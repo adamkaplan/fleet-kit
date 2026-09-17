@@ -11,15 +11,15 @@
 **Approve building Release 1: the charter convention plus fleet visibility, as a
 cloned repo driven by an install skill. Roughly two weeks of work.**
 
-Two things I need from you before anyone starts, because both can invalidate the
-plan:
+**Resolved by Adam, 2026-09-17.** The platform is **github.com Enterprise
+Cloud**, not Enterprise Server — so the native sub-issues API the queue depends on
+is available. Confirmed live: `repos/janus-infra/spire-venue/issues/459/sub_issues`
+returns 13 (VERIFIED). This was the highest-risk unknown in the investigation and
+it landed the right way. **And cost is out of scope** — see Open Questions.
 
-1. **How many people?** At 5, this works as proposed. At 50, the support model
-   and the label scheme both need rethinking before line one.
-2. **Is the team on github.com or Enterprise Server?** The queue mechanism is
-   built on **native sub-issues**. If GHES doesn't have that API, the core
-   invention doesn't work and this proposal needs redesigning, not editing.
-   (UNVERIFIED — I cannot test GHES from here.)
+**One question still open:** how many people? At 5 this works as proposed. At 50,
+the label scheme and the support model both need rethinking before line one. This
+shapes two decisions inside the plan; it does not invalidate it.
 
 And one thing to know before you read further: **the most valuable capability —
 unattended supervision — is gated on a third-party maintainer.** See Release 2.
@@ -213,7 +213,7 @@ Appendix C so they don't crowd out the operative list.
 | 1 | **Label collisions in a shared repo** | Labels are repo-global. Two teammates configuring the same label name see each other's work. `ak:` is **convention only** — nothing derives or enforces it. Must be a *required install input*, not a documented habit |
 | 2 | **The three-label exception** | `orchestrator`, `awaiting-user`, `fleet` are deliberately **un**namespaced *and* queried by literal name in census. So the rule is "namespace everything except these three," and a teammate who namespaces consistently **silently breaks the tooling**. This must ship as code, not a footnote |
 | 3 | **`gh` write access** | Creating issues, editing bodies, applying labels all need write/push. Triage is insufficient. Creating labels the first time needs admin |
-| 4 | **Native sub-issues** | The queue mechanism depends on it entirely. See the gating question up top |
+| 4 | ~~**Native sub-issues**~~ | **Resolved.** github.com Enterprise Cloud; API confirmed live (VERIFIED). No longer a risk |
 | 5 | **TCC / MDM** | Real and confirmed. Full Disk Access may be **locked by policy** and not grantable by the user at all. Must be a human gate the agent never retries |
 
 ### Two failure *shapes* that must inform the design
@@ -312,6 +312,10 @@ Nothing is deployed. herdr is a local process on a Unix socket (VERIFIED,
 board is a local binary with local SQLite; the durable store is GitHub Issues,
 which already exists. No servers, no containers, no cloud resources, no network
 listeners.
+
+One dependency, now confirmed rather than assumed: a github.com repo with Issues
+and **native sub-issues**. Adam has confirmed Enterprise Cloud and I verified the
+API responds, so the queue mechanism is safe.
 
 **The caveat that matters:** the shared repo *is* shared infrastructure wearing a
 disguise. Labels are a repo-global mutable namespace with no isolation beyond a
@@ -471,29 +475,32 @@ promised.
 
 ## Open questions I could not resolve
 
-These need someone's decision or a number nobody has measured.
+These need someone's decision.
 
-1. **Premium request consumption.** A 3-tier fleet with timer-driven wakes on
-   `claude-opus-5` at `reasoningEffort: high` is by construction a
-   token-consumption machine, multiplied by N teammates, against Copilot's
-   quotas. **Nobody has measured this**, including us. It is a plausible hard
-   "no" from a budget owner and it should be measured on our own fleet before we
-   ask anyone to adopt it.
-2. **Security review.** We would be handing N corporate laptops a kit that
+**Closed by Adam, 2026-09-17 — cost.** I had flagged premium-request consumption
+as a possible hard "no" from a budget owner. Ruled out of scope: OpenCode already
+tracks cost and the Chief of Staff can produce a figure on request. Two
+consequences worth recording. First, **the kit ships no cost instrumentation** —
+one less thing to build, and the right call. Second, that telemetry is
+*opencode's*; a teammate on Copilot CLI is not instrumented the same way, so if
+anyone ever does want a per-teammate number, it will not come from this kit. Not
+a problem today, just not a capability to assume later.
+
+1. **Security review.** We would be handing N corporate laptops a kit that
    encourages broad local agent authority, requires `gh` write access, and — per
    Q2 — leaves MCP write tools reachable under tool-tier denial. The `/etc`
    policy hook needs separate approval. I think the whole thing needs InfoSec
    eyes before distribution, not after, and on an MDM fleet that is a more likely
    blocker than anything technical here.
-3. **Support model.** When a teammate's fleet breaks in month three, who debugs
+2. **Support model.** When a teammate's fleet breaks in month three, who debugs
    it? census has no tests today, the heartbeat fails silently, herdr is
    third-party and pre-1.0. `fleet-doctor` is a detector, not a support plan.
-4. **herdr version pinning.** We correctly flag the board's bare-SHA pin as an
+3. **herdr version pinning.** We correctly flag the board's bare-SHA pin as an
    upgrade-story failure. But herdr itself is pre-1.0, installed via Homebrew,
    and has **already caused one `protocol_mismatch` outage here**. A teammate
    running `brew upgrade` at an arbitrary moment could break every fleet on the
    team at once. Same bug class, larger blast radius, no strategy.
-5. **Offboarding.** Someone leaves: their charters stay open in a shared repo,
+4. **Offboarding.** Someone leaves: their charters stay open in a shared repo,
    their label prefix persists forever, their `awaiting-user` issues block with
    nobody to answer. Guaranteed recurring mess at team scale.
 
@@ -503,7 +510,10 @@ These need someone's decision or a number nobody has measured.
 
 **Adam:**
 
-1. **Team size and github.com vs GHES** — the two gating questions at the top.
+*Answered 2026-09-17: platform is github.com Enterprise Cloud (sub-issues safe);
+cost is out of scope.*
+
+1. **Team size** — the one gating question still open.
 2. **The `python3 *: allow` hole.** Tighten it (losing `python3` convenience in
    the orchestrator tiers), or keep it and stop calling the guarantee structural?
    True today regardless of what we ship.
@@ -514,9 +524,6 @@ These need someone's decision or a number nobody has measured.
 4. **Is the root-owned `/etc` policy hook acceptable** on corporate laptops? It
    is the strongest tier-1 enforcement available and I would recommend it, but it
    is a machine-wide control and may be MDM-contested.
-5. **Measure cost before promising anything** (open question 1). I would not send
-   this to a wider team without a number.
-
 **Chief of Staff:**
 
 6. **Fix the internal inconsistencies before packaging** — `chief-of-staff.md:46`
@@ -590,9 +597,9 @@ every launcher must pass flags and that becomes load-bearing in the install spec
 | Board settle guard verified for claude/codex/opencode only | **READ** | `integration.rs:203-230` |
 | Charter convention in practice | **READ** | Issues #459, #456, #468, #471, #472, #474, #496 |
 | Copilot frontmatter `tools:` enforcement | **UNVERIFIED** | Appendix A |
-| GHES native sub-issues support | **UNVERIFIED** | Not testable here — gating question |
+| github.com Enterprise Cloud; sub-issues API live | **VERIFIED** | `orgs/janus-infra` plan=enterprise; `issues/459/sub_issues` → 13 |
 | Remote attach end-to-end | **UNVERIFIED** | No saved machines |
-| Premium request cost of a running fleet | **UNVERIFIED** | Never measured, by anyone |
+| Premium request cost of a running fleet | **OUT OF SCOPE** | Ruled out by Adam; OpenCode tracks it, CoS can report on request |
 
 ---
 
