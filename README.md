@@ -1,14 +1,20 @@
 # Fleet Kit
 
-A way to run several coding agents at once without losing track of them.
+Coding agents are cheap and getting cheaper. Your attention is not, and never
+will be. Fleet Kit is how you run thirty agents at once without paying thirty
+times the attention.
 
-It is not a framework and there is nothing to deploy. It is an **org chart made
-of agents**, plus the two things that hold it together: GitHub for memory, and a
-heartbeat for a pulse.
+It works by moving everything that normally competes for your focus — status,
+progress, what finished, who is stuck, what happens next — into structure that
+handles it without you. What reaches you is the one thing no agent can do for
+you: **judgement.** The calls that need taste, context, or your authority.
 
-If you run one agent at a time, you do not need this. It starts paying for itself
-at about three concurrent projects — roughly the point where you stop being able
-to remember what each one was doing.
+Everything else is noise, and noise is what this removes.
+
+There is nothing to deploy. It is an **org chart made of agents**, plus the two
+things that hold it together: GitHub for memory, and a heartbeat for a pulse.
+
+**If you want to run 30 agents at once, this is the way.**
 
 ---
 
@@ -17,53 +23,63 @@ to remember what each one was doing.
 ```mermaid
 flowchart TD
     You(["You"])
-    CoS["Chief of Staff<br/>one pane · owns no project · writes no code"]
+    CoS["Chief of Staff<br/>one pane, owns no project, writes no code"]
 
-    You <--> CoS
+    subgraph WS1["Workspace: Payments"]
+        O1["Orchestrator<br/>charter 12"]
+        A1(["coder"])
+        A2(["coder"])
+        A3(["coder"])
+        O1 --> A1
+        O1 --> A2
+        O1 --> A3
+    end
+
+    subgraph WS2["Workspace: Web App"]
+        O2["Orchestrator<br/>charter 31"]
+        B1(["coder"])
+        B2(["coder"])
+        O2 --> B1
+        O2 --> B2
+    end
+
+    subgraph WS3["Workspace: Infra"]
+        O3["Orchestrator<br/>charter 44"]
+        C1(["coder"])
+        C2(["coder"])
+        O3 --> C1
+        O3 --> C2
+    end
+
+    You --> CoS
     CoS --> O1
     CoS --> O2
     CoS --> O3
-
-    subgraph WS1[Workspace — Payments]
-        O1["Orchestrator<br/>charter #12"]
-        O1 --> A1(["coder"])
-        O1 --> A2(["coder"])
-    end
-
-    subgraph WS2[Workspace — Web App]
-        O2["Orchestrator<br/>charter #31"]
-        O2 --> B1(["coder"])
-    end
-
-    subgraph WS3[Workspace — Infra]
-        O3["Orchestrator<br/>charter #44"]
-        O3 --> C1(["coder"])
-        O3 --> C2(["coder"])
-    end
 
     classDef boss fill:#1f2937,stroke:#111827,color:#ffffff
     classDef orch fill:#1d4ed8,stroke:#1e3a8a,color:#ffffff
     classDef code fill:#e5e7eb,stroke:#9ca3af,color:#111827
     class CoS boss
     class O1,O2,O3 orch
-    class A1,A2,B1,C1,C2 code
+    class A1,A2,A3,B1,B2,C1,C2 code
 ```
 
 One workspace per project on the middle row. One Chief of Staff above them all.
-Coders come and go underneath.
+Coders come and go underneath. Add workspaces and the chart gets wider, not
+deeper — and your side of it does not change at all.
 
 Read down the chart and the rule is the same at every level: **the layer above
-never does the work of the layer below.** That is the whole idea. An orchestrator
-that starts editing files has stopped orchestrating, and nobody is watching its
-coders anymore.
+never does the work of the layer below.** That is what makes it scale. An
+orchestrator that starts editing files has stopped orchestrating, and nobody is
+watching its coders anymore.
 
 ### Underneath it all
 
 ```mermaid
 flowchart TD
     HB{{"Heartbeat<br/>wakes each orchestrator on its own schedule"}}
-    FLEET["Chief of Staff · Orchestrators · coders"]
-    GH[("GitHub Issues<br/>charters · queues · decisions")]
+    FLEET["Chief of Staff, Orchestrators, coders"]
+    GH[("GitHub Issues<br/>charters, queues, decisions")]
 
     HB -->|"wakes"| FLEET
     FLEET -->|"writes everything durable"| GH
@@ -76,12 +92,13 @@ flowchart TD
 
 **GitHub is the memory.** Panes die, laptops reboot, agents get replaced. Every
 charter, every assignment and every decision is a GitHub issue, so none of that
-loses work.
+loses work. This is also why the fleet can grow — nothing important is held in
+anyone's head or anyone's scrollback.
 
 **The heartbeat is the pulse.** A local background service wakes each
 orchestrator on its own adaptive schedule — busy ones often, quiet ones rarely.
-Without it, an agent that finishes a thought just sits there until a human
-notices it has stopped. Nobody polls anything.
+Without it, an agent that finishes a thought sits there until a human notices.
+With thirty agents, that human cannot be you.
 
 ---
 
@@ -383,12 +400,17 @@ work it out.
 ## Getting started
 
 1. Install it, agent-driven, and get `fleet-doctor` green.
-2. Open **one** charter for **one** project and run a single orchestrator for a
-   few days. Learn the shape before you scale it.
-3. Add workspaces as you need them.
-4. Add the Chief of Staff when you have three or more and have started losing
-   track — which is the problem it exists to solve, and it will not feel
-   necessary before then.
+2. Open one charter, run one orchestrator, dispatch a few coders. One afternoon
+   is enough to learn the shape.
+3. Add a workspace per project. This is the step that scales — each one is a new
+   charter and a new orchestrator, and nothing you already have changes.
+4. Stand up the Chief of Staff and hand it the fleet. From then on you talk to
+   one agent, not to twelve.
 
-The first real sign it is working is not a green dashboard. It is
-`gh issue list --label awaiting-user` coming back empty, and you believing it.
+Scaling from here is adding rows to the chart, not adding load to you. Ten
+workspaces run the same way three do: the orchestrators absorb the coordination,
+the charters hold the state, and the heartbeat keeps everything moving without
+anyone checking on it.
+
+The real sign it is working is not a dashboard full of green. It is
+`gh issue list --label awaiting-user` coming back empty — and you believing it.
