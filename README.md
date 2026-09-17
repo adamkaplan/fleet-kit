@@ -327,8 +327,8 @@ means a change in herdr itself, which is not ours.
 Short list. Each of these has already cost somebody time.
 
 **Namespace your labels.** Labels are repo-wide. If two people use a shared repo
-and both create a label called `board`, they are looking at each other's work.
-Pick a prefix and use it on everything you create — `ak:board`, `ak:payments`.
+and both create a label called `active`, they are looking at each other's work.
+Pick a prefix and use it on everything you create — `ak:active`, `ak:payments`.
 Your prefix is set once at install and everything derives from it.
 
 **Except these three.** `orchestrator`, `awaiting-user` and `fleet` are
@@ -336,8 +336,10 @@ deliberately un-namespaced and are queried by exact name. Do not prefix them, do
 not rename them. Tooling looks for those literal strings and will silently return
 nothing if they change.
 
-**`labels = [a, b]` in config is an AND, not an OR.** Adding a label to widen a
-filter narrows it instead, usually to zero. It looks like everything vanished.
+**Filtering on two labels is an AND, not an OR.** `gh issue list --label a
+--label b` returns issues carrying *both*. Adding a label to widen a search
+narrows it instead, usually to nothing, and it reads as though the work
+disappeared.
 
 **Agent definitions load once per session.** Edit one and nothing currently
 running picks it up — you have changed the next agent, not the ones already
@@ -354,28 +356,6 @@ What does **not** work is splitting the chart — orchestrator on the laptop,
 coders on a remote host. Pane addresses are only unique within one server, so two
 machines can both have a `w3:p1` and the charter can no longer tell them apart.
 Run the fleet on one host, attach from anywhere.
-
----
-
-## What is not in the box
-
-Honest list, so nobody goes looking.
-
-**The task board.** There is a board plugin that turns labelled GitHub issues
-into dispatched agents. It is genuinely useful and it is not included: it is
-third-party, it has no published binaries so you would be building it from source
-with a Rust toolchain, and its completion detection has not been verified against
-Copilot CLI. If you want it, get it from the vendor directly and treat it as
-yours to maintain.
-
-**Snapshot and restore.** Exists, saves fleet state to disk, and has never been
-proven to restore a real one. Not shipping something whose only job is to work on
-the worst day.
-
-**Cross-machine fleets.** See above.
-
-**A cost meter.** Nothing here tracks spend. Ask the Chief of Staff and it can
-work it out.
 
 ---
 
