@@ -108,14 +108,16 @@ With thirty agents, that human cannot be you.
 
 Answer questions. That is the job.
 
-One query tells you everything waiting on you, across every project:
+You do not run commands, open dashboards, or check on anything. You talk to the
+Chief of Staff:
 
-```bash
-gh issue list --label awaiting-user
-```
+> **"What needs me?"**
 
-If that list is empty, nothing is blocked on you. The rest of this document is
-mostly about why that sentence is trustworthy.
+It comes back with the decisions that are actually waiting on you, and nothing
+else. If there are none, it says so and you carry on with your day.
+
+That one exchange is your whole interface to thirty agents. The rest of this
+document is mostly about why the answer is trustworthy.
 
 ### Chief of Staff
 
@@ -126,8 +128,10 @@ Give it work and it routes that to whichever orchestrator owns the area. It also
 watches the other orchestrators and tells you when one is stuck, dead, or
 claiming to be finished while its queue is still full.
 
-It is structurally unable to edit files — a permission, not a promise. See
-[Locking the top two rows](#locking-the-top-two-rows).
+It does not write code. That boundary is held by its role definition rather than
+by a sandbox — see [Keeping the top two rows in their
+lane](#keeping-the-top-two-rows-in-their-lane), which is honest about how much
+that is and is not worth.
 
 ### Workspaces
 
@@ -189,7 +193,8 @@ Every assignment is a **native GitHub sub-issue** of the charter. Not a checkbox
 not a comment, not a local to-do file.
 
 You get a progress rollup for free, and the queue is readable without anyone
-scraping a terminal.
+scraping a terminal. This is the orchestrator's mechanics, not yours — shown so
+you know where the state lives:
 
 ```bash
 gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
@@ -216,7 +221,11 @@ ability to say it is blocked. So the label goes on before the question, every
 time.
 
 The label comes off as soon as you answer. Leave it on and you have poisoned the
-one list you trust.
+one list that matters.
+
+This label is what the Chief of Staff reads when you ask it what needs you. You
+never query it yourself — but it is worth knowing that the answer you get is
+assembled from something durable, not from an agent's recollection.
 
 ---
 
@@ -313,30 +322,48 @@ started, so herdr falls back to reading the terminal to guess. It mostly works.
 It is less reliable, and it is the one real rough edge in the system. Fixing it
 means a change in herdr itself, which is not ours.
 
-### Locking the top two rows
+### Keeping the top two rows in their lane
 
-The Chief of Staff and the orchestrators must not be able to write code. On
-Copilot CLI that is enforced at launch:
+The Chief of Staff and the orchestrators are not supposed to write code. Be clear
+about how that is actually achieved, because it is easy to overstate.
+
+**It is mostly prompting.** The boundary lives in the agent definition — the role
+is described, the STOP list is explicit, and the reasoning for it is spelled out
+rather than asserted. In practice this works well. It is also, in the end, an
+instruction to a model.
+
+**The permission layer helps but does not close it.** You can deny the
+file-editing tools, and you should. But an orchestrator's entire job is running
+`herdr`, `gh` and `git`, so **it must have a shell.** And a shell is a way to
+write files:
 
 ```bash
-copilot --agent chief-of-staff --excluded-tools create edit bash task
+python3 -c "open('f','w').write('...')"   # denied edit tool, file written anyway
+echo "..." > f                            # same outcome, fewer characters
 ```
 
-Those tools are not denied at call time — they are removed from the model's
-context entirely. It cannot call a tool it was never told about.
+So the top two rows can write files if they decide to. Nothing stops them. What
+stops them in practice is that they are told not to, repeatedly and with
+reasons, and that they have no task that requires it.
 
-Two things to get right:
+**What this means for you:** treat it as a design that keeps agents in their
+lane, **not as a security boundary.** It is the difference between a job
+description and a locked door. It will keep a well-behaved agent doing the right
+thing and it will not contain one that goes wrong. Do not hand these roles
+credentials or authority on the assumption that the sandbox will catch a
+mistake — there is no sandbox.
 
-**Launch through `fleet-launch`, not `copilot` directly.** On Copilot the
-guarantee lives in those flags, not in the agent file. Start the agent bare and
-you get a Chief of Staff that can edit. `bin/fleet-launch` exists so nobody has
-to remember.
+**Where hard enforcement does work:** a role that genuinely needs no shell — a
+reviewer, a critic, a read-only auditor. On Copilot CLI, `--excluded-tools`
+removes tools from the model's context entirely rather than denying them at call
+time, so it cannot call what it was never told about:
 
-**Do not grant a shell or an interpreter to the top two rows.** Allowing
-`python3` next to `edit: deny` hands back everything the denial took away —
-`python3 -c "open('f','w')..."` writes any file on disk. We had exactly this hole
-in our own config for a while. If a role must not write files, it must not have a
-way to run arbitrary code either.
+```bash
+copilot --agent reviewer --excluded-tools create edit bash task
+```
+
+That is a real boundary. It is available to you for any role that does not need
+to run anything, which is not the orchestrators.
 
 ---
 
@@ -412,5 +439,5 @@ workspaces run the same way three do: the orchestrators absorb the coordination,
 the charters hold the state, and the heartbeat keeps everything moving without
 anyone checking on it.
 
-The real sign it is working is not a dashboard full of green. It is
-`gh issue list --label awaiting-user` coming back empty — and you believing it.
+The real sign it is working is not a dashboard full of green. It is asking the
+Chief of Staff what needs you, hearing "nothing right now," and believing it.
