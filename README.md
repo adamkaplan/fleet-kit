@@ -1,0 +1,394 @@
+# Fleet Kit
+
+A way to run several coding agents at once without losing track of them.
+
+It is not a framework and there is nothing to deploy. It is an **org chart made
+of agents**, plus the two things that hold it together: GitHub for memory, and a
+heartbeat for a pulse.
+
+If you run one agent at a time, you do not need this. It starts paying for itself
+at about three concurrent projects — roughly the point where you stop being able
+to remember what each one was doing.
+
+---
+
+## The org chart
+
+```mermaid
+flowchart TD
+    You(["You"])
+    CoS["Chief of Staff<br/>one pane · owns no project · writes no code"]
+
+    You <--> CoS
+    CoS --> O1
+    CoS --> O2
+    CoS --> O3
+
+    subgraph WS1[Workspace — Payments]
+        O1["Orchestrator<br/>charter #12"]
+        O1 --> A1(["coder"])
+        O1 --> A2(["coder"])
+    end
+
+    subgraph WS2[Workspace — Web App]
+        O2["Orchestrator<br/>charter #31"]
+        O2 --> B1(["coder"])
+    end
+
+    subgraph WS3[Workspace — Infra]
+        O3["Orchestrator<br/>charter #44"]
+        O3 --> C1(["coder"])
+        O3 --> C2(["coder"])
+    end
+
+    classDef boss fill:#1f2937,stroke:#111827,color:#ffffff
+    classDef orch fill:#1d4ed8,stroke:#1e3a8a,color:#ffffff
+    classDef code fill:#e5e7eb,stroke:#9ca3af,color:#111827
+    class CoS boss
+    class O1,O2,O3 orch
+    class A1,A2,B1,C1,C2 code
+```
+
+One workspace per project on the middle row. One Chief of Staff above them all.
+Coders come and go underneath.
+
+Read down the chart and the rule is the same at every level: **the layer above
+never does the work of the layer below.** That is the whole idea. An orchestrator
+that starts editing files has stopped orchestrating, and nobody is watching its
+coders anymore.
+
+### Underneath it all
+
+```mermaid
+flowchart TD
+    HB{{"Heartbeat<br/>wakes each orchestrator on its own schedule"}}
+    FLEET["Chief of Staff · Orchestrators · coders"]
+    GH[("GitHub Issues<br/>charters · queues · decisions")]
+
+    HB -->|"wakes"| FLEET
+    FLEET -->|"writes everything durable"| GH
+
+    classDef sub fill:#065f46,stroke:#064e3b,color:#ffffff
+    classDef mid fill:#e5e7eb,stroke:#9ca3af,color:#111827
+    class HB,GH sub
+    class FLEET mid
+```
+
+**GitHub is the memory.** Panes die, laptops reboot, agents get replaced. Every
+charter, every assignment and every decision is a GitHub issue, so none of that
+loses work.
+
+**The heartbeat is the pulse.** A local background service wakes each
+orchestrator on its own adaptive schedule — busy ones often, quiet ones rarely.
+Without it, an agent that finishes a thought just sits there until a human
+notices it has stopped. Nobody polls anything.
+
+---
+
+## Who does what
+
+### You
+
+Answer questions. That is the job.
+
+One query tells you everything waiting on you, across every project:
+
+```bash
+gh issue list --label awaiting-user
+```
+
+If that list is empty, nothing is blocked on you. The rest of this document is
+mostly about why that sentence is trustworthy.
+
+### Chief of Staff
+
+One agent, one pane, always running. Owns no project. Writes no code.
+
+It is your single interface to everything else. Ask it for status and it answers.
+Give it work and it routes that to whichever orchestrator owns the area. It also
+watches the other orchestrators and tells you when one is stuck, dead, or
+claiming to be finished while its queue is still full.
+
+It is structurally unable to edit files — a permission, not a promise. See
+[Locking the top two rows](#locking-the-top-two-rows).
+
+### Workspaces
+
+One per project. A workspace is a herdr window with its own tabs, its own working
+directory, and its own orchestrator.
+
+Workspaces are **caches, not truth.** Everything durable is in Git and GitHub. If
+you lose a workspace you recreate it and nothing is gone. Treat them as
+disposable and you will not be tempted to hide state in them.
+
+### Orchestrators
+
+One per workspace. Each owns a **charter** — a single GitHub issue that is its
+identity, its scope and its queue.
+
+An orchestrator decides what needs doing, writes the brief, dispatches a coder,
+checks what comes back, and pushes blockers upward. It does not write product
+code, for the same reason the Chief of Staff does not, one row down.
+
+### Coders
+
+Ephemeral. One per assignment.
+
+A coder is dispatched into its own git worktree with a written brief. It works,
+commits, opens a PR, and exits. It does not outlive its task, and no two coders
+share a directory, so they cannot corrupt each other's tree.
+
+---
+
+## The charter
+
+Everything an orchestrator is lives in one GitHub issue.
+
+The body starts with a machine-readable block:
+
+````markdown
+```yaml
+orchestrator: payments
+workspace: Payments
+pane: w3:p1
+reports_to: your-github-handle
+status: active
+```
+````
+
+Below that, in prose: what it owns, what authority it has, and what it must never
+do. Keep it short enough to stay true.
+
+**`pane` is the important field.** It is the orchestrator's live address, and it
+is how tooling knows the difference between an agent that is working and one that
+died. A charter outlives the pane it names, so when an orchestrator is relaunched
+somewhere new, updating `pane` is its first act — before it resumes work. A stale
+`pane` makes a healthy orchestrator look dead. A fresh one on an abandoned
+charter makes a corpse look alive. Both waste somebody's afternoon.
+
+### The queue is sub-issues
+
+Every assignment is a **native GitHub sub-issue** of the charter. Not a checkbox,
+not a comment, not a local to-do file.
+
+You get a progress rollup for free, and the queue is readable without anyone
+scraping a terminal.
+
+```bash
+gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
+
+# note: sub_issue_id is the issue's DATABASE id, not its number. Fetch it.
+id=$(gh api repos/OWNER/REPO/issues/<new-number> --jq .id)
+gh api repos/OWNER/REPO/issues/<charter-number>/sub_issues -F sub_issue_id=$id
+```
+
+Close a sub-issue when the work is done and verified, not when it is dispatched.
+An open sub-issue is a live claim that something is outstanding.
+
+### `awaiting-user` is the only way to block you
+
+When an orchestrator needs a decision only you can make, it applies the
+`awaiting-user` label and writes a `## Decision required` section at the top of
+the issue: the question, the options, its recommendation, and what stays stopped
+until you answer.
+
+**Label first, ask second.** This ordering is not a style preference. Once an
+agent asks a question and blocks on it, it can no longer be reached to do
+anything — including telling you it is blocked. Blocking is what removes its
+ability to say it is blocked. So the label goes on before the question, every
+time.
+
+The label comes off as soon as you answer. Leave it on and you have poisoned the
+one list you trust.
+
+---
+
+## How the Chief of Staff knows anything
+
+It does not ask. Asking an agent whether it is alive is unreliable — a busy agent
+does not answer, and a dead one cannot.
+
+Instead it compares two sources that do not know about each other:
+
+- **GitHub** says what the work is — which charters are active, which sub-issues
+  are open, who is blocked.
+- **herdr** says what is alive — which panes exist, which have an agent, what
+  state that agent is in.
+
+Join them on the `pane` field and the mismatches fall out on their own:
+
+| Divergence | Means |
+|---|---|
+| Charter active, pane dead | The orchestrator died and nobody noticed |
+| Pane working, no charter | Something is running that nothing durable records |
+| Agent blocked, no `awaiting-user` | It is stuck and you will never hear about it |
+| Reports done, queue still open | It thinks it finished; its own queue disagrees |
+
+None of that requires polling, and none of it depends on an agent volunteering
+the truth about itself.
+
+---
+
+## Installing it
+
+You will need: **herdr**, an agent CLI, and **`gh`** authenticated with write
+access to the repo you will use.
+
+Installation is agent-driven. Point your agent at the install skill and it works
+through the steps:
+
+```
+Read the fleet-kit INSTALL skill and work through it. After each step, run
+that step's VERIFY command and paste the real output. Do not report success
+you have not observed. Stop at anything marked HUMAN and hand back to me.
+```
+
+Every step declares what proves it worked, so the agent confirms rather than
+assumes:
+
+```
+STEP 4 — Authenticate gh
+  DO:      gh auth login --scopes repo
+  HUMAN:   yes — browser + device code. Stop and hand over.
+  VERIFY:  gh auth status --active && gh api user --jq .login
+  PROVES:  a login name comes back, and repo scope is present
+```
+
+Run `fleet-doctor` at the end. Run it again any time something feels wrong — it
+is the same check either way.
+
+### Steps that need a human
+
+Your agent will stop at these. That is correct behaviour, not a failure:
+
+- **`gh auth login`** — browser and device code.
+- **macOS permission prompts** — the OS dialogs cannot be scripted. Your agent
+  will tell you which dialog and which button.
+- **Full Disk Access on a managed Mac** — may be locked by policy and not
+  grantable by you at all. That is an IT ticket. An agent that offers a clever
+  way around a locked security control is doing the wrong thing; tell it to stop.
+
+---
+
+## Your agent harness
+
+The team runs **GitHub Copilot CLI**. Three things worth knowing.
+
+**Your skills already work.** Copilot CLI reads personal skills from
+`~/.agents/skills/`, which is where these live. Nothing to convert, nothing to
+configure — `copilot skill list` will show them once they are on disk.
+
+**Agent definitions need translating.** Markdown with YAML frontmatter on both
+sides, but the fields differ:
+
+| opencode | Copilot CLI |
+|---|---|
+| `model: github-copilot/claude-opus-5` | `model: claude-opus-5` |
+| `variant: high` | `reasoningEffort: high` |
+| `permission: {edit: deny}` | `tools:` allow-list, plus launch flags |
+
+Both formats ship in `agents/`. Use the one for your harness.
+
+**Supervision is weaker on Copilot, for now.** herdr learns what an agent is
+doing from a small integration hook. The opencode hook reports working, blocked
+and idle directly. The Copilot hook currently reports only that a session
+started, so herdr falls back to reading the terminal to guess. It mostly works.
+It is less reliable, and it is the one real rough edge in the system. Fixing it
+means a change in herdr itself, which is not ours.
+
+### Locking the top two rows
+
+The Chief of Staff and the orchestrators must not be able to write code. On
+Copilot CLI that is enforced at launch:
+
+```bash
+copilot --agent chief-of-staff --excluded-tools create edit bash task
+```
+
+Those tools are not denied at call time — they are removed from the model's
+context entirely. It cannot call a tool it was never told about.
+
+Two things to get right:
+
+**Launch through `fleet-launch`, not `copilot` directly.** On Copilot the
+guarantee lives in those flags, not in the agent file. Start the agent bare and
+you get a Chief of Staff that can edit. `bin/fleet-launch` exists so nobody has
+to remember.
+
+**Do not grant a shell or an interpreter to the top two rows.** Allowing
+`python3` next to `edit: deny` hands back everything the denial took away —
+`python3 -c "open('f','w')..."` writes any file on disk. We had exactly this hole
+in our own config for a while. If a role must not write files, it must not have a
+way to run arbitrary code either.
+
+---
+
+## Rules that will bite you
+
+Short list. Each of these has already cost somebody time.
+
+**Namespace your labels.** Labels are repo-wide. If two people use a shared repo
+and both create a label called `board`, they are looking at each other's work.
+Pick a prefix and use it on everything you create — `ak:board`, `ak:payments`.
+Your prefix is set once at install and everything derives from it.
+
+**Except these three.** `orchestrator`, `awaiting-user` and `fleet` are
+deliberately un-namespaced and are queried by exact name. Do not prefix them, do
+not rename them. Tooling looks for those literal strings and will silently return
+nothing if they change.
+
+**`labels = [a, b]` in config is an AND, not an OR.** Adding a label to widen a
+filter narrows it instead, usually to zero. It looks like everything vanished.
+
+**Agent definitions load once per session.** Edit one and nothing currently
+running picks it up — you have changed the next agent, not the ones already
+working. Restart deliberately, or expect a fleet that disagrees with itself.
+
+This is also why **doctrine that changes belongs in a skill, not an agent
+definition.** Skills are re-read on use. Put the stable stuff — role boundaries,
+permissions — in the agent file. Put everything you expect to revise in a skill.
+
+**Remote works, but the whole fleet goes together.** `herdr --remote <ssh-target>`
+puts the server on a remote box and attaches your laptop as a client. Panes and
+running work stay on the server, so you can close the lid and nothing stops.
+What does **not** work is splitting the chart — orchestrator on the laptop,
+coders on a remote host. Pane addresses are only unique within one server, so two
+machines can both have a `w3:p1` and the charter can no longer tell them apart.
+Run the fleet on one host, attach from anywhere.
+
+---
+
+## What is not in the box
+
+Honest list, so nobody goes looking.
+
+**The task board.** There is a board plugin that turns labelled GitHub issues
+into dispatched agents. It is genuinely useful and it is not included: it is
+third-party, it has no published binaries so you would be building it from source
+with a Rust toolchain, and its completion detection has not been verified against
+Copilot CLI. If you want it, get it from the vendor directly and treat it as
+yours to maintain.
+
+**Snapshot and restore.** Exists, saves fleet state to disk, and has never been
+proven to restore a real one. Not shipping something whose only job is to work on
+the worst day.
+
+**Cross-machine fleets.** See above.
+
+**A cost meter.** Nothing here tracks spend. Ask the Chief of Staff and it can
+work it out.
+
+---
+
+## Getting started
+
+1. Install it, agent-driven, and get `fleet-doctor` green.
+2. Open **one** charter for **one** project and run a single orchestrator for a
+   few days. Learn the shape before you scale it.
+3. Add workspaces as you need them.
+4. Add the Chief of Staff when you have three or more and have started losing
+   track — which is the problem it exists to solve, and it will not feel
+   necessary before then.
+
+The first real sign it is working is not a green dashboard. It is
+`gh issue list --label awaiting-user` coming back empty, and you believing it.
