@@ -128,10 +128,8 @@ Give it work and it routes that to whichever orchestrator owns the area. It also
 watches the other orchestrators and tells you when one is stuck, dead, or
 claiming to be finished while its queue is still full.
 
-It does not write code. That boundary is held by its role definition rather than
-by a sandbox — see [Keeping the top two rows in their
-lane](#keeping-the-top-two-rows-in-their-lane), which is honest about how much
-that is and is not worth.
+It does not do the work. Like every role here, what it does and does not do is
+defined in its agent definition.
 
 ### Workspaces
 
@@ -311,7 +309,7 @@ sides, but the fields differ:
 |---|---|
 | `model: github-copilot/claude-opus-5` | `model: claude-opus-5` |
 | `variant: high` | `reasoningEffort: high` |
-| `permission: {edit: deny}` | `tools:` allow-list, plus launch flags |
+| `permission:` block | `tools:` allow-list |
 
 Both formats ship in `agents/`. Use the one for your harness.
 
@@ -321,49 +319,6 @@ and idle directly. The Copilot hook currently reports only that a session
 started, so herdr falls back to reading the terminal to guess. It mostly works.
 It is less reliable, and it is the one real rough edge in the system. Fixing it
 means a change in herdr itself, which is not ours.
-
-### Keeping the top two rows in their lane
-
-The Chief of Staff and the orchestrators are not supposed to write code. Be clear
-about how that is actually achieved, because it is easy to overstate.
-
-**It is mostly prompting.** The boundary lives in the agent definition — the role
-is described, the STOP list is explicit, and the reasoning for it is spelled out
-rather than asserted. In practice this works well. It is also, in the end, an
-instruction to a model.
-
-**The permission layer helps but does not close it.** You can deny the
-file-editing tools, and you should. But an orchestrator's entire job is running
-`herdr`, `gh` and `git`, so **it must have a shell.** And a shell is a way to
-write files:
-
-```bash
-python3 -c "open('f','w').write('...')"   # denied edit tool, file written anyway
-echo "..." > f                            # same outcome, fewer characters
-```
-
-So the top two rows can write files if they decide to. Nothing stops them. What
-stops them in practice is that they are told not to, repeatedly and with
-reasons, and that they have no task that requires it.
-
-**What this means for you:** treat it as a design that keeps agents in their
-lane, **not as a security boundary.** It is the difference between a job
-description and a locked door. It will keep a well-behaved agent doing the right
-thing and it will not contain one that goes wrong. Do not hand these roles
-credentials or authority on the assumption that the sandbox will catch a
-mistake — there is no sandbox.
-
-**Where hard enforcement does work:** a role that genuinely needs no shell — a
-reviewer, a critic, a read-only auditor. On Copilot CLI, `--excluded-tools`
-removes tools from the model's context entirely rather than denying them at call
-time, so it cannot call what it was never told about:
-
-```bash
-copilot --agent reviewer --excluded-tools create edit bash task
-```
-
-That is a real boundary. It is available to you for any role that does not need
-to run anything, which is not the orchestrators.
 
 ---
 
