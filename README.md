@@ -348,7 +348,7 @@ repo-wide. If two people use a shared repo and both create a label called
 Your prefix is your username:
 
 ```bash
-whoami        # adkaplan  ->  adkaplan:active, adkaplan:payments
+whoami        # jdoe  ->  jdoe:active, jdoe:payments
 ```
 
 Nobody picks it and no agent has to ask. On a corporate Mac the username is

@@ -23,7 +23,8 @@ Usage: fleet-doctor [--verbose] [--help]
   --help      This message.
 
 Configuration (first hit wins):
-  1. Environment: FLEET_REPO, FLEET_PREFIX
+  1. Environment: FLEET_REPO, FLEET_PREFIX,
+                  FLEET_HEARTBEAT_CONF, FLEET_HEARTBEAT_LABEL
   2. File:        ~/.config/fleet-kit/config   (KEY=value lines)
   3. Defaults:    FLEET_PREFIX=$(whoami); FLEET_REPO has no default.
 
@@ -274,8 +275,9 @@ if gh_guard sub-issues needrepo; then
 fi
 
 # =========================================================== 8. heartbeat
-HB_CONF="$HOME/.local/state/janus-director-heartbeat/config.json"
-HB_LABEL="com.janus.director-heartbeat"
+# Overridable so this works against a differently-named or relocated install.
+HB_CONF="${FLEET_HEARTBEAT_CONF:-$HOME/.local/state/fleet-heartbeat/config.json}"
+HB_LABEL="${FLEET_HEARTBEAT_LABEL:-com.fleet-kit.heartbeat}"
 if [ ! -f "$HB_CONF" ]; then
   emit ok heartbeat "not installed"
 else
