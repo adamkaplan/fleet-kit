@@ -1,9 +1,9 @@
 # Fleet Kit
 
-### tl;dr
+### tl;dr, agent install
 
 ```bash
-copilot -i "Clone https://github.com/dw-aura/fleet-kit.git into ~/Code/fleet-kit and follow its INSTALL.md."
+copilot -i "Clone https://github.com/dw-aura/fleet-kit.git and follow its fleet-kit/INSTALL.md."
 ```
 
 ---
