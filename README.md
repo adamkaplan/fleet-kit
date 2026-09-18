@@ -267,13 +267,13 @@ the truth about itself.
 You will need: **herdr**, an agent CLI, and **`gh`** authenticated with write
 access to the repo you will use.
 
-Installation is agent-driven. Point your agent at the install skill and it works
-through the steps:
+Installation is agent-driven. Point your agent at
+[`INSTALL.md`](INSTALL.md) and it works through the steps:
 
 ```
-Read the fleet-kit INSTALL skill and work through it. After each step, run
-that step's VERIFY command and paste the real output. Do not report success
-you have not observed. Stop at anything marked HUMAN and hand back to me.
+Read INSTALL.md in this repo and work through it. After each step, run that
+step's VERIFY command and paste the real output. Do not report success you
+have not observed. Stop at anything marked HUMAN and hand back to me.
 ```
 
 **Every step checks before it acts.** You are an engineer with a working machine,
