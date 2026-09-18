@@ -205,12 +205,12 @@ gh api repos/OWNER/REPO/issues/<charter-number>/sub_issues -F sub_issue_id=$id
 Close a sub-issue when the work is done and verified, not when it is dispatched.
 An open sub-issue is a live claim that something is outstanding.
 
-### `awaiting-user` is the only way to block you
+### `<user>:awaiting-user` is the only way to block you
 
-When an orchestrator needs a decision only you can make, it applies the
-`awaiting-user` label and writes a `## Decision required` section at the top of
-the issue: the question, the options, its recommendation, and what stays stopped
-until you answer.
+When an orchestrator needs a decision only you can make, it applies its
+`<user>:awaiting-user` label and writes a `## Decision required` section at the
+top of the issue: the question, the options, its recommendation, and what stays
+stopped until you answer.
 
 **Label first, ask second.** This ordering is not a style preference. Once an
 agent asks a question and blocks on it, it can no longer be reached to do
@@ -221,7 +221,7 @@ time.
 The label comes off as soon as you answer. Leave it on and you have poisoned the
 one list that matters.
 
-This label is what the Chief of Staff reads when you ask it what needs you. You
+That label is what the Chief of Staff reads when you ask it what needs you. You
 never query it yourself — but it is worth knowing that the answer you get is
 assembled from something durable, not from an agent's recollection.
 
@@ -245,7 +245,7 @@ Join them on the `pane` field and the mismatches fall out on their own:
 |---|---|
 | Charter active, pane dead | The orchestrator died and nobody noticed |
 | Pane working, no charter | Something is running that nothing durable records |
-| Agent blocked, no `awaiting-user` | It is stuck and you will never hear about it |
+| Agent blocked, no `<user>:awaiting-user` | It is stuck and you will never hear about it |
 | Reports done, queue still open | It thinks it finished; its own queue disagrees |
 
 None of that requires polling, and none of it depends on an agent volunteering
@@ -306,9 +306,6 @@ Your agent will stop at these. That is correct behaviour, not a failure:
   authenticated. Most people are, and this step will be skipped.
 - **macOS permission prompts** — the OS dialogs cannot be scripted. Your agent
   will tell you which dialog and which button.
-- **Full Disk Access on a managed Mac** — may be locked by policy and not
-  grantable by you at all. That is an IT ticket. An agent that offers a clever
-  way around a locked security control is doing the wrong thing; tell it to stop.
 
 ---
 
@@ -360,25 +357,23 @@ what a prefix needs to be — and `whoami` answers before `gh` is even
 authenticated. Initials would be shorter and would collide the first time you
 hired a second person with them.
 
-**No exceptions — including `orchestrator` and `awaiting-user`.** It is tempting
-to leave the structural labels un-prefixed since everyone means the same thing by
-them. Do not. Two people sharing a repo with a bare `orchestrator` label means
-each one's tooling sees the other's charters, and the damage is not cosmetic:
+**Every label, structural ones included.** The labels the tooling itself relies
+on get the prefix too — `<user>:orchestrator`, `<user>:awaiting-user`. It is
+tempting to leave those shared, since everyone means the same thing by them. Do
+not, and it is worth knowing why, because the damage is not cosmetic:
 
 - **Charter lists mix.** Your Chief of Staff reports on orchestrators that are
-  not yours and cannot be reached.
+  not yours and that it cannot reach.
 - **The pane join goes wrong silently.** A charter records its agent's address as
-  `w3:p1`. Those addresses are only unique within one machine, so your colleague's
-  `w3:p1` and yours are different agents with the same name. Your tooling will
+  `w3:p1`. Those addresses are only unique within one machine, so a colleague's
+  `w3:p1` and yours are different agents wearing the same name. Your tooling will
   cheerfully match their charter to your pane and report something confident and
   false.
-- **`awaiting-user` stops meaning anything.** It is the one list you trust. Fill
-  it with decisions belonging to someone else and "nothing needs you" is no longer
-  a sentence you can believe.
+- **Your one trusted list stops meaning anything.** Fill it with decisions
+  belonging to someone else and "nothing needs you" is no longer a sentence you
+  can believe.
 
-Prefix everything. `adkaplan:orchestrator`, `adkaplan:awaiting-user`,
-`adkaplan:payments`. The queries stay one-liners and they return only your
-fleet.
+So: `<user>:` on everything, with no exceptions to remember.
 
 **Filtering on two labels is an AND, not an OR.** `gh issue list --label a
 --label b` returns issues carrying *both*. Adding a label to widen a search

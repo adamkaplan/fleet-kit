@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+#
+# fleet-doctor — health check for the 3-tier agent fleet.
+#
+# STRICTLY READ-ONLY. Every command run here is a list/get/status/version call.
+# Nothing in this script creates, edits, deletes, prompts, or kills anything.
+# The only thing it writes is a scratch dir under TMPDIR, removed on exit.
+#
+# bash 3.2 compatible (macOS ships 3.2): no associative arrays, no mapfile,
+# no ${var^^}, no `timeout` (that's Homebrew coreutils, not base macOS).
+
+VERBOSE=0
+OK_N=0; WARN_N=0; FAIL_N=0
+LAST_OUT=""
+
+usage() {
+  cat <<'EOF'
+fleet-doctor — read-only health check for the agent fleet.
+
+Usage: fleet-doctor [--verbose] [--help]
+
+  --verbose   Show underlying command output for failing checks.
+  --help      This message.
+
+Configuration (first hit wins):
+  1. Environment: FLEET_REPO, FLEET_PREFIX
+  2. File:        ~/.config/fleet-kit/config   (KEY=value lines)
+  3. Defaults:    FLEET_PREFIX=$(whoami); FLEET_REPO has no default.
+
+If FLEET_REPO is unset the GitHub-dependent checks are skipped with a WARN.
+Exit 0 if no FAIL, 1 if any FAIL. WARN does not fail the run.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verbose|-v) VERBOSE=1 ;;
+    --help|-h)    usage; exit 0 ;;
+    *) echo "fleet-doctor: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------- scratch dir
+TMPDIR_FD=$(mktemp -d "${TMPDIR:-/tmp}/fleet-doctor.XXXXXX") || exit 2
+cleanup() { rm -rf "$TMPDIR_FD"; }
+trap cleanup EXIT INT TERM
+OUT="$TMPDIR_FD/out"
+
+# ------------------------------------------------------------------- helpers
+
+# run_to SECONDS CMD... — run with a wall-clock cap. Base macOS has no
+# `timeout`, so this backgrounds the command and shoots it if it overruns.
+# Output (stdout+stderr) lands in $OUT and $LAST_OUT. Returns command's rc.
+run_to() {
+  secs="$1"; shift
+  : >"$OUT"
+  "$@" >"$OUT" 2>&1 &
+  cmdpid=$!
+  ( sleep "$secs"; kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
+  watchpid=$!
+  wait "$cmdpid" 2>/dev/null
+  rc=$?
+  kill "$watchpid" 2>/dev/null
+  wait "$watchpid" 2>/dev/null
+  LAST_OUT=$(cat "$OUT" 2>/dev/null)
+  return $rc
+}
+
+# emit STATUS NAME DETAIL — one aligned line per check.
+emit() {
+  printf '%-5s %-16s %s\n' "$1" "$2" "$3"
+  case "$1" in
+    ok)   OK_N=$((OK_N+1)) ;;
+    WARN) WARN_N=$((WARN_N+1)) ;;
+    FAIL) FAIL_N=$((FAIL_N+1))
+          if [ "$VERBOSE" = "1" ] && [ -n "$LAST_OUT" ]; then
+            printf '%s\n' "$LAST_OUT" | sed 's/^/      | /'
+          fi ;;
+  esac
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# gh_guard NAME [needrepo] — emit a "skipped" WARN and return 1 when the
+# GitHub preconditions for a check aren't met. Keeps the four GitHub-dependent
+# checks from each repeating the same ladder.
+gh_guard() {
+  if [ -z "$FLEET_REPO" ]; then
+    emit WARN "$1" "skipped — FLEET_REPO unset"; return 1
+  elif [ "$GH_OK" = "0" ]; then
+    emit WARN "$1" "skipped — gh unavailable or unauthenticated"; return 1
+  elif [ "$2" = "needrepo" ] && [ "$REPO_OK" = "0" ]; then
+    emit WARN "$1" "skipped — repo not readable"; return 1
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------- config load
+# Env wins over file, file wins over defaults.
+_env_repo="$FLEET_REPO"; _env_prefix="$FLEET_PREFIX"
+CONFIG_FILE="$HOME/.config/fleet-kit/config"
+if [ -f "$CONFIG_FILE" ]; then
+  . "$CONFIG_FILE" 2>/dev/null
+fi
+[ -n "$_env_repo" ]   && FLEET_REPO="$_env_repo"
+[ -n "$_env_prefix" ] && FLEET_PREFIX="$_env_prefix"
+[ -z "$FLEET_PREFIX" ] && FLEET_PREFIX="$(whoami)"
+
+L_ORCH="${FLEET_PREFIX}:orchestrator"
+L_WAIT="${FLEET_PREFIX}:awaiting-user"
+
+# =========================================================== 1. herdr
+if ! have herdr; then
+  emit FAIL herdr "binary not on PATH"
+else
+  hv=""
+  run_to 5 herdr --version && hv=$(printf '%s' "$LAST_OUT" | head -1 | awk '{print $NF}')
+  [ -n "$hv" ] || hv="unknown version"
+  sock="${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}"
+  if [ ! -S "$sock" ]; then
+    emit FAIL herdr "$hv, socket missing or not a socket: $sock"
+  else
+    # A real round-trip through the socket, not just a stat. One python pass
+    # validates the JSON, writes the pane ids, and reports the count.
+    npanes=""
+    if run_to 8 herdr pane list; then
+      npanes=$(printf '%s' "$LAST_OUT" | python3 -c '
+import json,sys
+panes=json.load(sys.stdin)["result"]["panes"]
+open(sys.argv[1],"w").write("".join(p.get("pane_id","")+"\n" for p in panes))
+print(len(panes))' "$TMPDIR_FD/panes.txt" 2>/dev/null)
+    fi
+    if [ -n "$npanes" ]; then
+      emit ok herdr "$hv, socket responding, $npanes panes"
+    else
+      emit FAIL herdr "$hv, socket present but 'herdr pane list' failed/unparseable"
+    fi
+  fi
+fi
+
+# =========================================================== 2. agent CLI
+cli_desc=""; cli_found=0
+if have copilot; then
+  cv=""
+  run_to 10 copilot --version && cv=$(printf '%s' "$LAST_OUT" | head -1 \
+    | sed -E 's/[^0-9]*([0-9][0-9.]*).*/\1/; s/\.$//')
+  [ -n "$cv" ] || cv="?"
+  cli_desc="copilot $cv"; cli_found=1
+fi
+if have opencode; then
+  ov=""
+  run_to 10 opencode --version && ov=$(printf '%s' "$LAST_OUT" | head -1 | tr -d '[:space:]')
+  [ -n "$ov" ] || ov="?"
+  if [ -n "$cli_desc" ]; then cli_desc="$cli_desc, opencode $ov"; else cli_desc="opencode $ov"; fi
+  cli_found=1
+fi
+
+if [ "$cli_found" = "0" ]; then
+  emit FAIL agent-cli "neither 'copilot' nor 'opencode' found on PATH — need at least one"
+else
+  # `herdr integration status` is read-only (install/uninstall are the mutators).
+  outdated=""
+  if have herdr && run_to 6 herdr integration status; then
+    outdated=$(printf '%s' "$LAST_OUT" | grep 'outdated' \
+      | sed -E 's/^([^:]+): outdated \(([^)]*)\).*/\1 \2/' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+  fi
+  if [ -n "$outdated" ]; then
+    emit WARN agent-cli "$cli_desc; integration outdated: $outdated"
+  else
+    emit ok agent-cli "$cli_desc"
+  fi
+fi
+
+# =========================================================== 3. gh auth
+GH_OK=0
+if ! have gh; then
+  emit FAIL gh "binary not on PATH"
+else
+  if run_to 10 gh auth status --active; then
+    acct=$(printf '%s' "$LAST_OUT" | sed -n 's/.*Logged in to [^ ]* account \([^ ]*\).*/\1/p' | head -1)
+    [ -n "$acct" ] || acct="unknown account"
+    if printf '%s' "$LAST_OUT" | grep -q "'repo'"; then
+      GH_OK=1; emit ok gh "authenticated as $acct, repo scope present"
+    else
+      GH_OK=1; emit WARN gh "authenticated as $acct, but 'repo' scope absent"
+    fi
+  else
+    emit FAIL gh "not authenticated (gh auth status --active failed)"
+  fi
+fi
+
+# =========================================================== 4. repo access
+REPO_OK=0
+if [ -z "$FLEET_REPO" ]; then
+  emit WARN repo "FLEET_REPO unset — set it (e.g. owner/name) to enable GitHub checks"
+elif [ "$GH_OK" = "0" ]; then
+  emit WARN repo "skipped — gh unavailable or unauthenticated"
+else
+  # Reading .permissions.push reports *our* access; it grants nothing.
+  if run_to 12 gh api "repos/$FLEET_REPO" --jq .permissions.push; then
+    push=$(printf '%s' "$LAST_OUT" | tr -d '[:space:]')
+    if [ "$push" = "true" ]; then
+      REPO_OK=1; emit ok repo "$FLEET_REPO readable, push permission confirmed"
+    else
+      emit FAIL repo "$FLEET_REPO readable but no push permission (push=$push)"
+    fi
+  else
+    emit FAIL repo "cannot read $FLEET_REPO"
+  fi
+fi
+
+# =========================================================== 5. skills
+if ! have copilot; then
+  emit WARN skills "skipped — copilot not installed"
+else
+  if run_to 20 copilot skill list; then
+    # Count the indented entries under "Personal skills:" up to the blank line.
+    nskills=$(printf '%s' "$LAST_OUT" | awk '
+      /^Personal skills:/{f=1;next}
+      f&&/^[ \t]+[^ \t]/{n++;next}
+      f&&!/^[ \t]/{exit}
+      END{print n+0}')
+    [ -n "$nskills" ] || nskills=0
+    if [ "$nskills" -gt 0 ] 2>/dev/null; then
+      emit ok skills "$nskills personal skills discoverable"
+    else
+      emit WARN skills "no personal skills discovered"
+    fi
+  else
+    emit WARN skills "'copilot skill list' failed"
+  fi
+fi
+
+# =========================================================== 6. labels
+if gh_guard labels; then
+  if run_to 12 gh label list --repo "$FLEET_REPO" --limit 300 --json name --jq '.[].name'; then
+    labels_txt="$LAST_OUT"
+    missing=""
+    for want in "$L_ORCH" "$L_WAIT"; do
+      printf '%s\n' "$labels_txt" | grep -Fxq "$want" || missing="$missing $want"
+    done
+    if [ -z "$missing" ]; then
+      emit ok labels "$L_ORCH and $L_WAIT present"
+    else
+      # Print the remedy as TEXT. We do not run it.
+      cmds=""
+      for m in $missing; do
+        cmds="$cmds gh label create '$m' --repo $FLEET_REPO ;"
+      done
+      cmds=$(printf '%s' "$cmds" | sed 's/ ;$//; s/^ //')
+      emit FAIL labels "missing:$missing — create with: $cmds"
+    fi
+  else
+    emit FAIL labels "could not list labels for $FLEET_REPO"
+  fi
+fi
+
+# =========================================================== 7. sub-issues API
+if gh_guard sub-issues needrepo; then
+  probe=""
+  run_to 12 gh issue list --repo "$FLEET_REPO" --state all --limit 1 --json number --jq '.[0].number' \
+    && probe=$(printf '%s' "$LAST_OUT" | tr -d '[:space:]')
+  if [ -z "$probe" ]; then
+    emit WARN sub-issues "no issue available to probe the endpoint"
+  elif run_to 12 gh api "repos/$FLEET_REPO/issues/$probe/sub_issues"; then
+    nsub=$(printf '%s' "$LAST_OUT" | python3 -c \
+      'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null)
+    [ -n "$nsub" ] || nsub="?"
+    emit ok sub-issues "endpoint live (issue #$probe returned $nsub sub-issues)"
+  else
+    emit FAIL sub-issues "sub_issues endpoint errored for $FLEET_REPO (probed issue #$probe)"
+  fi
+fi
+
+# =========================================================== 8. heartbeat
+HB_CONF="$HOME/.local/state/janus-director-heartbeat/config.json"
+HB_LABEL="com.janus.director-heartbeat"
+if [ ! -f "$HB_CONF" ]; then
+  emit ok heartbeat "not installed"
+else
+  hb_herdr=$(python3 -c '
+import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("herdr","") or "")
+except Exception:
+    print("__BADJSON__")' "$HB_CONF" 2>/dev/null)
+  if launchctl list 2>/dev/null | grep -q "$HB_LABEL"; then loaded="LaunchAgent loaded"; else loaded="LaunchAgent NOT loaded"; fi
+  if [ "$hb_herdr" = "__BADJSON__" ]; then
+    LAST_OUT=$(cat "$HB_CONF" 2>/dev/null)
+    emit FAIL heartbeat "config is not valid JSON: $HB_CONF — $loaded"
+  elif [ -z "$hb_herdr" ]; then
+    LAST_OUT=$(cat "$HB_CONF" 2>/dev/null)
+    emit FAIL heartbeat "config has no 'herdr' key — $loaded"
+  elif [ ! -e "$hb_herdr" ]; then
+    LAST_OUT="config herdr path: $hb_herdr"
+    emit FAIL heartbeat "config points at $hb_herdr — does not exist; $loaded but supervising nothing"
+  elif [ ! -x "$hb_herdr" ]; then
+    LAST_OUT="config herdr path: $hb_herdr"
+    emit FAIL heartbeat "config points at $hb_herdr — not executable; $loaded but supervising nothing"
+  elif [ "${loaded}" = "LaunchAgent NOT loaded" ]; then
+    emit WARN heartbeat "$hb_herdr executable, but LaunchAgent not loaded"
+  else
+    emit ok heartbeat "$hb_herdr executable, $loaded"
+  fi
+fi
+
+# =========================================================== 9. charter drift
+# Best effort, WARN-only, never FAIL. Unparseable charters are skipped quietly.
+if [ ! -f "$TMPDIR_FD/panes.txt" ] && [ -n "$FLEET_REPO" ]; then
+  emit WARN charters "skipped — no pane list from herdr"
+elif gh_guard charters needrepo; then
+  if run_to 20 gh issue list --repo "$FLEET_REPO" --label "$L_ORCH" --state open \
+       --limit 100 --json number,title,body; then
+    printf '%s' "$LAST_OUT" >"$TMPDIR_FD/charters.json"
+    # Parse the first ```yaml fence of each body; emit "number<TAB>pane" for
+    # charters whose status is active. Anything malformed is silently dropped.
+    python3 -c '
+import json,re,sys
+try:
+    issues=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for it in issues:
+    try:
+        body=it.get("body") or ""
+        m=re.search(r"```ya?ml\s*\n(.*?)```", body, re.S)
+        if not m: continue
+        kv={}
+        for line in m.group(1).splitlines():
+            if ":" in line and not line.strip().startswith("#"):
+                k,v=line.split(":",1)
+                kv[k.strip()]=v.strip()
+        if kv.get("status","").lower()!="active": continue
+        pane=kv.get("pane","")
+        if not re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane): continue
+        print("%s\t%s" % (it.get("number"), pane))
+    except Exception:
+        continue' "$TMPDIR_FD/charters.json" >"$TMPDIR_FD/active.txt" 2>/dev/null
+
+    total=0; drift=0; drift_desc=""
+    while IFS="$(printf '\t')" read -r num pane; do
+      [ -n "$pane" ] || continue
+      total=$((total+1))
+      if ! grep -Fxq "$pane" "$TMPDIR_FD/panes.txt"; then
+        drift=$((drift+1))
+        drift_desc="$drift_desc #$num->$pane"
+      fi
+    done <"$TMPDIR_FD/active.txt"
+
+    if [ "$total" = "0" ]; then
+      emit WARN charters "no active charters found with label $L_ORCH"
+    elif [ "$drift" = "0" ]; then
+      emit ok charters "$total active charters, all panes live"
+    else
+      emit WARN charters "$drift of $total active charters name a dead pane:$drift_desc"
+    fi
+  else
+    emit WARN charters "could not list issues labelled $L_ORCH"
+  fi
+fi
+
+# ----------------------------------------------------------------- summary
+TOTAL=$((OK_N+WARN_N+FAIL_N))
+echo
+echo "$TOTAL checks: $OK_N ok, $WARN_N warn, $FAIL_N fail"
+[ "$FAIL_N" -gt 0 ] && exit 1
+exit 0
