@@ -349,10 +349,24 @@ and both create a label called `active`, they are looking at each other's work.
 Pick a prefix and use it on everything you create — `ak:active`, `ak:payments`.
 Your prefix is set once at install and everything derives from it.
 
-**Except these three.** `orchestrator`, `awaiting-user` and `fleet` are
-deliberately un-namespaced and are queried by exact name. Do not prefix them, do
-not rename them. Tooling looks for those literal strings and will silently return
-nothing if they change.
+**No exceptions — including `orchestrator` and `awaiting-user`.** It is tempting
+to leave the structural labels un-prefixed since everyone means the same thing by
+them. Do not. Two people sharing a repo with a bare `orchestrator` label means
+each one's tooling sees the other's charters, and the damage is not cosmetic:
+
+- **Charter lists mix.** Your Chief of Staff reports on orchestrators that are
+  not yours and cannot be reached.
+- **The pane join goes wrong silently.** A charter records its agent's address as
+  `w3:p1`. Those addresses are only unique within one machine, so your colleague's
+  `w3:p1` and yours are different agents with the same name. Your tooling will
+  cheerfully match their charter to your pane and report something confident and
+  false.
+- **`awaiting-user` stops meaning anything.** It is the one list you trust. Fill
+  it with decisions belonging to someone else and "nothing needs you" is no longer
+  a sentence you can believe.
+
+Prefix everything. `ak:orchestrator`, `ak:awaiting-user`, `ak:payments`. The
+queries stay one-liners and they return only your fleet.
 
 **Filtering on two labels is an AND, not an OR.** `gh issue list --label a
 --label b` returns issues carrying *both*. Adding a label to widen a search
