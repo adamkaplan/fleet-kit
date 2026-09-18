@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""heartbeat-ack — an agent tells the heartbeat it woke up, and when to come back.
+
+Run this exactly once per wake, before your turn ends. It is the only thing that
+changes a pane's cadence: the daemon proposes nothing and decides nothing about
+how often you want to be woken. An agent that never acks stays on the floor
+cadence forever, which is noisy for it and expensive for everyone.
+
+Python 3.9+, standard library only. This file is also imported as a module by
+`fleet-heartbeat`, which reuses the scheduling primitives below so the two can
+never disagree about where a pane's next wake lands.
+"""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import time
+
+# Cadence policy. Strictly 5 <= X < 60 minutes: below 5 the wakes cost more
+# attention than they save, and at 60 or more an agent has effectively opted out
+# of supervision without anybody deciding that.
+MIN_INTERVAL_MINUTES = 5.0
+MAX_INTERVAL_MINUTES = 60.0      # exclusive upper bound
+CLAMP_CEILING_MINUTES = 59.0     # what a >= 60 proposal becomes
+DEFAULT_INTERVAL_MINUTES = MIN_INTERVAL_MINUTES
+
+# Width of the deterministic per-pane phase offset. Panes hash into this window
+# so thirty orchestrators on the same cadence do not all fire on the same second.
+STAGGER_WINDOW_SECONDS = 300
+
+# State lives at its own named path. Config lives at its own named path, in
+# `fleet-heartbeat`. They happen to share a directory today; neither is derived
+# from the other, so either can move without dragging the other along.
+DEFAULT_STATE_DIR = Path.home() / ".local/state/fleet-heartbeat"
+STATE_BASENAME = "state.json"
+LOCK_BASENAME = "state.lock"
+
+# Bumped only when the on-disk shape changes incompatibly. Unrecognised schemas
+# are refused rather than coerced: silently "migrating" state we do not
+# understand is how you lose a fleet's scheduling and never find out.
+STATE_SCHEMA = 1
+
+
+class StateError(Exception):
+    """The state file exists but is not something we are willing to write to."""
+
+
+def utc(ts=None):
+    ts = time.time() if ts is None else ts
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_write(path, value):
+    """Write JSON to `path` so a reader never sees a half-written file.
+
+    tmp + fsync + rename + fsync of the directory, then read it back and compare.
+    The readback is not paranoia: an ack that reports success but did not land
+    leaves the agent believing its cadence changed while the daemon keeps waking
+    it on the old one, and nothing in either process would notice.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".heartbeat-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, str(path))
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+    persisted = json.loads(path.read_text())
+    if persisted != value:
+        raise StateError("persistence verification failed: %s does not match what was written" % path)
+
+
+def read_state_document(state_dir):
+    """Load the whole state document, or a fresh one. Refuses foreign schemas."""
+    path = Path(state_dir) / STATE_BASENAME
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"schema": STATE_SCHEMA, "service": {}, "panes": {}}
+    except ValueError as err:
+        raise StateError("state file is not valid JSON (%s): %s" % (path, err))
+    if not isinstance(raw, dict) or raw.get("schema") != STATE_SCHEMA:
+        raise StateError(
+            "state file %s has schema %r, expected %r — refusing to write to it"
+            % (path, raw.get("schema") if isinstance(raw, dict) else None, STATE_SCHEMA))
+    raw.setdefault("service", {})
+    raw.setdefault("panes", {})
+    return raw
+
+
+def parse_interval(value):
+    """Accept '45m', '45min', '45 minutes' or bare '45'. Reject anything else.
+
+    Agents type this by hand from a prompt, so the forgiving suffixes are worth
+    having. Units we do not mean — '45s', '2h' — are refused rather than guessed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    match = re.fullmatch(
+        r"([-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))\s*(?:m|min|mins|minute|minutes)?",
+        text, re.IGNORECASE)
+    if not match:
+        raise ValueError("Invalid cadence: %r. Expected e.g. '45m' or '45'" % (value,))
+    return float(match.group(1))
+
+
+def clamp_interval(proposed, current=DEFAULT_INTERVAL_MINUTES):
+    """Return (applied_minutes, was_clamped) for a proposed cadence.
+
+    A proposal of None means "leave my cadence alone", which is a legitimate ack.
+    """
+    if proposed is None:
+        return float(current), False
+    value = parse_interval(proposed)
+    if value < MIN_INTERVAL_MINUTES:
+        return MIN_INTERVAL_MINUTES, True
+    if value >= MAX_INTERVAL_MINUTES:
+        return CLAMP_CEILING_MINUTES, True
+    return value, False
+
+
+def stagger_offset(pane_id):
+    """Stable phase offset in [0, STAGGER_WINDOW_SECONDS) for this pane.
+
+    Derived from the pane id alone, so the daemon and this CLI compute the same
+    answer, and a restart does not reshuffle anybody's slot.
+    """
+    digest = hashlib.sha256(pane_id.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % STAGGER_WINDOW_SECONDS
+
+
+def calculate_next_due(pane_id, now=None, interval_minutes=DEFAULT_INTERVAL_MINUTES):
+    """Next wake, aligned to the pane's own interval grid plus its phase offset."""
+    now = time.time() if now is None else now
+    interval_seconds = int(interval_minutes * 60)
+    slot = (int(now) // interval_seconds) * interval_seconds + stagger_offset(pane_id)
+    if slot <= now:
+        slot += interval_seconds
+    return float(slot)
+
+
+def new_pane_state():
+    return {
+        "interval_minutes": DEFAULT_INTERVAL_MINUTES,
+        "consecutive_idle_acks": 0,
+        "consecutive_errors": 0,
+        "consecutive_defers": 0,
+        "unacked_wakes": 0,
+        "chronic_failure": False,
+        "chronic_reason": None,
+        "next_due": 0.0,
+        "attempts": [],
+    }
+
+
+def record_ack(state_dir, pane_id, is_idle, next_minutes=None, now=None):
+    """Record one ack under the state lock. Returns (applied, clamped, next_due).
+
+    Holding the same lock the daemon uses is what makes an ack arriving mid-tick
+    safe: the daemon re-reads the pane under lock after its I/O, so the cadence
+    set here wins rather than being overwritten by a stale in-flight copy.
+    """
+    now = time.time() if now is None else now
+    state_dir = Path(state_dir)
+    if not state_dir.is_dir():
+        raise FileNotFoundError("state directory does not exist: %s" % state_dir)
+
+    state_file = state_dir / STATE_BASENAME
+    lock_file = state_dir / LOCK_BASENAME
+
+    with lock_file.open("a") as lock:
+        os.chmod(str(lock_file), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            state = read_state_document(state_dir)
+            pane = state["panes"].setdefault(pane_id, new_pane_state())
+
+            applied, clamped = clamp_interval(next_minutes, pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))
+            pane["interval_minutes"] = applied
+
+            if next_minutes is not None:
+                pane["last_proposal"] = {
+                    "raw_minutes": parse_interval(next_minutes),
+                    "applied_minutes": applied,
+                    "clamped": clamped,
+                    "received": utc(now),
+                }
+
+            ack_state = "idle" if is_idle else "active"
+            pane["last_ack"] = {"state": ack_state, "received": utc(now), "next_minutes": applied}
+            pane["consecutive_idle_acks"] = (pane.get("consecutive_idle_acks", 0) + 1) if is_idle else 0
+
+            # An ack proves the pane is alive and listening, so every "it is not
+            # responding" counter resets here and nowhere else.
+            pane["consecutive_defers"] = 0
+            pane["unacked_wakes"] = 0
+            pane["chronic_failure"] = False
+            pane["chronic_reason"] = None
+            pane["next_due"] = calculate_next_due(pane_id, now, applied)
+
+            atomic_write(state_file, state)
+            return applied, clamped, pane["next_due"]
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def build_parser():
+    epilog = """Run exactly one of these before you finish your turn:
+  heartbeat-ack --pane <wN:pN> --idle   --wake-again-in 45m   # nothing to do; next check in 45 min
+  heartbeat-ack --pane <wN:pN> --active --wake-again-in 5m    # work in flight; check back in 5 min
+
+Cadence policy:
+  Cadence is strictly clamped to 5 <= X < 60 minutes.
+  Accepts a unit suffix (45m) or bare minutes (45).
+  Values < 5m clamp to 5.0m; values >= 60m clamp to 59.0m.
+  Omitting --wake-again-in acks without changing your cadence.
+
+If you never ack:
+  Your cadence stays at 5.0m and cannot adapt to your workload, so you are
+  woken every five minutes indefinitely. After three unacknowledged wakes the
+  daemon says so in the wake itself."""
+
+    parser = argparse.ArgumentParser(
+        prog="heartbeat-ack",
+        description="Acknowledge a heartbeat wake and set when the daemon checks back.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--pane", required=True, metavar="PANE",
+                        help="Your pane identifier, e.g. w2:p2")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--idle", action="store_true",
+                       help="Finished, or waiting on someone else (pair with a long cadence)")
+    group.add_argument("--active", action="store_true",
+                       help="Work is in flight (pair with a short cadence)")
+    parser.add_argument("--wake-again-in", type=parse_interval, default=None, metavar="CADENCE",
+                        help="Minutes until the next wake, e.g. '45m' (clamped to 5 <= X < 60)")
+    # Kept working, kept out of --help: older prompts in the wild still say --next.
+    parser.add_argument("--next", type=parse_interval, default=None, dest="legacy_next",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--state-dir", type=Path, default=None,
+                        help="Override the heartbeat state directory (default: %s)" % DEFAULT_STATE_DIR)
+    return parser
+
+
+def resolve_state_dir(explicit=None):
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    from_env = os.environ.get("FLEET_HEARTBEAT_STATE")
+    if from_env:
+        return Path(from_env).expanduser()
+    return DEFAULT_STATE_DIR
+
+
+def main():
+    args = build_parser().parse_args()
+    state_dir = resolve_state_dir(args.state_dir)
+    proposed = args.wake_again_in if args.wake_again_in is not None else args.legacy_next
+
+    try:
+        applied, clamped, next_due = record_ack(
+            state_dir=state_dir, pane_id=args.pane, is_idle=args.idle, next_minutes=proposed)
+    except Exception as err:
+        sys.stderr.write("Error: %s\n" % err)
+        return 1
+
+    note = " (clamped)" if clamped else ""
+    print("Ack recorded: pane=%s state=%s wake_again_in=%sm next_due=%s%s"
+          % (args.pane, "idle" if args.idle else "active", applied, utc(next_due), note))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""fleet-heartbeat — wakes supervised orchestrator panes on their own schedule.
+
+An orchestrator finishes a turn and then sits there forever unless something
+wakes it. With thirty of them, that something cannot be a person. This daemon
+is that something: it discovers opted-in panes through herdr, waits until each
+one is due, checks that waking it right now is safe, and sends a short prompt.
+
+Three rules shape everything below.
+
+  1. Never interrupt. A pane that is busy, blocked, disconnected, or has a
+     half-typed draft in its composer is left alone and retried later. Losing
+     somebody's unsent input is worse than a late wake.
+  2. The agent owns its cadence. This daemon proposes nothing; `heartbeat-ack`
+     is the only thing that changes when a pane is next woken.
+  3. Never write anything a human reads as truth. This process does not rename
+     tabs and does not touch anything outside its own state directory. Health
+     goes in state.json, where `fleet-doctor` reads it.
+
+Python 3.9+, standard library only.
+"""
+import argparse
+from contextlib import contextmanager
+from datetime import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------- shared code
+# The ack CLI owns the scheduling primitives (clamp, stagger, next-due, atomic
+# write) and this daemon borrows them rather than keeping a second copy. Two
+# copies of a rule is how the original ended up with three drifted versions of
+# its discovery gate. Locating that file also answers a second question — what
+# path the wake prompt should tell an agent to run — from a single lookup.
+
+ACK_BASENAME = "heartbeat-ack"
+
+
+def _load_ack_module():
+    """Import the sibling (or on-PATH) heartbeat-ack as a module. Returns (module, path)."""
+    candidates = [Path(__file__).resolve().parent / ACK_BASENAME]
+    on_path = shutil.which(ACK_BASENAME)
+    if on_path:
+        candidates.append(Path(on_path).resolve())
+    for candidate in candidates:
+        if candidate.is_file():
+            loader = importlib.machinery.SourceFileLoader("fleet_heartbeat_ack", str(candidate))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module, candidate
+    sys.stderr.write(
+        "fleet-heartbeat: cannot find '%s' next to %s or on PATH.\n"
+        "The daemon is useless without it — agents would have nothing to ack with.\n"
+        % (ACK_BASENAME, Path(__file__).resolve().parent))
+    raise SystemExit(2)
+
+
+ack, ACK_PATH = _load_ack_module()
+
+utc = ack.utc
+atomic_write = ack.atomic_write
+stagger_offset = ack.stagger_offset
+calculate_next_due = ack.calculate_next_due
+StateError = ack.StateError
+
+DEFAULT_INTERVAL_MINUTES = ack.DEFAULT_INTERVAL_MINUTES
+
+# ------------------------------------------------------------------ constants
+
+# Config and state each get their own literal path. They share a directory
+# today, but neither is computed from the other: in the original, state lived
+# wherever config happened to be, so moving one silently moved the other.
+DEFAULT_CONFIG_PATH = Path.home() / ".local/state/fleet-heartbeat/config.json"
+DEFAULT_STATE_DIR = ack.DEFAULT_STATE_DIR
+
+LABEL = "com.fleet-kit.heartbeat"
+
+# A tab opts in by carrying this glyph. That is the whole rule — see `discover`.
+BELL = "\U0001f514"
+
+# Everything the config may contain. Unknown keys are a hard error: an operator
+# who edits a key that nothing reads deserves an error, not silence.
+CONFIG_KEYS = ("herdr", "socket")
+
+HERDR_CALL_TIMEOUT = 15          # seconds for a normal herdr subcommand
+HERDR_VERSION_TIMEOUT = 10       # seconds for the startup liveness probe
+HERDR_MAX_OUTPUT = 500_000       # bytes; a larger reply is not a reply we trust
+SCREEN_LINES = 60                # how much of the pane to read for the draft check
+
+BACKOFF_STEPS = (30.0, 60.0, 120.0)
+ATTEMPT_HISTORY = 20
+NON_ACK_ESCALATION_THRESHOLD = 3
+
+# Chronic-failure thresholds. These do not change behaviour — the daemon keeps
+# trying — they change what `fleet-doctor` is able to tell you.
+CHRONIC_CONSECUTIVE_ERRORS = 2
+CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED = 5
+CHRONIC_CONSECUTIVE_DEFERS = 6
+CHRONIC_DROP_MIN_ATTEMPTS = 8
+CHRONIC_DROP_RATE = 0.2          # success rate at or below this counts as dropping
+
+POLL_CEILING_SECONDS = 10.0      # so a bell added to a tab takes effect promptly
+
+EXIT_FAULT = 2                   # service cannot supervise anything; say so and die
+
+# Conditions that mean "not now", not "broken". These defer with backoff.
+TRANSIENT_STATUSES = {
+    "busy_or_blocked_or_unknown",
+    "draft_or_unknown",
+    "cli_timeout",
+}
+# Conditions that mean something is actually wrong with the binding.
+STRUCTURAL_STATUSES = {
+    "socket_unavailable",
+    "cli_error",
+    "cli_unavailable",
+    "process_count_invalid",
+    "process_not_opencode",
+    "wrong_agent_kind",
+    "inspection_error",
+    "unavailable",
+}
+# Of those, the ones that could mean herdr itself has gone. Seeing one of these
+# re-runs the startup verification, which is what turns "retried forever, in
+# silence" into "the service is down and says why".
+HERDR_SUSPECT_STATUSES = {"cli_error", "cli_unavailable"}
+
+
+class Unavailable(Exception):
+    """A herdr call could not be completed. The string is the status code."""
+
+
+class ConfigError(Exception):
+    """The config is missing, malformed, or asks for something we will not do."""
+
+
+# ------------------------------------------------------------------ the config
+
+def load_config(config_path):
+    """Read and fully validate config.json. Raises ConfigError with a usable message."""
+    try:
+        raw = json.loads(Path(config_path).read_text())
+    except FileNotFoundError:
+        raise ConfigError("config not found: %s (run 'fleet-heartbeat init')" % config_path)
+    except ValueError as err:
+        raise ConfigError("config is not valid JSON (%s): %s" % (config_path, err))
+    if not isinstance(raw, dict):
+        raise ConfigError("config must be a JSON object: %s" % config_path)
+
+    missing = [key for key in CONFIG_KEYS if key not in raw]
+    if missing:
+        raise ConfigError("config %s is missing required key(s): %s" % (config_path, ", ".join(missing)))
+    unknown = sorted(set(raw) - set(CONFIG_KEYS))
+    if unknown:
+        raise ConfigError(
+            "config %s contains key(s) this service does not read: %s. "
+            "Remove them — a setting that is silently ignored is worse than a missing one."
+            % (config_path, ", ".join(unknown)))
+    for key in CONFIG_KEYS:
+        value = raw[key]
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ConfigError("config key %r must be an absolute path, got %r" % (key, value))
+    return {key: raw[key] for key in CONFIG_KEYS}
+
+
+def default_herdr_path():
+    """Best guess at where herdr lives, as an absolute path, or None.
+
+    herdr exports HERDR_BIN_PATH into the panes it runs, so inside a pane that
+    is the most accurate answer available. PATH is the fallback. Whichever wins,
+    the caller writes the resolved absolute path into config — `fleet-doctor`
+    checks that path is executable, and it cannot check a bare name.
+
+    Deliberately NOT os.path.realpath'd. A package manager's `bin` entry is
+    usually a symlink into a versioned directory, and following it pins the
+    config to a version that the next upgrade deletes — which is precisely the
+    silent-death failure this whole service now guards against.
+    """
+    from_env = os.environ.get("HERDR_BIN_PATH")
+    if from_env and Path(from_env).is_absolute():
+        return from_env
+    found = shutil.which("herdr")
+    return os.path.abspath(found) if found else None
+
+
+def default_socket_path():
+    from_env = os.environ.get("HERDR_SOCKET_PATH")
+    if from_env and Path(from_env).is_absolute():
+        return from_env
+    return str(Path.home() / ".config/herdr/herdr.sock")
+
+
+def verify_herdr(herdr_path, runner=subprocess.run):
+    """Prove the configured herdr can actually be run. Returns None, or (code, message).
+
+    This is the single most important check in the service. Without it a config
+    pointing at a herdr that was moved, deleted, or replaced by an unrunnable
+    file produces a daemon that starts cleanly, logs cheerfully, retries every
+    pane forever, and wakes nobody — supervision ends while every surface still
+    looks healthy. Checking "is it an absolute path" proves nothing at all.
+    """
+    path = Path(herdr_path)
+    if not path.is_absolute():
+        return ("herdr_not_absolute", "configured herdr path is not absolute: %s" % herdr_path)
+    if not path.exists():
+        return ("herdr_missing", "configured herdr does not exist: %s" % herdr_path)
+    if not path.is_file():
+        return ("herdr_not_file", "configured herdr is not a regular file: %s" % herdr_path)
+    if not os.access(str(path), os.X_OK):
+        return ("herdr_not_executable", "configured herdr is not executable: %s" % herdr_path)
+    try:
+        result = runner([str(path), "--version"], capture_output=True, text=True,
+                        timeout=HERDR_VERSION_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return ("herdr_version_timeout",
+                "%s did not answer --version within %ds" % (herdr_path, HERDR_VERSION_TIMEOUT))
+    except OSError as err:
+        return ("herdr_version_error", "%s could not be executed: %s" % (herdr_path, err))
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return ("herdr_version_failed",
+                "%s exited %d from --version%s"
+                % (herdr_path, result.returncode, (": " + detail[0]) if detail else ""))
+    if not (result.stdout or "").strip():
+        return ("herdr_version_empty",
+                "%s --version printed nothing; this is not a herdr binary" % herdr_path)
+    return None
+
+
+# ------------------------------------------------------------------- the state
+
+@contextmanager
+def state_lock(state_dir):
+    lock_file = Path(state_dir) / ack.LOCK_BASENAME
+    with lock_file.open("a") as lock:
+        os.chmod(str(lock_file), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def singleton(state_dir):
+    """One daemon per state directory. Two would race each other into a pane."""
+    lock_file = Path(state_dir) / "daemon.lock"
+    with lock_file.open("a") as lock:
+        os.chmod(str(lock_file), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Unavailable("singleton_busy") from None
+        yield
+
+
+def read_state(state_dir):
+    state = ack.read_state_document(state_dir)
+    for pane in state["panes"].values():
+        for key, value in ack.new_pane_state().items():
+            pane.setdefault(key, value)
+    return state
+
+
+def write_state(state_dir, state):
+    """Atomic write plus readback verification. Caller must hold the state lock."""
+    atomic_write(Path(state_dir) / ack.STATE_BASENAME, state)
+
+
+def paused(state_dir):
+    return (Path(state_dir) / "paused").exists()
+
+
+def record_service(state_dir, **fields):
+    """Merge fields into the service block. Used for fault, heartbeat-of-the-daemon, pid."""
+    with state_lock(state_dir):
+        state = read_state(state_dir)
+        state["service"].update(fields)
+        state["service"]["updated"] = utc()
+        write_state(state_dir, state)
+
+
+def record_fault(state_dir, code, message):
+    """Park a service-level fault where fleet-doctor and `status` will find it."""
+    try:
+        record_service(state_dir, fault=code, fault_message=message, fault_since=utc())
+    except Exception as err:
+        # Never let the fault reporter hide the fault.
+        sys.stderr.write("fleet-heartbeat: could not record fault in state: %s\n" % err)
+
+
+def ensure_private(state_dir):
+    """State holds prompt text and pane addresses; it is nobody else's business."""
+    try:
+        info = Path(state_dir).stat()
+    except FileNotFoundError:
+        raise ConfigError("state directory does not exist: %s (run 'fleet-heartbeat init')" % state_dir)
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ConfigError("state directory must be private (mode 0700, owned by you): %s" % state_dir)
+
+
+# ------------------------------------------------------------------ the prompt
+
+def ack_command():
+    """What the wake prompt should tell an agent to run.
+
+    Derived, never hardcoded. The original baked one literal install path into
+    every prompt, so an install anywhere else told every agent in the fleet to
+    run a command that did not exist on their machine.
+    """
+    if shutil.which(ACK_BASENAME):
+        return ACK_BASENAME
+    return str(ACK_PATH)
+
+
+def format_ago(seconds):
+    seconds = int(seconds)
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return "%ds ago" % seconds
+    if seconds < 3600:
+        return "%dm ago" % (seconds // 60)
+    return "%dh ago" % (seconds // 3600)
+
+
+def last_accepted_ts(pane_state):
+    stamp = pane_state.get("last_accepted")
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return None
+
+
+def build_wake_message(pane_id, now, pane_state, interval_m, command=None):
+    """One wake. Missed occurrences are coalesced into it, never stacked."""
+    command = command or ack_command()
+    interval_s = interval_m * 60.0
+
+    # If we are well past due, say so. An agent that reappears after an outage
+    # should know it is looking at a backlog, not at the last five minutes.
+    overdue = ""
+    accepted_ts = last_accepted_ts(pane_state)
+    if accepted_ts is not None:
+        elapsed = max(0.0, now - accepted_ts)
+        if elapsed > interval_s * 1.5:
+            missed = max(1, int(round((elapsed - interval_s) / interval_s)))
+            overdue = " (overdue: %d %s missed, last wake %s)" % (
+                missed, "occurrence" if missed == 1 else "occurrences", format_ago(elapsed))
+
+    cadence = "%dm" % interval_m if float(interval_m).is_integer() else "%.1fm" % interval_m
+    unacked = int(pane_state.get("unacked_wakes", 0))
+    escalation = ""
+    if unacked >= NON_ACK_ESCALATION_THRESHOLD:
+        never = not pane_state.get("last_ack")
+        escalation = "\n%s; your cadence is stuck at %s and cannot adapt until you ack." % (
+            ("You have NEVER acked (%d wakes unacknowledged)" % unacked) if never
+            else ("You have not acked the last %d wakes" % unacked), cadence)
+
+    return (
+        "Heartbeat %s%s. Check your workers and the open sub-issues on your charter. "
+        "Look for rabbit holes, repeated investigation, scope that nobody approved, and "
+        "review loops that have stopped moving. Do the minimum that advances the approved "
+        "goal: unblock or redirect stalled work, close finished gates, leave productive "
+        "work alone, and do not invent new blockers. Report only meaningful change, with "
+        "evidence."
+        "%s\n"
+        "REQUIRED before you finish this turn - run exactly one:\n"
+        "  %s --pane %s --idle   --wake-again-in 45m   # nothing to do; next check in 45 min\n"
+        "  %s --pane %s --active --wake-again-in 5m    # work in flight; check back in 5 min"
+        % (utc(now), overdue, escalation, command, pane_id, command, pane_id)
+    )
+
+
+# -------------------------------------------------------------------- the gate
+
+def empty_composer(screen):
+    """True only for a fully visible, empty, closed OpenCode input box.
+
+    This is the draft guard, and it is deliberately the strictest thing here.
+    Anything it cannot positively recognise as an empty composer — a clipped
+    box, an expanded one, control characters, a prompt we do not know — reads as
+    "maybe there is a draft", and the wake is deferred. False negatives cost a
+    few minutes; a false positive destroys typed input that was never sent.
+    """
+    if any(ord(char) < 32 and char != "\n" for char in screen):
+        return False
+    lines = screen.splitlines()
+    ends = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*\u2579\u2580+", line)]
+    if not ends:
+        return False
+    end = ends[-1]
+    width = len(lines[end])
+    if end < 4 or width < 20:
+        return False
+    # The row above the bottom border is the status line: "role [auto] · model".
+    if not re.fullmatch(r"\s*\u2503\s+[A-Za-z0-9_-]+(?:\s+auto)?\s+\u00b7\s+.+", lines[end - 1][:width]):
+        return False
+    start = end - 2
+    while start >= 0 and re.match(r"\s*\u2503", lines[start][:width]):
+        start -= 1
+    # An empty composer is exactly three bordered rows. More or fewer means the
+    # box is expanded, clipped, or holding a draft above blank lines.
+    if start < 0 or end - start - 2 != 3:
+        return False
+    return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
+
+
+# ------------------------------------------------------------------ the transport
+
+class Herdr:
+    def __init__(self, config, runner=subprocess.run):
+        self.config = config
+        self.runner = runner
+
+    def call(self, *args, text=False):
+        route = Path(self.config["socket"])
+        try:
+            info = route.stat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                raise Unavailable("socket_unavailable")
+            result = self.runner(
+                [self.config["herdr"], *args], capture_output=True, text=True,
+                timeout=HERDR_CALL_TIMEOUT,
+                env={**os.environ, "HERDR_ENV": "1", "HERDR_SOCKET_PATH": str(route)})
+            if result.returncode or len(result.stdout) > HERDR_MAX_OUTPUT:
+                raise Unavailable("cli_error")
+            return result.stdout if text else json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            raise Unavailable("cli_timeout") from None
+        except (OSError, ValueError):
+            raise Unavailable("cli_unavailable") from None
+
+    def tabs_with_agents(self):
+        """Every tab that currently hosts an agent, supervised or not."""
+        tabs = self.call("tab", "list").get("result", {}).get("tabs", [])
+        agents = self.call("agent", "list").get("result", {}).get("agents", [])
+        by_tab = {a.get("tab_id"): a for a in agents if a.get("tab_id")}
+
+        found = []
+        for tab in tabs:
+            agent = by_tab.get(tab.get("tab_id"))
+            if not agent:
+                continue
+            label = tab.get("label", "")
+            found.append({
+                "workspace_id": tab.get("workspace_id"),
+                "tab_id": tab.get("tab_id"),
+                "pane_id": agent.get("pane_id"),
+                "label": label,
+                "supervised": BELL in label,
+            })
+        return found
+
+    def discover(self):
+        """Supervised panes. The bell in the tab label is the only rule.
+
+        The original also required a particular word in the label. That gate was
+        undocumented, so renaming a tab silently ended its supervision, and the
+        same regex existed in three places across two repos and had already
+        drifted. One visible rule, in one place, that a person can read straight
+        off the tab bar.
+        """
+        return [t for t in self.tabs_with_agents() if t["supervised"]]
+
+    def inspect_pane(self, pane_id):
+        """Is it safe to send right now? Returns (status, observed telemetry).
+
+        Four layers, cheapest first. `observed` is recorded for humans reading
+        state later; it is never a gate, because pinning a pid means a restarted
+        agent is locked out of supervision until someone notices.
+        """
+        agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
+        if agent.get("agent") != "opencode":
+            return "wrong_agent_kind", {}
+        if agent.get("agent_status") not in {"idle", "done"}:
+            return "busy_or_blocked_or_unknown", {}
+
+        info = self.call("pane", "process-info", "--pane", pane_id).get("result", {}).get("process_info", {})
+        processes = info.get("foreground_processes", [])
+        if len(processes) != 1:
+            return "process_count_invalid", {}
+        process = processes[0]
+        if process.get("name") != "opencode" and process.get("argv0") != "opencode":
+            return "process_not_opencode", {}
+
+        observed = {
+            "pid": process.get("pid"),
+            "terminal_id": agent.get("terminal_id"),
+            "cwd": agent.get("cwd"),
+        }
+        screen = self.call("agent", "read", pane_id, "--source", "detection",
+                           "--lines", str(SCREEN_LINES), text=True)
+        return ("ready" if empty_composer(screen) else "draft_or_unknown"), observed
+
+    def send_pane(self, pane_id, message):
+        """Re-check immediately before sending. State can change during our own I/O."""
+        guard, observed = self.inspect_pane(pane_id)
+        if guard != "ready":
+            return guard, observed
+        response = self.call("agent", "prompt", pane_id, message)
+        accepted = response.get("result", {}).get("type") == "agent_prompted"
+        return ("accepted" if accepted else "cli_error"), observed
+
+
+# --------------------------------------------------------------------- health
+
+def compute_pane_health(pane_state, interval_m, now_ts):
+    """Delivery statistics and chronic-failure judgement for one pane.
+
+    Chronic failure used to flip the tab title to a warning glyph. It no longer
+    does: in practice that glyph produced three false alarms and zero true
+    positives, so people learned to ignore the one signal that would have
+    reported a real outage — and it made a tab title into mutable load-bearing
+    state that anyone could edit. The finding is recorded here instead, and
+    `fleet-doctor` is the surface that reports it.
+    """
+    attempts = pane_state.get("attempts", [])
+    total = len(attempts)
+    accepted = sum(1 for a in attempts if a.get("status") == "accepted")
+    success_rate = (accepted / total) if total else 1.0
+
+    errors = pane_state.get("consecutive_errors", 0)
+    defers = pane_state.get("consecutive_defers", 0)
+    accepted_ts = last_accepted_ts(pane_state)
+    since_accepted = (now_ts - accepted_ts) if accepted_ts is not None else None
+
+    reason = None
+    if errors >= CHRONIC_CONSECUTIVE_ERRORS:
+        reason = "consecutive_errors=%d" % errors
+    elif total >= CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED and accepted == 0:
+        reason = "stalled_zero_accepted(%d_attempts)" % total
+    elif defers >= CHRONIC_CONSECUTIVE_DEFERS:
+        reason = "persistent_defers=%d" % defers
+    elif total >= CHRONIC_DROP_MIN_ATTEMPTS and success_rate <= CHRONIC_DROP_RATE:
+        # A high drop rate is only chronic once it has also been a long time
+        # since anything landed; a busy pane can legitimately refuse a run of
+        # wakes and still be perfectly healthy.
+        if since_accepted is not None and since_accepted >= max(3 * interval_m * 60.0, 900.0):
+            reason = "chronic_drop_rate=%.0f%%" % ((1.0 - success_rate) * 100)
+
+    return {
+        "chronic_failure": reason is not None,
+        "chronic_reason": reason,
+        "total_attempts": total,
+        "accepted_attempts": accepted,
+        "success_rate": success_rate,
+        "consecutive_errors": errors,
+        "consecutive_defers": defers,
+        "last_accepted_ts": accepted_ts,
+    }
+
+
+def backoff_delay(consecutive_defers, interval_minutes):
+    """30s, 60s, then 120s, never longer than the pane's own interval."""
+    step = max(0, min(consecutive_defers - 1, len(BACKOFF_STEPS) - 1))
+    return min(BACKOFF_STEPS[step], interval_minutes * 60.0)
+
+
+# ----------------------------------------------------------------- the tick
+
+def new_pane(target):
+    pane = ack.new_pane_state()
+    pane["tab_id"] = target.get("tab_id")
+    pane["workspace_id"] = target.get("workspace_id")
+    return pane
+
+
+def tick_pane(state_dir, transport, target, now=None):
+    """One scheduling slot for one pane. Returns the resulting status string."""
+    now = time.time() if now is None else now
+    pane_id = target["pane_id"]
+
+    with state_lock(state_dir):
+        state = read_state(state_dir)
+        pane_state = state["panes"].setdefault(pane_id, new_pane(target))
+        if paused(state_dir):
+            return "paused"
+        if now < pane_state.get("next_due", 0):
+            return "not_due"
+
+        interval_m = float(pane_state.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))
+
+        # Claim the next slot *before* doing any I/O. If we crash, time out, or
+        # are killed mid-send, the slot is already spent and nothing replays it
+        # into the pane the instant we come back.
+        attempt = {"due": utc(now), "status": "attempting"}
+        pane_state["last_due"] = now
+        pane_state["next_due"] = calculate_next_due(pane_id, now, interval_m)
+        pane_state["attempts"] = (pane_state.get("attempts", []) + [attempt])[-ATTEMPT_HISTORY:]
+        write_state(state_dir, state)
+
+    observed = {}
+    delivered = None
+    try:
+        status, observed = transport.inspect_pane(pane_id)
+        if status == "ready":
+            message = build_wake_message(pane_id, now, pane_state, interval_m)
+            # Re-check the pause sentinel: inspection takes real time, and a
+            # human reaching for the brake expects it to work immediately.
+            if paused(state_dir):
+                status = "paused"
+            else:
+                status, send_observed = transport.send_pane(pane_id, message)
+                observed.update(send_observed or {})
+                if status == "accepted":
+                    delivered = message
+    except Unavailable as err:
+        code = str(err)
+        status = code if code in (TRANSIENT_STATUSES | STRUCTURAL_STATUSES) else "unavailable"
+    except Exception:
+        logging.exception("pane %s inspection failed", pane_id)
+        status = "inspection_error"
+
+    attempt.update(status=status, finished=utc(time.time()))
+    if status == "accepted":
+        attempt["accepted"] = utc(time.time())
+    if observed.get("pid"):
+        attempt["observed_pid"] = observed["pid"]
+
+    with state_lock(state_dir):
+        # Re-read under the lock: an ack may have landed while we were in I/O,
+        # and the agent's own cadence beats the copy we started the tick with.
+        state = read_state(state_dir)
+        pane = state["panes"].setdefault(pane_id, pane_state)
+        pane["attempts"] = (pane.get("attempts", [])[:-1] + [attempt])[-ATTEMPT_HISTORY:]
+        pane["last_due"] = now
+        interval_m = float(pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))
+        if observed:
+            pane["last_observed"] = observed
+
+        if status == "accepted":
+            pane["consecutive_defers"] = 0
+            pane["consecutive_errors"] = 0
+            pane["last_accepted"] = utc(now)
+            pane["unacked_wakes"] = int(pane.get("unacked_wakes", 0)) + 1
+            if delivered:
+                pane["last_message"] = {"timestamp": utc(now), "text": delivered}
+            if pane.get("next_due", 0) <= now:
+                pane["next_due"] = calculate_next_due(pane_id, now, interval_m)
+        elif status in TRANSIENT_STATUSES:
+            # Not a failure: the pane was busy or mid-draft. Retry soon, backing
+            # off, rather than dropping the occurrence until the next cycle.
+            pane["consecutive_defers"] = pane.get("consecutive_defers", 0) + 1
+            delay = backoff_delay(pane["consecutive_defers"], interval_m)
+            pane["next_due"] = now + delay
+            logging.info("pane %s deferred (%s, try %d): retrying in %ds",
+                         pane_id, status, pane["consecutive_defers"], int(delay))
+        else:
+            pane["consecutive_defers"] = 0
+            if pane.get("next_due", 0) <= now:
+                pane["next_due"] = calculate_next_due(pane_id, now, interval_m)
+
+        if status in STRUCTURAL_STATUSES:
+            pane["consecutive_errors"] = pane.get("consecutive_errors", 0) + 1
+
+        health = compute_pane_health(pane, interval_m, now)
+        pane["chronic_failure"] = health["chronic_failure"]
+        pane["chronic_reason"] = health["chronic_reason"]
+        if health["chronic_failure"]:
+            logging.warning("pane %s chronic failure: %s", pane_id, health["chronic_reason"])
+
+        write_state(state_dir, state)
+
+    logging.info("pane=%s status=%s interval=%.1fm defers=%d next_due=%s",
+                 pane_id, status, interval_m, pane.get("consecutive_defers", 0),
+                 utc(pane["next_due"]))
+    return status
+
+
+# ------------------------------------------------------------------- the loop
+
+def run(state_dir, config_path):
+    """The daemon. Returns only by raising SystemExit on an unrecoverable fault."""
+    with singleton(state_dir):
+        try:
+            config = load_config(config_path)
+        except ConfigError as err:
+            record_fault(state_dir, "config_invalid", str(err))
+            sys.stderr.write("fleet-heartbeat: %s\n" % err)
+            raise SystemExit(EXIT_FAULT)
+
+        fault = verify_herdr(config["herdr"])
+        if fault:
+            record_fault(state_dir, fault[0], fault[1])
+            sys.stderr.write(
+                "fleet-heartbeat: %s\n"
+                "Refusing to start. A running daemon that cannot reach herdr supervises "
+                "nothing while looking healthy, which is the failure this check exists to "
+                "prevent. Fix the 'herdr' path in %s, then restart.\n" % (fault[1], config_path))
+            raise SystemExit(EXIT_FAULT)
+
+        record_service(state_dir, fault=None, fault_message=None, fault_since=None,
+                       pid=os.getpid(), started=utc(), herdr=config["herdr"],
+                       ack_command=ack_command(), label=LABEL)
+        logging.info("started pid=%s herdr=%s", os.getpid(), config["herdr"])
+
+        while True:
+            _loop_once(state_dir, config_path, config)
+            _sleep_until_next(state_dir)
+
+
+def _loop_once(state_dir, config_path, config):
+    """One pass: reload config, discover, tick whatever is due, watch for faults."""
+    try:
+        config.update(load_config(config_path))
+    except ConfigError as err:
+        # An operator mid-edit should not take the fleet down, but they should
+        # not get silence either. Keep running on the last good config, loudly.
+        logging.error("config reload failed, continuing on previous config: %s", err)
+
+    transport = Herdr(config)
+    if paused(state_dir):
+        return
+
+    now = time.time()
+    suspect = False
+    try:
+        targets = transport.discover()
+    except Unavailable as err:
+        logging.error("discovery failed: %s", err)
+        record_service(state_dir, last_error="discover:%s" % err)
+        targets = []
+        suspect = str(err) in HERDR_SUSPECT_STATUSES
+
+    for target in targets:
+        pane_id = target["pane_id"]
+        with state_lock(state_dir):
+            state = read_state(state_dir)
+            pane = state["panes"].setdefault(pane_id, new_pane(target))
+            if not pane.get("next_due"):
+                pane["next_due"] = calculate_next_due(pane_id, now, pane["interval_minutes"])
+                write_state(state_dir, state)
+            due = now >= pane["next_due"]
+        if due and tick_pane(state_dir, transport, target, now) in HERDR_SUSPECT_STATUSES:
+            suspect = True
+
+    if suspect:
+        # herdr answered badly. Re-run the startup check: if the binary itself
+        # is gone or unrunnable this is a service outage, not a per-pane blip,
+        # and pretending otherwise is how the original died quietly.
+        fault = verify_herdr(config["herdr"])
+        if fault:
+            record_fault(state_dir, fault[0], fault[1])
+            sys.stderr.write("fleet-heartbeat: %s\nExiting — cannot supervise without herdr.\n" % fault[1])
+            logging.error("service fault: %s", fault[1])
+            raise SystemExit(EXIT_FAULT)
+
+
+def _sleep_until_next(state_dir):
+    """Sleep to the next due pane, capped so a newly belled tab is picked up fast."""
+    now = time.time()
+    with state_lock(state_dir):
+        state = read_state(state_dir)
+        upcoming = [p["next_due"] for p in state["panes"].values()
+                    if isinstance(p.get("next_due"), (int, float)) and p["next_due"] > now]
+    target = min(upcoming) if upcoming else now + POLL_CEILING_SECONDS
+    time.sleep(max(1.0, min(POLL_CEILING_SECONDS, target - now)))
+
+
+# ------------------------------------------------------------------- reporting
+
+def format_ago_iso(stamp, now_ts):
+    if not stamp:
+        return "never"
+    try:
+        delta = now_ts - datetime.fromisoformat(stamp).timestamp()
+    except (TypeError, ValueError):
+        return str(stamp)
+    return "in future" if delta < 0 else format_ago(delta)
+
+
+def daemon_liveness(service):
+    """One honest line about the daemon itself.
+
+    "ok" printed from a state file that no daemon has ever written is exactly
+    the kind of reassuring-but-false surface this port exists to remove, so an
+    unstarted or dead service says so.
+    """
+    if service.get("fault"):
+        return "FAULT", "%s — %s" % (service["fault"], service.get("fault_message", ""))
+    pid = service.get("pid")
+    if not pid:
+        return "unknown", "no daemon has ever run against this state directory"
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return "stopped", "last ran as pid %s, started %s; that process is gone" % (
+            pid, service.get("started", "?"))
+    except (PermissionError, ValueError, TypeError):
+        pass
+    return "running", "pid %s, started %s, herdr %s" % (
+        pid, service.get("started", "?"), service.get("herdr", "?"))
+
+
+def format_status(state, live_pane_ids, now_ts, notes=()):
+    service = state.get("service", {})
+    lines = ["FLEET HEARTBEAT  (cadence 5-59m, opt in by putting %s in a tab label)" % BELL, "=" * 96]
+    verdict, detail = daemon_liveness(service)
+    if verdict == "FAULT":
+        lines.append("SERVICE FAULT  %s" % detail)
+        lines.append("  since %s. Nothing is being supervised." % service.get("fault_since", "?"))
+    else:
+        lines.append("service        %s  (%s)" % (verdict, detail))
+    for note in notes:
+        lines.append("note           %s" % note)
+    lines.append("-" * 96)
+    lines.append("%-9s %-8s %-6s %-9s %-16s %-26s %s" %
+                 ("PANE", "TAB", "LIVE", "CADENCE", "DELIVERY", "NEXT DUE", "LAST ACK"))
+
+    panes = state.get("panes", {})
+    if not panes:
+        lines.append("(no panes tracked yet)")
+    for pane_id in sorted(panes):
+        pane = panes[pane_id]
+        interval_m = pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES)
+        health = compute_pane_health(pane, interval_m, now_ts)
+
+        total, accepted = health["total_attempts"], health["accepted_attempts"]
+        if not total:
+            delivery = "no attempts"
+        elif not accepted:
+            delivery = "0/%d STALLED" % total
+        elif health["consecutive_defers"]:
+            delivery = "%d/%d def %d" % (accepted, total, health["consecutive_defers"])
+        else:
+            delivery = "%d/%d (%.0f%%)" % (accepted, total, health["success_rate"] * 100)
+
+        last_ack = pane.get("last_ack") or {}
+        ack_str = ("%s %s" % (last_ack.get("state", "?"), format_ago_iso(last_ack.get("received"), now_ts))
+                   if last_ack else "never")
+
+        lines.append("%-9s %-8s %-6s %-9s %-16s %-26s %s" % (
+            pane_id, pane.get("tab_id") or "-",
+            "yes" if pane_id in live_pane_ids else "no",
+            "%.1fm" % interval_m, delivery,
+            utc(pane["next_due"]) if pane.get("next_due") else "not scheduled",
+            ack_str))
+        if pane.get("chronic_failure"):
+            lines.append("  ^ chronic failure: %s" % pane.get("chronic_reason"))
+
+    lines.append("=" * 96)
+    return "\n".join(lines)
+
+
+# -------------------------------------------------------------------- the CLI
+
+def render_plist():
+    """Fill the LaunchAgent template's placeholders from this environment.
+
+    Prints only. Installing is `> ~/Library/LaunchAgents/...` plus a bootstrap,
+    and that is deliberately the operator's keystroke, not ours.
+    """
+    prefix = Path(__file__).resolve().parent.parent
+    template = prefix / "templates" / (LABEL + ".plist")
+    if not template.is_file():
+        raise ConfigError("plist template not found: %s" % template)
+    return (template.read_text()
+            .replace("__PYTHON__", sys.executable)
+            .replace("__HOME__", str(Path.home()))
+            .replace("__PREFIX__", str(prefix)))
+
+
+def cmd_init(args):
+    state_dir = ack.resolve_state_dir(args.state_dir)
+    config_path = Path(args.config)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(state_dir), 0o700)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    herdr_path = args.herdr or default_herdr_path()
+    if not herdr_path:
+        sys.stderr.write("fleet-heartbeat: cannot find herdr. Pass --herdr /absolute/path.\n")
+        return EXIT_FAULT
+    fault = verify_herdr(herdr_path)
+    if fault:
+        sys.stderr.write("fleet-heartbeat: %s\nNot writing a config that points at a herdr "
+                         "this service cannot run.\n" % fault[1])
+        return EXIT_FAULT
+
+    if config_path.exists() and not args.force:
+        sys.stderr.write("fleet-heartbeat: %s already exists (use --force to overwrite)\n" % config_path)
+        return 1
+
+    # Absolute but not realpath'd: see default_herdr_path.
+    config = {"herdr": os.path.abspath(herdr_path), "socket": args.socket or default_socket_path()}
+    atomic_write(config_path, config)
+    print("Wrote %s" % config_path)
+    print(json.dumps(config, indent=2, sort_keys=True))
+    print("State directory: %s" % state_dir)
+    return 0
+
+
+def cmd_status(args):
+    state_dir = ack.resolve_state_dir(args.state_dir)
+    notes = []
+    try:
+        state = read_state(state_dir)
+    except StateError as err:
+        sys.stderr.write("fleet-heartbeat: %s\n" % err)
+        return EXIT_FAULT
+
+    live = set()
+    try:
+        config = load_config(args.config)
+        fault = verify_herdr(config["herdr"])
+        if fault:
+            notes.append("herdr unusable: %s" % fault[1])
+        else:
+            try:
+                live = {t["pane_id"] for t in Herdr(config).discover()}
+            except Unavailable as err:
+                notes.append("live discovery unavailable (%s); showing recorded state only" % err)
+    except ConfigError as err:
+        notes.append(str(err))
+
+    now_ts = time.time()
+    if paused(state_dir):
+        notes.append("PAUSED — %s exists, no wakes will be sent" % (state_dir / "paused"))
+
+    if args.json:
+        print(json.dumps({
+            "paused": paused(state_dir),
+            "state_dir": str(state_dir),
+            "config": str(args.config),
+            "notes": notes,
+            "service": state.get("service", {}),
+            "panes": state.get("panes", {}),
+            "live_panes": sorted(live),
+            "health": {pid: compute_pane_health(p, p.get("interval_minutes", DEFAULT_INTERVAL_MINUTES), now_ts)
+                       for pid, p in state.get("panes", {}).items()},
+        }, indent=2, sort_keys=True))
+    else:
+        print(format_status(state, live, now_ts, notes))
+    return EXIT_FAULT if state.get("service", {}).get("fault") else 0
+
+
+def cmd_list(args):
+    try:
+        config = load_config(args.config)
+    except ConfigError as err:
+        sys.stderr.write("fleet-heartbeat: %s\n" % err)
+        return EXIT_FAULT
+    fault = verify_herdr(config["herdr"])
+    if fault:
+        sys.stderr.write("fleet-heartbeat: %s\n" % fault[1])
+        return EXIT_FAULT
+    try:
+        targets = Herdr(config).tabs_with_agents()
+    except Unavailable as err:
+        sys.stderr.write("fleet-heartbeat: herdr unavailable (%s)\n" % err)
+        return EXIT_FAULT
+
+    state = read_state(ack.resolve_state_dir(args.state_dir))
+    print("%-10s %-8s %-9s %-11s %-9s %-8s %s" %
+          ("WORKSPACE", "TAB", "PANE", "SUPERVISED", "CADENCE", "STAGGER", "LABEL"))
+    print("-" * 96)
+    for target in targets:
+        pane = state.get("panes", {}).get(target["pane_id"], {})
+        print("%-10s %-8s %-9s %-11s %-9s %-8s %s" % (
+            target["workspace_id"] or "-", target["tab_id"] or "-", target["pane_id"] or "-",
+            "yes" if target["supervised"] else "no (no %s)" % BELL,
+            "%.1fm" % pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES),
+            "%ds" % stagger_offset(target["pane_id"] or ""),
+            target["label"]))
+    return 0
+
+
+def cmd_run(args):
+    state_dir = ack.resolve_state_dir(args.state_dir)
+    try:
+        ensure_private(state_dir)
+    except (ConfigError, OSError) as err:
+        sys.stderr.write("fleet-heartbeat: %s\n" % err)
+        return EXIT_FAULT
+
+    log_path = state_dir / "heartbeat.log"
+    handler = RotatingFileHandler(str(log_path), maxBytes=262_144, backupCount=3)
+    os.chmod(str(log_path), 0o600)
+    logging.basicConfig(level=logging.INFO, handlers=[handler],
+                        format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        run(state_dir, args.config)
+    except Unavailable as err:
+        sys.stderr.write("fleet-heartbeat: another daemon already owns %s (%s)\n" % (state_dir, err))
+        return EXIT_FAULT
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="fleet-heartbeat",
+        description="Wake supervised orchestrator panes on their own adaptive schedule.",
+        epilog="A tab opts in by having %s in its label. There is no enable command:\n"
+               "this daemon never writes tab titles, so what you see in the tab bar is\n"
+               "the truth about what is supervised." % BELL,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=Path,
+                        default=Path(os.environ.get("FLEET_HEARTBEAT_CONF") or DEFAULT_CONFIG_PATH),
+                        help="Path to config.json (default: %s)" % DEFAULT_CONFIG_PATH)
+    parser.add_argument("--state-dir", type=Path, default=None,
+                        help="Path to the state directory (default: %s)" % DEFAULT_STATE_DIR)
+
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("run", help="Run the daemon in the foreground (launchd does this)")
+
+    status = sub.add_parser("status", help="Human-readable service and per-pane health")
+    status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+
+    sub.add_parser("list", help="Tabular view of every tab with an agent, and whether it opts in")
+
+    init = sub.add_parser("init", help="Write config.json with a verified herdr path")
+    init.add_argument("--herdr", default=None, help="Absolute path to herdr (default: $HERDR_BIN_PATH, then PATH)")
+    init.add_argument("--socket", default=None, help="Absolute path to the herdr socket")
+    init.add_argument("--force", action="store_true", help="Overwrite an existing config")
+
+    sub.add_parser("plist", help="Print the LaunchAgent with placeholders filled in (does not install)")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.action == "run":
+        return cmd_run(args)
+    if args.action == "status":
+        return cmd_status(args)
+    if args.action == "list":
+        return cmd_list(args)
+    if args.action == "init":
+        return cmd_init(args)
+    if args.action == "plist":
+        try:
+            sys.stdout.write(render_plist())
+        except ConfigError as err:
+            sys.stderr.write("fleet-heartbeat: %s\n" % err)
+            return 1
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

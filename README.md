@@ -1,5 +1,22 @@
 # Fleet Kit
 
+### tl;dr — let an agent install it
+
+```bash
+copilot -i "Clone https://github.com/dw-aura/fleet-kit.git into ~/Code/fleet-kit, \
+then work through its INSTALL.md start to finish. Run each step's VERIFY command \
+and paste the real output. Do not report success you have not observed. Stop at \
+anything marked HUMAN and hand back to me."
+```
+
+Interactive on purpose. The install has a few steps only you can do — a browser
+login, an OS permission dialog — and an agent running headless cannot hand those
+back to you. Sit with it; it will stop when it needs you.
+
+Then read on, because the rest of this explains what you just installed.
+
+---
+
 Coding agents are cheap and getting cheaper. Your attention is not, and never
 will be. Fleet Kit is how you run thirty agents at once without paying thirty
 times the attention.
@@ -109,12 +126,10 @@ orchestrator on its own adaptive schedule — busy ones often, quiet ones rarely
 Without it, an agent that finishes a thought sits there until a human notices.
 With thirty agents, that human cannot be you.
 
-**The heartbeat is not in this release.** Everything else here works without it,
-but you drive the fleet rather than it driving itself: an orchestrator that
-finishes a thought waits for you to come back to it. That is fine for a handful
-of workspaces and it is the wrong answer for thirty. It is the next thing to
-build, and until it exists this is a fleet you supervise rather than one that
-supervises itself.
+It ships here, as a `launchd` service. It is optional and it is the difference
+between a fleet you supervise and one that supervises itself. An orchestrator
+opts in by having 🔔 in its tab label — one glyph, one rule, and nothing is woken
+until you add it.
 
 ---
 

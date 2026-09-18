@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+"""test-heartbeat — offline tests for fleet-heartbeat and heartbeat-ack.
+
+Runs with no herdr, no network, no launchd, and no access to the real state
+directory: every test gets a fresh temp HOME and temp state dir, and the only
+transport is a fake. Run it before you install anything and after you change
+anything.
+
+    bin/test-heartbeat            # everything
+    bin/test-heartbeat Clamp      # only tests whose name contains "Clamp"
+
+Exits non-zero if anything fails.
+"""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import logging
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+BIN = Path(__file__).resolve().parent
+
+# The code under test logs and writes to stderr on purpose. That is the point of
+# several tests; it is not something the test output needs to repeat.
+logging.disable(logging.CRITICAL)
+
+
+@contextlib.contextmanager
+def quiet_stderr():
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        yield buffer
+
+
+def _load(name, filename):
+    path = BIN / filename
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+hb = _load("t_fleet_heartbeat", "fleet-heartbeat")
+# The daemon locates and loads heartbeat-ack itself; reach through to the same
+# module object rather than loading a second copy, or the two would have
+# distinct exception classes and `except StateError` would silently miss.
+ackmod = hb.ack
+
+BELL = hb.BELL
+
+
+# --------------------------------------------------------------------- fakes
+
+def composer(draft="", sidebar=True, auto=True, role="Orchestrator"):
+    """A rendering of the OpenCode composer box, with or without a typed draft."""
+    width = 100
+    lines = ["", "  \u2503", "  \u2503 " + draft, "  \u2503",
+             "  \u2503  %s%s \u00b7 model" % (role, " auto" if auto else ""),
+             "  \u2579" + "\u2580" * 97, "footer"]
+    if sidebar:
+        lines[1:5] = [line.ljust(width) + "  sidebar data" for line in lines[1:5]]
+    return "\n".join(lines)
+
+
+class FakeHerdr(hb.Herdr):
+    """Stands in for the herdr CLI. Records everything, never touches a socket."""
+
+    def __init__(self, tabs=None, agents=None, status="idle", screen=None,
+                 process_name="opencode", process_count=1, prompt_ok=True, raise_on=None):
+        super().__init__({"herdr": "/dev/null/herdr", "socket": "/dev/null/sock"})
+        self.tabs = tabs if tabs is not None else [
+            {"tab_id": "w2:t2", "workspace_id": "w2", "label": "%s Payments" % BELL},
+            {"tab_id": "w6:t1", "workspace_id": "w6", "label": "Web App"},
+        ]
+        self.agents = agents if agents is not None else [
+            {"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "opencode",
+             "agent_status": status, "terminal_id": "term1"},
+            {"pane_id": "w6:p1", "tab_id": "w6:t1", "agent": "opencode",
+             "agent_status": "idle", "terminal_id": "term2"},
+        ]
+        self.status = status
+        self.screen = composer() if screen is None else screen
+        self.process_name = process_name
+        self.process_count = process_count
+        self.prompt_ok = prompt_ok
+        self.raise_on = raise_on          # status string to raise for non-listing calls
+        self.sent = []
+        self.calls = []
+
+    def set_agent_status(self, pane_id, status):
+        for agent in self.agents:
+            if agent["pane_id"] == pane_id:
+                agent["agent_status"] = status
+
+    def call(self, *args, text=False):
+        self.calls.append(args)
+        head = args[:2]
+        if self.raise_on and head not in {("tab", "list"), ("agent", "list")}:
+            raise hb.Unavailable(self.raise_on)
+        if head == ("tab", "list"):
+            return {"result": {"tabs": self.tabs}}
+        if head == ("agent", "list"):
+            return {"result": {"agents": self.agents}}
+        if head == ("agent", "get"):
+            agent = next((a for a in self.agents if a["pane_id"] == args[2]), None)
+            return {"result": {"agent": dict(agent)}} if agent else {"result": {}}
+        if head == ("pane", "process-info"):
+            procs = [{"name": self.process_name, "argv0": self.process_name, "pid": 4242}] * self.process_count
+            return {"result": {"process_info": {"foreground_processes": procs}}}
+        if head == ("agent", "read"):
+            return self.screen
+        if head == ("agent", "prompt"):
+            self.sent.append((args[2], args[3]))
+            return {"result": {"type": "agent_prompted" if self.prompt_ok else "rejected"}}
+        raise AssertionError("unexpected herdr call: %r" % (args,))
+
+
+def fake_runner(returncode=0, stdout="herdr 0.9.0\n", stderr="", raises=None):
+    """A stand-in for subprocess.run, for the herdr --version probe."""
+    def run(argv, **kwargs):
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+    return run
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.state = self.home / "state"
+        self.state.mkdir(mode=0o700)
+        self.config = self.state / "config.json"
+        self.config.write_text(json.dumps({"herdr": str(self.fake_bin()), "socket": "/tmp/nope.sock"}))
+
+    def fake_bin(self, name="herdr", body="#!/bin/sh\necho 'herdr 0.9.0'\n", mode=0o755):
+        path = self.home / name
+        path.write_text(body)
+        os.chmod(str(path), mode)
+        return path
+
+    def seed(self, pane_id="w2:p2", **fields):
+        state = hb.read_state(self.state)
+        pane = state["panes"].setdefault(pane_id, hb.new_pane({"tab_id": "w2:t2", "workspace_id": "w2"}))
+        pane.update(fields)
+        hb.write_state(self.state, state)
+        return pane
+
+    def pane(self, pane_id="w2:p2"):
+        return hb.read_state(self.state)["panes"][pane_id]
+
+    def run_ack(self, *argv):
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.state))
+        return subprocess.run([sys.executable, "-B", str(BIN / "heartbeat-ack"), *argv],
+                              capture_output=True, text=True, env=env)
+
+    def run_hb(self, *argv):
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.state))
+        return subprocess.run([sys.executable, "-B", str(BIN / "fleet-heartbeat"),
+                               "--config", str(self.config), *argv],
+                              capture_output=True, text=True, env=env)
+
+
+# ------------------------------------------------------------------ the clamp
+
+class TestClamp(Base):
+    def test_at_both_bounds(self):
+        self.assertEqual(ackmod.clamp_interval(5.0, 10.0), (5.0, False))       # lower bound included
+        self.assertEqual(ackmod.clamp_interval(59.9, 10.0), (59.9, False))     # just inside upper
+        self.assertEqual(ackmod.clamp_interval(60.0, 10.0), (59.0, True))      # upper bound excluded
+
+    def test_outside_the_bounds(self):
+        for proposed in (0, 1, 4.99, -5, "2m", "-5"):
+            self.assertEqual(ackmod.clamp_interval(proposed, 10.0), (5.0, True), proposed)
+        for proposed in (60, 61, 120, 100000, "65m"):
+            self.assertEqual(ackmod.clamp_interval(proposed, 10.0), (59.0, True), proposed)
+
+    def test_inside_is_untouched(self):
+        for text, expected in (("45m", 45.0), ("45", 45.0), ("45min", 45.0),
+                               ("45 minutes", 45.0), ("45M", 45.0), (20, 20.0)):
+            self.assertEqual(ackmod.clamp_interval(text, 10.0), (expected, False), text)
+
+    def test_none_keeps_the_current_cadence(self):
+        self.assertEqual(ackmod.clamp_interval(None, 15.0), (15.0, False))
+
+    def test_units_we_do_not_mean_are_refused(self):
+        for bad in ("bad", "45s", "2h", "", "45 42"):
+            with self.assertRaises(ValueError, msg=bad):
+                ackmod.clamp_interval(bad, 10.0)
+
+
+# --------------------------------------------------------------------- the ack
+
+class TestAck(Base):
+    def test_ack_resets_defer_counters_and_recomputes_due(self):
+        self.seed(consecutive_defers=4, unacked_wakes=7, consecutive_idle_acks=0,
+                  interval_minutes=5.0, next_due=1000.0, chronic_failure=True,
+                  chronic_reason="persistent_defers=4")
+
+        applied, clamped, next_due = ackmod.record_ack(self.state, "w2:p2", is_idle=True,
+                                                       next_minutes="30m", now=1000.0)
+        self.assertEqual((applied, clamped), (30.0, False))
+
+        pane = self.pane()
+        self.assertEqual(pane["consecutive_defers"], 0)
+        self.assertEqual(pane["unacked_wakes"], 0)
+        self.assertEqual(pane["consecutive_idle_acks"], 1)
+        self.assertFalse(pane["chronic_failure"])
+        self.assertIsNone(pane["chronic_reason"])
+        self.assertEqual(pane["interval_minutes"], 30.0)
+        self.assertEqual(pane["last_ack"]["state"], "idle")
+        # Re-aligned onto the 30m grid at this pane's own offset, not left where it was.
+        self.assertEqual(next_due, pane["next_due"])
+        self.assertEqual(int(next_due) % 1800, ackmod.stagger_offset("w2:p2"))
+        self.assertGreater(next_due, 1000.0)
+
+    def test_active_ack_clears_idle_streak(self):
+        ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes=10, now=1000.0)
+        ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes=10, now=1100.0)
+        self.assertEqual(self.pane()["consecutive_idle_acks"], 2)
+        ackmod.record_ack(self.state, "w2:p2", is_idle=False, next_minutes=5, now=1200.0)
+        self.assertEqual(self.pane()["consecutive_idle_acks"], 0)
+
+    def test_clamped_proposal_is_recorded_as_proposed_and_applied(self):
+        ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes="120m", now=1000.0)
+        proposal = self.pane()["last_proposal"]
+        self.assertEqual(proposal["raw_minutes"], 120.0)
+        self.assertEqual(proposal["applied_minutes"], 59.0)
+        self.assertTrue(proposal["clamped"])
+
+    def test_ack_does_not_disturb_the_service_block(self):
+        hb.record_service(self.state, pid=999, herdr="/somewhere/herdr")
+        ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes=10, now=1000.0)
+        self.assertEqual(hb.read_state(self.state)["service"]["pid"], 999)
+
+    def test_cli_is_invoked_by_the_documented_flags(self):
+        result = self.run_ack("--pane", "w2:p2", "--idle", "--wake-again-in", "45m")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ack recorded: pane=w2:p2 state=idle wake_again_in=45.0m", result.stdout)
+        self.assertEqual(self.pane()["interval_minutes"], 45.0)
+
+    def test_hidden_next_alias_still_works_and_stays_hidden(self):
+        result = self.run_ack("--pane", "w2:p2", "--active", "--next", "10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("wake_again_in=10.0m", result.stdout)
+        self.assertNotIn("--next", self.run_ack("--help").stdout)
+
+    def test_cli_fails_loudly_with_a_message_not_a_traceback(self):
+        # Defect: the original called sys.stderr.write without importing sys, so
+        # every error on this path raised NameError instead of reporting.
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.home / "does-not-exist"))
+        result = subprocess.run([sys.executable, "-B", str(BIN / "heartbeat-ack"),
+                                 "--pane", "w2:p2", "--idle", "--wake-again-in", "30m"],
+                                capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Error:", result.stderr)
+        self.assertNotIn("NameError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Ack recorded", result.stdout)
+
+    def test_help_documents_the_policy(self):
+        out = self.run_ack("--help").stdout
+        self.assertIn("Cadence is strictly clamped to 5 <= X < 60 minutes.", out)
+        self.assertIn("heartbeat-ack --pane <wN:pN> --idle   --wake-again-in 45m", out)
+        self.assertIn("heartbeat-ack --pane <wN:pN> --active --wake-again-in 5m", out)
+        self.assertIn("If you never ack:", out)
+
+
+# ----------------------------------------------------------- state persistence
+
+class TestStatePersistence(Base):
+    def test_write_then_read_round_trips(self):
+        state = hb.read_state(self.state)
+        state["panes"]["w2:p2"] = hb.new_pane({"tab_id": "w2:t2", "workspace_id": "w2"})
+        hb.write_state(self.state, state)
+        self.assertEqual(hb.read_state(self.state)["panes"]["w2:p2"]["interval_minutes"], 5.0)
+
+    def test_state_file_is_private_and_leaves_no_temp_files(self):
+        hb.write_state(self.state, hb.read_state(self.state))
+        path = self.state / "state.json"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.startswith(".heartbeat-")], [])
+
+    def test_readback_verification_catches_a_write_that_did_not_land(self):
+        # A tuple survives json.dump but comes back as a list, so the readback
+        # comparison must reject it. Any real divergence trips the same branch.
+        with self.assertRaises(ackmod.StateError):
+            ackmod.atomic_write(self.state / "probe.json", {"schema": 1, "panes": ("a", "b")})
+
+    def test_foreign_schema_is_refused_not_silently_migrated(self):
+        (self.state / "state.json").write_text(json.dumps({"schema": 3, "panes": {}}))
+        with self.assertRaises(ackmod.StateError):
+            hb.read_state(self.state)
+        with self.assertRaises(ackmod.StateError):
+            ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes=10)
+
+    def test_corrupt_state_is_refused(self):
+        (self.state / "state.json").write_text("{not json")
+        with self.assertRaises(ackmod.StateError):
+            hb.read_state(self.state)
+
+
+# ------------------------------------------------------------------- stagger
+
+class TestStagger(Base):
+    def test_offset_is_deterministic_and_process_independent(self):
+        self.assertEqual(ackmod.stagger_offset("w2:p2"), ackmod.stagger_offset("w2:p2"))
+        # Hardcoded, not recomputed: this is what pins the value across releases.
+        self.assertEqual(ackmod.stagger_offset("w2:p2"), 162)
+        self.assertEqual(ackmod.stagger_offset("w6:p1"), 22)
+        self.assertEqual(ackmod.stagger_offset("w9:p2"), 68)
+        out = subprocess.run([sys.executable, "-B", "-c",
+                              "import importlib.machinery as m;"
+                              "mod=m.SourceFileLoader('a', %r).load_module();"
+                              "print(mod.stagger_offset('w2:p2'))" % str(BIN / "heartbeat-ack")],
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "162", out.stderr)
+
+    def test_offsets_stay_inside_the_window(self):
+        for n in range(200):
+            offset = ackmod.stagger_offset("w%d:p%d" % (n, n))
+            self.assertTrue(0 <= offset < ackmod.STAGGER_WINDOW_SECONDS)
+
+    def test_panes_on_the_same_cadence_do_not_fire_together(self):
+        due = {p: ackmod.calculate_next_due(p, 1000.0, 5.0) for p in ("w2:p2", "w6:p1", "w9:p2")}
+        self.assertEqual(len(set(due.values())), 3)
+        self.assertEqual(due["w2:p2"], 1062.0)
+        self.assertEqual(due["w6:p1"], 1222.0)
+        self.assertEqual(due["w9:p2"], 1268.0)
+
+    def test_changing_one_cadence_moves_only_that_pane(self):
+        before = ackmod.calculate_next_due("w6:p1", 1000.0, 5.0)
+        self.assertEqual(ackmod.calculate_next_due("w2:p2", 1000.0, 30.0), 1962.0)
+        self.assertEqual(ackmod.calculate_next_due("w6:p1", 1000.0, 5.0), before)
+
+    def test_next_due_is_always_in_the_future(self):
+        for now in (0.0, 999.0, 1000.0, 1061.0, 1062.0, 1e9):
+            self.assertGreater(ackmod.calculate_next_due("w2:p2", now, 5.0), now)
+
+
+# -------------------------------------------------------------------- backoff
+
+class TestBackoff(Base):
+    def test_progression_is_bounded(self):
+        self.assertEqual(hb.backoff_delay(1, 5.0), 30.0)
+        self.assertEqual(hb.backoff_delay(2, 5.0), 60.0)
+        self.assertEqual(hb.backoff_delay(3, 5.0), 120.0)
+        self.assertEqual(hb.backoff_delay(9, 5.0), 120.0)     # never grows past the last step
+        self.assertEqual(hb.backoff_delay(0, 5.0), 30.0)      # defensive: never indexes backwards
+
+    def test_backoff_never_exceeds_the_panes_own_interval(self):
+        self.assertEqual(hb.backoff_delay(3, 1.0), 60.0)      # 120s capped to a 1m interval
+
+    def test_a_busy_pane_defers_and_then_lands(self):
+        herdr = FakeHerdr(status="working")
+        target = herdr.discover()[0]
+
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1000.0), "busy_or_blocked_or_unknown")
+        self.assertEqual(self.pane()["consecutive_defers"], 1)
+        self.assertEqual(self.pane()["next_due"], 1030.0)
+
+        # Inside the backoff window nothing is attempted at all.
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1015.0), "not_due")
+
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1030.0), "busy_or_blocked_or_unknown")
+        self.assertEqual(self.pane()["next_due"], 1090.0)
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1090.0), "busy_or_blocked_or_unknown")
+        self.assertEqual(self.pane()["next_due"], 1210.0)
+
+        herdr.set_agent_status("w2:p2", "idle")
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1210.0), "accepted")
+        self.assertEqual(self.pane()["consecutive_defers"], 0)
+        # Back onto the regular 5m grid, not left on the backoff schedule.
+        self.assertEqual(self.pane()["next_due"], 1362.0)
+        self.assertEqual(len(herdr.sent), 1)
+
+
+# ------------------------------------------------------------- the safe-send gate
+
+class TestSafeSend(Base):
+    def gate(self, **kwargs):
+        herdr = FakeHerdr(**kwargs)
+        target = herdr.discover()[0]
+        return herdr, hb.tick_pane(self.state, herdr, target, now=1000.0)
+
+    def test_a_clean_idle_pane_is_the_only_thing_that_gets_a_wake(self):
+        herdr, status = self.gate()
+        self.assertEqual(status, "accepted")
+        self.assertEqual(herdr.sent[0][0], "w2:p2")
+
+    def test_busy_pane_is_refused(self):
+        herdr, status = self.gate(status="working")
+        self.assertEqual(status, "busy_or_blocked_or_unknown")
+        self.assertEqual(herdr.sent, [])
+
+    def test_blocked_pane_is_refused(self):
+        herdr, status = self.gate(status="blocked")
+        self.assertEqual(status, "busy_or_blocked_or_unknown")
+        self.assertEqual(herdr.sent, [])
+
+    def test_disconnected_or_unknown_pane_is_refused(self):
+        for status_name in ("disconnected", "unknown", "", None):
+            herdr, status = self.gate(status=status_name)
+            self.assertEqual(status, "busy_or_blocked_or_unknown", status_name)
+            self.assertEqual(herdr.sent, [])
+            self.setUp()
+
+    def test_a_typed_draft_is_never_clobbered(self):
+        herdr, status = self.gate(screen=composer("half-written thought"))
+        self.assertEqual(status, "draft_or_unknown")
+        self.assertEqual(herdr.sent, [])
+
+    def test_an_unrecognisable_screen_is_treated_as_a_draft(self):
+        for screen in ("", "bare prompt", composer()[:40], composer() + "\x07"):
+            herdr, status = self.gate(screen=screen)
+            self.assertEqual(status, "draft_or_unknown", repr(screen[:20]))
+            self.assertEqual(herdr.sent, [])
+            self.setUp()
+
+    def test_wrong_process_or_agent_is_refused(self):
+        self.assertEqual(self.gate(process_count=2)[1], "process_count_invalid")
+        self.setUp()
+        self.assertEqual(self.gate(process_count=0)[1], "process_count_invalid")
+        self.setUp()
+        self.assertEqual(self.gate(process_name="bash")[1], "process_not_opencode")
+
+    def test_empty_composer_accepts_any_agent_role(self):
+        for role in ("Orchestrator", "Build", "Plan", "chief-of-staff"):
+            self.assertTrue(hb.empty_composer(composer(role=role)), role)
+            self.assertFalse(hb.empty_composer(composer("draft", role=role)), role)
+        self.assertTrue(hb.empty_composer(composer(auto=False)))
+
+    def test_the_pause_sentinel_halts_everything(self):
+        (self.state / "paused").touch()
+        herdr, status = self.gate()
+        self.assertEqual(status, "paused")
+        self.assertEqual(herdr.sent, [])
+
+
+# ------------------------------------------------------------------- discovery
+
+class TestDiscovery(Base):
+    def tabs(self, *labels):
+        tabs, agents = [], []
+        for index, label in enumerate(labels):
+            tabs.append({"tab_id": "w%d:t1" % index, "workspace_id": "w%d" % index, "label": label})
+            agents.append({"pane_id": "w%d:p1" % index, "tab_id": "w%d:t1" % index,
+                           "agent": "opencode", "agent_status": "idle"})
+        return FakeHerdr(tabs=tabs, agents=agents)
+
+    def test_the_bell_is_the_only_rule(self):
+        herdr = self.tabs("%s Payments" % BELL, "Orchestrator", "orchestrator", "%s" % BELL,
+                          "Infra %s trailing" % BELL, "\U0001f515 Orchestrator", "plain")
+        supervised = {t["tab_id"] for t in herdr.discover()}
+        self.assertEqual(supervised, {"w0:t1", "w3:t1", "w4:t1"})
+
+    def test_no_word_in_the_label_grants_anything(self):
+        # Deliberate change from the original, which required both a magic word
+        # and the glyph: renaming a tab must not silently change supervision.
+        self.assertEqual(self.tabs("Orchestrator").discover(), [])
+        self.assertEqual(self.tabs("Chief of Staff").discover(), [])
+
+    def test_a_tab_without_an_agent_is_not_a_candidate(self):
+        herdr = FakeHerdr(tabs=[{"tab_id": "w1:t1", "workspace_id": "w1", "label": "%s empty" % BELL}],
+                          agents=[])
+        self.assertEqual(herdr.discover(), [])
+
+    def test_list_shows_unsupervised_tabs_so_a_missing_bell_is_visible(self):
+        herdr = self.tabs("%s Payments" % BELL, "Web App")
+        rows = {t["tab_id"]: t["supervised"] for t in herdr.tabs_with_agents()}
+        self.assertEqual(rows, {"w0:t1": True, "w1:t1": False})
+
+
+# ------------------------------------------------- the daemon writes no tab titles
+
+class TestReadOnlyTabs(Base):
+    def test_no_rename_is_ever_attempted_even_through_chronic_failure(self):
+        herdr = FakeHerdr(screen=composer("permanent draft"))
+        target = herdr.discover()[0]
+        now = 1000.0
+        for _ in range(8):
+            hb.tick_pane(self.state, herdr, target, now=now)
+            now = self.pane()["next_due"]
+        self.assertTrue(self.pane()["chronic_failure"])
+        renames = [c for c in herdr.calls if c[:2] in {("tab", "rename"), ("tab", "set-label")}]
+        self.assertEqual(renames, [])
+
+    def test_the_rename_capability_does_not_exist_at_all(self):
+        self.assertFalse(hasattr(hb.Herdr, "set_tab_bell"))
+        source = (BIN / "fleet-heartbeat").read_text()
+        self.assertNotIn("tab\", \"rename", source)
+        self.assertNotIn("\u26a0", source)      # no warning glyph anywhere
+
+
+# ------------------------------------------------------------ chronic failure
+
+class TestChronicFailure(Base):
+    def health(self, **fields):
+        pane = hb.new_pane({"tab_id": "t", "workspace_id": "w"})
+        pane.update(fields)
+        return hb.compute_pane_health(pane, pane.get("interval_minutes", 5.0), fields.pop("_now", 10_000.0))
+
+    def attempts(self, total, accepted):
+        return ([{"status": "accepted", "due": hb.utc(1000)} for _ in range(accepted)] +
+                [{"status": "draft_or_unknown", "due": hb.utc(1000)} for _ in range(total - accepted)])
+
+    def test_consecutive_errors_threshold(self):
+        self.assertFalse(self.health(consecutive_errors=1)["chronic_failure"])
+        result = self.health(consecutive_errors=2)
+        self.assertTrue(result["chronic_failure"])
+        self.assertEqual(result["chronic_reason"], "consecutive_errors=2")
+
+    def test_zero_accepted_threshold(self):
+        self.assertFalse(self.health(attempts=self.attempts(4, 0))["chronic_failure"])
+        result = self.health(attempts=self.attempts(5, 0))
+        self.assertTrue(result["chronic_failure"])
+        self.assertIn("stalled_zero_accepted(5_attempts)", result["chronic_reason"])
+
+    def test_persistent_defers_threshold(self):
+        self.assertFalse(self.health(consecutive_defers=5, attempts=self.attempts(6, 1))["chronic_failure"])
+        result = self.health(consecutive_defers=6, attempts=self.attempts(7, 1))
+        self.assertTrue(result["chronic_failure"])
+        self.assertEqual(result["chronic_reason"], "persistent_defers=6")
+
+    def test_drop_rate_needs_both_a_bad_rate_and_a_long_silence(self):
+        stale = {"attempts": self.attempts(10, 2), "last_accepted": hb.utc(10_000 - 1800)}
+        self.assertTrue(self.health(**stale)["chronic_failure"])
+        self.assertIn("chronic_drop_rate=80%", self.health(**stale)["chronic_reason"])
+
+        # Same bad rate, but something landed a minute ago: a busy pane is not a broken one.
+        fresh = {"attempts": self.attempts(10, 2), "last_accepted": hb.utc(10_000 - 60)}
+        self.assertFalse(self.health(**fresh)["chronic_failure"])
+
+        # Bad rate over too few attempts is noise, not a pattern.
+        thin = {"attempts": self.attempts(7, 1), "last_accepted": hb.utc(10_000 - 1800)}
+        self.assertFalse(self.health(**thin)["chronic_failure"])
+
+    def test_a_healthy_pane_is_not_chronic(self):
+        self.assertFalse(self.health(attempts=self.attempts(20, 19),
+                                     last_accepted=hb.utc(10_000 - 60))["chronic_failure"])
+
+    def test_the_finding_is_recorded_in_state_for_fleet_doctor(self):
+        herdr = FakeHerdr(screen=composer("permanent draft"))
+        target = herdr.discover()[0]
+        now = 1000.0
+        for _ in range(6):
+            hb.tick_pane(self.state, herdr, target, now=now)
+            now = self.pane()["next_due"]
+        pane = self.pane()
+        self.assertTrue(pane["chronic_failure"])
+        self.assertTrue(pane["chronic_reason"])
+
+    def test_an_accepted_wake_clears_the_finding(self):
+        herdr = FakeHerdr(screen=composer("draft"))
+        target = herdr.discover()[0]
+        now = 1000.0
+        for _ in range(6):
+            hb.tick_pane(self.state, herdr, target, now=now)
+            now = self.pane()["next_due"]
+        self.assertTrue(self.pane()["chronic_failure"])
+
+        herdr.screen = composer()
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=now), "accepted")
+        self.assertFalse(self.pane()["chronic_failure"])
+
+
+# ------------------------------------------- defect 1: startup herdr verification
+
+class TestHerdrVerification(Base):
+    def test_a_good_herdr_verifies(self):
+        self.assertIsNone(hb.verify_herdr(str(self.fake_bin()), runner=fake_runner()))
+
+    def test_relative_path_is_refused(self):
+        self.assertEqual(hb.verify_herdr("herdr", runner=fake_runner())[0], "herdr_not_absolute")
+
+    def test_missing_file_is_caught(self):
+        code, message = hb.verify_herdr(str(self.home / "gone"), runner=fake_runner())
+        self.assertEqual(code, "herdr_missing")
+        self.assertIn("does not exist", message)
+
+    def test_a_broken_symlink_is_caught(self):
+        link = self.home / "dangling"
+        os.symlink(str(self.home / "nothing-here"), str(link))
+        self.assertEqual(hb.verify_herdr(str(link), runner=fake_runner())[0], "herdr_missing")
+
+    def test_a_directory_is_not_a_binary(self):
+        directory = self.home / "adir"
+        directory.mkdir()
+        self.assertEqual(hb.verify_herdr(str(directory), runner=fake_runner())[0], "herdr_not_file")
+
+    def test_non_executable_is_caught(self):
+        path = self.fake_bin(name="unrunnable", mode=0o644)
+        code, message = hb.verify_herdr(str(path), runner=fake_runner())
+        self.assertEqual(code, "herdr_not_executable")
+        self.assertIn("not executable", message)
+
+    def test_bad_version_exit_code_is_caught(self):
+        code, message = hb.verify_herdr(str(self.fake_bin()),
+                                        runner=fake_runner(returncode=127, stderr="no such thing\n"))
+        self.assertEqual(code, "herdr_version_failed")
+        self.assertIn("exited 127", message)
+
+    def test_silent_version_is_caught(self):
+        code, _ = hb.verify_herdr(str(self.fake_bin()), runner=fake_runner(stdout="   \n"))
+        self.assertEqual(code, "herdr_version_empty")
+
+    def test_hanging_version_is_caught(self):
+        code, _ = hb.verify_herdr(str(self.fake_bin()),
+                                  runner=fake_runner(raises=subprocess.TimeoutExpired("herdr", 10)))
+        self.assertEqual(code, "herdr_version_timeout")
+
+    def test_unexecutable_binary_format_is_caught(self):
+        code, _ = hb.verify_herdr(str(self.fake_bin()),
+                                  runner=fake_runner(raises=OSError("Exec format error")))
+        self.assertEqual(code, "herdr_version_error")
+
+    def test_the_real_probe_runs_a_real_binary(self):
+        # No fake runner here: this proves the subprocess plumbing itself works.
+        self.assertIsNone(hb.verify_herdr(str(self.fake_bin())))
+        self.assertEqual(hb.verify_herdr(str(self.fake_bin(name="silent", body="#!/bin/sh\nexit 3\n")))[0],
+                         "herdr_version_failed")
+
+    def test_the_daemon_refuses_to_start_and_records_the_fault(self):
+        self.config.write_text(json.dumps({"herdr": str(self.home / "gone"), "socket": "/tmp/x.sock"}))
+        with quiet_stderr() as stderr, self.assertRaises(SystemExit) as raised:
+            hb.run(self.state, self.config)
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertIn("Refusing to start", stderr.getvalue())
+        service = hb.read_state(self.state)["service"]
+        self.assertEqual(service["fault"], "herdr_missing")
+        self.assertIn("does not exist", service["fault_message"])
+        self.assertTrue(service["fault_since"])
+
+    def test_the_daemon_says_so_on_stderr_and_exits_non_zero(self):
+        self.config.write_text(json.dumps({"herdr": str(self.home / "gone"), "socket": "/tmp/x.sock"}))
+        result = self.run_hb("run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not exist", result.stderr)
+        self.assertIn("Refusing to start", result.stderr)
+
+    def test_a_herdr_that_disappears_at_runtime_becomes_a_service_fault(self):
+        # The original classed this as a per-pane transient and retried forever
+        # while the service looked healthy. It must now kill the daemon loudly.
+        good = self.fake_bin()
+        config = {"herdr": str(good), "socket": "/tmp/x.sock"}
+        self.config.write_text(json.dumps(config))
+        self.seed(next_due=1.0)          # due now, so the pass actually ticks
+        good.unlink()
+
+        herdr = FakeHerdr(raise_on="cli_unavailable")
+        original_transport = hb.Herdr
+        hb.Herdr = lambda cfg, **kw: herdr
+        try:
+            with quiet_stderr(), self.assertRaises(SystemExit) as raised:
+                hb._loop_once(self.state, self.config, dict(config))
+        finally:
+            hb.Herdr = original_transport
+        self.assertEqual(raised.exception.code, hb.EXIT_FAULT)
+        self.assertEqual(hb.read_state(self.state)["service"]["fault"], "herdr_missing")
+
+    def test_a_socket_outage_is_not_a_service_fault(self):
+        # herdr the binary is fine; its daemon is not listening. Survivable.
+        config = {"herdr": str(self.fake_bin()), "socket": "/tmp/x.sock"}
+        self.seed(next_due=1.0)
+        herdr = FakeHerdr(raise_on="socket_unavailable")
+        original_transport = hb.Herdr
+        hb.Herdr = lambda cfg, **kw: herdr
+        try:
+            hb._loop_once(self.state, self.config, dict(config))
+        finally:
+            hb.Herdr = original_transport
+        self.assertIsNone(hb.read_state(self.state)["service"].get("fault"))
+        self.assertEqual(self.pane()["attempts"][-1]["status"], "socket_unavailable")
+
+
+# ----------------------------------------------------------- config validation
+
+class TestConfig(Base):
+    def write(self, value):
+        self.config.write_text(json.dumps(value) if not isinstance(value, str) else value)
+        return self.config
+
+    def test_a_good_config_loads_to_exactly_the_keys_we_read(self):
+        config = hb.load_config(self.write({"herdr": "/bin/sh", "socket": "/tmp/s.sock"}))
+        self.assertEqual(config, {"herdr": "/bin/sh", "socket": "/tmp/s.sock"})
+
+    def test_dead_keys_are_rejected_rather_than_ignored(self):
+        # The original defined interval_seconds and never read it. An operator
+        # who tunes a setting must not be met with silence.
+        with self.assertRaises(hb.ConfigError) as raised:
+            hb.load_config(self.write({"herdr": "/bin/sh", "socket": "/tmp/s.sock",
+                                       "interval_seconds": 300, "schema": 3}))
+        self.assertIn("interval_seconds", str(raised.exception))
+        self.assertIn("schema", str(raised.exception))
+
+    def test_missing_keys_are_named(self):
+        with self.assertRaises(hb.ConfigError) as raised:
+            hb.load_config(self.write({"socket": "/tmp/s.sock"}))
+        self.assertIn("herdr", str(raised.exception))
+
+    def test_relative_paths_are_refused(self):
+        with self.assertRaises(hb.ConfigError):
+            hb.load_config(self.write({"herdr": "herdr", "socket": "/tmp/s.sock"}))
+
+    def test_malformed_json_names_the_file(self):
+        with self.assertRaises(hb.ConfigError) as raised:
+            hb.load_config(self.write("{nope"))
+        self.assertIn(str(self.config), str(raised.exception))
+
+    def test_a_missing_config_is_a_clear_message(self):
+        with self.assertRaises(hb.ConfigError) as raised:
+            hb.load_config(self.home / "no-such-config.json")
+        self.assertIn("config not found", str(raised.exception))
+
+    def test_dead_interval_constants_are_gone(self):
+        for name in ("DEFAULT_INTERVAL_SECONDS", "MIN_INTERVAL_MINUTES",
+                     "MAX_INTERVAL_MINUTES", "CLAMP_CEILING_MINUTES"):
+            self.assertFalse(hasattr(hb, name), "%s should live only in heartbeat-ack" % name)
+
+    def test_config_and_state_paths_are_independent_constants(self):
+        # Not "state is wherever config happens to be" — each is its own literal.
+        self.assertEqual(hb.DEFAULT_CONFIG_PATH.name, "config.json")
+        self.assertTrue(str(hb.DEFAULT_STATE_DIR).endswith("fleet-heartbeat"))
+        source = (BIN / "fleet-heartbeat").read_text()
+        self.assertNotIn("config.resolve().parent", source)
+        self.assertNotIn("config_path.parent", source.replace("config_path.parent.mkdir", ""))
+
+
+# ---------------------------------------------------------------- wake message
+
+class TestWakeMessage(Base):
+    def message(self, **fields):
+        pane = hb.new_pane({"tab_id": "w2:t2", "workspace_id": "w2"})
+        pane.update(fields)
+        return hb.build_wake_message("w2:p2", 10_000.0, pane, pane["interval_minutes"])
+
+    def test_the_ack_path_is_derived_not_hardcoded(self):
+        # The original baked one literal install path into every prompt, so any
+        # other install location told the whole fleet to run a missing command.
+        source = (BIN / "fleet-heartbeat").read_text()
+        self.assertNotIn('"~/', source, "no tilde-home path should be literal in the daemon")
+        self.assertTrue(hb.ACK_PATH.is_file(), "the ack CLI must be found, not assumed")
+        command = hb.ack_command()
+        self.assertTrue(command == "heartbeat-ack" or Path(command).is_file(), command)
+        self.assertIn("%s --pane w2:p2 --idle" % command, self.message())
+
+    def test_the_prompt_follows_the_binary_when_it_is_not_on_path(self):
+        # With nothing named heartbeat-ack on PATH, the prompt must name the
+        # absolute path we actually loaded rather than a guess.
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(self.home / "empty-path")
+        try:
+            self.assertEqual(hb.ack_command(), str(hb.ACK_PATH))
+        finally:
+            os.environ["PATH"] = saved
+
+    def test_it_names_both_invocations(self):
+        message = self.message()
+        self.assertIn("REQUIRED before you finish this turn - run exactly one:", message)
+        self.assertIn("--pane w2:p2 --idle   --wake-again-in 45m", message)
+        self.assertIn("--pane w2:p2 --active --wake-again-in 5m", message)
+
+    def test_escalation_appears_only_at_the_threshold(self):
+        for unacked in (0, 1, 2):
+            self.assertNotIn("acked", self.message(unacked_wakes=unacked))
+        message = self.message(unacked_wakes=3)
+        self.assertIn("You have NEVER acked (3 wakes unacknowledged)", message)
+        self.assertIn("stuck at 5m", message)
+
+    def test_escalation_wording_differs_once_a_pane_has_acked_before(self):
+        message = self.message(unacked_wakes=4, interval_minutes=10.0,
+                               last_ack={"state": "idle", "received": hb.utc(1.0), "next_minutes": 10.0})
+        self.assertIn("You have not acked the last 4 wakes", message)
+        self.assertIn("stuck at 10m", message)
+
+    def test_missed_occurrences_are_coalesced_into_one_wake(self):
+        message = self.message(last_accepted=hb.utc(10_000 - 900))
+        self.assertIn("overdue: 2 occurrences missed, last wake 15m ago", message)
+
+    def test_an_on_time_wake_carries_no_overdue_note(self):
+        self.assertNotIn("overdue", self.message(last_accepted=hb.utc(10_000 - 300)))
+
+    def test_escalation_clears_after_a_real_ack(self):
+        herdr = FakeHerdr()
+        target = herdr.discover()[0]
+        now = 1000.0
+        for _ in range(4):
+            hb.tick_pane(self.state, herdr, target, now=now)
+            now = self.pane()["next_due"]
+        self.assertIn("You have NEVER acked (3 wakes unacknowledged)", herdr.sent[-1][1])
+
+        self.assertEqual(self.run_ack("--pane", "w2:p2", "--idle", "--wake-again-in", "45m").returncode, 0)
+        hb.tick_pane(self.state, herdr, target, now=self.pane()["next_due"])
+        self.assertNotIn("acked", herdr.sent[-1][1])
+
+
+# ------------------------------------------------------------------ the CLI
+
+class TestCLI(Base):
+    def test_status_works_with_no_herdr_and_no_daemon(self):
+        result = self.run_hb("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FLEET HEARTBEAT", result.stdout)
+        # Must not claim health it cannot observe.
+        self.assertIn("no daemon has ever run", result.stdout)
+
+    def test_status_reports_a_dead_daemon_rather_than_ok(self):
+        hb.record_service(self.state, pid=999_999, started=hb.utc(1.0), herdr="/bin/sh")
+        self.assertIn("stopped", self.run_hb("status").stdout)
+
+    def test_status_json_is_machine_readable(self):
+        ackmod.record_ack(self.state, "w2:p2", is_idle=True, next_minutes=30, now=time.time())
+        result = self.run_hb("status", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["panes"]["w2:p2"]["interval_minutes"], 30.0)
+        self.assertIn("health", payload)
+        self.assertFalse(payload["paused"])
+
+    def test_status_surfaces_a_service_fault(self):
+        hb.record_fault(self.state, "herdr_missing", "configured herdr does not exist: /gone")
+        result = self.run_hb("status")
+        self.assertIn("SERVICE FAULT", result.stdout)
+        self.assertIn("herdr_missing", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_status_reports_a_pause(self):
+        (self.state / "paused").touch()
+        self.assertIn("PAUSED", self.run_hb("status").stdout)
+
+    def test_there_is_no_enable_or_disable(self):
+        # Opting in is a person adding the bell to a tab, not a command. The
+        # daemon has no way to write a tab title, so it has no way to enable one.
+        usage = self.run_hb("--help").stdout.split("positional arguments:")[0]
+        for word in ("enable", "disable", "toggle"):
+            self.assertNotIn(word, usage)
+        self.assertNotEqual(self.run_hb("enable", "w2:t2").returncode, 0)
+        self.assertNotEqual(self.run_hb("disable", "w2:t2").returncode, 0)
+
+    def test_run_refuses_a_world_readable_state_directory(self):
+        os.chmod(str(self.state), 0o755)
+        try:
+            result = self.run_hb("run")
+        finally:
+            os.chmod(str(self.state), 0o700)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be private", result.stderr)
+
+    def test_run_says_so_when_the_state_directory_is_missing(self):
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.home / "nowhere"))
+        result = subprocess.run([sys.executable, "-B", str(BIN / "fleet-heartbeat"),
+                                 "--config", str(self.config), "run"],
+                                capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("state directory does not exist", result.stderr)
+
+    def test_help_names_the_required_subcommands(self):
+        help_text = self.run_hb("--help").stdout
+        for word in ("run", "status", "list"):
+            self.assertIn(word, help_text)
+
+    def test_init_writes_a_config_fleet_doctor_can_check(self):
+        target = self.home / "fresh.json"
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.state))
+        result = subprocess.run([sys.executable, "-B", str(BIN / "fleet-heartbeat"),
+                                 "--config", str(target), "init",
+                                 "--herdr", str(self.fake_bin()), "--socket", "/tmp/s.sock"],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(target.read_text())
+        self.assertEqual(sorted(config), ["herdr", "socket"])
+        self.assertTrue(Path(config["herdr"]).is_absolute())
+        self.assertTrue(os.access(config["herdr"], os.X_OK))
+        # And the daemon accepts what init wrote, without further editing.
+        self.assertEqual(hb.load_config(target)["socket"], "/tmp/s.sock")
+
+    def test_init_does_not_pin_the_config_to_a_versioned_symlink_target(self):
+        # A package manager's bin entry is a symlink into a versioned directory.
+        # Following it writes a path the next upgrade deletes — the exact silent
+        # death this service exists to prevent.
+        real = self.fake_bin(name="herdr-1.2.3")
+        link = self.home / "herdr-current"
+        os.symlink(str(real), str(link))
+        target = self.home / "linked.json"
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.state))
+        subprocess.run([sys.executable, "-B", str(BIN / "fleet-heartbeat"),
+                        "--config", str(target), "init", "--herdr", str(link)],
+                       capture_output=True, text=True, env=env, check=True)
+        self.assertEqual(json.loads(target.read_text())["herdr"], str(link))
+
+    def test_init_refuses_to_write_a_config_pointing_at_a_dead_herdr(self):
+        target = self.home / "bad.json"
+        env = dict(os.environ, FLEET_HEARTBEAT_STATE=str(self.state))
+        result = subprocess.run([sys.executable, "-B", str(BIN / "fleet-heartbeat"),
+                                 "--config", str(target), "init", "--herdr", str(self.home / "gone")],
+                                capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(target.exists())
+
+    def test_plist_renders_with_no_placeholders_left(self):
+        import re as _re
+        result = self.run_hb("plist")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = _re.sub(r"<!--.*?-->", "", result.stdout, flags=_re.S)
+        for placeholder in ("__PYTHON__", "__HOME__", "__PREFIX__"):
+            self.assertNotIn(placeholder, body)
+        self.assertIn("<string>com.fleet-kit.heartbeat</string>", body)
+        self.assertIn("/bin/fleet-heartbeat", body)
+        self.assertNotIn("<string>/dev/null</string>", body)
+
+
+# ------------------------------------------------------- portability and hygiene
+
+class TestHygiene(unittest.TestCase):
+    FILES = ("fleet-heartbeat", "heartbeat-ack", "test-heartbeat")
+
+    def test_every_file_is_executable_with_the_portable_shebang(self):
+        for name in self.FILES:
+            path = BIN / name
+            self.assertTrue(os.access(str(path), os.X_OK), name)
+            self.assertEqual(path.read_text().splitlines()[0], "#!/usr/bin/env python3", name)
+
+    def test_standard_library_only(self):
+        third_party = {"requests", "yaml", "psutil", "click", "rich", "pytest", "dateutil"}
+        for name in self.FILES:
+            for line in (BIN / name).read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("import ", "from ")):
+                    root = stripped.split()[1].split(".")[0]
+                    self.assertNotIn(root, third_party, "%s: %s" % (name, stripped))
+
+    def test_sys_is_imported_wherever_stderr_is_written(self):
+        # Defect: the original wrote to sys.stderr in its error path without
+        # importing sys, so reporting an error raised NameError instead.
+        for name in self.FILES:
+            source = (BIN / name).read_text()
+            if "sys.stderr" in source or "sys.exit" in source:
+                self.assertIn("\nimport sys\n", source, name)
+
+    def test_no_personalisation(self):
+        # Assembled from fragments so this test file does not itself become the
+        # thing the check is looking for.
+        import re as _re
+        pattern = _re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan",
+                                        "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), _re.IGNORECASE)
+        for name in self.FILES:
+            for number, line in enumerate((BIN / name).read_text().splitlines(), 1):
+                self.assertIsNone(pattern.search(line), "%s:%d %s" % (name, number, line))
+
+    def test_the_kit_ships_exactly_one_plist(self):
+        plists = sorted(p.name for p in (BIN.parent / "templates").glob("*.plist"))
+        self.assertEqual(plists, ["com.fleet-kit.heartbeat.plist"])
+
+    def test_the_plist_template_is_parseable_once_substituted(self):
+        rendered = hb.render_plist()
+        proc = subprocess.run(["plutil", "-lint", "-"], input=rendered.encode(), capture_output=True)
+        if proc.returncode != 0 and b"plutil" not in proc.stderr:
+            self.fail("rendered plist is not valid: %s" % proc.stdout.decode())
+
+    def test_the_plist_never_sends_stderr_to_the_void(self):
+        import re as _re
+        template = (BIN.parent / "templates" / "com.fleet-kit.heartbeat.plist").read_text()
+        body = _re.sub(r"<!--.*?-->", "", template, flags=_re.S)
+        # stderr to /dev/null plus KeepAlive turns a fatal startup crash into an
+        # invisible restart loop. That is defect 8 and it must stay fixed.
+        self.assertNotIn("/dev/null", body)
+        self.assertIn("launchd-stderr.log", body)
+        self.assertIn("/opt/homebrew/bin", body)
+        self.assertNotIn("/usr/local/bin/python3", body)
+        for placeholder in ("__PYTHON__", "__HOME__", "__PREFIX__"):
+            self.assertIn(placeholder, body, "template must stay a template")
+
+
+# ---------------------------------------------------------------------- runner
+
+def main(argv):
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if argv:
+        keep = unittest.TestSuite()
+        for group in suite:
+            for case in group:
+                if any(token.lower() in case.id().lower() for token in argv):
+                    keep.addTest(case)
+        suite = keep
+
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+    result = runner.run(suite)
+
+    passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+    print()
+    print("=" * 70)
+    print("test-heartbeat: %d run, %d passed, %d failed, %d errored, %d skipped"
+          % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
+    print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
+    print("=" * 70)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

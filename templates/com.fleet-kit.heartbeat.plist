@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.fleet-kit.heartbeat — LaunchAgent TEMPLATE for fleet-heartbeat.
+
+  This file is a template, not a plist you can load. Three placeholders must be
+  substituted first:
+
+    __PYTHON__   absolute path to a python3 (3.9+).   $(command -v python3)
+    __HOME__     your home directory.                 $HOME
+    __PREFIX__   where the kit is checked out, such
+                 that __PREFIX__/bin/fleet-heartbeat
+                 exists.                              $PWD, from the repo root
+
+  The easy way, which fills all three from the running environment and prints
+  the result without installing anything:
+
+    bin/fleet-heartbeat plist > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+
+  By hand:
+
+    sed -e "s|__PYTHON__|$(command -v python3)|g" \
+        -e "s|__HOME__|$HOME|g" \
+        -e "s|__PREFIX__|$PWD|g" \
+        templates/com.fleet-kit.heartbeat.plist \
+        > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+
+  Then:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+
+  Do not hardcode /usr/local/bin/python3. That is a python.org install and a
+  stock Mac does not have one; the Command Line Tools python3 lives at
+  /usr/bin/python3. Substituting from `command -v python3` gets whichever one
+  the machine actually has.
+
+  There is exactly one copy of this file. If you find yourself keeping a second
+  one somewhere "for the installer", you have just signed up to keep two things
+  in sync by hand, and they will drift.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.fleet-kit.heartbeat</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-B</string>
+		<string>__PREFIX__/bin/fleet-heartbeat</string>
+		<string>run</string>
+	</array>
+
+	<!--
+	  Config and state paths are the built-in defaults, so they are not passed
+	  here. Override them with FLEET_HEARTBEAT_CONF / FLEET_HEARTBEAT_STATE
+	  below if you relocate either one. fleet-doctor reads the same env names.
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<!--
+		  Include /opt/homebrew/bin: on Apple Silicon that is where herdr lives,
+		  and leaving it out is why a service can look fine and find nothing.
+		  The daemon uses the absolute herdr path from config.json regardless;
+		  PATH matters for resolving heartbeat-ack in the wake prompt.
+		-->
+		<key>PATH</key>
+		<string>__PREFIX__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!--
+	  Long enough that a daemon which refuses to start (bad herdr path, bad
+	  config) restarts slowly and visibly rather than hammering the log.
+	-->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<!--
+	  Never /dev/null. The startup checks in this service are designed to fail
+	  loudly on stderr; sending stderr to /dev/null with KeepAlive set turns a
+	  fatal, self-describing crash into an invisible restart loop.
+	-->
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/state/fleet-heartbeat/launchd-stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/state/fleet-heartbeat/launchd-stdout.log</string>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>__HOME__</string>
+</dict>
+</plist>

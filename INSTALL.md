@@ -233,7 +233,43 @@ alone.
 
 ---
 
-## STEP 11 — Charter template (optional, 5 seconds)
+## STEP 11 — The heartbeat (optional, but it is the point)
+
+Without this, orchestrators stop when they finish a thought and wait for you.
+With it, they wake themselves on their own schedule and you stop being the thing
+that keeps the fleet moving.
+
+```
+CHECK:   launchctl list | grep com.fleet-kit.heartbeat
+         Already loaded?  -> skip to STEP 12.
+DO:      ./bin/fleet-heartbeat init
+         mkdir -p ~/.local/bin && ln -sf "$PWD/bin/heartbeat-ack" ~/.local/bin/heartbeat-ack
+         ./bin/fleet-heartbeat plist > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+         launchctl load ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+VERIFY:  ./bin/fleet-heartbeat status
+PROVES:  a service line that is not FAULT, and the state directory printed.
+```
+
+`init` refuses to write a config pointing at a herdr it cannot actually run, so a
+successful `init` is itself evidence. If it refuses, read what it says — it has
+found a real problem and starting anyway would give you a service that looks
+healthy and supervises nothing.
+
+Make sure `~/.local/bin` is on PATH, or the agents will be told to run an ack
+command they cannot reach.
+
+```
+HUMAN:   yes, one step. An orchestrator opts in by having 🔔 in its tab label.
+         Nothing is supervised until you add it.
+```
+
+That is the whole opt-in mechanism: one glyph, one rule. `./bin/fleet-heartbeat
+list` shows every tab holding an agent and whether it opts in, so if something is
+not being woken, that command answers why.
+
+---
+
+## STEP 12 — Charter template (optional, 5 seconds)
 
 ```
 CHECK:   ls templates/charter.md
@@ -244,7 +280,7 @@ PROVES:  they know where to start their first charter rather than
 
 ---
 
-## STEP 12 — Prove it
+## STEP 13 — Prove it
 
 ```
 CHECK:   none — always run this.
@@ -279,3 +315,42 @@ wrong and what you would need to get past it.
 Do not widen your own access, do not disable a security control, and do not
 invent a step that is not in this document. Being blocked and saying so clearly
 is a good outcome. Guessing is not.
+
+---
+
+## Send back what you learned
+
+This kit is maintained at **https://github.com/dw-aura/fleet-kit.git**.
+
+If you hit something material while installing — a step that was wrong, an
+assumption that did not hold on this machine, a check that passed when it should
+have failed — **open a pull request.** Not an issue you file and forget: a
+change, against the file that was wrong.
+
+The reasoning is the same one this whole system rests on. A correction that stays
+on one laptop has to be rediscovered by every person who installs after you, and
+they will each pay the same cost you just paid. The install is the moment you
+know something the document does not.
+
+**Worth a PR:**
+
+- A step that failed, and what actually worked.
+- A `CHECK` that reported success while the thing was broken. This is the worst
+  class of bug in an install and the easiest to notice exactly once.
+- A `VERIFY` whose output did not mean what `PROVES` claimed.
+- A prerequisite this document assumes and does not state.
+- A platform difference — a different chip, an older OS, a managed machine with
+  a control this did not anticipate.
+- A place the wording sent you down the wrong path even though it was accurate.
+
+**Not worth a PR:** your own repo name, your own label prefix, anything in your
+config. Those are supposed to differ.
+
+Keep it small and say what happened. One sentence of "here is what I ran, here is
+what I got, here is what fixed it" is worth more than a rewrite, and it is the
+part a reviewer cannot reconstruct. If you are not sure whether something is
+general or particular to your machine, send it anyway and say you are not sure —
+deciding that is a reviewer's job, not a blocker for you.
+
+If you changed something to get the install working, that change is already
+written. Sending it costs you one more command.
