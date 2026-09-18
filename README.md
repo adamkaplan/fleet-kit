@@ -18,6 +18,15 @@ things that hold it together: GitHub for memory, and a heartbeat for a pulse.
 
 ---
 
+![A Fleet Kit workspace: the Director tab alongside eight dispatched workers, with one workspace per project down the left](docs/fleet-kit.png)
+
+One orchestrator and eight coders, mid-flight. The tab bar is the queue — each
+worker tab is a GitHub issue someone was dispatched against. Down the left is one
+workspace per project, which is the row of the org chart you are about to read
+about. The pane in the middle is a worker reporting back.
+
+---
+
 ## The org chart
 
 ```mermaid
