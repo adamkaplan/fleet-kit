@@ -1,19 +1,10 @@
 # Fleet Kit
 
-### tl;dr — let an agent install it
+### tl;dr
 
 ```bash
-copilot -i "Clone https://github.com/dw-aura/fleet-kit.git into ~/Code/fleet-kit, \
-then work through its INSTALL.md start to finish. Run each step's VERIFY command \
-and paste the real output. Do not report success you have not observed. Stop at \
-anything marked HUMAN and hand back to me."
+copilot -i "Clone https://github.com/dw-aura/fleet-kit.git into ~/Code/fleet-kit and follow its INSTALL.md."
 ```
-
-Interactive on purpose. The install has a few steps only you can do — a browser
-login, an OS permission dialog — and an agent running headless cannot hand those
-back to you. Sit with it; it will stop when it needs you.
-
-Then read on, because the rest of this explains what you just installed.
 
 ---
 
