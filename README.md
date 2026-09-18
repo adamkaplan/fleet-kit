@@ -267,16 +267,33 @@ that step's VERIFY command and paste the real output. Do not report success
 you have not observed. Stop at anything marked HUMAN and hand back to me.
 ```
 
-Every step declares what proves it worked, so the agent confirms rather than
+**Every step checks before it acts.** You are an engineer with a working machine,
+not a fresh laptop — most of this is probably already done. A step whose
+precondition is already satisfied is skipped, not re-run. Nothing here logs you
+out of something you were logged into.
+
+Every step also declares what proves it worked, so the agent confirms rather than
 assumes:
 
 ```
-STEP 4 — Authenticate gh
+STEP 4 — GitHub authentication
+  CHECK:   gh auth status --active
+           already logged in with 'repo' scope?  -> skip, nothing to do
+           logged in without it?                 -> gh auth refresh --scopes repo
+           not logged in?                        -> DO below
   DO:      gh auth login --scopes repo
-  HUMAN:   yes — browser + device code. Stop and hand over.
+  HUMAN:   yes — browser and device code. Stop and hand over.
   VERIFY:  gh auth status --active && gh api user --jq .login
-  PROVES:  a login name comes back, and repo scope is present
+  PROVES:  a login name comes back, and the token carries 'repo'
 ```
+
+Note the middle branch. Being logged in is not the same as having the scope this
+needs, and the fix for that is `gh auth refresh`, which adds the scope to your
+existing session. Re-running `gh auth login` would work too, and would also drag
+you through a browser you did not need to open.
+
+Because every step checks first, the whole install is safe to re-run. If it dies
+halfway, run it again — it picks up where it stopped rather than starting over.
 
 Run `fleet-doctor` at the end. Run it again any time something feels wrong — it
 is the same check either way.
@@ -285,7 +302,8 @@ is the same check either way.
 
 Your agent will stop at these. That is correct behaviour, not a failure:
 
-- **`gh auth login`** — browser and device code.
+- **`gh auth login`** — browser and device code, *if* you are not already
+  authenticated. Most people are, and this step will be skipped.
 - **macOS permission prompts** — the OS dialogs cannot be scripted. Your agent
   will tell you which dialog and which button.
 - **Full Disk Access on a managed Mac** — may be locked by policy and not
