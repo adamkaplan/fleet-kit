@@ -109,6 +109,13 @@ orchestrator on its own adaptive schedule — busy ones often, quiet ones rarely
 Without it, an agent that finishes a thought sits there until a human notices.
 With thirty agents, that human cannot be you.
 
+**The heartbeat is not in this release.** Everything else here works without it,
+but you drive the fleet rather than it driving itself: an orchestrator that
+finishes a thought waits for you to come back to it. That is fine for a handful
+of workspaces and it is the wrong answer for thirty. It is the next thing to
+build, and until it exists this is a fleet you supervise rather than one that
+supervises itself.
+
 ---
 
 ## Who does what
@@ -404,6 +411,27 @@ What does **not** work is splitting the chart — orchestrator on the laptop,
 coders on a remote host. Pane addresses are only unique within one server, so two
 machines can both have a `w3:p1` and the charter can no longer tell them apart.
 Run the fleet on one host, attach from anywhere.
+
+---
+
+## Keeping it current
+
+The doctrine lives in the skills, and the skills are symlinked out of this
+checkout. So `git pull` here updates every agent on your machine at once, without
+touching anything you have customised.
+
+Agent definitions are the exception. They are copied, not linked, so a pull does
+not overwrite yours — and because a definition is read once when a session
+starts, a running agent will not pick up a change either way. Restart an agent
+deliberately when you want it to see a new definition.
+
+If you change something that everyone should get, it belongs in a skill and in a
+pull request here. If you change something that is yours alone, it belongs in
+your copy of an agent definition.
+
+Questions, breakage, and anything that turns out to be wrong in this document:
+raise an issue on this repo rather than fixing it locally and moving on. A
+correction that stays on one laptop has to be discovered again by everyone else.
 
 ---
 

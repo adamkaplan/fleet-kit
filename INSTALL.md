@@ -233,7 +233,18 @@ alone.
 
 ---
 
-## STEP 11 — Prove it
+## STEP 11 — Charter template (optional, 5 seconds)
+
+```
+CHECK:   ls templates/charter.md
+DO:      nothing to install. Tell the person it is there.
+PROVES:  they know where to start their first charter rather than
+         writing one from a blank issue.
+```
+
+---
+
+## STEP 12 — Prove it
 
 ```
 CHECK:   none — always run this.
