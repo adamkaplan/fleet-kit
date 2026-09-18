@@ -344,10 +344,21 @@ means a change in herdr itself, which is not ours.
 
 Short list. Each of these has already cost somebody time.
 
-**Namespace your labels.** Labels are repo-wide. If two people use a shared repo
-and both create a label called `active`, they are looking at each other's work.
-Pick a prefix and use it on everything you create — `ak:active`, `ak:payments`.
-Your prefix is set once at install and everything derives from it.
+**Namespace your labels, and derive the prefix — do not choose it.** Labels are
+repo-wide. If two people use a shared repo and both create a label called
+`active`, they are looking at each other's work.
+
+Your prefix is your username:
+
+```bash
+whoami        # adkaplan  ->  adkaplan:active, adkaplan:payments
+```
+
+Nobody picks it and no agent has to ask. On a corporate Mac the username is
+already unique across the company and already length-capped, which is exactly
+what a prefix needs to be — and `whoami` answers before `gh` is even
+authenticated. Initials would be shorter and would collide the first time you
+hired a second person with them.
 
 **No exceptions — including `orchestrator` and `awaiting-user`.** It is tempting
 to leave the structural labels un-prefixed since everyone means the same thing by
@@ -365,8 +376,9 @@ each one's tooling sees the other's charters, and the damage is not cosmetic:
   it with decisions belonging to someone else and "nothing needs you" is no longer
   a sentence you can believe.
 
-Prefix everything. `ak:orchestrator`, `ak:awaiting-user`, `ak:payments`. The
-queries stay one-liners and they return only your fleet.
+Prefix everything. `adkaplan:orchestrator`, `adkaplan:awaiting-user`,
+`adkaplan:payments`. The queries stay one-liners and they return only your
+fleet.
 
 **Filtering on two labels is an AND, not an OR.** `gh issue list --label a
 --label b` returns issues carrying *both*. Adding a label to widen a search
