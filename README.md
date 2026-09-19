@@ -458,3 +458,7 @@ anyone checking on it.
 
 The real sign it is working is not a dashboard full of green. It is asking the
 Chief of Staff what needs you, hearing "nothing right now," and believing it.
+
+---
+
+*Internal and proprietary. Not for distribution outside the company.*
