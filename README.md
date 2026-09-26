@@ -117,7 +117,8 @@ orchestrator on its own adaptive schedule — busy ones often, quiet ones rarely
 Without it, an agent that finishes a thought sits there until a human notices.
 With thirty agents, that human cannot be you.
 
-It ships here, as a `launchd` service. It is optional and it is the difference
+It ships here, as a `launchd` service on macOS and a systemd user unit on
+Linux. It is optional and it is the difference
 between a fleet you supervise and one that supervises itself. An orchestrator
 opts in by having 🔔 in its tab label — one glyph, one rule, and nothing is woken
 until you add it.
