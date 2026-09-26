@@ -278,6 +278,7 @@ fi
 # Overridable so this works against a differently-named or relocated install.
 HB_CONF="${FLEET_HEARTBEAT_CONF:-$HOME/.local/state/fleet-heartbeat/config.json}"
 HB_LABEL="${FLEET_HEARTBEAT_LABEL:-com.fleet-kit.heartbeat}"
+HB_UNIT="${FLEET_HEARTBEAT_UNIT:-fleet-kit-heartbeat.service}"
 if [ ! -f "$HB_CONF" ]; then
   emit ok heartbeat "not installed"
 else
@@ -287,7 +288,19 @@ try:
     print(json.load(open(sys.argv[1])).get("herdr","") or "")
 except Exception:
     print("__BADJSON__")' "$HB_CONF" 2>/dev/null)
-  if launchctl list 2>/dev/null | grep -q "$HB_LABEL"; then loaded="LaunchAgent loaded"; else loaded="LaunchAgent NOT loaded"; fi
+  # "loaded" is the service-manager verdict; hb_down is set when it is not running us.
+  hb_down=""
+  if [ "$(uname -s)" = "Linux" ]; then
+    hb_active=$(systemctl --user is-active "$HB_UNIT" 2>/dev/null)
+    hb_enabled=$(systemctl --user is-enabled "$HB_UNIT" 2>/dev/null)
+    if [ "$hb_active" = "active" ]; then
+      loaded="systemd unit active (${hb_enabled:-unknown})"
+    else
+      loaded="systemd unit NOT active (${hb_active:-unknown}, ${hb_enabled:-not-found})"; hb_down=1
+    fi
+  else
+    if launchctl list 2>/dev/null | grep -q "$HB_LABEL"; then loaded="LaunchAgent loaded"; else loaded="LaunchAgent NOT loaded"; hb_down=1; fi
+  fi
   if [ "$hb_herdr" = "__BADJSON__" ]; then
     LAST_OUT=$(cat "$HB_CONF" 2>/dev/null)
     emit FAIL heartbeat "config is not valid JSON: $HB_CONF — $loaded"
@@ -300,8 +313,8 @@ except Exception:
   elif [ ! -x "$hb_herdr" ]; then
     LAST_OUT="config herdr path: $hb_herdr"
     emit FAIL heartbeat "config points at $hb_herdr — not executable; $loaded but supervising nothing"
-  elif [ "${loaded}" = "LaunchAgent NOT loaded" ]; then
-    emit WARN heartbeat "$hb_herdr executable, but LaunchAgent not loaded"
+  elif [ -n "$hb_down" ]; then
+    emit WARN heartbeat "$hb_herdr executable, but $loaded"
   else
     emit ok heartbeat "$hb_herdr executable, $loaded"
   fi

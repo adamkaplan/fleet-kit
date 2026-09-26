@@ -1,0 +1,60 @@
+# fleet-kit-heartbeat.service — systemd --user unit TEMPLATE for fleet-heartbeat.
+#
+# The Linux sibling of com.fleet-kit.heartbeat.plist. Same daemon, same
+# placeholders, same rules. This file is a template, not a unit you can load.
+# Three placeholders must be substituted first:
+#
+#   __PYTHON__   absolute path to a python3 (3.9+).   $(command -v python3)
+#   __HOME__     your home directory.                 $HOME
+#   __PREFIX__   where the kit is checked out, such
+#                that __PREFIX__/bin/fleet-heartbeat
+#                exists.                              $PWD, from the repo root
+#
+# The easy way, which fills all three from the running environment and prints
+# the result without installing anything:
+#
+#   bin/fleet-heartbeat unit > ~/.config/systemd/user/fleet-kit-heartbeat.service
+#
+# Then:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fleet-kit-heartbeat.service
+#
+# A user unit only runs while you have a session unless lingering is on:
+# `loginctl enable-linger $USER` if the box is headless.
+#
+# There is exactly one copy of this file. Do not keep a second one for the
+# installer; it will drift.
+
+[Unit]
+Description=fleet-kit heartbeat (wakes supervised orchestrator panes)
+
+[Service]
+Type=simple
+ExecStart=__PYTHON__ -B __PREFIX__/bin/fleet-heartbeat run
+WorkingDirectory=__HOME__
+
+# Config and state paths are the built-in defaults, so they are not passed
+# here. Override with FLEET_HEARTBEAT_CONF / FLEET_HEARTBEAT_STATE if you
+# relocate either one. fleet-doctor reads the same env names.
+Environment=HOME=__HOME__
+# The daemon uses the absolute herdr path from config.json regardless; PATH
+# matters for resolving heartbeat-ack in the wake prompt, and mise shims are
+# where herdr lives when it was installed with `mise use -g herdr`.
+Environment=PATH=__PREFIX__/bin:%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+
+Restart=always
+# Long enough that a daemon which refuses to start (bad herdr path, bad
+# config) restarts slowly and visibly rather than hammering the log.
+# Mirrors the plist's ThrottleInterval.
+RestartSec=30
+
+# Never /dev/null. The startup checks in this service are designed to fail
+# loudly on stderr; discarding stderr with Restart=always turns a fatal,
+# self-describing crash into an invisible restart loop. Read it with:
+#   journalctl --user -u fleet-kit-heartbeat.service
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
