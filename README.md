@@ -6,6 +6,12 @@
 copilot -i "Clone https://github.com/adamkaplan/fleet-kit.git and follow its fleet-kit/INSTALL.md."
 ```
 
+```bash
+opencode --prompt "Clone https://github.com/adamkaplan/fleet-kit.git and follow its fleet-kit/INSTALL.md."
+```
+
+opencode puts the prompt in its input box; press Enter to send it.
+
 ---
 
 Coding agents are cheap and getting cheaper. Your attention is not, and never
