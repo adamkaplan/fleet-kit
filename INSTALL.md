@@ -174,8 +174,10 @@ CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination
 DO:      mkdir -p ~/.agents/skills
          ln -s "$PWD/skills/fleet-charter"     ~/.agents/skills/fleet-charter
          ln -s "$PWD/skills/fleet-coordination" ~/.agents/skills/fleet-coordination
-VERIFY:  copilot skill list
-PROVES:  both named under "Personal skills", with their descriptions.
+VERIFY:  Copilot CLI:  copilot skill list
+         opencode:     ls ~/.agents/skills/fleet-*/SKILL.md
+PROVES:  Copilot CLI: both named under "Personal skills", with their descriptions.
+         opencode: both SKILL.md paths listed, through the links.
 ```
 
 **Symlink, do not copy.** `~/.agents/skills/` is read natively by Copilot CLI,

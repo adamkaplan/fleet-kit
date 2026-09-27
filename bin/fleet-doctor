@@ -217,6 +217,22 @@ else
 fi
 
 # =========================================================== 5. skills
+# Harness-neutral first: ~/.agents/skills is read by Copilot CLI, opencode and
+# Claude Code alike, so this holds whichever agent CLI is installed. -d and -f
+# follow the symlinks INSTALL creates, so a dangling link counts as missing.
+sk_missing=""
+for sk in fleet-charter fleet-coordination; do
+  sk_dir="$HOME/.agents/skills/$sk"
+  if [ ! -d "$sk_dir" ] || [ ! -f "$sk_dir/SKILL.md" ]; then
+    sk_missing="$sk_missing $sk"
+  fi
+done
+if [ -z "$sk_missing" ]; then
+  emit ok agents-skills "fleet-charter and fleet-coordination in ~/.agents/skills"
+else
+  emit WARN agents-skills "missing or no SKILL.md in ~/.agents/skills:$sk_missing (INSTALL STEP 8)"
+fi
+
 if ! have copilot; then
   emit WARN skills "skipped — copilot not installed"
 else

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""test-fleet-doctor-config — offline tests for fleet-doctor's config precedence.
+"""test-fleet-doctor-config — offline tests for fleet-doctor's config precedence
+and its harness-neutral skills check.
 
 Runs the real bin/fleet-doctor on a hermetic PATH with a temp HOME: stub
 `herdr`, `gh`, `systemctl`, `launchctl` and `uname`, no network, and no real
@@ -155,6 +156,53 @@ class EnvBeatsFile(Case):
         d.run(FLEET_PREFIX="envpfx")
         self.assertIn("envpfx:orchestrator", d.output)
         self.assertNotIn("filepfx", d.output)
+
+
+class HarnessNeutralSkills(Case):
+    """Section 5 checks ~/.agents/skills whatever agent CLI is installed."""
+
+    def link_skills(self, d, names, with_skill_md=True):
+        repo = d.tmp / "repo-skills"
+        skills = d.home / ".agents" / "skills"
+        skills.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            src = repo / name
+            src.mkdir(parents=True)
+            if with_skill_md:
+                (src / "SKILL.md").write_text("# %s\n" % name)
+            (skills / name).symlink_to(src)
+
+    def test_both_linked_is_ok_without_copilot(self):
+        d = self.doctor()
+        self.link_skills(d, ["fleet-charter", "fleet-coordination"])
+        d.run()
+        self.assertTrue(d.line("agents-skills").startswith("ok"), d.line("agents-skills"))
+        # The copilot path is unchanged: still a skipped WARN when it is absent.
+        self.assertIn("skipped — copilot not installed", d.line("skills"))
+
+    def test_one_missing_warns_and_names_it(self):
+        d = self.doctor()
+        self.link_skills(d, ["fleet-charter"])
+        d.run()
+        line = d.line("agents-skills")
+        self.assertTrue(line.startswith("WARN"), line)
+        # Exactly the missing one is listed, not the present one.
+        self.assertIn("~/.agents/skills: fleet-coordination (", line)
+
+    def test_dir_without_skill_md_warns(self):
+        d = self.doctor()
+        self.link_skills(d, ["fleet-charter", "fleet-coordination"], with_skill_md=False)
+        d.run()
+        self.assertTrue(d.line("agents-skills").startswith("WARN"), d.line("agents-skills"))
+
+    def test_dangling_link_warns(self):
+        d = self.doctor()
+        self.link_skills(d, ["fleet-charter", "fleet-coordination"])
+        shutil.rmtree(str(d.tmp / "repo-skills" / "fleet-charter"))
+        d.run()
+        line = d.line("agents-skills")
+        self.assertTrue(line.startswith("WARN"), line)
+        self.assertIn("fleet-charter", line)
 
 
 if __name__ == "__main__":
