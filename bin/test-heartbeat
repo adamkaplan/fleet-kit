@@ -20,6 +20,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,11 @@ BELL = hb.BELL
 
 # --------------------------------------------------------------------- fakes
 
+# opencode 2.x from npm runs as opencode.exe; herdr reports it with a full path
+# in argv[0]. This is the shape observed on king (witt3rd/fleet-ops#28).
+NPM_OPENCODE = ("/home/user/.local/share/mise/installs/npm-opencode-cli/latest/node_modules/.bin/"
+                "../.mise/@opencode+cli@2.0.11/node_modules/@opencode/cli/bin/opencode.exe")
+
 def composer(draft="", sidebar=True, auto=True, role="Orchestrator"):
     """A rendering of the OpenCode composer box, with or without a typed draft."""
     width = 100
@@ -75,8 +81,8 @@ class FakeHerdr(hb.Herdr):
     """Stands in for the herdr CLI. Records everything, never touches a socket."""
 
     def __init__(self, tabs=None, agents=None, status="idle", screen=None,
-                 process_name="opencode", process_argv=None, process_count=1,
-                 prompt_ok=True, raise_on=None):
+                 process_name="opencode.exe", process_argv=None, process_count=1,
+                 prompt_ok=True, raise_on=None, process_info_raises=None):
         super().__init__({"herdr": "/dev/null/herdr", "socket": "/dev/null/sock"})
         self.tabs = tabs if tabs is not None else [
             {"tab_id": "w2:t2", "workspace_id": "w2", "label": "%s Payments" % BELL},
@@ -91,8 +97,10 @@ class FakeHerdr(hb.Herdr):
         self.status = status
         self.screen = composer() if screen is None else screen
         self.process_name = process_name
-        # herdr reports argv as a list; default to the bare name as argv[0].
-        self.process_argv = [process_name] if process_argv is None else process_argv
+        # herdr reports argv as a list. The default is what npm opencode 2.x
+        # looks like on king: opencode.exe with a full path in argv[0].
+        self.process_argv = [NPM_OPENCODE] if process_argv is None else process_argv
+        self.process_info_raises = process_info_raises
         self.process_count = process_count
         self.prompt_ok = prompt_ok
         self.raise_on = raise_on          # status string to raise for non-listing calls
@@ -115,13 +123,19 @@ class FakeHerdr(hb.Herdr):
             return {"result": {"agents": self.agents}}
         if head == ("agent", "get"):
             agent = next((a for a in self.agents if a["pane_id"] == args[2]), None)
-            return {"result": {"agent": dict(agent)}} if agent else {"result": {}}
+            if agent is None:
+                # Real herdr prints {"error":{"code":"agent_not_found",...}} and
+                # exits 1, which Herdr.call turns into cli_error.
+                raise hb.Unavailable("cli_error")
+            return {"result": {"agent": dict(agent)}}
         if head == ("pane", "process-info"):
+            if self.process_info_raises:
+                raise hb.Unavailable(self.process_info_raises)
             # herdr's real shape: name, argv (a list), cmdline, pid, cwd. There
             # is no argv0 field; do not invent one.
             proc = {"name": self.process_name, "argv": list(self.process_argv),
                     "cmdline": " ".join(self.process_argv), "pid": 4242,
-                    "cwd": "/home/dt/src/ext/fleet-kit"}
+                    "cwd": "/home/user/src/ext/fleet-kit"}
             procs = [dict(proc) for _ in range(self.process_count)]
             return {"result": {"process_info": {"foreground_processes": procs,
                                                 "pane_id": args[3], "shell_pid": 4000}}}
@@ -436,64 +450,68 @@ class TestSafeSend(Base):
             self.assertEqual(herdr.sent, [])
             self.setUp()
 
-    def test_wrong_process_or_agent_is_refused(self):
-        self.assertEqual(self.gate(process_count=2)[1], "process_count_invalid")
-        self.setUp()
-        self.assertEqual(self.gate(process_count=0)[1], "process_count_invalid")
-        self.setUp()
-        self.assertEqual(self.gate(process_name="bash")[1], "process_not_opencode")
+    # herdr's agent detection is the authority on what runs in the pane; the
+    # foreground process name is not consulted (witt3rd/fleet-ops#28).
 
-    # opencode 2.x from npm runs as opencode.exe; herdr reports it with a full
-    # path in argv[0]. This is the shape observed on king (fleet-ops#28).
-    NPM_OPENCODE = "/home/dt/.local/share/mise/installs/node/26.6.0/lib/node_modules/@opencode/cli/bin/opencode.exe"
-
-    def test_bare_opencode_is_accepted(self):
-        herdr, status = self.gate(process_name="opencode", process_argv=["opencode", "--auto"])
+    def test_herdr_opencode_idle_with_npm_opencode_exe_is_ready(self):
+        herdr, status = self.gate()          # opencode.exe, full path in argv[0]
         self.assertEqual(status, "accepted")
         self.assertEqual(len(herdr.sent), 1)
+        self.assertEqual(self.pane()["attempts"][-1]["observed_pid"], 4242)
 
-    def test_npm_opencode_exe_with_full_path_argv0_is_accepted(self):
-        herdr, status = self.gate(process_name="opencode.exe",
-                                  process_argv=[self.NPM_OPENCODE, "--auto"])
-        self.assertEqual(status, "accepted")
-        self.assertEqual(len(herdr.sent), 1)
-
-    def test_full_path_argv0_alone_is_enough(self):
-        # A name herdr truncated or reported oddly still passes on argv[0].
-        herdr, status = self.gate(process_name="MainThread",
-                                  process_argv=[self.NPM_OPENCODE, "--auto"])
-        self.assertEqual(status, "accepted")
-
-    def test_a_bare_shell_is_refused(self):
-        for name, argv in (("bash", ["-bash"]), ("bash", ["/usr/bin/bash"]),
-                           ("zsh", ["/bin/zsh", "-l"])):
+    def test_the_process_name_is_not_a_gate(self):
+        for name, argv in (("opencode", ["opencode", "--auto"]),
+                           ("MainThread", [NPM_OPENCODE]),
+                           ("node", ["/usr/bin/node", "/x/opencode/index.js"])):
             herdr, status = self.gate(process_name=name, process_argv=argv)
-            self.assertEqual(status, "process_not_opencode", argv)
+            self.assertEqual(status, "accepted", name)
+            self.setUp()
+
+    def test_process_info_is_telemetry_only(self):
+        # An odd or failed process-info answer blanks the pid; it never blocks.
+        for kwargs in ({"process_count": 0}, {"process_count": 2},
+                       {"process_info_raises": "cli_error"}):
+            herdr, status = self.gate(**kwargs)
+            self.assertEqual(status, "accepted", kwargs)
+            self.assertNotIn("observed_pid", self.pane()["attempts"][-1], kwargs)
+            self.setUp()
+
+    def test_a_non_opencode_agent_kind_is_refused(self):
+        for kind in ("claude", "codex", "copilot", "", None):
+            agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
+                       "agent_status": "idle", "terminal_id": "term1"}]
+            herdr, status = self.gate(agents=agents)
+            self.assertEqual(status, "wrong_agent_kind", kind)
             self.assertEqual(herdr.sent, [])
             self.setUp()
 
-    def test_node_running_something_else_is_refused(self):
-        herdr, status = self.gate(process_name="node",
-                                  process_argv=["/usr/bin/node", "/srv/app/server.js"])
-        self.assertEqual(status, "process_not_opencode")
+    def test_no_agent_in_the_pane_is_refused(self):
+        # herdr's real answer for a pane with no agent, through the real call().
+        sock_path = self.home / "herdr.sock"
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(str(sock_path))
+        herdr = hb.Herdr({"herdr": "/dev/null/herdr", "socket": str(sock_path)},
+                         runner=fake_runner(returncode=1, stdout=json.dumps(
+                             {"error": {"code": "agent_not_found",
+                                        "message": "agent target w2:p2 not found"},
+                              "id": "cli:agent:get"})))
+        with self.assertRaises(hb.Unavailable) as caught:
+            herdr.inspect_pane("w2:p2")
+        self.assertEqual(str(caught.exception), "cli_error")
+
+    def test_an_agent_that_exits_before_the_send_is_not_woken(self):
+        # The staleness probe on king: when opencode exits -- /exit or SIGKILL --
+        # herdr drops the agent within 0.5s and the pane is back to its shell.
+        # Discovery saw an idle opencode; by inspection herdr says no agent.
+        herdr = FakeHerdr()
+        target = herdr.discover()[0]
+        herdr.agents = [a for a in herdr.agents if a["pane_id"] != target["pane_id"]]
+        herdr.process_name, herdr.process_argv = "bash", ["-bash"]
+        status = hb.tick_pane(self.state, herdr, target, now=1000.0)
+        self.assertEqual(status, "cli_error")
         self.assertEqual(herdr.sent, [])
-
-    def test_a_lookalike_is_refused(self):
-        for name, argv in (("opencode-foo", ["/usr/local/bin/opencode-foo"]),
-                           ("opencode-foo.exe", ["/x/bin/opencode-foo.exe"]),
-                           ("myopencode", ["myopencode"]),
-                           ("opencode.exe.bak", ["/x/opencode.exe.bak"])):
-            herdr, status = self.gate(process_name=name, process_argv=argv)
-            self.assertEqual(status, "process_not_opencode", argv)
-            self.assertEqual(herdr.sent, [])
-            self.setUp()
-
-    def test_executable_stem(self):
-        self.assertEqual(hb.executable_stem(self.NPM_OPENCODE), "opencode")
-        self.assertEqual(hb.executable_stem("opencode"), "opencode")
-        self.assertEqual(hb.executable_stem("C:\\bin\\OpenCode.EXE"), "OpenCode")
-        for bad in (None, "", 42, ["opencode"]):
-            self.assertEqual(hb.executable_stem(bad), "", bad)
+        self.assertNotIn(("agent", "read"), [c[:2] for c in herdr.calls])
 
     def test_empty_composer_accepts_any_agent_role(self):
         for role in ("Orchestrator", "Build", "Plan", "chief-of-staff"):
