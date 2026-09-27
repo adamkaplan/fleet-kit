@@ -476,14 +476,47 @@ class TestSafeSend(Base):
             self.assertNotIn("observed_pid", self.pane()["attempts"][-1], kwargs)
             self.setUp()
 
-    def test_a_non_opencode_agent_kind_is_refused(self):
-        for kind in ("claude", "codex", "copilot", "", None):
+    def test_a_kind_with_no_draft_guard_is_refused(self):
+        for kind in ("claude", "codex", "copilot", "grok", "", None):
             agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
                        "agent_status": "idle", "terminal_id": "term1"}]
             herdr, status = self.gate(agents=agents)
             self.assertEqual(status, "wrong_agent_kind", kind)
             self.assertEqual(herdr.sent, [])
+            # The screen is never even read: there is nothing to check it with.
+            self.assertNotIn(("agent", "read"), [c[:2] for c in herdr.calls], kind)
             self.setUp()
+
+    def test_an_unwakeable_kind_is_not_an_error_and_health_names_it(self):
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "claude",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents)
+        target = herdr.discover()[0]
+        now = 1000.0
+        for _ in range(3):
+            self.assertEqual(hb.tick_pane(self.state, herdr, target, now=now), "wrong_agent_kind")
+            pane = self.pane()
+            # Normal cadence, not a backoff retry, and not a growing error count.
+            self.assertGreater(pane["next_due"], now + 60)
+            now = pane["next_due"]
+        pane = self.pane()
+        self.assertEqual(herdr.sent, [])
+        self.assertEqual(pane.get("consecutive_errors", 0), 0)
+        self.assertEqual(pane.get("consecutive_defers", 0), 0)
+        self.assertEqual(pane["attempts"][-1]["agent_kind"], "claude")
+        self.assertTrue(pane["chronic_failure"])
+        self.assertEqual(pane["chronic_reason"], "agent_kind_not_wakeable:claude")
+
+    def test_switching_to_a_wakeable_kind_clears_the_finding(self):
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "codex",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents)
+        target = herdr.discover()[0]
+        hb.tick_pane(self.state, herdr, target, now=1000.0)
+        self.assertEqual(self.pane()["chronic_reason"], "agent_kind_not_wakeable:codex")
+        herdr.agents[0]["agent"] = "opencode"
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=self.pane()["next_due"]), "accepted")
+        self.assertFalse(self.pane()["chronic_failure"])
 
     def test_no_agent_in_the_pane_is_refused(self):
         # herdr's real answer for a pane with no agent, through the real call().
@@ -558,6 +591,12 @@ class TestDiscovery(Base):
         herdr = self.tabs("%s Payments" % BELL, "Web App")
         rows = {t["tab_id"]: t["supervised"] for t in herdr.tabs_with_agents()}
         self.assertEqual(rows, {"w0:t1": True, "w1:t1": False})
+
+    def test_list_shows_each_agent_kind_and_whether_it_can_be_woken(self):
+        herdr = self.tabs("%s Payments" % BELL, "%s Web App" % BELL)
+        herdr.agents[1]["agent"] = "claude"
+        rows = {t["tab_id"]: (t["agent_kind"], t["wakeable"]) for t in herdr.tabs_with_agents()}
+        self.assertEqual(rows, {"w0:t1": ("opencode", True), "w1:t1": ("claude", False)})
 
 
 # ------------------------------------------------- the daemon writes no tab titles

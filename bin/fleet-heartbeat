@@ -128,11 +128,16 @@ STRUCTURAL_STATUSES = {
     "socket_unavailable",
     "cli_error",
     "cli_unavailable",
-    "wrong_agent_kind",
     "inspection_error",
     "unavailable",
 }
-# Of those, the ones that could mean herdr itself has gone. Seeing one of these
+# A supervised pane whose agent kind has no draft guard in WAKEABLE_KINDS. It is
+# never sent anything, and it is not an error either: nothing is broken, and
+# counting it as one used to report "consecutive_errors=2" instead of the cause.
+# It is re-checked on its normal cadence, since the pane may start another
+# agent, and health names the kind (`agent_kind_not_wakeable:<kind>`).
+NOT_WAKEABLE_STATUSES = {"wrong_agent_kind"}
+# Of the structural ones, the ones that could mean herdr itself has gone. Seeing one of these
 # re-runs the startup verification, which is what turns "retried forever, in
 # silence" into "the service is down and says why".
 HERDR_SUSPECT_STATUSES = {"cli_error", "cli_unavailable"}
@@ -478,6 +483,8 @@ class Herdr:
                 "tab_id": tab.get("tab_id"),
                 "pane_id": agent.get("pane_id"),
                 "label": label,
+                "agent_kind": agent.get("agent"),
+                "wakeable": agent.get("agent") in WAKEABLE_KINDS,
                 "supervised": BELL in label,
             })
         return found
@@ -514,11 +521,12 @@ class Herdr:
         agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
         input_box_is_empty = WAKEABLE_KINDS.get(agent.get("agent"))
         if input_box_is_empty is None:
-            return "wrong_agent_kind", {}
+            return "wrong_agent_kind", {"agent_kind": agent.get("agent")}
         if agent.get("agent_status") not in {"idle", "done"}:
             return "busy_or_blocked_or_unknown", {}
 
         observed = {
+            "agent_kind": agent.get("agent"),
             "pid": self.foreground_pid(pane_id),
             "terminal_id": agent.get("terminal_id"),
             "cwd": agent.get("cwd"),
@@ -574,7 +582,12 @@ def compute_pane_health(pane_state, interval_m, now_ts):
     since_accepted = (now_ts - accepted_ts) if accepted_ts is not None else None
 
     reason = None
-    if errors >= CHRONIC_CONSECUTIVE_ERRORS:
+    latest = attempts[-1] if attempts else {}
+    if latest.get("status") in NOT_WAKEABLE_STATUSES:
+        # Not a delivery problem, and no amount of retrying fixes it: the bell
+        # is on a pane the heartbeat has no draft guard for.
+        reason = "agent_kind_not_wakeable:%s" % (latest.get("agent_kind") or "unknown")
+    elif errors >= CHRONIC_CONSECUTIVE_ERRORS:
         reason = "consecutive_errors=%d" % errors
     elif total >= CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED and accepted == 0:
         reason = "stalled_zero_accepted(%d_attempts)" % total
@@ -665,6 +678,8 @@ def tick_pane(state_dir, transport, target, now=None):
         attempt["accepted"] = utc(time.time())
     if observed.get("pid"):
         attempt["observed_pid"] = observed["pid"]
+    if status in NOT_WAKEABLE_STATUSES:
+        attempt["agent_kind"] = observed.get("agent_kind")
 
     with state_lock(state_dir):
         # Re-read under the lock: an ack may have landed while we were in I/O,
@@ -1045,14 +1060,16 @@ def cmd_list(args):
         return EXIT_FAULT
 
     state = read_state(ack.resolve_state_dir(args.state_dir))
-    print("%-10s %-8s %-9s %-11s %-9s %-8s %s" %
-          ("WORKSPACE", "TAB", "PANE", "SUPERVISED", "CADENCE", "STAGGER", "LABEL"))
-    print("-" * 96)
+    row = "%-10s %-8s %-9s %-11s %-11s %-9s %-9s %-8s %s"
+    print(row % ("WORKSPACE", "TAB", "PANE", "KIND", "SUPERVISED", "WAKEABLE", "CADENCE", "STAGGER", "LABEL"))
+    print("-" * 118)
     for target in targets:
         pane = state.get("panes", {}).get(target["pane_id"], {})
-        print("%-10s %-8s %-9s %-11s %-9s %-8s %s" % (
+        print(row % (
             target["workspace_id"] or "-", target["tab_id"] or "-", target["pane_id"] or "-",
+            target["agent_kind"] or "-",
             "yes" if target["supervised"] else "no (no %s)" % BELL,
+            "yes" if target["wakeable"] else "no",
             "%.1fm" % pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES),
             "%ds" % stagger_offset(target["pane_id"] or ""),
             target["label"]))
