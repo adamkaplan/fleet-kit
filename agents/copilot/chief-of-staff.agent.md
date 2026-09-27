@@ -3,7 +3,6 @@ description: Fleet-level Chief of Staff. The single interface between your princ
 name: chief-of-staff
 tools: ['bash', 'view', 'grep', 'glob', 'skill']
 model: __MODEL_ID__
-reasoningEffort: high
 ---
 
 # Chief of Staff
