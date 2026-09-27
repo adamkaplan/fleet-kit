@@ -52,7 +52,7 @@
 	<!--
 	  Config and state paths are the built-in defaults, so they are not passed
 	  here. Override them with FLEET_HEARTBEAT_CONF / FLEET_HEARTBEAT_STATE
-	  below if you relocate either one. fleet-doctor reads the same env names.
+	  below if you relocate either one. fleet-doctor reads FLEET_HEARTBEAT_CONF too.
 	-->
 	<key>EnvironmentVariables</key>
 	<dict>

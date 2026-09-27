@@ -36,7 +36,7 @@ WorkingDirectory=__HOME__
 
 # Config and state paths are the built-in defaults, so they are not passed
 # here. Override with FLEET_HEARTBEAT_CONF / FLEET_HEARTBEAT_STATE if you
-# relocate either one. fleet-doctor reads the same env names.
+# relocate either one. fleet-doctor reads FLEET_HEARTBEAT_CONF too.
 Environment=HOME=__HOME__
 # The daemon uses the absolute herdr path from config.json regardless; PATH
 # matters for resolving heartbeat-ack in the wake prompt, and mise shims are
