@@ -75,7 +75,8 @@ class FakeHerdr(hb.Herdr):
     """Stands in for the herdr CLI. Records everything, never touches a socket."""
 
     def __init__(self, tabs=None, agents=None, status="idle", screen=None,
-                 process_name="opencode", process_count=1, prompt_ok=True, raise_on=None):
+                 process_name="opencode", process_argv=None, process_count=1,
+                 prompt_ok=True, raise_on=None):
         super().__init__({"herdr": "/dev/null/herdr", "socket": "/dev/null/sock"})
         self.tabs = tabs if tabs is not None else [
             {"tab_id": "w2:t2", "workspace_id": "w2", "label": "%s Payments" % BELL},
@@ -90,6 +91,8 @@ class FakeHerdr(hb.Herdr):
         self.status = status
         self.screen = composer() if screen is None else screen
         self.process_name = process_name
+        # herdr reports argv as a list; default to the bare name as argv[0].
+        self.process_argv = [process_name] if process_argv is None else process_argv
         self.process_count = process_count
         self.prompt_ok = prompt_ok
         self.raise_on = raise_on          # status string to raise for non-listing calls
@@ -114,8 +117,14 @@ class FakeHerdr(hb.Herdr):
             agent = next((a for a in self.agents if a["pane_id"] == args[2]), None)
             return {"result": {"agent": dict(agent)}} if agent else {"result": {}}
         if head == ("pane", "process-info"):
-            procs = [{"name": self.process_name, "argv0": self.process_name, "pid": 4242}] * self.process_count
-            return {"result": {"process_info": {"foreground_processes": procs}}}
+            # herdr's real shape: name, argv (a list), cmdline, pid, cwd. There
+            # is no argv0 field; do not invent one.
+            proc = {"name": self.process_name, "argv": list(self.process_argv),
+                    "cmdline": " ".join(self.process_argv), "pid": 4242,
+                    "cwd": "/home/dt/src/ext/fleet-kit"}
+            procs = [dict(proc) for _ in range(self.process_count)]
+            return {"result": {"process_info": {"foreground_processes": procs,
+                                                "pane_id": args[3], "shell_pid": 4000}}}
         if head == ("agent", "read"):
             return self.screen
         if head == ("agent", "prompt"):
@@ -433,6 +442,58 @@ class TestSafeSend(Base):
         self.assertEqual(self.gate(process_count=0)[1], "process_count_invalid")
         self.setUp()
         self.assertEqual(self.gate(process_name="bash")[1], "process_not_opencode")
+
+    # opencode 2.x from npm runs as opencode.exe; herdr reports it with a full
+    # path in argv[0]. This is the shape observed on king (fleet-ops#28).
+    NPM_OPENCODE = "/home/dt/.local/share/mise/installs/node/26.6.0/lib/node_modules/@opencode/cli/bin/opencode.exe"
+
+    def test_bare_opencode_is_accepted(self):
+        herdr, status = self.gate(process_name="opencode", process_argv=["opencode", "--auto"])
+        self.assertEqual(status, "accepted")
+        self.assertEqual(len(herdr.sent), 1)
+
+    def test_npm_opencode_exe_with_full_path_argv0_is_accepted(self):
+        herdr, status = self.gate(process_name="opencode.exe",
+                                  process_argv=[self.NPM_OPENCODE, "--auto"])
+        self.assertEqual(status, "accepted")
+        self.assertEqual(len(herdr.sent), 1)
+
+    def test_full_path_argv0_alone_is_enough(self):
+        # A name herdr truncated or reported oddly still passes on argv[0].
+        herdr, status = self.gate(process_name="MainThread",
+                                  process_argv=[self.NPM_OPENCODE, "--auto"])
+        self.assertEqual(status, "accepted")
+
+    def test_a_bare_shell_is_refused(self):
+        for name, argv in (("bash", ["-bash"]), ("bash", ["/usr/bin/bash"]),
+                           ("zsh", ["/bin/zsh", "-l"])):
+            herdr, status = self.gate(process_name=name, process_argv=argv)
+            self.assertEqual(status, "process_not_opencode", argv)
+            self.assertEqual(herdr.sent, [])
+            self.setUp()
+
+    def test_node_running_something_else_is_refused(self):
+        herdr, status = self.gate(process_name="node",
+                                  process_argv=["/usr/bin/node", "/srv/app/server.js"])
+        self.assertEqual(status, "process_not_opencode")
+        self.assertEqual(herdr.sent, [])
+
+    def test_a_lookalike_is_refused(self):
+        for name, argv in (("opencode-foo", ["/usr/local/bin/opencode-foo"]),
+                           ("opencode-foo.exe", ["/x/bin/opencode-foo.exe"]),
+                           ("myopencode", ["myopencode"]),
+                           ("opencode.exe.bak", ["/x/opencode.exe.bak"])):
+            herdr, status = self.gate(process_name=name, process_argv=argv)
+            self.assertEqual(status, "process_not_opencode", argv)
+            self.assertEqual(herdr.sent, [])
+            self.setUp()
+
+    def test_executable_stem(self):
+        self.assertEqual(hb.executable_stem(self.NPM_OPENCODE), "opencode")
+        self.assertEqual(hb.executable_stem("opencode"), "opencode")
+        self.assertEqual(hb.executable_stem("C:\\bin\\OpenCode.EXE"), "OpenCode")
+        for bad in (None, "", 42, ["opencode"]):
+            self.assertEqual(hb.executable_stem(bad), "", bad)
 
     def test_empty_composer_accepts_any_agent_role(self):
         for role in ("Orchestrator", "Build", "Plan", "chief-of-staff"):

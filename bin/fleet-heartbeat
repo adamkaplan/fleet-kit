@@ -420,6 +420,36 @@ def empty_composer(screen):
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
 
 
+def executable_stem(value):
+    """The bare program name in a process name or argv[0]: basename, minus `.exe`.
+
+    `/…/node_modules/@opencode/cli/bin/opencode.exe` and `opencode` both come
+    out as `opencode`. Anything that is not a non-empty string comes out empty.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    stem = value.replace("\\", "/").rsplit("/", 1)[-1]
+    if stem.lower().endswith(".exe"):
+        stem = stem[:-4]
+    return stem
+
+
+def is_opencode_process(process):
+    """Is this herdr foreground process an OpenCode agent?
+
+    herdr's `pane process-info` reports each process as `name`, `argv` (a list),
+    `cmdline`, `pid` and `cwd`. OpenCode's executable takes more than one form:
+    a bare `opencode`, or — as npm installs opencode 2.x — a full path to
+    `opencode.exe`. So the check reduces `name` and `argv[0]` to their
+    executable stem (see `executable_stem`) and requires either to be exactly
+    `opencode`. The match is exact after that reduction, so a shell, `node`
+    running anything, or a lookalike such as `opencode-foo` is still refused.
+    """
+    argv = process.get("argv")
+    argv0 = argv[0] if isinstance(argv, list) and argv else None
+    return any(executable_stem(value) == "opencode" for value in (process.get("name"), argv0))
+
+
 # ------------------------------------------------------------------ the transport
 
 class Herdr:
@@ -495,7 +525,7 @@ class Herdr:
         if len(processes) != 1:
             return "process_count_invalid", {}
         process = processes[0]
-        if process.get("name") != "opencode" and process.get("argv0") != "opencode":
+        if not is_opencode_process(process):
             return "process_not_opencode", {}
 
         observed = {
