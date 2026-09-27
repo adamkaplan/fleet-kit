@@ -323,7 +323,7 @@ you through a browser you did not need to open.
 Because every step checks first, the whole install is safe to re-run. If it dies
 halfway, run it again — it picks up where it stopped rather than starting over.
 
-Run `fleet-doctor` at the end. Run it again any time something feels wrong — it
+Run `./bin/fleet-doctor` at the end. Run it again any time something feels wrong — it
 is the same check either way.
 
 ### Steps that need a human
@@ -449,7 +449,7 @@ correction that stays on one laptop has to be discovered again by everyone else.
 
 ## Getting started
 
-1. Install it, agent-driven, and get `fleet-doctor` green.
+1. Install it, agent-driven, and get `./bin/fleet-doctor` green.
 2. Open one charter, run one orchestrator, dispatch a few coders. One afternoon
    is enough to learn the shape.
 3. Add a workspace per project. This is the step that scales — each one is a new
