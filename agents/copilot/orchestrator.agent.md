@@ -3,7 +3,6 @@ description: Workspace orchestrator. Owns one charter issue, decides what needs 
 name: orchestrator
 tools: ['bash', 'view', 'grep', 'glob', 'skill']
 model: __MODEL_ID__
-reasoningEffort: high
 ---
 
 # Orchestrator

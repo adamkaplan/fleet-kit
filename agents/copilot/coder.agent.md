@@ -3,7 +3,6 @@ description: Ephemeral worker. One assignment, one git worktree. Writes the code
 name: coder
 tools: ['bash', 'view', 'grep', 'glob', 'create', 'edit', 'skill']
 model: __MODEL_ID__
-reasoningEffort: high
 ---
 
 # Coder

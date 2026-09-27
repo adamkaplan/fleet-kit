@@ -353,7 +353,6 @@ sides, but the fields differ:
 | opencode | Copilot CLI |
 |---|---|
 | `model: github-copilot/claude-opus-5` | `model: claude-opus-5` |
-| `variant: high` | `reasoningEffort: high` |
 | `permission:` block | `tools:` allow-list |
 
 Both formats ship in `agents/`. Use the one for your harness.
