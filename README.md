@@ -123,6 +123,11 @@ between a fleet you supervise and one that supervises itself. An orchestrator
 opts in by having 🔔 in its tab label — one glyph, one rule, and nothing is woken
 until you add it.
 
+The heartbeat wakes only opencode panes. A Copilot CLI pane with 🔔 in its label
+is never woken: before sending anything, `bin/fleet-heartbeat` checks the pane's
+agent kind and skips anything that is not `opencode` (`inspect_pane`, status
+`wrong_agent_kind`). Copilot orchestrators still work; they just wait for you.
+
 ---
 
 ## Who does what

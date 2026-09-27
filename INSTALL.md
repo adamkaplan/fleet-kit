@@ -322,6 +322,12 @@ That is the whole opt-in mechanism: one glyph, one rule. `./bin/fleet-heartbeat
 list` shows every tab holding an agent and whether it opts in, so if something is
 not being woken, that command answers why.
 
+**The heartbeat wakes only opencode panes.** A Copilot CLI pane with 🔔 in its
+label is never woken. Before sending, `bin/fleet-heartbeat` asks herdr for the
+pane's agent kind and skips anything that is not `opencode` (`inspect_pane`,
+status `wrong_agent_kind`). If the person runs orchestrators in Copilot CLI, tell
+them this step will not supervise those panes.
+
 ---
 
 ## STEP 12 — Charter template (optional, 5 seconds)
