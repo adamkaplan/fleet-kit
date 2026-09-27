@@ -197,9 +197,19 @@ CHECK:   Copilot CLI:  ls ~/.copilot/agents/
 DO:      Copilot CLI:  mkdir -p ~/.copilot/agents && cp agents/copilot/*.md ~/.copilot/agents/
          opencode:     mkdir -p ~/.config/opencode/agents && cp agents/opencode/*.md ~/.config/opencode/agents/
 VERIFY:  Copilot CLI:  copilot --agent chief-of-staff -p "Reply with only your role name." -s
-         opencode:     opencode --agent chief-of-staff --help
-PROVES:  the agent resolves by name. An unknown-agent error means it did not install.
+         opencode:     opencode api get /api/agent | grep -o '"chief-of-staff"'
+PROVES:  the agent resolves by name. An unknown-agent error (Copilot) or no match
+         (opencode) means it did not install.
 ```
+
+Do not verify opencode with `opencode --agent … --help`. OpenCode v2's TUI has
+no `--agent` flag, and `--help` exits 0 before anything is resolved, so that
+check passes whether or not the agent exists. `opencode api` asks the running
+service for the agents it actually loaded.
+
+To use an agent in opencode v2, start `opencode` and pick it with `/agents`
+(or `Ctrl+X` `A`, or `Shift+Tab` to cycle). Only `opencode run` takes
+`--agent`. Copilot CLI takes `copilot --agent <name>` directly.
 
 ```
 CHECK:   grep -l '__MODEL_ID__\|__PROVIDER__' <agents dir>/*.md
