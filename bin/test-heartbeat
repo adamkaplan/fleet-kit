@@ -77,6 +77,251 @@ def composer(draft="", sidebar=True, auto=True, role="Orchestrator"):
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------ captured screens
+#
+# Real `herdr agent read --source detection` captures from a live probe
+# (witt3rd/fleet-ops#33), sanitised: the working directory is /work/project,
+# model names are generic, long rules and wide padding are shortened, and each
+# is cut to the rows the checks look at. Every draft was typed into a throwaway
+# probe tab with `herdr agent send-keys`. herdr reported every one of these
+# screens as idle or done, including the dialogs — which is the point.
+#
+# CODEX_HOOKS_DIALOG is rebuilt from a visible read whose blank rows were not
+# kept; its text is verbatim, its blank rows are approximate. No trust or login
+# dialog was answered to take these.
+
+OPENCODE_EMPTY = "\n".join([
+    '',
+    '',
+    '  ┃',
+    '  ┃',
+    '  ┃',
+    '  ┃  Build · Model Name',
+    '  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
+    '  /work/project    14.4K (1%) · $0.06  ctrl+p commands',
+])
+
+OPENCODE_WELCOME = "\n".join([
+    '        ▄',
+    '        █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█',
+    '        █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀',
+    '        ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀',
+    '',
+    '',
+    '        ┃',
+    '        ┃  Ask anything… "Fix a TODO in the codebase"',
+    '        ┃',
+    '        ┃  Build · Model Name',
+    '        ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
+    '        /work/project    shift+tab agents  ctrl+p commands',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '  ⊙ 1 MCP /mcps    2.0.11',
+])
+
+OPENCODE_DRAFT = "\n".join([
+    '',
+    '',
+    '  ┃',
+    '  ┃  draft text',
+    '  ┃',
+    '  ┃  Build · Model Name',
+    '  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
+    '  /work/project    14.4K (1%) · $0.06  ctrl+p commands',
+])
+
+OPENCODE_DRAFT_MULTILINE = "\n".join([
+    '',
+    '',
+    '  ┃',
+    '  ┃  draft text',
+    '  ┃  line2',
+    '  ┃',
+    '  ┃  Build · Model Name',
+    '  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
+    '  /work/project    14.4K (1%) · $0.06  ctrl+p commands',
+])
+
+OPENCODE_SLASH_MENU = "\n".join([
+    '  ┃ /cd          Change working directory    ┃',
+    '  ┃ /clear       New session    ┃',
+    '  ┃ /compact     Compact session    ┃',
+    '  ┃ /connect     Connect an integration    ┃',
+    '  ┃ /continue    Switch session    ┃',
+    '  ┃ /copy        Copy session transcript    ┃',
+    '  ┃ /debug       View debug info    ┃',
+    '  ┃ /diff        Open diff viewer    ┃',
+    '  ┃',
+    '  ┃  /',
+    '  ┃',
+    '  ┃  Build · Model Name',
+    '  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀',
+    '  /work/project    14.4K (1%) · $0.06  ctrl+p commands',
+])
+
+PI_STARTUP = "\n".join([
+    '────────────────────────────────────────────────────────────────────────────────',
+    ' Update Available',
+    ' New version 0.87.1 is available. Run pi update',
+    ' Changelog: https://pi.dev/changelog',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '/work/project',
+    '0.0%/1.0M (auto)    (provider) model • high',
+])
+
+PI_EMPTY = "\n".join([
+    '',
+    " I don't have a specific name assigned in my context. I'm pi, a coding agent.",
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '/work/project',
+    '↑134 ↓21 R2.9k CH95.6% $0.000 0.3%/1.0M (auto)    (provider) model • high',
+])
+
+PI_DRAFT = "\n".join([
+    '',
+    " I don't have a specific name assigned in my context. I'm pi, a coding agent.",
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    'draft text',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '/work/project',
+    '↑134 ↓21 R2.9k CH95.6% $0.000 0.3%/1.0M (auto)    (provider) model • high',
+])
+
+PI_DRAFT_MULTILINE = "\n".join([
+    '',
+    " I don't have a specific name assigned in my context. I'm pi, a coding agent.",
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    'draft text',
+    'line2',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '/work/project',
+    '↑134 ↓21 R2.9k CH95.6% $0.000 0.3%/1.0M (auto)    (provider) model • high',
+])
+
+PI_SLASH_MENU = "\n".join([
+    '',
+    " I don't have a specific name assigned in my context. I'm pi, a coding agent.",
+    '',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '/',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '→ settings    Open settings menu',
+    '  model    <provider/model> — Select model (opens selector UI)',
+    '  tree    Navigate session tree (switch branches)',
+    '  thinking    <level> — Set thinking level',
+    '  scoped-models    Enable/disable models for Ctrl+P cycling',
+    '  (1/41)',
+    '/work/project',
+    '↑134 ↓21 R2.9k CH95.6% $0.000 0.3%/1.0M (auto)    (provider) model • high',
+])
+
+CLAUDE_TRUST_DIALOG = "\n".join([
+    '────────────────────────────────────────────────────────────────────────────────',
+    ' Accessing workspace:',
+    '',
+    ' /work/project',
+    '',
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.",
+    '',
+    " Claude Code'll be able to read, edit, and execute files here.",
+    '',
+    ' Security guide',
+    '',
+    ' ❯ 1. Yes, I trust this folder',
+    '   2. No, exit',
+    '',
+    ' Enter to confirm · Esc to cancel',
+])
+
+CODEX_TRUST_DIALOG = "\n".join([
+    '',
+    '  Folder access',
+    '  /work/project',
+    '',
+    '  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.',
+    '',
+    '› 1. Trust and continue',
+    '  2. Back to Agent Command Center',
+    '',
+    '  enter continue · esc back',
+])
+
+GROK_DEVICE_LOGIN = "\n".join([
+    '',
+    '',
+    '        Copying not working? Click here to show full URL.',
+    '',
+    '        Waiting for approval...',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '        ctrl+q  quit',
+])
+
+CODEX_HOOKS_DIALOG = "\n".join([
+    '',
+    '  Hooks need review',
+    '',
+    '  1 hook is new or changed.',
+    '  Hooks can run outside the sandbox after you trust them.',
+    '',
+    '\u203a 1. Review hooks',
+    '  2. Trust all and continue',
+    "  3. Continue without trusting (hooks won't run)",
+    '',
+    '  enter confirm \u00b7 esc skip',
+])
+
+
 class FakeHerdr(hb.Herdr):
     """Stands in for the herdr CLI. Records everything, never touches a socket."""
 
@@ -557,6 +802,81 @@ class TestSafeSend(Base):
         herdr, status = self.gate()
         self.assertEqual(status, "paused")
         self.assertEqual(herdr.sent, [])
+
+
+# ------------------------------------------------------- the per-kind fixture rule
+
+# A kind is wakeable only with a positive empty-input-box check and captured
+# fixtures in all three classes: an empty box (must read as ready), a typed
+# draft (must not), and a dialog or other non-empty screen (must not).
+KIND_FIXTURES = {
+    "opencode": {
+        "empty": [OPENCODE_EMPTY],
+        "draft": [OPENCODE_DRAFT, OPENCODE_DRAFT_MULTILINE, OPENCODE_SLASH_MENU],
+        # The fresh-session welcome screen shows placeholder text in the box.
+        # In plain text that is indistinguishable from a draft, so it defers.
+        "other": [OPENCODE_WELCOME],
+    },
+}
+
+# Screens that must never read as ready under any registered check. The trust
+# and login dialogs are the ones herdr reported as idle.
+DIALOGS = {
+    "claude trust": CLAUDE_TRUST_DIALOG,
+    "codex trust": CODEX_TRUST_DIALOG,
+    "codex hooks": CODEX_HOOKS_DIALOG,
+    "grok device login": GROK_DEVICE_LOGIN,
+}
+
+
+class TestKindFixtures(Base):
+    def test_every_wakeable_kind_has_all_three_fixture_classes(self):
+        self.assertEqual(set(hb.WAKEABLE_KINDS), set(KIND_FIXTURES))
+        for kind, classes in KIND_FIXTURES.items():
+            for name in ("empty", "draft", "other"):
+                self.assertTrue(classes.get(name), "%s has no %s fixture" % (kind, name))
+
+    def test_each_kind_reads_its_own_fixtures_correctly(self):
+        for kind, classes in KIND_FIXTURES.items():
+            check = hb.WAKEABLE_KINDS[kind]
+            for screen in classes["empty"]:
+                self.assertTrue(check(screen), kind)
+            for name in ("draft", "other"):
+                for screen in classes[name]:
+                    self.assertFalse(check(screen), "%s %s:\n%s" % (kind, name, screen))
+
+    def test_no_check_accepts_a_dialog_or_another_kinds_screen(self):
+        for kind, check in hb.WAKEABLE_KINDS.items():
+            for name, screen in DIALOGS.items():
+                self.assertFalse(check(screen), "%s accepted %s" % (kind, name))
+            for other, classes in KIND_FIXTURES.items():
+                if other == kind:
+                    continue
+                for screen in classes["empty"] + classes["draft"] + classes["other"]:
+                    self.assertFalse(check(screen), "%s accepted a %s screen" % (kind, other))
+
+    def test_a_dialog_reported_idle_is_never_sent_anything(self):
+        # End to end: herdr says idle, the screen is a trust dialog.
+        for kind in hb.WAKEABLE_KINDS:
+            for name, screen in DIALOGS.items():
+                agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
+                           "agent_status": "idle", "terminal_id": "term1"}]
+                herdr = FakeHerdr(agents=agents, screen=screen)
+                status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+                self.assertEqual(status, "draft_or_unknown", (kind, name))
+                self.assertEqual(herdr.sent, [])
+                self.setUp()
+
+    def test_a_kind_without_a_guard_is_refused_on_its_own_dialog(self):
+        for kind, screen in (("claude", CLAUDE_TRUST_DIALOG), ("codex", CODEX_TRUST_DIALOG),
+                             ("codex", CODEX_HOOKS_DIALOG), ("grok", GROK_DEVICE_LOGIN)):
+            agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
+                       "agent_status": "idle", "terminal_id": "term1"}]
+            herdr = FakeHerdr(agents=agents, screen=screen)
+            status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+            self.assertEqual(status, "wrong_agent_kind", kind)
+            self.assertEqual(herdr.sent, [])
+            self.setUp()
 
 
 # ------------------------------------------------------------------- discovery
