@@ -98,14 +98,19 @@ gh_guard() {
 }
 
 # --------------------------------------------------------------- config load
-# Env wins over file, file wins over defaults.
-_env_repo="$FLEET_REPO"; _env_prefix="$FLEET_PREFIX"
+# Env wins over file, file wins over defaults — for every variable read here.
+# A non-empty environment value is saved before the file is sourced and put
+# back afterwards. ${!v} and printf -v are both bash 3.2.
+CONFIG_VARS="FLEET_REPO FLEET_PREFIX FLEET_HEARTBEAT_CONF FLEET_HEARTBEAT_LABEL FLEET_HEARTBEAT_UNIT HERDR_SOCKET_PATH"
+for _v in $CONFIG_VARS; do printf -v "_env_$_v" '%s' "${!_v}"; done
 CONFIG_FILE="$HOME/.config/fleet-kit/config"
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE" 2>/dev/null
 fi
-[ -n "$_env_repo" ]   && FLEET_REPO="$_env_repo"
-[ -n "$_env_prefix" ] && FLEET_PREFIX="$_env_prefix"
+for _v in $CONFIG_VARS; do
+  _e="_env_$_v"
+  [ -n "${!_e}" ] && printf -v "$_v" '%s' "${!_e}"
+done
 [ -z "$FLEET_PREFIX" ] && FLEET_PREFIX="$(whoami)"
 
 L_ORCH="${FLEET_PREFIX}:orchestrator"
