@@ -326,6 +326,8 @@ halfway, run it again — it picks up where it stopped rather than starting over
 Run `./bin/fleet-doctor` at the end. Run it again any time something feels wrong — it
 is the same check either way.
 
+The offline test suites (`bin/test-*`) run on every PR and every push to `main`; results are on the repo's [Actions tab](https://github.com/adamkaplan/fleet-kit/actions/workflows/test.yml).
+
 ### Steps that need a human
 
 Your agent will stop at these. That is correct behaviour, not a failure:
