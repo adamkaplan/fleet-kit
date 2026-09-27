@@ -142,6 +142,24 @@ print(len(panes))' "$TMPDIR_FD/panes.txt" 2>/dev/null)
 fi
 
 # =========================================================== 2. agent CLI
+
+# opencode_version RAW — the dotted version out of an `opencode --version`
+# line, or nothing. Accepts "1.18.32", "v2.0.11" and "opencode v2.0.11".
+opencode_version() {
+  printf '%s\n' "$1" | sed -nE 's/^[^0-9]*([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -1
+}
+
+# opencode_generation VERSION — v1, v2 or unknown. It decides how a named agent
+# starts: v1's TUI takes --agent; v2's TUI does not. An unrecognised major is
+# "unknown" rather than a guess.
+opencode_generation() {
+  case "$1" in
+    1.*) echo v1 ;;
+    2.*) echo v2 ;;
+    *)   echo unknown ;;
+  esac
+}
+
 cli_desc=""; cli_found=0
 if have copilot; then
   cv=""
@@ -150,9 +168,13 @@ if have copilot; then
   [ -n "$cv" ] || cv="?"
   cli_desc="copilot $cv"; cli_found=1
 fi
+oc_raw=""; oc_gen=""
 if have opencode; then
   ov=""
-  run_to 10 opencode --version && ov=$(printf '%s' "$LAST_OUT" | head -1 | tr -d '[:space:]')
+  # v1 prints a bare "1.18.32"; v2 prints "opencode v2.0.11".
+  run_to 10 opencode --version && oc_raw=$(printf '%s' "$LAST_OUT" | head -1)
+  ov=$(opencode_version "$oc_raw")
+  oc_gen=$(opencode_generation "$ov")
   [ -n "$ov" ] || ov="?"
   if [ -n "$cli_desc" ]; then cli_desc="$cli_desc, opencode $ov"; else cli_desc="opencode $ov"; fi
   cli_found=1
@@ -172,6 +194,25 @@ else
   else
     emit ok agent-cli "$cli_desc"
   fi
+fi
+
+# =========================================================== 2b. dispatch mode
+# How an orchestrator starts a *named* agent in a herdr pane on this machine.
+# Classification only; nothing is started. The full recipe is in the
+# fleet-coordination skill, "Starting a named agent in a pane".
+if have copilot; then
+  emit ok dispatch "copilot: agent start <n> --kind copilot --pane <p> -- --agent <agent>"
+fi
+if have opencode; then
+  case "$oc_gen" in
+    v1)
+      emit ok dispatch "opencode $ov = v1: agent start <n> --kind opencode --pane <p> -- --agent <agent>" ;;
+    v2)
+      emit ok dispatch "opencode $ov = v2: no TUI --agent; opencode api session.create {agent,location} then agent start … -- -s <ses_id>" ;;
+    *)
+      LAST_OUT="$oc_raw"
+      emit WARN dispatch "opencode '${oc_raw:-no --version output}' = unknown: start plain opencode, pick the agent with Shift+Tab, read the footer after every key" ;;
+  esac
 fi
 
 # =========================================================== 3. gh auth
