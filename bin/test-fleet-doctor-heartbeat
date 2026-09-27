@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""test-fleet-doctor-heartbeat — offline tests for fleet-doctor's heartbeat-health check.
+
+Runs a copy of the real bin/fleet-doctor from a scratch bin dir. Beside it
+sits a stub `fleet-heartbeat` that prints a canned `status --json` document
+and logs its argv. PATH is hermetic: no herdr, no gh, no network, no real
+heartbeat. HOME is a temp dir, so no real config or state is read. The PATH
+holds only symlinks to the ordinary utilities the script needs.
+
+    bin/test-fleet-doctor-heartbeat           # everything
+    bin/test-fleet-doctor-heartbeat Chronic   # only tests whose name contains "Chronic"
+
+Exits non-zero if anything fails.
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+BIN = Path(__file__).resolve().parent
+DOCTOR = BIN / "fleet-doctor"
+# The commit before this check existed, used to show the old behaviour.
+BASELINE = "234385a"
+
+UTILITIES = ("bash", "sh", "env", "mktemp", "rm", "cat", "sed", "awk", "grep",
+             "head", "tr", "python3", "whoami", "uname", "sleep", "kill",
+             "dirname", "pwd")
+
+STUB = """#!/bin/sh
+printf '%%s\\n' "$*" >> "%(log)s"
+cat "%(doc)s"
+exit %(rc)d
+"""
+
+
+def status_doc(service=None, health=None, live=None):
+    service = {"pid": 4242, "started": "2026-09-27T00:00:00+00:00", "fault": None,
+               "fault_message": None, "fault_since": None} if service is None else service
+    health = health or {}
+    return {
+        "paused": False, "state_dir": "/state", "config": "/config.json", "notes": [],
+        "service": service, "panes": {p: {} for p in health},
+        "live_panes": sorted(health) if live is None else live,
+        "health": health,
+    }
+
+
+def healthy(pane_errors=0):
+    return {"accepted_attempts": 5, "total_attempts": 5, "chronic_failure": False,
+            "chronic_reason": None, "consecutive_errors": pane_errors,
+            "consecutive_defers": 0, "success_rate": 1.0, "last_accepted_ts": 1.0}
+
+
+def chronic(errors, total=20):
+    return {"accepted_attempts": 0, "total_attempts": total, "chronic_failure": True,
+            "chronic_reason": "consecutive_errors=%d" % errors, "consecutive_errors": errors,
+            "consecutive_defers": 0, "success_rate": 0.0, "last_accepted_ts": None}
+
+
+FAULT = {"pid": 4242, "fault": "herdr_missing", "fault_message": "herdr not found at /x/herdr",
+         "fault_since": "2026-09-27T01:00:00+00:00"}
+
+
+class DoctorRun:
+    """One fleet-doctor run in a scratch HOME with a stubbed fleet-heartbeat."""
+
+    def __init__(self, tmp, doc_text, rc=0, stub=True, installed=True, doctor_src=None):
+        self.tmp = Path(tmp)
+        self.path_dir = self.tmp / "path"
+        self.path_dir.mkdir()
+        self.bin_dir = self.tmp / "bin"
+        self.bin_dir.mkdir()
+        self.log = self.tmp / "calls.log"
+        self.log.touch()
+        for tool in UTILITIES:
+            real = shutil.which(tool)
+            if real:
+                (self.path_dir / tool).symlink_to(real)
+
+        self.doctor = self.bin_dir / "fleet-doctor"
+        if doctor_src is None:
+            shutil.copy(str(DOCTOR), str(self.doctor))
+        else:
+            self.doctor.write_text(doctor_src)
+        self.doctor.chmod(0o755)
+
+        if stub:
+            doc = self.tmp / "status.json"
+            doc.write_text(doc_text)
+            hb = self.bin_dir / "fleet-heartbeat"
+            hb.write_text(STUB % {"log": self.log, "doc": doc, "rc": rc})
+            hb.chmod(0o755)
+
+        # A config whose herdr is a real executable, so check 8 passes its
+        # path tests and the new check is what's under test.
+        self.conf = self.tmp / "heartbeat-config.json"
+        if installed:
+            herdr = self.tmp / "fake-herdr"
+            herdr.write_text("#!/bin/sh\nexit 0\n")
+            herdr.chmod(0o755)
+            self.conf.write_text(json.dumps({"herdr": str(herdr)}))
+
+    def run(self, *args):
+        home = self.tmp / "home"
+        home.mkdir(exist_ok=True)
+        env = {
+            "PATH": str(self.path_dir),
+            "HOME": str(home),
+            "TMPDIR": str(self.tmp),
+            "FLEET_PREFIX": "tester",
+            "FLEET_HEARTBEAT_CONF": str(self.conf),
+            "HERDR_SOCKET_PATH": str(self.tmp / "no-such.sock"),
+        }
+        proc = subprocess.run([str(self.path_dir / "bash"), str(self.doctor)] + list(args),
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=60)
+        self.output = proc.stdout
+        self.rc = proc.returncode
+        return proc
+
+    def lines(self, check):
+        out = []
+        for line in self.output.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[1] == check:
+                out.append(line)
+        return out
+
+    def calls(self):
+        return self.log.read_text().splitlines()
+
+
+class DoctorCase(unittest.TestCase):
+
+    def doctor(self, doc, rc=0, args=(), **kw):
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor-heartbeat.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        text = doc if isinstance(doc, str) else json.dumps(doc)
+        run = DoctorRun(tmp, text, rc=rc, **kw)
+        run.run(*args)
+        return run
+
+    def health_lines(self, run):
+        found = run.lines("heartbeat-health")
+        self.assertTrue(found, "no heartbeat-health line in:\n%s" % run.output)
+        return found
+
+    def fail_count(self, run):
+        for line in run.output.splitlines():
+            if line.endswith(" fail") and "checks:" in line:
+                return int(line.rsplit(",", 1)[1].split()[0])
+        self.fail("no summary line in:\n%s" % run.output)
+
+    def assert_read_only_call(self, run):
+        """The only thing fleet-doctor may ask fleet-heartbeat for is status --json."""
+        self.assertEqual(run.calls(), ["--config %s status --json" % run.conf], run.output)
+
+
+class Healthy(DoctorCase):
+
+    def test_healthy_panes_are_ok_with_a_count(self):
+        run = self.doctor(status_doc(health={"w1:p1": healthy(), "w2:p1": healthy()}))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("ok "), lines[0])
+        self.assertIn("2 supervised panes", lines[0])
+        self.assert_read_only_call(run)
+
+    def test_one_transient_error_is_not_chronic(self):
+        run = self.doctor(status_doc(health={"w1:p1": healthy(pane_errors=1)}))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("ok "), lines[0])
+
+
+class Chronic(DoctorCase):
+
+    def test_each_chronic_pane_is_a_warn_naming_pane_and_reason(self):
+        run = self.doctor(status_doc(
+            health={"w1:p1": chronic(61), "w2:p1": healthy(), "w5:p1": chronic(12, total=14)},
+            live=["w1:p1", "w2:p1"]))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 2, run.output)
+        for line in lines:
+            self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("w1:p1 chronic failure: consecutive_errors=61", lines[0])
+        self.assertIn("0/20 recent wakes accepted", lines[0])
+        self.assertNotIn("not live", lines[0])
+        self.assertIn("w5:p1 chronic failure: consecutive_errors=12", lines[1])
+        self.assertIn("pane not live", lines[1])
+        self.assertNotIn("w2:p1", run.output)
+        # Other checks FAIL in this hermetic sandbox (no herdr, no gh), so
+        # compare against a healthy run rather than expecting exit 0.
+        self.assertEqual(self.fail_count(run), self.fail_count(self.doctor(status_doc())),
+                         "a chronic pane must WARN, not add a FAIL:\n%s" % run.output)
+        self.assert_read_only_call(run)
+
+    def test_non_error_reason_also_shows_the_error_count(self):
+        pane = chronic(0, total=6)
+        pane["chronic_reason"] = "zero_accepted_in_6"
+        run = self.doctor(status_doc(health={"w3:p1": pane}))
+        line = self.health_lines(run)[0]
+        self.assertIn("w3:p1 chronic failure: zero_accepted_in_6", line)
+        self.assertIn("consecutive_errors=0", line)
+
+    def test_baseline_doctor_passed_a_chronic_pane_silently(self):
+        """On main before this change the same state produced no finding at all."""
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not available")
+        proc = subprocess.run([git, "-C", str(BIN), "show", "%s:bin/fleet-doctor" % BASELINE],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True)
+        if proc.returncode != 0:
+            self.skipTest("baseline commit %s not in this clone" % BASELINE)
+        run = self.doctor(status_doc(health={"w1:p1": chronic(61)}), doctor_src=proc.stdout)
+        self.assertEqual(run.lines("heartbeat-health"), [], run.output)
+        self.assertNotIn("chronic", run.output.lower())
+        self.assertNotIn("w1:p1", run.output)
+        heartbeat = run.lines("heartbeat")
+        self.assertEqual(len(heartbeat), 1, run.output)
+        # Without systemctl on PATH the unit reads as not active, so the old
+        # check WARNs about the service manager. It says nothing about wakes.
+        self.assertNotIn("error", heartbeat[0].lower())
+
+
+class ServiceFault(DoctorCase):
+
+    def test_service_fault_is_fail_and_fails_the_run(self):
+        # status exits 3 on a fault but still prints the document.
+        run = self.doctor(status_doc(service=FAULT), rc=3)
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("FAIL "), lines[0])
+        self.assertIn("herdr_missing", lines[0])
+        self.assertIn("herdr not found at /x/herdr", lines[0])
+        self.assertEqual(self.fail_count(run), self.fail_count(self.doctor(status_doc())) + 1, run.output)
+        self.assertEqual(run.rc, 1, run.output)
+        self.assert_read_only_call(run)
+
+    def test_fault_and_chronic_panes_are_both_reported(self):
+        run = self.doctor(status_doc(service=FAULT, health={"w1:p1": chronic(3)}), rc=3)
+        lines = self.health_lines(run)
+        self.assertEqual([l.split()[0] for l in lines], ["FAIL", "WARN"], run.output)
+
+    def test_verbose_does_not_dump_the_status_document(self):
+        run = self.doctor(status_doc(service=FAULT), rc=3, args=("--verbose",))
+        self.assertNotIn('"live_panes"', run.output)
+
+
+class Unavailable(DoctorCase):
+
+    def test_status_failing_with_no_output_is_a_skipped_warn(self):
+        run = self.doctor("", rc=3)
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("WARN "), lines[0])
+        self.assertIn("skipped", lines[0])
+        self.assertIn("exit 3", lines[0])
+        self.assert_read_only_call(run)
+
+    def test_garbage_output_is_a_skipped_warn_not_a_crash(self):
+        run = self.doctor("fleet-heartbeat: state.json is corrupt\n{not json", rc=3)
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("WARN "), lines[0])
+        self.assertIn("skipped", lines[0])
+        self.assertIn("checks:", run.output, "doctor did not reach its summary")
+
+    def test_empty_state_is_a_skipped_warn(self):
+        run = self.doctor(status_doc(service={}, health={}))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("WARN "), lines[0])
+        self.assertIn("skipped — no heartbeat state yet", lines[0])
+
+    def test_missing_fleet_heartbeat_is_a_skipped_warn(self):
+        run = self.doctor(status_doc(), stub=False)
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 1, run.output)
+        self.assertTrue(lines[0].startswith("WARN "), lines[0])
+        self.assertIn("fleet-heartbeat not found", lines[0])
+
+    def test_not_installed_is_ok_and_never_calls_status(self):
+        run = self.doctor(status_doc(health={"w1:p1": chronic(9)}), installed=False)
+        lines = self.health_lines(run)
+        self.assertEqual(lines, ["ok    heartbeat-health not installed"], run.output)
+        self.assertEqual(run.calls(), [])
+
+
+# ---------------------------------------------------------------------- runner
+
+def main(argv):
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if argv:
+        keep = unittest.TestSuite()
+        for group in suite:
+            for case in group:
+                if any(token.lower() in case.id().lower() for token in argv):
+                    keep.addTest(case)
+        suite = keep
+
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+    result = runner.run(suite)
+
+    passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+    print()
+    print("=" * 70)
+    print("test-fleet-doctor-heartbeat: %d run, %d passed, %d failed, %d errored, %d skipped"
+          % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
+    print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
+    print("=" * 70)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
