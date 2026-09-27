@@ -289,7 +289,7 @@ DO:      ./bin/fleet-heartbeat init
          mkdir -p ~/.local/bin && ln -sf "$PWD/bin/heartbeat-ack" ~/.local/bin/heartbeat-ack
          macOS:
          ./bin/fleet-heartbeat plist > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
-         launchctl load ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
          Linux:
          mkdir -p ~/.config/systemd/user
          ./bin/fleet-heartbeat unit > ~/.config/systemd/user/fleet-kit-heartbeat.service \
