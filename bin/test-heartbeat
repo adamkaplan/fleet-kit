@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 BIN = Path(__file__).resolve().parent
 
@@ -749,8 +750,52 @@ class TestSafeSend(Base):
         self.assertEqual(pane.get("consecutive_errors", 0), 0)
         self.assertEqual(pane.get("consecutive_defers", 0), 0)
         self.assertEqual(pane["attempts"][-1]["agent_kind"], "claude")
-        self.assertTrue(pane["chronic_failure"])
+        # Labelled not wakeable, not chronic: nothing is broken.
+        self.assertFalse(pane["chronic_failure"])
+        self.assertEqual(pane["not_wakeable"], "claude")
         self.assertEqual(pane["chronic_reason"], "agent_kind_not_wakeable:claude")
+
+    def test_an_unwakeable_kind_logs_no_chronic_warning(self):
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "claude",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents)
+        with mock.patch.object(hb.logging, "warning") as warning:
+            hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+        self.assertEqual(warning.call_args_list, [])
+
+    def test_status_labels_an_unwakeable_pane_not_wakeable(self):
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "copilot",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents)
+        hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+        text = hb.format_status(hb.read_state(self.state), {"w2:p2"}, 1001.0)
+        self.assertIn("  ^ not wakeable: agent_kind_not_wakeable:copilot "
+                      "(\U0001f514 has no effect on this agent)", text)
+        self.assertNotIn("chronic failure", text)
+
+    def test_state_from_before_not_wakeable_reads_right_after_the_next_tick(self):
+        # What the previous code wrote: the same finding, flagged chronic.
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "claude",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents)
+        target = herdr.discover()[0]
+        state = hb.read_state(self.state)
+        pane = hb.new_pane(target)
+        pane.update(next_due=1000.0, chronic_failure=True,
+                    chronic_reason="agent_kind_not_wakeable:claude",
+                    attempts=[{"due": hb.utc(900.0), "status": "wrong_agent_kind",
+                               "agent_kind": "claude"}])
+        state["panes"]["w2:p2"] = pane
+        hb.write_state(self.state, state)
+        # Even before a tick, status judges from the attempts, not the old flag.
+        self.assertIn("^ not wakeable:", hb.format_status(hb.read_state(self.state), {"w2:p2"}, 950.0))
+        self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1000.0), "wrong_agent_kind")
+        pane = self.pane()
+        self.assertFalse(pane["chronic_failure"])
+        self.assertEqual(pane["not_wakeable"], "claude")
+        text = hb.format_status(hb.read_state(self.state), {"w2:p2"}, 1001.0)
+        self.assertIn("  ^ not wakeable: agent_kind_not_wakeable:claude", text)
+        self.assertNotIn("chronic failure", text)
 
     def test_switching_to_a_wakeable_kind_clears_the_finding(self):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "codex",
@@ -762,6 +807,8 @@ class TestSafeSend(Base):
         herdr.agents[0]["agent"] = "opencode"
         self.assertEqual(hb.tick_pane(self.state, herdr, target, now=self.pane()["next_due"]), "accepted")
         self.assertFalse(self.pane()["chronic_failure"])
+        self.assertIsNone(self.pane()["not_wakeable"])
+        self.assertIsNone(self.pane()["chronic_reason"])
 
     def test_no_agent_in_the_pane_is_refused(self):
         # herdr's real answer for a pane with no agent, through the real call().
@@ -1042,6 +1089,11 @@ class TestChronicFailure(Base):
         pane = self.pane()
         self.assertTrue(pane["chronic_failure"])
         self.assertTrue(pane["chronic_reason"])
+        self.assertIsNone(pane["not_wakeable"])
+        # A real chronic pane is still reported as one.
+        text = hb.format_status(hb.read_state(self.state), {"w2:p2"}, now)
+        self.assertIn("  ^ chronic failure: %s" % pane["chronic_reason"], text)
+        self.assertNotIn("not wakeable", text)
 
     def test_an_accepted_wake_clears_the_finding(self):
         herdr = FakeHerdr(screen=composer("draft"))

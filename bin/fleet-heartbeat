@@ -619,11 +619,15 @@ def compute_pane_health(pane_state, interval_m, now_ts):
     since_accepted = (now_ts - accepted_ts) if accepted_ts is not None else None
 
     reason = None
+    not_wakeable = None
     latest = attempts[-1] if attempts else {}
     if latest.get("status") in NOT_WAKEABLE_STATUSES:
-        # Not a delivery problem, and no amount of retrying fixes it: the bell
-        # is on a pane the heartbeat has no draft guard for.
-        reason = "agent_kind_not_wakeable:%s" % (latest.get("agent_kind") or "unknown")
+        # Not a delivery problem, and not a failure: the bell is on a pane the
+        # heartbeat has no draft guard for, so 🔔 has no effect there. It is
+        # labelled as such rather than as chronic. The reason text is kept for
+        # anything that already matches on it.
+        not_wakeable = latest.get("agent_kind") or "unknown"
+        reason = "agent_kind_not_wakeable:%s" % not_wakeable
     elif errors >= CHRONIC_CONSECUTIVE_ERRORS:
         reason = "consecutive_errors=%d" % errors
     elif total >= CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED and accepted == 0:
@@ -638,8 +642,9 @@ def compute_pane_health(pane_state, interval_m, now_ts):
             reason = "chronic_drop_rate=%.0f%%" % ((1.0 - success_rate) * 100)
 
     return {
-        "chronic_failure": reason is not None,
+        "chronic_failure": reason is not None and not_wakeable is None,
         "chronic_reason": reason,
+        "not_wakeable": not_wakeable,
         "total_attempts": total,
         "accepted_attempts": accepted,
         "success_rate": success_rate,
@@ -757,6 +762,7 @@ def tick_pane(state_dir, transport, target, now=None):
         health = compute_pane_health(pane, interval_m, now)
         pane["chronic_failure"] = health["chronic_failure"]
         pane["chronic_reason"] = health["chronic_reason"]
+        pane["not_wakeable"] = health["not_wakeable"]
         if health["chronic_failure"]:
             logging.warning("pane %s chronic failure: %s", pane_id, health["chronic_reason"])
 
@@ -936,7 +942,12 @@ def format_status(state, live_pane_ids, now_ts, notes=()):
             "%.1fm" % interval_m, delivery,
             utc(pane["next_due"]) if pane.get("next_due") else "not scheduled",
             ack_str))
-        if pane.get("chronic_failure"):
+        # Judged from the attempts, not the stored flag, so state written
+        # before `not_wakeable` existed (chronic_failure true) reads right too.
+        if health["not_wakeable"]:
+            lines.append("  ^ not wakeable: %s (🔔 has no effect on this agent)"
+                         % health["chronic_reason"])
+        elif pane.get("chronic_failure"):
             lines.append("  ^ chronic failure: %s" % pane.get("chronic_reason"))
 
     lines.append("=" * 96)
