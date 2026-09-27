@@ -817,6 +817,14 @@ KIND_FIXTURES = {
         # In plain text that is indistinguishable from a draft, so it defers.
         "other": [OPENCODE_WELCOME],
     },
+    "pi": {
+        # At startup, under an update notice, and after a finished turn.
+        "empty": [PI_STARTUP, PI_EMPTY],
+        "draft": [PI_DRAFT, PI_DRAFT_MULTILINE],
+        # The slash-command menu opens below the editor. No pi-native modal was
+        # captured; the DIALOGS below are checked against pi's guard as well.
+        "other": [PI_SLASH_MENU],
+    },
 }
 
 # Screens that must never read as ready under any registered check. The trust
@@ -866,6 +874,23 @@ class TestKindFixtures(Base):
                 self.assertEqual(status, "draft_or_unknown", (kind, name))
                 self.assertEqual(herdr.sent, [])
                 self.setUp()
+
+    def test_pi_refuses_near_misses(self):
+        rule = "\u2500" * 80
+        footer = ["/work/project", "stats"]
+        near = {
+            "no footer": [rule, "", rule],
+            "footer too long": [rule, "", rule] + footer + ["x", "y"],
+            "blank row in footer": [rule, "", rule, "/work/project", "", "stats"],
+            "two blank rows": [rule, "", "", rule] + footer,
+            "rules differ in width": [rule, "", rule[:-1]] + footer,
+            "indented rule": ["  " + rule, "", "  " + rule] + footer,
+            "short rules": ["\u2500" * 10, "", "\u2500" * 10] + footer,
+            "control character": [rule, "\x1b", rule] + footer,
+        }
+        self.assertTrue(hb.pi_empty_composer("\n".join([rule, "", rule] + footer)))
+        for name, lines in near.items():
+            self.assertFalse(hb.pi_empty_composer("\n".join(lines)), name)
 
     def test_a_kind_without_a_guard_is_refused_on_its_own_dialog(self):
         for kind, screen in (("claude", CLAUDE_TRUST_DIALOG), ("codex", CODEX_TRUST_DIALOG),

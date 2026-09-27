@@ -425,6 +425,36 @@ def opencode_empty_composer(screen):
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
 
 
+PI_FOOTER_MAX_LINES = 3
+
+
+def pi_empty_composer(screen):
+    """True only for pi's input box, empty, directly above its footer.
+
+    pi draws its editor between two full-width `─` rules, with a short footer
+    under the lower one (the working directory, then token and model stats).
+    Empty means exactly one blank row between the last two rules, both rules
+    the same width, and nothing but a footer of 1–3 non-blank rows below.
+    A draft fills that row or adds rows; the slash-command menu opens below
+    the lower rule and pushes the footer down. Both read as not ready.
+    Captured live with pi 0.85.1 (witt3rd/fleet-ops#33).
+    """
+    if any(ord(char) < 32 and char != "\n" for char in screen):
+        return False
+    lines = [line.rstrip() for line in screen.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    rules = [i for i, line in enumerate(lines) if re.fullmatch(r"\u2500{20,}", line)]
+    if len(rules) < 2:
+        return False
+    top, bottom = rules[-2], rules[-1]
+    footer = lines[bottom + 1:]
+    if not 1 <= len(footer) <= PI_FOOTER_MAX_LINES or not all(footer):
+        return False
+    if bottom - top != 2 or len(lines[top]) != len(lines[bottom]):
+        return False
+    return lines[top + 1] == ""
+
 # The draft guard, per herdr agent kind. A kind is wakeable only if it is listed
 # here, and it is listed only once its check has fixtures for an empty input box
 # (must read as ready), a typed draft (must not), and a dialog or other non-empty
@@ -437,6 +467,7 @@ def opencode_empty_composer(screen):
 # reports nothing about drafts, so there is no generic check to fall back on.
 WAKEABLE_KINDS = {
     "opencode": opencode_empty_composer,
+    "pi": pi_empty_composer,
 }
 
 
