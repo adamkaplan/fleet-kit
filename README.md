@@ -6,6 +6,12 @@
 copilot -i "Clone https://github.com/adamkaplan/fleet-kit.git and follow its fleet-kit/INSTALL.md."
 ```
 
+```bash
+opencode --prompt "Clone https://github.com/adamkaplan/fleet-kit.git and follow its fleet-kit/INSTALL.md."
+```
+
+opencode puts the prompt in its input box; press Enter to send it.
+
 ---
 
 Coding agents are cheap and getting cheaper. Your attention is not, and never
@@ -347,28 +353,33 @@ Your agent will stop at these. That is correct behaviour, not a failure:
 
 ## Your agent harness
 
-The team runs **GitHub Copilot CLI**. Three things worth knowing.
+fleet-kit works with any agent herdr can run. It ships agent definitions for two
+of them, **opencode** and **GitHub Copilot CLI**, both in `agents/`. Three
+things worth knowing.
 
-**Your skills already work.** Copilot CLI reads personal skills from
+**Your skills already work.** Both read personal skills from
 `~/.agents/skills/`, which is where these live. Nothing to convert, nothing to
-configure — `copilot skill list` will show them once they are on disk.
+configure.
 
-**Agent definitions need translating.** Markdown with YAML frontmatter on both
+**Agent definitions differ by harness.** Markdown with YAML frontmatter on both
 sides, but the fields differ:
 
 | opencode | Copilot CLI |
 |---|---|
-| `model: github-copilot/claude-opus-5` | `model: claude-opus-5` |
+| `model: __PROVIDER__/__MODEL_ID__` | `model: __MODEL_ID__` |
 | `permission:` block | `tools:` allow-list |
 
-Both formats ship in `agents/`. Use the one for your harness.
+The `model:` values are placeholders the installer fills in. Use the files for
+your harness.
 
 **Supervision is weaker on Copilot, for now.** herdr learns what an agent is
-doing from a small integration hook. The opencode hook reports working, blocked
-and idle directly. The Copilot hook currently reports only that a session
-started, so herdr falls back to reading the terminal to guess. It mostly works.
-It is less reliable, and it is the one real rough edge in the system. Fixing it
-means a change in herdr itself, which is not ours.
+doing from a small integration hook. The opencode integration reports working,
+blocked and idle directly. The Copilot one reports only its session identity, so
+herdr reads the terminal to work out its state
+([herdr integrations](https://herdr.dev/docs/integrations/)). It mostly works,
+but it is less reliable, and fixing it means a change in herdr itself. The
+heartbeat never wakes Copilot panes either; see
+[the heartbeat](#underneath-it-all).
 
 ---
 
@@ -386,8 +397,8 @@ Your prefix is your username:
 whoami        # jdoe  ->  jdoe:active, jdoe:payments
 ```
 
-Nobody picks it and no agent has to ask. On a corporate Mac the username is
-already unique across the company and already length-capped, which is exactly
+Nobody picks it and no agent has to ask. On most work machines the username is
+already unique across the organisation and already length-capped, which is exactly
 what a prefix needs to be — and `whoami` answers before `gh` is even
 authenticated. Initials would be shorter and would collide the first time you
 hired a second person with them.
