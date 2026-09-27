@@ -515,9 +515,9 @@ class TestSafeSend(Base):
 
     def test_empty_composer_accepts_any_agent_role(self):
         for role in ("Orchestrator", "Build", "Plan", "chief-of-staff"):
-            self.assertTrue(hb.empty_composer(composer(role=role)), role)
-            self.assertFalse(hb.empty_composer(composer("draft", role=role)), role)
-        self.assertTrue(hb.empty_composer(composer(auto=False)))
+            self.assertTrue(hb.opencode_empty_composer(composer(role=role)), role)
+            self.assertFalse(hb.opencode_empty_composer(composer("draft", role=role)), role)
+        self.assertTrue(hb.opencode_empty_composer(composer(auto=False)))
 
     def test_the_pause_sentinel_halts_everything(self):
         (self.state / "paused").touch()

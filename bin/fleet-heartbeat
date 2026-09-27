@@ -388,7 +388,7 @@ def build_wake_message(pane_id, now, pane_state, interval_m, command=None):
 
 # -------------------------------------------------------------------- the gate
 
-def empty_composer(screen):
+def opencode_empty_composer(screen):
     """True only for a fully visible, empty, closed OpenCode input box.
 
     This is the draft guard, and it is deliberately the strictest thing here.
@@ -418,6 +418,21 @@ def empty_composer(screen):
     if start < 0 or end - start - 2 != 3:
         return False
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
+
+
+# The draft guard, per herdr agent kind. A kind is wakeable only if it is listed
+# here, and it is listed only once its check has fixtures for an empty input box
+# (must read as ready), a typed draft (must not), and a dialog or other non-empty
+# screen (must not) — see TestKindFixtures in bin/test-heartbeat.
+#
+# The check is also the dialog guard. For agents herdr classifies from the
+# screen, a dialog it does not recognise falls back to `idle` (herdr docs,
+# "Blocked state"; probed live, witt3rd/fleet-ops#33). So `idle` alone never
+# licenses a send: only a positively recognised empty input box does. herdr
+# reports nothing about drafts, so there is no generic check to fall back on.
+WAKEABLE_KINDS = {
+    "opencode": opencode_empty_composer,
+}
 
 
 
@@ -482,21 +497,23 @@ class Herdr:
         """Is it safe to send right now? Returns (status, observed telemetry).
 
         Three layers, cheapest first: herdr's agent kind, herdr's agent status,
-        then the empty-composer draft guard. herdr's own agent detection is the
-        authority on what is running in the pane. The integration hook reports
-        the opencode lifecycle, and herdr drops the agent within half a second
-        when opencode exits, even when it is killed outright (probed on king,
-        witt3rd/fleet-ops#28). An earlier layer re-derived the same fact from
-        the foreground process name. That duplicate broke the moment opencode's
-        executable became `opencode.exe`, and it refused every wake.
+        then that kind's empty-input-box check from `WAKEABLE_KINDS`. herdr's
+        own agent detection is the authority on what is running in the pane.
+        The integration hook reports the opencode lifecycle, and herdr drops the
+        agent within half a second when opencode exits, even when it is killed
+        outright (probed on king, witt3rd/fleet-ops#28). An earlier layer
+        re-derived the same fact from the foreground process name. That
+        duplicate broke the moment opencode's executable became `opencode.exe`,
+        and it refused every wake.
 
-        The kind check stays `opencode` because the draft guard only knows the
-        opencode composer. `observed` is recorded for humans reading state
-        later; it is never a gate, because pinning a pid means a restarted
-        agent is locked out of supervision until someone notices.
+        A kind with no entry in `WAKEABLE_KINDS` is never sent anything,
+        whatever herdr says its status is. `observed` is recorded for humans
+        reading state later; it is never a gate, because pinning a pid means a
+        restarted agent is locked out of supervision until someone notices.
         """
         agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
-        if agent.get("agent") != "opencode":
+        input_box_is_empty = WAKEABLE_KINDS.get(agent.get("agent"))
+        if input_box_is_empty is None:
             return "wrong_agent_kind", {}
         if agent.get("agent_status") not in {"idle", "done"}:
             return "busy_or_blocked_or_unknown", {}
@@ -508,7 +525,7 @@ class Herdr:
         }
         screen = self.call("agent", "read", pane_id, "--source", "detection",
                            "--lines", str(SCREEN_LINES), text=True)
-        return ("ready" if empty_composer(screen) else "draft_or_unknown"), observed
+        return ("ready" if input_box_is_empty(screen) else "draft_or_unknown"), observed
 
     def foreground_pid(self, pane_id):
         """The pane's sole foreground pid, for telemetry only. None if unclear.
