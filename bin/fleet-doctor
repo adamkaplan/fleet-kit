@@ -186,7 +186,7 @@ if have opencode; then
 fi
 
 if [ "$cli_found" = "0" ]; then
-  emit FAIL agent-cli "neither 'copilot' nor 'opencode' found on PATH — need at least one"
+  emit FAIL agent-cli "neither 'copilot' nor 'opencode' found on PATH — fleet-kit ships agent definitions for those two, so it needs at least one"
 else
   # `herdr integration status` is read-only (install/uninstall are the mutators).
   outdated=""
