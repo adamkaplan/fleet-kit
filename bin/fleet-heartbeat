@@ -1056,9 +1056,9 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path,
                         default=Path(os.environ.get("FLEET_HEARTBEAT_CONF") or DEFAULT_CONFIG_PATH),
-                        help="Path to config.json (default: %s)" % DEFAULT_CONFIG_PATH)
+                        help="Path to config.json (default: $FLEET_HEARTBEAT_CONF, then %s)" % DEFAULT_CONFIG_PATH)
     parser.add_argument("--state-dir", type=Path, default=None,
-                        help="Path to the state directory (default: %s)" % DEFAULT_STATE_DIR)
+                        help="Path to the state directory (default: $FLEET_HEARTBEAT_STATE, then %s)" % DEFAULT_STATE_DIR)
 
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("run", help="Run the daemon in the foreground (launchd or systemd does this)")

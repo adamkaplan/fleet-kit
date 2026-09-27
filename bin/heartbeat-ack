@@ -259,7 +259,7 @@ If you never ack:
     parser.add_argument("--next", type=parse_interval, default=None, dest="legacy_next",
                         help=argparse.SUPPRESS)
     parser.add_argument("--state-dir", type=Path, default=None,
-                        help="Override the heartbeat state directory (default: %s)" % DEFAULT_STATE_DIR)
+                        help="Override the heartbeat state directory (default: $FLEET_HEARTBEAT_STATE, then %s)" % DEFAULT_STATE_DIR)
     return parser
 
 

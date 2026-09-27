@@ -296,7 +296,7 @@ DO:      ./bin/fleet-heartbeat init
            && systemctl --user daemon-reload \
            && systemctl --user enable --now fleet-kit-heartbeat.service
 VERIFY:  ./bin/fleet-heartbeat status
-PROVES:  a service line that is not FAULT, the state directory printed, and a
+PROVES:  a service line that is not FAULT, and a
          "service manager:" note saying loaded (macOS) or active (Linux).
 ```
 
