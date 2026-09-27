@@ -15,7 +15,8 @@ Three rules shape everything below.
      is the only thing that changes when a pane is next woken.
   3. Never write anything a human reads as truth. This process does not rename
      tabs and does not touch anything outside its own state directory. Health
-     goes in state.json, where `fleet-doctor` reads it.
+     goes in state.json. `fleet-heartbeat status --json` reports it, and
+     `fleet-doctor` reads that output, never the file itself.
 
 Python 3.9+, standard library only.
 """
@@ -104,7 +105,8 @@ ATTEMPT_HISTORY = 20
 NON_ACK_ESCALATION_THRESHOLD = 3
 
 # Chronic-failure thresholds. These do not change behaviour — the daemon keeps
-# trying — they change what `fleet-doctor` is able to tell you.
+# trying — they change what `status` reports, and so what `fleet-doctor`
+# (which reads `status --json`) can warn about.
 CHRONIC_CONSECUTIVE_ERRORS = 2
 CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED = 5
 CHRONIC_CONSECUTIVE_DEFERS = 6
@@ -126,8 +128,6 @@ STRUCTURAL_STATUSES = {
     "socket_unavailable",
     "cli_error",
     "cli_unavailable",
-    "process_count_invalid",
-    "process_not_opencode",
     "wrong_agent_kind",
     "inspection_error",
     "unavailable",
@@ -293,7 +293,7 @@ def record_service(state_dir, **fields):
 
 
 def record_fault(state_dir, code, message):
-    """Park a service-level fault where fleet-doctor and `status` will find it."""
+    """Park a service-level fault in state, where `status` reports it (fleet-doctor reads `status --json`)."""
     try:
         record_service(state_dir, fault=code, fault_message=message, fault_since=utc())
     except Exception as err:
@@ -420,6 +420,7 @@ def empty_composer(screen):
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
 
 
+
 # ------------------------------------------------------------------ the transport
 
 class Herdr:
@@ -480,8 +481,18 @@ class Herdr:
     def inspect_pane(self, pane_id):
         """Is it safe to send right now? Returns (status, observed telemetry).
 
-        Four layers, cheapest first. `observed` is recorded for humans reading
-        state later; it is never a gate, because pinning a pid means a restarted
+        Three layers, cheapest first: herdr's agent kind, herdr's agent status,
+        then the empty-composer draft guard. herdr's own agent detection is the
+        authority on what is running in the pane. The integration hook reports
+        the opencode lifecycle, and herdr drops the agent within half a second
+        when opencode exits, even when it is killed outright (probed on king,
+        witt3rd/fleet-ops#28). An earlier layer re-derived the same fact from
+        the foreground process name. That duplicate broke the moment opencode's
+        executable became `opencode.exe`, and it refused every wake.
+
+        The kind check stays `opencode` because the draft guard only knows the
+        opencode composer. `observed` is recorded for humans reading state
+        later; it is never a gate, because pinning a pid means a restarted
         agent is locked out of supervision until someone notices.
         """
         agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
@@ -490,22 +501,27 @@ class Herdr:
         if agent.get("agent_status") not in {"idle", "done"}:
             return "busy_or_blocked_or_unknown", {}
 
-        info = self.call("pane", "process-info", "--pane", pane_id).get("result", {}).get("process_info", {})
-        processes = info.get("foreground_processes", [])
-        if len(processes) != 1:
-            return "process_count_invalid", {}
-        process = processes[0]
-        if process.get("name") != "opencode" and process.get("argv0") != "opencode":
-            return "process_not_opencode", {}
-
         observed = {
-            "pid": process.get("pid"),
+            "pid": self.foreground_pid(pane_id),
             "terminal_id": agent.get("terminal_id"),
             "cwd": agent.get("cwd"),
         }
         screen = self.call("agent", "read", pane_id, "--source", "detection",
                            "--lines", str(SCREEN_LINES), text=True)
         return ("ready" if empty_composer(screen) else "draft_or_unknown"), observed
+
+    def foreground_pid(self, pane_id):
+        """The pane's sole foreground pid, for telemetry only. None if unclear.
+
+        Best-effort by design. It never gates a send, so a failed or odd
+        `process-info` answer costs a blank in the record and nothing else.
+        """
+        try:
+            info = self.call("pane", "process-info", "--pane", pane_id)
+        except Unavailable:
+            return None
+        processes = info.get("result", {}).get("process_info", {}).get("foreground_processes", [])
+        return processes[0].get("pid") if len(processes) == 1 else None
 
     def send_pane(self, pane_id, message):
         """Re-check immediately before sending. State can change during our own I/O."""
@@ -526,8 +542,9 @@ def compute_pane_health(pane_state, interval_m, now_ts):
     does: in practice that glyph produced three false alarms and zero true
     positives, so people learned to ignore the one signal that would have
     reported a real outage — and it made a tab title into mutable load-bearing
-    state that anyone could edit. The finding is recorded here instead, and
-    `fleet-doctor` is the surface that reports it.
+    state that anyone could edit. The finding is recorded here instead.
+    `status` shows it, and `fleet-doctor` reports it as a WARN per pane from
+    `status --json`.
     """
     attempts = pane_state.get("attempts", [])
     total = len(attempts)

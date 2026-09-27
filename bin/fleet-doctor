@@ -383,6 +383,74 @@ except Exception:
   fi
 fi
 
+# =========================================================== 8b. heartbeat health
+# Is the heartbeat actually getting wakes through? Check 8 only says the service
+# is installed and loaded. A daemon can be up while every wake is refused, and
+# that should not pass silently. `fleet-heartbeat status --json` is the one
+# source of truth here: it is read-only, and it computes per-pane health the
+# same way the daemon does. We never read state.json ourselves and never call
+# any other subcommand.
+#
+# fleet-heartbeat is looked up next to this script first, so a checkout
+# inspects itself, and on PATH second.
+HB_BIN="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/fleet-heartbeat"
+[ -x "$HB_BIN" ] || HB_BIN=$(command -v fleet-heartbeat 2>/dev/null)
+if [ ! -f "$HB_CONF" ]; then
+  emit ok heartbeat-health "not installed"
+elif [ -z "$HB_BIN" ] || [ ! -x "$HB_BIN" ]; then
+  LAST_OUT=""
+  emit WARN heartbeat-health "skipped — fleet-heartbeat not found next to fleet-doctor or on PATH"
+else
+  # status exits non-zero on a service fault but still prints the JSON, so
+  # the exit code alone decides nothing. Only the parse does.
+  run_to 20 "$HB_BIN" --config "$HB_CONF" status --json
+  hb_rc=$?
+  printf '%s' "$LAST_OUT" >"$TMPDIR_FD/hb-status.json"
+  # One "LEVEL<TAB>detail" line per finding. An empty result means the parse failed.
+  python3 -c '
+import json,sys
+try:
+    doc=json.load(open(sys.argv[1]))
+    service=doc.get("service") or {}
+    health=doc.get("health") or {}
+    live=set(doc.get("live_panes") or [])
+    if not isinstance(service,dict) or not isinstance(health,dict):
+        raise ValueError("unexpected shape")
+except Exception:
+    sys.exit(0)
+if service.get("fault"):
+    print("FAIL\tservice fault %s — %s (since %s); nothing is being supervised" % (
+        service.get("fault"), service.get("fault_message") or "?", service.get("fault_since") or "?"))
+if not service.get("pid") and not health and not service.get("fault"):
+    print("WARN\tskipped — no heartbeat state yet (no daemon has run against %s)" % doc.get("state_dir","?"))
+    sys.exit(0)
+chronic=0
+for pane in sorted(health):
+    h=health[pane] or {}
+    if h.get("chronic_failure"):
+        chronic+=1
+        reason=h.get("chronic_reason") or "?"
+        extra=[]
+        if "consecutive_errors" not in reason:
+            extra.append("consecutive_errors=%s" % h.get("consecutive_errors", "?"))
+        extra.append("%s/%s recent wakes accepted" % (h.get("accepted_attempts", "?"), h.get("total_attempts", "?")))
+        if pane not in live:
+            extra.append("pane not live")
+        print("WARN\t%s chronic failure: %s (%s)" % (pane, reason, ", ".join(extra)))
+if not service.get("fault") and chronic==0:
+    print("ok\t%d supervised panes, none in chronic failure" % len(health))
+' "$TMPDIR_FD/hb-status.json" >"$TMPDIR_FD/hb-health.txt" 2>/dev/null
+  if [ ! -s "$TMPDIR_FD/hb-health.txt" ]; then
+    emit WARN heartbeat-health "skipped — 'fleet-heartbeat status --json' unavailable (exit $hb_rc, no parseable JSON)"
+  else
+    # --verbose would otherwise dump the whole status document under the FAIL.
+    LAST_OUT=""
+    while IFS="$(printf '\t')" read -r hb_level hb_detail; do
+      [ -n "$hb_level" ] && emit "$hb_level" heartbeat-health "$hb_detail"
+    done <"$TMPDIR_FD/hb-health.txt"
+  fi
+fi
+
 # =========================================================== 9. charter drift
 # Best effort, WARN-only, never FAIL. Unparseable charters are skipped quietly.
 if [ ! -f "$TMPDIR_FD/panes.txt" ] && [ -n "$FLEET_REPO" ]; then
