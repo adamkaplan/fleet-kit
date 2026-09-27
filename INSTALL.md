@@ -51,13 +51,20 @@ is exactly what a label prefix has to be.
 ```
 CHECK:   command -v herdr && herdr --version
          Present?  -> skip to STEP 3.
-DO:      brew install herdr
+DO:      macOS:  brew install herdr
+         Linux:  the distro package manager, or  mise use -g herdr
 VERIFY:  herdr --version
 PROVES:  a version prints. 0.9.0 or later.
 ```
 
 herdr is in homebrew-core, so no tap is needed. If `brew` itself is missing, that
 is a `HUMAN` step — stop and say so rather than installing Homebrew unprompted.
+
+On Linux, **check the version, not just presence.** fleet-kit needs 0.9.0 or
+later and some distro packages lag — Omarchy, for one, has shipped 0.8.2. If the
+packaged herdr is too old, install a current one with `mise use -g herdr` and
+make sure it wins on PATH. Do not `herdr update` over a package-managed binary:
+the package manager owns that file and will fight you for it.
 
 ---
 
@@ -194,6 +201,23 @@ VERIFY:  Copilot CLI:  copilot --agent chief-of-staff -p "Reply with only your r
 PROVES:  the agent resolves by name. An unknown-agent error means it did not install.
 ```
 
+```
+CHECK:   grep -l '__MODEL_ID__\|__PROVIDER__' <agents dir>/*.md
+         Nothing listed?  -> done with this step.
+HUMAN:   yes, if the person has not said which model. Ask; do not guess.
+DO:      Copilot CLI:  sed -i.bak 's|__MODEL_ID__|<model-id>|' ~/.copilot/agents/*.md
+         opencode:     sed -i.bak 's|__PROVIDER__/__MODEL_ID__|<provider>/<model-id>|' \
+                         ~/.config/opencode/agents/*.md
+VERIFY:  the CHECK above lists nothing, then re-run the VERIFY above.
+PROVES:  every definition names a real model.
+```
+
+**The definitions ship with a placeholder `model:` line** — `__MODEL_ID__` for
+Copilot CLI, `__PROVIDER__/__MODEL_ID__` for opencode. Left unsubstituted, the
+harness cannot resolve the model and the agent will not start. Use an id the
+harness actually lists (`opencode models`, or the Copilot CLI `/model` picker).
+Delete the `.bak` files once it works.
+
 Copy rather than symlink here, and this is the one place the asymmetry is
 deliberate. Agent definitions are read once when a session starts and never
 reloaded, so linking them buys nothing — a running agent will not see a change
@@ -218,6 +242,14 @@ VERIFY:  herdr integration status
 PROVES:  your harness reports "current", not "not installed" or "outdated".
 ```
 
+If the install fails with `copilot config directory not found`, Copilot CLI has
+never been run on this machine and `~/.copilot` does not exist yet. Run the
+harness once (start it and quit) and retry.
+
+Install this **before** starting the agents you want supervised. After a herdr
+server restart, native agent session restore only works for panes whose
+integration was installed before the agent started.
+
 This is how herdr knows whether an agent is working, blocked or idle — which is
 what makes supervision possible at all.
 
@@ -240,15 +272,28 @@ With it, they wake themselves on their own schedule and you stop being the thing
 that keeps the fleet moving.
 
 ```
-CHECK:   launchctl list | grep com.fleet-kit.heartbeat
-         Already loaded?  -> skip to STEP 12.
+CHECK:   macOS:  launchctl list | grep com.fleet-kit.heartbeat
+         Linux:  systemctl --user is-enabled fleet-kit-heartbeat.service
+         Already loaded / enabled?  -> skip to STEP 12.
 DO:      ./bin/fleet-heartbeat init
          mkdir -p ~/.local/bin && ln -sf "$PWD/bin/heartbeat-ack" ~/.local/bin/heartbeat-ack
+         macOS:
          ./bin/fleet-heartbeat plist > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
          launchctl load ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+         Linux:
+         mkdir -p ~/.config/systemd/user
+         ./bin/fleet-heartbeat unit > ~/.config/systemd/user/fleet-kit-heartbeat.service \
+           && systemctl --user daemon-reload \
+           && systemctl --user enable --now fleet-kit-heartbeat.service
 VERIFY:  ./bin/fleet-heartbeat status
-PROVES:  a service line that is not FAULT, and the state directory printed.
+PROVES:  a service line that is not FAULT, the state directory printed, and a
+         "service manager:" note saying loaded (macOS) or active (Linux).
 ```
+
+On Linux the service's stderr goes to the journal:
+`journalctl --user -u fleet-kit-heartbeat.service`. A user unit stops when the
+person logs out unless lingering is on — on a headless box, `loginctl
+enable-linger $USER` is a `HUMAN` decision worth raising.
 
 `init` refuses to write a config pointing at a herdr it cannot actually run, so a
 successful `init` is itself evidence. If it refuses, read what it says — it has

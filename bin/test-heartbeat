@@ -19,6 +19,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -917,6 +918,16 @@ class TestCLI(Base):
         self.assertIn("/bin/fleet-heartbeat", body)
         self.assertNotIn("<string>/dev/null</string>", body)
 
+    def test_unit_renders_with_no_placeholders_left(self):
+        result = self.run_hb("unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = "\n".join(l for l in result.stdout.splitlines() if not l.lstrip().startswith("#"))
+        for placeholder in ("__PYTHON__", "__HOME__", "__PREFIX__"):
+            self.assertNotIn(placeholder, body)
+        self.assertIn("/bin/fleet-heartbeat run", body)
+        self.assertIn("WantedBy=default.target", body)
+        self.assertNotIn("/dev/null", body)
+
 
 # ------------------------------------------------------- portability and hygiene
 
@@ -960,8 +971,28 @@ class TestHygiene(unittest.TestCase):
         plists = sorted(p.name for p in (BIN.parent / "templates").glob("*.plist"))
         self.assertEqual(plists, ["com.fleet-kit.heartbeat.plist"])
 
+    def test_the_kit_ships_exactly_one_unit(self):
+        units = sorted(p.name for p in (BIN.parent / "templates").glob("*.service"))
+        self.assertEqual(units, ["fleet-kit-heartbeat.service"])
+
+    def test_the_unit_never_sends_output_to_the_void(self):
+        template = (BIN.parent / "templates" / "fleet-kit-heartbeat.service").read_text()
+        body = "\n".join(l for l in template.splitlines() if not l.lstrip().startswith("#"))
+        # Same defect 8 as the plist: Restart=always plus a discarded stderr is
+        # an invisible restart loop.
+        self.assertNotIn("/dev/null", body)
+        self.assertIn("StandardError=journal", body)
+        self.assertIn("Restart=always", body)
+        self.assertIn("RestartSec=30", body)
+        for placeholder in ("__PYTHON__", "__HOME__", "__PREFIX__"):
+            self.assertIn(placeholder, body, "template must stay a template")
+
     def test_the_plist_template_is_parseable_once_substituted(self):
         rendered = hb.render_plist()
+        import plistlib
+        plistlib.loads(rendered.encode())  # portable check; plutil is macOS-only
+        if not shutil.which("plutil"):
+            return
         proc = subprocess.run(["plutil", "-lint", "-"], input=rendered.encode(), capture_output=True)
         if proc.returncode != 0 and b"plutil" not in proc.stderr:
             self.fail("rendered plist is not valid: %s" % proc.stdout.decode())
