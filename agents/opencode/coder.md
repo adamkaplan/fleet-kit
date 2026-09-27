@@ -3,6 +3,7 @@ name: coder
 description: Ephemeral worker. One assignment, one git worktree. Writes the code, commits it, opens a PR, reports back honestly, exits.
 mode: primary
 model: __PROVIDER__/__MODEL_ID__
+variant: high
 permission:
   edit: allow
   read: allow

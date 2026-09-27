@@ -3,6 +3,7 @@ name: chief-of-staff
 description: Fleet-level Chief of Staff. The single interface between your principal and every orchestrator; supervises orchestrator health by divergence, routes incoming work, and surfaces only the decisions the principal owns.
 mode: primary
 model: __PROVIDER__/__MODEL_ID__
+variant: high
 permission:
   edit: deny
   read: allow

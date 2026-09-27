@@ -3,6 +3,7 @@ name: orchestrator
 description: Workspace orchestrator. Owns one charter issue, decides what needs doing, dispatches coders into isolated worktrees, verifies what comes back, and pushes blockers upward. Writes no product code.
 mode: primary
 model: __PROVIDER__/__MODEL_ID__
+variant: high
 permission:
   edit: deny
   read: allow
