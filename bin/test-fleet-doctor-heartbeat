@@ -12,6 +12,8 @@ holds only symlinks to the ordinary utilities the script needs.
 
 Exits non-zero if anything fails.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -59,6 +61,21 @@ def chronic(errors, total=20):
     return {"accepted_attempts": 0, "total_attempts": total, "chronic_failure": True,
             "chronic_reason": "consecutive_errors=%d" % errors, "consecutive_errors": errors,
             "consecutive_defers": 0, "success_rate": 0.0, "last_accepted_ts": None}
+
+
+def not_wakeable(kind):
+    return {"accepted_attempts": 0, "total_attempts": 3, "chronic_failure": False,
+            "chronic_reason": "agent_kind_not_wakeable:%s" % kind, "not_wakeable": kind,
+            "consecutive_errors": 0, "consecutive_defers": 0, "success_rate": 0.0,
+            "last_accepted_ts": None}
+
+
+def load_heartbeat():
+    loader = importlib.machinery.SourceFileLoader("fleet_heartbeat", str(BIN / "fleet-heartbeat"))
+    spec = importlib.util.spec_from_loader("fleet_heartbeat", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 FAULT = {"pid": 4242, "fault": "herdr_missing", "fault_message": "herdr not found at /x/herdr",
@@ -226,6 +243,48 @@ class Chronic(DoctorCase):
         # Without systemctl on PATH the unit reads as not active, so the old
         # check WARNs about the service manager. It says nothing about wakes.
         self.assertNotIn("error", heartbeat[0].lower())
+
+
+class NotWakeable(DoctorCase):
+
+    def test_a_not_wakeable_pane_is_its_own_warn_not_chronic(self):
+        run = self.doctor(status_doc(health={"w1:p1": not_wakeable("copilot"), "w2:p1": healthy()}))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 2, run.output)
+        self.assertTrue(lines[0].startswith("WARN "), lines[0])
+        self.assertIn("w1:p1 not wakeable (agent_kind_not_wakeable:copilot) "
+                      "\u2014 \U0001f514 has no effect", lines[0])
+        self.assertNotIn("chronic failure:", run.output)
+        # Not counted as chronic, so the ok line still speaks, and says why.
+        self.assertTrue(lines[1].startswith("ok "), lines[1])
+        self.assertIn("2 supervised panes, none in chronic failure (1 not wakeable)", lines[1])
+        self.assertEqual(self.fail_count(run), self.fail_count(self.doctor(status_doc())),
+                         "a not-wakeable pane must WARN, not add a FAIL:\n%s" % run.output)
+        self.assert_read_only_call(run)
+
+    def test_a_real_chronic_pane_beside_it_is_still_chronic(self):
+        run = self.doctor(status_doc(health={"w1:p1": not_wakeable("claude"), "w5:p1": chronic(12)}))
+        lines = self.health_lines(run)
+        self.assertEqual(len(lines), 2, run.output)
+        self.assertIn("w1:p1 not wakeable (agent_kind_not_wakeable:claude)", lines[0])
+        self.assertIn("w5:p1 chronic failure: consecutive_errors=12", lines[1])
+        self.assertFalse(any(line.startswith("ok ") for line in lines), run.output)
+
+    def test_state_written_by_the_old_code_reads_as_not_wakeable(self):
+        # The previous heartbeat stored chronic_failure true with this reason.
+        # status --json recomputes health from the attempts, so the doctor sees
+        # the new label, not the stale flag.
+        hb = load_heartbeat()
+        pane = {"chronic_failure": True, "chronic_reason": "agent_kind_not_wakeable:codex",
+                "consecutive_errors": 0, "consecutive_defers": 0,
+                "attempts": [{"due": "2026-09-27T00:00:00+00:00", "status": "wrong_agent_kind",
+                              "agent_kind": "codex"}]}
+        health = hb.compute_pane_health(pane, 5.0, 10_000.0)
+        self.assertFalse(health["chronic_failure"])
+        run = self.doctor(status_doc(health={"w3:p1": health}))
+        lines = self.health_lines(run)
+        self.assertIn("w3:p1 not wakeable (agent_kind_not_wakeable:codex)", lines[0])
+        self.assertNotIn("chronic failure:", run.output)
 
 
 class ServiceFault(DoctorCase):

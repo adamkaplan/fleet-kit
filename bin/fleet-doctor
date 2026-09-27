@@ -425,9 +425,14 @@ if not service.get("pid") and not health and not service.get("fault"):
     print("WARN\tskipped — no heartbeat state yet (no daemon has run against %s)" % doc.get("state_dir","?"))
     sys.exit(0)
 chronic=0
+not_wakeable=0
 for pane in sorted(health):
     h=health[pane] or {}
-    if h.get("chronic_failure"):
+    if h.get("not_wakeable"):
+        not_wakeable+=1
+        print("WARN\t%s not wakeable (%s) — 🔔 has no effect" % (
+            pane, h.get("chronic_reason") or "agent_kind_not_wakeable:%s" % h["not_wakeable"]))
+    elif h.get("chronic_failure"):
         chronic+=1
         reason=h.get("chronic_reason") or "?"
         extra=[]
@@ -438,7 +443,8 @@ for pane in sorted(health):
             extra.append("pane not live")
         print("WARN\t%s chronic failure: %s (%s)" % (pane, reason, ", ".join(extra)))
 if not service.get("fault") and chronic==0:
-    print("ok\t%d supervised panes, none in chronic failure" % len(health))
+    print("ok\t%d supervised panes, none in chronic failure%s" % (
+        len(health), " (%d not wakeable)" % not_wakeable if not_wakeable else ""))
 ' "$TMPDIR_FD/hb-status.json" >"$TMPDIR_FD/hb-health.txt" 2>/dev/null
   if [ ! -s "$TMPDIR_FD/hb-health.txt" ]; then
     emit WARN heartbeat-health "skipped — 'fleet-heartbeat status --json' unavailable (exit $hb_rc, no parseable JSON)"
