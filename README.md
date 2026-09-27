@@ -123,10 +123,16 @@ between a fleet you supervise and one that supervises itself. An orchestrator
 opts in by having 🔔 in its tab label — one glyph, one rule, and nothing is woken
 until you add it.
 
-The heartbeat wakes only opencode panes. A Copilot CLI pane with 🔔 in its label
-is never woken: before sending anything, `bin/fleet-heartbeat` checks the pane's
-agent kind and skips anything that is not `opencode` (`inspect_pane`, status
-`wrong_agent_kind`). Copilot orchestrators still work; they just wait for you.
+The heartbeat wakes a pane only when it can positively recognise that agent's
+empty input box — the same check that stops it typing over a half-written draft
+or into a dialog. Today that is **opencode** only. Any other herdr-detected
+agent (Copilot CLI, Claude Code, Codex, pi, …) with 🔔 in its tab is never sent
+anything; `./bin/fleet-heartbeat list` shows it as not wakeable, and `status`
+names the reason (`agent_kind_not_wakeable:<kind>`). Those orchestrators still
+work; they just wait for you. Supporting another agent means adding its
+input-box check with captured fixtures for an empty box, a draft and a dialog.
+pi is a candidate: its check exists, pending a fixture of a pi-native selector
+or menu that reads as not ready.
 
 ---
 

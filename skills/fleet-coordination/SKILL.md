@@ -73,6 +73,10 @@ herdr tab create --workspace <wN> --cwd <worktree> --label <name> --no-focus
 | opencode v2 | create the session with its agent, then resume it (below) |
 | opencode, unknown version | the fallback (below) |
 
+Other herdr-supported CLIs start the same way, with `--kind <kind>`, but fleet-kit
+ships no agent definitions for them, and how each one selects a named agent is
+unverified. Do not guess a flag for them.
+
 **opencode v2.** The v2 TUI has no `--agent` flag. `opencode --agent <agent>`
 exits 1 with `Unrecognized flag: --agent`, which in a pane leaves a shell rather
 than an agent. `opencode --agent <agent> --help` exits 0 anyway, so it proves

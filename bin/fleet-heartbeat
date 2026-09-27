@@ -128,11 +128,16 @@ STRUCTURAL_STATUSES = {
     "socket_unavailable",
     "cli_error",
     "cli_unavailable",
-    "wrong_agent_kind",
     "inspection_error",
     "unavailable",
 }
-# Of those, the ones that could mean herdr itself has gone. Seeing one of these
+# A supervised pane whose agent kind has no draft guard in WAKEABLE_KINDS. It is
+# never sent anything, and it is not an error either: nothing is broken, and
+# counting it as one used to report "consecutive_errors=2" instead of the cause.
+# It is re-checked on its normal cadence, since the pane may start another
+# agent, and health names the kind (`agent_kind_not_wakeable:<kind>`).
+NOT_WAKEABLE_STATUSES = {"wrong_agent_kind"}
+# Of the structural ones, the ones that could mean herdr itself has gone. Seeing one of these
 # re-runs the startup verification, which is what turns "retried forever, in
 # silence" into "the service is down and says why".
 HERDR_SUSPECT_STATUSES = {"cli_error", "cli_unavailable"}
@@ -388,7 +393,7 @@ def build_wake_message(pane_id, now, pane_state, interval_m, command=None):
 
 # -------------------------------------------------------------------- the gate
 
-def empty_composer(screen):
+def opencode_empty_composer(screen):
     """True only for a fully visible, empty, closed OpenCode input box.
 
     This is the draft guard, and it is deliberately the strictest thing here.
@@ -418,6 +423,58 @@ def empty_composer(screen):
     if start < 0 or end - start - 2 != 3:
         return False
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
+
+
+PI_FOOTER_MAX_LINES = 3
+
+
+def pi_empty_composer(screen):
+    """True only for pi's input box, empty, directly above its footer.
+
+    pi draws its editor between two full-width `─` rules, with a short footer
+    under the lower one (the working directory, then token and model stats).
+    Empty means exactly one blank row between the last two rules, both rules
+    the same width, and nothing but a footer of 1–3 non-blank rows below.
+    A draft fills that row or adds rows; the slash-command menu opens below
+    the lower rule and pushes the footer down. Both read as not ready.
+    Captured live with pi 0.85.1 (witt3rd/fleet-ops#33).
+
+    A candidate only: it is not in WAKEABLE_KINDS until a pi-native modal
+    fixture reads as not ready (see the note there).
+    """
+    if any(ord(char) < 32 and char != "\n" for char in screen):
+        return False
+    lines = [line.rstrip() for line in screen.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    rules = [i for i, line in enumerate(lines) if re.fullmatch(r"\u2500{20,}", line)]
+    if len(rules) < 2:
+        return False
+    top, bottom = rules[-2], rules[-1]
+    footer = lines[bottom + 1:]
+    if not 1 <= len(footer) <= PI_FOOTER_MAX_LINES or not all(footer):
+        return False
+    if bottom - top != 2 or len(lines[top]) != len(lines[bottom]):
+        return False
+    return lines[top + 1] == ""
+
+# The draft guard, per herdr agent kind. A kind is wakeable only if it is listed
+# here, and it is listed only once its check has fixtures for an empty input box
+# (must read as ready), a typed draft (must not), and a dialog or other non-empty
+# screen (must not) — see TestKindFixtures in bin/test-heartbeat.
+#
+# The check is also the dialog guard. For agents herdr classifies from the
+# screen, a dialog it does not recognise falls back to `idle` (herdr docs,
+# "Blocked state"; probed live, witt3rd/fleet-ops#33). So `idle` alone never
+# licenses a send: only a positively recognised empty input box does. herdr
+# reports nothing about drafts, so there is no generic check to fall back on.
+WAKEABLE_KINDS = {
+    "opencode": opencode_empty_composer,
+    # pi is a candidate, not registered: pi_empty_composer passes its empty,
+    # draft and slash-menu captures, but no pi-native modal (a selector or menu
+    # drawn over an empty editor) has been captured to prove it reads as not
+    # ready. That is the case where herdr says idle and Enter lands in a menu.
+}
 
 
 
@@ -463,6 +520,8 @@ class Herdr:
                 "tab_id": tab.get("tab_id"),
                 "pane_id": agent.get("pane_id"),
                 "label": label,
+                "agent_kind": agent.get("agent"),
+                "wakeable": agent.get("agent") in WAKEABLE_KINDS,
                 "supervised": BELL in label,
             })
         return found
@@ -482,33 +541,36 @@ class Herdr:
         """Is it safe to send right now? Returns (status, observed telemetry).
 
         Three layers, cheapest first: herdr's agent kind, herdr's agent status,
-        then the empty-composer draft guard. herdr's own agent detection is the
-        authority on what is running in the pane. The integration hook reports
-        the opencode lifecycle, and herdr drops the agent within half a second
-        when opencode exits, even when it is killed outright (probed on king,
-        witt3rd/fleet-ops#28). An earlier layer re-derived the same fact from
-        the foreground process name. That duplicate broke the moment opencode's
-        executable became `opencode.exe`, and it refused every wake.
+        then that kind's empty-input-box check from `WAKEABLE_KINDS`. herdr's
+        own agent detection is the authority on what is running in the pane.
+        The integration hook reports the opencode lifecycle, and herdr drops the
+        agent within half a second when opencode exits, even when it is killed
+        outright (probed on king, witt3rd/fleet-ops#28). An earlier layer
+        re-derived the same fact from the foreground process name. That
+        duplicate broke the moment opencode's executable became `opencode.exe`,
+        and it refused every wake.
 
-        The kind check stays `opencode` because the draft guard only knows the
-        opencode composer. `observed` is recorded for humans reading state
-        later; it is never a gate, because pinning a pid means a restarted
-        agent is locked out of supervision until someone notices.
+        A kind with no entry in `WAKEABLE_KINDS` is never sent anything,
+        whatever herdr says its status is. `observed` is recorded for humans
+        reading state later; it is never a gate, because pinning a pid means a
+        restarted agent is locked out of supervision until someone notices.
         """
         agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
-        if agent.get("agent") != "opencode":
-            return "wrong_agent_kind", {}
+        input_box_is_empty = WAKEABLE_KINDS.get(agent.get("agent"))
+        if input_box_is_empty is None:
+            return "wrong_agent_kind", {"agent_kind": agent.get("agent")}
         if agent.get("agent_status") not in {"idle", "done"}:
             return "busy_or_blocked_or_unknown", {}
 
         observed = {
+            "agent_kind": agent.get("agent"),
             "pid": self.foreground_pid(pane_id),
             "terminal_id": agent.get("terminal_id"),
             "cwd": agent.get("cwd"),
         }
         screen = self.call("agent", "read", pane_id, "--source", "detection",
                            "--lines", str(SCREEN_LINES), text=True)
-        return ("ready" if empty_composer(screen) else "draft_or_unknown"), observed
+        return ("ready" if input_box_is_empty(screen) else "draft_or_unknown"), observed
 
     def foreground_pid(self, pane_id):
         """The pane's sole foreground pid, for telemetry only. None if unclear.
@@ -557,7 +619,12 @@ def compute_pane_health(pane_state, interval_m, now_ts):
     since_accepted = (now_ts - accepted_ts) if accepted_ts is not None else None
 
     reason = None
-    if errors >= CHRONIC_CONSECUTIVE_ERRORS:
+    latest = attempts[-1] if attempts else {}
+    if latest.get("status") in NOT_WAKEABLE_STATUSES:
+        # Not a delivery problem, and no amount of retrying fixes it: the bell
+        # is on a pane the heartbeat has no draft guard for.
+        reason = "agent_kind_not_wakeable:%s" % (latest.get("agent_kind") or "unknown")
+    elif errors >= CHRONIC_CONSECUTIVE_ERRORS:
         reason = "consecutive_errors=%d" % errors
     elif total >= CHRONIC_MIN_ATTEMPTS_ZERO_ACCEPTED and accepted == 0:
         reason = "stalled_zero_accepted(%d_attempts)" % total
@@ -648,6 +715,8 @@ def tick_pane(state_dir, transport, target, now=None):
         attempt["accepted"] = utc(time.time())
     if observed.get("pid"):
         attempt["observed_pid"] = observed["pid"]
+    if status in NOT_WAKEABLE_STATUSES:
+        attempt["agent_kind"] = observed.get("agent_kind")
 
     with state_lock(state_dir):
         # Re-read under the lock: an ack may have landed while we were in I/O,
@@ -1028,14 +1097,16 @@ def cmd_list(args):
         return EXIT_FAULT
 
     state = read_state(ack.resolve_state_dir(args.state_dir))
-    print("%-10s %-8s %-9s %-11s %-9s %-8s %s" %
-          ("WORKSPACE", "TAB", "PANE", "SUPERVISED", "CADENCE", "STAGGER", "LABEL"))
-    print("-" * 96)
+    row = "%-10s %-8s %-9s %-11s %-11s %-9s %-9s %-8s %s"
+    print(row % ("WORKSPACE", "TAB", "PANE", "KIND", "SUPERVISED", "WAKEABLE", "CADENCE", "STAGGER", "LABEL"))
+    print("-" * 118)
     for target in targets:
         pane = state.get("panes", {}).get(target["pane_id"], {})
-        print("%-10s %-8s %-9s %-11s %-9s %-8s %s" % (
+        print(row % (
             target["workspace_id"] or "-", target["tab_id"] or "-", target["pane_id"] or "-",
+            target["agent_kind"] or "-",
             "yes" if target["supervised"] else "no (no %s)" % BELL,
+            "yes" if target["wakeable"] else "no",
             "%.1fm" % pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES),
             "%ds" % stagger_offset(target["pane_id"] or ""),
             target["label"]))
