@@ -375,7 +375,7 @@ is a good outcome. Guessing is not.
 
 ## Send back what you learned
 
-This kit is maintained at **https://github.com/dw-aura/fleet-kit.git**.
+This kit is maintained at **https://github.com/adamkaplan/fleet-kit**.
 
 If you hit something material while installing — a step that was wrong, an
 assumption that did not hold on this machine, a check that passed when it should

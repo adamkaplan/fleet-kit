@@ -3,7 +3,7 @@
 ### tl;dr, agent install
 
 ```bash
-copilot -i "Clone https://github.com/dw-aura/fleet-kit.git and follow its fleet-kit/INSTALL.md."
+copilot -i "Clone https://github.com/adamkaplan/fleet-kit.git and follow its fleet-kit/INSTALL.md."
 ```
 
 ---
