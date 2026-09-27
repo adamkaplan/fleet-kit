@@ -123,6 +123,11 @@ between a fleet you supervise and one that supervises itself. An orchestrator
 opts in by having 🔔 in its tab label — one glyph, one rule, and nothing is woken
 until you add it.
 
+The heartbeat wakes only opencode panes. A Copilot CLI pane with 🔔 in its label
+is never woken: before sending anything, `bin/fleet-heartbeat` checks the pane's
+agent kind and skips anything that is not `opencode` (`inspect_pane`, status
+`wrong_agent_kind`). Copilot orchestrators still work; they just wait for you.
+
 ---
 
 ## Who does what
@@ -318,7 +323,7 @@ you through a browser you did not need to open.
 Because every step checks first, the whole install is safe to re-run. If it dies
 halfway, run it again — it picks up where it stopped rather than starting over.
 
-Run `fleet-doctor` at the end. Run it again any time something feels wrong — it
+Run `./bin/fleet-doctor` at the end. Run it again any time something feels wrong — it
 is the same check either way.
 
 ### Steps that need a human
@@ -444,7 +449,7 @@ correction that stays on one laptop has to be discovered again by everyone else.
 
 ## Getting started
 
-1. Install it, agent-driven, and get `fleet-doctor` green.
+1. Install it, agent-driven, and get `./bin/fleet-doctor` green.
 2. Open one charter, run one orchestrator, dispatch a few coders. One afternoon
    is enough to learn the shape.
 3. Add a workspace per project. This is the step that scales — each one is a new

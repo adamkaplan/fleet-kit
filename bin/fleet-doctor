@@ -99,14 +99,19 @@ gh_guard() {
 }
 
 # --------------------------------------------------------------- config load
-# Env wins over file, file wins over defaults.
-_env_repo="$FLEET_REPO"; _env_prefix="$FLEET_PREFIX"
+# Env wins over file, file wins over defaults — for every variable read here.
+# A non-empty environment value is saved before the file is sourced and put
+# back afterwards. ${!v} and printf -v are both bash 3.2.
+CONFIG_VARS="FLEET_REPO FLEET_PREFIX FLEET_HEARTBEAT_CONF FLEET_HEARTBEAT_LABEL FLEET_HEARTBEAT_UNIT HERDR_SOCKET_PATH"
+for _v in $CONFIG_VARS; do printf -v "_env_$_v" '%s' "${!_v}"; done
 CONFIG_FILE="$HOME/.config/fleet-kit/config"
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE" 2>/dev/null
 fi
-[ -n "$_env_repo" ]   && FLEET_REPO="$_env_repo"
-[ -n "$_env_prefix" ] && FLEET_PREFIX="$_env_prefix"
+for _v in $CONFIG_VARS; do
+  _e="_env_$_v"
+  [ -n "${!_e}" ] && printf -v "$_v" '%s' "${!_e}"
+done
 [ -z "$FLEET_PREFIX" ] && FLEET_PREFIX="$(whoami)"
 
 L_ORCH="${FLEET_PREFIX}:orchestrator"
@@ -254,6 +259,22 @@ else
 fi
 
 # =========================================================== 5. skills
+# Harness-neutral first: ~/.agents/skills is read by Copilot CLI, opencode and
+# Claude Code alike, so this holds whichever agent CLI is installed. -d and -f
+# follow the symlinks INSTALL creates, so a dangling link counts as missing.
+sk_missing=""
+for sk in fleet-charter fleet-coordination; do
+  sk_dir="$HOME/.agents/skills/$sk"
+  if [ ! -d "$sk_dir" ] || [ ! -f "$sk_dir/SKILL.md" ]; then
+    sk_missing="$sk_missing $sk"
+  fi
+done
+if [ -z "$sk_missing" ]; then
+  emit ok agents-skills "fleet-charter and fleet-coordination in ~/.agents/skills"
+else
+  emit WARN agents-skills "missing or no SKILL.md in ~/.agents/skills:$sk_missing (INSTALL STEP 8)"
+fi
+
 if ! have copilot; then
   emit WARN skills "skipped — copilot not installed"
 else

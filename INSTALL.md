@@ -174,8 +174,10 @@ CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination
 DO:      mkdir -p ~/.agents/skills
          ln -s "$PWD/skills/fleet-charter"     ~/.agents/skills/fleet-charter
          ln -s "$PWD/skills/fleet-coordination" ~/.agents/skills/fleet-coordination
-VERIFY:  copilot skill list
-PROVES:  both named under "Personal skills", with their descriptions.
+VERIFY:  Copilot CLI:  copilot skill list
+         opencode:     ls ~/.agents/skills/fleet-*/SKILL.md
+PROVES:  Copilot CLI: both named under "Personal skills", with their descriptions.
+         opencode: both SKILL.md paths listed, through the links.
 ```
 
 **Symlink, do not copy.** `~/.agents/skills/` is read natively by Copilot CLI,
@@ -300,7 +302,7 @@ DO:      ./bin/fleet-heartbeat init
          mkdir -p ~/.local/bin && ln -sf "$PWD/bin/heartbeat-ack" ~/.local/bin/heartbeat-ack
          macOS:
          ./bin/fleet-heartbeat plist > ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
-         launchctl load ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet-kit.heartbeat.plist
          Linux:
          mkdir -p ~/.config/systemd/user
          ./bin/fleet-heartbeat unit > ~/.config/systemd/user/fleet-kit-heartbeat.service \
@@ -332,6 +334,12 @@ HUMAN:   yes, one step. An orchestrator opts in by having 🔔 in its tab label.
 That is the whole opt-in mechanism: one glyph, one rule. `./bin/fleet-heartbeat
 list` shows every tab holding an agent and whether it opts in, so if something is
 not being woken, that command answers why.
+
+**The heartbeat wakes only opencode panes.** A Copilot CLI pane with 🔔 in its
+label is never woken. Before sending, `bin/fleet-heartbeat` asks herdr for the
+pane's agent kind and skips anything that is not `opencode` (`inspect_pane`,
+status `wrong_agent_kind`). If the person runs orchestrators in Copilot CLI, tell
+them this step will not supervise those panes.
 
 ---
 
