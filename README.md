@@ -462,4 +462,4 @@ Chief of Staff what needs you, hearing "nothing right now," and believing it.
 
 ---
 
-*Internal and proprietary. Not for distribution outside the company.*
+*MIT licensed — see [LICENSE](LICENSE).*
