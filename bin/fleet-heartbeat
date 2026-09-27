@@ -126,8 +126,6 @@ STRUCTURAL_STATUSES = {
     "socket_unavailable",
     "cli_error",
     "cli_unavailable",
-    "process_count_invalid",
-    "process_not_opencode",
     "wrong_agent_kind",
     "inspection_error",
     "unavailable",
@@ -420,6 +418,7 @@ def empty_composer(screen):
     return all(re.fullmatch(r"\s*\u2503\s*", line[:width]) for line in lines[start + 1:end - 1])
 
 
+
 # ------------------------------------------------------------------ the transport
 
 class Herdr:
@@ -480,8 +479,18 @@ class Herdr:
     def inspect_pane(self, pane_id):
         """Is it safe to send right now? Returns (status, observed telemetry).
 
-        Four layers, cheapest first. `observed` is recorded for humans reading
-        state later; it is never a gate, because pinning a pid means a restarted
+        Three layers, cheapest first: herdr's agent kind, herdr's agent status,
+        then the empty-composer draft guard. herdr's own agent detection is the
+        authority on what is running in the pane. The integration hook reports
+        the opencode lifecycle, and herdr drops the agent within half a second
+        when opencode exits, even when it is killed outright (probed on king,
+        witt3rd/fleet-ops#28). An earlier layer re-derived the same fact from
+        the foreground process name. That duplicate broke the moment opencode's
+        executable became `opencode.exe`, and it refused every wake.
+
+        The kind check stays `opencode` because the draft guard only knows the
+        opencode composer. `observed` is recorded for humans reading state
+        later; it is never a gate, because pinning a pid means a restarted
         agent is locked out of supervision until someone notices.
         """
         agent = self.call("agent", "get", pane_id).get("result", {}).get("agent", {})
@@ -490,22 +499,27 @@ class Herdr:
         if agent.get("agent_status") not in {"idle", "done"}:
             return "busy_or_blocked_or_unknown", {}
 
-        info = self.call("pane", "process-info", "--pane", pane_id).get("result", {}).get("process_info", {})
-        processes = info.get("foreground_processes", [])
-        if len(processes) != 1:
-            return "process_count_invalid", {}
-        process = processes[0]
-        if process.get("name") != "opencode" and process.get("argv0") != "opencode":
-            return "process_not_opencode", {}
-
         observed = {
-            "pid": process.get("pid"),
+            "pid": self.foreground_pid(pane_id),
             "terminal_id": agent.get("terminal_id"),
             "cwd": agent.get("cwd"),
         }
         screen = self.call("agent", "read", pane_id, "--source", "detection",
                            "--lines", str(SCREEN_LINES), text=True)
         return ("ready" if empty_composer(screen) else "draft_or_unknown"), observed
+
+    def foreground_pid(self, pane_id):
+        """The pane's sole foreground pid, for telemetry only. None if unclear.
+
+        Best-effort by design. It never gates a send, so a failed or odd
+        `process-info` answer costs a blank in the record and nothing else.
+        """
+        try:
+            info = self.call("pane", "process-info", "--pane", pane_id)
+        except Unavailable:
+            return None
+        processes = info.get("result", {}).get("process_info", {}).get("foreground_processes", [])
+        return processes[0].get("pid") if len(processes) == 1 else None
 
     def send_pane(self, pane_id, message):
         """Re-check immediately before sending. State can change during our own I/O."""
