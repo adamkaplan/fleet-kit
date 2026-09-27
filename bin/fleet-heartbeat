@@ -438,6 +438,9 @@ def pi_empty_composer(screen):
     A draft fills that row or adds rows; the slash-command menu opens below
     the lower rule and pushes the footer down. Both read as not ready.
     Captured live with pi 0.85.1 (witt3rd/fleet-ops#33).
+
+    A candidate only: it is not in WAKEABLE_KINDS until a pi-native modal
+    fixture reads as not ready (see the note there).
     """
     if any(ord(char) < 32 and char != "\n" for char in screen):
         return False
@@ -467,7 +470,10 @@ def pi_empty_composer(screen):
 # reports nothing about drafts, so there is no generic check to fall back on.
 WAKEABLE_KINDS = {
     "opencode": opencode_empty_composer,
-    "pi": pi_empty_composer,
+    # pi is a candidate, not registered: pi_empty_composer passes its empty,
+    # draft and slash-menu captures, but no pi-native modal (a selector or menu
+    # drawn over an empty editor) has been captured to prove it reads as not
+    # ready. That is the case where herdr says idle and Enter lands in a menu.
 }
 
 

@@ -817,15 +817,22 @@ KIND_FIXTURES = {
         # In plain text that is indistinguishable from a draft, so it defers.
         "other": [OPENCODE_WELCOME],
     },
+}
+
+# Checks written and captured for, but not registered. pi is missing a
+# pi-native modal fixture (a selector or menu over an empty editor), so it stays
+# unwakeable; these tests keep its check honest until that capture exists.
+CANDIDATE_CHECKS = {"pi": hb.pi_empty_composer}
+CANDIDATE_FIXTURES = {
     "pi": {
         # At startup, under an update notice, and after a finished turn.
         "empty": [PI_STARTUP, PI_EMPTY],
         "draft": [PI_DRAFT, PI_DRAFT_MULTILINE],
-        # The slash-command menu opens below the editor. No pi-native modal was
-        # captured; the DIALOGS below are checked against pi's guard as well.
+        # The slash-command menu opens below the editor. It is not a modal.
         "other": [PI_SLASH_MENU],
     },
 }
+ALL_FIXTURES = dict(KIND_FIXTURES, **CANDIDATE_FIXTURES)
 
 # Screens that must never read as ready under any registered check. The trust
 # and login dialogs are the ones herdr reported as idle.
@@ -845,8 +852,9 @@ class TestKindFixtures(Base):
                 self.assertTrue(classes.get(name), "%s has no %s fixture" % (kind, name))
 
     def test_each_kind_reads_its_own_fixtures_correctly(self):
-        for kind, classes in KIND_FIXTURES.items():
-            check = hb.WAKEABLE_KINDS[kind]
+        checks = dict(hb.WAKEABLE_KINDS, **CANDIDATE_CHECKS)
+        for kind, classes in ALL_FIXTURES.items():
+            check = checks[kind]
             for screen in classes["empty"]:
                 self.assertTrue(check(screen), kind)
             for name in ("draft", "other"):
@@ -854,10 +862,10 @@ class TestKindFixtures(Base):
                     self.assertFalse(check(screen), "%s %s:\n%s" % (kind, name, screen))
 
     def test_no_check_accepts_a_dialog_or_another_kinds_screen(self):
-        for kind, check in hb.WAKEABLE_KINDS.items():
+        for kind, check in dict(hb.WAKEABLE_KINDS, **CANDIDATE_CHECKS).items():
             for name, screen in DIALOGS.items():
                 self.assertFalse(check(screen), "%s accepted %s" % (kind, name))
-            for other, classes in KIND_FIXTURES.items():
+            for other, classes in ALL_FIXTURES.items():
                 if other == kind:
                     continue
                 for screen in classes["empty"] + classes["draft"] + classes["other"]:
@@ -874,6 +882,18 @@ class TestKindFixtures(Base):
                 self.assertEqual(status, "draft_or_unknown", (kind, name))
                 self.assertEqual(herdr.sent, [])
                 self.setUp()
+
+    def test_candidates_are_not_wakeable(self):
+        for kind in CANDIDATE_CHECKS:
+            self.assertNotIn(kind, hb.WAKEABLE_KINDS)
+        # A pi pane on an empty editor, herdr idle: still never sent anything.
+        agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "pi",
+                   "agent_status": "idle", "terminal_id": "term1"}]
+        herdr = FakeHerdr(agents=agents, screen=PI_EMPTY)
+        status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+        self.assertEqual(status, "wrong_agent_kind")
+        self.assertEqual(herdr.sent, [])
+        self.assertEqual(self.pane()["chronic_reason"], "agent_kind_not_wakeable:pi")
 
     def test_pi_refuses_near_misses(self):
         rule = "\u2500" * 80

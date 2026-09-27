@@ -342,14 +342,15 @@ answers why.
 
 **The heartbeat wakes a pane only when it can positively recognise that agent's
 empty input box** — the same check that stops it typing over a half-written
-draft or into a dialog. Today that is **opencode** and **pi**. Any other
-herdr-detected agent (Copilot CLI, Claude Code, Codex, …) with 🔔 in its tab is
+draft or into a dialog. Today that is **opencode** only. Any other
+herdr-detected agent (Copilot CLI, Claude Code, Codex, pi, …) with 🔔 in its tab is
 never sent anything; `./bin/fleet-heartbeat list` shows it as not wakeable
 (`WAKEABLE no`), and `status` names the reason
 (`agent_kind_not_wakeable:<kind>`). If the person runs orchestrators in one of
 those, tell them this step will not supervise those panes. Supporting another
 agent means adding its input-box check with captured fixtures for an empty box,
-a draft and a dialog.
+a draft and a dialog. pi is a candidate: its check exists, pending a fixture of
+a pi-native selector or menu that reads as not ready.
 
 ---
 
