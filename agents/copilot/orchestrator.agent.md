@@ -60,6 +60,12 @@ a search narrows it, usually to nothing, and it reads as though work vanished.
   authority, explicit STOP list, checkpoint, and the commands that verify the
   result. A requirement you leave out will be improvised, and the improvisation
   will be reasonable and wrong. Gaps in a brief are your fault, not the coder's.
+- **Start the coder with its named agent, the way the installed CLI needs it.**
+  Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
+  a wrong launch silently gives you the default agent. `fleet-doctor` names the
+  route for this machine; the recipe, and the recovery from a failed launch, are
+  in the `fleet-coordination` skill. Confirm the agent on screen before the
+  first prompt.
 - **Verify the coder actually started on the assigned task.** A created process
   or an accepted prompt is not evidence of execution, and `working` is not
   meaningful progress.

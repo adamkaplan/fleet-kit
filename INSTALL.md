@@ -197,19 +197,30 @@ CHECK:   Copilot CLI:  ls ~/.copilot/agents/
 DO:      Copilot CLI:  mkdir -p ~/.copilot/agents && cp agents/copilot/*.md ~/.copilot/agents/
          opencode:     mkdir -p ~/.config/opencode/agents && cp agents/opencode/*.md ~/.config/opencode/agents/
 VERIFY:  Copilot CLI:  copilot --agent chief-of-staff -p "Reply with only your role name." -s
-         opencode:     opencode api get /api/agent | grep -o '"chief-of-staff"'
+         opencode v2:  opencode api get /api/agent | grep -o '"chief-of-staff"'
+         opencode v1:  opencode agent list | grep '^chief-of-staff '
 PROVES:  the agent resolves by name. An unknown-agent error (Copilot) or no match
          (opencode) means it did not install.
 ```
 
+`opencode --version` tells the generations apart. v1 prints a bare `1.x.y`, and
+v2 prints `opencode v2.x.y`. `./bin/fleet-doctor` classifies it on its
+`dispatch` line.
+
 Do not verify opencode with `opencode --agent … --help`. OpenCode v2's TUI has
 no `--agent` flag, and `--help` exits 0 before anything is resolved, so that
 check passes whether or not the agent exists. `opencode api` asks the running
-service for the agents it actually loaded.
+v2 service for the agents it actually loaded. v1 has no `api` subcommand; its
+`opencode agent list` loads the same definitions.
 
-To use an agent in opencode v2, start `opencode` and pick it with `/agents`
-(or `Ctrl+X` `A`, or `Shift+Tab` to cycle). Only `opencode run` takes
-`--agent`. Copilot CLI takes `copilot --agent <name>` directly.
+How a named agent is started differs by CLI. Copilot CLI and opencode v1 take
+`--agent <name>` on the interactive command. The opencode v2 TUI does not. On
+v2, create the session with its agent (`opencode api session.create` with
+`agent`), then start the TUI on it with `opencode -s <session-id>`. By hand, you
+can also start plain `opencode` and pick the agent with `/agents` (or `Ctrl+X`
+`A`, or `Shift+Tab` to cycle). The full recipe for starting a coder in a herdr
+pane, including how to recover from a failed launch, is in the
+`fleet-coordination` skill under "Starting a named agent in a pane".
 
 ```
 CHECK:   grep -l '__MODEL_ID__\|__PROVIDER__' <agents dir>/*.md

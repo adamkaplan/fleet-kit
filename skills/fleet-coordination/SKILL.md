@@ -47,6 +47,93 @@ For complex or newly-shaped scope, ask the coder for a short readback of task,
 authority and exclusions before it starts. Two sentences of readback catches the
 misunderstanding that would otherwise cost you an afternoon and a wasted branch.
 
+## Starting a named agent in a pane
+
+The brief is worthless if it lands in the wrong agent. How you start a named agent
+depends on which CLI is installed and, for opencode, which generation. A launch
+that works on one silently falls back to the default agent on another. Detect
+first, then use the matching route:
+
+```text
+./bin/fleet-doctor | grep dispatch     # names the route for this machine
+opencode --version                     # bare "1.x.y" = v1; "opencode v2.x.y" = v2
+```
+
+Every route starts in a **fresh pane** with a **new, unique agent name**:
+
+```text
+herdr tab create --workspace <wN> --cwd <worktree> --label <name> --no-focus
+                                  # pane id: .result.root_pane.pane_id
+```
+
+| CLI | Start the named agent |
+|---|---|
+| Copilot CLI | `herdr agent start <name> --kind copilot --pane <p> -- --agent <agent>` |
+| opencode v1 | `herdr agent start <name> --kind opencode --pane <p> -- --agent <agent>` |
+| opencode v2 | create the session with its agent, then resume it (below) |
+| opencode, unknown version | the fallback (below) |
+
+**opencode v2.** The v2 TUI has no `--agent` flag. `opencode --agent <agent>`
+exits 1 with `Unrecognized flag: --agent`, which in a pane leaves a shell rather
+than an agent. `opencode --agent <agent> --help` exits 0 anyway, so it proves
+nothing. What v2 does have is a session that stores its
+agent, a TUI that resumes a session with `-s`, and an API that creates a session
+with an agent without sending anything to the model:
+
+```text
+ses=$(opencode api session.create \
+  --data '{"title":"<name>","agent":"<agent>","location":{"directory":"<worktree>"}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+herdr agent start <name> --kind opencode --pane <p> -- -s "$ses"
+```
+
+Two v2 routes that look right and are not:
+
+- `opencode run --agent <agent> "<prompt>"` followed by `-s` does keep the agent.
+  But the prompt has already reached the model before you could check anything.
+- `default_agent` is config for the whole service or directory, not per pane. It
+  also changes every other session there. Setting it through
+  `OPENCODE_CONFIG_CONTENT` does nothing to the shared background service. It
+  only takes effect with a private `--standalone` server, which the rest of the
+  fleet cannot see.
+
+**Fallback** (unknown version, or `session.create` failed): start plain `opencode`
+in the pane. Send `herdr agent send-keys <name> shift+tab` **one key at a time**,
+and read the footer after every key until it names the agent. The cycle order
+depends on which agents are installed, so never count presses blind. `/agents`
+or `Ctrl+X` `A` opens a picker instead.
+
+**Confirm the agent on screen before the first prompt.** In opencode, the line
+above the composer's bottom border reads `<Agent> · <model>`, for example
+`Coder · Claude Opus 5.5 OpenRouter`:
+
+```text
+herdr agent read <name> --source visible | grep '┃  .* · '
+```
+
+Only once it names the right agent do you send the brief with
+`herdr agent prompt <name> …`. If it names anything else, stop. Do not prompt
+the pane, and do not correct the agent from inside the conversation.
+
+**Recovering from a failed launch.** A start that timed out or failed can leave
+the pane `launch_pending` and the name still bound. herdr then refuses to reuse
+either. `agent_name_taken` means the name is still live, and its message names
+the pane holding it. `agent_pane_busy` means the pane is not an available shell.
+Do not retry into the same pane or under the same name, and do not send keys
+blind to clear it. Open a new tab with `herdr tab create …` and start again with
+a fresh name (`coder24` → `coder24-b`). Close the dead tab only if you created
+it and have checked it holds no work.
+
+Sources: opencode v1 TUI `--agent` is in the
+[v1 CLI docs](https://opencode.ai/docs/cli/) and
+[`tui.ts` at v1.18.32](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/cli/cmd/tui.ts#L104-L107).
+For v2, see [agent selection](https://opencode.ai/v2/docs/agents/) ("does not
+replace the agent stored on an existing session"), the
+[TUI keys](https://opencode.ai/v2/docs/cli/tui/) and `session.create` in the
+service's `/openapi.json`. For Copilot, see the
+[CLI command reference](https://docs.github.com/en/copilot/reference/cli-command-reference)
+(`--agent=AGENT`).
+
 ## What a checkpoint is
 
 A checkpoint is a promise to report at a stated moment, with an overdue time
