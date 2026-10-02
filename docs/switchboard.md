@@ -11,7 +11,7 @@
 | PR | Branch | Scope | State |
 |---|---|---|---|
 | 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | ready for review [#15](https://github.com/adamkaplan/fleet-kit/pull/15); spikes pass |
-| 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send` | planned |
+| 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send`; the Lab scenario runner; spikes as scenarios | draft; offline and spike scenarios pass, the Lab tier of W2, B1 and R2 is next |
 | 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
 | 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
@@ -330,7 +330,7 @@ service and handles authentication. One client class owns every call.
 | note | `session.synthetic` with `resume: false`, `delivery: "steer"` and `metadata.fleet.keys` (S3) |
 | wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (S4: idle, a turn starts in 0.06 s; busy, it runs after the turn's final reply, never between steps) |
 | note → wake | `session.inbox.update` to `queue`, then to `steer`; or `session.inbox.cancel` and resend the same id as a wake (S3) |
-| message id | Derived from the recipient and the keys (`msg_` and 26 hex digits), so a retry reuses it. v2 admits a repeated id once and returns the original record (S2) |
+| message id | Derived from the recipient's session id and the keys (`msg_` and 26 hex digits), so a retry reuses it. v2 admits a repeated id once and returns the original record, silently (S2), which is why the id uses the session and not the agent's name: a relaunched agent with the same name must not have its messages swallowed |
 | events | `GET /api/event` streams only over direct HTTP to the service (Basic auth, credentials in the service's registration file); `opencode api` buffers the whole response (S2). The switchboard polls, woken early by herdr's status events |
 | move a v1 session | `experimental.session.import` (PR 10) |
 
@@ -919,8 +919,9 @@ Delivered means in the recipient's transcript. Its keys are never sent again.
    events older than the look-back window).
 2. **Delivered is a fact in the recipient's history.** A key found in the
    recipient's transcript or v2 inbox is never delivered again.
-3. **At most once (verify S2).** The message id is derived from the recipient
-   and the keys, so a retry after a crash reuses it and v2 admits it once.
+3. **At most once (S2).** The message id is derived from the recipient's
+   session and the keys, so a retry after a crash reuses it and v2 admits it
+   once.
 4. **Re-check before every write.** The agent is observed again immediately
    before a note or wake; if the decision no longer holds, nothing is sent.
 5. **Every external write is audited before and after.**
@@ -1056,9 +1057,9 @@ flowchart LR
 | S6 | Pass for PR 1's scope | herdr reported working, blocked (0.06 s after a permission ask) and done; `agent_session` names the session; the `unread` token is readable. A login shell's PATH put v1 ahead of the Lab's v2, so `launch` must start v2 by absolute path and check it. Plugin link and `[[startup]]` move to PR 3 |
 | S7 | Pass | The scripted model, registered as an OpenAI-compatible provider, streams replies, runs a shell tool call, and asks a permission; herdr's status follows it |
 
-Spikes run as `bin/proof-switchboard spike s3|s4|s5|s6`. They become scenario
-files tagged `spike` with the Lab scenario runner in PR 2, so they can be
-re-run on every v2 or herdr upgrade.
+S2–S7 are scenario files tagged `spike` (PR 2), run by
+`bin/proof-switchboard run`, so they can be re-run on every v2 or herdr
+upgrade.
 
 **Stop rule.** If S3 or S4 fails, work stops and we decide together before
 PR 2. No fallback is built ahead of time. If S7 fails, lab-scripted runs fall
@@ -1198,6 +1199,14 @@ removes it:
 
 The control must fail on the expectations it names. A scenario whose control
 passes proves nothing, and fails the run.
+
+**Runners.** `bin/test-switchboard` runs every offline-tier scenario against
+stateful fakes of herdr and v2 that encode the spike-verified behaviour, with a
+simulated clock. `bin/proof-switchboard run [paths] [--tier lab-scripted]`
+runs the lab-scripted tier: fresh Lab sessions per run and per control, real
+time, oracles read from the transcripts, the scripted model's request log,
+herdr status and pane reads. Each runner fails the run if a scenario fails or
+its control passes.
 
 **Evidence.** Each run writes `scenario-runs/<time>/<id>/`, which is
 gitignored: `report.md` with pass or fail per expectation for the run and its
@@ -1444,3 +1453,11 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   `bin/proof-switchboard` (Lab, scripted model, spikes). Spikes S1–S7 pass;
   S3 corrected the note: `steer`, not `queue`. The v2 binary must be
   configured by absolute path.
+- 2026-10-02: PR 1 ready for review. PR 2 built: the delivery engine (fact
+  sources, discovery from herdr and v2 metadata, derived pending, the rule,
+  note-to-wake conversion, the `run` loop with a lock, `send`, `pending`),
+  offline scenarios W2, B1 and R2 against stateful fakes, the Lab scenario
+  runner, and spikes S2–S7 as scenario files. Message ids derive from the
+  recipient's session, not its name. The Lab tier of W2, B1 and R2 needs the
+  runner to drive the engine; that is next. Scenario vocabulary still has two
+  `model_saw` selector styles to reconcile.
