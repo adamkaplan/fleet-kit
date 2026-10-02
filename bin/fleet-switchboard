@@ -9,15 +9,20 @@ recipient's transcript or inbox), decides note, wake, wait or hold by the
 delivery rule, and delivers. See docs/switchboard.md, "Delivery rule".
 
     fleet-switchboard run [--once]          the daemon, or one pass
+    fleet-switchboard ensure                start the daemon if it is not running
+    fleet-switchboard poke                  ask the daemon for a pass now
+    fleet-switchboard launch <name> ...     a new fleet agent in its own herdr tab
     fleet-switchboard send <name> <text>    deliver to another agent now
     fleet-switchboard pending <name>        what is pending, and why it waits
     fleet-switchboard status                config, clients, fleet agents
 
 Rules this file keeps from the start:
 
-  1. herdr is never a delivery channel. HerdrClient reads agents, sets a
-     sidebar token and shows a toast. It has no way to type into a pane or to
-     move focus, and a hygiene test scans this file to keep it that way.
+  1. herdr is never a delivery channel. HerdrClient reads agents and panes,
+     sets a sidebar token, shows a toast, opens a tab that runs a program
+     directly (no shell, nothing typed) and closes a pane `launch` itself
+     opened. It has no way to type into a pane or to move focus, and a hygiene
+     test scans this file to keep it that way.
   2. Every v2 call goes through one method, V2Client._call, which builds the
      argv and runs the configured binary with the configured environment. The
      v2 binary is reached only through a wrapper that isolates its data.
@@ -40,6 +45,9 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -62,6 +70,11 @@ DEFAULTS = {
     # instead; the Lab hit exactly that.
     "opencode": None,
     "opencode_env": {},
+    # The program that actually runs in a pane, when `opencode` is a wrapper
+    # that execs something else (the Lab). None: `opencode` itself.
+    "opencode_executable": None,
+    # Extra environment for the TUI `launch` starts, beside opencode_env.
+    "launch_env": {},
     "herdr": "herdr",
     "batch_seconds": 90,
     "engaged_minutes": 10,
@@ -107,7 +120,7 @@ def validate_config(raw, source="config"):
             "A setting that is silently ignored is worse than a missing one."
             % (source, ", ".join(unknown)))
     config = dict(DEFAULTS)
-    config["opencode_env"] = {}
+    config["opencode_env"], config["launch_env"] = {}, {}
     config.update(raw)
     opencode = config["opencode"]
     if opencode is not None and (not isinstance(opencode, str) or not os.path.isabs(opencode)):
@@ -116,19 +129,25 @@ def validate_config(raw, source="config"):
     if not isinstance(config["herdr"], str) or not config["herdr"].strip():
         raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["herdr"]))
-    env = config["opencode_env"]
-    if not isinstance(env, dict):
-        raise ConfigError("%s: 'opencode_env' must be an object of NAME: value strings, got %r"
-                          % (source, type(env).__name__))
-    for name, value in env.items():
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-            raise ConfigError("%s: 'opencode_env' has an invalid variable name: %r" % (source, name))
-        if not isinstance(value, str):
-            raise ConfigError("%s: 'opencode_env' value for %s must be a string" % (source, name))
+    executable = config["opencode_executable"]
+    if executable is not None and (not isinstance(executable, str) or not os.path.isabs(executable)):
+        raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
+    envs = {}
+    for key in ("opencode_env", "launch_env"):
+        env = config[key]
+        if not isinstance(env, dict):
+            raise ConfigError("%s: %r must be an object of NAME: value strings, got %r"
+                              % (source, key, type(env).__name__))
+        for name, value in env.items():
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                raise ConfigError("%s: %r has an invalid variable name: %r" % (source, key, name))
+            if not isinstance(value, str):
+                raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
+        envs[key] = dict(env)
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
-    config["opencode_env"] = dict(env)
+    config.update(envs)
     return config
 
 
@@ -443,20 +462,67 @@ class HerdrError(Exception):
         super().__init__("%s: %s" % (reason, detail) if detail else reason)
 
 
+def herdr_socket_path(environ=None):
+    """Where herdr listens: $HERDR_SOCKET_PATH, else herdr.sock in its config directory."""
+    environ = os.environ if environ is None else environ
+    if environ.get("HERDR_SOCKET_PATH"):
+        return environ["HERDR_SOCKET_PATH"]
+    base = environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base and os.path.isabs(base) else Path.home() / ".config"
+    return str(root / "herdr" / "herdr.sock")
+
+
+def unix_socket_call(path, method, params, timeout=HERDR_CALL_TIMEOUT):
+    """One request to herdr's socket API: a JSON line out, a JSON line back."""
+    request = json.dumps({"id": "%s:%s" % (PROG, method), "method": method, "params": params},
+                         separators=(",", ":")) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(path)
+            conn.sendall(request.encode("utf-8"))
+            reply = b""
+            while not reply.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                reply += chunk
+    except socket.timeout:
+        raise HerdrError("timeout", "herdr's socket did not answer within %ss" % timeout) from None
+    except OSError as err:
+        raise HerdrError("unavailable", "cannot reach herdr's socket %s: %s" % (path, err.strerror or err)) from None
+    try:
+        return json.loads(reply.decode("utf-8"))
+    except ValueError:
+        raise HerdrError("bad_json", "herdr's socket returned non-JSON: %s" % _one_line(reply.decode("utf-8", "replace"), 120)) from None
+
+
+TOKEN_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+TOKEN_VALUE_MAX = 80
+TITLE_MAX, BODY_MAX = 80, 240  # herdr's own caps on a toast
+
+
 class HerdrClient:
-    """Reads agents, sets a sidebar token, shows a toast. Nothing else.
+    """Reads agents and panes, sets a badge, shows a toast, opens a tab that
+    runs a program directly, and closes a pane `launch` itself opened.
 
     herdr is never a delivery channel (docs/switchboard.md, the herdr table's
     "never" row). This class deliberately has no method that types into a pane
-    or moves focus, and no general way to run an arbitrary herdr command.
+    or moves focus, and no general way to run an arbitrary herdr command. Its
+    one socket method, `layout.apply`, execs a program with argv in a new pane:
+    there is no shell, so nothing is typed, and no focus key is ever sent.
     """
 
     SOURCE = PROG
+    SOCKET_METHODS = ("layout.apply",)
 
-    def __init__(self, binary, runner=subprocess.run, timeout=HERDR_CALL_TIMEOUT):
+    def __init__(self, binary, runner=subprocess.run, timeout=HERDR_CALL_TIMEOUT, socket_call=None,
+                 socket_path=None):
         self.binary = binary
         self.runner = runner
         self.timeout = timeout
+        self.socket_call = socket_call or unix_socket_call
+        self.socket_path = socket_path
 
     def _call(self, *args):
         argv = [self.binary, *args]
@@ -477,6 +543,14 @@ class HerdrClient:
         except ValueError:
             raise HerdrError("bad_json", "herdr returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
 
+    def _socket(self, method, params):
+        if method not in self.SOCKET_METHODS:
+            raise ValueError("herdr socket method not allowed: %r" % method)
+        reply = self.socket_call(self.socket_path or herdr_socket_path(), method, params, self.timeout)
+        if isinstance(reply, dict) and reply.get("error"):
+            raise HerdrError("exit", _one_line(json.dumps(reply["error"], sort_keys=True)))
+        return reply
+
     @staticmethod
     def _result(body, field, kind):
         value = (body or {}).get("result", {}).get(field) if isinstance(body, dict) else None
@@ -490,15 +564,56 @@ class HerdrClient:
     def agent_get(self, target):
         return self._result(self._call("agent", "get", target), "agent", dict)
 
+    def pane_process_info(self, pane):
+        """The foreground processes of a pane: [{"cmdline": ..., "name": ...}, ...]."""
+        info = self._result(self._call("pane", "process-info", "--pane", pane), "process_info", dict)
+        processes = info.get("foreground_processes")
+        if not isinstance(processes, list):
+            raise HerdrError("bad_shape", "expected foreground_processes in herdr's reply")
+        return [p for p in processes if isinstance(p, dict)]
+
     def pane_report_metadata_token(self, pane, name, value, ttl_ms=None):
-        args = ["pane", "report-metadata", "--pane", pane, "--source", self.SOURCE,
-                "--token", "%s=%s" % (name, value)]
+        if not TOKEN_NAME.match(str(name)):
+            raise ValueError("token name must match %s: %r" % (TOKEN_NAME.pattern, name))
+        value = str(value)
+        if not value.strip() or len(value) > TOKEN_VALUE_MAX:
+            raise ValueError("token value must be 1-%d characters" % TOKEN_VALUE_MAX)
+        args = ["pane", "report-metadata", pane, "--source", self.SOURCE, "--token", "%s=%s" % (name, value)]
         if ttl_ms is not None:
             args += ["--ttl-ms", str(int(ttl_ms))]
         return self._call(*args)
 
-    def notification_show(self, title, body):
-        return self._call("notification", "show", "--title", title, "--body", body)
+    def pane_clear_token(self, pane, name):
+        if not TOKEN_NAME.match(str(name)):
+            raise ValueError("token name must match %s: %r" % (TOKEN_NAME.pattern, name))
+        return self._call("pane", "report-metadata", pane, "--source", self.SOURCE, "--clear-token", name)
+
+    def notification_show(self, title, body=None):
+        """Show a toast. Returns {"shown": bool, "reason": ...}: herdr answers
+        even when it shows nothing (rate_limited, busy, no_foreground_client, disabled)."""
+        args = ["notification", "show", str(title)[:TITLE_MAX]]
+        if body:
+            args += ["--body", str(body)[:BODY_MAX]]
+        body = self._call(*args)
+        shown = self._result(body, "shown", bool)
+        reason = body["result"].get("reason")
+        return {"shown": shown, "reason": reason if isinstance(reason, str) else None}
+
+    def pane_close(self, pane):
+        return self._call("pane", "close", pane)
+
+    def open_tab_running(self, workspace, label, cwd, argv, env):
+        """A new tab in `workspace` whose one pane execs `argv` directly. Never
+        types, never takes focus. Returns {"tab_id", "pane_id"}."""
+        reply = self._socket("layout.apply", {
+            "workspace_id": workspace, "tab_label": label,
+            "root": {"type": "pane", "label": label, "cwd": cwd, "command": list(argv), "env": dict(env)}})
+        layout = (reply or {}).get("result", {}).get("layout") if isinstance(reply, dict) else None
+        root = layout.get("root") if isinstance(layout, dict) else None
+        pane, tab = (root or {}).get("pane_id"), layout.get("tab_id") if isinstance(layout, dict) else None
+        if not isinstance(pane, str) or not isinstance(tab, str):
+            raise HerdrError("bad_shape", "expected layout.tab_id and layout.root.pane_id in herdr's reply")
+        return {"tab_id": tab, "pane_id": pane}
 
 
 # ------------------------------------------------------------------ the facts
@@ -609,6 +724,7 @@ STATUS = {"working": "working", "idle": "idle", "done": "idle", "blocked": "bloc
 READ_LIMIT = 200    # transcript messages per read, newest first
 SINCE_SLACK = 60    # seconds read back beyond the oldest fact, for clock skew
 MESSAGE_CAP = 4000  # characters in one delivered message
+HELD_TOAST_AFTER = 15 * 60  # seconds an item is held before you get a toast
 
 
 def agent_session(entry):
@@ -621,6 +737,13 @@ def agent_session(entry):
     if isinstance(value, dict):
         value = value.get("value") if value.get("kind", "id") == "id" else None
     return value if isinstance(value, str) and value else None
+
+
+def runs_program(cmdline, executable):
+    """True when a process command line is `executable`, alone or with arguments."""
+    if not isinstance(cmdline, str) or not executable:
+        return False
+    return cmdline == executable or cmdline.startswith(executable + " ")
 
 
 def _seconds(value):
@@ -671,6 +794,7 @@ class Observation:
         self.name, self.session_id, self.pane, self.status = name, session_id, pane, status
         self.fleet, self.idle_at, self.outcome = fleet, idle_at, outcome
         self.last_human_prompt, self.problem = last_human_prompt, problem
+        self.wrong_program = False  # the pane runs something other than the configured v2
         self.conflict = []  # other sessions that claim the same name
 
     def engaged(self, now, window):
@@ -683,7 +807,7 @@ class Observation:
         return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
                 "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                 "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
-                "conflict": self.conflict}
+                "wrong_program": self.wrong_program, "conflict": self.conflict}
 
 
 class Discovery:
@@ -692,6 +816,7 @@ class Discovery:
     def __init__(self):
         self.agents = {}
         self.problems = []
+        self.entries = []  # herdr's agent list as read, so render can compare tokens
 
     def add(self, observation):
         known = self.agents.get(observation.name)
@@ -834,6 +959,8 @@ class Switchboard:
         self.sources, self.now, self.actor = list(sources), now, actor
         self.batch_seconds = config["batch_seconds"]
         self.engaged_seconds = config["engaged_minutes"] * 60
+        self.executable = config["opencode_executable"] or config["opencode"]
+        self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
 
     # -- the audit
@@ -880,11 +1007,33 @@ class Switchboard:
         observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
                                   STATUS.get(entry.get("agent_status"), "unknown"), fleet,
                                   _seconds(times.get("idle")), info.get("outcome"))
+        self.check_program(observation)
+        if observation.problem:
+            return observation
         try:
             observation.last_human_prompt = self.last_human_prompt(session_id, now)
         except V2Error as err:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
+
+    def check_program(self, observation):
+        """The restart hazard: after a herdr restart a pane may be a shell, and
+        herdr resumes the agent by typing `opencode` into it, which can start
+        another OpenCode. A pane whose process is not the configured v2 is held,
+        and nothing is delivered to it. A pane that cannot be read is held too."""
+        if not observation.pane:
+            observation.problem = "%s has no herdr pane to check" % observation.name
+            return
+        try:
+            programs = [p.get("cmdline") for p in self.herdr.pane_process_info(observation.pane)]
+        except HerdrError as err:
+            observation.problem = "cannot read what pane %s of %s runs: %s" % (observation.pane, observation.name, err)
+            return
+        if not any(runs_program(cmdline, self.executable) for cmdline in programs):
+            observation.wrong_program = True
+            observation.problem = "pane %s of %s runs a different opencode than the configured v2 (%s): %s" % (
+                observation.pane, observation.name, self.executable,
+                _one_line("; ".join(str(c) for c in programs), 120) or "nothing")
 
     def discover(self, now, entries=None):
         """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
@@ -895,6 +1044,7 @@ class Switchboard:
             except HerdrError as err:
                 found.problems.append("herdr unreachable: %s" % err)
                 return found
+        found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1074,11 +1224,14 @@ class Switchboard:
     def run_pass(self):
         """One pass. One agent's failure is audited and never stops the others."""
         now = self.now()
-        report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": []}
+        report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
+                  "badges": [], "toasts": []}
         discovery = self.discover(now)
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
         for observation in list(discovery.agents.values()):
+            if observation.wrong_program:
+                self._note("program.guard", observation.name, {"pane": observation.pane, "reason": observation.problem})
             try:
                 report["converted"].extend(self.convert_lapsed_notes(observation, now))
             except Exception as err:
@@ -1087,6 +1240,7 @@ class Switchboard:
         by_recipient = {}
         for fact in facts:
             by_recipient.setdefault(fact.recipient, []).append(fact)
+        held = {}
         for recipient in sorted(by_recipient):
             try:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
@@ -1095,6 +1249,7 @@ class Switchboard:
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
+                    held[recipient] = plan
                     report["held"].append({"recipient": recipient, "reason": plan.reason})
                     self._note("hold", recipient, {"reason": plan.reason,
                                                    "keys": [fact.key for fact in plan.pending]})
@@ -1104,7 +1259,92 @@ class Switchboard:
                         report["sent"].append(dict(outcome, recipient=recipient))
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
+        self.render(discovery, held, now, report)
         return report
+
+    # -- render: the sidebar badge and the toast
+
+    def unread_count(self, observation, held):
+        """The unread badge for one agent, derived on every pass, never stored:
+        the facts in switchboard notes that wait in v2's inbox for a turn to
+        carry them, plus the facts held for the agent. A note a turn has
+        carried is read; a wake starts its own turn, so it is never unread."""
+        inbox = self.v2.inbox_list(observation.session_id)
+        waiting = [item for item in (inbox if isinstance(inbox, list) else [])
+                   if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
+                   and item.get("delivery") == "steer" and item.get("resume") is not True]
+        count = sum(max(1, len(_fleet_keys(item))) for item in waiting)
+        plan = held.get(observation.name)
+        return count + (len(plan.pending) if plan else 0)
+
+    def render_badges(self, discovery, held, report):
+        """Write `unread` where it differs from what herdr's agent list shows."""
+        shown = {entry.get("pane_id"): (entry.get("tokens") or {}).get("unread") for entry in discovery.entries}
+        for name, observation in sorted(discovery.agents.items()):
+            if not observation.pane:
+                continue
+            try:
+                count = self.unread_count(observation, held)
+                current = shown.get(observation.pane)
+                if count == 0 and current is None or count and current == str(count):
+                    continue
+                detail = {"pane": observation.pane, "badge": "unread", "count": count, "was": current}
+                with self._external("herdr.badge", name, detail):
+                    if count:
+                        self.herdr.pane_report_metadata_token(observation.pane, "unread", count)
+                    else:
+                        self.herdr.pane_clear_token(observation.pane, "unread")
+                report["badges"].append({"agent": name, "count": count})
+            except Exception as err:
+                self._failed(name, "badge", err, report)
+
+    def toast_candidates(self, discovery, held, now):
+        """[(agent, reason, title, body)], one per agent, most urgent reason first:
+        a pane on another program, a blocked agent, items held past the limit."""
+        wanted = {}
+        for name, plan in held.items():
+            if now - min(fact.created for fact in plan.pending) >= HELD_TOAST_AFTER:
+                wanted[name] = ("held: %s" % plan.reason, "%s: %d item(s) held" % (name, len(plan.pending)),
+                                plan.reason)
+        for name, observation in discovery.agents.items():
+            if observation.wrong_program:
+                wanted[name] = ("different opencode", "%s: pane runs a different opencode" % name,
+                                observation.problem)
+            elif observation.status == "blocked":
+                wanted[name] = ("blocked", "%s is blocked" % name,
+                                "%s is waiting on a permission request or a question" % name)
+        return [(name,) + wanted[name] for name in sorted(wanted)]
+
+    def render_toast(self, discovery, held, now, report):
+        """At most one toast per pass (herdr allows one a second, and queues none),
+        for the first agent whose reason has not been toasted yet. A reason
+        that has cleared is forgotten, so it toasts again if it comes back."""
+        candidates = self.toast_candidates(discovery, held, now)
+        self.toasted = {name: reason for name, reason in self.toasted.items()
+                        if any(c[0] == name and c[1] == reason for c in candidates)}
+        for name, reason, title, body in candidates:
+            if self.toasted.get(name) == reason:
+                continue
+            with self._external("herdr.notification", name, {"reason": reason, "title": title}) as result:
+                reply = self.herdr.notification_show(title, body)
+                result["reply"] = reply
+            if reply["shown"] or reply["reason"] == "disabled":
+                self.toasted[name] = reason  # shown, or herdr has toasts off for good
+            report["toasts"].append({"agent": name, "reason": reason, "shown": reply["shown"],
+                                     "why": reply["reason"]})
+            return  # rate_limited, busy, no_foreground_client: owed, tried again next pass
+
+    def render(self, discovery, held, now, report):
+        """Step 5: update herdr. A failure here is audited and never stops the pass."""
+        if self.audit is None:
+            return
+        steps = (("badge", lambda: self.render_badges(discovery, held, report)),
+                 ("toast", lambda: self.render_toast(discovery, held, now, report)))
+        for step, call in steps:
+            try:
+                call()
+            except Exception as err:
+                self._failed(None, step, err, report)
 
     # -- the CLI's entry points
 
@@ -1135,23 +1375,305 @@ class Switchboard:
                 "plan": plan.to_json() if plan else None, "source_problems": problems}
 
 
-def run_daemon(engine, state_dir, poll, sleep=time.sleep, passes=None):
-    """`run`: a pass every `poll` seconds under the single-instance lock.
+# ------------------------------------------------- the poke socket and the daemon
 
-    A pass that raises is audited and the loop goes on; only a SimulatedCrash
-    (or a signal) ends it. `passes` bounds the loop, for `--once` and tests.
+POKE_SOCKET = "poke.sock"
+ENSURE_PATIENCE = 3.0  # seconds `ensure` waits for the daemon to take its lock
+POKE_ALARM = 2         # seconds before a stuck `poke` ends itself
+
+
+@contextmanager
+def in_directory(path):
+    """Work from `path` for the block. A unix socket path is limited to about
+    100 bytes, so the poke socket is always named relative to the state dir."""
+    before = os.getcwd()
+    os.chdir(str(path))
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
+def open_poke_socket(state_dir):
+    """The daemon's end: a datagram socket at $STATE/poke.sock, a stale one replaced."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        with in_directory(state_dir):
+            try:
+                os.unlink(POKE_SOCKET)
+            except FileNotFoundError:
+                pass
+            sock.bind(POKE_SOCKET)
+            os.chmod(POKE_SOCKET, 0o600)
+        sock.setblocking(False)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def send_poke(state_dir):
+    """Ask the daemon for a pass. One non-blocking datagram; True when it was sent.
+
+    Never blocks and never raises: a daemon that is down, or too busy to take
+    one more datagram, has not lost anything, because the next pass derives
+    everything again.
     """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.setblocking(False)
+        with in_directory(state_dir):
+            sock.sendto(b"poke", POKE_SOCKET)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def drain_pokes(sock):
+    """Read every datagram waiting. Returns how many."""
+    count = 0
+    while sock is not None:
+        try:
+            sock.recv(64)
+        except (BlockingIOError, InterruptedError):
+            break
+        count += 1
+    return count
+
+
+def wait_for_poke(sock, timeout):
+    """Wait up to `timeout` seconds for a poke. True when one came."""
+    if sock is None:
+        time.sleep(timeout)
+        return False
+    ready, _, _ = select.select([sock], [], [], timeout)
+    return bool(ready)
+
+
+def run_daemon(engine, state_dir, poll, wait=None, passes=None):
+    """`run`: a pass on every poke, and at least every `poll` seconds, under the
+    single-instance lock.
+
+    The daemon waits on its poke socket with select, and drains every datagram
+    before each pass, so a burst of events is one pass. A pass that raises is
+    audited and the loop goes on; only a SimulatedCrash (or a signal) ends it.
+    `wait(sock, timeout)` and `passes` are for tests and `--once`.
+    """
+    wait = wait or wait_for_poke
     with single_instance(state_dir):
-        done = 0
+        try:
+            sock = open_poke_socket(state_dir)
+        except OSError as err:  # no pokes then; the poll interval still passes
+            sock = None
+            engine._note("poke.unavailable", None, {"error": _one_line(str(err))})
+        try:
+            done = 0
+            while True:
+                drain_pokes(sock)
+                try:
+                    engine.run_pass()
+                except Exception as err:
+                    engine._failed(None, "pass", err, {"errors": []})
+                done += 1
+                if passes is not None and done >= passes:
+                    return done
+                wait(sock, poll)
+        finally:
+            if sock is not None:
+                sock.close()
+
+
+def run_lock_held(state_dir):
+    """True when a daemon holds run.lock. Takes and drops the lock to find out."""
+    fd = os.open(str(Path(state_dir) / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def daemon_environment(environ):
+    """The environment for a daemon started from a hook: herdr's server env
+    minus the hook's own pane, which is whatever pane you had focused."""
+    return {name: value for name, value in environ.items()
+            if not name.startswith("HERDR_PLUGIN_")
+            and name not in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID")}
+
+
+def spawn_daemon(state_dir, spawn=subprocess.Popen):
+    """Start `run` in a session of its own, with none of the caller's pipes.
+
+    herdr waits for EOF on a hook's stdout and stderr, and counts the hook as
+    running until then; a daemon that kept them would hold a plugin slot for
+    ever. Its output goes to $STATE/daemon.log, and setsid keeps it alive
+    when herdr's hook runner is cleaned up.
+    """
+    log = os.open(str(Path(state_dir) / "daemon.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        return spawn([sys.executable, os.path.realpath(__file__), "run"], stdin=subprocess.DEVNULL,
+                     stdout=log, stderr=log, close_fds=True, start_new_session=True,
+                     cwd=str(state_dir), env=daemon_environment(os.environ))
+    finally:
+        os.close(log)
+
+
+@contextmanager
+def ensure_lock(state_dir, patience, sleep=time.sleep):
+    """Serialise concurrent `ensure` runs: a startup hook and a person at once."""
+    fd = os.open(str(Path(state_dir) / "ensure.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        waited = 0.0
         while True:
             try:
-                engine.run_pass()
-            except Exception as err:
-                engine._failed(None, "pass", err, {"errors": []})
-            done += 1
-            if passes is not None and done >= passes:
-                return done
-            sleep(poll)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if waited >= patience:
+                    raise LockError("another ensure is still starting the daemon") from None
+                sleep(0.05)
+                waited += 0.05
+        yield
+    finally:
+        os.close(fd)
+
+
+def ensure_daemon(state_dir, spawn=subprocess.Popen, patience=ENSURE_PATIENCE, sleep=time.sleep):
+    """Make sure a daemon runs. Returns "running" or "started"; raises LockError
+    when a started daemon did not take its lock within `patience` seconds."""
+    with ensure_lock(state_dir, patience, sleep):
+        if run_lock_held(state_dir):
+            return "running"
+        spawn_daemon(state_dir, spawn)
+        waited = 0.0
+        while not run_lock_held(state_dir):
+            if waited >= patience:
+                raise LockError("the daemon did not start within %gs; see %s" % (
+                    patience, Path(state_dir) / "daemon.log"))
+            sleep(0.05)
+            waited += 0.05
+        return "started"
+
+
+# ----------------------------------------------------------------- launching
+
+LAUNCH_PATIENCE = 30  # seconds for the new pane to show the v2 on the new session
+NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # herdr's own pattern for an agent name
+
+
+class LaunchError(Exception):
+    """A launch that did not finish, and what it left behind."""
+
+
+def launch_problems(name, agent, directory, workspace, issue):
+    """Why these launch arguments cannot be used (empty when they can)."""
+    problems = []
+    if not NAME_RE.match(name or ""):
+        problems.append("name must match %s (lower case, digits, - and _), got %r" % (NAME_RE.pattern, name))
+    if not agent:
+        problems.append("--agent is required")
+    if not directory or not os.path.isabs(directory) or not os.path.isdir(directory):
+        problems.append("--dir must be an absolute path of an existing directory, got %r" % directory)
+    if not workspace:
+        problems.append("no target workspace: pass --workspace or run from a herdr pane")
+    if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
+        problems.append("--issue must be an issue number, got %r" % (issue,))
+    return problems
+
+
+def fleet_record(name, role, reports_to, issue):
+    fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": issue}
+    return {key: value for key, value in fleet.items() if value is not None}
+
+
+def pane_problem(engine, pane, session_id):
+    """None when `pane` shows the v2 TUI on `session_id`, else the first thing wrong.
+
+    Positive evidence only: herdr names the agent and the session, and the
+    pane's own process is the configured v2 executable. Anything unread or
+    unclear is a problem, never a pass.
+    """
+    try:
+        entry = engine.herdr.agent_get(pane)
+        programs = [p.get("cmdline") for p in engine.herdr.pane_process_info(pane)]
+    except HerdrError as err:
+        return "herdr cannot say what pane %s shows yet: %s" % (pane, err)
+    if entry.get("agent") != "opencode":
+        return "herdr sees agent %r in pane %s, not opencode" % (entry.get("agent"), pane)
+    if agent_session(entry) != session_id:
+        return "pane %s shows session %s, not %s" % (pane, agent_session(entry), session_id)
+    if not any(runs_program(cmdline, engine.executable) for cmdline in programs):
+        return "pane %s runs %s, not the configured v2 %s" % (
+            pane, _one_line("; ".join(str(c) for c in programs), 120) or "nothing", engine.executable)
+    return None
+
+
+def wait_until_verified(engine, pane, session_id, patience, sleep):
+    deadline, problem = engine.now() + patience, None
+    while True:
+        problem = pane_problem(engine, pane, session_id)
+        if problem is None:
+            return
+        if engine.now() >= deadline:
+            raise LaunchError("could not verify the new pane: %s" % problem)
+        sleep(1)
+
+
+def close_own_pane(engine, name, pane, why):
+    """Close the one pane this launch opened. Never anything else."""
+    try:
+        with engine._external("herdr.pane.close", name, {"pane": pane, "why": why}):
+            engine.herdr.pane_close(pane)
+        return "closed pane %s" % pane
+    except Exception as err:  # the original failure matters more than this one
+        return "could not close pane %s: %s" % (pane, _one_line(str(err)))
+
+
+def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep):
+    """Create a fleet agent: a v2 session, its own herdr tab, the brief.
+
+    Nothing is typed. The tab's program is started by argv through herdr's
+    socket, so no shell and no PATH decide which OpenCode runs. The brief is
+    sent only after the pane is proved to run the configured v2 on the new
+    session. A failure after the pane opened closes that pane, and no other.
+    Returns {"name", "session", "pane", "tab"}.
+    """
+    problems = launch_problems(name, agent, directory, workspace, issue)
+    if problems:
+        raise LaunchError("; ".join(problems))
+    taken = engine.discover(engine.now()).agents.get(name)
+    if taken is not None:
+        raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
+    fleet = fleet_record(name, role, reports_to, issue)
+    with engine._external("v2.session.create", name, {"agent": agent, "directory": directory,
+                                                      "fleet": fleet}) as result:
+        session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+        result["session"] = session_id
+    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    argv = [engine.config["opencode"], "-s", session_id]
+    pane = None
+    try:
+        with engine._external("herdr.layout.apply", name, {
+                "workspace": workspace, "label": name, "cwd": directory, "argv": argv,
+                "env_names": sorted(env), "session": session_id}) as result:
+            opened = engine.herdr.open_tab_running(workspace, name, directory, argv, env)
+            pane = result["pane"] = opened["pane_id"]
+            result["tab"] = opened["tab_id"]
+        wait_until_verified(engine, pane, session_id, patience, sleep)
+        if brief:
+            with engine._external("v2.session.prompt", name, {"session": session_id, "brief_chars": len(brief)}):
+                engine.v2.prompt(session_id, brief, {"fleet": {"from": "switchboard", "brief": True}})
+    except Exception as err:
+        left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
+            else "no pane was opened"
+        raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
+    return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
 
 
 # --------------------------------------------------------------------- the CLI
@@ -1180,6 +1702,8 @@ def collect_status(runner=subprocess.run, now=time.time):
         report["config"].update({
             "opencode": config["opencode"],
             "opencode_env": sorted(config["opencode_env"]),  # names only, never values
+            "opencode_executable": config["opencode_executable"],
+            "launch_env": sorted(config["launch_env"]),
             "herdr": config["herdr"],
             "batch_seconds": config["batch_seconds"],
             "engaged_minutes": config["engaged_minutes"],
@@ -1263,6 +1787,8 @@ def format_status(report):
                                              "" if config["exists"] else " (not present; defaults)"))
         lines.append("      opencode   %s  env: %s" % (config["opencode"] or "(not configured)",
                                                        ", ".join(config["opencode_env"]) or "none"))
+        if config["opencode_executable"]:
+            lines.append("      process    %s (what a pane must run)" % config["opencode_executable"])
         lines.append("      herdr      %s" % config["herdr"])
         lines.append("      timing     batch %ss, engaged %s min, call timeout %ss, poll %ss"
                      % (config["batch_seconds"], config["engaged_minutes"], config["call_timeout_seconds"],
@@ -1320,7 +1846,7 @@ def identify_caller(herdr, v2, environ):
     return name
 
 
-def build_engine(runner, now, actor, writable=True):
+def build_engine(runner, now, actor, writable=True, socket_call=None):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
     config = load_config()
     if config["opencode"] is None:
@@ -1329,12 +1855,12 @@ def build_engine(runner, now, actor, writable=True):
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
-    herdr = HerdrClient(config["herdr"], runner)
+    herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
     return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor), state, config
 
 
-def cmd_run(args, runner, now, sleep):
+def cmd_run(args, runner, now, wait):
     engine, state, config = build_engine(runner, now, "daemon")
     if args.once:
         with single_instance(state):
@@ -1347,9 +1873,53 @@ def cmd_run(args, runner, now, sleep):
                 len(report["converted"]), len(report["errors"])))
         return EXIT_OK if not report["errors"] else EXIT_ERROR
     try:
-        run_daemon(engine, state, args.poll or config["poll_seconds"], sleep)
+        run_daemon(engine, state, args.poll or config["poll_seconds"], wait)
     except KeyboardInterrupt:
         return EXIT_OK
+    return EXIT_OK
+
+
+def cmd_ensure(args, spawn=subprocess.Popen):
+    load_config()  # a daemon that cannot read its config would exit at once; say so here
+    state = ensure_state_dir()
+    outcome = ensure_daemon(state, spawn)
+    print("daemon %s" % outcome)
+    return EXIT_OK
+
+
+def cmd_poke(args):
+    """Ask the daemon for a pass. Silent, fast, and always exit 0: it runs inside
+    herdr's hook runner, which has no timeout and a shared limit on commands."""
+    signal.alarm(POKE_ALARM)
+    try:
+        send_poke(state_dir_path())
+    except Exception:  # nothing a poke does may make a hook noisy or slow
+        pass
+    finally:
+        signal.alarm(0)
+    return EXIT_OK
+
+
+def read_brief(path, stdin):
+    """The brief for `launch`: a file, or `-` for standard input. None when not given."""
+    if path is None:
+        return None
+    try:
+        text = stdin.read() if path == "-" else Path(path).read_text()
+    except OSError as err:
+        raise LaunchError("cannot read the brief %s: %s" % (path, err.strerror or err)) from None
+    if not text.strip():
+        raise LaunchError("the brief %s is empty" % path)
+    return text
+
+
+def cmd_launch(args, runner, now, socket_call=None):
+    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
+    brief = read_brief(args.brief_file, sys.stdin)
+    engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                        args.issue, brief)
+    print(json.dumps(done, sort_keys=True))
     return EXIT_OK
 
 
@@ -1412,6 +1982,17 @@ def build_parser():
     send.add_argument("text", nargs="+", help="The message")
     send.add_argument("--issue", type=int, help="The issue the message is about")
     send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
+    sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
+    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
+    launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
+    launch.add_argument("--agent", required=True, help="The OpenCode agent definition, such as coder")
+    launch.add_argument("--dir", required=True, help="The agent's working directory (absolute)")
+    launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
+    launch.add_argument("--role", help="metadata.fleet.role")
+    launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
+    launch.add_argument("--issue", type=int, help="metadata.fleet.issue")
+    launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -1419,7 +2000,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None, runner=subprocess.run, now=time.time, sleep=time.sleep):
+def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
+         socket_call=None):
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exit_:
@@ -1429,9 +2011,15 @@ def main(argv=None, runner=subprocess.run, now=time.time, sleep=time.sleep):
         return EXIT_OK
     if args.action == "status":
         return cmd_status(args, runner, now)
+    if args.action == "poke":
+        return cmd_poke(args)
     try:
+        if args.action == "ensure":
+            return cmd_ensure(args, spawn)
+        if args.action == "launch":
+            return cmd_launch(args, runner, now, socket_call)
         if args.action == "run":
-            return cmd_run(args, runner, now, sleep)
+            return cmd_run(args, runner, now, wait)
         if args.action == "send":
             return cmd_send(args, runner, now)
         if args.action == "pending":
@@ -1439,7 +2027,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, sleep=time.sleep):
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
-    except (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError) as err:
+    except (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError,
+            LaunchError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
     sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))

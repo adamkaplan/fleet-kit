@@ -50,6 +50,9 @@ DELIVERIES = ("queue", "steer")
 STATUSES = ("working", "idle", "done", "blocked")
 OF = ("session", "message")
 OUTCOMES = ("completed", "error")
+# The systems a control can run instead of the switchboard. `fleet-heartbeat`
+# is today's: it types a wake into the agent's input box, with `agent prompt`.
+BASELINES = ("fleet-heartbeat",)
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -80,6 +83,7 @@ STEP_FIELDS = {
     "note": _SYNTHETIC,
     "wake": _SYNTHETIC,
     "wait": {},
+    "launch": {"agent": (True, _CAST), "brief": (False, "text")},
     "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
              "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
     "pass": {"faults": (False, "faults")},
@@ -91,7 +95,7 @@ STEP_ACTORS = {
     "permission": ("you", "cast"), "comment": ("world",), "kill-daemon": ("world",),
     "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
     "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
-    "fact": ("world",), "pass": ("world",),
+    "fact": ("world",), "pass": ("world",), "launch": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -110,6 +114,8 @@ EXPECT_FIELDS = {
     "tool_outcome": {"agent": (True, _CAST), "tool": (False, "name"), "outcome": (True, "outcome")},
     "judged": {"agent": (True, _CAST), "question": (True, "text"), "threshold": (False, "probability")},
     "status_is": {"agent": (True, _CAST), "status": (True, "status"), "at": (True, "duration")},
+    "pane_runs_v2": {"agent": (True, _CAST)},
+    "no_typing": {"agent": (True, _CAST)},
     "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
                            "text": (False, "text"), "fleet": (False, "fleet")},
 }
@@ -387,8 +393,9 @@ def _validate_control(control, labels, scenario, errors):
         errors.append("control: unknown key %r" % key)
     if "fault" in control and control["fault"] not in KNOWN_FAULTS:
         errors.append("control.fault: unknown fault %r (known: %s)" % (control["fault"], ", ".join(KNOWN_FAULTS)))
-    if "baseline" in control and not (isinstance(control["baseline"], str) and control["baseline"].strip()):
-        errors.append("control.baseline: must be a non-empty string naming the system run instead")
+    if "baseline" in control and control["baseline"] not in BASELINES:
+        errors.append("control.baseline: must name the system run instead, one of %s, got %r"
+                      % (", ".join(BASELINES), control["baseline"]))
     if "variant" in control and scenario is None and not isinstance(control["variant"], dict):
         errors.append("control.variant: must be an object")
     elif "variant" in control and scenario is not None:

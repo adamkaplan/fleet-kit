@@ -53,6 +53,8 @@ is how many.
 | `close-pane` | world | `agent` | The agent's pane closes (PR 4) |
 | `synthetic`, `note`, `wake` | world | `to`, `key`, `text`, [`id`], [`resume`], [`delivery`: `queue`, `steer`] | A v2 synthetic message sent directly, without the engine (spikes). `note` defaults to resume false + steer, `wake` to resume true + queue, `synthetic` to resume false + steer. The same `id` name in one play is the same derived message id |
 | `fact` | world | `to`, `key`, `summary`, [`kind`], [`issue`], [`from`], [`batch`] | A fact for the engine: a line in its Lab fact source, `$STATE/lab-facts.jsonl`, read only when `FLEET_SWITCHBOARD_LAB=1` |
+| `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with the cast's role, `reports_to` and issue, into the herdr workspace of the play. The member has no session until the step runs. The brief is the first prompt, once the pane is verified |
+| `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with its role, `reports_to` and issue from the cast, into the play's herdr workspace. The member has no session until the step runs. The brief is the first prompt, sent once the pane is verified |
 | `pass` | world | [`faults`] | One engine pass with these faults on, such as `crash-after-send` |
 | `kill-daemon`, `restart-daemon` | world | none | While the daemon is down only `pass` steps run the engine; a restart forgets everything in memory |
 | `wait` | world | none | Marks the end of the play |
@@ -67,6 +69,8 @@ is how many.
 | `no_machine_turn` | `agent` | No model call was triggered by a fleet message |
 | `within` | `agent`, `step` (an index), `seconds`, [`key`] | With `key`: the message carrying it was delivered and answered within `seconds` of the step. Without: the agent's next final reply was |
 | `draft_intact` | `agent`, `text` | The input box still holds `text`, and no message contains it |
+| `pane_runs_v2` | `agent` | herdr names the agent in the pane that shows the session `opencode`, and the pane's process is the configured v2 executable on that session |
+| `no_typing` | `agent` | The pane was started by argv, so it has no shell, and nothing was typed: the pane's first process is the v2 itself (Lab: herdr's `process-info`; offline: the fake's launch record and its typing log) |
 | `status_is` | `agent`, `status` (`working`, `idle`, `done`, `blocked`, or a list), `at` | herdr's status at that time |
 | `tool_outcome` | `agent`, [`tool`], `outcome` (`completed`, `error`) | The agent's last call of `tool` (default `shell`) ended so, and a completed result went back to the model |
 | `metadata_roundtrip` | `agent`, `of` (`session`, `message`), [`key` or `text`], [`fleet`] | v2 returns `metadata.fleet` exactly: the cast's, or `fleet`; a message is named by exactly one of `key` or `text` |
@@ -95,7 +99,7 @@ Exactly one of:
 |---|---|---|
 | `fault` | a known fault name | The scenario plays again with `FLEET_SWITCHBOARD_FAULT` set on every engine process; only scenarios that run the engine |
 | `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
-| `baseline` | the system run instead | Not built yet |
+| `baseline` | `fleet-heartbeat` | Today's system delivers instead. The runner, the only code allowed to type and only into Lab panes, types each `fact`'s wake with `herdr agent prompt` (`[heartbeat] <summary>`), and the engine's daemon does not run. The fake herdr's `agent prompt` does what the TUI does: it submits the input box's text followed by the prompt |
 
 plus `fails`: the expectations, by `name` or `that`, the control must break.
 A control that breaks none of them proves nothing, and fails the run.
@@ -117,6 +121,13 @@ with the `lab-scripted` tier in the Lab, in real time, on fresh v2 sessions,
 then plays its control. Every cast member gets a warm-up turn first; that
 brief, and every `turn`, are marked as the fleet's (`metadata.fleet`), so
 only a `message` counts as you prompting.
+
+A `launch` step runs `fleet-switchboard launch` on the same private config,
+which also names `opencode_executable` (the Lab's real v2 binary, because the
+wrapper execs it and a pane's process is the binary) and `launch_env` (the
+marker that lets the wrapper keep the pane's herdr identity). The runner passes
+the Lab workspace id, checks the new pane is inside it, and closes it when the
+play ends.
 
 A scenario with a `fact`, `pass` or daemon step runs the real engine,
 `bin/fleet-switchboard`, with `XDG_CONFIG_HOME` and `XDG_STATE_HOME` in a

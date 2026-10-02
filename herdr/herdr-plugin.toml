@@ -1,0 +1,37 @@
+# Fleet Switchboard's herdr plugin: start the daemon with herdr, and turn
+# herdr's events into pokes. See docs/switchboard.md, "herdr".
+#
+# herdr runs each command with this directory as its working directory, never
+# through a shell, and joins a relative argv[0] that contains "/" to it.
+# Hooks have no timeout and share a global limit of 32 commands in flight, so
+# `poke` is silent and returns at once, and `ensure` returns as soon as the
+# daemon holds its lock.
+id = "fleet-switchboard"
+name = "Fleet Switchboard"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Event-driven delivery for Fleet Kit agents on OpenCode v2"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["../bin/fleet-switchboard", "ensure"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["../bin/fleet-switchboard", "poke"]
+
+[[events]]
+on = "pane.created"
+command = ["../bin/fleet-switchboard", "poke"]
+
+[[events]]
+on = "pane.closed"
+command = ["../bin/fleet-switchboard", "poke"]
+
+[[events]]
+on = "pane.exited"
+command = ["../bin/fleet-switchboard", "poke"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["../bin/fleet-switchboard", "poke"]
