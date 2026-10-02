@@ -1,0 +1,100 @@
+{
+  "id": "G1",
+  "title": "A comment lands on an ask and reaches the orchestrator that owns it",
+  "problem": 4,
+  "since_pr": 5,
+  "tiers": [
+    "offline"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "web": {
+      "role": "orchestrator",
+      "charter": 2
+    }
+  },
+  "issues": {
+    "12": {
+      "intent": "Add a health check to the platform service",
+      "parent": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "10s",
+      "actor": "world",
+      "do": "comment",
+      "issue": 12,
+      "id": 5001,
+      "body": "Please also cover the probe",
+      "why": "A signed webhook for a comment on issue 12, a sub-issue of platform's charter 1"
+    },
+    {
+      "at": "3m",
+      "actor": "world",
+      "do": "comment",
+      "issue": 12,
+      "id": 5001,
+      "body": "Please also cover the probe",
+      "why": "GitHub sends the same comment again, under a new delivery. The object id is the key, so it is not delivered twice"
+    },
+    {
+      "at": "4m",
+      "actor": "world",
+      "do": "comment",
+      "issue": 12,
+      "id": 5002,
+      "body": "A second, different comment",
+      "why": "With the dedupe off, the repeat of 5001 rides with this new key: a new message id, so v2 admits it"
+    },
+    {
+      "at": "8m",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "once",
+      "that": "delivered",
+      "to": "platform",
+      "key": "github.comment:5001",
+      "count": 1,
+      "mode": "wake"
+    },
+    {
+      "name": "second-once",
+      "that": "delivered",
+      "to": "platform",
+      "key": "github.comment:5002",
+      "count": 1
+    },
+    {
+      "name": "one-message",
+      "that": "message_count",
+      "to": "platform",
+      "count": 2
+    },
+    {
+      "name": "not-the-other-charter",
+      "that": "message_count",
+      "to": "web",
+      "count": 0,
+      "why": "Routing: the other orchestrator owns issue 2, not 12 or 1"
+    },
+    {
+      "name": "forwarding",
+      "that": "github_watch",
+      "state": "running"
+    }
+  ],
+  "control": {
+    "fault": "no-dedupe",
+    "fails": [
+      "once"
+    ]
+  }
+}

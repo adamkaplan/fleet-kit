@@ -56,6 +56,7 @@ OUTCOMES = ("completed", "error")
 # The systems a control can run instead of the switchboard. `fleet-heartbeat`
 # is today's: it types a wake into the agent's input box, with `agent prompt`.
 BASELINES = ("fleet-heartbeat", "timer-heartbeat")
+WATCH_STATES = tuple(_load_switchboard().WATCH_STATES)
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -76,7 +77,8 @@ STEP_FIELDS = {
     "draft": {"to": (True, _CAST), "text": (True, "line")},
     "away": {},
     "permission": {"to": (False, _CAST), "decision": (False, "decision")},
-    "comment": {"issue": (True, "issue"), "body": (True, "text")},
+    "comment": {"issue": (True, "issue"), "body": (True, "text"), "id": (False, "count1"),
+                "from": (False, "name")},
     "kill-daemon": {},
     "restart-daemon": {},
     "close-pane": {"agent": (True, _CAST)},
@@ -91,6 +93,9 @@ STEP_FIELDS = {
     "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
              "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
     "pass": {"faults": (False, "faults")},
+    # GitHub (PR 5)
+    "kill-forwarder": {},
+    "occupy-hook": {},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -100,6 +105,7 @@ STEP_ACTORS = {
     "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
     "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
     "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
+    "kill-forwarder": ("world",), "occupy-hook": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -122,6 +128,7 @@ EXPECT_FIELDS = {
     "no_typing": {"agent": (True, _CAST)},
     "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
                            "text": (False, "text"), "fleet": (False, "fleet")},
+    "github_watch": {"state": (True, "watch_state"), "repo": (False, "name")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
@@ -199,6 +206,8 @@ def _field_ok(check, value, cast, steps=0):
         return value in OF
     if check == "outcome":
         return value in OUTCOMES
+    if check == "watch_state":
+        return value in WATCH_STATES
     if check == "fleet":
         return value is None or isinstance(value, dict)
     if check == "faults":
@@ -215,7 +224,8 @@ _CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenari
                "when": "one of " + ", ".join(WHEN), "decision": "one of " + ", ".join(DECISIONS),
                "delivery": " or ".join(DELIVERIES),
                "status": "one of %s, or a non-empty list of them" % ", ".join(STATUSES),
-               "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES), "fleet": "an object or null",
+               "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES),
+               "watch_state": "one of " + ", ".join(WATCH_STATES), "fleet": "an object or null",
                "faults": "a non-empty list of known fault names"}
 
 

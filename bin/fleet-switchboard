@@ -42,15 +42,19 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -82,6 +86,13 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "poll_seconds": 5,
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
+    # GitHub events (PR 5)
+    "github_repos": [],
+    "gh": "gh",
+    "github_lookback_hours": 24,
+    "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
+                      "check_suite", "workflow_run"],
+    "github_port": None,
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -150,6 +161,7 @@ def validate_config(raw, source="config"):
                 "worker_lookback_hours"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    _validate_github(config, source)
     config.update(envs)
     return config
 
@@ -1101,6 +1113,13 @@ class Switchboard:
         fresh.conflict = list(previous.conflict)
         return fresh, None
 
+    def _acknowledge(self, keys):
+        """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered."""
+        for source in self.sources:
+            acknowledge = getattr(source, "acknowledge", None)
+            if acknowledge is not None:
+                acknowledge(keys)
+
     # -- derive
 
     def collect_facts(self):
@@ -1149,13 +1168,14 @@ class Switchboard:
                           discovery.missing(recipient))
         pending = facts
         if not fault("no-dedupe"):
-            since = min(fact.created for fact in facts) - SINCE_SLACK
+            since = min(fact.created - getattr(fact, "look_back", 0) for fact in facts) - SINCE_SLACK
             try:
                 delivered, complete = self.delivered_keys(observation.session_id, since)
             except V2Error as err:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
+            self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
@@ -1202,6 +1222,7 @@ class Switchboard:
                 raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
                                      % message_id)
             result["id"] = record.get("id") if isinstance(record, dict) else None
+        self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
 
@@ -2065,6 +2086,936 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
+# ======================================================= GitHub events (PR 5)
+#
+# One section, self-contained. The pieces, in the order they are built:
+#
+#   config      `_validate_github`, called from validate_config
+#   verify      `signature_matches`: HMAC-SHA256 of the raw body, constant time
+#   items       webhook payloads and catch-up reads -> GitHubItem, with keys
+#               made from GitHub object ids (never delivery ids)
+#   hub         `GitHubHub`: the localhost listener, one supervised
+#               `gh webhook forward` child per watched repo, the in-memory
+#               queue the fact source drains, the catch-up read, routing
+#   status      `github_status` / `format_github`
+#
+# Facts are not stored. Webhook arrivals wait in memory until the engine
+# reports them delivered (or found in the recipient's transcript); a daemon
+# restart relies on the catch-up read. The webhook secret is made for every
+# forwarder start and lives only in memory and in that forwarder's argv.
+
+GITHUB_EVENTS = ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
+                 "check_suite", "workflow_run"]
+GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+GITHUB_EVENT_RE = re.compile(r"^[a-z_]+$")
+GITHUB_BACKOFF_BASE = 5        # seconds before the first restart; doubles each failure
+GITHUB_BACKOFF_MAX = 300
+GITHUB_STABLE = 60             # a forwarder that ran this long starts the backoff over
+GITHUB_CONFLICT_RETRY = 1800   # seconds between attempts, and catch-up reads, while someone else forwards
+GITHUB_CATCHUP_DELAY = 10      # seconds after a start: the forwarder has connected, so no gap remains
+GITHUB_LOOKUP_TTL = 600
+GITHUB_LOOKUP_RETRY = 60
+GITHUB_BODY_LIMIT = 5 * 1024 * 1024
+GITHUB_QUEUE_LIMIT = 2000
+GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
+CONFLICT_TEXT = "Hook already exists"
+WATCH_FILE = "github-watch.json"
+WATCH_STATES = ("starting", "running", "backoff", "conflict")
+
+
+def _validate_github(config, source):
+    """Check the github_* keys and `gh`; give `config` its own copies of the lists."""
+    repos = config["github_repos"]
+    if not isinstance(repos, list) or not all(isinstance(r, str) and GITHUB_REPO_RE.match(r) for r in repos):
+        raise ConfigError("%s: 'github_repos' must be a list of \"owner/repo\" strings, got %r" % (source, repos))
+    if len(set(repos)) != len(repos):
+        raise ConfigError("%s: 'github_repos' names a repo twice: one forwarder per repo" % source)
+    events = config["github_events"]
+    if not isinstance(events, list) or not events or not all(
+            isinstance(e, str) and GITHUB_EVENT_RE.match(e) for e in events):
+        raise ConfigError("%s: 'github_events' must be a non-empty list of event names such as "
+                          "\"issue_comment\", got %r" % (source, events))
+    if not isinstance(config["gh"], str) or not config["gh"].strip():
+        raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
+                          % (source, config["gh"]))
+    if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
+        raise ConfigError("%s: 'github_lookback_hours' must be a positive number, got %r"
+                          % (source, config["github_lookback_hours"]))
+    port = config["github_port"]
+    if port is not None and not (isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535):
+        raise ConfigError("%s: 'github_port' must be null (any free port) or a port number, got %r" % (source, port))
+    config["github_repos"], config["github_events"] = list(repos), list(events)
+
+
+# ------------------------------------------------------------- verification
+
+def sign_body(secret, body):
+    """The `X-Hub-Signature-256` value for `body` under `secret`."""
+    return "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+
+def signature_matches(secret, body, header):
+    """True when `header` is the signature of the raw `body`. Constant time."""
+    if not isinstance(header, str) or not secret:
+        return False
+    return hmac.compare_digest(sign_body(secret, body).encode("ascii"), header.encode("utf-8", "replace"))
+
+
+def _scrub(text, *secrets_):
+    """`text` with every secret in `secrets_` replaced; for anything read back from a child."""
+    for secret in secrets_:
+        if secret:
+            text = text.replace(secret, REDACTED)
+    return text
+
+
+# -------------------------------------------------------------------- items
+
+class GitHubItem:
+    """One thing that happened on GitHub, keyed by object id, not yet routed.
+
+    `issues`: issue numbers it is known to concern (the issue, its parents,
+    the issues a PR closes), nearest first. `lookups`: `("issue", n)` or
+    `("pr", n)` reads that can add more, made only when `issues` names no
+    owner. `recipient` is set once an owner is found.
+    """
+
+    def __init__(self, key, kind, summary, repo, issues, lookups, sender, created):
+        self.key, self.kind, self.summary, self.repo = key, kind, summary, repo
+        self.issues, self.lookups, self.sender, self.created = list(issues), list(lookups), sender, created
+        self.recipient = None
+
+    @property
+    def issue(self):
+        return self.issues[0] if self.issues else None
+
+
+CLOSES_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+(?:[\w.-]+/[\w.-]+)?#(\d+)", re.I)
+
+
+def closing_numbers(text):
+    """Issue numbers named by "closes #N", "fixes #N", "resolves #N" in a PR body."""
+    found = []
+    for match in CLOSES_RE.finditer(text if isinstance(text, str) else ""):
+        if int(match.group(1)) not in found:
+            found.append(int(match.group(1)))
+    return found
+
+
+def _id(obj):
+    value = obj.get("id") if isinstance(obj, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _number(obj):
+    value = obj.get("number") if isinstance(obj, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else None
+
+
+def _login(obj):
+    user = obj.get("user") if isinstance(obj, dict) else None
+    login = user.get("login") if isinstance(user, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
+def _url_number(url):
+    match = re.search(r"/(?:issues|pulls)/([0-9]+)$", url) if isinstance(url, str) else None
+    return int(match.group(1)) if match else None
+
+
+def parent_of(issue):
+    """The parent issue number a payload or REST issue names, if it does."""
+    if not isinstance(issue, dict):
+        return None
+    for field in ("parent", "parent_issue"):
+        value = issue.get(field)
+        found = value if isinstance(value, int) and not isinstance(value, bool) else _number(value)
+        if found:
+            return found
+    return _url_number(issue.get("parent_issue_url"))
+
+
+def _is_pr(issue):
+    return isinstance(issue, dict) and bool(issue.get("pull_request"))
+
+
+def _issue_refs(issue, number):
+    """(known issue numbers, lookups) for something that lives on issue or PR `number`."""
+    if _is_pr(issue):
+        return closing_numbers(issue.get("body")), [("pr", number)]
+    parent = parent_of(issue)
+    if parent:
+        return [number, parent], [("issue", parent)]
+    return [number], [("issue", number)]
+
+
+def _pr_refs(pr, number):
+    """(known, lookups) for a PR object: the issues it closes, the ones the payload links."""
+    known = closing_numbers(pr.get("body") if isinstance(pr, dict) else None)
+    linked = pr.get("linked_issues") if isinstance(pr, dict) else None
+    for entry in linked if isinstance(linked, list) else []:
+        n = entry if isinstance(entry, int) and not isinstance(entry, bool) else _number(entry)
+        if n and n not in known:
+            known.append(n)
+    return known, [("issue", n) for n in known] if known else [("pr", number)]
+
+
+def _pr_numbers(obj):
+    prs = obj.get("pull_requests") if isinstance(obj, dict) else None
+    return [n for n in (_number(p) for p in (prs if isinstance(prs, list) else [])) if n]
+
+
+def _comment_item(repo, comment, issue, now):
+    cid = _id(comment)
+    number = _number(issue) or _url_number(comment.get("issue_url"))
+    if cid is None or number is None:
+        return None
+    known, lookups = _issue_refs(issue, number)
+    summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
+    return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now)
+
+
+def _issue_item(repo, issue, now, what=None):
+    iid, number, updated = _id(issue), _number(issue), issue.get("updated_at")
+    if iid is None or number is None or not isinstance(updated, str):
+        return None
+    known, lookups = _issue_refs(issue, number)
+    summary = "issue #%d %s: %s" % (number, what or "updated", _one_line(issue.get("title") or "", 200))
+    return GitHubItem("github.issue:%d:%s" % (iid, updated), "github.issue", summary, repo, known, lookups,
+                      _login(issue), now)
+
+
+def _pr_state(pr):
+    return "merged" if pr.get("merged") or pr.get("merged_at") else str(pr.get("state") or "open")
+
+
+def _pr_item(repo, pr, now):
+    pid, number = _id(pr), _number(pr)
+    if pid is None or number is None:
+        return None
+    state = _pr_state(pr)
+    known, lookups = _pr_refs(pr, number)
+    summary = "PR #%d is %s: %s" % (number, state, _one_line(pr.get("title") or "", 200))
+    return GitHubItem("github.pr:%d:%s" % (pid, state), "github.pr", summary, repo, known, lookups, _login(pr), now)
+
+
+def _review_item(repo, review, pr, now):
+    rid, number = _id(review), _number(pr)
+    if rid is None or number is None:
+        return None
+    known, lookups = _pr_refs(pr, number)
+    state = str(review.get("state") or "reviewed").lower()
+    summary = "@%s reviewed PR #%d (%s): %s" % (_login(review) or "someone", number, state,
+                                                _one_line(review.get("body") or "", 300))
+    return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now)
+
+
+def _check_item(repo, obj, now, prefix, label):
+    oid, conclusion = _id(obj), obj.get("conclusion")
+    numbers = _pr_numbers(obj)
+    if oid is None or not isinstance(conclusion, str) or not conclusion or not numbers:
+        return None
+    summary = "%s %s on PR %s" % (label, conclusion, ", ".join("#%d" % n for n in numbers))
+    return GitHubItem("github.check:%s%d:%s" % (prefix, oid, conclusion), "github.check", summary, repo, [],
+                      [("pr", n) for n in numbers], None, now)
+
+
+def _wh_issues(repo, payload, now):
+    action, issue = payload.get("action"), payload.get("issue")
+    if action not in ("opened", "edited", "closed", "reopened", "labeled", "unlabeled"):
+        return []
+    what = action
+    label = (payload.get("label") or {}).get("name") if isinstance(payload.get("label"), dict) else None
+    if action in ("labeled", "unlabeled") and label:
+        what = "label %s %s" % (label, "added" if action == "labeled" else "removed")
+    item = _issue_item(repo, issue, now, what)
+    return [item] if item else []
+
+
+def _wh_issue_comment(repo, payload, now):
+    if payload.get("action") != "created":
+        return []
+    item = _comment_item(repo, payload.get("comment") or {}, payload.get("issue"), now)
+    return [item] if item else []
+
+
+def _wh_pull_request(repo, payload, now):
+    if payload.get("action") not in ("opened", "reopened", "closed", "ready_for_review"):
+        return []
+    item = _pr_item(repo, payload.get("pull_request") or {}, now)
+    return [item] if item else []
+
+
+def _wh_review(repo, payload, now):
+    if payload.get("action") != "submitted":
+        return []
+    item = _review_item(repo, payload.get("review") or {}, payload.get("pull_request") or {}, now)
+    return [item] if item else []
+
+
+def _wh_check_suite(repo, payload, now):
+    if payload.get("action") != "completed":
+        return []
+    item = _check_item(repo, payload.get("check_suite") or {}, now, "", "check suite")
+    return [item] if item else []
+
+
+def _wh_workflow_run(repo, payload, now):
+    if payload.get("action") != "completed":
+        return []
+    run = payload.get("workflow_run") or {}
+    item = _check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run"))
+    return [item] if item else []
+
+
+def _wh_sub_issues(repo, payload, now):
+    parent, sub, action = payload.get("parent_issue"), payload.get("sub_issue"), payload.get("action")
+    pid, sid, pn, sn = _id(parent), _id(sub), _number(parent), _number(sub)
+    if None in (pid, sid, pn, sn) or not isinstance(action, str):
+        return []
+    summary = "sub-issue #%d: %s (parent #%d)" % (sn, action.replace("_", " "), pn)
+    return [GitHubItem("github.subissue:%d:%d:%s" % (pid, sid, action), "github.subissue", summary, repo,
+                       [pn, sn], [("issue", pn)], _login(payload.get("sender")), now)]
+
+
+WEBHOOK_HANDLERS = {"issues": _wh_issues, "issue_comment": _wh_issue_comment, "pull_request": _wh_pull_request,
+                    "pull_request_review": _wh_review, "check_suite": _wh_check_suite,
+                    "workflow_run": _wh_workflow_run, "sub_issues": _wh_sub_issues}
+
+
+def webhook_items(event, payload, now):
+    """The items one webhook delivery holds. An event nobody handles holds none."""
+    handler = WEBHOOK_HANDLERS.get(event)
+    repo = (payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else None
+    if handler is None or not isinstance(repo, str):
+        return []
+    return handler(repo, payload, now)
+
+
+def decode_json_stream(text):
+    """Every JSON value in `text`: `gh api --paginate` prints one document per page."""
+    decoder, values, at = json.JSONDecoder(), [], 0
+    while True:
+        while at < len(text) and text[at].isspace():
+            at += 1
+        if at >= len(text):
+            return values
+        value, at = decoder.raw_decode(text, at)
+        values.append(value)
+
+
+def _records(values, key=None):
+    """The records in pages: lists are flattened; with `key`, an object's list under it."""
+    records = []
+    for value in values:
+        if isinstance(value, list):
+            records.extend(value)
+        elif isinstance(value, dict) and key and isinstance(value.get(key), list):
+            records.extend(value[key])
+    return [r for r in records if isinstance(r, dict)]
+
+
+def _is_orchestrator(observation):
+    return (observation.fleet or {}).get("role") == "orchestrator"
+
+
+def pick_owner(agents, numbers, repo=None):
+    """The fleet agent that owns the first of `numbers`, or None. One recipient per item.
+
+    An agent owns the issues in its metadata.fleet `issue` and `charter`. An
+    orchestrator beats any other role; then the nearest issue in `numbers`
+    wins, then the name.
+    """
+    best = None
+    for name in sorted(agents):
+        fleet = agents[name].fleet or {}
+        if repo and isinstance(fleet.get("repo"), str) and fleet["repo"] != repo:
+            continue
+        owned = set()
+        for field in ("issue", "charter"):
+            value = fleet.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                owned.add(value)
+            elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
+                owned.add(int(value.strip().lstrip("#")))
+        ranks = [numbers.index(n) for n in owned if n in numbers]
+        if ranks:
+            rank = (0 if fleet.get("role") == "orchestrator" else 1, min(ranks))
+            if best is None or rank < best[0]:
+                best = (rank, name)
+    return best[1] if best else None
+
+
+# ------------------------------------------------------------------- the hub
+
+class GitHubUnavailable(Exception):
+    """A `gh api` read that did not answer; the caller tries again later."""
+
+
+class Watch:
+    """One watched repo: its forwarder child and what is known about it. Memory only."""
+
+    def __init__(self, repo):
+        self.repo, self.state, self.proc, self.secret = repo, "backoff", None, None
+        self.failures = self.starts = 0
+        self.next_start = 0.0
+        self.started = self.catchup_at = self.last_catch_up = None
+        self.last_error = self.catch_up_error = None
+
+    def to_json(self):
+        """What `status` may show. Never the secret."""
+        return {"repo": self.repo, "state": self.state, "starts": self.starts, "failures": self.failures,
+                "forwarder_pid": getattr(self.proc, "pid", None), "started": iso(self.started),
+                "next_start": iso(self.next_start) if self.proc is None else None,
+                "last_catch_up": iso(self.last_catch_up), "last_error": self.last_error,
+                "catch_up_error": self.catch_up_error}
+
+
+def spawn_forwarder(argv, log_path):
+    """Start the forwarder detached, its output in `log_path`. It never inherits our pipes."""
+    fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                                start_new_session=True, close_fds=True)
+    finally:
+        os.close(fd)
+
+
+def _terminate(proc):
+    """Stop a forwarder and anything it started (it leads its own process group)."""
+    try:
+        if isinstance(proc, subprocess.Popen):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+class GitHubHub:
+    """The listener, the forwarder supervisor, the queue and the catch-up read.
+
+    Everything shared between the listener thread, the supervisor thread and
+    the engine's pass is behind `self.lock`. `now`, `runner` (for `gh api`) and
+    `spawn` (for the forwarders) are injected, so tests run a simulated clock
+    and a fake `gh` and never reach a real binary.
+    """
+
+    def __init__(self, config, state_dir, audit=None, runner=subprocess.run, spawn=spawn_forwarder,
+                 now=time.time, actor="daemon"):
+        self.config, self.state_dir, self.audit = config, Path(state_dir), audit
+        self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
+        self.lock = threading.RLock()
+        self.queue = {}        # key -> GitHubItem, until delivered
+        self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.lookback = config["github_lookback_hours"] * 3600
+        self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
+        self.conflict_retry, self.catchup_delay = GITHUB_CONFLICT_RETRY, GITHUB_CATCHUP_DELAY
+        self.discover = lambda: None  # set by attach()
+        self.autostart = True
+        self.port, self.server, self.threads, self.stopping = config["github_port"] or 0, None, [], threading.Event()
+        self._cache, self._retry, self._rejects, self._suppressed = {}, {}, [], 0
+        self._unrouted, self._snapshot = set(), None
+
+    # -- wiring
+
+    def attach(self, engine):
+        """Make this hub one of `engine`'s fact sources, reading the fleet through it."""
+        self.discover = lambda: engine.discover(engine.now())
+        engine.sources.append(self.fact_source())
+        return engine
+
+    def _audit(self, event, subject, detail):
+        if self.audit is not None:
+            self.audit.append(self.actor, event, subject, detail)
+
+    # -- the listener
+
+    def open_listener(self):
+        """Bind 127.0.0.1 (never another address) and serve POST /github in a thread."""
+        hub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "fleet-switchboard"
+            timeout = 10  # a stalled sender must not hold a thread
+
+            def _reply(self, status, text):
+                data = (text + "\n").encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                try:
+                    size = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    return self._reply(411, "length required")
+                if size < 0 or size > GITHUB_BODY_LIMIT:
+                    return self._reply(413, "too large")
+                status, text = hub.receive(self.path.split("?")[0], self.headers, self.rfile.read(size))
+                self._reply(status, text)
+
+            def do_GET(self):
+                self._reply(405, "POST only")
+
+            def log_message(self, *args):  # the daemon's stderr is not a log
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        server.daemon_threads = True
+        self.server, self.port = server, server.server_address[1]
+        self._thread(server.serve_forever)
+        return self.port
+
+    def _thread(self, target):
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        self.threads.append(thread)
+
+    def start(self):
+        """Open the listener, then supervise the forwarders every second. Idempotent."""
+        with self.lock:
+            if self.server is not None:
+                return
+            self.stopping.clear()
+            self.open_listener()
+            self._thread(self._supervise)
+
+    def _supervise(self):
+        while not self.stopping.wait(1.0):
+            try:
+                self.tick()
+            except Exception as err:  # the supervisor must outlive any one bad tick
+                self._audit("github.error", None, {"error": _one_line(str(err))})
+
+    def stop(self):
+        """Stop the listener and every forwarder."""
+        self.stopping.set()
+        server, self.server = self.server, None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        with self.lock:
+            for watch in self.watches.values():
+                if watch.proc is not None:
+                    _terminate(watch.proc)
+                    watch.proc, watch.secret, watch.state = None, None, "backoff"
+            self._write_snapshot(self.now(), stopped=True)
+
+    # -- receiving
+
+    def _verified_repo(self, header, body):
+        """The repo whose current secret signed `body`, or None. Checks every secret."""
+        match = None
+        with self.lock:
+            for repo, watch in self.watches.items():
+                if watch.secret and signature_matches(watch.secret, body, header):
+                    match = repo
+        return match
+
+    def _reject(self, reason, body):
+        now = self.now()
+        with self.lock:
+            self._rejects = [t for t in self._rejects if now - t < 60]
+            if len(self._rejects) >= GITHUB_REJECT_AUDITS:
+                self._suppressed += 1
+                return
+            self._rejects.append(now)
+            suppressed, self._suppressed = self._suppressed, 0
+        self._audit("github.rejected", None, {"reason": reason, "bytes": len(body), "also_rejected": suppressed})
+
+    def receive(self, path, headers, body):
+        """One POST. The signature is checked before the body is read as anything.
+
+        Returns (HTTP status, one line). Nothing is ingested unless it passes.
+        """
+        if path != "/github":
+            return 404, "not found"
+        header = _header(headers, "X-Hub-Signature-256")
+        repo = self._verified_repo(header, body)
+        if repo is None:
+            self._reject("signature missing" if not header else "signature does not match", body)
+            return 401, "bad signature"
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            self._audit("github.rejected", repo, {"reason": "body is not a JSON object", "bytes": len(body)})
+            return 400, "bad body"
+        event = _header(headers, "X-GitHub-Event") or ""
+        sent = (payload.get("repository") or {}).get("full_name")
+        if sent not in (None, repo):
+            self._audit("github.rejected", repo, {"reason": "payload names another repo", "event": event})
+            return 202, "ignored"
+        try:
+            items = webhook_items(event, dict(payload, repository={"full_name": repo}), self.now())
+        except Exception as err:
+            self._audit("github.rejected", repo, {"reason": "unreadable %s: %s" % (event, _one_line(str(err)))})
+            return 400, "bad payload"
+        self.enqueue(items)
+        self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
+                                              "keys": [item.key for item in items]})
+        return 202, "accepted"
+
+    def enqueue(self, items):
+        with self.lock:
+            for item in items:
+                self.queue.setdefault(item.key, item)  # the same object seen twice is one item
+            while len(self.queue) > GITHUB_QUEUE_LIMIT:
+                self.queue.pop(next(iter(self.queue)))
+
+    def acknowledge(self, keys):
+        """The engine found these keys delivered: forget them. Not stored, so a later
+        catch-up that reads them again queues them once more, and the transcript
+        stops the repeat."""
+        with self.lock:
+            for key in keys:
+                self.queue.pop(key, None)
+
+    # -- the fact source
+
+    def fact_source(self):
+        def github_facts():
+            if self.autostart:
+                self.start()  # inside the daemon's lock: the first pass starts it
+            return self.facts()
+        github_facts.acknowledge = self.acknowledge
+        return github_facts
+
+    def facts(self):
+        """Every queued item that has an owner now, as Facts. Expired items are dropped."""
+        now = self.now()
+        with self.lock:
+            for key in [k for k, i in self.queue.items() if i.created < now - self.lookback]:
+                del self.queue[key]
+            waiting = [item for item in self.queue.values() if item.recipient is None]
+        if waiting:
+            discovery = self.discover()
+            for item in waiting:
+                self._route(item, discovery, now)
+        with self.lock:
+            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender)
+                     for i in self.queue.values() if i.recipient]
+        for fact in found:
+            # An object seen again (a catch-up, a redelivery) was perhaps delivered long
+            # ago: the engine's read of the transcript must reach back that far.
+            fact.look_back = self.lookback
+        return found
+
+    def _route(self, item, discovery, now):
+        if discovery is None or discovery.problems:
+            return  # the fleet cannot be read: keep it, ask again next pass
+        try:
+            owner = self.owner_of(item, discovery.agents, now)
+        except GitHubUnavailable:
+            return
+        with self.lock:
+            if owner:
+                item.recipient = owner
+            elif item.key in self.queue:
+                del self.queue[item.key]
+                if item.key not in self._unrouted:
+                    self._unrouted.add(item.key)
+                    self._audit("github.unrouted", item.repo, {"keys": [item.key], "issues": item.issues})
+
+    def owner_of(self, item, agents, now):
+        """The owner of an item: known issues first, then reads that climb to parents
+        and to the issues a PR closes. Raises GitHubUnavailable when a read fails."""
+        known, pending, done = list(item.issues), list(item.lookups), set()
+        while True:
+            owner = pick_owner(agents, known, item.repo)
+            if owner and _is_orchestrator(agents[owner]):
+                return owner
+            if not pending:
+                return owner  # a worker that owns the issue, when no orchestrator above it does
+            lookup = pending.pop(0)
+            if lookup in done:
+                continue
+            done.add(lookup)
+            more_known, more_lookups = self._expand(item.repo, lookup, now)
+            known += [n for n in more_known if n not in known]
+            pending += more_lookups
+
+    def _expand(self, repo, lookup, now):
+        kind, number = lookup
+        data = self._read_one(repo, "%s/%d" % ("pulls" if kind == "pr" else "issues", number), now)
+        if kind == "pr":
+            return _pr_refs(data, number)[0], [("issue", n) for n in _pr_refs(data, number)[0]]
+        if _is_pr(data):
+            return closing_numbers(data.get("body")), [("pr", number)]
+        parent = parent_of(data)
+        return ([parent], [("issue", parent)]) if parent else ([], [])
+
+    def _read_one(self, repo, path, now):
+        key = (repo, path)
+        with self.lock:
+            cached = self._cache.get(key)
+            if cached and now < cached[0]:
+                return cached[1]
+            if now < self._retry.get(key, 0):
+                raise GitHubUnavailable("read of %s failed recently; trying again later" % path)
+        try:
+            pages = self.gh_api("repos/%s/%s" % (repo, path), paginate=False)
+            data = pages[0] if pages and isinstance(pages[0], dict) else {}
+        except GitHubUnavailable:
+            with self.lock:
+                self._retry[key] = now + GITHUB_LOOKUP_RETRY
+            raise
+        with self.lock:
+            self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
+        return data
+
+    # -- gh api, and the catch-up read
+
+    def gh_api(self, path, paginate=True):
+        argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
+        try:
+            done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"])
+        except (OSError, subprocess.SubprocessError) as err:
+            raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0], _one_line(str(err)))) from None
+        if done.returncode != 0:
+            raise GitHubUnavailable("gh api %s failed: %s" % (path.split("?")[0], _one_line(done.stderr or "", 200)))
+        try:
+            return decode_json_stream(done.stdout or "")
+        except ValueError:
+            raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
+
+    def catch_up_items(self, repo, now):
+        """The items for everything that changed on `repo` since now - look-back,
+        keyed exactly as the webhooks are. Returns (items, errors): one read
+        failing does not stop the others."""
+        since, items, errors, pulls = iso(now - self.lookback), [], [], []
+
+        def read(name, path, key=None):
+            try:
+                return _records(self.gh_api(path), key)
+            except GitHubUnavailable as err:
+                errors.append("%s: %s" % (name, err))
+                return []
+
+        def fresh(record, field="updated_at"):
+            return isinstance(record.get(field), str) and record[field] >= since
+
+        base = "repos/%s/" % repo
+        comments = [c for c in read("comments", base + "issues/comments?since=%s&per_page=100" % since) if fresh(c)]
+        commented = {}
+        for comment in comments:
+            number = _url_number(comment.get("issue_url"))
+            commented[number] = max(commented.get(number, ""), comment["updated_at"])
+            items.append(_comment_item(repo, comment, None, now))
+        for issue in read("issues", base + "issues?state=all&since=%s&per_page=100" % since):
+            if _is_pr(issue) or not fresh(issue):
+                continue
+            if issue["updated_at"] <= commented.get(_number(issue), ""):
+                continue  # a comment bumped it; the comment is the news
+            items.append(_issue_item(repo, issue, now))
+        for pr in read("pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=50"):
+            if fresh(pr):
+                pulls.append(pr)
+                items.append(_pr_item(repo, pr, now))
+        for pr in pulls:
+            number = _number(pr)
+            for review in read("reviews", base + "pulls/%d/reviews?per_page=100" % number):
+                if fresh(review, "submitted_at"):
+                    items.append(_review_item(repo, review, pr, now))
+            sha = (pr.get("head") or {}).get("sha")
+            for suite in read("check suites", base + "commits/%s/check-suites?per_page=100" % sha,
+                              "check_suites") if sha else []:
+                if fresh(suite):
+                    items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
+                        {"number": number}]), now, "", "check suite"))
+        for run in read("workflow runs", base + "actions/runs?per_page=50", "workflow_runs"):
+            if fresh(run):
+                items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
+        return [item for item in items if item is not None], errors
+
+    def catch_up(self, watch, now):
+        items, errors = self.catch_up_items(watch.repo, now)
+        self.enqueue(items)
+        with self.lock:
+            watch.last_catch_up = now
+            watch.catch_up_error = "; ".join(errors) if errors else None
+            watch.catchup_at = now + GITHUB_LOOKUP_RETRY if errors else None  # a failed read is read again
+        self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items], "errors": errors})
+
+    # -- the supervisor
+
+    def tick(self):
+        """One supervisor step for every watch: reap, restart with backoff, catch up."""
+        now = self.now()
+        for watch in list(self.watches.values()):
+            try:
+                self._tick_watch(watch, now)
+            except Exception as err:
+                with self.lock:
+                    watch.last_error = _scrub(_one_line(str(err)), watch.secret)
+                self._audit("github.error", watch.repo, {"error": watch.last_error})
+        self._write_snapshot(now)
+
+    def _tick_watch(self, watch, now):
+        if watch.proc is not None:
+            code = watch.proc.poll()
+            if code is not None:
+                self._exited(watch, code, now)
+            elif watch.failures and now - watch.started >= GITHUB_STABLE:
+                watch.failures = 0
+        if watch.proc is None and now >= watch.next_start:
+            self._start(watch, now)
+        if watch.catchup_at is not None and now >= watch.catchup_at:
+            self.catch_up(watch, now)
+
+    def argv_for(self, watch):
+        url = "http://127.0.0.1:%d/github" % self.port
+        return [self.config["gh"], "webhook", "forward", "--repo=%s" % watch.repo,
+                "--events=%s" % ",".join(self.config["github_events"]), "--url=%s" % url,
+                "--secret=%s" % watch.secret]
+
+    def log_path(self, watch):
+        directory = self.state_dir / "logs"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
+
+    def _start(self, watch, now):
+        secret = secrets.token_hex(32)  # a new one for every start; memory and argv only
+        with self.lock:
+            watch.secret = secret
+        try:
+            proc = self.spawn(self.argv_for(watch), self.log_path(watch))
+        except OSError as err:
+            with self.lock:
+                watch.secret = None
+            self._failed(watch, now, "cannot start %s: %s" % (self.config["gh"], _one_line(str(err), 200)))
+            return
+        with self.lock:
+            watch.proc, watch.started, watch.starts = proc, now, watch.starts + 1
+            watch.state, watch.next_start = "running", now
+            watch.catchup_at = now + self.catchup_delay
+        self._audit("github.watch", watch.repo, {"state": "running", "starts": watch.starts})
+
+    def _log_tail(self, watch):
+        try:
+            with open(str(self.log_path(watch)), "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 4096))
+                return handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _exited(self, watch, code, now):
+        tail = _scrub(self._log_tail(watch), watch.secret)
+        with self.lock:
+            watch.proc, watch.secret = None, None
+        if CONFLICT_TEXT in tail:
+            with self.lock:
+                watch.state, watch.next_start = "conflict", now + self.conflict_retry
+                watch.last_error = "someone else is already forwarding %s (%s); catch-up reads continue" % (
+                    watch.repo, CONFLICT_TEXT)
+            self._audit("github.watch", watch.repo, {"state": "conflict", "retry_in": self.conflict_retry})
+            return
+        lines = [line for line in tail.splitlines() if line.strip()]
+        reason = "exited with code %s%s" % (code, ": " + _one_line(lines[-1], 200) if lines else "")
+        if now - (watch.started or now) >= GITHUB_STABLE:
+            watch.failures = 0
+        self._failed(watch, now, reason)
+
+    def _failed(self, watch, now, reason):
+        with self.lock:
+            watch.failures += 1
+            delay = min(self.backoff_max, self.backoff_base * 2 ** (watch.failures - 1))
+            watch.state, watch.next_start, watch.last_error = "backoff", now + delay, reason
+        self._audit("github.watch", watch.repo, {"state": "backoff", "failures": watch.failures,
+                                                 "retry_in": delay, "reason": reason})
+
+    # -- status
+
+    def describe(self):
+        with self.lock:
+            return {"port": self.port, "lookback_hours": self.lookback / 3600.0,
+                    "watches": [w.to_json() for _, w in sorted(self.watches.items())]}
+
+    def _write_snapshot(self, now, stopped=False):
+        """A copy of `describe()` for `status`, which runs in another process. No secret,
+        no events; deleting it loses nothing."""
+        body = dict(self.describe(), pid=None if stopped else os.getpid())
+        text = json.dumps(body, sort_keys=True)
+        if text == self._snapshot:
+            return
+        self._snapshot = text
+        path = self.state_dir / WATCH_FILE
+        tmp = path.with_name(WATCH_FILE + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(dict(body, updated=iso(now)), sort_keys=True))
+        os.replace(str(tmp), str(path))
+
+
+def _header(headers, name):
+    """A header from an http.server message or a plain dict, any case."""
+    if hasattr(headers, "get") and not isinstance(headers, dict):
+        return headers.get(name)
+    lowered = name.lower()
+    return next((v for k, v in headers.items() if k.lower() == lowered), None)
+
+
+def attach_github(engine, config, state_dir, runner, now):
+    """The daemon's hub, or None when no repo is watched. SIGTERM becomes a clean stop."""
+    if not config["github_repos"]:
+        return None
+    hub = GitHubHub(config, state_dir, engine.audit, runner, spawn_forwarder, now, engine.actor)
+    hub.attach(engine)
+
+    def terminate(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    return hub
+
+
+def github_status(config, state_dir):
+    """What `status` says about GitHub: the config, and the daemon's last snapshot of its watches."""
+    report = {"repos": list(config["github_repos"]), "lookback_hours": config["github_lookback_hours"],
+              "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None}
+    try:
+        snapshot = json.loads((Path(state_dir) / WATCH_FILE).read_text())
+    except (OSError, ValueError):
+        return report
+    pid = snapshot.get("pid")
+    try:
+        if isinstance(pid, int):
+            os.kill(pid, 0)
+            report["daemon"] = True
+    except ProcessLookupError:
+        pass
+    except OSError:
+        report["daemon"] = True  # alive, but not ours to signal
+    report["port"] = snapshot.get("port")
+    report["updated"] = snapshot.get("updated")
+    report["watches"] = [w for w in snapshot.get("watches", []) if w.get("repo") in report["repos"]]
+    return report
+
+
+def format_github(report):
+    """Status lines for GitHub; none when no repo is watched."""
+    if not report["repos"]:
+        return []
+    lines = ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
+             % (", ".join(report["repos"]), report["lookback_hours"])]
+    if not report["daemon"]:
+        lines.append("        daemon not running: forwarder state is unknown")
+    for watch in report["watches"] if report["daemon"] else []:
+        line = "        %-24s %s" % (watch["repo"], watch["state"])
+        if watch["state"] == "conflict":
+            line += " (someone else is forwarding; catch-up reads only)"
+        if watch["failures"]:
+            line += ", %d failure(s)" % watch["failures"]
+        if watch["last_error"]:
+            line += ": " + watch["last_error"]
+        lines.append(line)
+    return lines
+
+
 # --------------------------------------------------------------------- the CLI
 
 def _check(probe):
@@ -2136,6 +3087,8 @@ def collect_status(runner=subprocess.run, now=time.time):
     report["v2"] = {"ok": v2_ok, ("detail" if v2_ok else "error"): v2_line}
     report["herdr"] = {"ok": herdr_ok, ("detail" if herdr_ok else "error"): herdr_line}
     report["agents"] = agents  # informational: an agent's trouble is not the switchboard's
+    if config_ok and state_ok:
+        report["github"] = github_status(config, state)
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
     return report
 
@@ -2205,6 +3158,7 @@ def format_status(report):
         lines.extend("        problem: %s" % problem for problem in agents["problems"])
     else:
         lines.append("      agents     %s" % agents["error"])
+    lines.extend(format_github(report["github"]) if "github" in report else [])
     return "\n".join(lines)
 
 
@@ -2261,10 +3215,14 @@ def cmd_run(args, runner, now, wait):
                 report["at"], len(report["sent"]), len(report["held"]), len(report["waiting"]),
                 len(report["converted"]), len(report["errors"])))
         return EXIT_OK if not report["errors"] else EXIT_ERROR
+    hub = attach_github(engine, config, state, runner, now)
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait)
     except KeyboardInterrupt:
         return EXIT_OK
+    finally:
+        if hub is not None:
+            hub.stop()
     return EXIT_OK
 
 

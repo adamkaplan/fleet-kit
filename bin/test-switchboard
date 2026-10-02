@@ -18,6 +18,7 @@ import copy
 import fcntl
 import fnmatch
 import hashlib
+import hmac
 import importlib.machinery
 import importlib.util
 import inspect
@@ -28,6 +29,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -154,7 +156,10 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
-            "worker_lookback_hours": 24})
+            "worker_lookback_hours": 24,
+            "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None,
+            "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
+                              "check_suite", "workflow_run"]})
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -3783,7 +3788,7 @@ class TestOfflineScenarios(Base):
 
     def test_an_unknown_step_or_oracle_is_refused_not_skipped(self):
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
-        b1["steps"].append({"at": "6m", "actor": "world", "do": "comment"})
+        b1["steps"].append({"at": "6m", "actor": "world", "do": "edit-intent"})
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
@@ -3909,6 +3914,1299 @@ def _scenario_test(path):
 
 for _path in sc.scenario_files(sc.DEFAULT_DIR):
     setattr(TestOfflineScenarios, "test_scenario_" + re.sub(r"\W", "_", _path.stem), _scenario_test(_path))
+
+
+# ============================================================ GitHub events (PR 5)
+#
+# One section: a stateful fake of GitHub and of the `gh` binary, a rig that
+# wires it to a hub and an engine, the offline runner's GitHub steps and
+# oracle (added to OfflineRun here, so the runner above stays as it was), and
+# the tests. Nothing here reaches a network or a real `gh`.
+
+GH_REPO = "fleet/scratch"
+GH_BIN = "/fake/bin/gh"
+GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook")
+
+
+class FakeProc:
+    """A forwarder child: alive until it exits or is told to stop."""
+
+    _pids = iter(range(5000, 90000))
+
+    def __init__(self, argv):
+        self.argv, self.code, self.pid = list(argv), None, next(FakeProc._pids)
+        self.secret = next(a for a in argv if a.startswith("--secret="))[len("--secret="):]
+
+    def poll(self):
+        return self.code
+
+    def terminate(self):
+        self.code = -15
+
+    def exit(self, code=1):
+        self.code = code
+
+
+class FakeGitHub:
+    """GitHub's objects, `gh api` over them, and `gh webhook forward` as processes.
+
+    `runner` is what the hub runs for `gh api`; `spawn` is what it runs for the
+    forwarder. A forwarder that is alive carries each event to the hub, signed
+    with the secret from its own argv; with none alive an event is lost, and
+    only a later `gh api` read finds it. `occupied` makes every forwarder die
+    at once with "Hook already exists".
+    """
+
+    def __init__(self, clock, repo=GH_REPO):
+        self.clock, self.repo, self.hub = clock, repo, None
+        self.issues, self.comments, self.pulls, self.reviews, self.suites, self.runs = {}, [], {}, {}, [], []
+        self.procs, self.api_calls, self.occupied = [], [], False
+        self.api_down, self.spawn_error, self.exit_text = False, None, "error: Hook already exists on %s\n" % repo
+
+    def stamp(self):
+        return sb.iso(self.clock.now())
+
+    # -- objects
+    def issue(self, number, title="an issue", parent=None, body="", labels=(), age=30 * 86400):
+        """An issue that existed `age` seconds ago and has not changed since: outside the look-back window."""
+        obj = {"id": 9000 + number, "number": number, "title": title, "body": body, "state": "open",
+               "updated_at": sb.iso(self.clock.now() - age), "user": {"login": "owner"}, "labels": [{"name": n} for n in labels]}
+        if parent:
+            obj["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (self.repo, parent)
+        self.issues[number] = obj
+        return obj
+
+    def pull(self, number, closes=(), title="a change", state="open", merged=False):
+        body = " ".join("Closes #%d." % n for n in closes)
+        self.pulls[number] = {"id": 7000 + number, "number": number, "title": title, "body": body, "state": state,
+                              "merged": merged, "updated_at": self.stamp(), "user": {"login": "coder"},
+                              "head": {"sha": "sha%d" % number}}
+        return self.pulls[number]
+
+    def comment(self, number, body, cid, login="octocat", forward=True):
+        issue = self.issues.get(number) or self.issue(number)
+        stamp = self.stamp()
+        comment = {"id": cid, "body": body, "user": {"login": login}, "created_at": stamp, "updated_at": stamp,
+                   "issue_url": "https://api.github.com/repos/%s/issues/%d" % (self.repo, number)}
+        self.comments.append(comment)
+        issue["updated_at"] = stamp
+        if forward:
+            return self.send("issue_comment", {"action": "created", "issue": dict(issue), "comment": comment})
+
+    # -- the webhook side
+    def forwarder(self):
+        alive = [p for p in self.procs if p.poll() is None]
+        return alive[-1] if alive else None
+
+    def send(self, event, payload, delivery="d-1"):
+        """GitHub sends an event. Returns the hub's (status, text), or None when nobody forwards."""
+        proc = self.forwarder()
+        if proc is None:
+            return None
+        body = json.dumps(dict(payload, repository={"full_name": self.repo})).encode()
+        headers = {"X-Hub-Signature-256": sb.sign_body(proc.secret, body), "X-GitHub-Event": event,
+                   "X-GitHub-Delivery": delivery}
+        return self.hub.receive("/github", headers, body)
+
+    def kill_forwarder(self):
+        proc = self.forwarder()
+        if proc is not None:
+            proc.exit(1)
+
+    def spawn(self, argv, log_path):
+        if self.spawn_error:
+            raise OSError(self.spawn_error)
+        proc = FakeProc(argv)
+        self.procs.append(proc)
+        if self.occupied:
+            Path(log_path).write_text(self.exit_text)
+            proc.exit(1)
+        return proc
+
+    # -- gh api
+    def runner(self, argv, **kwargs):
+        if argv[0] != GH_BIN or argv[1] != "api":
+            raise AssertionError("a test reached for a real binary: %r" % argv[:2])
+        path = argv[-1]
+        self.api_calls.append(path)
+        if self.api_down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502\n")
+        data = self.answer(path.split("?")[0][len("repos/%s/" % self.repo):], urllib_query(path))
+        pages = data if "--paginate" in argv and isinstance(data, list) else [data]
+        if isinstance(data, list):
+            pages = [[item] for item in data] if "--paginate" in argv else [data]
+        return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(p) for p in pages), "")
+
+    def since(self, items, query, field="updated_at"):
+        floor = query.get("since", "")
+        return [i for i in items if i.get(field, "") >= floor]
+
+    def answer(self, path, query):
+        parts = path.split("/")
+        if path == "issues/comments":
+            return self.since(self.comments, query)
+        if path == "issues":
+            as_issue = [dict(p, pull_request={"url": "https://api.github.com/repos/x/pulls/%d" % p["number"]})
+                        for p in self.pulls.values()]
+            return self.since(list(self.issues.values()) + as_issue, query)
+        if parts[0] == "issues" and len(parts) == 2:
+            number = int(parts[1])
+            if number in self.issues:
+                return self.issues[number]
+            return dict(self.pulls[number], pull_request={"url": "x"}) if number in self.pulls else {"number": number}
+        if path == "pulls":
+            return sorted(self.pulls.values(), key=lambda p: p["updated_at"], reverse=True)
+        if parts[0] == "pulls" and len(parts) == 2:
+            return self.pulls.get(int(parts[1]), {})
+        if parts[0] == "pulls" and parts[2:] == ["reviews"]:
+            return self.reviews.get(int(parts[1]), [])
+        if parts[0] == "commits" and parts[2:] == ["check-suites"]:
+            return {"check_suites": [s for s in self.suites if s["sha"] == parts[1]]}
+        if path == "actions/runs":
+            return {"workflow_runs": self.runs}
+        raise AssertionError("fake gh api: no route for %r" % path)
+
+
+def urllib_query(path):
+    query = {}
+    for pair in path.partition("?")[2].split("&"):
+        if pair:
+            name, _, value = pair.partition("=")
+            query[name] = value
+    return query
+
+
+class GithubRig:
+    """A hub on fake GitHub, attached to an engine on the fake fleet, on one simulated clock."""
+
+    def __init__(self, test, agents=None, config=None, repos=(GH_REPO,)):
+        raw = {"github_repos": list(repos), "gh": GH_BIN}
+        raw.update(config or {})
+        self.world = World(test, agents=(), config=raw)
+        for name, fleet in (agents if agents is not None else
+                            {"platform": {"role": "orchestrator", "charter": 1}}).items():
+            self.world.add_agent(name, fleet=fleet)
+        self.gh = FakeGitHub(self.world.clock)
+        self.hub = sb.GitHubHub(self.world.config, self.world.state, sb.AuditLog(self.world.audit_path),
+                                self.gh.runner, self.gh.spawn, self.world.clock.now)
+        self.hub.autostart, self.hub.port, self.gh.hub = False, 4711, self.hub
+        self.world.engine = self.hub.attach(self.world.new_engine())
+
+    def pump(self, seconds, every=5):
+        """Simulated time: the supervisor ticks, then a pass runs, every `every` seconds."""
+        for _ in range(0, int(seconds), every):
+            self.world.tick(every)
+            self.hub.tick()
+            self.world.engine.run_pass()
+
+    def watch(self, repo=GH_REPO):
+        return self.hub.watches[repo]
+
+    def keys(self):
+        return sorted(item.key for item in self.hub.queue.values())
+
+    def delivered(self, name="platform"):
+        return sorted(k for a in self.world.admissions(name) for k in a["keys"])
+
+    def state_text(self):
+        """Every byte under the state directory, the audit log included."""
+        return "\n".join(p.read_text(errors="replace") for p in sorted(self.world.state.rglob("*")) if p.is_file())
+
+
+def _hub_source(name):
+    return inspect.getsource(getattr(sb.GitHubHub, name))
+
+
+# ------------------------------------------------ the offline runner's GitHub steps
+
+def _github_extend_offline_run():
+    """Give OfflineRun the GitHub steps (`comment`, `kill-forwarder`, `occupy-hook`) and the
+    `github_watch` oracle, without touching the runner's own methods: its `apply`, `__init__`
+    and `one_pass` are wrapped, and everything but GitHub goes straight through."""
+    original_init, original_apply, original_pass = OfflineRun.__init__, OfflineRun.apply, OfflineRun.one_pass
+
+    def uses_github(scenario):
+        return any(s["do"] in GITHUB_STEPS for s in scenario["steps"]) or \
+            any(e["that"] == "github_watch" for e in scenario["expect"])
+
+    def build_hub(self):
+        world = self.world
+        self.gh = FakeGitHub(world.clock)
+        self.hub = sb.GitHubHub(world.config, world.state, sb.AuditLog(world.audit_path), self.gh.runner,
+                                self.gh.spawn, world.clock.now)
+        self.hub.autostart, self.hub.port, self.gh.hub = False, 4711, self.hub
+        for number, issue in sorted(self.scenario.get("issues", {}).items()):
+            self.gh.issue(int(number), parent=issue.get("parent"))
+
+    def init(self, test, scenario, label, faults=(), baseline=None):
+        original_init(self, test, scenario, label, faults, baseline)
+        self.hub = None
+        if uses_github(scenario):
+            raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO], "gh": GH_BIN}
+            self.world.config = sb.validate_config(raw)
+            build_hub(self)
+            make_engine = self.world.new_engine
+            self.world.new_engine = lambda *a, **k: self.hub.attach(make_engine(*a, **k))
+            self.world.engine = self.world.new_engine()
+
+    def apply(self, step):
+        do = step["do"]
+        if self.hub is not None and do == "restart-daemon":
+            build_hub(self)  # a new process: no queue, no forwarder, no secret survives
+        if do == "comment":
+            self.gh.comment(int(step["issue"]), step["body"], step.get("id", 1000 + self.scenario["steps"].index(step)),
+                            step.get("from", "octocat"))
+        elif do == "kill-forwarder":
+            self.gh.kill_forwarder()
+        elif do == "occupy-hook":
+            self.gh.occupied = True
+        else:
+            original_apply(self, step)
+        if self.hub is not None and do == "kill-daemon":
+            self.hub.stop()
+
+    def one_pass(self, step_faults):
+        if self.hub is not None and self.daemon:
+            self.hub.tick()
+        original_pass(self, step_faults)
+
+    def oracle_github_watch(self, e):
+        watch = self.hub.watches[e.get("repo", GH_REPO)]
+        return watch.state == e["state"], "the watch on %s is %s (last error: %s)" % (
+            watch.repo, watch.state, watch.last_error)
+
+    OfflineRun.__init__, OfflineRun.apply, OfflineRun.one_pass = init, apply, one_pass
+    OfflineRun.oracle_github_watch = oracle_github_watch
+
+
+_github_extend_offline_run()
+
+STEP_EXAMPLES.update({"comment": {"issue": 2, "body": "looks good", "id": 5001, "from": "reviewer"},
+                      "kill-forwarder": {}, "occupy-hook": {}})
+EXPECT_EXAMPLES["github_watch"] = {"state": "conflict", "repo": "fleet/scratch"}
+
+
+# ------------------------------------------------------------------- the tests
+
+class TestGithubConfig(Base):
+    def cfg(self, **raw):
+        return sb.validate_config(raw)
+
+    def test_defaults_watch_nothing_and_name_the_documented_events(self):
+        config = self.cfg()
+        self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
+                          config["github_port"]), ([], "gh", 24, None))
+        self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
+                                                   "pull_request_review", "check_suite", "workflow_run"])
+
+    def test_a_config_gets_its_own_lists(self):
+        first = self.cfg()
+        first["github_repos"].append("a/b")
+        first["github_events"].append("push")
+        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 7))
+        self.assertEqual(sb.DEFAULTS["github_repos"], [])
+
+    def test_good_values(self):
+        config = self.cfg(github_repos=["a/b", "c-d/e.f_g"], gh="/opt/gh", github_lookback_hours=0.5,
+                          github_events=["issue_comment"], github_port=8123)
+        self.assertEqual((config["github_repos"], config["gh"], config["github_port"]),
+                         (["a/b", "c-d/e.f_g"], "/opt/gh", 8123))
+
+    def test_bad_values_are_refused_by_name(self):
+        for key, value in (("github_repos", "a/b"), ("github_repos", ["ab"]), ("github_repos", ["a/b/c"]),
+                           ("github_repos", ["a/b", "a/b"]), ("github_repos", [3]), ("gh", ""), ("gh", 3),
+                           ("github_lookback_hours", 0), ("github_lookback_hours", True),
+                           ("github_events", []), ("github_events", ["Issues"]), ("github_events", "issues"),
+                           ("github_port", 0), ("github_port", 70000), ("github_port", "80"), ("github_port", True)):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    self.cfg(**{key: value})
+                self.assertIn(key, str(caught.exception))
+
+    def test_an_unknown_key_is_still_refused(self):
+        with self.assertRaises(sb.ConfigError):
+            self.cfg(github_repo=["a/b"])
+
+
+class TestGithubVerification(Base):
+    SECRET = "s" * 64
+
+    def test_the_signature_is_the_hmac_of_the_raw_body(self):
+        body = b'{"a": 1}'
+        header = "sha256=" + hmac.new(self.SECRET.encode(), body, hashlib.sha256).hexdigest()
+        self.assertEqual(sb.sign_body(self.SECRET, body), header)
+        self.assertTrue(sb.signature_matches(self.SECRET, body, header))
+
+    def test_anything_else_is_refused(self):
+        body = b"{}"
+        good = sb.sign_body(self.SECRET, body)
+        for what, header in (("none", None), ("empty", ""), ("no prefix", good[len("sha256="):]),
+                             ("other body", sb.sign_body(self.SECRET, b"{ }")),
+                             ("other secret", sb.sign_body("x" * 64, body)), ("truncated", good[:-2]),
+                             ("sha1", "sha1=" + good[len("sha256="):]), ("non-ascii", "sha256=\u00e9" * 3)):
+            with self.subTest(what=what):
+                self.assertFalse(sb.signature_matches(self.SECRET, body, header))
+        self.assertFalse(sb.signature_matches("", body, sb.sign_body("", body)), "no secret, no match")
+
+    def test_the_comparison_is_constant_time(self):
+        self.assertIn("hmac.compare_digest", inspect.getsource(sb.signature_matches))
+        self.assertNotIn("==", inspect.getsource(sb.signature_matches))
+
+
+class TestGithubReceive(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh = self.rig.hub, self.rig.gh
+        self.hub.tick()  # starts the forwarder: a secret exists now
+        self.secret = self.gh.procs[-1].secret
+        self.gh.issue(12, parent=1)
+
+    def post(self, event="issue_comment", payload=None, secret=None, signature="auto", path="/github", raw=None):
+        payload = payload if payload is not None else {
+            "action": "created", "issue": self.gh.issues[12],
+            "comment": {"id": 5001, "body": "hi", "user": {"login": "octocat"}},
+            "repository": {"full_name": GH_REPO}}
+        body = raw if raw is not None else json.dumps(payload).encode()
+        headers = {"X-GitHub-Event": event, "X-GitHub-Delivery": "d-1"}
+        if signature == "auto":
+            signature = sb.sign_body(secret or self.secret, body)
+        if signature is not None:
+            headers["X-Hub-Signature-256"] = signature
+        return self.hub.receive(path, headers, body)
+
+    def rejected(self):
+        return [e for e in self.rig.world.audit() if e["event"] == "github.rejected"]
+
+    def test_a_signed_event_is_accepted_and_queued_by_its_object_id(self):
+        self.assertEqual(self.post()[0], 202)
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+
+    def test_an_unsigned_event_is_refused_audited_and_ingests_nothing(self):
+        self.assertEqual(self.post(signature=None)[0], 401)
+        self.assertEqual(self.rig.keys(), [])
+        self.assertEqual([e["detail"]["reason"] for e in self.rejected()], ["signature missing"])
+
+    def test_a_wrongly_signed_event_is_refused_audited_and_ingests_nothing(self):
+        for what, kwargs in (("another secret", {"secret": "z" * 64}), ("garbage", {"signature": "sha256=00"}),
+                             ("a stale secret", {})):
+            with self.subTest(what=what):
+                if what == "a stale secret":
+                    self.gh.kill_forwarder()
+                    self.rig.pump(10)
+                    self.assertNotEqual(self.gh.procs[-1].secret, self.secret)
+                code, _ = self.post(**kwargs) if what != "a stale secret" else self.post(secret=self.secret)
+                self.assertEqual(code, 401)
+                self.assertEqual(self.rig.keys(), [])
+        self.assertEqual({e["detail"]["reason"] for e in self.rejected()}, {"signature does not match"})
+
+    def test_the_signature_is_checked_before_the_body_is_read(self):
+        # A body that is not JSON gets 401 when unsigned, and 400 only once it is signed.
+        self.assertEqual(self.post(raw=b"{not json", signature=None)[0], 401)
+        self.assertEqual(self.post(raw=b"{not json")[0], 400)
+        self.assertEqual(self.post(raw=b"[1]")[0], 400)
+
+    def test_only_the_github_path_answers(self):
+        self.assertEqual(self.post(path="/other")[0], 404)
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_an_event_for_another_repo_is_ignored(self):
+        payload = {"action": "created", "issue": self.gh.issues[12], "comment": {"id": 5002},
+                   "repository": {"full_name": "someone/else"}}
+        self.assertEqual(self.post(payload=payload)[0], 202)
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_events_nobody_handles_ingest_nothing(self):
+        self.assertEqual(self.post(event="ping", payload={"zen": "x", "repository": {"full_name": GH_REPO}})[0], 202)
+        self.assertEqual(self.post(event="push", payload={"repository": {"full_name": GH_REPO}})[0], 202)
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_a_flood_of_bad_signatures_is_mostly_counted_not_audited(self):
+        for _ in range(sb.GITHUB_REJECT_AUDITS + 30):
+            self.post(signature="sha256=00")
+        self.assertEqual(len(self.rejected()), sb.GITHUB_REJECT_AUDITS)
+        self.rig.world.clock.t += 61
+        self.post(signature="sha256=00")
+        self.assertEqual(self.rejected()[-1]["detail"]["also_rejected"], 30)
+
+    def test_a_redelivery_with_a_new_delivery_id_is_one_item(self):
+        for delivery in ("d-1", "d-2"):
+            self.gh.send("issue_comment", {"action": "created", "issue": self.gh.issues[12],
+                                           "comment": {"id": 5001, "body": "hi"}}, delivery)
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+
+
+class TestGithubSecret(Base):
+    """Invariant 7: the secret lives in memory and in the forwarder's argv, nowhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.world = self.rig.hub, self.rig.gh, self.rig.world
+        self.gh.issue(12, parent=1)
+
+    def test_each_start_gets_a_new_secret_in_argv_only(self):
+        secrets_ = []
+        for _ in range(3):
+            self.hub.tick()
+            secrets_.append(self.gh.procs[-1].secret)
+            self.assertIn("--secret=%s" % secrets_[-1], self.gh.procs[-1].argv)
+            self.gh.kill_forwarder()
+            self.world.clock.t += 400
+            self.hub.tick()  # sees the exit
+            self.world.clock.t += 400
+        self.assertEqual(len(set(secrets_)), 3)
+        self.assertTrue(all(len(s) == 64 for s in secrets_))
+
+    def test_a_dead_forwarder_leaves_no_secret_to_sign_with(self):
+        self.hub.tick()
+        self.gh.kill_forwarder()
+        self.hub.tick()
+        self.assertIsNone(self.rig.watch().secret)
+
+    def run_everything(self):
+        self.hub.tick()
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(120)
+        self.gh.kill_forwarder()
+        self.rig.pump(30)
+        return self.gh.procs[0].secret
+
+    def test_the_secret_is_in_no_file_audit_status_or_error(self):
+        first = self.run_everything()
+        secrets_ = [p.secret for p in self.gh.procs]
+        self.assertGreater(len(secrets_), 1)
+        texts = [self.rig.state_text(), json.dumps(self.hub.describe()),
+                 "\n".join(sb.format_github(sb.github_status(self.world.config, self.world.state)))]
+        for secret in secrets_:
+            for text in texts:
+                self.assertNotIn(secret, text)
+        self.assertNotIn(first, json.dumps(self.world.audit()))
+
+    def test_a_secret_a_child_prints_is_scrubbed_from_what_we_report(self):
+        self.hub.tick()
+        proc = self.gh.procs[-1]
+        self.hub.log_path(self.rig.watch()).write_text("fatal: bad secret %s\n" % proc.secret)
+        proc.exit(2)
+        self.hub.tick()
+        watch = self.rig.watch()
+        self.assertIn("exited with code 2", watch.last_error)
+        self.assertNotIn(proc.secret, watch.last_error)
+        self.assertNotIn(proc.secret, json.dumps(self.world.audit()))
+        self.assertIn("[redacted]", watch.last_error)
+
+    def test_a_failed_catch_up_names_no_secret_either(self):
+        self.hub.tick()
+        self.gh.api_down = True
+        self.world.clock.t += 20
+        self.hub.tick()
+        self.assertIn("HTTP 502", self.rig.watch().catch_up_error)
+        self.assertNotIn(self.gh.procs[-1].secret, json.dumps(self.hub.describe()))
+
+    def test_the_hub_never_writes_the_secret_anywhere_but_memory_and_argv(self):
+        source = class_source("GitHubHub")
+        self.assertEqual(source.count("secrets.token_hex"), 1)
+        for line in source.splitlines():
+            if "watch.secret" in line:
+                self.assertNotIn("audit", line)
+                self.assertNotIn("write", line)
+
+    def test_the_snapshot_status_reads_has_no_secret_and_is_private(self):
+        self.hub.tick()
+        path = self.world.state / sb.WATCH_FILE
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertNotIn(self.gh.procs[-1].secret, path.read_text())
+
+
+class TestGithubListener(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh = self.rig.hub, self.rig.gh
+        self.addCleanup(self.hub.stop)
+
+    def post(self, port, body, headers):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", "/github", body=body, headers=headers)
+        reply = connection.getresponse()
+        reply.read()
+        connection.close()
+        return reply.status
+
+    def test_it_binds_localhost_only(self):
+        port = self.hub.open_listener()
+        self.assertEqual(self.hub.server.server_address[0], "127.0.0.1")
+        self.assertEqual(self.hub.server.server_address[1], port)
+
+    def test_it_can_be_pinned_to_a_port(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        rig = GithubRig(self, config={"github_port": port})
+        rig.hub.port = port
+        self.addCleanup(rig.hub.stop)
+        self.assertEqual(rig.hub.open_listener(), port)
+
+    def test_a_request_over_the_socket_is_verified_like_any_other(self):
+        self.hub.port = 0
+        port = self.hub.open_listener()
+        self.hub.tick()
+        self.gh.issue(12, parent=1)
+        body = json.dumps({"action": "created", "issue": self.gh.issues[12], "comment": {"id": 5001, "body": "x"},
+                           "repository": {"full_name": GH_REPO}}).encode()
+        headers = {"X-GitHub-Event": "issue_comment", "Content-Type": "application/json"}
+        self.assertEqual(self.post(port, body, headers), 401)
+        self.assertEqual(self.post(port, body, dict(headers, **{"X-Hub-Signature-256": "sha256=00"})), 401)
+        self.assertEqual(self.rig.keys(), [])
+        signed = dict(headers, **{"X-Hub-Signature-256": sb.sign_body(self.gh.procs[-1].secret, body)})
+        self.assertEqual(self.post(port, body, signed), 202)
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+
+    def test_the_forwarders_url_names_the_bound_port_on_localhost(self):
+        self.hub.port = 0
+        port = self.hub.open_listener()
+        self.hub.tick()
+        argv = self.gh.procs[-1].argv
+        self.assertEqual(argv[:3], [GH_BIN, "webhook", "forward"])
+        self.assertIn("--url=http://127.0.0.1:%d/github" % port, argv)
+        self.assertIn("--repo=%s" % GH_REPO, argv)
+        self.assertIn("--events=issues,issue_comment,sub_issues,pull_request,pull_request_review,"
+                      "check_suite,workflow_run", argv)
+
+    def test_the_source_never_binds_another_address(self):
+        source = inspect.getsource(sb.GitHubHub.open_listener)
+        self.assertIn('("127.0.0.1", self.port)', source)
+        for wide in ("0.0.0.0", '("", ', "('', ", "localhost", "::"):
+            self.assertNotIn(wide, source)
+
+    def test_stop_ends_the_listener_and_the_forwarders(self):
+        self.hub.open_listener()
+        self.hub.tick()
+        proc = self.gh.procs[-1]
+        self.hub.stop()
+        self.assertEqual(proc.poll(), -15)
+        self.assertIsNone(self.hub.server)
+
+
+class TestGithubSupervisor(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.world = self.rig.hub, self.rig.gh, self.rig.world
+        self.watch = self.rig.watch()
+
+    def at(self, seconds):
+        self.world.clock.t = EPOCH + seconds
+        self.hub.tick()
+
+    def test_a_forwarder_is_started_for_each_watched_repo_and_none_other(self):
+        rig = GithubRig(self, repos=("a/one", "b/two"))
+        rig.hub.tick()
+        self.assertEqual(sorted(a for p in rig.gh.procs for a in p.argv if a.startswith("--repo=")),
+                         ["--repo=a/one", "--repo=b/two"])
+
+    def test_it_restarts_with_exponential_backoff_up_to_a_cap(self):
+        self.at(0)
+        waits, now = [], 0
+        for _ in range(8):
+            self.gh.kill_forwarder()
+            now += 1
+            self.at(now)  # notices the exit
+            self.assertEqual(self.watch.state, "backoff")
+            waits.append(self.watch.next_start - (EPOCH + now))
+            now = self.watch.next_start - EPOCH
+            self.at(now)
+            self.assertEqual(self.watch.state, "running")
+        self.assertEqual(waits, [5, 10, 20, 40, 80, 160, 300, 300])
+
+    def test_a_forwarder_that_stayed_up_starts_the_backoff_over(self):
+        self.at(0)
+        for now in (1, 7, 18):  # three quick failures
+            self.gh.kill_forwarder()
+            self.at(now)
+            self.at(self.watch.next_start - EPOCH)
+        self.assertEqual(self.watch.failures, 3)
+        self.at(self.watch.started - EPOCH + sb.GITHUB_STABLE + 1)
+        self.assertEqual(self.watch.failures, 0)
+        self.gh.kill_forwarder()
+        self.at(self.watch.started - EPOCH + sb.GITHUB_STABLE + 2)
+        self.assertEqual(self.watch.next_start - self.world.clock.now(), 5)
+
+    def test_it_does_not_restart_before_the_backoff_has_passed(self):
+        self.at(0)
+        self.gh.kill_forwarder()
+        self.at(1)
+        self.at(4)
+        self.assertEqual((len(self.gh.procs), self.watch.state), (1, "backoff"))
+
+    def test_hook_already_exists_marks_a_conflict_and_waits_long(self):
+        self.gh.occupied = True
+        self.at(0)
+        self.at(5)
+        self.assertEqual(self.watch.state, "conflict")
+        self.assertIn(sb.CONFLICT_TEXT, self.watch.last_error)
+        self.assertEqual(self.watch.next_start, EPOCH + 5 + sb.GITHUB_CONFLICT_RETRY)
+        self.at(sb.GITHUB_CONFLICT_RETRY - 1)
+        self.assertEqual(len(self.gh.procs), 1)
+        self.at(5 + sb.GITHUB_CONFLICT_RETRY)
+        self.assertEqual(len(self.gh.procs), 2, "it tries again once the interval has passed")
+
+    def test_a_conflict_clears_when_the_other_forwarder_goes(self):
+        self.gh.occupied = True
+        self.at(0)
+        self.at(5)
+        self.gh.occupied = False
+        self.at(5 + sb.GITHUB_CONFLICT_RETRY)
+        self.assertEqual(self.watch.state, "running")
+
+    def test_a_plain_failure_is_not_a_conflict(self):
+        self.at(0)
+        self.hub.log_path(self.watch).write_text("error: websocket closed\n")
+        self.gh.procs[-1].exit(1)
+        self.at(1)
+        self.assertEqual(self.watch.state, "backoff")
+        self.assertIn("websocket closed", self.watch.last_error)
+
+    def test_a_gh_that_cannot_start_backs_off_and_says_so(self):
+        self.gh.spawn_error = "No such file or directory"
+        self.at(0)
+        self.assertEqual((self.watch.state, self.watch.failures), ("backoff", 1))
+        self.assertIn("cannot start %s" % GH_BIN, self.watch.last_error)
+        self.assertIsNone(self.watch.secret)
+
+    def test_a_tick_that_raises_is_recorded_and_the_next_still_runs(self):
+        self.at(0)
+        self.gh.procs[-1].poll = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.at(1)
+        self.assertEqual(self.watch.last_error, "boom")
+        self.assertTrue(any(e["event"] == "github.error" for e in self.world.audit()))
+
+    def test_state_changes_are_audited_once_each(self):
+        self.at(0)
+        self.gh.kill_forwarder()
+        self.at(1)
+        states = [e["detail"]["state"] for e in self.world.audit() if e["event"] == "github.watch"]
+        self.assertEqual(states, ["running", "backoff"])
+
+    def test_the_supervisor_thread_ticks_until_stopped(self):
+        self.hub.autostart = False
+        ticks = []
+        self.hub.tick = lambda: ticks.append(1)
+        real_wait = self.hub.stopping.wait
+        self.hub.stopping.wait = lambda t: real_wait(0.001)
+        self.hub._thread(self.hub._supervise)
+        time.sleep(0.05)
+        self.hub.stopping.set()
+        self.assertGreater(len(ticks), 2)
+
+
+class TestGithubRealChild(Base):
+    """The one test that starts a real process: a script of our own, never a real `gh`."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = sb.validate_config({"github_repos": [GH_REPO], "gh": str(self.home / "gh")})
+        self.state = sb.ensure_state_dir()
+
+    def hub(self, body):
+        self.fake_bin("gh", body)
+        hub = sb.GitHubHub(self.config, self.state, now=time.time, runner=lambda *a, **k: self.fail("gh api"))
+        hub.port = 4711
+        self.addCleanup(hub.stop)
+        return hub
+
+    def wait_for(self, check):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if check():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_the_child_leads_its_own_session_and_writes_to_the_log_not_our_pipes(self):
+        hub = self.hub('echo "forwarding $*" | sed "s/--secret=[0-9a-f]*/--secret=X/"; sleep 30\n')
+        watch = hub.watches[GH_REPO]
+        hub._start(watch, time.time())
+        pid = watch.proc.pid
+        self.assertEqual(os.getpgid(pid), pid, "its own process group: start_new_session")
+        self.assertTrue(self.wait_for(lambda: "forwarding webhook forward" in hub._log_tail(watch)))
+        self.assertEqual(stat.S_IMODE(hub.log_path(watch).stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.state / "logs").stat().st_mode), 0o700)
+        hub.stop()
+        self.assertTrue(self.wait_for(lambda: watch.proc is None))
+        self.assertTrue(self.wait_for(lambda: not self.alive(pid)))
+
+    def alive(self, pid):
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            return waited == 0
+        except ChildProcessError:
+            return False
+
+    def test_it_sees_hook_already_exists_from_a_real_process(self):
+        hub = self.hub('echo "error: Hook already exists on fleet/scratch" >&2; exit 1\n')
+        watch = hub.watches[GH_REPO]
+        hub._start(watch, time.time())
+        self.assertTrue(self.wait_for(lambda: watch.proc.poll() is not None))
+        hub._exited(watch, watch.proc.poll(), time.time())
+        self.assertEqual(watch.state, "conflict")
+
+    def test_it_inherits_none_of_our_pipes(self):
+        source = inspect.getsource(sb.spawn_forwarder)
+        for needle in ("stdin=subprocess.DEVNULL", "stdout=fd", "stderr=fd", "start_new_session=True", "close_fds=True"):
+            self.assertIn(needle, source)
+        self.assertNotIn("PIPE", source)
+
+    def test_a_missing_gh_is_a_backoff_not_a_crash(self):
+        hub = sb.GitHubHub(sb.validate_config({"github_repos": [GH_REPO], "gh": "/no/such/gh"}), self.state)
+        hub.port = 4711
+        hub.tick()
+        self.assertEqual(hub.watches[GH_REPO].state, "backoff")
+        self.assertIn("cannot start", hub.watches[GH_REPO].last_error)
+
+
+class TestGithubKeys(Base):
+    """Keys come from GitHub object ids, so a webhook and a catch-up of one object agree."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1},
+                                           "coder": {"role": "coder", "issue": 12}})
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.world.clock.t += 3600
+        self.gh.issue(1, title="charter")
+        self.gh.issue(12, title="the work", parent=1)
+        self.hub.tick()
+
+    def catch_up_keys(self):
+        items, errors = self.hub.catch_up_items(GH_REPO, self.world.clock.now())
+        self.assertEqual(errors, [])
+        return sorted(i.key for i in items)
+
+    def test_a_comment(self):
+        self.gh.comment(12, "hello", 5001)
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+        self.assertEqual(self.catch_up_keys(), ["github.comment:5001"])
+
+    def test_an_issue_edit_by_its_updated_at(self):
+        self.gh.issues[12]["updated_at"] = "2027-02-01T00:00:00Z"
+        self.gh.issues[12]["title"] = "renamed"
+        self.gh.send("issues", {"action": "edited", "issue": self.gh.issues[12]})
+        self.assertEqual(self.rig.keys(), ["github.issue:9012:2027-02-01T00:00:00Z"])
+        self.assertIn("github.issue:9012:2027-02-01T00:00:00Z", self.catch_up_keys())
+
+    def test_a_label_change_and_awaiting_user_removal_is_an_event_of_interest(self):
+        self.gh.issues[1]["updated_at"] = "2027-02-02T00:00:00Z"
+        self.gh.send("issues", {"action": "unlabeled", "issue": self.gh.issues[1], "label": {"name": "awaiting-user"}})
+        (item,) = self.hub.queue.values()
+        self.assertEqual(item.key, "github.issue:9001:2027-02-02T00:00:00Z")
+        self.assertIn("label awaiting-user removed", item.summary)
+
+    def test_a_pull_request_by_its_state(self):
+        self.gh.pull(30, closes=(12,))
+        self.gh.send("pull_request", {"action": "opened", "pull_request": self.gh.pulls[30]})
+        self.assertEqual(self.rig.keys(), ["github.pr:7030:open"])
+        self.assertIn("github.pr:7030:open", self.catch_up_keys())
+        merged = self.gh.pull(30, closes=(12,), state="closed", merged=True)
+        self.gh.send("pull_request", {"action": "closed", "pull_request": merged})
+        self.assertIn("github.pr:7030:merged", self.rig.keys())
+
+    def test_a_review(self):
+        pr = self.gh.pull(30, closes=(12,))
+        review = {"id": 6001, "state": "APPROVED", "body": "ship it", "user": {"login": "rev"},
+                  "submitted_at": self.gh.stamp()}
+        self.gh.reviews[30] = [review]
+        self.gh.send("pull_request_review", {"action": "submitted", "review": review, "pull_request": pr})
+        self.assertIn("github.review:6001", self.rig.keys())
+        self.assertIn("github.review:6001", self.catch_up_keys())
+
+    def test_a_check_suite_and_a_workflow_run(self):
+        pr = self.gh.pull(30, closes=(12,))
+        suite = {"id": 8001, "conclusion": "failure", "sha": "sha30", "updated_at": self.gh.stamp(),
+                 "pull_requests": [{"number": 30}]}
+        run = {"id": 8101, "name": "ci", "conclusion": "success", "updated_at": self.gh.stamp(),
+               "pull_requests": [{"number": 30}]}
+        self.gh.suites, self.gh.runs = [suite], [run]
+        self.gh.send("check_suite", {"action": "completed", "check_suite": suite})
+        self.gh.send("workflow_run", {"action": "completed", "workflow_run": run})
+        self.assertEqual(self.rig.keys(), ["github.check:8001:failure", "github.check:run-8101:success"])
+        self.assertEqual(self.catch_up_keys(), ["github.check:8001:failure", "github.check:run-8101:success",
+                                                "github.pr:7030:open"])
+
+    def test_unfinished_checks_and_unhandled_actions_make_nothing(self):
+        suite = {"id": 8002, "conclusion": None, "pull_requests": [{"number": 30}]}
+        self.gh.send("check_suite", {"action": "requested", "check_suite": suite})
+        self.gh.send("check_suite", {"action": "completed", "check_suite": suite})
+        self.gh.send("issue_comment", {"action": "deleted", "issue": self.gh.issues[12], "comment": {"id": 1}})
+        self.gh.send("pull_request", {"action": "synchronize", "pull_request": self.gh.pull(30)})
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_a_sub_issue_event(self):
+        self.gh.send("sub_issues", {"action": "sub_issue_added", "parent_issue": self.gh.issues[1],
+                                    "sub_issue": self.gh.issues[12]})
+        self.assertEqual(self.rig.keys(), ["github.subissue:9001:9012:sub_issue_added"])
+
+    def test_the_delivery_id_never_makes_a_key(self):
+        self.gh.send("issue_comment", {"action": "created", "issue": self.gh.issues[12],
+                                       "comment": {"id": 5001, "body": "x"}}, delivery="delivery-xyz")
+        self.assertFalse(any("delivery" in key for key in self.rig.keys()))
+
+    def test_a_comment_bumping_an_issue_is_not_also_reported_as_an_issue_update(self):
+        self.gh.comment(12, "hello", 5001, forward=False)
+        self.assertEqual(self.catch_up_keys(), ["github.comment:5001"])
+
+    def test_only_the_look_back_window_is_read(self):
+        self.gh.comment(12, "old", 5001, forward=False)
+        self.world.clock.t += 24 * 3600 + 10
+        self.gh.comment(12, "new", 5002, forward=False)
+        self.assertEqual(self.catch_up_keys(), ["github.comment:5002"])
+        self.assertIn("since=%s" % sb.iso(self.world.clock.now() - 24 * 3600), "".join(self.gh.api_calls))
+
+
+class TestGithubRouting(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1},
+                                           "web": {"role": "orchestrator", "charter": 2},
+                                           "coder": {"role": "coder", "issue": 12}})
+        self.gh, self.hub = self.rig.gh, self.rig.hub
+        self.gh.issue(1)
+        self.gh.issue(2)
+        self.gh.issue(12, parent=1)
+        self.gh.issue(13, parent=2)
+        self.gh.issue(20)
+        self.hub.tick()
+
+    def routed(self):
+        return {f.key: f.recipient for f in self.hub.facts()}
+
+    def test_a_comment_on_a_sub_issue_goes_to_the_charters_orchestrator_not_the_worker(self):
+        self.gh.comment(12, "hi", 5001)
+        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
+
+    def test_a_comment_on_the_charter_itself(self):
+        self.gh.comment(1, "hi", 5001)
+        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
+
+    def test_another_orchestrators_issue_goes_to_that_one(self):
+        self.gh.comment(13, "hi", 5001)
+        self.assertEqual(self.routed(), {"github.comment:5001": "web"})
+
+    def test_a_worker_alone_owning_the_issue_gets_it(self):
+        self.gh.issue(40)
+        self.gh.issues[40]["parent_issue_url"] = None
+        agents = {"coder": {"role": "coder", "issue": 40}}
+        rig = GithubRig(self, agents=agents)
+        rig.gh.issue(40)
+        rig.hub.tick()
+        rig.gh.comment(40, "hi", 5001)
+        self.assertEqual({f.key: f.recipient for f in rig.hub.facts()}, {"github.comment:5001": "coder"})
+
+    def test_an_issue_nobody_owns_is_dropped_and_audited_once(self):
+        self.gh.comment(20, "hi", 5001)
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.rig.keys(), [])
+        self.hub.facts()
+        unrouted = [e for e in self.rig.world.audit() if e["event"] == "github.unrouted"]
+        self.assertEqual([e["detail"]["keys"][0] for e in unrouted], ["github.comment:5001"])
+
+    def test_nothing_is_dropped_while_the_fleet_cannot_be_read(self):
+        self.gh.comment(12, "hi", 5001)
+        self.rig.world.herdr.down = True
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+        self.rig.world.herdr.down = False
+        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
+
+    def test_a_pull_request_goes_to_the_owner_of_an_issue_it_closes(self):
+        self.gh.pull(30, closes=(13,))
+        self.gh.send("pull_request", {"action": "opened", "pull_request": self.gh.pulls[30]})
+        self.assertEqual(self.routed(), {"github.pr:7030:open": "web"})
+
+    def test_closing_keywords(self):
+        self.assertEqual(sb.closing_numbers("Fixes #4, resolved: #5. closes fleet/scratch#6 and also see #7"),
+                         [4, 5, 6])
+        self.assertEqual(sb.closing_numbers(None), [])
+
+    def test_a_pull_request_that_closes_nothing_owned_is_dropped(self):
+        self.gh.pull(31, closes=(20,))
+        self.gh.send("pull_request", {"action": "opened", "pull_request": self.gh.pulls[31]})
+        self.assertEqual(self.routed(), {})
+
+    def test_a_check_suite_is_routed_through_the_prs_in_its_payload(self):
+        self.gh.pull(30, closes=(12,))
+        suite = {"id": 8001, "conclusion": "failure", "pull_requests": [{"number": 30}]}
+        self.gh.send("check_suite", {"action": "completed", "check_suite": suite})
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+        self.assertIn("repos/%s/pulls/30" % GH_REPO, self.gh.api_calls)
+
+    def test_a_check_for_a_pr_nobody_owns_is_dropped(self):
+        self.gh.pull(32, closes=(20,))
+        self.gh.send("check_suite", {"action": "completed", "check_suite": {
+            "id": 8002, "conclusion": "success", "pull_requests": [{"number": 32}]}})
+        self.gh.send("check_suite", {"action": "completed", "check_suite": {
+            "id": 8003, "conclusion": "success", "pull_requests": []}})
+        self.assertEqual(self.routed(), {})
+
+    def test_lookups_are_made_only_when_the_payload_does_not_settle_it(self):
+        self.gh.comment(12, "hi", 5001)  # the payload names the parent: no gh api
+        self.routed()
+        self.assertEqual(self.gh.api_calls, [])
+
+    def test_a_lookup_that_fails_keeps_the_item_and_is_not_repeated_every_pass(self):
+        self.gh.pull(30, closes=(12,))
+        self.gh.send("check_suite", {"action": "completed", "check_suite": {
+            "id": 8001, "conclusion": "failure", "pull_requests": [{"number": 30}]}})
+        self.gh.api_down = True
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.rig.keys(), ["github.check:8001:failure"])
+        calls = len(self.gh.api_calls)
+        self.routed()
+        self.assertEqual(len(self.gh.api_calls), calls, "retried only after the retry interval")
+        self.gh.api_down = False
+        self.rig.world.clock.t += sb.GITHUB_LOOKUP_RETRY + 1
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+
+    def test_a_looked_up_parent_chain_is_followed(self):
+        self.gh.issue(14, parent=12)           # a grandchild; its webhook payload names no parent
+        self.gh.issues[14].pop("parent_issue_url")
+        self.gh.issues[14]["parent_issue_url"] = None
+        self.gh.comments.append({"id": 5009, "body": "deep", "user": {"login": "x"}, "issue_url":
+                                 "https://api.github.com/repos/%s/issues/14" % GH_REPO,
+                                 "updated_at": self.gh.stamp()})
+        self.gh.issues[14]["parent_issue_url"] = "https://api.github.com/repos/%s/issues/12" % GH_REPO
+        items, _ = self.hub.catch_up_items(GH_REPO, self.rig.world.clock.now())
+        self.hub.enqueue(items)
+        self.assertEqual(self.routed(), {"github.comment:5009": "platform"})
+
+    def test_an_item_older_than_the_look_back_window_expires(self):
+        self.gh.comment(12, "hi", 5001)
+        self.rig.world.clock.t += 24 * 3600 + 1
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_the_nearest_issue_wins_between_orchestrators(self):
+        agents = {"outer": {"role": "orchestrator", "charter": 1}, "inner": {"role": "orchestrator", "charter": 12}}
+        rig = GithubRig(self, agents=agents)
+        rig.gh.issue(12, parent=1)
+        rig.hub.tick()
+        rig.gh.comment(12, "hi", 5001)
+        self.assertEqual({f.key: f.recipient for f in rig.hub.facts()}, {"github.comment:5001": "inner"})
+
+    def test_the_fact_carries_the_issue_the_author_and_a_summary(self):
+        self.gh.comment(12, "please look\nat this", 5001, login="octocat")
+        (fact_,) = self.hub.facts()
+        self.assertEqual((fact_.issue, fact_.sender, fact_.kind), (12, "octocat", "github.comment"))
+        self.assertEqual(fact_.summary, "@octocat commented on #12: please look at this")
+
+
+class TestGithubDelivery(Base):
+    """The queue holds an item until the engine has delivered it; nothing else is stored."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.gh.issue(12, parent=1)
+        self.hub.tick()
+
+    def test_a_webhook_is_delivered_once_after_the_batch_window_and_leaves_the_queue(self):
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(60)
+        self.assertEqual(self.rig.delivered(), [])
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"], "held in memory until delivered")
+        self.rig.pump(60)
+        self.assertEqual(self.rig.delivered(), ["github.comment:5001"])
+        self.assertEqual(self.rig.keys(), [])
+
+    def test_an_item_that_is_held_stays_queued(self):
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(200)
+        self.assertEqual(self.rig.delivered(), [])
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+
+    def test_the_same_object_seen_again_after_delivery_is_not_delivered_again(self):
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(120)
+        self.gh.send("issue_comment", {"action": "created", "issue": self.gh.issues[12],
+                                       "comment": self.gh.comments[0]}, "d-2")
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"], "queued again: the queue stores nothing")
+        self.rig.pump(200)
+        self.assertEqual(self.rig.delivered(), ["github.comment:5001"])
+        self.assertEqual(self.rig.keys(), [], "the transcript already had it, so it was acknowledged")
+
+    def test_the_repeat_is_delivered_again_when_dedupe_is_off(self):
+        os.environ[sb.FAULT_ENV] = "no-dedupe"
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(120)
+        self.gh.send("issue_comment", {"action": "created", "issue": self.gh.issues[12],
+                                       "comment": self.gh.comments[0]}, "d-2")
+        self.gh.comment(12, "another", 5002)  # a new key makes a new message id, so v2 admits the repeat
+        self.rig.pump(200)
+        self.assertEqual(self.rig.delivered(), ["github.comment:5001"] * 2 + ["github.comment:5002"])
+
+    def test_a_restart_loses_the_queue_and_the_catch_up_gets_it_back(self):
+        self.gh.comment(12, "hello", 5001)
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+        stored = [p for p in self.world.state.rglob("*") if p.is_file() and p.name != "audit.jsonl"]
+        for path in stored:
+            self.assertNotIn("github.comment:5001", path.read_text(errors="replace"), path.name)
+        restarted = GithubRig(self)  # a new process: nothing in memory
+        self.assertEqual(restarted.keys(), [])
+        restarted.gh.comments, restarted.gh.issues = self.gh.comments, self.gh.issues
+        restarted.world.clock.t = self.world.clock.now()
+        restarted.hub.tick()
+        restarted.pump(15)
+        self.assertEqual(restarted.keys(), ["github.comment:5001"], "the catch-up read brings it back")
+
+    def test_a_sent_key_is_acknowledged_even_when_only_the_delivery_path_saw_it(self):
+        self.gh.comment(12, "hello", 5001)
+        self.rig.pump(120)
+        self.assertEqual(self.rig.keys(), [])
+        source = inspect.getsource(sb.Switchboard.deliver)
+        self.assertIn("self._acknowledge(keys)", source)
+
+    def test_facts_the_source_has_are_the_engines_and_status_reads_them_without_acknowledging(self):
+        self.gh.comment(12, "hello", 5001)
+        engine = self.hub.attach(self.world.new_engine(writable=False))
+        facts, problems = engine.collect_facts()
+        self.assertEqual(([f.key for f in facts], problems), (["github.comment:5001"], []))
+        self.assertEqual(self.rig.keys(), ["github.comment:5001"])
+
+
+class TestGithubCatchUp(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.world.clock.t += 7200
+        self.gh.issue(12, parent=1)
+
+    def test_one_read_follows_each_start_and_nothing_polls(self):
+        self.hub.tick()
+        self.assertEqual(self.gh.api_calls, [], "not before the forwarder has had time to connect")
+        self.rig.pump(10)
+        first = len(self.gh.api_calls)
+        self.assertGreater(first, 0)
+        self.rig.pump(3000)
+        self.assertEqual(len(self.gh.api_calls), first, "a quiet, healthy forwarder is never polled")
+
+    def test_a_restarted_forwarder_is_followed_by_another_read_that_recovers_the_gap(self):
+        self.rig.pump(15)
+        self.gh.kill_forwarder()
+        self.gh.comment(12, "while down", 5001)
+        self.assertEqual(self.rig.keys(), [], "the event was lost: nobody was forwarding")
+        self.rig.pump(5)  # exit seen, backoff
+        self.rig.pump(20)  # restart, then the read
+        self.assertEqual(self.rig.keys() or self.rig.delivered(), ["github.comment:5001"])
+
+    def test_a_webhook_and_a_catch_up_of_one_object_are_one_delivery(self):
+        self.rig.pump(15)
+        self.gh.comment(12, "both ways", 5001)  # webhook now
+        self.gh.kill_forwarder()
+        self.rig.pump(30)  # restart + catch-up reads the same comment
+        self.rig.pump(200)
+        self.assertEqual(self.rig.delivered(), ["github.comment:5001"])
+
+    def test_a_failed_read_is_retried_and_reported(self):
+        self.gh.api_down = True
+        self.rig.pump(15)
+        self.assertIn("HTTP 502", self.rig.watch().catch_up_error)
+        self.gh.comment(12, "later", 5001, forward=False)
+        self.gh.api_down = False
+        self.rig.pump(sb.GITHUB_LOOKUP_RETRY + 10)
+        self.assertIsNone(self.rig.watch().catch_up_error)
+        self.assertEqual(self.rig.keys() or self.rig.delivered(), ["github.comment:5001"])
+
+    def test_one_failing_read_does_not_stop_the_others(self):
+        self.gh.comment(12, "x", 5001, forward=False)
+        original = self.gh.answer
+
+        def answer(path, query):
+            if path == "pulls":
+                raise AssertionError("never mind")
+            return original(path, query)
+
+        self.gh.answer = lambda path, query: (_ for _ in ()).throw(sb.GitHubUnavailable("pulls down")) \
+            if path == "pulls" else original(path, query)
+        self.gh.runner_original = self.gh.runner
+        self.hub.runner = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 500")
+                                              if argv[-1].split("?")[0].endswith("/pulls") else self.gh.runner(argv))
+        items, errors = self.hub.catch_up_items(GH_REPO, self.world.clock.now())
+        self.assertEqual([i.key for i in items], ["github.comment:5001"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("pulls", errors[0])
+
+    def test_paginated_output_is_read_page_by_page(self):
+        self.assertEqual(sb.decode_json_stream('[{"a": 1}]\n[{"a": 2}]\n{"b": 3}'), [[{"a": 1}], [{"a": 2}], {"b": 3}])
+        self.assertEqual(sb.decode_json_stream(""), [])
+        with self.assertRaises(ValueError):
+            sb.decode_json_stream("[{")
+        self.gh.comment(12, "a", 5001, forward=False)
+        self.gh.comment(12, "b", 5002, forward=False)
+        items, errors = self.hub.catch_up_items(GH_REPO, self.world.clock.now())
+        self.assertEqual(sorted(i.key for i in items), ["github.comment:5001", "github.comment:5002"])
+
+    def test_gh_that_cannot_run_or_answers_nonsense_is_an_unavailable_read(self):
+        for runner in (lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError("no gh")),
+                       lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "<html>", ""),
+                       lambda argv, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 5))):
+            self.hub.runner = runner
+            with self.assertRaises(sb.GitHubUnavailable):
+                self.hub.gh_api("repos/x/y/issues")
+
+
+class TestGithubStatus(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.world = self.rig.hub, self.rig.gh, self.rig.world
+
+    def status(self):
+        return sb.github_status(self.world.config, self.world.state)
+
+    def test_no_watched_repo_adds_no_lines(self):
+        self.assertEqual(sb.format_github(sb.github_status(sb.validate_config({}), self.world.state)), [])
+
+    def test_without_a_daemon_it_says_the_state_is_unknown(self):
+        lines = sb.format_github(self.status())
+        self.assertIn("older events are lost", lines[0])
+        self.assertIn("daemon not running", lines[1])
+
+    def test_a_snapshot_of_a_live_daemon_shows_each_watch(self):
+        self.hub.tick()
+        report = self.status()
+        self.assertTrue(report["daemon"])
+        self.assertEqual([(w["repo"], w["state"]) for w in report["watches"]], [(GH_REPO, "running")])
+        self.assertIn("%s" % GH_REPO, sb.format_github(report)[1])
+
+    def test_a_conflict_is_reported_as_one(self):
+        self.gh.occupied = True
+        self.hub.tick()
+        self.world.clock.t += 5
+        self.hub.tick()
+        text = "\n".join(sb.format_github(self.status()))
+        self.assertIn("conflict", text)
+        self.assertIn("catch-up reads only", text)
+
+    def test_repeated_failures_show(self):
+        self.gh.spawn_error = "nope"
+        for _ in range(3):
+            self.world.clock.t += 400
+            self.hub.tick()
+        self.assertIn("3 failure(s)", "\n".join(sb.format_github(self.status())))
+
+    def test_a_snapshot_of_a_dead_pid_is_not_believed(self):
+        self.hub.tick()
+        path = self.world.state / sb.WATCH_FILE
+        data = json.loads(path.read_text())
+        data["pid"] = 2 ** 22 + 1234567
+        path.write_text(json.dumps(data))
+        self.assertFalse(self.status()["daemon"])
+
+    def test_stop_marks_the_snapshot_as_no_daemon(self):
+        self.hub.tick()
+        self.hub.stop()
+        self.assertFalse(self.status()["daemon"])
+
+    def test_a_snapshot_for_other_repos_is_not_shown(self):
+        self.hub.tick()
+        other = sb.validate_config({"github_repos": ["x/y"]})
+        self.assertEqual(sb.github_status(other, self.world.state)["watches"], [])
+
+    def test_the_status_command_includes_github(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO]})
+        with captured() as (out, _):
+            code = sb.main(["status", "--json"], runner=self.world.route, now=self.world.clock.now)
+        report = json.loads(out.getvalue())
+        self.assertEqual((code, report["github"]["repos"]), (0, [GH_REPO]))
+        with captured() as (out, _):
+            sb.main(["status"], runner=self.world.route, now=self.world.clock.now)
+        self.assertIn("github", out.getvalue())
+
+
+class TestGithubDaemon(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def test_no_repo_means_no_hub_and_no_change_to_the_daemon(self):
+        engine, state, config = sb.build_engine(self.world.route, self.world.clock.now, "daemon")
+        before = list(engine.sources)
+        self.assertIsNone(sb.attach_github(engine, config, state, self.world.route, self.world.clock.now))
+        self.assertEqual(engine.sources, before)
+
+    def test_with_repos_the_hub_is_a_fact_source_and_the_daemon_starts_it_only_inside_its_lock(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO]})
+        started = []
+        with mock.patch.object(sb, "spawn_forwarder", side_effect=lambda *a: started.append(a)), \
+                mock.patch.object(sb.signal, "signal"), mock.patch.object(sb.GitHubHub, "open_listener", return_value=1):
+            with sb.single_instance(self.world.state):
+                with captured():
+                    code = sb.main(["run"], runner=self.world.route, now=self.world.clock.now)
+            self.assertEqual((code, started), (1, []), "the lock is refused before anything starts")
+
+    def test_the_daemon_runs_the_hub_alongside_the_passes_and_stops_it_at_the_end(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO]})
+        gh = FakeGitHub(self.world.clock)
+        sleeps = []
+
+        def sleep(sock, seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 2:
+                raise KeyboardInterrupt
+
+        runner = lambda argv, **kw: self.world.route(argv, **kw) if argv[0] != "gh" else gh.runner(argv)
+        with mock.patch.object(sb, "spawn_forwarder", side_effect=gh.spawn), \
+                mock.patch.object(sb.signal, "signal") as handler, \
+                mock.patch.object(sb.GitHubHub, "open_listener", return_value=4711), \
+                mock.patch.object(sb.GitHubHub, "_supervise"), mock.patch.object(sb.GitHubHub, "_thread"):
+            code = sb.main(["run"], runner=runner, now=self.world.clock.now, wait=sleep)
+        self.assertEqual((code, sleeps), (0, [5, 5]))
+        self.assertEqual(handler.call_args[0][0], sb.signal.SIGTERM)
+        self.assertTrue((self.world.state / sb.WATCH_FILE).exists())
+        self.assertIsNone(json.loads((self.world.state / sb.WATCH_FILE).read_text())["pid"], "stopped")
+
+    def test_run_once_never_starts_a_forwarder(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO]})
+        with mock.patch.object(sb, "spawn_forwarder") as spawn:
+            code = sb.main(["run", "--once"], runner=self.world.route, now=self.world.clock.now)
+        self.assertEqual(code, 0)
+        spawn.assert_not_called()
+
+    def test_the_engine_never_types_into_a_pane_for_github_either(self):
+        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+
+
+class TestGithubScenarios(Base):
+    def test_the_catalog_has_g1_to_g3_and_the_spike(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid in ("G1", "G2", "G3"):
+            self.assertIn("offline", found[sid]["tiers"])
+            self.assertEqual(found[sid]["since_pr"], 5)
+            self.assertEqual(found[sid]["control"]["fault"], "no-dedupe")
+        self.assertIn("spike", found["SG1"]["tags"])
+        self.assertNotIn("offline", found["SG1"]["tiers"])
+
+    def test_the_vocabulary_has_the_github_kinds(self):
+        for do in ("kill-forwarder", "occupy-hook"):
+            self.assertEqual(sc.STEP_ACTORS[do], ("world",))
+        self.assertEqual(sorted(sc.STEP_FIELDS["comment"]), ["body", "from", "id", "issue"])
+        self.assertEqual(sc.WATCH_STATES, sb.WATCH_STATES)
+
+    def test_a_scenario_that_loses_its_forwarder_without_catch_up_loses_the_comment(self):
+        g2 = sc.load(sc.DEFAULT_DIR / "g2-forwarder-dies.json")
+        run = OfflineRun(self, g2, "nocatchup")
+        run.hub.catch_up = lambda watch, now: setattr(watch, "catchup_at", None)
+        run.run()
+        results = {r["label"]: r["ok"] for r in run.evaluate()}
+        self.assertTrue(results["first-once"])
+        self.assertFalse(results["second-once"])
+        self.assertFalse(results["third-once"])
 
 
 # ------------------------------------------------------- portability and hygiene
@@ -4820,7 +6118,7 @@ class TestPR4Catalog(unittest.TestCase):
         fs = lab.fleet_scenario()
         for path in sc.scenario_files(sc.DEFAULT_DIR):
             scenario = sc.load(path)
-            if "lab-scripted" in scenario["tiers"] and scenario["since_pr"] >= 4:
+            if "lab-scripted" in scenario["tiers"] and scenario["since_pr"] >= 4 and "spike" not in scenario.get("tags", ()):
                 with self.subTest(scenario=scenario["id"]):
                     self.assertEqual(lab.unsupported(scenario, fs), [])
                     self.assertTrue(lab.uses_engine(scenario))
