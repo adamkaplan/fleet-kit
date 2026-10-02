@@ -1334,6 +1334,8 @@ RUNS_DIR = os.path.join(REPO_ROOT, "scenario-runs")
 RUN_TIERS = ("lab-scripted",)
 LAB_TUI_AGENT = "lab-tui"
 ENGINE = os.path.join(REPO_ROOT, "bin", "fleet-switchboard")
+# PR 7: the hand-written Jev answers every engine in the Lab replays (no network, no key).
+JEV_REPLAY = os.path.join(REPO_ROOT, "scenarios", "jev", "replay.json")
 ENGINE_POLL = 5  # seconds between the Lab daemon's passes, as the offline runner's
 ENGINE_ACTIONS = ("fact", "pass", "kill-daemon", "restart-daemon", "delete-state", "close-pane")
 # What this tier plays and checks.
@@ -1341,7 +1343,7 @@ RUN_ACTIONS = ("turn", "message", "draft", "away", "permission", "synthetic", "n
                "wait", "launch") + ENGINE_ACTIONS
 RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "delivered",
                     "message_count", "model_saw", "status_is", "metadata_roundtrip", "pane_runs_v2",
-                    "no_typing", "toast")
+                    "no_typing", "toast", "classified")
 RUN_BASELINES = ("fleet-heartbeat",)
 SYNTHETIC_DEFAULTS = {"note": (False, "steer"), "wake": (True, "queue"),
                       "synthetic": (False, "steer")}
@@ -1605,7 +1607,7 @@ class LabEngine:
         write_herdr_shim(self.shim, self.root, real)
         self.config = {"opencode": lab.wrapper, "opencode_executable": lab.v2_bin,
                        "launch_env": {"FLEET_SWITCHBOARD_LAB_PANE": "1"},
-                       "herdr": self.shim}
+                       "herdr": self.shim, "jev": {"replay": JEV_REPLAY}}
         self.config.update(config or {})
         with open(os.path.join(self.config_home, "fleet-switchboard", "config.json"), "w") as f:
             json.dump(self.config, f, indent=2, sort_keys=True)
@@ -2088,7 +2090,7 @@ class ScenarioRun:
         if self.engine:
             # Evidence only: what the engine says it did. No oracle reads it.
             for entry in self.engine.audit():
-                if entry.get("event") in ("v2.synthetic", "v2.inbox.update", "recheck", "hold", "error"):
+                if entry.get("event") in ("v2.synthetic", "v2.inbox.update", "recheck", "hold", "error", "classify"):
                     self.note("audit", iso_epoch(entry.get("ts")), event=entry.get("event"), phase=entry.get("phase"),
                               subject=entry.get("subject"), detail=entry.get("detail"), error=entry.get("error"))
 
@@ -2288,6 +2290,16 @@ class ScenarioRun:
                 ids.append(m.get("id"))
         return len(ids) == item["count"], "%d switchboard message(s) (want %d): %s" % (
             len(ids), item["count"], ", ".join(ids) or "none")
+
+    def check_classified(self, item):
+        """PR 7. The engine's audit log owns this fact: Jev's classification of
+        the message that step `step` sent. The last entry for that message wins."""
+        text = self.scenario["steps"][item["step"]]["text"]
+        found = [e for e in self.engine.audit() if e.get("event") == "classify"
+                 and (e.get("detail") or {}).get("agent") == item["agent"]
+                 and text in (((e["detail"].get("question") or {}).get("state") or {}).get("message") or "")]
+        got = found[-1]["detail"]["answer"]["choice"] if found else None
+        return got == item["as"], "%d classification(s) of %r; the last chose %r" % (len(found), short(text, 50), got)
 
     def check_metadata_roundtrip(self, item):
         """session.get (of=session) or message.list (of=message, by key or text)

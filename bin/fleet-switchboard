@@ -128,7 +128,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS))
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS))
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -166,6 +166,7 @@ def validate_config(raw, source="config"):
     validate_intent_config(config, source)
     _validate_github(config, source)
     config.update(envs)
+    validate_jev_config(config, raw, source)
     return config
 
 
@@ -1001,6 +1002,7 @@ class Switchboard:
             bind = getattr(source, "bind", None)
             if bind:
                 bind(self)
+        self.jev, self._classified = build_jev(config), set()  # PR 7: the decision model; messages classified
 
     # -- the audit
 
@@ -1290,6 +1292,7 @@ class Switchboard:
                 report["converted"].extend(self.convert_lapsed_notes(observation, now))
             except Exception as err:
                 self._failed(observation.name, "convert", err, report)
+        run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
         facts, _ = self.collect_facts()
         by_recipient = {}
         for fact in facts:
@@ -1434,6 +1437,572 @@ class Switchboard:
         return {"name": name, "observation": observation.to_json() if observation else None,
                 "missing": None if observation else discovery.missing(name),
                 "plan": plan.to_json() if plan else None, "source_problems": problems}
+
+
+# ============================================================================
+# PR 7: the decision model, the classifier and the policy judge's questions
+#
+# One section, so the stack rebases cleanly. docs/switchboard.md, "Classify: a
+# decision model" and "The judge". Registered in four places: the config check
+# (`validate_jev_config`), `Switchboard.__init__` (`build_jev`), `run_pass`
+# (`run_shadow_classifier`) and the unknown-key list (`PR7_CONFIG_KEYS`).
+# ============================================================================
+import socket
+import urllib.error
+import urllib.request
+
+JEV_MODEL = "typesafe/jev-1.13"
+JEV_URL = "https://openrouter.ai/api/v1/systemone"
+JEV_KEY_ENV = "OPENROUTER_API_KEY"
+JEV_DEFAULTS = {
+    "model": JEV_MODEL,
+    "url": JEV_URL,
+    "key_env": JEV_KEY_ENV,       # the NAME of the variable that holds the key, never the key
+    "timeout_seconds": 20,
+    "min_confidence": 0.7,        # the classifier's threshold; SF2 will choose the real one
+    "record_file": None,          # append every real call here as a request/response pair
+    "replay": None,               # answer from this file instead of calling Jev
+}
+PR7_CONFIG_KEYS = ("jev", "shadow_judges")
+JEV_HTTP_REASONS = {400: "invalid", 401: "unauthorized", 402: "no_credit", 403: "unauthorized",
+                    413: "too_large", 422: "invalid", 429: "rate_limited"}
+JEV_REASONS = ("invalid", "unauthorized", "no_credit", "too_large", "rate_limited",
+               "timeout", "unreachable", "bad_response")
+JEV_TEXT_LIMIT = 1000   # characters of any one message or intent sent to Jev
+JEV_DETAIL_LIMIT = 160  # characters of a provider's text kept in an error
+
+
+def validate_jev_config(config, raw, source="config"):
+    """Check and complete `jev` and `shadow_judges`. Silent when `raw` has neither."""
+    if not any(name in raw for name in PR7_CONFIG_KEYS):
+        return
+    jev = raw.get("jev")
+    if jev is not None:
+        config["jev"] = _checked_jev_settings(jev, source)
+    shadow = raw.get("shadow_judges")
+    if shadow is not None and not isinstance(shadow, bool):
+        raise ConfigError("%s: 'shadow_judges' must be true or false, got %r" % (source, shadow))
+    if shadow and jev is None:
+        raise ConfigError("%s: 'shadow_judges' needs a 'jev' object: there is no decision model to ask" % source)
+    config["shadow_judges"] = (jev is not None) if shadow is None else shadow
+
+
+def _checked_jev_settings(jev, source):
+    if not isinstance(jev, dict):
+        raise ConfigError("%s: 'jev' must be an object, got %r" % (source, type(jev).__name__))
+    unknown = sorted(set(jev) - set(JEV_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'jev' contains key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(JEV_DEFAULTS)))
+    settings = dict(JEV_DEFAULTS, **jev)
+    for name in ("model", "url", "key_env"):
+        if not isinstance(settings[name], str) or not settings[name].strip():
+            raise ConfigError("%s: 'jev.%s' must be a non-empty string, got %r" % (source, name, settings[name]))
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", settings["key_env"]):
+        raise ConfigError("%s: 'jev.key_env' is the NAME of an environment variable, got %r "
+                          "(never put the key itself in this file)" % (source, settings["key_env"]))
+    if not re.match(r"^(https://|http://(localhost|127\.0\.0\.1)[:/])", settings["url"]):
+        raise ConfigError("%s: 'jev.url' must be https (the key travels with it), got %r" % (source, settings["url"]))
+    if not _is_number(settings["timeout_seconds"]) or settings["timeout_seconds"] <= 0:
+        raise ConfigError("%s: 'jev.timeout_seconds' must be a positive number, got %r"
+                          % (source, settings["timeout_seconds"]))
+    if not _is_number(settings["min_confidence"]) or not 0 < settings["min_confidence"] <= 1:
+        raise ConfigError("%s: 'jev.min_confidence' must be a number above 0 and at most 1, got %r"
+                          % (source, settings["min_confidence"]))
+    for name in ("record_file", "replay"):
+        value = settings[name]
+        if value is not None and (not isinstance(value, str) or not os.path.isabs(value)):
+            raise ConfigError("%s: 'jev.%s' must be an absolute path, got %r" % (source, name, value))
+    if settings["record_file"] and settings["replay"]:
+        raise ConfigError("%s: 'jev' cannot both record real calls and replay recorded ones" % source)
+    return settings
+
+
+# ------------------------------------------------------------------ the client
+
+class JevError(Exception):
+    """A Jev call with no usable answer. `reason` is one of JEV_REASONS."""
+
+    def __init__(self, reason, detail=None, latency_ms=None):
+        self.reason, self.detail, self.latency_ms = reason, detail, latency_ms
+        super().__init__("%s: %s" % (reason, detail) if detail else reason)
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _scrub_provider_text(text, key=None):
+    """One short line of a provider's text with the key (and any bearer value) removed."""
+    text = str(text if text is not None else "")
+    if key:
+        text = text.replace(key, "[key]")
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [key]", text)
+    return _one_line(text, JEV_DETAIL_LIMIT)
+
+
+def _is_probability(value):
+    return _is_number(value) and 0 <= value <= 1
+
+
+def check_answers(questions, answers):
+    """`answers` (a dict by question id, or a list in question order) as a dict, or JevError.
+
+    A missing answer, an out-of-range probability or an option nobody offered
+    is a bad answer, never a reading.
+    """
+    if isinstance(answers, list):
+        if len(answers) != len(questions):
+            raise JevError("bad_response", "%d answer(s) for %d question(s)" % (len(answers), len(questions)))
+        answers = dict(zip(questions, answers))
+    if not isinstance(answers, dict):
+        raise JevError("bad_response", "no answers")
+    for name, question in questions.items():
+        answer = answers.get(name)
+        if not isinstance(answer, dict):
+            raise JevError("bad_response", "question %s is not answered" % name)
+        if question.get("type") == "noul":
+            if not _is_probability(answer.get("noul")):
+                raise JevError("bad_response", "question %s: noul is not a probability" % name)
+            continue
+        if answer.get("choice") not in question.get("criteria", {}):
+            raise JevError("bad_response", "question %s: choice is not one of the options" % name)
+        probabilities = answer.get("probabilities")
+        if probabilities is not None:
+            values = list(probabilities.values()) if isinstance(probabilities, dict) else [None]
+            if not all(_is_probability(v) for v in values) or abs(sum(values) - 1) > 0.01:
+                raise JevError("bad_response", "question %s: probabilities do not sum to 1" % name)
+            if set(probabilities) - set(question["criteria"]):
+                raise JevError("bad_response", "question %s: probabilities name an option nobody offered" % name)
+    return answers
+
+
+def _usage_of(usage):
+    """The numbers of a usage block under names the audit does not redact."""
+    usage = usage if isinstance(usage, dict) else {}
+    pairs = (("in", "input_tokens"), ("out", "output_tokens"), ("cost", "cost"))
+    return {short: usage[name] for short, name in pairs if _is_number(usage.get(name))}
+
+
+class JevClient:
+    """The decision model over HTTPS (OpenRouter's System One endpoint).
+
+    The key is read from the environment variable named in the config at the
+    moment of each call. It is never stored on the client, written to a file,
+    put in an argument list, or kept in an error. `opener` has urlopen's shape
+    so tests inject a fake and never reach a network.
+    """
+
+    def __init__(self, settings, environ=None, opener=None, clock=time.monotonic):
+        self.settings = settings
+        self.environ = os.environ if environ is None else environ
+        self.opener = opener or urllib.request.urlopen
+        self.clock = clock
+
+    def decide(self, state, questions):
+        """{"model", "answers", "usage", "latency_ms"}. Raises JevError, with the latency."""
+        key = self.environ.get(self.settings["key_env"])
+        started = self.clock()
+        try:
+            if not key:
+                raise JevError("unauthorized", "no key in $%s" % self.settings["key_env"])
+            body = {"model": self.settings["model"], "state": state, "questions": questions}
+            out = self._post(body, key)
+            answers = check_answers(questions, out.get("answers"))
+        except JevError as err:
+            err.latency_ms = int((self.clock() - started) * 1000)
+            raise
+        result = {"model": _scrub_provider_text(out.get("model") or self.settings["model"], key), "answers": answers,
+                  "usage": _usage_of(out.get("usage")), "latency_ms": int((self.clock() - started) * 1000)}
+        self._record(body, out)
+        return result
+
+    def _post(self, body, key):
+        request = urllib.request.Request(
+            self.settings["url"], data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                     "Accept": "application/json"})
+        response = None
+        try:
+            response = self.opener(request, timeout=self.settings["timeout_seconds"])
+            raw = response.read()
+        except urllib.error.HTTPError as err:
+            reason = JEV_HTTP_REASONS.get(err.code, "unreachable")
+            raise JevError(reason, "HTTP %s %s" % (err.code, _scrub_provider_text(self._body_of(err), key)))
+        except (socket.timeout, TimeoutError):
+            raise JevError("timeout", "no answer in %ss" % self.settings["timeout_seconds"])
+        except urllib.error.URLError as err:
+            if isinstance(err.reason, (socket.timeout, TimeoutError)):
+                raise JevError("timeout", "no answer in %ss" % self.settings["timeout_seconds"])
+            raise JevError("unreachable", _scrub_provider_text(err.reason, key))
+        except OSError as err:
+            raise JevError("unreachable", _scrub_provider_text(err, key))
+        finally:
+            if response is not None and hasattr(response, "close"):
+                response.close()
+        try:
+            out = json.loads(raw)
+        except (TypeError, ValueError):
+            raise JevError("bad_response", "the answer is not JSON")
+        if not isinstance(out, dict):
+            raise JevError("bad_response", "the answer is not an object")
+        return out
+
+    @staticmethod
+    def _body_of(err):
+        try:
+            return err.read().decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    def _record(self, body, out):
+        path = self.settings.get("record_file")
+        if not path:
+            return
+        line = json.dumps({"request": body, "response": out}, sort_keys=True) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as handle:
+            handle.write(line)
+
+
+class ReplayJev:
+    """Answers from a hand-written or recorded file, never from the network.
+
+    The file is a JSON object {"pairs": [...], "rules": [...]} or JSON lines of
+    pairs (what `jev.record_file` writes). A pair is {"request": {state,
+    questions[, model]}, "response": {answers[, model, usage]}} and matches an
+    identical request. A rule is {"contains": text, "choice": {option: p},
+    "noul": {question: p}, "error": reason} and matches a request whose
+    "message" contains the text (a rule without "contains" matches anything);
+    the first match wins. A question nobody answered is an error, loudly.
+    """
+
+    def __init__(self, path, model=JEV_MODEL):
+        self.path, self.model = path, model
+        self._pairs = self._rules = None
+
+    def _load(self):
+        if self._pairs is not None:
+            return
+        try:
+            text = Path(self.path).read_text()
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = {"pairs": [json.loads(line) for line in text.splitlines() if line.strip()]}
+            if "request" in data:  # a record file holding exactly one line parses as that pair
+                data = {"pairs": [data]}
+            pairs, rules = list(data.get("pairs") or []), list(data.get("rules") or [])
+        except (OSError, ValueError, AttributeError) as err:
+            raise JevError("bad_response", "cannot read the replay file: %s" % _scrub_provider_text(err))
+        self._pairs = {_canonical({"model": p["request"].get("model", self.model),
+                                   "state": p["request"].get("state"),
+                                   "questions": p["request"].get("questions")}): p["response"] for p in pairs}
+        self._rules = rules
+
+    def decide(self, state, questions):
+        self._load()
+        response = self._pairs.get(_canonical({"model": self.model, "state": state, "questions": questions}))
+        if response is None:
+            response = self._by_rule(state, questions)
+        answers = check_answers(questions, response.get("answers"))
+        return {"model": str(response.get("model") or self.model), "answers": answers,
+                "usage": _usage_of(response.get("usage")), "latency_ms": int(response.get("latency_ms") or 0)}
+
+    def _by_rule(self, state, questions):
+        message = state.get("message") if isinstance(state, dict) else None
+        subject = message if isinstance(message, str) else _canonical(state)
+        for rule in self._rules:
+            if rule.get("contains", "") in subject:
+                if rule.get("error") in JEV_REASONS:
+                    raise JevError(rule["error"], "replayed")
+                return {"answers": self._answers_of(rule, questions), "model": rule.get("model")}
+        raise JevError("bad_response", "nothing recorded for this question")
+
+    @staticmethod
+    def _answers_of(rule, questions):
+        answers = {}
+        for name, question in questions.items():
+            if question.get("type") == "noul":
+                answers[name] = {"type": "noul", "noul": (rule.get("noul") or {}).get(name, 0.0)}
+                continue
+            options = list(question.get("criteria", {}))
+            given = rule.get("choice") or {}
+            probabilities = {option: given.get(option, 0.0) for option in options}
+            total = sum(p for p in probabilities.values() if _is_number(p))
+            if total > 0:  # a rule may name options this question lacks: scale what is left to 1
+                probabilities = {option: p / total for option, p in probabilities.items()}
+            top = max(options, key=lambda option: (probabilities[option], option == "current"))
+            answers[name] = {"type": "choice", "choice": top, "probabilities": probabilities}
+        return answers
+
+
+def build_jev(config):
+    """The decision model the config asks for, or None when `jev` is not configured."""
+    settings = config.get("jev")
+    if not settings:
+        return None
+    if settings.get("replay"):
+        return ReplayJev(settings["replay"], settings["model"])
+    return JevClient(settings)
+
+
+# ----------------------------------------------------------------- the classifier
+
+CLASSIFY_ID = "about"
+CLASSIFY_INSTRUCTIONS = (
+    "The Chief of Staff is an AI assistant working for one person, who has just sent a new message. "
+    "Which of the following is the new message about: the work in progress, an ask somebody else is "
+    "already working on, or something new?")
+
+
+def _clip(text, limit=JEV_TEXT_LIMIT):
+    text = "" if text is None else str(text)
+    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
+
+
+def _ask_line(ask):
+    ask = ask or {}
+    line = _clip(ask.get("intent") or "no stated intent", 300)
+    if ask.get("done_when"):
+        line += " (done when: %s)" % _clip(ask["done_when"], 200)
+    return line
+
+
+def classify_options(current_ask, open_asks):
+    """Option name -> its criterion: `current`, one per open ask by issue number, `new`."""
+    options = {"current": "The message is about the work in progress now: %s." % _ask_line(current_ask)}
+    own = str((current_ask or {}).get("issue"))
+    for ask in open_asks or []:
+        name = str(ask["issue"])
+        if name == own:
+            continue  # the current ask is `current`, not a second option
+        options[name] = "The message is about ask %s (%s), which %s already owns." % (
+            name, _clip(ask.get("intent") or "no stated intent", 300), ask.get("owner") or "someone")
+    options["new"] = "The message is about something else: new work unrelated to the work in progress and to every open ask."
+    return options
+
+
+def classify_request(message, previous_message, current_ask, open_asks):
+    """(state, questions) for one classification."""
+    state = {"message": _clip(message), "previous_message": _clip(previous_message) if previous_message else None,
+             "current_ask": {"issue": (current_ask or {}).get("issue"), "intent": _ask_line(current_ask)},
+             "open_asks": [{"issue": str(a["issue"]), "intent": _clip(a.get("intent") or "", 300),
+                            "owner": a.get("owner")} for a in open_asks or []]}
+    question = {"type": "choice", "instructions": CLASSIFY_INSTRUCTIONS,
+                "criteria": classify_options(current_ask, open_asks)}
+    return state, {CLASSIFY_ID: question}
+
+
+def _default_current(reason, extra=None):
+    out = {"choice": "current", "probabilities": None, "confident": False, "reason": reason,
+           "jev_choice": None, "model": None, "usage": {}, "latency_ms": None}
+    out.update(extra or {})
+    return out
+
+
+def classify(jev, message, previous_message, current_ask, open_asks, min_confidence=0.7):
+    """One Jev call: {choice, probabilities, confident, reason, ...}. Never raises on Jev's account.
+
+    `confident` is true when the top probability reaches `min_confidence`. When
+    Jev is unreachable, errs, or is unsure, the choice is `current`: the safe
+    default changes nothing. `jev_choice` keeps what Jev said, for the audit.
+    """
+    state, questions = classify_request(message, previous_message, current_ask, open_asks)
+    try:
+        result = jev.decide(state, questions)
+    except JevError as err:
+        return _default_current("jev %s" % err.reason, {"latency_ms": err.latency_ms})
+    answer = result["answers"][CLASSIFY_ID]
+    probabilities = answer.get("probabilities")
+    out = {"probabilities": probabilities, "jev_choice": answer["choice"], "model": result["model"],
+           "usage": result["usage"], "latency_ms": result["latency_ms"]}
+    if not probabilities:
+        return dict(_default_current("jev gave no probabilities"), **out, choice="current")
+    top = probabilities.get(answer["choice"], 0.0)
+    if top < min_confidence:
+        return dict(out, choice="current", confident=False,
+                    reason="unsure: %s at %.2f is below %.2f" % (answer["choice"], top, min_confidence))
+    return dict(out, choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
+
+
+# ---------------------------------------------------------- the policy judge's questions
+
+POLICY_THRESHOLD = 0.5
+POLICY_OUTCOMES = ("allow", "ask", "deny", "hard-deny")  # least to most strict
+POLICY_QUESTIONS = {
+    "outside_intent": ("Is this action beyond the ask's Intent and Done-when?",
+                       "The action goes beyond what the Intent and Done-when ask for.",
+                       "The action is part of doing what the Intent and Done-when ask for."),
+    "hard_to_reverse": ("Is this action destructive, irreversible or security-sensitive?",
+                        "It destroys data, cannot be undone, or weakens security.",
+                        "It is easy to undo and touches nothing sensitive."),
+    "speaks_for_you": ("Is this action a merge, deploy, publish, message to other people, or spend that "
+                       "the charter's standing authority does not cover?",
+                       "It merges, deploys, publishes, messages others or spends, and nothing in the "
+                       "standing authority covers it.",
+                       "It does none of those, or the standing authority covers it."),
+    "outside_scope": ("Does this action touch a repository, environment, account or credential outside "
+                      "this agent's assignment?",
+                      "It touches something outside what this agent was assigned.",
+                      "It stays inside what this agent was assigned."),
+}
+POLICY_ASK_FOR = ("hard_to_reverse", "speaks_for_you", "outside_scope")
+
+
+def policy_questions():
+    """The four yes/no questions, by id."""
+    return {name: {"type": "noul", "instructions": text, "criteria": {"true": yes, "false": no}}
+            for name, (text, yes, no) in POLICY_QUESTIONS.items()}
+
+
+def policy_state(role, intent, done_when, authority, tool, arguments):
+    return {"role": role, "intent": _clip(intent, 600), "done_when": _clip(done_when, 400),
+            "standing_authority": _clip(authority, 300), "tool": tool,
+            "arguments": _clip(_canonical(arguments) if not isinstance(arguments, str) else arguments, 1500)}
+
+
+def _stricter(first, second):
+    return max((first, second), key=POLICY_OUTCOMES.index)
+
+
+def combine_policy(answers, thresholds=None, configured="allow"):
+    """The outcome of the four answers, never looser than `configured` (invariant 9).
+
+    `answers` maps question id to a probability, or None when unanswered.
+    outside_intent at its threshold is a hard deny; any of the other three is
+    an ask; an unanswered or malformed answer counts for nothing, so the
+    configured outcome stands. Returns {outcome, configured, fired, reason}.
+    """
+    if configured not in POLICY_OUTCOMES:
+        raise ValueError("unknown configured outcome: %r" % (configured,))
+    limits = dict.fromkeys(POLICY_QUESTIONS, POLICY_THRESHOLD)
+    limits.update(thresholds or {})
+    answers = answers or {}
+    fired = [name for name in POLICY_QUESTIONS
+             if _is_probability(answers.get(name)) and answers[name] >= limits[name]]
+    judged = "allow"
+    if "outside_intent" in fired:
+        judged = "hard-deny"
+    elif any(name in fired for name in POLICY_ASK_FOR):
+        judged = "ask"
+    if fault("judge-loosens"):
+        outcome = judged  # the fault: the judge's word replaces the configured outcome
+    else:
+        outcome = _stricter(configured, judged)
+    reason = "judge: %s" % ", ".join(fired) if fired else "judge: nothing at its threshold"
+    return {"outcome": outcome, "configured": configured, "fired": fired, "reason": reason}
+
+
+def judge_tool_call(jev, configured, state, thresholds=None):
+    """Ask the four questions about one tool call and combine them. Never raises, never loosens.
+
+    No answer (slow, unreachable, an error) leaves the configured outcome.
+    """
+    questions = policy_questions()
+    try:
+        result = jev.decide(state, questions)
+    except JevError as err:
+        combined = combine_policy(None, thresholds, configured)
+        combined.update(reason="judge unavailable (%s): configured outcome stands" % err.reason,
+                        latency_ms=err.latency_ms, usage={})
+        return combined
+    answers = {name: result["answers"][name]["noul"] for name in questions}
+    combined = combine_policy(answers, thresholds, configured)
+    combined.update(answers=answers, latency_ms=result["latency_ms"], usage=result["usage"], model=result["model"])
+    return combined
+
+
+# ------------------------------------------------------- shadow mode in the engine
+
+def _message_text(message):
+    text = message.get("text")
+    if isinstance(text, str):
+        return text
+    parts = message.get("content")
+    if isinstance(parts, list):
+        return "\n".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
+def human_prompts(messages):
+    """Your prompts in a transcript read newest first: type `user` without `metadata.fleet`."""
+    return [m for m in messages if isinstance(m, dict) and m.get("type") == "user" and _fleet_meta(m) is None]
+
+
+def _ask_of(fleet, owner=None):
+    issue = fleet.get("issue")
+    if issue is None:
+        return None
+    return {"issue": issue, "intent": fleet.get("intent") or "", "owner": owner}
+
+
+def open_asks_of(discovery, cos_name):
+    """The asks others hold: a fleet agent with an issue, other than the Chief of Staff.
+
+    Intent text arrives with `fleet-switchboard intents` (PR 6); until then an
+    ask has its issue number and owner only.
+    """
+    asks, seen = [], set()
+    for name, other in sorted(discovery.agents.items()):
+        ask = _ask_of(other.fleet, name)
+        if name != cos_name and ask and ask["issue"] not in seen:
+            seen.add(ask["issue"])
+            asks.append(ask)
+    return asks
+
+
+def _classify_audit(engine, observation, message, previous, request, answer):
+    state, questions = request
+    detail = {"agent": observation.name, "session": observation.session_id, "message_id": message.get("id"),
+              "status": observation.status, "shadow": True,
+              "question": {"state": state, "options": list(questions[CLASSIFY_ID]["criteria"])},
+              "answer": {"choice": answer["choice"], "confident": answer["confident"],
+                         "reason": answer["reason"], "jev_choice": answer["jev_choice"],
+                         "probabilities": answer["probabilities"]},
+              "model": answer["model"], "usage": answer["usage"], "latency_ms": answer["latency_ms"]}
+    engine.audit.append(engine.actor, "classify", "classify:%s:%s" % (observation.session_id, message.get("id")), detail)
+
+
+def shadow_classify(engine, observation, discovery, now):
+    """Classify your newest prompt to a Chief of Staff once, and write what Jev said. Acts on nothing."""
+    prompts = human_prompts(engine._messages(observation.session_id))
+    if not prompts:
+        return False
+    message = prompts[0]
+    created = _created(message)
+    key = "classify:%s:%s" % (observation.session_id, message.get("id"))
+    if message.get("id") is None or key in engine._classified:
+        return False
+    if created is None or now - created > engine.engaged_seconds:
+        return False
+    engine._classified.add(key)  # one attempt per message, whatever the answer
+    asks = open_asks_of(discovery, observation.name)
+    if observation.status != "working" and not asks:
+        return False  # nothing to choose between: it simply becomes the foreground work
+    previous = _message_text(prompts[1]) if len(prompts) > 1 else None
+    current = _ask_of(observation.fleet, observation.name)
+    request = classify_request(_message_text(message), previous, current, asks)
+    answer = classify(engine.jev, _message_text(message), previous, current, asks,
+                      engine.config["jev"]["min_confidence"])
+    _classify_audit(engine, observation, message, previous, request, answer)
+    return True
+
+
+def run_shadow_classifier(engine, discovery, now):
+    """Each Chief of Staff, once per new prompt. A failure is audited and never stops the pass."""
+    if engine.jev is None or engine.audit is None or not engine.config.get("shadow_judges"):
+        return
+    if fault("no-classify"):
+        return
+    for observation in list(discovery.agents.values()):
+        if observation.fleet.get("role") != "chief-of-staff" or observation.problem:
+            continue
+        try:
+            shadow_classify(engine, observation, discovery, now)
+        except Exception as err:
+            engine.audit.append(engine.actor, "error", observation.name,
+                                {"step": "classify", "error": "%s: %s" % (type(err).__name__, _one_line(str(err)))})
 
 
 # ------------------------------------------------- the poke socket and the daemon

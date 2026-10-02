@@ -12,11 +12,11 @@
 |---|---|---|---|
 | 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | ready for review [#15](https://github.com/adamkaplan/fleet-kit/pull/15); spikes pass |
 | 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send`; the Lab scenario runner; spikes as scenarios | ready for review [#17](https://github.com/adamkaplan/fleet-kit/pull/17); W2, B1, R2 and S2–S7 pass offline and in the Lab |
-| 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
-| 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
-| 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
-| 6 | `switchboard/intent` | Asks with Intent and Done-when; every message names its ask; `intents`; changes surfaced; role maxims and the reach-for-you rubric | planned |
-| 7 | `switchboard/judges` | Jev decision-model client; the message classifier and the tool-call judge in shadow mode | planned |
+| 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | ready for review [#19](https://github.com/adamkaplan/fleet-kit/pull/19); D1 and L1 pass offline and in the Lab |
+| 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | ready for review [#20](https://github.com/adamkaplan/fleet-kit/pull/20); N1, N2, W1, W3, R1, H1, R3 pass offline and in the Lab; Q1 offline only |
+| 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | ready for review [#21](https://github.com/adamkaplan/fleet-kit/pull/21); G1–G3 pass offline; SG1 is a spike for a scratch repo |
+| 6 | `switchboard/intent` | Asks with Intent and Done-when; every message names its ask; `intents`; changes surfaced; role maxims and the reach-for-you rubric | ready for review [#22](https://github.com/adamkaplan/fleet-kit/pull/22); I1–I3 pass offline; I4, K1, K2 wait for the Copilot login |
+| 7 | `switchboard/judges` | Jev decision-model client; the message classifier and the tool-call judge in shadow mode | ready for review [#23](https://github.com/adamkaplan/fleet-kit/pull/23); J1 and F5 pass offline and in the Lab |
 | 8 | `switchboard/foreground` | Classify your messages; hand unrelated work to a background subagent; decorate messages about owned asks; spikes SF1–SF4 | planned |
 | 9 | `switchboard/policy` | Tool-call policy judge through the thin `fleet-hooks` plugin; spikes SP1–SP2 | planned |
 | 10 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
@@ -1238,16 +1238,16 @@ R1.
 | N2 | A note waits 10 minutes with no message from you | 3 | Note converted to a wake | PR 4 | offline, lab-scripted |
 | W1 | A worker finishes while you are away | 4 | Worker-done fact | PR 4 | offline, lab-scripted |
 | W3 | A worker stops on a permission prompt | 4 | Blocked fact and toast | PR 4 | offline, lab-scripted |
-| Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated), lab-scripted (30 min) |
+| Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated); the Lab tier is owed: its control is the old timer, which is not built there |
 | R1 | The daemon is killed while a worker finishes, then restarted | 4 | Derived pending, dedupe (invariants 1–2) | PR 4 | offline, lab-scripted |
 | H1 | A worker's pane is closed between deciding and delivering | — | Re-check before every write (invariant 4); hold and toast | PR 4 | offline, lab-scripted |
 | R3 | The state directory is deleted while items are pending | — | Nothing but the audit history and reminders is lost (invariant 8) | PR 4 | offline, lab-scripted |
-| G1 | A comment lands on an ask | 4 | Routing, Intent header | PR 5 | offline, lab-scripted |
-| G2 | The forwarder dies while events are sent | 4 | Catch-up read, object-id keys | PR 5 | offline, lab-scripted |
-| G3 | Someone else is already forwarding the repo | — | Conflict reported, fallback | PR 5 | offline, lab-scripted |
+| G1 | A comment lands on an ask | 4 | Routing, Intent header | PR 5 | offline; the Lab runner cannot yet post a signed webhook |
+| G2 | The forwarder dies while events are sent | 4 | Catch-up read, object-id keys | PR 5 | offline; Lab owed, as G1 |
+| G3 | Someone else is already forwarding the repo | — | Conflict reported, fallback | PR 5 | offline; Lab owed, as G1 |
 | I1 | An orchestrator reports "one of two fixed" | 1 | Intent header on reports going up | PR 6 | offline, lab-model (the Chief of Staff flags it against Done-when) |
-| I2 | An issue has no Intent section | 1 | "No intent recorded" | PR 6 | offline, lab-scripted |
-| I3 | An Intent is edited on GitHub | 1 | Change surfaced, old → new | PR 6 | offline, lab-scripted |
+| I2 | An issue has no Intent section | 1 | "No intent recorded" | PR 6 | offline; the Lab has no fake GitHub yet |
+| I3 | An Intent is edited on GitHub | 1 | Change surfaced, old → new | PR 6 | offline; Lab owed, as I2 |
 | I4 | An orchestrator wants to change an Intent | 1 | Proposes with `send`; only you or the Chief of Staff with your yes change it | PR 6 | lab-model |
 | K1 | A worker's fix fails its check | 1 | "Say it failed"; "The last message stands alone": the Chief of Staff's message to you names the failure and its evidence (judged) | PR 6 | lab-model; control `no-maxims` |
 | K2 | An orchestrator's report recommends a code change nobody asked for | 1 | "A diagnosis is not a mandate": the Chief of Staff relays it as a finding and asks, rather than authorising the change (judged) | PR 6 | lab-model; control `no-maxims` |
@@ -1467,3 +1467,52 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   `agent_session` is an object, and v2 keeps a waiting item's metadata under
   `payload.metadata`. Both fixed, and the fakes now use the real shapes. The
   two runners share one scenario vocabulary.
+- 2026-10-02: PRs 3 to 7 built in parallel by separate workers on
+  worktrees off PR 2, then rebased into the stack in order and verified
+  together. Every tip passes all five suites offline.
+  - **PR 3, herdr.** `ensure` and `poke` (a datagram to `poke.sock`, named
+    relative to the state dir because macOS caps a socket path at 104 bytes),
+    the plugin manifest (not linked: issue #16 Q5), `launch` through
+    `layout.apply` with an argv command (it never types into a pane), the
+    unread badge, toasts, and a restart guard that refuses a pane running a
+    different opencode. The herdr client's argv was corrected against the real
+    CLI and the fake herdr now exits 2 on any shape the real one would reject.
+    D1 and L1 pass in both tiers.
+  - **PR 4, worker events.** `worker.idle` and `worker.blocked` facts derived
+    each pass from v2 and herdr, `remind`, and scenarios N1, N2, W1, W3, Q1,
+    R1, H1 and R3. `coverage --through-pr N` enforces only the problems whose
+    scenarios are due by PR N. Q1's two-hour scenario is offline only: its
+    control is the old timer, which is not built in the Lab.
+  - **PR 5, GitHub events.** One `gh webhook forward` child per repo, a
+    localhost listener that verifies the HMAC before it parses anything, a
+    per-start secret held only in memory and in the child's argv, object-id
+    keys, and a catch-up read after each forwarder start. G1 to G3 pass
+    offline. SG1 stays a spike for a scratch repo.
+  - **PR 6, intent.** The `## Intent` and `Done when:` parser and its cache,
+    a per-ask section in every message, `intents` and `intent`, `send`
+    refusing without `--issue`, and the pure intent-change fact. The role
+    definitions gained the maxims, the reach-for-you rubric and a paragraph on
+    `[switchboard]` messages, replacing prose they now duplicate. I1 to I3
+    pass offline; I4, K1 and K2 are lab-model and wait for the Copilot login.
+  - **PR 7, judges.** The Jev client (key read at call time from a named
+    environment variable, scrubbed from every error), the shadow classifier
+    that logs and acts on nothing, and the policy combiner that never loosens
+    a configured outcome. J1 and F5 pass in both tiers.
+  - **Reconciliations the rebase forced.** Two toast mechanisms collapsed into
+    PR 3's render step, so there is one path to herdr's `notification show`.
+    One `toast` oracle serves both runners. PR 7's provider-text scrubber was
+    renamed because PR 5 already owned `_scrub`.
+  - **Lab verification at the top of the stack.** The whole lab-scripted tier
+    passes with every control failing: B1, D1, F5, H1, J1, L1, N1, N2, R1, R2,
+    R3, S2 to S7, W1, W2, W3. The first run failed H1 and W3 on the same
+    point: the Lab's herdr shim logged the toast correctly, but its oracle
+    still read the old `--title` flag, which PR 3 had corrected to a
+    positional title. Fixed in PR 4 with a test that reads the argv the real
+    client writes, and both pass.
+  - **Owed.** The Lab tier of Q1, G1 to G3, I2 and I3 (the runner cannot post
+    a signed webhook, play `edit-intent`, or fake GitHub yet); spike SG1 on a
+    scratch repo; `session.form.list` is an unverified operation name; v2
+    listing is not paged, so a recipient with more than 200 synthetic
+    messages in the look-back is held; the two test fakes of GitHub should
+    become one.
+

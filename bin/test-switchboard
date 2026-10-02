@@ -3497,6 +3497,19 @@ def _matches(keys, pattern):
     return any(fnmatch.fnmatchcase(key, pattern) for key in keys)
 
 
+JEV_REPLAY = REPO / "scenarios" / "jev" / "replay.json"
+JEV_SCENARIO_CONFIG = {"jev": {"replay": str(JEV_REPLAY)}}  # the hand-written answers every scenario runs against
+
+
+def classified_in_audit(entries, agent, text, choice):
+    """True when the audit's last classification of that agent's message `text` chose `choice`."""
+    found = [e for e in entries if e.get("event") == "classify"
+             and (e.get("detail") or {}).get("agent") == agent
+             and text in ((e["detail"].get("question") or {}).get("state") or {}).get("message", "")]
+    got = found[-1]["detail"]["answer"]["choice"] if found else None
+    return got == choice, "%d classification(s) of the message; the last chose %r" % (len(found), got)
+
+
 class OfflineRun:
     """One scenario on the fakes: a pass every POLL seconds while the daemon
     runs, steps applied at their times, a simulated clock in 1 s ticks.
@@ -3511,7 +3524,7 @@ class OfflineRun:
         self.work = test.home / "scenario-repo"
         self.work.mkdir(exist_ok=True)
         self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
-                           config=scenario.get("config"))
+                           config=dict(JEV_SCENARIO_CONFIG, **(scenario.get("config") or {})))
         launched = {step["agent"] for step in scenario["steps"] if step["do"] == "launch"}
         for name, member in sorted(scenario["cast"].items()):
             if name not in launched:  # a launched agent does not exist until `launch` makes it
@@ -3688,6 +3701,8 @@ class OfflineRun:
         typed = self.world.herdr.typing_attempts
         ok = entry is not None and entry.get("argv", [None])[0] == FAKE_OPENCODE and not typed
         return ok, "pane %s opened by argv %s; typing attempts: %s" % (pane, (entry or {}).get("argv"), typed or "none")
+    def oracle_classified(self, e):  # PR 7: see "PR 7" below
+        return classified_in_audit(self.world.audit(), e["agent"], self.scenario["steps"][e["step"]]["text"], e["as"])
 
     def evaluate(self):
         results = []
@@ -3799,7 +3814,7 @@ class TestOfflineScenarios(Base):
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
-        b1["expect"].append({"that": "classified"})
+        b1["expect"].append({"that": "no-such-oracle"})
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
 
@@ -5283,8 +5298,7 @@ class TestHygiene(unittest.TestCase):
 #
 # Everything below extends the fakes and the offline scenario runner by
 # attachment (`adds_to`), so the shared classes above stay as they were.
-# ======================================================================
-
+# ===============================================================
 def adds_to(cls):
     """Attach the decorated function to `cls` under its own name."""
     def attach(function):
@@ -6912,6 +6926,706 @@ class TestIntentScenarios(Base):
         self.assertEqual(len(judged), 1)
         self.assertIn("not evaluated offline", judged[0]["seen"])
         self.assertNotIn("flags-divergence", report["proves_nothing"])
+# ======================================================================
+# PR 7: the decision model, the classifier, the judge's combiner
+# ======================================================================
+
+KEY_VALUE = "sk-or-test-0123456789abcdef"  # a made-up key: it only has to be findable
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.closed = False
+
+    def read(self):
+        return self._body
+
+    def close(self):
+        self.closed = True
+
+
+class FakeOpener:
+    """urlopen's shape. Answers from `reply`: a body, or an exception instance to raise."""
+
+    def __init__(self, reply):
+        self.reply, self.calls = reply, []
+
+    def __call__(self, request, timeout=None):
+        self.calls.append({"url": request.full_url, "method": request.get_method(), "timeout": timeout,
+                           "headers": dict(request.header_items()), "body": json.loads(request.data)})
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return FakeResponse(self.reply)
+
+
+def http_error(code, body=b"{}"):
+    return sb.urllib.error.HTTPError("https://x.test", code, "msg", {}, io.BytesIO(body))
+
+
+def noul_answers(**given):
+    return {name: {"type": "noul", "noul": p} for name, p in given.items()}
+
+
+def choice_answer(choice, probabilities):
+    return {"type": "choice", "choice": choice, "probabilities": probabilities}
+
+
+def jev_reply(answers, **extra):
+    body = {"model": "typesafe/jev-1.13-20260917", "answers": answers,
+            "usage": {"input_tokens": 120, "output_tokens": 9, "cost": 3.5e-05}}
+    body.update(extra)
+    return body
+
+
+class FakeJev:
+    """The decision model with deterministic answers and no network.
+
+    `rule` is answers (as in a Jev reply), a JevError reason string, None
+    (unreachable), or a function (state, questions) -> one of those.
+    """
+
+    def __init__(self, rule=None, latency_ms=12):
+        self.rule, self.calls, self.latency_ms = rule, [], latency_ms
+
+    def decide(self, state, questions):
+        self.calls.append({"state": state, "questions": questions})
+        answers = self.rule(state, questions) if callable(self.rule) else self.rule
+        if isinstance(answers, str):
+            raise sb.JevError(answers, "fake", latency_ms=self.latency_ms)
+        if answers is None:
+            raise sb.JevError("unreachable", "fake had no answer", latency_ms=self.latency_ms)
+        return {"model": "fake", "answers": sb.check_answers(questions, answers),
+                "usage": {"in": 100, "out": 5, "cost": 3e-05}, "latency_ms": self.latency_ms}
+
+
+def confident(choice, top=0.95, others=("current", "new")):
+    """Answers to a classify question: `choice` at `top`, the rest sharing what is left."""
+    rest = [o for o in others if o != choice]
+    probabilities = {choice: top}
+    probabilities.update({o: (1 - top) / len(rest) for o in rest} if rest else {})
+    return {sb.CLASSIFY_ID: choice_answer(choice, probabilities)}
+
+
+JEV_SETTINGS = dict(sb.JEV_DEFAULTS)
+
+
+class TestJevConfig(Base):
+    def config(self, **raw):
+        return sb.validate_config(dict({"opencode": FAKE_OPENCODE}, **raw))
+
+    def test_no_jev_keys_leave_the_config_as_it_was(self):
+        config = self.config()
+        self.assertNotIn("jev", config)
+        self.assertNotIn("shadow_judges", config)
+
+    def test_a_jev_object_is_completed_with_defaults(self):
+        config = self.config(jev={"min_confidence": 0.8})
+        self.assertEqual(config["jev"], dict(JEV_SETTINGS, min_confidence=0.8))
+        self.assertEqual(config["jev"]["model"], "typesafe/jev-1.13")
+        self.assertEqual(config["jev"]["key_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(config["jev"]["timeout_seconds"], 20)
+
+    def test_unknown_subkeys_are_rejected(self):
+        with self.assertRaisesRegex(sb.ConfigError, "'jev' contains key.*api_key"):
+            self.config(jev={"api_key": "x"})
+
+    def test_shadow_judges_follows_whether_jev_is_configured(self):
+        self.assertTrue(self.config(jev={})["shadow_judges"])
+        self.assertFalse(self.config(jev={}, shadow_judges=False)["shadow_judges"])
+        self.assertFalse(self.config(shadow_judges=False)["shadow_judges"])
+        with self.assertRaisesRegex(sb.ConfigError, "needs a 'jev' object"):
+            self.config(shadow_judges=True)
+
+    def test_bad_values_are_refused_with_the_key_named(self):
+        cases = [({"key_env": KEY_VALUE}, "jev.key_env"), ({"key_env": ""}, "jev.key_env"),
+                 ({"url": "http://openrouter.ai/x"}, "jev.url"), ({"url": "ftp://x"}, "jev.url"),
+                 ({"timeout_seconds": 0}, "jev.timeout_seconds"), ({"timeout_seconds": "9"}, "jev.timeout_seconds"),
+                 ({"min_confidence": 0}, "jev.min_confidence"), ({"min_confidence": 1.5}, "jev.min_confidence"),
+                 ({"model": ""}, "jev.model"), ({"replay": "relative.json"}, "jev.replay"),
+                 ({"record_file": "r.jsonl"}, "jev.record_file"),
+                 ({"record_file": "/tmp/a", "replay": "/tmp/b"}, "record real calls")]
+        for jev, needle in cases:
+            with self.subTest(jev=jev):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    self.config(jev=jev)
+                self.assertIn(needle, str(caught.exception))
+        with self.assertRaisesRegex(sb.ConfigError, "jev"):
+            self.config(jev=["x"])
+        with self.assertRaisesRegex(sb.ConfigError, "shadow_judges"):
+            self.config(jev={}, shadow_judges="yes")
+
+    def test_the_refusal_of_a_key_in_the_config_does_not_echo_it_as_a_secret_rule(self):
+        # The error names the setting; the value shown is the user's own mistake, but
+        # the documented place for the key is the environment, and the message says so.
+        with self.assertRaisesRegex(sb.ConfigError, "NAME of an environment variable"):
+            self.config(jev={"key_env": KEY_VALUE})
+
+    def test_http_is_allowed_only_for_the_local_machine(self):
+        self.assertEqual(self.config(jev={"url": "http://127.0.0.1:8080/x"})["jev"]["url"], "http://127.0.0.1:8080/x")
+        self.assertEqual(self.config(jev={"url": "http://localhost:8080/x"})["jev"]["url"], "http://localhost:8080/x")
+        with self.assertRaises(sb.ConfigError):
+            self.config(jev={"url": "http://localhost.evil.test/x"})
+
+
+class TestJevClient(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["OPENROUTER_API_KEY"] = KEY_VALUE
+        self.questions = {"q": {"type": "noul", "instructions": "x", "criteria": {"true": "t", "false": "f"}}}
+        self.state = {"message": "hello"}
+
+    def client(self, reply, **settings):
+        self.opener = FakeOpener(reply)
+        ticks = iter(x / 10.0 for x in range(0, 1000, 3))
+        return sb.JevClient(dict(JEV_SETTINGS, **settings), opener=self.opener, clock=lambda: next(ticks))
+
+    def decide(self, reply, **settings):
+        return self.client(reply, **settings).decide(self.state, self.questions)
+
+    def test_the_request_is_the_systemone_shape_with_the_key_in_a_header_only(self):
+        out = self.decide(jev_reply(noul_answers(q=0.23)))
+        call = self.opener.calls[0]
+        self.assertEqual(call["url"], "https://openrouter.ai/api/v1/systemone")
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["timeout"], 20)
+        self.assertEqual(call["headers"]["Authorization"], "Bearer " + KEY_VALUE)
+        self.assertEqual(call["body"], {"model": "typesafe/jev-1.13", "state": self.state, "questions": self.questions})
+        self.assertNotIn(KEY_VALUE, json.dumps(call["body"]) + call["url"])
+        self.assertEqual(out["answers"]["q"]["noul"], 0.23)
+        self.assertEqual(out["usage"], {"in": 120, "out": 9, "cost": 3.5e-05})
+        self.assertEqual(out["model"], "typesafe/jev-1.13-20260917")
+
+    def test_the_key_is_read_at_the_call_from_the_variable_named_in_the_config(self):
+        client = self.client(jev_reply(noul_answers(q=0.5)), key_env="MY_JEV_KEY")
+        os.environ.pop("MY_JEV_KEY", None)
+        with self.assertRaises(sb.JevError) as caught:
+            client.decide(self.state, self.questions)
+        self.assertEqual(caught.exception.reason, "unauthorized")
+        self.assertEqual(self.opener.calls, [], "no key means no call")
+        self.assertIn("MY_JEV_KEY", str(caught.exception))
+        os.environ["MY_JEV_KEY"] = "first-" + KEY_VALUE
+        client.decide(self.state, self.questions)
+        os.environ["MY_JEV_KEY"] = "second-" + KEY_VALUE
+        client.decide(self.state, self.questions)
+        self.assertEqual([c["headers"]["Authorization"] for c in self.opener.calls],
+                         ["Bearer first-" + KEY_VALUE, "Bearer second-" + KEY_VALUE])
+
+    def test_the_key_is_never_stored_on_the_client(self):
+        client = self.client(jev_reply(noul_answers(q=0.5)))
+        client.decide(self.state, self.questions)
+        held = repr({k: v for k, v in vars(client).items() if k != "environ"})
+        self.assertFalse(KEY_VALUE in held, "the key is held by the client")
+        source = class_source("JevClient")
+        for banned in ("print(", "sys.stderr", "logging", "environ[", "self.key"):
+            self.assertNotIn(banned, source)
+
+    def test_every_http_status_has_its_reason(self):
+        for code, reason in ((400, "invalid"), (422, "invalid"), (401, "unauthorized"), (403, "unauthorized"),
+                             (402, "no_credit"), (413, "too_large"), (429, "rate_limited"), (500, "unreachable"),
+                             (503, "unreachable")):
+            with self.subTest(code=code):
+                with self.assertRaises(sb.JevError) as caught:
+                    self.decide(http_error(code))
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_timeouts_and_unreachable(self):
+        urlerror = sb.urllib.error.URLError
+        cases = [(sb.socket.timeout("t"), "timeout"), (TimeoutError("t"), "timeout"),
+                 (urlerror(sb.socket.timeout("t")), "timeout"), (urlerror("no route to host"), "unreachable"),
+                 (ConnectionResetError("reset"), "unreachable"), (OSError("down"), "unreachable")]
+        for error, reason in cases:
+            with self.subTest(error=error):
+                with self.assertRaises(sb.JevError) as caught:
+                    self.decide(error)
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_the_call_is_bounded_by_the_configured_timeout(self):
+        self.decide(jev_reply(noul_answers(q=0.1)), timeout_seconds=3.5)
+        self.assertEqual(self.opener.calls[0]["timeout"], 3.5)
+
+    def test_unusable_answers_are_bad_responses(self):
+        good = noul_answers(q=0.1)
+        cases = {"not json": b"<html>", "a list": b"[]", "no answers": {"model": "m"},
+                 "unanswered": {"answers": {}}, "out of range": {"answers": noul_answers(q=1.5)},
+                 "not a number": {"answers": noul_answers(q="high")},
+                 "a list of the wrong length": {"answers": [good["q"], good["q"]]}}
+        for name, reply in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(sb.JevError) as caught:
+                    self.decide(reply)
+                self.assertEqual(caught.exception.reason, "bad_response")
+
+    def test_a_list_of_answers_is_read_in_question_order(self):
+        out = self.decide({"answers": [noul_answers(q=0.4)["q"]]})
+        self.assertEqual(out["answers"]["q"]["noul"], 0.4)
+
+    def test_choice_answers_are_checked_against_the_options(self):
+        question = {"c": {"type": "choice", "instructions": "x", "criteria": {"current": "a", "new": "b"}}}
+        bad = [{"c": choice_answer("other", {"current": 0.5, "new": 0.5})},
+               {"c": choice_answer("new", {"current": 0.5, "new": 0.1})},
+               {"c": choice_answer("new", {"current": 0.5, "new": 0.5, "extra": 0.0})},
+               {"c": {"type": "choice", "choice": "new", "probabilities": ["x"]}}]
+        for answers in bad:
+            with self.subTest(answers=answers):
+                with self.assertRaises(sb.JevError):
+                    self.client({"answers": answers}).decide(self.state, question)
+        ok = self.client({"answers": {"c": choice_answer("new", {"current": 0.2, "new": 0.8})}}).decide(self.state, question)
+        self.assertEqual(ok["answers"]["c"]["choice"], "new")
+
+    def test_latency_is_measured_for_answers_and_for_errors(self):
+        out = self.decide(jev_reply(noul_answers(q=0.1)))
+        self.assertGreater(out["latency_ms"], 0)
+        with self.assertRaises(sb.JevError) as caught:
+            self.decide(http_error(429))
+        self.assertGreater(caught.exception.latency_ms, 0)
+
+    def test_the_key_never_reaches_an_error_even_when_the_provider_echoes_it(self):
+        echo = ("bad key %s, Authorization: Bearer %s" % (KEY_VALUE, KEY_VALUE)).encode()
+        for error in (http_error(401, echo), sb.urllib.error.URLError("refused %s" % KEY_VALUE),
+                      OSError("Bearer " + KEY_VALUE)):
+            with self.subTest(error=error):
+                with self.assertRaises(sb.JevError) as caught:
+                    self.decide(error)
+                self.assertNotIn(KEY_VALUE, str(caught.exception))
+                self.assertNotIn(KEY_VALUE, caught.exception.detail)
+        out = self.decide(jev_reply(noul_answers(q=0.1), model="m " + KEY_VALUE))
+        self.assertNotIn(KEY_VALUE, json.dumps(out))
+
+    def test_the_response_body_is_closed(self):
+        client = self.client(jev_reply(noul_answers(q=0.1)))
+        responses = []
+        original = client.opener
+
+        def spy(request, timeout=None):
+            responses.append(original(request, timeout))
+            return responses[-1]
+        client.opener = spy
+        client.decide(self.state, self.questions)
+        self.assertTrue(responses[0].closed)
+
+    def test_real_calls_can_be_recorded_without_the_key_and_replayed(self):
+        path = self.home / "recorded.jsonl"
+        self.decide(jev_reply(noul_answers(q=0.31)), record_file=str(path))
+        text = path.read_text()
+        self.assertNotIn(KEY_VALUE, text)
+        self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
+        pair = json.loads(text)
+        self.assertEqual(pair["request"]["questions"], self.questions)
+        replayed = sb.ReplayJev(str(path)).decide(self.state, self.questions)
+        self.assertEqual(replayed["answers"]["q"]["noul"], 0.31)
+        with self.assertRaises(sb.JevError) as caught:  # a reworded question is not silently answered
+            sb.ReplayJev(str(path)).decide({"message": "other"}, self.questions)
+        self.assertEqual(caught.exception.reason, "bad_response")
+
+    def test_a_failed_call_records_nothing(self):
+        path = self.home / "recorded.jsonl"
+        with self.assertRaises(sb.JevError):
+            self.decide(http_error(429), record_file=str(path))
+        self.assertFalse(path.exists())
+
+
+class TestReplayJev(Base):
+    def replay(self, data):
+        path = self.home / "replay.json"
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return sb.ReplayJev(str(path))
+
+    def question(self, *options):
+        return {"c": {"type": "choice", "instructions": "x", "criteria": {o: o for o in options}}}
+
+    def test_rules_match_the_message_in_order_and_scale_to_the_options_offered(self):
+        replay = self.replay({"rules": [{"contains": "alpha", "choice": {"new": 0.9, "current": 0.1, "615": 0.5}},
+                                        {"contains": "gone", "error": "timeout"},
+                                        {"choice": {"current": 1}}]})
+        out = replay.decide({"message": "an alpha thing"}, self.question("current", "new"))
+        self.assertEqual(out["answers"]["c"]["choice"], "new")
+        self.assertAlmostEqual(sum(out["answers"]["c"]["probabilities"].values()), 1.0)
+        self.assertEqual(replay.decide({"message": "else"}, self.question("current", "new"))["answers"]["c"]["choice"],
+                         "current")
+        with self.assertRaises(sb.JevError) as caught:
+            replay.decide({"message": "gone"}, self.question("current", "new"))
+        self.assertEqual(caught.exception.reason, "timeout")
+
+    def test_noul_rules_answer_by_question_id_and_default_to_low(self):
+        replay = self.replay({"rules": [{"noul": {"hard_to_reverse": 0.9}}]})
+        out = replay.decide({"tool": "x"}, sb.policy_questions())
+        self.assertEqual({k: v["noul"] for k, v in out["answers"].items()},
+                         {"outside_intent": 0.0, "hard_to_reverse": 0.9, "speaks_for_you": 0.0, "outside_scope": 0.0})
+
+    def test_a_missing_or_broken_file_or_an_unmatched_question_is_a_bad_response_not_a_crash(self):
+        for replay in (sb.ReplayJev(str(self.home / "nope.json")), self.replay("not json {"),
+                       self.replay({"rules": [{"contains": "zzz", "choice": {"new": 1}}]})):
+            with self.subTest(replay=replay.path):
+                with self.assertRaises(sb.JevError) as caught:
+                    replay.decide({"message": "x"}, self.question("current", "new"))
+                self.assertEqual(caught.exception.reason, "bad_response")
+
+    def test_the_committed_answers_file_is_valid_and_hand_written(self):
+        data = json.loads(JEV_REPLAY.read_text())
+        self.assertEqual(set(data), {"note", "rules"})
+        replay = sb.ReplayJev(str(JEV_REPLAY))
+        out = replay.decide({"message": "x billing export"}, sb.classify_request("x", None, None, [])[1])
+        self.assertEqual(out["answers"][sb.CLASSIFY_ID]["choice"], "new")
+
+    def test_build_jev_picks_the_backend_the_config_names(self):
+        self.assertIsNone(sb.build_jev({}))
+        self.assertIsInstance(sb.build_jev({"jev": dict(JEV_SETTINGS)}), sb.JevClient)
+        self.assertIsInstance(sb.build_jev({"jev": dict(JEV_SETTINGS, replay="/x/y.json")}), sb.ReplayJev)
+
+
+class TestClassify(unittest.TestCase):
+    ASKS = [{"issue": 615, "intent": "fix the project agents", "owner": "cos-615"}]
+
+    def classify(self, answers, asks=(), **kwargs):
+        jev = FakeJev(answers)
+        out = sb.classify(jev, "a new message", "the one before", {"issue": 7, "intent": "Add health", "done_when": "200"},
+                          list(asks), **kwargs)
+        self.jev = jev
+        return out
+
+    def test_the_question_has_current_one_option_per_open_ask_and_new(self):
+        self.classify(confident("current"), self.ASKS)
+        state, questions = self.jev.calls[0]["state"], self.jev.calls[0]["questions"]
+        question = questions[sb.CLASSIFY_ID]
+        self.assertEqual(question["type"], "choice")
+        self.assertEqual(list(question["criteria"]), ["current", "615", "new"])
+        self.assertEqual(state["message"], "a new message")
+        self.assertEqual(state["previous_message"], "the one before")
+        self.assertIn("Add health", state["current_ask"]["intent"])
+        self.assertIn("done when: 200", state["current_ask"]["intent"])
+        self.assertEqual(state["open_asks"][0], {"issue": "615", "intent": "fix the project agents", "owner": "cos-615"})
+        self.assertEqual(len(questions), 1, "one question per message")
+
+    def test_the_current_ask_is_not_also_an_ask_option(self):
+        options = sb.classify_options({"issue": 615}, self.ASKS)
+        self.assertEqual(list(options), ["current", "new"])
+
+    def test_a_confident_answer_is_taken_whatever_it_is(self):
+        for choice in ("current", "615", "new"):
+            with self.subTest(choice=choice):
+                out = self.classify(confident(choice, 0.93, ("current", "615", "new")), self.ASKS)
+                self.assertEqual((out["choice"], out["confident"]), (choice, True))
+                self.assertEqual(out["jev_choice"], choice)
+                self.assertIn("0.93", out["reason"])
+                self.assertEqual(out["usage"]["cost"], 3e-05)
+                self.assertEqual(out["latency_ms"], 12)
+
+    def test_the_threshold_is_inclusive_and_configurable(self):
+        self.assertTrue(self.classify(confident("new", 0.7))["confident"])
+        out = self.classify(confident("new", 0.69))
+        self.assertEqual((out["choice"], out["confident"], out["jev_choice"]), ("current", False, "new"))
+        self.assertIn("unsure", out["reason"])
+        self.assertEqual(self.classify(confident("new", 0.69), min_confidence=0.6)["choice"], "new")
+        self.assertEqual(self.classify(confident("new", 0.9), min_confidence=0.95)["choice"], "current")
+
+    def test_no_probabilities_is_not_confidence(self):
+        out = self.classify({sb.CLASSIFY_ID: {"type": "choice", "choice": "new"}})
+        self.assertEqual((out["choice"], out["confident"]), ("current", False))
+        self.assertIn("no probabilities", out["reason"])
+
+    def test_every_error_defaults_to_current_with_its_reason(self):
+        for reason in sb.JEV_REASONS:
+            with self.subTest(reason=reason):
+                out = self.classify(reason)
+                self.assertEqual((out["choice"], out["confident"]), ("current", False))
+                self.assertEqual(out["reason"], "jev " + reason)
+                self.assertEqual(out["latency_ms"], 12)
+
+    def test_long_messages_are_cut_before_they_are_sent(self):
+        state, _ = sb.classify_request("x" * 5000, None, None, [])
+        self.assertLessEqual(len(state["message"]), sb.JEV_TEXT_LIMIT)
+
+
+POLICY_CASES = {  # answers -> judged outcome with nothing configured (allow)
+    "nothing high": ({"outside_intent": 0.1, "hard_to_reverse": 0.2, "speaks_for_you": 0.0, "outside_scope": 0.3}, "allow"),
+    "outside intent": ({"outside_intent": 0.9}, "hard-deny"),
+    "hard to reverse": ({"hard_to_reverse": 0.8}, "ask"),
+    "speaks for you": ({"speaks_for_you": 0.8}, "ask"),
+    "outside scope": ({"outside_scope": 0.8}, "ask"),
+    "outside intent beats the rest": ({"outside_intent": 0.9, "hard_to_reverse": 0.9, "outside_scope": 0.9}, "hard-deny"),
+    "at the threshold": ({"hard_to_reverse": 0.5}, "ask"),
+    "just under": ({"hard_to_reverse": 0.499, "outside_intent": 0.499}, "allow"),
+}
+
+
+class TestPolicyCombiner(Base):
+    def test_four_yes_no_questions_in_the_documented_order(self):
+        questions = sb.policy_questions()
+        self.assertEqual(list(questions), ["outside_intent", "hard_to_reverse", "speaks_for_you", "outside_scope"])
+        for question in questions.values():
+            self.assertEqual(question["type"], "noul")
+            self.assertEqual(set(question["criteria"]), {"true", "false"})
+            self.assertTrue(question["instructions"].endswith("?"))
+
+    def test_the_state_carries_what_the_judge_needs_and_nothing_else(self):
+        state = sb.policy_state("coder", "Add health", "200", "may merge green PRs", "shell", {"command": "ls"})
+        self.assertEqual(set(state), {"role", "intent", "done_when", "standing_authority", "tool", "arguments"})
+        self.assertIn("ls", state["arguments"])
+
+    def test_each_branch(self):
+        for name, (answers, judged) in POLICY_CASES.items():
+            with self.subTest(case=name):
+                out = sb.combine_policy(answers, configured="allow")
+                self.assertEqual(out["outcome"], judged)
+
+    def test_the_combiner_never_loosens_a_configured_outcome(self):
+        for configured in sb.POLICY_OUTCOMES:
+            for name, (answers, judged) in POLICY_CASES.items():
+                with self.subTest(configured=configured, case=name):
+                    out = sb.combine_policy(answers, configured=configured)
+                    order = sb.POLICY_OUTCOMES.index
+                    self.assertGreaterEqual(order(out["outcome"]), order(configured))
+                    self.assertEqual(out["outcome"], max(configured, judged, key=order))
+
+    def test_ask_can_become_deny_and_allow_can_become_ask_or_deny(self):
+        self.assertEqual(sb.combine_policy({"outside_intent": 0.9}, configured="ask")["outcome"], "hard-deny")
+        self.assertEqual(sb.combine_policy({"outside_scope": 0.9}, configured="allow")["outcome"], "ask")
+        self.assertEqual(sb.combine_policy({"outside_scope": 0.9}, configured="deny")["outcome"], "deny")
+        self.assertEqual(sb.combine_policy({"outside_scope": 0.9}, configured="ask")["outcome"], "ask")
+
+    def test_no_answer_or_a_bad_answer_counts_for_nothing(self):
+        for answers in (None, {}, {"outside_intent": None}, {"outside_intent": "high"}, {"outside_intent": 7},
+                        {"outside_intent": True}):
+            for configured in sb.POLICY_OUTCOMES:
+                with self.subTest(answers=answers, configured=configured):
+                    self.assertEqual(sb.combine_policy(answers, configured=configured)["outcome"], configured)
+
+    def test_thresholds_are_per_question(self):
+        answers = {"outside_intent": 0.6, "hard_to_reverse": 0.6}
+        out = sb.combine_policy(answers, {"outside_intent": 0.7, "hard_to_reverse": 0.55}, "allow")
+        self.assertEqual((out["outcome"], out["fired"]), ("ask", ["hard_to_reverse"]))
+
+    def test_the_result_says_which_questions_fired(self):
+        out = sb.combine_policy({"speaks_for_you": 0.9, "outside_scope": 0.9}, configured="allow")
+        self.assertEqual(out["fired"], ["speaks_for_you", "outside_scope"])
+        self.assertIn("speaks_for_you", out["reason"])
+
+    def test_an_unknown_configured_outcome_is_refused(self):
+        with self.assertRaises(ValueError):
+            sb.combine_policy({}, configured="maybe")
+
+    def test_judge_loosens_downgrades_only_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "judge-loosens"
+        os.environ.pop(sb.LAB_ENV, None)
+        self.assertEqual(sb.combine_policy({}, configured="ask")["outcome"], "ask", "off outside the Lab")
+        os.environ[sb.LAB_ENV] = "1"
+        self.assertEqual(sb.combine_policy({}, configured="ask")["outcome"], "allow")
+        self.assertEqual(sb.combine_policy({"outside_scope": 0.9}, configured="deny")["outcome"], "ask")
+
+    def test_judge_tool_call_asks_four_questions_and_combines(self):
+        jev = FakeJev(noul_answers(outside_intent=0.1, hard_to_reverse=0.9, speaks_for_you=0.1, outside_scope=0.1))
+        out = sb.judge_tool_call(jev, "allow", {"tool": "shell"})
+        self.assertEqual(out["outcome"], "ask")
+        self.assertEqual(out["answers"]["hard_to_reverse"], 0.9)
+        self.assertEqual(list(jev.calls[0]["questions"]), list(sb.POLICY_QUESTIONS))
+        self.assertEqual(out["usage"]["cost"], 3e-05)
+
+
+class TestP5SlowOrUnreachableJudge(Base):
+    """Catalog P5: the configured outcome stands, and nothing blocks on the judge.
+
+    The tool-call hook arrives with PR 9, so this runs the combiner's whole path
+    (`judge_tool_call`) against a fake that times out, as the scenario would:
+    the safeguard is "no answer keeps the configured outcome" and its control
+    is the Lab fault `judge-loosens`.
+    """
+
+    def judged(self, configured, reason):
+        return sb.judge_tool_call(FakeJev(reason), configured, {"tool": "shell"})
+
+    def test_every_failure_keeps_every_configured_outcome(self):
+        for reason in sb.JEV_REASONS:
+            for configured in sb.POLICY_OUTCOMES:
+                with self.subTest(reason=reason, configured=configured):
+                    out = self.judged(configured, reason)
+                    self.assertEqual(out["outcome"], configured)
+                    self.assertIn("configured outcome stands", out["reason"])
+                    self.assertEqual(out["fired"], [])
+                    self.assertEqual(out["latency_ms"], 12)
+
+    def test_the_slow_judge_is_cut_off_by_the_client_timeout_not_waited_for(self):
+        opener = FakeOpener(sb.socket.timeout("slow"))
+        os.environ["OPENROUTER_API_KEY"] = KEY_VALUE
+        client = sb.JevClient(dict(JEV_SETTINGS, timeout_seconds=0.5), opener=opener)
+        out = sb.judge_tool_call(client, "ask", {"tool": "shell"})
+        self.assertEqual((out["outcome"], opener.calls[0]["timeout"]), ("ask", 0.5))
+
+    def test_the_control_judge_loosens_downgrades_it(self):
+        os.environ[sb.LAB_ENV] = "1"
+        os.environ[sb.FAULT_ENV] = "judge-loosens"
+        loosened = self.judged("ask", "timeout")["outcome"]
+        self.assertEqual(loosened, "allow")
+        self.assertNotEqual(loosened, "ask", "the run's expectation fails under the control")
+        os.environ[sb.FAULT_ENV] = ""
+        self.assertEqual(self.judged("ask", "timeout")["outcome"], "ask")
+
+
+class TestShadowClassifier(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("cos",), config={"jev": {"replay": "/fake/replay.json"}})
+        self.world.add_agent("coder", fleet={"role": "coder", "issue": 615, "reports_to": "cos"})
+        self.world.sessions["cos"]
+        self.fix_role("cos", "chief-of-staff")
+        self.world.engine = self.world.new_engine()
+        self.jev = self.world.engine.jev = FakeJev(lambda s, q: confident("new", 0.9, tuple(q[sb.CLASSIFY_ID]["criteria"])))
+
+    def fix_role(self, name, role):
+        self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]["role"] = role
+
+    def say(self, text, lasts=30):
+        self.world.v2.start_turn(self.world.sessions["cos"], text, fleet=False, lasts=lasts)
+
+    def passes(self, count=1):
+        for _ in range(count):
+            self.world.engine.run_pass()
+            self.world.tick(5)
+
+    def classifications(self):
+        return [e for e in self.world.audit() if e["event"] == "classify"]
+
+    def test_a_new_prompt_while_busy_is_classified_once_and_audited(self):
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual(len(self.jev.calls), 1)
+        (entry,) = self.classifications()
+        detail = entry["detail"]
+        self.assertTrue(entry["subject"].startswith("classify:%s:" % self.world.sessions["cos"]))
+        self.assertEqual(detail["agent"], "cos")
+        self.assertEqual(detail["question"]["state"]["message"], "Also, the billing export?")
+        self.assertEqual(detail["question"]["options"], ["current", "615", "new"])
+        self.assertEqual((detail["answer"]["choice"], detail["answer"]["confident"]), ("new", True))
+        self.assertEqual((detail["latency_ms"], detail["usage"]["cost"], detail["model"]), (12, 3e-05, "fake"))
+        self.assertTrue(detail["shadow"])
+
+    def test_it_takes_no_action_at_all(self):
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual(self.world.v2.writes, [])
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(self.world.admissions("coder"), [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] not in ("classify",)], [])
+        self.assertEqual([c[1:3] for c in self.world.herdr.calls if c[1:3] not in HERDR_ALLOWED], [])
+
+    def test_each_new_message_is_classified_once_and_the_previous_one_is_sent_along(self):
+        self.say("first", lasts=5)
+        self.passes(1)
+        self.world.tick(10)
+        self.say("second", lasts=30)
+        self.passes(3)
+        self.assertEqual([c["state"]["message"] for c in self.jev.calls], ["first", "second"])
+        self.assertIsNone(self.jev.calls[0]["state"]["previous_message"])
+        self.assertEqual(self.jev.calls[1]["state"]["previous_message"], "first")
+        keys = [e["subject"] for e in self.classifications()]
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_a_restart_forgets_in_memory_but_only_reclassifies_a_message_still_in_the_window(self):
+        self.say("hello", lasts=300)
+        self.passes(1)
+        self.world.engine = self.world.new_engine()
+        self.world.engine.jev = self.jev
+        self.passes(1)
+        self.assertEqual(len(self.jev.calls), 2, "dedupe is in memory; a restart classifies the newest prompt again")
+        self.world.tick(11 * 60)
+        self.world.engine = self.world.new_engine()
+        self.world.engine.jev = self.jev
+        self.passes(1)
+        self.assertEqual(len(self.jev.calls), 2, "a prompt older than the engagement window is left alone")
+
+    def test_nothing_to_choose_between_means_no_call(self):
+        self.world.v2.sessions[self.world.sessions["coder"]]["metadata"]["fleet"].pop("issue")
+        self.say("a lone message", lasts=0)
+        self.passes(2)
+        self.assertEqual(self.jev.calls, [], "idle, and no other ask")
+
+    def test_other_asks_alone_are_enough_to_classify_an_idle_chief_of_staff(self):
+        self.say("a message", lasts=0)
+        self.passes(1)
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_only_a_chief_of_staff_is_classified(self):
+        self.fix_role("cos", "orchestrator")
+        self.say("a message")
+        self.passes(2)
+        self.assertEqual(self.jev.calls, [])
+
+    def test_the_fleets_own_messages_are_not_yours(self):
+        self.world.v2.start_turn(self.world.sessions["cos"], "fleet task", fleet=True, lasts=30)
+        self.passes(2)
+        self.assertEqual(self.jev.calls, [])
+
+    def test_unconfigured_or_switched_off_it_does_nothing(self):
+        self.say("a message")
+        self.world.engine.config = dict(self.world.engine.config, shadow_judges=False)
+        self.passes(2)
+        self.assertEqual(self.jev.calls, [])
+        self.world.engine.config = dict(self.world.engine.config, shadow_judges=True)
+        self.world.engine.jev = None
+        self.passes(1)
+        self.assertEqual(self.classifications(), [])
+        bare = World(self, agents=("cos",), state=self.home / "bare")
+        self.assertIsNone(bare.engine.jev)
+        self.assertNotIn("jev", bare.engine.config)
+
+    def test_the_no_classify_fault_skips_it_in_the_lab_only(self):
+        os.environ[sb.FAULT_ENV] = "no-classify"
+        self.say("a message")
+        self.passes(1)
+        self.assertEqual(self.jev.calls, [])
+        os.environ.pop(sb.LAB_ENV)
+        self.passes(1)
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_an_unreachable_jev_is_audited_as_current_and_never_retried_for_the_same_message(self):
+        self.jev.rule = "unreachable"
+        self.say("a message")
+        self.passes(3)
+        (entry,) = self.classifications()
+        self.assertEqual((entry["detail"]["answer"]["choice"], entry["detail"]["answer"]["reason"]),
+                         ("current", "jev unreachable"))
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_a_crash_in_the_classifier_is_audited_and_the_pass_goes_on(self):
+        def explode(state, questions):
+            raise RuntimeError("boom")
+        self.jev.rule = explode
+        self.world.fact("coder", "lab.fact:x", "something")
+        self.say("a message")
+        self.world.tick(100)
+        report = self.world.engine.run_pass()
+        errors = [e for e in self.world.audit() if e["event"] == "error"]
+        self.assertEqual(errors[0]["detail"]["step"], "classify")
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(len(report["sent"]), 1, "delivery still happened")
+
+    def test_the_key_never_reaches_the_audit(self):
+        os.environ["OPENROUTER_API_KEY"] = KEY_VALUE
+        opener = FakeOpener(http_error(401, ("echo " + KEY_VALUE).encode()))
+        self.world.engine.jev = sb.JevClient(dict(JEV_SETTINGS), opener=opener)
+        self.say("a message")
+        self.passes(1)
+        self.assertEqual(self.classifications()[0]["detail"]["answer"]["reason"], "jev unauthorized")
+        self.assertNotIn(KEY_VALUE, self.world.audit_path.read_text())
+
+    def test_the_audit_redacts_nothing_it_needs(self):
+        # `usage` uses names the audit's redaction does not treat as credentials.
+        entry = sb.redact({"usage": {"in": 1, "out": 2, "cost": 3e-05}})
+        self.assertEqual(entry, {"usage": {"in": 1, "out": 2, "cost": 3e-05}})
+
+
+class TestPR7Source(unittest.TestCase):
+    def test_the_engine_still_never_types(self):
+        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+
+    def test_the_decision_model_section_is_one_clearly_marked_block(self):
+        source = SWITCHBOARD.read_text()
+        self.assertEqual(source.count("\n# PR 7: the decision model"), 1)
+
+    def test_the_replay_answers_name_no_private_text(self):
+        text = JEV_REPLAY.read_text().lower()
+        for fragment in ("sk-", "bearer", "http"):
+            self.assertNotIn(fragment, text)
 
 
 # ---------------------------------------------------------------------- runner
