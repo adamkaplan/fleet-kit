@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""fleet-scenario — checks and lists the switchboard's scenario files.
+
+A scenario is one promised behaviour, written as JSON in scenarios/switchboard/:
+who is in the cast, what happens and when, what must and must not follow, and
+the control that switches the safeguard off so the scenario must fail. The
+format is in docs/switchboard.md, section "Scenario testing".
+
+    fleet-scenario validate [paths...]   every *.json in scenarios/switchboard/ by default
+    fleet-scenario list
+    fleet-scenario coverage [--enforce]  exit 1 when enforced and a problem has no scenario
+
+The test runners import this file for `validate`, `load`, `load_dir` and
+`coverage`. Python 3.9+, standard library only.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+import sys
+
+PROG = "fleet-scenario"
+BIN = Path(__file__).resolve().parent
+DEFAULT_DIR = BIN.parent / "scenarios" / "switchboard"
+
+
+def _load_switchboard():
+    """The fault list has one home, bin/fleet-switchboard; read it from there."""
+    path = BIN / "fleet-switchboard"
+    loader = importlib.machinery.SourceFileLoader("fleet_scenario_switchboard", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+KNOWN_FAULTS = tuple(_load_switchboard().KNOWN_FAULTS)
+
+PROBLEMS = (1, 2, 3, 4)
+TIERS = ("offline", "lab-scripted", "lab-model")
+ROLES = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+ACTORS = ("you", "world")
+ACTIONS = ("turn", "message", "draft", "away", "permission", "comment", "kill-daemon",
+           "restart-daemon", "close-pane", "edit-intent", "synthetic", "note", "wake", "wait")
+EXPECTATIONS = ("delivered", "no_machine_turn", "within", "draft_intact", "message_has_intent",
+                "classified", "handed_off", "toast", "tool_outcome", "judged", "admitted_once",
+                "model_saw", "status_is", "metadata_roundtrip")
+
+REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
+OPTIONAL = ("tags", "issues")
+CAST_KEYS = ("role", "reports_to", "issue", "charter")
+ISSUE_KEYS = ("intent", "done_when", "parent")
+CONTROL_KINDS = ("fault", "baseline", "variant")
+
+ID_RE = re.compile(r"^[A-Z]{1,2}[0-9]+$")
+ISSUE_RE = re.compile(r"^[1-9][0-9]*$")
+DURATION_RE = re.compile(r"^([0-9]+)(s|m|h)$")
+UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
+
+
+class ScenarioError(Exception):
+    """A scenario file that cannot be read or does not validate."""
+
+
+def _int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def duration_seconds(text):
+    """'0s', '10s', '2m', '2h' -> seconds. None if it is not a duration."""
+    match = DURATION_RE.match(text) if isinstance(text, str) else None
+    return int(match.group(1)) * UNIT_SECONDS[match.group(2)] if match else None
+
+
+def _validate_cast(cast, errors):
+    if not isinstance(cast, dict):
+        errors.append("cast: must be an object of name -> member")
+        return {}
+    for name, member in cast.items():
+        where = "cast.%s" % name
+        if name in ACTORS:
+            errors.append("%s: %r is reserved for steps' actors" % (where, name))
+        if not isinstance(member, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(member) - set(CAST_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        if member.get("role") not in ROLES:
+            errors.append("%s.role: must be one of %s, got %r" % (where, ", ".join(ROLES), member.get("role")))
+        if "reports_to" in member:
+            boss = member["reports_to"]
+            if boss not in cast or boss == name:
+                errors.append("%s.reports_to: must name another cast member, got %r" % (where, boss))
+        for key in ("issue", "charter"):
+            if key in member and not (_int(member[key]) and member[key] >= 1):
+                errors.append("%s.%s: must be an issue number (integer >= 1), got %r" % (where, key, member[key]))
+    return cast
+
+
+def _validate_issues(issues, errors):
+    if not isinstance(issues, dict):
+        errors.append("issues: must be an object of issue number -> issue")
+        return
+    for number, issue in issues.items():
+        where = "issues.%s" % number
+        if not ISSUE_RE.match(number):
+            errors.append("%s: key must be an issue number string such as \"12\"" % where)
+        if not isinstance(issue, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(issue) - set(ISSUE_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        # null means the issue has no such section, which is itself a case to test.
+        if "intent" not in issue:
+            errors.append("%s.intent: required (a string, or null for an issue with no Intent section)" % where)
+        for key in ("intent", "done_when"):
+            if key in issue and not (issue[key] is None or isinstance(issue[key], str)):
+                errors.append("%s.%s: must be a string or null" % (where, key))
+        if "parent" in issue and not (_int(issue["parent"]) and issue["parent"] >= 1):
+            errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
+
+
+def _validate_steps(steps, cast, errors):
+    if not isinstance(steps, list):
+        errors.append("steps: must be a list")
+        return
+    previous = 0
+    for index, step in enumerate(steps):
+        where = "steps[%d]" % index
+        if not isinstance(step, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        at = duration_seconds(step.get("at"))
+        if at is None:
+            errors.append("%s.at: must be a duration such as \"0s\", \"10s\", \"2m\" or \"2h\", got %r"
+                          % (where, step.get("at")))
+        elif at < previous:
+            errors.append("%s.at: %s is earlier than the step before it; times must not decrease"
+                          % (where, step["at"]))
+        else:
+            previous = at
+        actor = step.get("actor")
+        if not (actor in ACTORS or (isinstance(actor, str) and actor in cast)):
+            errors.append("%s.actor: must be \"you\", \"world\" or a cast name, got %r" % (where, actor))
+        if step.get("do") not in ACTIONS:
+            errors.append("%s.do: must be one of %s, got %r" % (where, ", ".join(ACTIONS), step.get("do")))
+
+
+def _validate_expect(expect, errors):
+    labels = set()
+    if not isinstance(expect, list) or not expect:
+        errors.append("expect: must be a non-empty list")
+        return labels
+    names = set()
+    for index, item in enumerate(expect):
+        where = "expect[%d]" % index
+        if not isinstance(item, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        if item.get("that") not in EXPECTATIONS:
+            errors.append("%s.that: must be one of %s, got %r"
+                          % (where, ", ".join(EXPECTATIONS), item.get("that")))
+        else:
+            labels.add(item["that"])
+        if "name" in item:
+            name = item["name"]
+            if not isinstance(name, str) or not name:
+                errors.append("%s.name: must be a non-empty string" % where)
+            elif name in names:
+                errors.append("%s.name: %r is used twice; names must be unique" % (where, name))
+            else:
+                names.add(name)
+                labels.add(name)
+    return labels
+
+
+def _validate_control(control, labels, errors):
+    if not isinstance(control, dict):
+        errors.append("control: must be an object")
+        return
+    kinds = [kind for kind in CONTROL_KINDS if kind in control]
+    if len(kinds) != 1:
+        errors.append("control: must have exactly one of %s, found %s"
+                      % (", ".join(CONTROL_KINDS), ", ".join(kinds) or "none"))
+    for key in sorted(set(control) - set(CONTROL_KINDS) - {"fails"}):
+        errors.append("control: unknown key %r" % key)
+    if "fault" in control and control["fault"] not in KNOWN_FAULTS:
+        errors.append("control.fault: unknown fault %r (known: %s)" % (control["fault"], ", ".join(KNOWN_FAULTS)))
+    if "baseline" in control and not (isinstance(control["baseline"], str) and control["baseline"].strip()):
+        errors.append("control.baseline: must be a non-empty string naming the system run instead")
+    if "variant" in control and not isinstance(control["variant"], dict):
+        errors.append("control.variant: must be an object")
+    fails = control.get("fails")
+    if not isinstance(fails, list) or not fails:
+        errors.append("control.fails: must be a non-empty list of the expectations the control breaks")
+        return
+    for entry in fails:
+        if entry not in labels:
+            errors.append("control.fails: %r matches no expectation's name or 'that'" % (entry,))
+
+
+def validate(obj):
+    """Every reason `obj` is not a valid scenario. An empty list means it is."""
+    if not isinstance(obj, dict):
+        return ["scenario: must be a JSON object"]
+    errors = []
+    for key in sorted(set(obj) - set(REQUIRED) - set(OPTIONAL)):
+        errors.append("unknown top-level key %r" % key)
+    for key in REQUIRED:
+        if key not in obj:
+            errors.append("%s: required" % key)
+
+    if "id" in obj and not (isinstance(obj["id"], str) and ID_RE.match(obj["id"])):
+        errors.append("id: must match %s, such as \"N1\", got %r" % (ID_RE.pattern, obj["id"]))
+    if "title" in obj and not (isinstance(obj["title"], str) and obj["title"].strip()):
+        errors.append("title: must be a non-empty string")
+    if "problem" in obj and not (obj["problem"] is None or (_int(obj["problem"]) and obj["problem"] in PROBLEMS)):
+        errors.append("problem: must be 1, 2, 3, 4 or null, got %r" % (obj["problem"],))
+    if "since_pr" in obj and not (_int(obj["since_pr"]) and obj["since_pr"] >= 1):
+        errors.append("since_pr: must be an integer >= 1, got %r" % (obj["since_pr"],))
+    if "tiers" in obj:
+        tiers = obj["tiers"]
+        if (not isinstance(tiers, list) or not tiers or any(t not in TIERS for t in tiers)
+                or len(set(tiers)) != len(tiers)):
+            errors.append("tiers: must be a non-empty list of distinct values from %s, got %r"
+                          % (", ".join(TIERS), tiers))
+    if "tags" in obj and not (isinstance(obj["tags"], list) and all(isinstance(t, str) and t for t in obj["tags"])):
+        errors.append("tags: must be a list of non-empty strings")
+
+    cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
+    if "issues" in obj:
+        _validate_issues(obj["issues"], errors)
+    if "steps" in obj:
+        _validate_steps(obj["steps"], cast, errors)
+    labels = _validate_expect(obj["expect"], errors) if "expect" in obj else set()
+    if "control" in obj:
+        _validate_control(obj["control"], labels, errors)
+    return errors
+
+
+def read(path):
+    """Parse one file. Returns (obj, errors); obj is None when it is not JSON."""
+    try:
+        return json.loads(Path(path).read_text()), []
+    except FileNotFoundError:
+        return None, ["no such file"]
+    except ValueError as err:
+        return None, ["not valid JSON: %s" % err]
+    except OSError as err:
+        return None, ["cannot read: %s" % (err.strerror or err)]
+
+
+def load(path):
+    """One valid scenario, or ScenarioError naming every problem with it."""
+    obj, errors = read(path)
+    if obj is not None:
+        errors = validate(obj)
+    if errors:
+        raise ScenarioError("%s: %s" % (path, "; ".join(errors)))
+    return obj
+
+
+def scenario_files(directory):
+    return sorted(Path(directory).glob("*.json"))
+
+
+def load_dir(directory=DEFAULT_DIR):
+    """Every scenario in `directory`, sorted by file name. Raises on the first bad one."""
+    scenarios = [load(path) for path in scenario_files(directory)]
+    seen = {}
+    for path, scenario in zip(scenario_files(directory), scenarios):
+        if scenario["id"] in seen:
+            raise ScenarioError("%s: id %s is also used by %s" % (path, scenario["id"], seen[scenario["id"]]))
+        seen[scenario["id"]] = path
+    return scenarios
+
+
+def coverage(scenarios):
+    """{problem: [scenario ids]} for each of problems 1-4, empty when uncovered."""
+    covered = {problem: [] for problem in PROBLEMS}
+    for scenario in scenarios:
+        if scenario.get("problem") in covered:
+            covered[scenario["problem"]].append(scenario["id"])
+    return {problem: sorted(ids) for problem, ids in covered.items()}
+
+
+# --------------------------------------------------------------------- the CLI
+
+def _expand(paths):
+    files, errors = [], []
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            files.extend(scenario_files(path))
+        elif path.exists():
+            files.append(path)
+        else:
+            errors.append("%s: no such file or directory" % raw)
+    return files, errors
+
+
+def cmd_validate(args):
+    files, failures = _expand(args.paths or [str(DEFAULT_DIR)])
+    ids = {}
+    for path in files:
+        obj, errors = read(path)
+        if obj is not None:
+            errors = validate(obj)
+            if not errors:
+                if obj["id"] in ids:
+                    errors = ["id %s is also used by %s" % (obj["id"], ids[obj["id"]])]
+                ids.setdefault(obj["id"], path)
+        failures.extend("%s: %s" % (path, error) for error in errors)
+    for line in failures:
+        sys.stderr.write("%s: %s\n" % (PROG, line))
+    print("%d scenario file(s) checked, %d error(s)" % (len(files), len(failures)))
+    return 1 if failures else 0
+
+
+def _load_for_report(directory):
+    try:
+        return load_dir(directory), None
+    except ScenarioError as err:
+        return None, str(err)
+
+
+def cmd_list(args):
+    scenarios, error = _load_for_report(args.dir)
+    if error:
+        sys.stderr.write("%s: %s\n" % (PROG, error))
+        return 1
+    row = "%-5s %-7s %-6s %-28s %s"
+    print(row % ("ID", "PROBLEM", "SINCE", "TIERS", "TITLE"))
+    for s in sorted(scenarios, key=lambda s: s["id"]):
+        print(row % (s["id"], "-" if s["problem"] is None else s["problem"], "PR %d" % s["since_pr"],
+                     ",".join(s["tiers"]), s["title"]))
+    return 0
+
+
+def cmd_coverage(args):
+    scenarios, error = _load_for_report(args.dir)
+    if error:
+        sys.stderr.write("%s: %s\n" % (PROG, error))
+        return 1
+    covered = coverage(scenarios)
+    for problem, ids in covered.items():
+        print("problem %d: %s" % (problem, ", ".join(ids) or "(no scenario)"))
+    missing = [problem for problem, ids in covered.items() if not ids]
+    if args.enforce and missing:
+        sys.stderr.write("%s: no scenario covers problem(s) %s\n" % (PROG, ", ".join(map(str, missing))))
+        return 1
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Check and list switchboard scenarios (docs/switchboard.md#scenario-testing).")
+    sub = parser.add_subparsers(dest="action", required=True)
+    check = sub.add_parser("validate", help="Validate scenario files (default: every *.json in %s)"
+                           % DEFAULT_DIR.relative_to(BIN.parent))
+    check.add_argument("paths", nargs="*", help="Files or directories")
+    for name, text in (("list", "One line per scenario"),
+                       ("coverage", "Which scenarios cover each of problems 1-4")):
+        command = sub.add_parser(name, help=text)
+        command.add_argument("--dir", type=Path, default=DEFAULT_DIR, help="Scenario directory")
+        if name == "coverage":
+            command.add_argument("--enforce", action="store_true",
+                                 help="Exit 1 when any of problems 1-4 has no scenario")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return {"validate": cmd_validate, "list": cmd_list, "coverage": cmd_coverage}[args.action](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+"""test-switchboard — offline tests for fleet-switchboard and fleet-scenario.
+
+Runs with no herdr, no OpenCode, no GitHub and no network. Every test gets a
+fresh temp HOME with its own XDG config and state directories, and the only
+transports are fakes. Run it before you install anything and after you change
+anything.
+
+    bin/test-switchboard            # everything
+    bin/test-switchboard V2Client   # only tests whose name contains "V2Client"
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`, and the exit code
+is non-zero on failure.
+"""
+import ast
+import contextlib
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import inspect
+import io
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import unittest
+from unittest import mock
+
+BIN = Path(__file__).resolve().parent
+REPO = BIN.parent
+SWITCHBOARD = BIN / "fleet-switchboard"
+SCENARIO = BIN / "fleet-scenario"
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sb = _load("t_fleet_switchboard", SWITCHBOARD)
+sc = _load("t_fleet_scenario", SCENARIO)
+
+
+def class_source(name, method=None):
+    """The source of a class in bin/fleet-switchboard, or of one of its methods."""
+    source = SWITCHBOARD.read_text()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            if method is None:
+                return ast.get_source_segment(source, node)
+            for inner in node.body:
+                if isinstance(inner, ast.FunctionDef) and inner.name == method:
+                    return ast.get_source_segment(source, inner)
+    raise LookupError("%s.%s not found" % (name, method))
+
+
+@contextlib.contextmanager
+def captured():
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        yield out, err
+
+
+# --------------------------------------------------------------------- fakes
+
+class FakeRunner:
+    """Stands in for subprocess.run. Records every call; answers from a script.
+
+    Every call gets `default`, or `route(argv)` when a route is given. An
+    answer is (returncode, stdout, stderr), or an exception instance to raise.
+    """
+
+    def __init__(self, default=(0, '{"data": {}}', ""), route=None):
+        self.calls = []
+        self.default = default
+        self.route = route
+
+    @property
+    def argv(self):
+        return self.calls[-1][0]
+
+    @property
+    def kwargs(self):
+        return self.calls[-1][1]
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        answer = self.route(argv) if self.route else self.default
+        if isinstance(answer, BaseException):
+            raise answer
+        code, stdout, stderr = answer
+        return subprocess.CompletedProcess(argv, code, stdout, stderr)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name).resolve()
+        patcher = mock.patch.dict(os.environ, {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / "xdg-config"),
+            "XDG_STATE_HOME": str(self.home / "xdg-state"),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in (sb.LAB_ENV, sb.FAULT_ENV):
+            os.environ.pop(name, None)
+        self.config_file = self.home / "xdg-config" / "fleet-switchboard" / "config.json"
+        self.state_dir = self.home / "xdg-state" / "fleet-switchboard"
+
+    def write_config(self, obj):
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config_file.write_text(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def fake_bin(self, name, body):
+        path = self.home / name
+        path.write_text("#!/bin/sh\n" + body)
+        os.chmod(str(path), 0o755)
+        return path
+
+    def run_cli(self, path, *argv):
+        return subprocess.run([sys.executable, "-B", str(path), *argv],
+                              capture_output=True, text=True, env=dict(os.environ))
+
+
+# ------------------------------------------------------------------ the config
+
+class TestConfig(Base):
+    def test_missing_file_means_every_default(self):
+        self.assertFalse(self.config_file.exists())
+        self.assertEqual(sb.load_config(), {
+            "opencode": None, "opencode_env": {}, "herdr": "herdr",
+            "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20})
+
+    def test_path_follows_xdg_config_home(self):
+        self.assertEqual(sb.config_path(), self.config_file)
+
+    def test_default_path_is_under_home_when_xdg_is_unset_or_relative(self):
+        for value in (None, "relative/dir"):
+            with self.subTest(value=value):
+                if value is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = value
+                self.assertEqual(sb.config_path(), self.home / ".config/fleet-switchboard/config.json")
+
+    def test_overrides_replace_only_what_they_name(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode", "opencode_env": {"XDG_DATA_HOME": "/tmp/lab"},
+                           "batch_seconds": 5, "call_timeout_seconds": 2.5})
+        config = sb.load_config()
+        self.assertEqual(config["opencode"], "/opt/lab/bin/opencode")
+        self.assertEqual(config["opencode_env"], {"XDG_DATA_HOME": "/tmp/lab"})
+        self.assertEqual(config["batch_seconds"], 5)
+        self.assertEqual(config["call_timeout_seconds"], 2.5)
+        self.assertEqual(config["herdr"], "herdr")
+        self.assertEqual(config["engaged_minutes"], 10)
+
+    def test_defaults_are_not_shared_between_loads(self):
+        sb.load_config()["opencode_env"]["LEAK"] = "1"
+        self.assertEqual(sb.load_config()["opencode_env"], {})
+        self.assertEqual(sb.DEFAULTS["opencode_env"], {})
+
+    def test_bad_values_are_refused_with_the_key_named(self):
+        cases = [
+            ({"opencode": 7}, "'opencode'"),
+            ({"opencode": ""}, "'opencode'"),
+            ({"opencode": "opencode"}, "'opencode'"),
+            ({"opencode": "bin/opencode"}, "'opencode'"),
+            ({"herdr": None}, "'herdr'"),
+            ({"herdr": ["herdr"]}, "'herdr'"),
+            ({"opencode_env": ["A=1"]}, "'opencode_env'"),
+            ({"opencode_env": {"A": 1}}, "'opencode_env'"),
+            ({"opencode_env": {"BAD NAME": "x"}}, "'opencode_env'"),
+            ({"batch_seconds": "90"}, "'batch_seconds'"),
+            ({"batch_seconds": True}, "'batch_seconds'"),
+            ({"batch_seconds": 0}, "'batch_seconds'"),
+            ({"engaged_minutes": -1}, "'engaged_minutes'"),
+            ({"engaged_minutes": None}, "'engaged_minutes'"),
+            ({"call_timeout_seconds": "20"}, "'call_timeout_seconds'"),
+            ({"surprise": 1}, "surprise"),
+        ]
+        for raw, needle in cases:
+            with self.subTest(raw=raw):
+                self.write_config(raw)
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.load_config()
+                self.assertIn(needle, str(caught.exception))
+
+    def test_malformed_files_are_refused(self):
+        for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
+            with self.subTest(text=text):
+                self.write_config(text)
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.load_config()
+                self.assertIn(needle, str(caught.exception))
+
+
+# ------------------------------------------------------------------- the state
+
+class TestStateDir(Base):
+    def test_created_private_under_xdg_state_home_whatever_the_umask(self):
+        # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
+        # yields exactly 0700; 0 would let a looser mode through if one were asked for.
+        for umask in (0, 0o022, 0o277):
+            with self.subTest(umask=oct(umask)):
+                if self.state_dir.exists():
+                    self.state_dir.rmdir()
+                self.state_dir.parent.mkdir(parents=True, exist_ok=True)
+                old = os.umask(umask)
+                try:
+                    path = sb.ensure_state_dir()
+                finally:
+                    os.umask(old)
+                self.assertEqual(path, self.state_dir)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_missing_parents_are_created_too(self):
+        self.assertFalse(self.state_dir.parent.exists())
+        self.assertEqual(stat.S_IMODE(sb.ensure_state_dir().stat().st_mode), 0o700)
+
+    def test_default_is_under_home_when_xdg_is_unset(self):
+        os.environ.pop("XDG_STATE_HOME", None)
+        self.assertEqual(sb.state_dir_path(), self.home / ".local/state/fleet-switchboard")
+
+    def test_existing_private_dir_is_accepted(self):
+        self.state_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        self.assertEqual(sb.ensure_state_dir(), self.state_dir)
+
+    def test_group_or_world_readable_dir_is_refused_not_repaired(self):
+        for mode in (0o750, 0o705, 0o755, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(str(self.state_dir), mode)
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.ensure_state_dir()
+                self.assertIn("private", str(caught.exception))
+                self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), mode)
+
+    def test_a_file_in_its_place_is_refused(self):
+        self.state_dir.parent.mkdir(parents=True)
+        self.state_dir.write_text("")
+        os.chmod(str(self.state_dir), 0o600)
+        with self.assertRaises(sb.ConfigError):
+            sb.ensure_state_dir()
+
+
+# ------------------------------------------------------------- OpenCode v2
+
+SES = "ses_0123456789abcdef"
+MSG = "msg_0123456789abcdef0123456789"
+
+
+class TestV2Client(Base):
+    def client(self, **runner_args):
+        runner = FakeRunner(**runner_args)
+        return sb.V2Client("/opt/lab/bin/opencode", {"XDG_DATA_HOME": "/tmp/lab-data"}, runner, 7), runner
+
+    def test_argv_for_every_method(self):
+        meta = {"fleet": {"name": "coder", "role": "coder"}}
+        cases = [
+            (lambda c: c.server_info(), ["server.info"]),
+            (lambda c: c.session_create("build", "Coder", "/srv/repo", meta),
+             ["session.create", "-d", json.dumps(
+                 {"agent": "build", "location": {"directory": "/srv/repo"}, "metadata": meta, "title": "Coder"},
+                 separators=(",", ":"), sort_keys=True)]),
+            (lambda c: c.session_create("build", "Coder", "/srv/repo", meta, permissions=[{"action": "deny"}]),
+             ["session.create", "-d", json.dumps(
+                 {"agent": "build", "location": {"directory": "/srv/repo"}, "metadata": meta,
+                  "permissions": [{"action": "deny"}], "title": "Coder"},
+                 separators=(",", ":"), sort_keys=True)]),
+            (lambda c: c.session_get(SES), ["session.get", "--param", "sessionID=" + SES]),
+            (lambda c: c.session_active(), ["session.active"]),
+            (lambda c: c.message_list(SES), ["session.message.list", "--param", "sessionID=" + SES]),
+            (lambda c: c.message_list(SES, limit=20, order="desc", type="synthetic", cursor="cur_1"),
+             ["session.message.list", "--param", "sessionID=" + SES, "--param", "limit=20",
+              "--param", "order=desc", "--param", "type=synthetic", "--param", "cursor=cur_1"]),
+            (lambda c: c.synthetic(SES, "[switchboard] hi", {"fleet": {"keys": ["a"]}}, False, "queue", MSG),
+             ["session.synthetic", "--param", "sessionID=" + SES, "-d", json.dumps(
+                 {"delivery": "queue", "id": MSG, "metadata": {"fleet": {"keys": ["a"]}},
+                  "resume": False, "text": "[switchboard] hi"}, separators=(",", ":"), sort_keys=True)]),
+            (lambda c: c.prompt(SES, "brief"),
+             ["session.prompt", "--param", "sessionID=" + SES, "-d", '{"text":"brief"}']),
+            (lambda c: c.prompt(SES, "brief", metadata={"fleet": {}}, delivery="queue", resume=True),
+             ["session.prompt", "--param", "sessionID=" + SES, "-d",
+              '{"delivery":"queue","metadata":{"fleet":{}},"resume":true,"text":"brief"}']),
+            (lambda c: c.inbox_list(SES), ["session.inbox.list", "--param", "sessionID=" + SES]),
+            (lambda c: c.inbox_update(SES, MSG, "steer"),
+             ["session.inbox.update", "--param", "sessionID=" + SES, "--param", "inboxID=" + MSG,
+              "-d", '{"delivery":"steer"}']),
+        ]
+        for call, tail in cases:
+            client, runner = self.client()
+            call(client)
+            with self.subTest(op=tail[0]):
+                self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api"] + tail)
+                self.assertEqual(runner.kwargs["timeout"], 7)
+                self.assertTrue(runner.kwargs["capture_output"])
+                self.assertEqual(runner.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_every_call_goes_through_one_method(self):
+        source = class_source("V2Client")
+        self.assertEqual(source.count("self.runner("), 1)
+        self.assertEqual(source.count('"api"'), 1)
+        self.assertIn("self.runner(", class_source("V2Client", "_call"))
+
+    def test_env_is_the_process_env_with_the_config_env_on_top(self):
+        os.environ["XDG_DATA_HOME"] = "/live/data"
+        os.environ["SOMETHING_ELSE"] = "kept"
+        client, runner = self.client()
+        client.server_info()
+        env = runner.kwargs["env"]
+        self.assertEqual(env["XDG_DATA_HOME"], "/tmp/lab-data")
+        self.assertEqual(env["SOMETHING_ELSE"], "kept")
+        self.assertEqual(os.environ["XDG_DATA_HOME"], "/live/data")
+
+    def test_data_envelope_is_unwrapped(self):
+        client, _ = self.client(default=(0, '{"data": {"ses_1": {"type": "running"}}}', ""))
+        self.assertEqual(client.session_active(), {"ses_1": {"type": "running"}})
+        client, _ = self.client(default=(0, '{"data": {}}', ""))
+        self.assertEqual(client.session_active(), {})
+        client, _ = self.client(default=(0, '[{"id": "msg_1"}]', ""))
+        self.assertEqual(client.message_list(SES), [{"id": "msg_1"}])
+        client, _ = self.client(default=(0, "  \n", ""))
+        self.assertIsNone(client.server_info())
+
+    def test_http_error_carries_its_status_and_body(self):
+        client, _ = self.client(default=(1, '{"name":"NotFound","message":"no such session"}',
+                                         "HTTP 404 Not Found\n"))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_get(SES)
+        err = caught.exception
+        self.assertEqual((err.reason, err.status), ("http", 404))
+        self.assertIn("no such session", err.detail)
+        self.assertIn("404", str(err))
+
+    def test_nonzero_exit_without_http_status(self):
+        client, _ = self.client(default=(1, "", "error: cannot find the service\nmore\n"))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.server_info()
+        self.assertEqual((caught.exception.reason, caught.exception.status), ("exit", None))
+        self.assertNotIn("\n", caught.exception.detail)
+        client, _ = self.client(default=(3, "", ""))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.server_info()
+        self.assertIn("exit 3", str(caught.exception))
+
+    def test_timeout_and_missing_binary(self):
+        client, _ = self.client(default=subprocess.TimeoutExpired(["x"], 7))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_active()
+        self.assertEqual(caught.exception.reason, "timeout")
+        client, _ = self.client(default=FileNotFoundError(2, "No such file or directory"))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_active()
+        self.assertEqual(caught.exception.reason, "unavailable")
+
+    def test_bad_json_on_success(self):
+        client, _ = self.client(default=(0, "Commands:\n  opencode api\n", ""))
+        with self.assertRaises(sb.V2Error) as caught:
+            client.server_info()
+        self.assertEqual(caught.exception.reason, "bad_json")
+
+    def test_errors_never_carry_the_environment(self):
+        client = sb.V2Client("/opt/lab/bin/opencode", {"OPENCODE_SERVER_PASSWORD": "hunter2-value"},
+                             FakeRunner(default=(1, "", "HTTP 401 Unauthorized")), 7)
+        with self.assertRaises(sb.V2Error) as caught:
+            client.server_info()
+        self.assertNotIn("hunter2-value", str(caught.exception))
+
+    def test_arguments_are_checked_before_anything_runs(self):
+        client, runner = self.client()
+        bad = [
+            lambda: client.synthetic(SES, "t", {}, "false", "queue", MSG),
+            lambda: client.synthetic(SES, "t", {}, False, "interrupt", MSG),
+            lambda: client.synthetic(SES, "t", {}, False, "queue", "abc"),
+            lambda: client.message_list(SES, order="newest"),
+            lambda: client.session_create("build", "t", "relative/dir", {}),
+            lambda: client.inbox_update(SES, MSG, "now"),
+            lambda: client.prompt(SES, "t", delivery="later"),
+        ]
+        for call in bad:
+            with self.assertRaises(ValueError):
+                call()
+        self.assertEqual(runner.calls, [])
+
+
+# ------------------------------------------------------------------- herdr
+
+FORBIDDEN_HERDR = ("prompt", "send-keys", "send-text", "run", "focus")
+
+
+def herdr_typing_violations(source):
+    """Every way `source` could make herdr type into a pane or move focus.
+
+    Used on bin/fleet-switchboard, and on a planted violation to show it bites.
+    """
+    found = []
+    tree = ast.parse(source)
+    tokens = [node.value for node in ast.walk(tree)
+              if isinstance(node, ast.Constant) and isinstance(node.value, str) and not re.search(r"\s", node.value)]
+    for token in tokens:
+        if token in ("send-keys", "send-text"):
+            found.append(token)
+        if "focus" in token.lower() and not token.startswith("--no-"):
+            found.append(token)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "HerdrClient":
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Constant) and inner.value in FORBIDDEN_HERDR:
+                    found.append("HerdrClient uses %r" % inner.value)
+    for pattern in (r"""["']agent["']\s*,\s*["'](prompt|send-keys)["']""",
+                    r"""["']pane["']\s*,\s*["'](send-text|send-keys|run)["']"""):
+        found.extend(m.group(0) for m in re.finditer(pattern, source))
+    return found
+
+
+class TestHerdrClient(Base):
+    def client(self, stdout='{"result": {"agents": [], "agent": {}}}'):
+        runner = FakeRunner(default=(0, stdout, ""))
+        return sb.HerdrClient("/opt/herdr", runner), runner
+
+    def test_argv_for_every_method(self):
+        cases = [
+            (lambda c: c.agent_list(), ["agent", "list"]),
+            (lambda c: c.agent_get("w1:p2"), ["agent", "get", "w1:p2"]),
+            (lambda c: c.pane_report_metadata_token("w1:p2", "unread", 3),
+             ["pane", "report-metadata", "--pane", "w1:p2", "--source", "fleet-switchboard",
+              "--token", "unread=3"]),
+            (lambda c: c.pane_report_metadata_token("w1:p2", "unread", 0, ttl_ms=60000),
+             ["pane", "report-metadata", "--pane", "w1:p2", "--source", "fleet-switchboard",
+              "--token", "unread=0", "--ttl-ms", "60000"]),
+            (lambda c: c.notification_show("Held", "coder is blocked"),
+             ["notification", "show", "--title", "Held", "--body", "coder is blocked"]),
+        ]
+        for call, tail in cases:
+            client, runner = self.client()
+            call(client)
+            with self.subTest(tail=tail):
+                self.assertEqual(runner.argv, ["/opt/herdr"] + tail)
+                self.assertEqual(runner.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_replies_are_unwrapped_and_checked(self):
+        client, _ = self.client('{"result": {"agents": [{"pane_id": "w1:p2"}]}}')
+        self.assertEqual(client.agent_list(), [{"pane_id": "w1:p2"}])
+        client, _ = self.client('{"result": {"agent": {"agent_status": "idle"}}}')
+        self.assertEqual(client.agent_get("w1:p2"), {"agent_status": "idle"})
+        client, _ = self.client('{"result": {}}')
+        with self.assertRaises(sb.HerdrError) as caught:
+            client.agent_list()
+        self.assertEqual(caught.exception.reason, "bad_shape")
+
+    def test_failures_map_to_one_error_type(self):
+        for answer, reason in (((1, "", "no server\n"), "exit"), ((0, "nope", ""), "bad_json"),
+                               (subprocess.TimeoutExpired(["herdr"], 15), "timeout"),
+                               (FileNotFoundError(2, "No such file"), "unavailable")):
+            with self.subTest(reason=reason):
+                client = sb.HerdrClient("/opt/herdr", FakeRunner(default=answer))
+                with self.assertRaises(sb.HerdrError) as caught:
+                    client.agent_list()
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_it_can_only_read_badge_and_toast(self):
+        public = sorted(name for name, _ in inspect.getmembers(sb.HerdrClient, inspect.isfunction)
+                        if not name.startswith("_"))
+        self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "pane_report_metadata_token"])
+
+    def test_no_call_it_makes_types_or_moves_focus(self):
+        client, runner = self.client()
+        client.agent_list()
+        client.agent_get("w1:p2")
+        client.pane_report_metadata_token("w1:p2", "unread", 1, ttl_ms=5)
+        client.notification_show("t", "b")
+        for argv, _ in runner.calls:
+            subcommands = argv[1:3]
+            for word in FORBIDDEN_HERDR:
+                self.assertNotIn(word, subcommands, argv)
+            self.assertFalse(any("focus" in part and not part.startswith("--no-") for part in argv), argv)
+
+    def test_source_never_names_a_typing_or_focus_command(self):
+        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+
+    def test_the_source_scan_catches_a_planted_violation(self):
+        # A gate never seen failing is decoration.
+        planted = SWITCHBOARD.read_text().replace(
+            "    def notification_show(self, title, body):",
+            "    def wake(self, pane, text):\n        return self._call(\"agent\", \"prompt\", pane, text)\n\n"
+            "    def notification_show(self, title, body):")
+        self.assertNotEqual(planted, SWITCHBOARD.read_text())
+        self.assertTrue(herdr_typing_violations(planted))
+        for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]'):
+            with self.subTest(snippet=snippet):
+                self.assertTrue(herdr_typing_violations(snippet))
+        self.assertEqual(herdr_typing_violations('x = ["tab", "create", "--no-focus"]'), [])
+
+
+# ----------------------------------------------------------------- the audit
+
+class TestAuditLog(Base):
+    def setUp(self):
+        super().setUp()
+        self.path = sb.ensure_state_dir() / "audit.jsonl"
+        self.audit = sb.AuditLog(self.path)
+
+    def entries(self):
+        return [json.loads(line) for line in self.path.read_text().splitlines()]
+
+    def test_append_writes_one_json_line_per_entry(self):
+        self.audit.append("daemon", "hold", "coder", {"why": "blocked"})
+        self.audit.append("daemon", "pass", None)
+        entries = self.entries()
+        self.assertEqual(len(entries), 2)
+        first = entries[0]
+        self.assertEqual({k: first[k] for k in ("actor", "event", "subject", "detail")},
+                         {"actor": "daemon", "event": "hold", "subject": "coder", "detail": {"why": "blocked"}})
+        self.assertRegex(first["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+
+    def test_append_never_rewrites_what_is_there(self):
+        self.path.write_text('{"earlier": true}\n')
+        os.chmod(str(self.path), 0o600)
+        self.audit.append("cli", "send", "platform")
+        lines = self.path.read_text().splitlines()
+        self.assertEqual(lines[0], '{"earlier": true}')
+        self.assertEqual(len(lines), 2)
+
+    def test_file_is_private(self):
+        old = os.umask(0)
+        try:
+            self.audit.append("cli", "send", "platform")
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+
+    def test_each_write_is_flushed_to_disk(self):
+        with mock.patch.object(sb.os, "fsync", wraps=os.fsync) as fsync:
+            self.audit.append("cli", "send", "platform")
+        self.assertEqual(fsync.call_count, 1)
+
+    def test_external_writes_intent_then_result(self):
+        with self.audit.external("daemon", "v2.synthetic", "platform", {"message_id": MSG}) as outcome:
+            self.assertEqual([e["phase"] for e in self.entries()], ["intent"])
+            outcome["receipt"] = "msg_x"
+        intent, result = self.entries()
+        self.assertEqual((intent["phase"], result["phase"]), ("intent", "result"))
+        self.assertEqual(intent["call"], result["call"])
+        self.assertEqual(intent["detail"], {"message_id": MSG})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["detail"], {"receipt": "msg_x"})
+        self.assertEqual((result["event"], result["subject"]), ("v2.synthetic", "platform"))
+
+    def test_external_records_the_error_and_reraises(self):
+        with self.assertRaises(sb.V2Error):
+            with self.audit.external("daemon", "v2.synthetic", "platform"):
+                raise sb.V2Error("http", 503, "service down")
+        intent, result = self.entries()
+        self.assertEqual(intent["phase"], "intent")
+        self.assertFalse(result["ok"])
+        self.assertIn("V2Error", result["error"])
+        self.assertIn("503", result["error"])
+
+    def test_credentials_are_redacted_at_any_depth(self):
+        self.audit.append("daemon", "config", "x", {
+            "token": "t-1", "api_key": "k-2", "Password": "p-3", "client_secret": "s-4",
+            "Authorization": "Bearer a-5", "OPENROUTER_API_KEY": "k-6",
+            "nested": [{"headers": {"authorization": "Bearer b-7"}}, {"accessToken": "t-8"}],
+            "keys": ["worker.idle:ses_1:1700000000"], "plain": "visible"})
+        text = self.path.read_text()
+        for secret in ("t-1", "k-2", "p-3", "s-4", "a-5", "k-6", "b-7", "t-8"):
+            self.assertNotIn(secret, text)
+        detail = self.entries()[0]["detail"]
+        self.assertEqual(detail["token"], sb.REDACTED)
+        self.assertEqual(detail["nested"][0]["headers"]["authorization"], sb.REDACTED)
+        self.assertEqual(detail["plain"], "visible")
+        # The fact keys a message covers are what the audit exists to show.
+        self.assertEqual(detail["keys"], ["worker.idle:ses_1:1700000000"])
+
+    def test_external_redacts_both_entries(self):
+        with self.audit.external("daemon", "x", "y", {"secret": "s-1"}) as outcome:
+            outcome["token"] = "t-2"
+        text = self.path.read_text()
+        self.assertNotIn("s-1", text)
+        self.assertNotIn("t-2", text)
+
+
+# ------------------------------------------------------------------ the faults
+
+DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue", "no-batch",
+              "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
+              "judge-loosens", "no-maxims")
+
+
+class TestFaults(Base):
+    def test_the_list_is_the_documented_one(self):
+        self.assertEqual(tuple(sb.KNOWN_FAULTS), DOC_FAULTS)
+        self.assertEqual(sc.KNOWN_FAULTS, DOC_FAULTS)
+
+    def test_off_outside_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "no-batch"
+        self.assertFalse(sb.fault("no-batch"))
+        for marker in ("0", "true", "yes", ""):
+            os.environ[sb.LAB_ENV] = marker
+            self.assertFalse(sb.fault("no-batch"), marker)
+
+    def test_on_in_the_lab_only_for_named_faults(self):
+        os.environ[sb.LAB_ENV] = "1"
+        self.assertFalse(sb.fault("no-batch"))
+        os.environ[sb.FAULT_ENV] = " no-batch , no-recheck,"
+        self.assertTrue(sb.fault("no-batch"))
+        self.assertTrue(sb.fault("no-recheck"))
+        self.assertFalse(sb.fault("no-dedupe"))
+
+    def test_an_unknown_name_raises_in_or_out_of_the_lab(self):
+        for lab in ("1", None):
+            with self.subTest(lab=lab):
+                if lab:
+                    os.environ[sb.LAB_ENV] = lab
+                else:
+                    os.environ.pop(sb.LAB_ENV, None)
+                os.environ[sb.FAULT_ENV] = "no-batch,no-bacth"
+                with self.assertRaises(sb.FaultError) as caught:
+                    sb.fault("no-batch")
+                self.assertIn("no-bacth", str(caught.exception))
+        os.environ.pop(sb.FAULT_ENV)
+        with self.assertRaises(sb.FaultError):
+            sb.fault("not-a-fault")
+
+
+# ------------------------------------------------------------- the message id
+
+class TestMessageId(unittest.TestCase):
+    def test_shape(self):
+        self.assertRegex(sb.derive_message_id("ses_1", ["a"]), r"^msg_[0-9a-f]{26}$")
+
+    def test_pinned_canonical_form(self):
+        # A change here changes every id, and v2 would admit retried messages twice.
+        canonical = json.dumps(["ses_1", ["a", "b"]], separators=(",", ":"))
+        expected = "msg_" + hashlib.sha256(canonical.encode()).hexdigest()[:26]
+        self.assertEqual(sb.derive_message_id("ses_1", ["b", "a"]), expected)
+
+    def test_stable_and_independent_of_order_and_duplicates(self):
+        first = sb.derive_message_id("ses_1", ["worker.idle:ses_2:10", "reminder:3"])
+        self.assertEqual(first, sb.derive_message_id("ses_1", ["reminder:3", "worker.idle:ses_2:10"]))
+        self.assertEqual(first, sb.derive_message_id("ses_1", ("reminder:3", "reminder:3", "worker.idle:ses_2:10")))
+        self.assertEqual(first, sb.derive_message_id("ses_1", iter(["worker.idle:ses_2:10", "reminder:3"])))
+
+    def test_recipient_and_keys_both_matter(self):
+        base = sb.derive_message_id("ses_1", ["a"])
+        self.assertNotEqual(base, sb.derive_message_id("ses_2", ["a"]))
+        self.assertNotEqual(base, sb.derive_message_id("ses_1", ["a", "b"]))
+        # No ambiguity from joining: one key with a comma is not two keys.
+        self.assertNotEqual(sb.derive_message_id("ses_1", ["a,b"]), sb.derive_message_id("ses_1", ["a", "b"]))
+
+    def test_nothing_to_derive_from_is_refused(self):
+        for recipient, keys in (("ses_1", []), ("", ["a"]), ("ses_1", [""]), ("ses_1", [1])):
+            with self.subTest(recipient=recipient, keys=keys):
+                with self.assertRaises(ValueError):
+                    sb.derive_message_id(recipient, keys)
+
+
+# ------------------------------------------------------------- the scenarios
+
+VALID = {
+    "id": "N1",
+    "title": "A worker finishes while you are talking to its orchestrator",
+    "problem": 3,
+    "since_pr": 4,
+    "tiers": ["offline", "lab-scripted"],
+    "tags": ["example"],
+    "cast": {
+        "cos": {"role": "chief-of-staff"},
+        "platform": {"role": "orchestrator", "reports_to": "cos", "charter": 1},
+        "coder": {"role": "coder", "reports_to": "platform", "issue": 2},
+        "helper": {"role": "cos-subagent", "reports_to": "cos", "issue": 3},
+    },
+    "issues": {
+        "1": {"intent": "Run the platform", "done_when": None},
+        "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1},
+        "3": {"intent": None},
+    },
+    "steps": [
+        {"at": "0s", "actor": "coder", "do": "turn", "lasts": "30s"},
+        {"at": "10s", "actor": "you", "do": "message", "to": "platform", "text": "status?"},
+        {"at": "10s", "actor": "world", "do": "comment", "issue": 2, "body": "looks good"},
+        {"at": "2m", "actor": "you", "do": "draft", "to": "platform", "text": "and next"},
+        {"at": "2h", "actor": "world", "do": "wait"},
+    ],
+    "expect": [
+        {"name": "one-note", "that": "delivered", "to": "platform", "key": "worker.idle:coder:*",
+         "mode": "note", "count": 1},
+        {"that": "no_machine_turn", "agent": "platform"},
+        {"that": "message_has_intent", "to": "platform", "issue": 2},
+    ],
+    "control": {"fault": "no-engagement-gate", "fails": ["no_machine_turn", "one-note"]},
+}
+
+
+def mutate(change):
+    obj = copy.deepcopy(VALID)
+    change(obj)
+    return obj
+
+
+def _set(path, value):
+    def change(obj):
+        target = obj
+        for part in path[:-1]:
+            target = target[part]
+        target[path[-1]] = value
+    return change
+
+
+def _drop(path):
+    def change(obj):
+        target = obj
+        for part in path[:-1]:
+            target = target[part]
+        del target[path[-1]]
+    return change
+
+
+REJECTED = [
+    # (what, change, a substring of the expected error)
+    ("unknown top-level key", _set(["notes"], "x"), "unknown top-level key 'notes'"),
+    ("id lower case", _set(["id"], "n1"), "id:"),
+    ("id three letters", _set(["id"], "ABC1"), "id:"),
+    ("id no number", _set(["id"], "N"), "id:"),
+    ("id not a string", _set(["id"], 1), "id:"),
+    ("title empty", _set(["title"], " "), "title:"),
+    ("title not a string", _set(["title"], 3), "title:"),
+    ("problem 5", _set(["problem"], 5), "problem:"),
+    ("problem 0", _set(["problem"], 0), "problem:"),
+    ("problem string", _set(["problem"], "3"), "problem:"),
+    ("problem bool", _set(["problem"], True), "problem:"),
+    ("since_pr 0", _set(["since_pr"], 0), "since_pr:"),
+    ("since_pr string", _set(["since_pr"], "4"), "since_pr:"),
+    ("since_pr float", _set(["since_pr"], 1.5), "since_pr:"),
+    ("tiers empty", _set(["tiers"], []), "tiers:"),
+    ("tiers unknown", _set(["tiers"], ["offline", "cloud"]), "tiers:"),
+    ("tiers string", _set(["tiers"], "offline"), "tiers:"),
+    ("tiers repeated", _set(["tiers"], ["offline", "offline"]), "tiers:"),
+    ("tags string", _set(["tags"], "spike"), "tags:"),
+    ("tags non-string", _set(["tags"], [1]), "tags:"),
+    ("cast not an object", _set(["cast"], ["coder"]), "cast:"),
+    ("cast member not an object", _set(["cast", "coder"], "coder"), "cast.coder:"),
+    ("cast role unknown", _set(["cast", "coder", "role"], "reviewer"), "cast.coder.role"),
+    ("cast role missing", _drop(["cast", "cos", "role"]), "cast.cos.role"),
+    ("cast reports_to unknown", _set(["cast", "coder", "reports_to"], "nobody"), "cast.coder.reports_to"),
+    ("cast reports_to self", _set(["cast", "coder", "reports_to"], "coder"), "cast.coder.reports_to"),
+    ("cast issue string", _set(["cast", "coder", "issue"], "2"), "cast.coder.issue"),
+    ("cast charter zero", _set(["cast", "platform", "charter"], 0), "cast.platform.charter"),
+    ("cast unknown key", _set(["cast", "coder", "model"], "x"), "unknown key 'model'"),
+    ("cast name reserved", _set(["cast", "you"], {"role": "coder"}), "reserved"),
+    ("issues not an object", _set(["issues"], []), "issues:"),
+    ("issue key not a number", _set(["issues", "#2"], {"intent": "x"}), "issues.#2"),
+    ("issue not an object", _set(["issues", "2"], "x"), "issues.2:"),
+    ("issue intent missing", _drop(["issues", "2", "intent"]), "issues.2.intent"),
+    ("issue intent not a string", _set(["issues", "2", "intent"], 5), "issues.2.intent"),
+    ("issue done_when not a string", _set(["issues", "2", "done_when"], ["x"]), "issues.2.done_when"),
+    ("issue parent string", _set(["issues", "2", "parent"], "1"), "issues.2.parent"),
+    ("issue unknown key", _set(["issues", "2", "owner"], "x"), "unknown key 'owner'"),
+    ("steps not a list", _set(["steps"], {}), "steps:"),
+    ("step not an object", _set(["steps", 0], "turn"), "steps[0]:"),
+    ("step at without unit", _set(["steps", 1, "at"], "10"), "steps[1].at"),
+    ("step at in days", _set(["steps", 1, "at"], "1d"), "steps[1].at"),
+    ("step at a number", _set(["steps", 1, "at"], 10), "steps[1].at"),
+    ("step at missing", _drop(["steps", 1, "at"]), "steps[1].at"),
+    ("step times decrease", _set(["steps", 4, "at"], "90s"), "times must not decrease"),
+    ("step actor unknown", _set(["steps", 0, "actor"], "nobody"), "steps[0].actor"),
+    ("step actor missing", _drop(["steps", 0, "actor"]), "steps[0].actor"),
+    ("step do unknown", _set(["steps", 0, "do"], "type"), "steps[0].do"),
+    ("step do missing", _drop(["steps", 0, "do"]), "steps[0].do"),
+    ("expect empty", _set(["expect"], []), "expect:"),
+    ("expect not a list", _set(["expect"], {"that": "delivered"}), "expect:"),
+    ("expectation not an object", _set(["expect", 1], "no_machine_turn"), "expect[1]:"),
+    ("expectation that unknown", _set(["expect", 1, "that"], "happy"), "expect[1].that"),
+    ("expectation that missing", _drop(["expect", 2, "that"]), "expect[2].that"),
+    ("expectation name repeated", _set(["expect", 2, "name"], "one-note"), "used twice"),
+    ("expectation name empty", _set(["expect", 2, "name"], ""), "expect[2].name"),
+    ("control not an object", _set(["control"], "no-batch"), "control:"),
+    ("control without a kind", _set(["control"], {"fails": ["no_machine_turn"]}), "exactly one"),
+    ("control with two kinds", _set(["control", "baseline"], "fleet-heartbeat"), "exactly one"),
+    ("control fault unknown", _set(["control", "fault"], "no-safety"), "unknown fault"),
+    ("control baseline empty", _set(["control"], {"baseline": "", "fails": ["one-note"]}), "control.baseline"),
+    ("control variant not an object", _set(["control"], {"variant": "x", "fails": ["one-note"]}), "control.variant"),
+    ("control fails missing", _drop(["control", "fails"]), "control.fails"),
+    ("control fails empty", _set(["control", "fails"], []), "control.fails"),
+    ("control fails not a list", _set(["control", "fails"], "one-note"), "control.fails"),
+    ("control fails unmatched", _set(["control", "fails"], ["one-note", "draft_intact"]), "'draft_intact' matches no"),
+    ("control unknown key", _set(["control", "why"], "x"), "unknown key 'why'"),
+]
+
+
+class TestScenarioValidator(unittest.TestCase):
+    def test_the_full_fixture_is_valid(self):
+        self.assertEqual(sc.validate(copy.deepcopy(VALID)), [])
+
+    def test_valid_alternatives(self):
+        alternatives = [
+            _set(["problem"], None),
+            _set(["control"], {"baseline": "fleet-heartbeat", "fails": ["no_machine_turn"]}),
+            _set(["control"], {"variant": {"engaged_minutes": 0}, "fails": ["delivered"]}),
+            _set(["steps"], []),
+            _drop(["issues"]),
+            _drop(["tags"]),
+            _set(["tiers"], ["lab-model"]),
+            _set(["tags"], ["spike"]),
+        ]
+        for change in alternatives:
+            obj = mutate(change)
+            with self.subTest(obj={k: obj.get(k) for k in ("problem", "control", "steps", "tiers")}):
+                self.assertEqual(sc.validate(obj), [])
+
+    def test_each_rule_rejects_its_fixture(self):
+        for what, change, needle in REJECTED:
+            with self.subTest(what=what):
+                errors = sc.validate(mutate(change))
+                self.assertTrue(errors, "accepted: %s" % what)
+                self.assertTrue(any(needle in e for e in errors), "%s: %s" % (what, errors))
+
+    def test_every_required_key_is_required(self):
+        for key in sc.REQUIRED:
+            with self.subTest(key=key):
+                self.assertIn("%s: required" % key, sc.validate(mutate(_drop([key]))))
+
+    def test_not_an_object(self):
+        self.assertEqual(sc.validate([VALID]), ["scenario: must be a JSON object"])
+
+    def test_every_documented_value_is_accepted(self):
+        for do in sc.ACTIONS:
+            self.assertEqual(sc.validate(mutate(_set(["steps", 0, "do"], do))), [], do)
+        for that in sc.EXPECTATIONS:
+            self.assertEqual(sc.validate(mutate(_set(["expect", 2, "that"], that))), [], that)
+        for name in DOC_FAULTS:
+            self.assertEqual(sc.validate(mutate(_set(["control", "fault"], name))), [], name)
+
+    def test_durations(self):
+        self.assertEqual([sc.duration_seconds(t) for t in ("0s", "10s", "2m", "2h", "150s")],
+                         [0, 10, 120, 7200, 150])
+        for bad in ("", "1.5s", "-1s", "1 s", "1d", None, 3):
+            self.assertIsNone(sc.duration_seconds(bad), bad)
+
+
+class TestScenarioFiles(Base):
+    def put(self, name, obj, directory=None):
+        directory = directory or self.home / "scenarios"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(obj if isinstance(obj, str) else json.dumps(obj))
+        return path
+
+    def test_load_and_load_dir(self):
+        self.put("n1.json", VALID)
+        self.put("w1.json", mutate(_set(["id"], "W1")))
+        self.put("README.md", "not a scenario")
+        self.assertEqual(sc.load(self.home / "scenarios" / "n1.json")["id"], "N1")
+        self.assertEqual([s["id"] for s in sc.load_dir(self.home / "scenarios")], ["N1", "W1"])
+        self.put("x1.json", mutate(_set(["id"], "x")))
+        with self.assertRaises(sc.ScenarioError) as caught:
+            sc.load_dir(self.home / "scenarios")
+        self.assertIn("x1.json", str(caught.exception))
+
+    def test_load_dir_refuses_a_repeated_id(self):
+        self.put("a.json", VALID)
+        self.put("b.json", VALID)
+        with self.assertRaises(sc.ScenarioError):
+            sc.load_dir(self.home / "scenarios")
+
+    def test_load_refuses_bad_json(self):
+        with self.assertRaises(sc.ScenarioError):
+            sc.load(self.put("bad.json", "{"))
+
+    def test_coverage_lists_every_problem(self):
+        scenarios = [mutate(_set(["id"], "A%d" % n)) for n in range(3)]
+        scenarios[1]["problem"] = 1
+        scenarios[2]["problem"] = None
+        self.assertEqual(sc.coverage(scenarios), {1: ["A1"], 2: [], 3: ["A0"], 4: []})
+
+    def test_validate_cli_exit_codes(self):
+        good = self.put("n1.json", VALID)
+        self.assertEqual(self.run_cli(SCENARIO, "validate", str(good)).returncode, 0)
+        self.assertEqual(self.run_cli(SCENARIO, "validate", str(good.parent)).returncode, 0)
+        bad = self.put("bad.json", mutate(_set(["since_pr"], 0)), self.home / "bad")
+        proc = self.run_cli(SCENARIO, "validate", str(bad))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("since_pr", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.run_cli(SCENARIO, "validate", str(self.put("j.json", "{", self.home / "j"))).returncode, 1)
+        self.assertEqual(self.run_cli(SCENARIO, "validate", str(self.home / "missing.json")).returncode, 1)
+        empty = self.home / "empty"
+        empty.mkdir()
+        self.assertEqual(self.run_cli(SCENARIO, "validate", str(empty)).returncode, 0)
+        self.assertEqual(self.run_cli(SCENARIO, "frobnicate").returncode, 2)
+
+    def test_validate_cli_refuses_a_repeated_id_across_files(self):
+        self.put("a.json", VALID, self.home / "dup")
+        self.put("b.json", VALID, self.home / "dup")
+        proc = self.run_cli(SCENARIO, "validate", str(self.home / "dup"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("also used by", proc.stderr)
+
+    def test_validate_cli_defaults_to_the_repo_scenarios(self):
+        proc = self.run_cli(SCENARIO, "validate")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sc.DEFAULT_DIR, REPO / "scenarios" / "switchboard")
+
+    def test_list_and_coverage_cli(self):
+        directory = self.home / "scenarios"
+        for n, problem in enumerate((1, 2, 3)):
+            self.put("a%d.json" % n, mutate(lambda o, n=n, p=problem: (o.update(id="A%d" % n, problem=p))))
+        listing = self.run_cli(SCENARIO, "list", "--dir", str(directory))
+        self.assertEqual(listing.returncode, 0)
+        self.assertIn("A2", listing.stdout)
+        self.assertEqual(self.run_cli(SCENARIO, "coverage", "--dir", str(directory)).returncode, 0)
+        enforced = self.run_cli(SCENARIO, "coverage", "--enforce", "--dir", str(directory))
+        self.assertEqual(enforced.returncode, 1)
+        self.assertIn("problem(s) 4", enforced.stderr)
+        self.put("a3.json", mutate(lambda o: o.update(id="A3", problem=4)))
+        self.assertEqual(self.run_cli(SCENARIO, "coverage", "--enforce", "--dir", str(directory)).returncode, 0)
+        self.put("bad.json", "{")
+        self.assertEqual(self.run_cli(SCENARIO, "list", "--dir", str(directory)).returncode, 1)
+
+
+# --------------------------------------------------------------------- the CLI
+
+def routed(v2=(0, '{"data": {"version": "2.0.22"}}', ""), herdr=(0, '{"result": {"agents": [{}, {}]}}', "")):
+    """A runner that answers the configured v2 binary and herdr differently."""
+    def route(argv):
+        return v2 if argv[1:2] == ["api"] else herdr
+    return FakeRunner(route=route)
+
+
+class TestStatus(Base):
+    def status(self, runner, *argv):
+        with captured() as (out, err):
+            code = sb.main(["status", *argv], runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_all_ok(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode", "herdr": "/opt/herdr"})
+        runner = routed()
+        code, out, err = self.status(runner)
+        self.assertEqual(code, 0, out)
+        self.assertIn("version 2.0.22", out)
+        self.assertIn("2 agent(s)", out)
+        self.assertEqual(err, "")
+        self.assertEqual([argv for argv, _ in runner.calls],
+                         [["/opt/lab/bin/opencode", "api", "server.info"], ["/opt/herdr", "agent", "list"]])
+        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
+
+    def test_unconfigured_v2_is_reported_and_never_run(self):
+        # A bare name would be resolved through PATH, which can find OpenCode v1.
+        runner = routed()
+        code, out, _ = self.status(runner)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^ERROR v2 +not configured: ")
+        self.assertEqual([argv[0] for argv, _ in runner.calls], ["herdr"])
+
+    def test_failures_are_one_line_each_and_exit_1(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode"})
+        runner = routed(v2=(1, '{"name":"ServiceUnavailable"}', "HTTP 503 Service Unavailable\n"),
+                        herdr=FileNotFoundError(2, "No such file or directory"))
+        code, out, err = self.status(runner)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^ERROR v2 +http 503: ")
+        self.assertRegex(out, r"(?m)^ERROR herdr +unavailable: ")
+        self.assertNotIn("Traceback", out + err)
+
+    def test_json_report(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode"})
+        runner = routed(v2=subprocess.TimeoutExpired(["opencode"], 20), herdr=(0, "garbage", ""))
+        code, out, _ = self.status(runner, "--json")
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertFalse(report["ok"])
+        self.assertIn("timeout", report["v2"]["error"])
+        self.assertIn("bad_json", report["herdr"]["error"])
+        self.assertTrue(report["config"]["ok"])
+        self.assertTrue(report["state_dir"]["ok"])
+
+    def test_an_unexpected_exception_is_still_one_line(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode"})
+        runner = routed(v2=RuntimeError("boom"))
+        code, out, err = self.status(runner)
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected RuntimeError: boom", out)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_bad_config_skips_the_probes_and_says_why(self):
+        self.write_config({"batch_seconds": "soon"})
+        runner = routed()
+        code, out, _ = self.status(runner)
+        self.assertEqual(code, 1)
+        self.assertIn("batch_seconds", out)
+        self.assertIn("not checked: config unusable", out)
+        self.assertEqual(runner.calls, [])
+
+    def test_open_state_dir_and_bad_fault_are_reported(self):
+        self.state_dir.mkdir(parents=True)
+        os.chmod(str(self.state_dir), 0o755)
+        os.environ[sb.FAULT_ENV] = "no-such-fault"
+        code, out, _ = self.status(routed())
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^ERROR state +state directory must be private")
+        self.assertRegex(out, r"(?m)^ERROR lab +.*no-such-fault")
+
+    def test_env_values_are_never_printed(self):
+        self.write_config({"opencode_env": {"OPENCODE_SERVER_PASSWORD": "pw-value-123"}})
+        for argv in ((), ("--json",)):
+            _, out, err = self.status(routed(), *argv)
+            self.assertNotIn("pw-value-123", out + err)
+            self.assertIn("OPENCODE_SERVER_PASSWORD", out)
+
+    def test_lab_faults_are_shown(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode"})
+        os.environ[sb.LAB_ENV] = "1"
+        os.environ[sb.FAULT_ENV] = "no-batch"
+        code, out, _ = self.status(routed())
+        self.assertEqual(code, 0)
+        self.assertIn("faults requested: no-batch", out)
+
+    def test_real_process_with_failing_fakes_prints_no_traceback(self):
+        opencode = self.fake_bin("opencode", "echo '{\"name\":\"Down\"}'\necho 'HTTP 502 Bad Gateway' >&2\nexit 1\n")
+        herdr = self.fake_bin("herdr", "echo 'not json'\n")
+        self.write_config({"opencode": str(opencode), "herdr": str(herdr), "call_timeout_seconds": 5})
+        proc = self.run_cli(SWITCHBOARD, "status")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^ERROR v2 +http 502")
+        self.assertRegex(proc.stdout, r"(?m)^ERROR herdr +bad_json")
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+        missing = self.home / "absent-binary"
+        self.write_config({"opencode": str(missing), "herdr": str(missing)})
+        proc = self.run_cli(SWITCHBOARD, "status", "--json")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(json.loads(proc.stdout)["v2"]["ok"], False)
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+
+    def test_real_process_with_working_fakes(self):
+        opencode = self.fake_bin("opencode", "echo '{\"data\":{\"version\":\"2.0.22\"}}'\n")
+        herdr = self.fake_bin("herdr", "echo '{\"result\":{\"agents\":[]}}'\n")
+        self.write_config({"opencode": str(opencode), "herdr": str(herdr)})
+        proc = self.run_cli(SWITCHBOARD, "status")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_version_and_usage_exit_codes(self):
+        proc = self.run_cli(SWITCHBOARD, "version")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), "fleet-switchboard %s" % sb.VERSION)
+        self.assertEqual(self.run_cli(SWITCHBOARD).returncode, 2)
+        self.assertEqual(self.run_cli(SWITCHBOARD, "deliver").returncode, 2)
+        self.assertEqual(self.run_cli(SWITCHBOARD, "status", "--bogus").returncode, 2)
+
+
+# ------------------------------------------------------- portability and hygiene
+
+def _stdlib_roots():
+    paths = {sysconfig.get_paths()[k] for k in ("stdlib", "platstdlib")}
+    return tuple(os.path.realpath(p) for p in paths)
+
+
+class TestHygiene(unittest.TestCase):
+    FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard")
+
+    def test_every_file_is_executable_with_the_portable_shebang(self):
+        for name in self.FILES:
+            path = BIN / name
+            with self.subTest(name=name):
+                self.assertTrue(os.access(str(path), os.X_OK), name)
+                self.assertEqual(path.read_text().splitlines()[0], "#!/usr/bin/env python3", name)
+
+    def test_standard_library_only(self):
+        roots = _stdlib_roots()
+        for name in self.FILES:
+            tree = ast.parse((BIN / name).read_text())
+            modules = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    modules.add(node.module.split(".")[0])
+            for module in sorted(modules):
+                with self.subTest(name=name, module=module):
+                    spec = importlib.util.find_spec(module)
+                    self.assertIsNotNone(spec, "%s imports %s, which is not installed" % (name, module))
+                    origin = spec.origin or ""
+                    if origin in ("built-in", "frozen") or module in sys.builtin_module_names:
+                        continue
+                    real = os.path.realpath(origin)
+                    self.assertTrue(real.startswith(roots) and "site-packages" not in real,
+                                    "%s imports %s from %s" % (name, module, origin))
+
+    def test_sys_is_imported_wherever_stderr_or_exit_is_used(self):
+        for name in self.FILES:
+            source = (BIN / name).read_text()
+            if "sys.stderr" in source or "sys.exit" in source:
+                self.assertIn("\nimport sys\n", source, name)
+
+    def test_no_personalisation(self):
+        # Assembled from fragments so this test file does not itself become the
+        # thing the check is looking for.
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan",
+                                       "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), re.IGNORECASE)
+        for name in self.FILES:
+            for number, line in enumerate((BIN / name).read_text().splitlines(), 1):
+                self.assertIsNone(pattern.search(line), "%s:%d %s" % (name, number, line))
+
+    def test_scenario_runs_are_not_committed(self):
+        ignored = (REPO / ".gitignore").read_text().splitlines()
+        self.assertIn("scenario-runs/", ignored)
+
+    def test_ci_runs_this_suite_and_the_validator(self):
+        workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+        self.assertIn("bin/test-switchboard 2>&1", workflow)
+        self.assertIn("run: bin/fleet-scenario validate", workflow)
+
+
+# ---------------------------------------------------------------------- runner
+
+def main(argv):
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    if argv:
+        keep = unittest.TestSuite()
+        for group in suite:
+            for case in group:
+                if any(token.lower() in case.id().lower() for token in argv):
+                    keep.addTest(case)
+        suite = keep
+
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+    result = runner.run(suite)
+
+    passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+    print()
+    print("=" * 70)
+    print("test-switchboard: %d run, %d passed, %d failed, %d errored, %d skipped"
+          % (result.testsRun, passed, len(result.failures), len(result.errors), len(result.skipped)))
+    print("=" * 70)
+    ok = result.wasSuccessful() and result.testsRun > 0
+    print("RESULT: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

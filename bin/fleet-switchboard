@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""fleet-switchboard — routes facts to fleet agents as OpenCode v2 messages.
+
+This is the offline core: configuration, the private state directory, the one
+client for OpenCode v2 (`opencode api`), the one client for herdr, the audit
+log, fault gating for the Lab, and the derived message id. Delivery comes in
+later changes; see docs/switchboard.md.
+
+Rules this file keeps from the start:
+
+  1. herdr is never a delivery channel. HerdrClient reads agents, sets a
+     sidebar token and shows a toast. It has no way to type into a pane or to
+     move focus, and a hygiene test scans this file to keep it that way.
+  2. Every v2 call goes through one method, V2Client._call, which builds the
+     argv and runs the configured binary with the configured environment. The
+     v2 binary is reached only through a wrapper that isolates its data.
+  3. Every write to another system is audited twice: the intent before the
+     call and the result after it, including when the call raised.
+  4. No secret is ever written to the audit log; values under credential-like
+     key names are redacted before a line is written.
+
+Python 3.9+, standard library only.
+"""
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import uuid
+
+VERSION = "0.1.0"
+PROG = "fleet-switchboard"
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+
+# ------------------------------------------------------------------ the config
+
+DEFAULTS = {
+    # No default: the v2 binary must be named by absolute path. A bare name is
+    # resolved through PATH, and a shell's PATH can find the OpenCode v1 binary
+    # instead; the Lab hit exactly that.
+    "opencode": None,
+    "opencode_env": {},
+    "herdr": "herdr",
+    "batch_seconds": 90,
+    "engaged_minutes": 10,
+    "call_timeout_seconds": 20,
+}
+
+HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
+
+
+class ConfigError(Exception):
+    """The config, or the state directory, cannot be used as it is."""
+
+
+def _xdg(variable, fallback):
+    """An XDG base directory. A relative value is ignored, as the spec says."""
+    value = os.environ.get(variable)
+    if value and os.path.isabs(value):
+        return Path(value)
+    return Path.home() / fallback
+
+
+def config_path():
+    return _xdg("XDG_CONFIG_HOME", ".config") / PROG / "config.json"
+
+
+def state_dir_path():
+    return _xdg("XDG_STATE_HOME", ".local/state") / PROG
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def validate_config(raw, source="config"):
+    """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
+    if not isinstance(raw, dict):
+        raise ConfigError("%s must be a JSON object" % source)
+    unknown = sorted(set(raw) - set(DEFAULTS))
+    if unknown:
+        raise ConfigError(
+            "%s contains key(s) this tool does not read: %s. "
+            "A setting that is silently ignored is worse than a missing one."
+            % (source, ", ".join(unknown)))
+    config = dict(DEFAULTS)
+    config["opencode_env"] = {}
+    config.update(raw)
+    opencode = config["opencode"]
+    if opencode is not None and (not isinstance(opencode, str) or not os.path.isabs(opencode)):
+        raise ConfigError("%s: 'opencode' must be the absolute path of the OpenCode v2 binary, got %r"
+                          % (source, opencode))
+    if not isinstance(config["herdr"], str) or not config["herdr"].strip():
+        raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
+                          % (source, config["herdr"]))
+    env = config["opencode_env"]
+    if not isinstance(env, dict):
+        raise ConfigError("%s: 'opencode_env' must be an object of NAME: value strings, got %r"
+                          % (source, type(env).__name__))
+    for name, value in env.items():
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            raise ConfigError("%s: 'opencode_env' has an invalid variable name: %r" % (source, name))
+        if not isinstance(value, str):
+            raise ConfigError("%s: 'opencode_env' value for %s must be a string" % (source, name))
+    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds"):
+        if not _is_number(config[key]) or config[key] <= 0:
+            raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    config["opencode_env"] = dict(env)
+    return config
+
+
+def load_config(path=None):
+    """Read config.json. A missing file means every default applies."""
+    path = Path(path) if path else config_path()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return validate_config({}, str(path))
+    except OSError as err:
+        raise ConfigError("cannot read %s: %s" % (path, err.strerror or err))
+    try:
+        raw = json.loads(text)
+    except ValueError as err:
+        raise ConfigError("%s is not valid JSON: %s" % (path, err))
+    return validate_config(raw, str(path))
+
+
+# ------------------------------------------------------------------- the state
+
+def ensure_state_dir(path=None):
+    """Create the state directory with mode 0700, or check the existing one.
+
+    It holds the audit log, which records who was sent what. A directory that
+    someone else owns, or that the group or world can read, is refused rather
+    than repaired: something changed it, and that deserves a person's look.
+    """
+    path = Path(path) if path else state_dir_path()
+    if not path.exists():
+        path.mkdir(parents=True, mode=0o700)
+        os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask
+    info = path.stat()
+    if not path.is_dir():
+        raise ConfigError("state path is not a directory: %s" % path)
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ConfigError("state directory must be private (mode 0700, owned by you): %s" % path)
+    return path
+
+
+# ------------------------------------------------------------------ the faults
+
+# Each fault switches one safeguard off, so a scenario's control can prove the
+# safeguard is what makes the scenario pass. They work only in the Lab.
+KNOWN_FAULTS = (
+    "no-engagement-gate",
+    "no-recheck",
+    "no-dedupe",
+    "steer-not-queue",
+    "no-batch",
+    "no-intent-header",
+    "no-classify",
+    "crash-after-send",
+    "no-policy-judge",
+    "judge-loosens",
+    "no-maxims",
+)
+
+LAB_ENV = "FLEET_SWITCHBOARD_LAB"
+FAULT_ENV = "FLEET_SWITCHBOARD_FAULT"
+
+
+class FaultError(Exception):
+    """A fault name nobody defined. A typo here would make a control prove nothing."""
+
+
+def active_faults():
+    """The fault names requested in the environment, checked, as a sorted list."""
+    raw = os.environ.get(FAULT_ENV, "")
+    names = sorted({part.strip() for part in raw.split(",") if part.strip()})
+    unknown = [name for name in names if name not in KNOWN_FAULTS]
+    if unknown:
+        raise FaultError("%s names unknown fault(s): %s (known: %s)"
+                         % (FAULT_ENV, ", ".join(unknown), ", ".join(KNOWN_FAULTS)))
+    return names
+
+
+def fault(name):
+    """True only in the Lab, and only for a fault named in the environment."""
+    if name not in KNOWN_FAULTS:
+        raise FaultError("unknown fault: %r" % name)
+    requested = active_faults()
+    return os.environ.get(LAB_ENV) == "1" and name in requested
+
+
+# ------------------------------------------------------------- the message id
+
+def derive_message_id(recipient, keys):
+    """The v2 message id for a delivery: the recipient plus the keys it covers.
+
+    A retry after a crash derives the same id, and v2 admits a repeated id
+    once, so a message is delivered at most once (invariant 3). Order and
+    duplicates in `keys` do not change the id.
+    """
+    if not isinstance(recipient, str) or not recipient:
+        raise ValueError("recipient must be a non-empty string")
+    keys = list(keys)
+    if not keys or not all(isinstance(key, str) and key for key in keys):
+        raise ValueError("keys must be a non-empty list of non-empty strings")
+    canonical = json.dumps([recipient, sorted(set(keys))], separators=(",", ":"), ensure_ascii=False)
+    return "msg_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:26]
+
+
+# ----------------------------------------------------------------- the audit
+
+SENSITIVE = ("token", "key", "password", "secret", "authorization")
+REDACTED = "[redacted]"
+
+
+def _sensitive(name):
+    lowered = str(name).lower()
+    # `keys` is the list of fact names a message covers (docs/switchboard.md
+    # §Data), such as `worker.idle:<session>:<time>`. It is the one thing the
+    # audit must show about a delivery, and it never holds a credential.
+    if lowered == "keys":
+        return False
+    return any(word in lowered for word in SENSITIVE)
+
+
+def redact(value):
+    """A copy of `value` with every credential-like key's value replaced."""
+    if isinstance(value, dict):
+        return {k: (REDACTED if _sensitive(k) else redact(v)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(v) for v in value]
+    return value
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class AuditLog:
+    """Append-only JSON lines. Never read by a decision; written before and after."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def append(self, actor, event, subject=None, detail=None, **extra):
+        entry = {"ts": utc_now(), "actor": actor, "event": event,
+                 "subject": subject, "detail": redact(detail)}
+        entry.update(redact(extra))
+        line = json.dumps(entry, sort_keys=True, default=str) + "\n"
+        fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return entry
+
+    @contextmanager
+    def external(self, actor, event, subject=None, detail=None):
+        """Audit one write to another system: `intent` before, `result` after.
+
+        Yields a dict the caller may fill with what came back; it becomes the
+        result entry's detail. An exception is recorded, then re-raised.
+        """
+        call = uuid.uuid4().hex[:12]
+        self.append(actor, event, subject, detail, phase="intent", call=call)
+        outcome = {}
+        try:
+            yield outcome
+        except BaseException as err:
+            self.append(actor, event, subject, outcome or None, phase="result", call=call,
+                        ok=False, error="%s: %s" % (type(err).__name__, err))
+            raise
+        self.append(actor, event, subject, outcome or None, phase="result", call=call, ok=True)
+
+
+# ------------------------------------------------------------- OpenCode v2
+
+class V2Error(Exception):
+    """A v2 call that did not return usable JSON.
+
+    reason: "http" (v2 answered with an HTTP error), "exit" (non-zero exit, no
+    HTTP status), "timeout", "bad_json" or "unavailable" (could not run).
+    """
+
+    def __init__(self, reason, status=None, detail=None):
+        self.reason = reason
+        self.status = status
+        self.detail = detail
+        text = reason if status is None else "%s %s" % (reason, status)
+        super().__init__("%s: %s" % (text, detail) if detail else text)
+
+
+def _one_line(text, limit=300):
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
+
+
+class V2Client:
+    """The one client for OpenCode v2. Every call is `<binary> api <operation>`."""
+
+    DELIVERIES = ("queue", "steer")
+    ORDERS = ("desc", "asc")
+
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20):
+        self.binary = binary
+        self.env = dict(env or {})
+        self.runner = runner
+        self.timeout = timeout
+
+    def _call(self, operation, params=None, data=None):
+        argv = [self.binary, "api", operation]
+        for name, value in (params or {}).items():
+            if value is not None:
+                argv += ["--param", "%s=%s" % (name, value)]
+        if data is not None:
+            argv += ["-d", json.dumps(data, separators=(",", ":"), sort_keys=True)]
+        env = dict(os.environ)
+        env.update(self.env)
+        try:
+            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
+                                 env=env, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise V2Error("timeout", None, "%s did not answer within %ss" % (operation, self.timeout)) from None
+        except OSError as err:
+            raise V2Error("unavailable", None, "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        if result.returncode != 0:
+            match = re.search(r"\bHTTP (\d{3})\b", stderr)
+            if match:
+                # v2 put the error body on stdout and `HTTP <code> <reason>` on stderr.
+                raise V2Error("http", int(match.group(1)), _one_line(stdout) or _one_line(stderr))
+            raise V2Error("exit", None, _one_line(stderr) or _one_line(stdout) or "exit %d" % result.returncode)
+        if not stdout.strip():
+            return None
+        try:
+            body = json.loads(stdout)
+        except ValueError:
+            raise V2Error("bad_json", None, "%s returned non-JSON: %s" % (operation, _one_line(stdout, 120))) from None
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
+    def server_info(self):
+        return self._call("server.info")
+
+    def session_create(self, agent, title, directory, metadata, permissions=None):
+        if not os.path.isabs(directory):
+            raise ValueError("directory must be absolute: %r" % directory)
+        data = {"agent": agent, "title": title, "location": {"directory": directory},
+                "metadata": metadata}
+        if permissions is not None:
+            data["permissions"] = permissions
+        return self._call("session.create", data=data)
+
+    def session_get(self, session_id):
+        return self._call("session.get", {"sessionID": session_id})
+
+    def session_active(self):
+        return self._call("session.active")
+
+    def message_list(self, session_id, limit=None, order=None, type=None, cursor=None):
+        if order is not None and order not in self.ORDERS:
+            raise ValueError("order must be one of %s" % ", ".join(self.ORDERS))
+        return self._call("session.message.list", {
+            "sessionID": session_id, "limit": limit, "order": order, "type": type, "cursor": cursor})
+
+    def synthetic(self, session_id, text, metadata, resume, delivery, message_id):
+        if not isinstance(resume, bool):
+            raise ValueError("resume must be true or false")
+        if delivery not in self.DELIVERIES:
+            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
+        if not isinstance(message_id, str) or not message_id.startswith("msg_"):
+            raise ValueError("message id must start with msg_: %r" % message_id)
+        return self._call("session.synthetic", {"sessionID": session_id}, {
+            "id": message_id, "text": text, "metadata": metadata,
+            "resume": resume, "delivery": delivery})
+
+    def prompt(self, session_id, text, metadata=None, delivery=None, resume=None):
+        if delivery is not None and delivery not in self.DELIVERIES:
+            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
+        data = {"text": text}
+        for name, value in (("metadata", metadata), ("delivery", delivery), ("resume", resume)):
+            if value is not None:
+                data[name] = value
+        return self._call("session.prompt", {"sessionID": session_id}, data)
+
+    def inbox_list(self, session_id):
+        return self._call("session.inbox.list", {"sessionID": session_id})
+
+    def inbox_update(self, session_id, inbox_id, delivery):
+        if delivery not in self.DELIVERIES:
+            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
+        return self._call("session.inbox.update", {"sessionID": session_id, "inboxID": inbox_id},
+                          {"delivery": delivery})
+
+
+# ------------------------------------------------------------------- herdr
+
+class HerdrError(Exception):
+    """A herdr call that did not return usable JSON."""
+
+    def __init__(self, reason, detail=None):
+        self.reason = reason
+        self.detail = detail
+        super().__init__("%s: %s" % (reason, detail) if detail else reason)
+
+
+class HerdrClient:
+    """Reads agents, sets a sidebar token, shows a toast. Nothing else.
+
+    herdr is never a delivery channel (docs/switchboard.md, the herdr table's
+    "never" row). This class deliberately has no method that types into a pane
+    or moves focus, and no general way to run an arbitrary herdr command.
+    """
+
+    SOURCE = PROG
+
+    def __init__(self, binary, runner=subprocess.run, timeout=HERDR_CALL_TIMEOUT):
+        self.binary = binary
+        self.runner = runner
+        self.timeout = timeout
+
+    def _call(self, *args):
+        argv = [self.binary, *args]
+        try:
+            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
+                                 stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise HerdrError("timeout", "herdr did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise HerdrError("unavailable", "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
+        if result.returncode != 0:
+            raise HerdrError("exit", _one_line(result.stderr) or _one_line(result.stdout)
+                             or "exit %d" % result.returncode)
+        if not (result.stdout or "").strip():
+            return None
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            raise HerdrError("bad_json", "herdr returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
+
+    @staticmethod
+    def _result(body, field, kind):
+        value = (body or {}).get("result", {}).get(field) if isinstance(body, dict) else None
+        if not isinstance(value, kind):
+            raise HerdrError("bad_shape", "expected result.%s in herdr's reply" % field)
+        return value
+
+    def agent_list(self):
+        return self._result(self._call("agent", "list"), "agents", list)
+
+    def agent_get(self, target):
+        return self._result(self._call("agent", "get", target), "agent", dict)
+
+    def pane_report_metadata_token(self, pane, name, value, ttl_ms=None):
+        args = ["pane", "report-metadata", "--pane", pane, "--source", self.SOURCE,
+                "--token", "%s=%s" % (name, value)]
+        if ttl_ms is not None:
+            args += ["--ttl-ms", str(int(ttl_ms))]
+        return self._call(*args)
+
+    def notification_show(self, title, body):
+        return self._call("notification", "show", "--title", title, "--body", body)
+
+
+# --------------------------------------------------------------------- the CLI
+
+def _check(probe):
+    """Run one probe. Returns (ok, one line). Never raises, never a traceback."""
+    try:
+        return True, probe()
+    except (V2Error, HerdrError, ConfigError, FaultError) as err:
+        return False, _one_line(str(err))
+    except Exception as err:  # status must always answer; say what broke in one line
+        return False, _one_line("unexpected %s: %s" % (type(err).__name__, err))
+
+
+def _v2_summary(info):
+    version = info.get("version") if isinstance(info, dict) else None
+    return "server.info answered%s" % (", version %s" % version if version else "")
+
+
+def collect_status(runner=subprocess.run):
+    report = {"version": VERSION}
+    path = config_path()
+    config_ok, config = _check(lambda: load_config(path))
+    report["config"] = {"path": str(path), "exists": path.exists(), "ok": config_ok}
+    if config_ok:
+        report["config"].update({
+            "opencode": config["opencode"],
+            "opencode_env": sorted(config["opencode_env"]),  # names only, never values
+            "herdr": config["herdr"],
+            "batch_seconds": config["batch_seconds"],
+            "engaged_minutes": config["engaged_minutes"],
+            "call_timeout_seconds": config["call_timeout_seconds"],
+        })
+    else:
+        report["config"]["error"] = config
+
+    state_ok, state = _check(lambda: str(ensure_state_dir()))
+    report["state_dir"] = {"path": str(state_dir_path()), "ok": state_ok}
+    if not state_ok:
+        report["state_dir"]["error"] = state
+
+    faults_ok, faults = _check(active_faults)
+    report["lab"] = {"on": os.environ.get(LAB_ENV) == "1", "ok": faults_ok}
+    if faults_ok:
+        report["lab"]["faults"] = faults
+    else:
+        report["lab"]["error"] = faults
+
+    if config_ok:
+        herdr = HerdrClient(config["herdr"], runner)
+        if config["opencode"] is None:
+            v2_ok, v2_line = False, ("not configured: set 'opencode' in %s to the absolute path of "
+                                     "the OpenCode v2 binary" % config_path())
+        else:
+            v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+            v2_ok, v2_line = _check(lambda: _v2_summary(v2.server_info()))
+        herdr_ok, herdr_line = _check(lambda: "%d agent(s)" % len(herdr.agent_list()))
+    else:
+        v2_ok, v2_line = False, "not checked: config unusable"
+        herdr_ok, herdr_line = False, "not checked: config unusable"
+    report["v2"] = {"ok": v2_ok, ("detail" if v2_ok else "error"): v2_line}
+    report["herdr"] = {"ok": herdr_ok, ("detail" if herdr_ok else "error"): herdr_line}
+    report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
+    return report
+
+
+def format_status(report):
+    def mark(part):
+        return "ok   " if part["ok"] else "ERROR"
+
+    config = report["config"]
+    lines = ["%s %s" % (PROG, report["version"])]
+    if config["ok"]:
+        lines.append("%s config     %s%s" % (mark(config), config["path"],
+                                             "" if config["exists"] else " (not present; defaults)"))
+        lines.append("      opencode   %s  env: %s" % (config["opencode"] or "(not configured)",
+                                                       ", ".join(config["opencode_env"]) or "none"))
+        lines.append("      herdr      %s" % config["herdr"])
+        lines.append("      timing     batch %ss, engaged %s min, call timeout %ss"
+                     % (config["batch_seconds"], config["engaged_minutes"], config["call_timeout_seconds"]))
+    else:
+        lines.append("%s config     %s" % (mark(config), config["error"]))
+    state = report["state_dir"]
+    lines.append("%s state      %s" % (mark(state), state["path"] if state["ok"] else state["error"]))
+    lab = report["lab"]
+    if lab["ok"]:
+        lab_line = "on" if lab["on"] else "off"
+        if lab["faults"]:
+            lab_line += ", faults requested: %s%s" % (", ".join(lab["faults"]), "" if lab["on"] else " (ignored outside the Lab)")
+    else:
+        lab_line = lab["error"]
+    lines.append("%s lab        %s" % (mark(lab), lab_line))
+    for name in ("v2", "herdr"):
+        part = report[name]
+        lines.append("%s %-10s %s" % (mark(part), name, part["detail"] if part["ok"] else part["error"]))
+    return "\n".join(lines)
+
+
+def cmd_status(args, runner=subprocess.run):
+    report = collect_status(runner)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(format_status(report))
+    return EXIT_OK if report["ok"] else EXIT_ERROR
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Route facts to fleet agents as OpenCode v2 messages. Never types into a pane.",
+        epilog="Config: $XDG_CONFIG_HOME/%s/config.json (optional). "
+               "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
+    sub = parser.add_subparsers(dest="action", required=True)
+    status = sub.add_parser("status", help="Config, state directory, and whether v2 and herdr answer")
+    status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    sub.add_parser("version", help="Print the version")
+    return parser
+
+
+def main(argv=None, runner=subprocess.run):
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exit_:
+        return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+    if args.action == "version":
+        print("%s %s" % (PROG, VERSION))
+        return EXIT_OK
+    if args.action == "status":
+        return cmd_status(args, runner)
+    sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

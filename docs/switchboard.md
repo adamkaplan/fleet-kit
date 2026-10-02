@@ -1,0 +1,1446 @@
+# Switchboard: tracking
+
+> Event-driven delivery for Fleet Kit on OpenCode v2 that never interrupts.
+> This plan is updated as each PR lands. Last updated 2026-10-02.
+>
+> It lives at `docs/switchboard.md` on the stack. After PR 1 it is edited only
+> on the current top branch, so status updates never rebase lower PRs.
+
+## Status
+
+| PR | Branch | Scope | State |
+|---|---|---|---|
+| 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | ready for review [#15](https://github.com/adamkaplan/fleet-kit/pull/15); spikes pass |
+| 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send` | planned |
+| 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
+| 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
+| 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
+| 6 | `switchboard/intent` | Asks with Intent and Done-when; every message names its ask; `intents`; changes surfaced; role maxims and the reach-for-you rubric | planned |
+| 7 | `switchboard/judges` | Jev decision-model client; the message classifier and the tool-call judge in shadow mode | planned |
+| 8 | `switchboard/foreground` | Classify your messages; hand unrelated work to a background subagent; decorate messages about owned asks; spikes SF1–SF4 | planned |
+| 9 | `switchboard/policy` | Tool-call policy judge through the thin `fleet-hooks` plugin; spikes SP1–SP2 | planned |
+| 10 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
+
+Each PR is opened as soon as it is ready. The whole stack merges to `main` in
+one atomic `gh stack merge`, and only once the system is complete.
+
+```mermaid
+flowchart LR
+  main(["main"])
+  subgraph substrate["Substrate: closes problems 3 and 4"]
+    direction LR
+    p1["1 · v2 client, scenarios, spikes"] --> p2["2 · delivery"] --> p3["3 · herdr"] --> p4["4 · worker events, substrate scenarios"]
+  end
+  subgraph system["Rest of the system: problems 1 and 2"]
+    direction LR
+    p5["5 · GitHub events"] --> p6["6 · intent, maxims"] --> p7["7 · judges"] --> p8["8 · foreground"] --> p9["9 · policy"] --> p10["10 · v1 move"]
+  end
+  main --> p1
+  p4 --> p5
+  p10 -. "one atomic gh stack merge" .-> main
+```
+
+## Problems
+
+The fleet is a fan-out: you talk to a Chief of Staff, which hands work to
+orchestrators, which dispatch workers. You mostly talk to the Chief of Staff,
+not to the agents below it.
+
+1. **Telephone, mostly on the way back.** Your intent travels down through the
+   Chief of Staff and progress travels back up the same way. The drift happens
+   mostly on the way up: an orchestrator reports in its own framing, the Chief
+   of Staff adopts it, and both its next ask and its summary to you follow that
+   framing instead of what you asked. Nothing keeps your original intent and
+   success criteria in front of the Chief of Staff when a report arrives. Also,
+   text the Chief of Staff types into an orchestrator's pane looks exactly like
+   your typing.
+2. **Serial Chief of Staff.** You think of things to discuss faster than the
+   Chief of Staff can carry them out. It has one conversation and works on one
+   thing at a time, so a question about B waits for A to finish or gets mixed
+   into A, and machine wakes take turns in the middle of your conversation
+   with it.
+3. **Interruptions.** Wakes are typed into the agent's input box.
+   - A half-written message of yours can be submitted along with the wake,
+     because the empty-box check and the send are not atomic.
+   - Wakes also arrive as turns in the middle of your conversation with the
+     agent.
+4. **Silent completions.** A worker finishing wakes nobody. Its orchestrator
+   only finds out on the next timer.
+
+How it works today, with each problem marked where it happens:
+
+```mermaid
+flowchart LR
+  you(["You"]) -- "asks" --> cos["Chief of Staff<br/>2 · one conversation,<br/>one request at a time"]
+  cos -- "briefs, typed as if it were you" --> orch["Orchestrator"]
+  orch -- "briefs" --> worker["Coder"]
+  orch -- "1 · reports in its own framing" --> cos
+  cos -. "1 · next ask and its summary to you<br/>follow the new framing" .-> you
+  timer["Heartbeat timer"] -. "3 · pastes into the input box,<br/>presses Enter, even mid-conversation" .-> cos
+  timer -. "3" .-> orch
+  worker -- "finishes, comments" --> gh[("GitHub issue")]
+  gh -. "4 · nobody is told<br/>until the next timer" .-> orch
+```
+
+Evidence from real use:
+
+- An idle orchestrator spent 18 overnight wakes in a row concluding "no
+  change."
+- A Chief of Staff pane missed thousands of wakes because of an unsent draft.
+  The only sign was a symbol on its tab.
+- A Chief of Staff gave its principal a status picture built from
+  orchestrators' framing; two of its three facts were wrong.
+
+## Decisions
+
+| Topic | Decision |
+|---|---|
+| Harness | OpenCode v2 only. Other harnesses come later, as adapters. |
+| Plugins | At most one, and thin: `fleet-hooks` forwards v2's `permission` hook (PR 9), and a `prompt` hook if PR 8 needs it, to the CLI. No logic lives in it. herdr's own OpenCode integration reports status; v2's server API covers notes, wakes and reads. |
+| Location | `bin/fleet-switchboard` (stdlib Python) plus a herdr plugin manifest, both in this repo. |
+| State | Almost none. An append-only audit log and a reminders file. Everything else is derived on each pass from herdr, v2 and GitHub, so there is nothing to keep in sync; see [Data](#data). |
+| Status | herdr is authoritative for working, idle and blocked. Its OpenCode integration supports v2 through a pane-local TUI plugin. |
+| Engagement | "You are engaged with an agent" means you prompted it in the last 10 minutes. There is no viewed state. It matters mostly for the Chief of Staff, the agent you talk to. |
+| Intent | Each request handed to an orchestrator is an ask: an issue under its charter with a one-line Intent and a one-line Done-when. Every message names its ask and carries those lines, in both directions. Only you, or the Chief of Staff with your yes, change them (PR 6). |
+| Chief of Staff attention | Serial by default. Jev classifies each message from you against the asks in flight. Unrelated work in progress is handed to a background subagent with a written brief, never a forked session; a message about an ask that already has an owner is decorated so the Chief of Staff forwards it (PR 8). |
+| Decision model | Jev (`typesafe/jev-1.13` on OpenRouter) for yes/no and pick-one judgements: cheap, fast, probabilities instead of text. Shadow mode first (PR 7). Unsure or unreachable means change nothing. |
+| Conduct | A few short maxims per role, and one reach-for-you rubric, instead of long rules (PR 6). Adapted from Firstmate. |
+| Tool calls | No fixed read-only roles. Consequential tool calls are judged in context by Jev against the role, the ask's Intent and the charter's standing authority. The judge only tightens: allow can become ask or deny, never the reverse (PR 9). |
+| Testing | Every promised behaviour is a scenario, run offline in CI against fakes and in the Lab against real v2 and herdr. Each scenario's control, with its safeguard switched off, must fail. See [Scenario testing](#scenario-testing). |
+| Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
+| GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
+| Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
+| Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. The TUI does not show it (S3); the badge, `status` and the audit log do. |
+| Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
+| Talking to orchestrators | You can talk to any orchestrator directly. Nothing extra is recorded; the issue already carries the intent. |
+| v1 sessions | Imported, not restarted (PR 10). |
+
+## Design
+
+```mermaid
+flowchart LR
+  subgraph inputs["Read"]
+    direction TB
+    herdr_in["herdr<br/>agent status · session ids<br/>status-change events"]
+    oc_in["OpenCode v2<br/>turn end · outcome<br/>fleet metadata · transcripts"]
+    gh_in["GitHub, PR 5 on<br/>webhooks · Intent lines"]
+  end
+  subgraph daemon["fleet-switchboard daemon"]
+    direction TB
+    loop["observe → derive<br/>→ decide → deliver<br/>→ render"]
+    files[("audit.jsonl<br/>reminders.json")]
+    loop --> files
+  end
+  subgraph outputs["Write"]
+    direction TB
+    oc_out["OpenCode v2 API<br/>note or wake<br/>as a synthetic message"]
+    herdr_out["herdr<br/>badge · toast"]
+  end
+  cli["Agents and you<br/>send · remind"]
+  herdr_in --> loop
+  oc_in --> loop
+  gh_in --> loop
+  loop --> oc_out
+  loop --> herdr_out
+  cli -- "send delivers directly,<br/>by the same rule" --> oc_out
+  cli -- "remind" --> files
+```
+
+### Delivery rule
+
+Items for an agent are collected for 90 s, so a burst of events becomes one
+message. A `send` from another agent skips the batch.
+
+- **You are engaged with the agent → note.** Engaged means you prompted it in
+  the last 10 minutes: the newest user message in its transcript that the
+  fleet did not send. The switchboard calls `session.synthetic` with
+  `resume: false` and `delivery: "steer"`. That starts no turn; the note
+  reaches the model in the same request as your next message, just before it
+  (S3). With `queue` it would instead arrive after the agent had answered you,
+  and start a turn of its own.
+- **Otherwise → wake.** `session.synthetic` with `resume: true` and
+  `delivery: "queue"`. It never cuts into a running turn.
+- **The message is the delivery.** It contains the items themselves, grouped
+  by issue, each group headed by that issue's Intent and Done-when lines (PR 6).
+  There is nothing to fetch and nothing to acknowledge: once the message is in
+  the agent's transcript, it has been delivered. Messages are capped in length;
+  overflow is listed by `fleet-switchboard pending <agent>`.
+- **Never typed.** The switchboard never calls `herdr agent prompt` and never
+  writes into a pane's input box.
+- **A note that outlives your attention.** If 10 minutes pass with no prompt
+  from you and a note is still waiting in v2's inbox, it becomes a wake:
+  `session.inbox.update` to `queue` and then to `steer`, which starts a turn
+  (S3). v2 refuses to change a waiting steer item to steer directly.
+- **Invisible in the TUI.** v2's TUI shows neither notes nor wakes, only the
+  agent's reply (S3). What was delivered is visible in the herdr badge,
+  `fleet-switchboard status` and the audit log.
+
+```mermaid
+flowchart TD
+  item["Pending item for agent A"] --> batch["Batch for 90 s<br/>send skips this"]
+  batch --> recheck["Observe A again"]
+  recheck --> blocked{"A blocked or gone,<br/>or v2 unreachable?"}
+  blocked -- "yes" --> hold["Hold<br/>audit why · toast after 15 min"]
+  hold -. "next pass" .-> recheck
+  blocked -- "no" --> engaged{"You prompted A<br/>in the last 10 min?"}
+  engaged -- "yes" --> note["Note<br/>synthetic, resume false<br/>no turn starts"]
+  engaged -- "no" --> wake["Wake<br/>synthetic, resume true, delivery queue"]
+  note --> lapse{"Still in v2's inbox<br/>after 10 min without you?"}
+  lapse -- "yes" --> steer["Convert to a wake<br/>turn starts"]
+  lapse -- "no: your next message carried it" --> done(["Delivered"])
+  wake --> busy{"A busy?"}
+  busy -- "yes" --> after["Runs after the current turn"]
+  busy -- "no" --> now["Turn starts now"]
+  steer --> done
+  after --> done
+  now --> done
+```
+
+## System design
+
+This section is the contract the code is built against. Anything marked
+**(verify Sn)** is an assumption that spike Sn must confirm before code
+depends on it.
+
+### Components
+
+| Component | Runs as | Does |
+|---|---|---|
+| `fleet-switchboard run` | One long-running daemon per user, guarded by a single-instance lock. Started by herdr's `[[startup]]` hook through `fleet-switchboard ensure`. | The loop below, on every herdr status event and at least every 60 s |
+| `fleet-switchboard <command>` | Short-lived CLI, run by you and by agents | `launch`, `send`, `remind`, `intent`, `pending`, `status`, `audit`, `poke`. `send` applies the delivery rule and delivers itself; it does not need the daemon |
+| Harness adapter | A class shared by the daemon and the CLI, one per harness kind | Everything harness-specific: launch, observe, note, wake |
+| herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon; turns herdr events into pokes |
+| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
+| Decision model client (PR 7) | A class in `bin/fleet-switchboard`, stdlib `urllib`. The OpenRouter key comes from the switchboard's config and never enters an agent's environment | Jev calls for the classifier and the shadow judges |
+| `fleet-hooks` plugin (PR 8–9) | A v2 plugin of a few lines, loaded from the Lab's config | Forwards v2's `permission` hook, and `prompt` if needed, to `fleet-switchboard`; holds no logic |
+| GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon, which receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
+
+The daemon runs one loop with five steps:
+
+1. **Observe.** Ask herdr which panes run fleet agents and what state each is
+   in. Read each agent's session from v2.
+2. **Derive.** Compute the facts that hold now, such as "this worker's last
+   turn ended at T," and subtract the facts already delivered, which are
+   recorded in each recipient's transcript. What remains is pending.
+3. **Decide.** For each agent whose pending items are past the batch window,
+   apply the delivery rule.
+4. **Deliver.** Observe that agent again, then note or wake it.
+5. **Render.** Update herdr: unread badges, toasts for held items.
+
+Every write to another system is recorded in the audit log twice: the intent
+before the call, and the result after it.
+
+### Integration touch points
+
+#### herdr
+
+herdr hosts the panes, owns agent status, and tells the switchboard when status
+changes. It is never a delivery channel to an agent.
+
+| Direction | Call | Purpose |
+|---|---|---|
+| setup | `herdr integration install opencode` | Installs herdr's OpenCode integration, including its v2 TUI plugin, which reports working, idle and blocked, and the session id. In the Lab it goes into the scratch config (verify S1, S6) |
+| read | `agent list`, `agent get` | Pane, workspace, tab, `agent_status` (authoritative for v2 panes through the integration), `agent_session` (which v2 session the pane shows) |
+| read | Plugin `[[events]]` on `pane.agent_status_changed`, `pane.created`, `pane.closed`, `pane.exited` | Run `fleet-switchboard poke`, so a status change is acted on within seconds. A 60 s pass is the backstop |
+| write | `tab create --no-focus`, then `agent start --kind opencode --pane <p> -- -s <session>` | Open a pane for a launched agent without moving your focus |
+| write | `pane report-metadata --token unread=<n>` | Unread count in the sidebar. Display-only; the switchboard never uses `report-agent`, which would take status authority away from the integration |
+| write | `notification show` | Toast for a held item, a blocked worker, an Intent change, or a switchboard fault |
+| never | `agent prompt`, `agent send-keys`, `pane send-text`, `pane send-keys`, `pane run`, any focus command | The switchboard never types and never moves your focus |
+
+herdr's v2 status comes from the TUI plugin, so it covers agents running the
+full TUI. v2's Mini and headless clients report nothing; fleet agents always
+run the TUI.
+
+#### Harness adapter contract
+
+Every harness implements one interface. The daemon and the delivery rule see
+only this interface, never a harness by name.
+
+```text
+launch(name, agent, directory, brief, fleet)   -> session ref
+observe(session ref)                           -> Observation
+delivered(session ref, since)                  -> keys already delivered
+note(session ref, text, keys, message id)      -> receipt   # adds context; starts no turn
+wake(session ref, text, keys, message id)      -> receipt   # starts a turn if idle; waits for the current turn if busy
+capabilities                                   -> which of the above it guarantees
+```
+
+`Observation` fields:
+
+| Field | Meaning | OpenCode v2 source |
+|---|---|---|
+| `status` | `working`, `idle` or `blocked` | herdr `agent_status` |
+| `fleet` | Name, role, `reports_to`, issue | v2 session metadata, set at launch |
+| `idle_at`, `outcome` | When the last turn ended, and whether it succeeded, failed or was interrupted | v2 `Session.Info.time.idle`, `outcome` |
+| `blocked_on` | The pending permission request or question, by id | v2 `permission.request.list`, `form.list` |
+| `last_human_prompt` | When you last prompted it | v2 transcript |
+
+The delivery rule degrades by capability, not by harness:
+
+- **No `note`.** Items wait for a wake.
+- **No `wake` that avoids typing.** Badge and toast only; the agent gets the
+  items with its next turn. A typed wake is not part of the contract.
+- **No `last_human_prompt`.** Every delivery is a wake.
+
+The two adapters this document describes, side by side:
+
+```mermaid
+classDiagram
+  direction LR
+  class HarnessAdapter {
+    <<interface>>
+    +capabilities
+    +launch(name, agent, directory, brief, fleet) SessionRef
+    +observe(ref) Observation
+    +delivered(ref, since) Keys
+    +note(ref, text, keys, message_id) Receipt
+    +wake(ref, text, keys, message_id) Receipt
+  }
+  class OpenCodeV2Adapter {
+    <<built>>
+    status from herdr integration
+    note via synthetic, resume false
+    wake via synthetic, resume true, queue
+    delivered keys from transcript metadata
+  }
+  class HookAdapter {
+    <<specified only>>
+    note via prompt-submit hook context
+    wake via stop hook, busy-to-idle only
+    delivered keys in a local file
+  }
+  HarnessAdapter <|.. OpenCodeV2Adapter
+  HarnessAdapter <|.. HookAdapter
+```
+
+#### OpenCode v2 adapter (built)
+
+All v2 calls go through `opencode api <operation>`, which finds the shared
+service and handles authentication. One client class owns every call.
+
+| Contract | OpenCode v2 |
+|---|---|
+| launch | `session.create` with the agent, title, location and `metadata.fleet = {name, role, reports_to, issue}`; a herdr tab running the TUI with `-s <session>`, started by absolute path and checked with `pane process-info` (S6: a login shell's PATH can resolve `opencode` to v1); then `session.prompt` with the brief, marked as sent by the fleet |
+| observe `status` | herdr `agent_status` for the pane whose `agent_session` is this session (S6). `done` counts as idle: herdr shows `done` after a turn in an unfocused pane |
+| observe `fleet` | `session.get` → `metadata.fleet` (verify S5) |
+| observe `idle_at`, `outcome` | `session.get` → `time.idle`, `outcome` |
+| observe `blocked_on` | `permission.request.list`, `form.list` |
+| observe `last_human_prompt` | `session.message.list`, newest first: the first message of type `user` without `metadata.fleet` (S5). Fleet prompts are also type `user`, so the metadata is what tells them apart |
+| delivered | Synthetic messages newer than `since`, read newest first: their `metadata.fleet.keys`. Plus `session.inbox.list`, for notes not yet delivered (verify S5) |
+| note | `session.synthetic` with `resume: false`, `delivery: "steer"` and `metadata.fleet.keys` (S3) |
+| wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (S4: idle, a turn starts in 0.06 s; busy, it runs after the turn's final reply, never between steps) |
+| note → wake | `session.inbox.update` to `queue`, then to `steer`; or `session.inbox.cancel` and resend the same id as a wake (S3) |
+| message id | Derived from the recipient and the keys (`msg_` and 26 hex digits), so a retry reuses it. v2 admits a repeated id once and returns the original record (S2) |
+| events | `GET /api/event` streams only over direct HTTP to the service (Basic auth, credentials in the service's registration file); `opencode api` buffers the whole response (S2). The switchboard polls, woken early by herdr's status events |
+| move a v1 session | `experimental.session.import` (PR 10) |
+
+Capabilities: all of them, if S3 and S4 pass.
+
+#### Hook-based harness adapter (contract only; not built)
+
+A Claude Code-style harness has no server API, but it runs configured shell
+commands on lifecycle events. It plugs in through
+`fleet-switchboard hook <event>`, which reads the hook's JSON on stdin and
+prints whatever the harness should inject. Hooks are configuration, not a
+plugin.
+
+| Contract | Hook-based harness |
+|---|---|
+| launch | `herdr agent start --kind <k>`; the session id arrives through the session-start hook |
+| observe `status` | herdr's screen detection, or the harness's own hooks |
+| observe `last_human_prompt` | Prompt-submit hook. Every prompt is yours, because the switchboard never types |
+| delivered | No transcript API, so this adapter keeps delivered keys in a small local file: the one place it needs state |
+| note | The prompt-submit hook returns pending items as added context. They ride on your next message, so no turn is started |
+| wake | Partial. The stop hook can refuse to stop while items are pending, which covers the busy-to-idle edge only. An agent that is already idle cannot be woken without typing, so it gets a badge and a toast |
+
+This is why the contract has capability flags: the same rule runs safely
+against a weaker harness.
+
+#### GitHub (PR 5)
+
+GitHub events arrive as webhooks, relayed by the `gh webhook forward`
+extension ([cli/gh-webhook](https://github.com/cli/gh-webhook)). Nothing is
+polled on a timer.
+
+- **One forwarder per watched repo,** started and supervised by the daemon as a
+  child process. Watched repos are the ones holding the issues named in fleet
+  agents' metadata. The forwarder runs
+  `gh webhook forward --repo=<repo> --events=<list> --url=http://127.0.0.1:<port>/github --secret=<secret>`,
+  where `<port>` belongs to a listener the daemon opens on localhost only.
+- **Events:** `issues` (including edits and label changes such as
+  `awaiting-user`), `issue_comment`, `sub_issues`, `pull_request`,
+  `pull_request_review`, `check_suite` and `workflow_run`. Verify SG1 for
+  `sub_issues`.
+- **Verification:** the daemon checks `X-Hub-Signature-256` against the secret
+  before reading the body. That stops any local process from posting fake
+  events.
+- **Routing:** an event becomes a pending item for the orchestrator that owns
+  the issue it touches. Issue events match on the issue number against the
+  charter and its sub-issues. PR events match through the issues the PR
+  closes. Check and workflow events match through the PRs listed in their
+  payload.
+- **Catching up after a gap:** the forwarder never replays what it missed. It
+  reconnects 3 times, 5 s apart, then exits, and anything that happens while it
+  is down is lost. So each time a forwarder starts, the daemon makes one
+  catch-up read with `gh api` over a fixed look-back window (default 24 hours).
+  That read fills a gap; it is not a poll. Keys come from GitHub object ids,
+  not delivery ids, so an event seen both ways is delivered once.
+- **Writes:** none.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant GH as GitHub
+  participant F as gh webhook forward
+  participant SB as fleet-switchboard
+  participant O as Orchestrator
+  SB->>F: start for one repo, pointing at 127.0.0.1 with a fresh secret
+  F->>GH: create the repo's cli hook, connect, activate
+  SB->>GH: catch-up read over the look-back window
+  GH-->>F: event, over the websocket
+  F->>SB: POST /github with X-GitHub-Delivery and signature
+  SB->>SB: verify, route to an issue owner, key by object id
+  Note over SB,O: from here the delivery rule applies, as for any item
+  F-xSB: exits after 3 failed reconnects
+  SB->>F: restart with backoff, then catch up again
+```
+
+**Constraints from GitHub's docs and the extension's source.** Settled by spike
+SG1 before PR 5 builds on them.
+
+| Constraint | Consequence |
+|---|---|
+| "Webhook forwarding is only designed for use during testing and development. It is not supported for use in production environments." | Acceptable for one person's local fleet. If GitHub withdraws it, fall back to the catch-up read on a long interval |
+| "Only one person can use webhook forwarding at a time for each repository and organization." A second forwarder gets `Hook already exists` | The daemon reports the conflict in `status` and a toast, and falls back to catch-up reads for that repo |
+| Creating the hook requires admin on the repo; `--org` needs the `admin:org_hook` scope | `fleet-doctor` checks for admin before a repo is watched |
+| `--secret` is passed on the command line, so other local users can see it in `ps` | A new secret for every forwarder start, never stored. Acceptable on a single-user machine |
+
+| Spike | Passes when |
+|---|---|
+| SG1 | On a scratch repo: the forwarder creates and activates the hook; events arrive signed; `sub_issues` is accepted; a second forwarder gets `Hook already exists`; after the forwarder is killed, the hook is cleaned up or left inactive, and that is recorded; events sent while it is down are absent, and the catch-up read recovers them |
+
+#### Agents
+
+Agents talk to the switchboard only through its CLI, from their own shell. The
+CLI identifies the caller from its herdr pane (`HERDR_PANE_ID` → session →
+fleet metadata), so `--from` is never typed.
+
+| Command | Who | Effect |
+|---|---|---|
+| `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6 |
+| `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
+| `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
+| `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
+| `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
+| `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
+
+Each agent definition gains one paragraph: what a `[switchboard]` message is,
+that agents message each other with `send` and never by typing into a pane,
+and (PR 6) that reports are checked against the issue's Intent and Done-when.
+Agents the switchboard manages do not use `heartbeat-ack`.
+
+#### You
+
+| Surface | Shows |
+|---|---|
+| herdr sidebar | Status (from herdr's integration) and an unread count per pane |
+| herdr toast | An item held longer than 15 minutes and why; a blocked worker; an Intent change; a switchboard fault |
+| `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
+| `fleet-switchboard audit` | The decision history for one agent or one issue |
+| `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |
+
+### Intent lines (PR 6)
+
+The usual pattern for agentic coding is one session per intent. Here the Chief
+of Staff and each orchestrator are single long-lived sessions whose job is to
+carry many intents at once: every ask they are tracking is a sub-intent of that
+job. Every incoming message is a context switch between those asks, and when a
+message does not say which ask it belongs to, the asks bleed into each other.
+The drift in problem 1 is the visible result: a report arrives, and the session
+treats it as being about whatever it was last thinking of, in the reporter's
+framing.
+
+So every message says which ask it belongs to, and carries that ask's intent
+and success criteria with it, in both directions.
+
+**Three levels.**
+
+```mermaid
+flowchart LR
+  charter["Charter<br/>the orchestrator's standing job<br/>never repeated in messages"]
+  ask["Ask<br/>one per request handed off<br/>Intent and Done when<br/>written by the Chief of Staff"]
+  work["Work item, optional<br/>one per worker assignment<br/>Intent<br/>written by the orchestrator"]
+  charter -- "sub-issue" --> ask
+  ask -- "sub-issue" --> work
+```
+
+- **Ask.** Each request the Chief of Staff hands to an orchestrator becomes an
+  issue under that orchestrator's charter, opening with one Intent line and one
+  Done-when line. This is the unit both the Chief of Staff and the orchestrator
+  are accountable for.
+- **Work item.** When an orchestrator splits an ask across workers, each
+  assignment is a sub-issue of the ask with its own one-line Intent. For a
+  single worker the ask itself can be the work item.
+- **Charter.** The orchestrator's standing job. It is the same for every
+  message, so it is never repeated.
+
+This adds the ask level to the fleet-charter skill, which today puts worker
+assignments directly under the charter.
+
+```markdown
+## Intent
+Fix the project agents that show "Agent unavailable" in production.
+Done when: both project agents answer a chat message in production.
+```
+
+**Who writes and changes it.** The Chief of Staff writes an ask's lines at
+hand-off, in your terms: your ask, never widened into a general goal or a
+coverage list, because Done-when is what reports are held to. An orchestrator
+writes a work item's line when it creates one. After
+that, an Intent or Done-when changes only by you, or by the Chief of Staff with
+your yes. Orchestrators and workers propose a change with `send`; they never
+edit it.
+
+GitHub is the only copy. The switchboard reads the section from the issue body
+and caches it in memory by ETag; `issues` webhooks invalidate the cache. It
+never writes it.
+
+**What the switchboard does with it.**
+
+- **Every message names one issue.** A message covering several asks has one
+  section per ask, never interleaved.
+- **Each section is headed by its ask.** The ask's Intent and Done-when, then
+  the work item's Intent if the message is about a work item under it: at most
+  three lines. This covers GitHub events, a worker finishing, and every `send`,
+  in both directions, so a report coming up to the Chief of Staff carries the
+  same anchor its hand-off went down with.
+- **Open asks at a glance.** `fleet-switchboard intents` lists the caller's
+  open asks, one line each with its Done-when: every ask for the Chief of
+  Staff, the asks under its charter for an orchestrator. It is derived from
+  GitHub on every call.
+- **Missing intent is visible.** A message about an issue without the section
+  says "no intent recorded," and `status` lists those issues.
+- **Changes are surfaced, never silent.** An `issues.edited` webhook that
+  changes the Intent section produces an item for the Chief of Staff showing
+  old → new, and a toast to you.
+
+**The rules, in the agent definitions.** The Chief of Staff checks every
+orchestrator report against its ask's Done-when before acting on it or
+summarising it to you, and says so when they diverge.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant O as Orchestrator
+  participant SB as fleet-switchboard
+  participant GH as GitHub
+  participant C as Chief of Staff
+  O->>SB: send cos --issue 615 "deployed, one of the two agents fixed"
+  SB->>GH: read ask 615's Intent (cached)
+  SB->>C: [switchboard] from platform, about ask 615<br/>Intent · Done when · then the report
+  Note over C: report vs. Done when:<br/>"one of two" is not done
+  C->>SB: send platform --issue 615 "the second agent is still in scope"
+```
+
+### Conduct: maxims and when to reach for you (PR 6)
+
+Behaviour is set by a few short maxims, not by long rules. A reasoning agent
+gets more from one well-chosen phrase than from a paragraph of conditions, and
+a short list stays read.
+
+**Shared by every role.**
+
+- **Festina lente.** Make haste slowly: the careful step is the fast one.
+- **Chesterton's fence.** Know why something is there before removing it.
+- **Cut the root, not the branch.** Fix the cause, not the symptom. The same
+  theme twice means the root is somewhere else.
+- **Outcomes, not mechanics.** Report results and decisions, not internals.
+- **Say it failed.** A failure is reported plainly, with its evidence.
+- **A diagnosis is not a mandate.** Findings are evidence, not permission to
+  change things.
+- **Don't widen the ask.** Words like "security" or "critical" are evidence
+  about the work, not more scope.
+- **Permission doesn't travel.** An instruction covers exactly what it names,
+  never the next thing like it.
+- **An empty queue is not a mandate.** Idle is healthy; don't invent work.
+
+**Chief of Staff and orchestrators.**
+
+- **Trust, but verify.** A report is checked against its ask's Done-when and
+  its evidence before it is acted on or passed up.
+
+**Chief of Staff only.**
+
+- **The last message stands alone.** You may read only that one.
+- **No change, no message.**
+- **Evidence, consequence, options, recommendation.** The shape of every
+  escalation.
+
+**When to reach for you.** Chief of Staff and orchestrators decide toward the
+ask's Intent, and reach for you only when:
+
+- it grows the contract;
+- it can't be undone;
+- it speaks for you: a merge, a deploy, a publish, a spend;
+- the key isn't yours: a credential, a login, an account;
+- it's ready for your eyes: a review, findings;
+- they are stuck after trying.
+
+Orchestrators reach you through the Chief of Staff, or the `awaiting-user`
+label when it is about their charter.
+
+These lines replace prose in the role definitions rather than adding to it:
+each role file opens with a `## Maxims` block of at most a dozen lines. The
+same reach-for-you rubric is also what the tool-call policy judge checks
+([PR 9](#tool-call-policy-pr-9)): the agent holds it as a maxim, and the judge
+backs it up at the moment of action.
+
+**Adapted from [Firstmate](https://github.com/kunchenguid/firstmate)**, a
+supervisor for agent fleets. Firstmate converged on two ideas this design
+already uses: a notification is a reason to look, not the truth ("events wake;
+state decides"), and a restart must be a non-event because durable state, not
+conversation memory, is authoritative. The maxims above distil its escalation
+etiquette and its rules for deciding versus asking.
+
+Not taken: fixed restrictions such as read-only roles, because the Chief of
+Staff and orchestrators need `gh` and other commands whose effects can't be
+judged from their names (the policy judge does that instead); one human contact
+only (you can talk to orchestrators directly); the long term-translation table;
+and a 400-line always-loaded contract.
+
+### Foreground and background (PR 8)
+
+Notes keep machine turns out of your conversation, and intent lines let the
+Chief of Staff answer from a message instead of investigating. That leaves the
+rest of problem 2: you think of things faster than the Chief of Staff carries
+them out.
+
+**What it must do.** The Chief of Staff works serially by default. Each message
+from you is classified against the asks already in flight, and what happens
+depends on the answer:
+
+| Your message is about | What happens |
+|---|---|
+| The work the Chief of Staff is doing now | Nothing extra; it reaches the Chief of Staff as usual |
+| An ask that already has an owner: a background subagent or an orchestrator | The message is decorated with that ask and its owner. The Chief of Staff sends the owner anything relevant with `send`, then carries on with what it was doing |
+| Something new, while the Chief of Staff is busy | The message is decorated "hand off first". The Chief of Staff hands its current work to a background subagent, then turns to you |
+| Something new, while the Chief of Staff is idle | Nothing extra; it becomes the foreground work |
+
+This applies to the Chief of Staff only; orchestrators are driven by the fleet,
+not by you.
+
+```mermaid
+flowchart TD
+  msg["Your message"] --> any{"Anything to choose between?<br/>Chief of Staff busy,<br/>or other open asks"}
+  any -- "no" --> plain["Delivered as usual"]
+  any -- "yes" --> jev["Classify: one Jev call"]
+  jev --> conf{"Confident?"}
+  conf -- "no" --> plain
+  conf -- "yes" --> which{"About what?"}
+  which -- "the current work" --> plain
+  which -- "an ask with an owner" --> dec["Decorated with the ask and its owner<br/>Chief of Staff forwards details with send,<br/>then carries on"]
+  which -- "something new,<br/>Chief of Staff busy" --> ho["Decorated: hand off first<br/>Chief of Staff writes a handoff brief,<br/>a background subagent takes the work,<br/>then it answers you"]
+  which -- "something new,<br/>Chief of Staff idle" --> plain
+```
+
+#### Classify: a decision model
+
+One call to Jev per message from you, made only when there is something to
+choose between. Jev (`typesafe/jev-1.13` on OpenRouter's System One endpoint,
+`POST /api/v1/systemone`) answers typed questions with probabilities instead
+of text. Here it gets one `choice` question:
+
+- **State:** your new message and your previous one; the current ask's Intent
+  and Done-when; one line per open ask, with its Intent and owner, from
+  `fleet-switchboard intents`.
+- **Options:** `current`, one option per open ask, and `new`.
+- **Answer:** the chosen option and the probability of each.
+
+It is cheap and fast: about $0.00003 per call where it has been used before,
+because only input tokens are billed. Its latency here is measured by SF2. When
+the top probability is below a threshold, or Jev is unreachable, the answer is
+`current`: the safe default is to change nothing. Every question and answer is
+written to the audit log. The OpenRouter key is read by the switchboard only
+and never enters an agent's environment.
+
+The classifier runs in shadow mode first (PR 7): logged, never acted on, until
+its answers match labelled cases from real Chief of Staff transcripts (SF2).
+
+#### Hand off: a brief, not a fork
+
+The session is not forked. The Chief of Staff's history is long and full of
+other asks, and a copy would carry all of that into the subagent. Instead the
+Chief of Staff writes a short handoff brief, and a fresh background subagent
+continues from it:
+
+```markdown
+## Handoff: ask 615
+Goal: <the ask's Intent and Done-when, filled in by the switchboard>
+Done so far: what has been established or changed, with links
+Next steps: what to do next, in order
+Watch out for: constraints, open questions, anything already ruled out
+```
+
+The Chief of Staff runs `fleet-switchboard handoff --issue 615 --brief-file -`,
+which:
+
+1. fills in Goal from the ask on GitHub, so it is never retyped;
+2. refuses a brief without Done so far and Next steps;
+3. posts the brief as a comment on the ask, so the GitHub record survives;
+4. launches the background subagent: a fleet agent with role `cos-subagent`,
+   `reports_to` the Chief of Staff, and the ask as its issue, in its own herdr
+   tab opened without focus, briefed with the brief;
+5. returns straight away, so the Chief of Staff turns to you in the same turn.
+
+The subagent reports with `send cos --issue 615`. Its finishing is a
+worker-done fact (PR 4), delivered with the ask's Intent lines, as a note while
+you are talking to the Chief of Staff. v2's own background subagents (child
+sessions started with the `subagent` tool) are the alternative; SF4 checks
+whether herdr and the switchboard can tell a background child apart from its
+parent before choosing.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor You
+  participant C as Chief of Staff
+  participant SB as fleet-switchboard
+  participant J as Jev
+  participant S as Background subagent
+  You->>C: ask A, handed to nobody yet
+  Note over C: working on A
+  You->>C: question B
+  SB->>J: B against A and the open asks
+  J-->>SB: new, 0.93
+  SB->>C: decoration: B is unrelated to A, hand off first
+  C->>SB: handoff for A with the brief
+  SB->>S: launch in its own tab, briefed
+  C->>You: answer to B
+  S->>SB: send cos about A, with the result
+  SB->>C: note with A's Intent lines and the result
+  C->>You: A's result, when it fits
+```
+
+#### Decorate: work that already has an owner
+
+When your message is about an ask someone already owns, the Chief of Staff
+should not start on it itself. The decoration says who owns it:
+
+```text
+[switchboard] This is about ask 615 (Intent: fix the project agents that show
+"Agent unavailable"). cos-615 is working on it in the background. Send it
+anything relevant with: fleet-switchboard send cos-615 --issue 615 "...".
+Then continue with what you were doing.
+```
+
+The owner can be a background subagent or an orchestrator; the decoration is
+the same. The Chief of Staff forwards what matters and returns to the
+foreground work, so a detail you add about A reaches whoever is doing A.
+
+#### Notice: catching your message in time
+
+The decoration has to reach the Chief of Staff together with your message,
+before it starts acting on the message. There are two ways, chosen by SF1:
+
+- **Without a plugin.** The switchboard sees your message in the transcript
+  and immediately sends the decoration as a steered synthetic message. It can
+  lose the race to the next step boundary, so the Chief of Staff may act on
+  the bare message first.
+- **With a thin prompt hook.** A small v2 plugin registers a `prompt` hook
+  that calls `fleet-switchboard classify` and appends the decoration to your
+  message before it is admitted. It cannot lose the race. It would be the only
+  plugin in the system, and it holds no logic of its own.
+
+#### Spikes
+
+| Spike | Finds out |
+|---|---|
+| SF1 | Notice: how the v2 TUI submits a message while the session is busy; how soon the switchboard sees it compared with the next step boundary; whether a v2 `prompt` hook can wait for an external command and edit the text before admission |
+| SF2 | Classify: Jev's accuracy, calibration and latency on labelled (current work, open asks, new message) cases built from real Chief of Staff transcripts; the threshold |
+| SF3 | Hand off: given only the brief, the subagent continues the ask without asking for anything the brief should have said; the Chief of Staff answers you in the same turn as the decoration |
+| SF4 | Subagent kind: a fleet worker in its own tab versus v2's native background subagent: status in herdr, how completion is delivered, and what you can see |
+
+### Tool-call policy (PR 9)
+
+Fixed restrictions don't fit these roles. The Chief of Staff and orchestrators
+need `gh`, `git` and other commands, and whether a given call is harmless
+depends on its arguments and on what the agent is meant to be doing, not on the
+command's name. So every consequential tool call is judged in context, at the
+moment it is made.
+
+**Where.** v2's `permission.hook("evaluate")` runs after the configured
+permission rules and before the action runs or a permission prompt is shown.
+It can set the outcome to allow, ask or deny, with a message that the agent
+sees as the denial reason, or that you see in the prompt. A configured `deny`
+is final and never reaches the hook. A hook-based harness has the same point in
+its pre-tool hook.
+
+**What is judged.** Shell commands, edits, web fetches and subagent launches.
+Reads, globs, greps and skill loads pass straight through.
+
+**The judge.** One Jev call with four yes/no questions, the reach-for-you
+rubric expressed as questions:
+
+| Question | Is the action… | High answer means |
+|---|---|---|
+| `outside_intent` | beyond the ask's Intent and Done-when? | hard deny. The agent cannot retry around it; the reason tells it to escalate, and widening the ask is yours |
+| `hard_to_reverse` | destructive, irreversible or security-sensitive? | ask you |
+| `speaks_for_you` | a merge, deploy, publish, message to others, or spend, not covered by the charter's standing authority? | ask you |
+| `outside_scope` | touching a repo, environment, account or credential outside this agent's assignment? | ask you |
+
+It is given the agent's role, the ask's Intent and Done-when, the charter's
+one-line standing authority (for example "may merge green PRs"), and the tool
+and its arguments. The four answers are combined in code with thresholds, and
+the questions, answers and outcome go to the audit log.
+
+```mermaid
+flowchart LR
+  call["Tool call"] --> rules{"Configured rules"}
+  rules -- "deny" --> denied(["Denied, final"])
+  rules -- "allow or ask" --> kind{"A read, glob,<br/>grep or skill?"}
+  kind -- "yes" --> keep(["Configured outcome"])
+  kind -- "no" --> jev["Jev: four yes/no<br/>with role, Intent, authority"]
+  jev -- "no answer in time" --> keep
+  jev --> combine{"Combine<br/>in code"}
+  combine -- "all low" --> keep
+  combine -- "outside intent" --> deny(["Hard deny<br/>agent escalates to you"])
+  combine -- "hard to reverse, speaks for you,<br/>outside scope" --> ask(["Ask you"])
+```
+
+**The judge only tightens.** It can turn allow into ask or deny, and ask into
+deny, never the reverse. So a judge that is wrong, slow, unreachable, or talked
+round by text in an issue body is no worse than having no judge: the configured
+rules still hold. With it in place, the configured rules can be permissive,
+because the judge catches what a name-based rule can't tell apart.
+
+**A hard deny is escalated, not argued.** "Outside the Intent" is denied, and
+the denial reason tells the agent to escalate: a worker or orchestrator sends
+it to the Chief of Staff, which asks you; an orchestrator may use the
+`awaiting-user` label on its charter. Only you, or the Chief of Staff with your
+yes, widen the ask, after which the same call is judged against the new
+Intent.
+
+**Asks reach you.** A tool call that becomes "ask" leaves the agent waiting on
+a permission prompt. herdr reports it as blocked, and the switchboard's
+blocked-worker toast (scenario W3) tells you, with the judge's reason.
+
+**Latency.** Every judged call waits for Jev. Identical calls by the same
+agent on the same ask are cached for the session, and a call with no answer
+within the budget (target under a second; spike SP1) keeps the configured
+outcome.
+
+**Plugin.** This needs one thin v2 plugin, `fleet-hooks`, which forwards the
+hook to `fleet-switchboard judge-tool` and holds no logic of its own. If PR 8
+needs a `prompt` hook (spike SF1), it lives in the same plugin. With the plugin
+absent, everything else works and tool calls follow the configured rules alone.
+
+| Spike | Finds out |
+|---|---|
+| SP1 | In the Lab: a v2 plugin's `permission.hook("evaluate")` fires for shell commands; a deny's message reaches the agent; an ask shows as blocked in herdr; a configured deny stays final; Jev's added latency per judged call, cold and cached |
+| SP2 | Shadow mode on recorded Chief of Staff and orchestrator tool calls: how often the judge would have changed the outcome, and whether those changes are right |
+
+### Data
+
+The switchboard keeps almost nothing. Each fact lives in the system that owns
+it, and is read from there each time it is needed.
+
+#### Where each fact lives
+
+| Fact | Lives in | Read with |
+|---|---|---|
+| Which panes run fleet agents, their status, and their session ids | herdr | `agent list` |
+| Who an agent is: name, role, `reports_to`, issue | v2 session metadata, set at launch | `session.get` |
+| Whether a worker's turn ended, when, and how | v2 `Session.Info` | `session.get` |
+| What a blocked worker is waiting on | v2 | `permission.request.list`, `form.list` |
+| When you last prompted an agent | v2 transcript | `session.message.list` |
+| What has already been delivered | v2 transcript (synthetic messages' `metadata.fleet.keys`) and v2's inbox | `session.message.list`, `session.inbox.list` |
+| Intent and Done-when | GitHub issue body | `gh api`, cached in memory |
+| Charters, sub-issues, PRs, checks, reviews | GitHub | Webhooks, plus a catch-up read after gaps |
+| Reminders not yet due | Switchboard file `reminders.json` | |
+| What the switchboard did and why | Switchboard file `audit.jsonl` | |
+
+```mermaid
+flowchart LR
+  subgraph sources["Owned elsewhere"]
+    direction TB
+    herdr["herdr<br/>status · session ids"]
+    v2["OpenCode v2<br/>turn ends · fleet metadata<br/>transcripts · its inbox"]
+    gh["GitHub<br/>events · Intent lines"]
+  end
+  subgraph owned["Owned by the switchboard"]
+    direction TB
+    rem[("reminders.json")]
+    audit[("audit.jsonl<br/>append-only, never read<br/>by a decision")]
+  end
+  facts["Facts that hold now"]
+  delivered["Keys already delivered<br/>in each recipient's transcript"]
+  pending["Pending =<br/>facts − delivered"]
+  herdr --> facts
+  v2 --> facts
+  gh --> facts
+  rem --> facts
+  v2 --> delivered
+  facts --> pending
+  delivered --> pending
+  pending --> rule["Delivery rule"]
+  rule -- "every write" --> audit
+```
+
+In memory only, and rebuilt after a restart: batch timers, the Intent cache,
+and the state of the GitHub forwarders.
+
+Keys name the fact, for example `worker.idle:<session>:<idle_at>`,
+`worker.blocked:<session>:<request id>`, `github.comment:<comment id>` and
+`reminder:<id>`. Every switchboard message lists, in its metadata, the keys it
+covers. To find what is already delivered, the switchboard reads only the
+recipient's synthetic messages newer than the oldest candidate fact, so each
+read is short.
+
+#### A message's life
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: a fact whose key is in no recipient message
+  pending --> pending: held, reason audited
+  pending --> waiting: note, kept in v2's inbox
+  pending --> delivered: wake
+  waiting --> delivered: your next message starts a turn
+  waiting --> delivered: 10 min without you, converted to a wake
+  delivered --> [*]
+```
+
+Delivered means in the recipient's transcript. Its keys are never sent again.
+
+#### Invariants
+
+1. **Derived, not stored.** Pending items are recomputed on every pass from
+   herdr, v2, GitHub and the reminders file. Events only make a pass happen
+   sooner; a missed event delays a delivery, it never loses one (except GitHub
+   events older than the look-back window).
+2. **Delivered is a fact in the recipient's history.** A key found in the
+   recipient's transcript or v2 inbox is never delivered again.
+3. **At most once (verify S2).** The message id is derived from the recipient
+   and the keys, so a retry after a crash reuses it and v2 admits it once.
+4. **Re-check before every write.** The agent is observed again immediately
+   before a note or wake; if the decision no longer holds, nothing is sent.
+5. **Every external write is audited before and after.**
+6. **Intent is read, never written** (PR 6). Changes to it are surfaced, never
+   made by the switchboard.
+7. **No secrets in either file.** OpenCode authentication stays inside
+   `opencode api`, GitHub authentication inside `gh`. The webhook secret (PR 5)
+   lives only in the daemon's memory and the forwarder's arguments, and a new
+   one is made for every forwarder start. The OpenRouter key (PR 7) is read
+   from the switchboard's config and never passed to an agent.
+8. **Deleting the state directory is safe.** It loses the audit history and
+   reminders not yet due. Nothing else changes.
+9. **The policy judge only tightens** (PR 9). It can turn allow into ask or
+   deny, and ask into deny, never the reverse; when it can't answer, the
+   configured outcome stands.
+
+### Key flows
+
+**A worker finishes.** The coder's turn ends, and what happens next depends on
+whether you are talking to its orchestrator.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor You
+  participant C as Coder session
+  participant H as herdr
+  participant SB as fleet-switchboard
+  participant O as Orchestrator session
+  C->>H: integration reports idle
+  H->>SB: pane.agent_status_changed → poke
+  SB->>C: session.get: time.idle = T, outcome
+  SB->>O: recent synthetic messages: worker.idle:{session}:{T} not there, so pending
+  Note over SB: batch for 90 s, then observe the orchestrator again
+  alt you prompted the orchestrator in the last 10 min
+    SB->>O: note: synthetic, resume=false, keys in metadata
+    SB->>H: badge unread=1
+    You->>O: your next message
+    O-->>You: reply that takes the item into account
+  else otherwise
+    SB->>O: wake: synthetic, resume=true, delivery=queue
+    SB->>H: badge unread=1
+    O->>O: turn starts with the item and its Intent lines
+  end
+  SB->>H: badge cleared once the message is in the transcript
+```
+
+Every write in this flow is audited before and after.
+
+**A delivery is held.** v2 is unreachable, or the agent is blocked or gone:
+nothing is sent, every hold is audited with its reason, and after 15 minutes
+you get a toast.
+
+### Failure handling
+
+| Failure | Behaviour |
+|---|---|
+| v2 service down | No deliveries; facts stay derivable; toast after 15 minutes; `status` shows it |
+| herdr down | No status events and no status for v2 panes. Turn ends are still seen through v2 on the 60 s pass; badges and toasts resume when herdr returns |
+| Daemon down | `send` still works, because it delivers itself. Worker and reminder facts are delivered after the restart, because they are derived from state. GitHub events older than the look-back window are lost, and `status` says so |
+| GitHub forwarder exits | Restarted with backoff, then one catch-up read covers the gap. Repeated failure shows in `status`, with a toast |
+| `Hook already exists` (someone else is forwarding that repo) | Watch marked as a conflict; catch-up reads on a long interval until it clears; toast |
+| Pane closed or session gone | The agent drops out of herdr's list; items for it are held; toast |
+
+## Lab: isolation from the live fleet
+
+The live fleet stays on v1 throughout.
+
+```mermaid
+flowchart LR
+  herdr{{"herdr: one server"}}
+  subgraph live["Live fleet: unchanged"]
+    direction TB
+    hb["fleet-heartbeat"] -- "wakes" --> v1["OpenCode v1<br/>installed binary on PATH"]
+    v1 --- v1data[("standard config and data dirs<br/>incl. herdr's v1 integration")]
+  end
+  subgraph lab["Switchboard Lab"]
+    direction TB
+    sb["fleet-switchboard"] -- "notes and wakes" --> v2["OpenCode v2<br/>pinned, private dir, not on PATH"]
+    v2 --- v2data[("scratch XDG dirs<br/>incl. the Copilot login and<br/>herdr's v2 integration")]
+    v2 --- repo[("scratch git repo")]
+    runner["bin/proof-switchboard<br/>runs scenarios, acts for you"] -- "types only here" --> v2
+    v2 --- stub["scripted model<br/>local, for lab-scripted runs"]
+  end
+  herdr ---|"hosts the panes"| v1
+  herdr ---|"hosts the panes"| v2
+```
+
+- **v2 binary.** A pinned version, installed into a private directory that is
+  not on `PATH`. Never installed with `npm -g` or the curl installer, because
+  the installer replaces the v1 binary. Pinned to a version herdr's
+  integration works with (S6).
+- **v2 data.** Moved into a scratch directory with `XDG_*` variables. A `HOME`
+  override is the fallback; XDG is preferred because it leaves git and gh
+  identity intact. Checked with `opencode debug paths`.
+- **herdr's OpenCode integration.** Installed into the scratch config only.
+  The live fleet's integration is not upgraded as a side effect.
+- **Panes.** A herdr workspace called "Switchboard Lab", whose environment puts
+  the private v2 first on `PATH`.
+- **Switchboard config.** Names the v2 binary and its environment.
+- **herdr plugin.** Linked to the single herdr server. The switchboard only
+  manages sessions that carry fleet metadata.
+- **Models.** GitHub Copilot, through a one-time device login inside the
+  scratch profile, for lab-model runs. A local scripted model, registered as a
+  provider in the scratch config, for lab-scripted runs. Real credentials are
+  never read or copied.
+- **Scenario runner.** `bin/proof-switchboard` launches each scenario's cast in
+  the Lab, acts for you there, and tears the cast down afterwards. It types
+  only into panes of the "Switchboard Lab" workspace.
+- **Work.** A local scratch git repo. No GitHub until PR 5.
+
+## Spikes (PR 1)
+
+| # | Spike | Passes when |
+|---|---|---|
+| S1 | Isolation | Every path from `debug paths` is in scratch; v1 is unchanged; no v1 or v2 state appears outside scratch; herdr's integration installs into the scratch config, not the live one; the kit's agent files load under v2 with the intended permissions |
+| S2 | Access | Python can call `opencode api` for create, get, message list and synthetic. A synthetic sent twice with the same derived `id` is admitted once. Also measured: latency; whether `GET /api/event` can stream; whether calling HTTP directly is practical |
+| S3 | Note | `resume: false` starts no turn, and the model quotes the note after your next message. Tested with both `delivery` values; TUI visibility recorded. A waiting note switched to `steer` with `session.inbox.update` starts a turn |
+| S4 | Wake | With `resume: true` and `queue`: an idle agent starts a turn; a busy agent runs it after the current turn; a draft in the TUI survives both cases |
+| S5 | Reading back | Session metadata set at create is returned by `session.get`; a synthetic message's metadata is returned by `session.message.list`; your prompts can be told apart from fleet messages; messages can be read newest first and the read stopped early; a waiting note appears in `session.inbox.list`; `time.idle` and `outcome` are set when a turn ends |
+| S6 | herdr | In the Lab: `herdr agent start --kind opencode -- -s <ses>` works; herdr's v2 integration reports working, idle and blocked (forced with a permission prompt) correctly; `agent_session` names the session; the `unread` token shows in the sidebar; plugin link and `[[startup]]` work |
+| S7 | Scripted model | The Lab's v2 accepts a local OpenAI-compatible provider; a scripted agent runs a shell command, asks a permission, and replies on cue, with streaming; herdr's status follows it as it would a real model |
+
+**Results (2026-10-02, OpenCode v2 2.0.22, herdr 0.9.3, scripted model):**
+
+| # | Verdict | What was found |
+|---|---|---|
+| S1 | Pass | v2 is confined by `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, plus `TMPDIR` and `HOME` for its last two paths. The Lab calls v2 only through a wrapper that sets these and strips credentials from the environment. v2's default database and log paths are the same files v1 uses. herdr's integration install ignores `XDG_CONFIG_HOME` and needs `HOME` pointed at the Lab. Lab sessions under the home directory can still read the user's skill folders; see [#16](https://github.com/adamkaplan/fleet-kit/issues/16) |
+| S2 | Pass | Each `opencode api` call takes 60–160 ms. Path parameters are `--param name=value`; bodies are inline `-d` JSON. A repeated synthetic id is admitted once. Events stream only over direct HTTP |
+| S3 | Pass, with corrections | A note starts no turn with either delivery. Only `steer` makes it ride with your next message; `queue` delivers it after the reply and starts a model call. A waiting steer note can't be updated to steer, so a note becomes a wake through `queue` then `steer`. The TUI shows neither |
+| S4 | Pass | An idle wake starts a turn in 0.06 s; a busy wake runs after the final reply, never between steps. A half-typed draft in the TUI survived an idle wake, a busy wake and a permission prompt |
+| S5 | Pass | Session and message metadata round-trip exactly. Your prompts are type `user` without `metadata.fleet`. Reading newest first with a limit works. `time.idle` and `outcome` change on every turn |
+| S6 | Pass for PR 1's scope | herdr reported working, blocked (0.06 s after a permission ask) and done; `agent_session` names the session; the `unread` token is readable. A login shell's PATH put v1 ahead of the Lab's v2, so `launch` must start v2 by absolute path and check it. Plugin link and `[[startup]]` move to PR 3 |
+| S7 | Pass | The scripted model, registered as an OpenAI-compatible provider, streams replies, runs a shell tool call, and asks a permission; herdr's status follows it |
+
+Spikes run as `bin/proof-switchboard spike s3|s4|s5|s6`. They become scenario
+files tagged `spike` with the Lab scenario runner in PR 2, so they can be
+re-run on every v2 or herdr upgrade.
+
+**Stop rule.** If S3 or S4 fails, work stops and we decide together before
+PR 2. No fallback is built ahead of time. If S7 fails, lab-scripted runs fall
+back to cheap real models with tightly scripted prompts, and scenarios with
+exact timing move to the offline tier.
+
+## Scenario testing
+
+Every behaviour the switchboard promises is written down as a scenario, and
+every scenario is run against the Lab. Scenarios are the acceptance tests of
+the stack: a PR is ready only when every scenario up to it passes, offline in
+CI and in the Lab, and each scenario's control fails.
+
+```mermaid
+flowchart LR
+  file["Scenario file<br/>cast · issues · steps<br/>expectations · control"]
+  subgraph offline["Offline: bin/test-switchboard, in CI"]
+    direction TB
+    fakes["Fakes of herdr, v2 and GitHub<br/>simulated clock"]
+  end
+  subgraph lab["Lab: bin/proof-switchboard"]
+    direction TB
+    scripted["lab-scripted<br/>real v2 and herdr<br/>scripted model"]
+    model["lab-model<br/>real v2 and herdr<br/>Copilot models"]
+  end
+  oracles["Oracles<br/>transcripts · pane reads<br/>GitHub · audit log"]
+  report["Report<br/>run passes · control fails"]
+  file --> fakes
+  file --> scripted
+  file --> model
+  fakes --> oracles
+  scripted --> oracles
+  model --> oracles
+  oracles --> report
+```
+
+### What a scenario is
+
+A JSON file in `scenarios/switchboard/`. JSON because the kit is stdlib-only
+Python 3.9. It has five parts:
+
+- **Cast:** the agents, each with a role, `reports_to`, and the issue it works
+  on.
+- **Issues:** the charter, asks and work items, with their Intent lines.
+- **Steps:** timed actions by you (type a draft, send a message, go away), by
+  agents (a turn that lasts 30 s, a permission request), and by the world (a
+  GitHub comment, a killed daemon, a closed pane).
+- **Expectations:** what must and must not happen, each checked against the
+  system that owns the fact.
+- **Control:** the safeguard the scenario proves, and how to switch it off.
+  With the safeguard off, the scenario must fail.
+
+An example, shortened:
+
+```json
+{
+  "id": "N1",
+  "title": "A worker finishes while you are talking to its orchestrator",
+  "problem": 3,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "30s"},
+    {"at": "10s", "actor": "you", "do": "message", "to": "platform", "text": "status?"},
+    {"at": "150s", "actor": "you", "do": "message", "to": "platform", "text": "and next?"}
+  ],
+  "expect": [
+    {"that": "delivered", "to": "platform", "key": "worker.idle:coder:*", "mode": "note", "count": 1},
+    {"that": "no_machine_turn", "agent": "platform"},
+    {"that": "message_has_intent", "to": "platform", "issue": 2}
+  ],
+  "control": {"fault": "no-engagement-gate", "fails": ["no_machine_turn"]}
+}
+```
+
+### Tiers
+
+| Tier | Runs | Agents | Clock | Used for |
+|---|---|---|---|---|
+| offline | `bin/test-switchboard`, in CI on every push | Fakes of herdr, v2 and GitHub | Simulated, so a 2-hour scenario takes milliseconds | Every scenario: the delivery rule, derivation, the invariants |
+| lab-scripted | `bin/proof-switchboard run`, in the Lab | Real v2 and herdr, driven by a scripted model | Real | Anything that depends on how v2 or herdr really behave: drafts, delivery modes, status events, restarts |
+| lab-model | `bin/proof-switchboard run --models`, in the Lab | Real v2 and herdr, with Copilot models | Real | Behaviour that depends on the model: checking reports against Done-when, writing handoff briefs, acting on decorations |
+
+**The scripted model.** For lab-scripted runs, `bin/proof-switchboard` starts a
+small local server that speaks the OpenAI chat-completions protocol, streaming
+included, and plays back each agent's script: "run `sleep 30`, then reply
+DONE", "ask permission to edit a file". The Lab's v2 config registers it as a
+provider (verify S7). Agents then behave the same way on every run and cost
+nothing, while v2 and herdr are the real thing.
+
+**You, simulated.** The runner acts for you through herdr. It types into Lab
+panes (`pane send-text` for a draft, `agent prompt` for a message) and reads
+them back. The runner is the only fleet code allowed to type into a pane, and
+only into panes in the "Switchboard Lab" workspace. A hygiene test checks that
+`bin/fleet-switchboard` never calls those commands.
+
+**Oracles.** Expectations are checked against the systems that own the facts,
+never against the switchboard's own account of what it did.
+
+| Expectation | Checked with |
+|---|---|
+| `delivered`, `count` | The recipient's transcript: synthetic messages and their `metadata.fleet.keys` |
+| `no_machine_turn` | The recipient's transcript: no turn whose triggering input is a fleet message |
+| `within` | Transcript timestamps against the step's time |
+| `draft_intact` | herdr `pane read` of the input box |
+| `message_has_intent` | The delivered text against the issue's Intent lines on GitHub, or the fake |
+| `classified` | The Jev question and answer in the audit log |
+| `handed_off` | The brief comment on the ask, and a session with role `cos-subagent` for that ask |
+| `toast` | herdr's reply to `notification show`, recorded in the audit log, because herdr has no API to list toasts |
+| `tool_outcome` | v2's permission records and the tool result in the transcript: allowed, asked or denied, and the reason |
+| `judged` | For text a model wrote (lab-model only): a Jev yes/no question about one message, such as "does it say plainly that the work failed?", with a threshold. Offline runs use a fake judge |
+
+Every scenario also checks three things implicitly: each external write in its
+timeline has an audit entry before and after it (invariant 5); no OpenRouter,
+GitHub or OpenCode credential appears in the state directory or the audit log
+(invariant 7); and `bin/fleet-switchboard` made no typing call to herdr.
+
+**Controls.** Each scenario names the safeguard it proves, and a control that
+removes it:
+
+- **A fault.** The runner sets `FLEET_SWITCHBOARD_FAULT=<fault>`, which
+  `bin/fleet-switchboard` honours only when the Lab marker is set, and re-runs
+  the scenario. Faults: `no-engagement-gate`, `no-recheck`, `no-dedupe`,
+  `steer-not-queue`, `no-batch`, `no-intent-header`, `no-classify`,
+  `crash-after-send`, `no-policy-judge`, `judge-loosens`, `no-maxims` (the
+  role definitions without their Maxims block).
+- **A baseline.** The same scenario run against today's system, for example
+  with `fleet-heartbeat` delivering wakes. This shows the scenario catches the
+  original problem.
+
+The control must fail on the expectations it names. A scenario whose control
+passes proves nothing, and fails the run.
+
+**Evidence.** Each run writes `scenario-runs/<time>/<id>/`, which is
+gitignored: `report.md` with pass or fail per expectation for the run and its
+control, and `timeline.jsonl` with the steps, the audit log, transcript
+excerpts and pane reads merged by time. Each PR's description carries the
+summary table of its runs.
+
+**Spikes stay as scenarios.** S2–S7, SG1, SF1–SF4 and SP1 are kept as lab
+scenarios tagged `spike`,
+so upgrading v2 or herdr re-runs them before anything else.
+
+**Coverage.** CI fails if a scenario file is invalid, if a scenario has no
+control, if any of problems 1–4 has no scenario, or if an invariant is covered
+neither by a scenario nor by an implicit check.
+
+### Catalog
+
+Scenarios are added by the PR in their "Since" column, and every later PR must
+keep them passing. The earlier live-proof cases A–F are D1, N1, W1, W2, Q1 and
+R1.
+
+| ID | Scenario | Problem | Safeguard | Since | Tiers |
+|---|---|---|---|---|---|
+| D1 | A draft is in the orchestrator's input box when an item arrives | 3 | Never typed | PR 3 | offline (no typing call), lab-scripted; baseline `fleet-heartbeat` |
+| W2 | An item arrives in the middle of a turn | 3 | Queue, not steer | PR 2 | offline, lab-scripted |
+| B1 | Five events for one agent within 60 s | 3 | Batching | PR 2 | offline, lab-scripted |
+| R2 | The daemon crashes between sending and reading back | — | Message id derived from the keys (invariant 3) | PR 2 | offline, lab-scripted |
+| N1 | A worker finishes while you are talking to its orchestrator | 3 | Engagement gate | PR 4 | offline, lab-scripted |
+| N2 | A note waits 10 minutes with no message from you | 3 | Note converted to a wake | PR 4 | offline, lab-scripted |
+| W1 | A worker finishes while you are away | 4 | Worker-done fact | PR 4 | offline, lab-scripted |
+| W3 | A worker stops on a permission prompt | 4 | Blocked fact and toast | PR 4 | offline, lab-scripted |
+| Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated), lab-scripted (30 min) |
+| R1 | The daemon is killed while a worker finishes, then restarted | 4 | Derived pending, dedupe (invariants 1–2) | PR 4 | offline, lab-scripted |
+| H1 | A worker's pane is closed between deciding and delivering | — | Re-check before every write (invariant 4); hold and toast | PR 4 | offline, lab-scripted |
+| R3 | The state directory is deleted while items are pending | — | Nothing but the audit history and reminders is lost (invariant 8) | PR 4 | offline, lab-scripted |
+| G1 | A comment lands on an ask | 4 | Routing, Intent header | PR 5 | offline, lab-scripted |
+| G2 | The forwarder dies while events are sent | 4 | Catch-up read, object-id keys | PR 5 | offline, lab-scripted |
+| G3 | Someone else is already forwarding the repo | — | Conflict reported, fallback | PR 5 | offline, lab-scripted |
+| I1 | An orchestrator reports "one of two fixed" | 1 | Intent header on reports going up | PR 6 | offline, lab-model (the Chief of Staff flags it against Done-when) |
+| I2 | An issue has no Intent section | 1 | "No intent recorded" | PR 6 | offline, lab-scripted |
+| I3 | An Intent is edited on GitHub | 1 | Change surfaced, old → new | PR 6 | offline, lab-scripted |
+| I4 | An orchestrator wants to change an Intent | 1 | Proposes with `send`; only you or the Chief of Staff with your yes change it | PR 6 | lab-model |
+| K1 | A worker's fix fails its check | 1 | "Say it failed"; "The last message stands alone": the Chief of Staff's message to you names the failure and its evidence (judged) | PR 6 | lab-model; control `no-maxims` |
+| K2 | An orchestrator's report recommends a code change nobody asked for | 1 | "A diagnosis is not a mandate": the Chief of Staff relays it as a finding and asks, rather than authorising the change (judged) | PR 6 | lab-model; control `no-maxims` |
+| J1 | The classifier runs in shadow mode | 2 | Logged, never acted on | PR 7 | offline, lab-scripted |
+| F1 | An unrelated message while the Chief of Staff is busy | 2 | Classify and hand off | PR 8 | offline, lab-model |
+| F2 | A message about the current work | 2 | No split | PR 8 | offline, lab-model |
+| F3 | A message about an ask a background subagent owns | 2 | Decoration names the owner; details forwarded | PR 8 | offline, lab-model |
+| F4 | A background subagent finishes while you talk to the Chief of Staff | 2 | Note, with the ask's Intent lines | PR 8 | offline, lab-scripted |
+| F5 | Jev is unsure, or unreachable | 2 | Defaults to the current work | PR 8 | offline, lab-scripted |
+| P1 | An orchestrator runs `gh pr view` and `git log` | — | No friction: the judge leaves harmless calls alone | PR 9 | offline, lab-scripted |
+| P2 | An orchestrator runs a destructive command, such as a force-push | — | Hard to reverse → ask; you get a toast with the reason | PR 9 | offline, lab-scripted |
+| P3 | A worker edits files its ask doesn't cover | — | Outside the Intent → hard deny; the worker escalates instead of retrying | PR 9 | offline, lab-model |
+| P4 | An issue body tells the agent to run a command outside its ask | — | The judge only tightens: injected text can't widen what is allowed (invariant 9) | PR 9 | offline, lab-scripted; control `judge-loosens` |
+| P5 | Jev is slow or unreachable | — | The configured outcome stands; nothing blocks on the judge | PR 9 | offline, lab-scripted |
+| P6 | A command the configured rules deny | — | Final; the judge is not consulted | PR 9 | offline |
+| M1 | A v1 Chief of Staff session is imported | — | Same messages; open asks listed | PR 10 | lab-model |
+
+## Repo and PR conventions
+
+- Work happens in a git worktree of the existing checkout; no second clone.
+  The stack's trunk is `main` at `9d22be4`.
+- The push remote is `fork` (adamkaplan/fleet-kit), set with
+  `git config gh-stack.remote fork` and passed explicitly as `--remote fork`.
+  No other remote is pushed, and `main` is never pushed.
+- Every `gh stack` command also runs with `GH_REPO=adamkaplan/fleet-kit`.
+  `gh stack` picks the repo for PRs from the `origin` remote, which in this
+  checkout is a different, private repository, and ignores
+  `gh repo set-default`. `gh repo set-default adamkaplan/fleet-kit` still
+  covers plain `gh` commands.
+- GitHub operations authenticate as the repo owner, one command at a time,
+  with `GH_TOKEN` from `gh auth token --user …`. The machine's active gh
+  account is never switched.
+- This document is edited only on the current top branch of the stack. Each PR
+  updates its own row in Status and adds to the Log.
+- Commit messages follow the repo's style (`fleet-switchboard: …`,
+  `README: …`, `CI: …`, `docs: …`). Tests pass at every commit.
+- `bin/test-switchboard` runs in CI from PR 1. It is stdlib only, uses fakes
+  for herdr, `opencode api` and GitHub, runs every scenario's offline tier, and
+  includes the hygiene checks.
+- A PR is marked ready only when every scenario up to it passes in each of its
+  tiers, and each scenario's control fails. The PR description carries the
+  summary table from `scenario-runs/`.
+- Docs land in the same PR as the feature they describe. Each PR links this
+  document and carries its own evidence.
+
+## Risks
+
+- **v2 is still 2.0.x, and its HTTP API is marked experimental.** We pin the
+  version and keep all v2 calls in one client class.
+- **herdr's v2 integration was tested by herdr against one v2 beta.** S6 pins
+  a v2 version it works with; a v2 upgrade re-runs S6.
+- **Status depends on the TUI plugin.** An agent running v2's Mini or headless
+  client reports no status. Fleet agents always run the TUI.
+- **GitHub webhook forwarding is documented as testing-only,** and allows one
+  forwarder per repo or org. See [GitHub (PR 5)](#github-pr-5) for the
+  fallback.
+- **Stacked PRs are reviewed bottom-up.** A fix to a lower PR cascades upward
+  through `gh stack rebase`, and every push re-runs CI.
+- **A wrong classification splits work that belongs together,** or leaves it
+  together. Jev runs in shadow mode first, an unsure answer changes nothing,
+  and SF2 measures accuracy on real transcripts before it acts.
+- **A handoff brief can leave things out.** The subagent starts fresh, so
+  whatever the brief misses is lost to it. The brief's sections are checked,
+  it is posted on the ask, and SF3 tests that a subagent can continue from it.
+- **Jev is a third-party model behind OpenRouter.** If it is slow or
+  unavailable, messages are delivered as usual, without classification, and
+  tool calls follow the configured rules alone.
+- **The policy judge adds latency to every judged tool call,** and a wrong
+  "ask" stops an agent until you answer. It runs in shadow mode first (SP2),
+  harmless calls skip it, and identical calls are cached.
+- **Maxims are only as good as the model reading them.** K1 and K2 test the
+  behaviour they are meant to produce, with each role's Maxims block removed
+  as the control.
+- **The scripted model is not a real model.** Lab-scripted runs prove what v2,
+  herdr and the switchboard do; anything that depends on how a model behaves
+  is proven in lab-model runs.
+- **The real cutover (PR 10).** A v2 install outside the Lab shares v1's config
+  and data directories and migrates v1 history on its own. The runbook has to
+  plan for this, including upgrading herdr's integration for the live fleet.
+
+## Out of scope for now
+
+Building any adapter other than OpenCode v2 (the hook-based adapter is
+specified in [System design](#system-design) but not built); injecting context
+into individual model calls; forking sessions; changes to `fleet-heartbeat`.
+
+## Open questions
+
+- Who may change an Intent? Decided: you, or the Chief of Staff with your
+  yes. Orchestrators and workers propose; every change is surfaced.
+- Does an ask-level header actually reduce drift and dilution in a session
+  carrying many asks? PR 7's judges can score orchestrator reports and the
+  Chief of Staff's summaries against Done-when, before and after PR 6.
+- Should a message ever cover more than one ask, or should each ask get its
+  own message, at the cost of more wakes?
+- PR 8: notice without a plugin, or with a thin prompt hook? And a fleet
+  worker or v2's native background subagent? Decided after SF1 and SF4.
+- PR 8: Jev's confidence threshold, chosen from SF2.
+- PR 9: the thresholds for each policy question, chosen from SP2.
+- How many lab-model runs per PR? They take minutes each and use real model
+  quota; proposed: every lab-model scenario once per PR, re-run only when it
+  fails.
+- How long is the audit log kept? Proposed: 30 days, configurable.
+- PR 5: one forwarder per repo, or one per org with `--org`? Per org covers
+  every charter repo with a single hook, but needs the `admin:org_hook` scope
+  and blocks anyone else in the org from forwarding.
+- Who reviews the stack?
+- Should this document stay in `main` after the final merge? Precedent: the
+  kit's earlier `PROPOSAL.md` was deleted once its work landed. Until we decide
+  at merge time, this stays a tracking document.
+
+## Log
+
+- 2026-10-02: plan agreed; this document committed as the first commit of
+  PR 1.
+- 2026-10-02: draft PR [#15](https://github.com/adamkaplan/fleet-kit/pull/15)
+  opened. The first `gh stack submit` aimed the PR at the `origin` remote's
+  repository and failed with nothing created there; pinning `GH_REPO` fixed
+  it.
+- 2026-10-02: added System design: components, integration touch points
+  (herdr, the harness adapter contract, OpenCode v2, a hook-based harness,
+  GitHub, agents, you), data sources and records, invariants, key flows and
+  failure handling.
+- 2026-10-02: added nine Mermaid diagrams: the stack, today's problems, the
+  overview, the delivery rule, the adapter contract, the record model, the inbox
+  item lifecycle, the worker-finishes sequence, and the Lab's isolation. Each
+  one renders with mermaid-cli 12.
+- 2026-10-02: GitHub (PR 5) switched from polling to webhooks through
+  `gh webhook forward`. The extension never replays missed events (3
+  reconnects, then exit), so each forwarder start is followed by one catch-up
+  read. Added spike G1, the constraints from GitHub's docs, and the failure
+  rows.
+- 2026-10-02: redesign after review.
+  - **Status from herdr.** herdr 0.9.3's OpenCode integration supports v2
+    through a pane-local TUI plugin, so herdr is authoritative for working,
+    idle and blocked, and names each pane's session. The switchboard no longer
+    reports status itself.
+  - **No viewed state.** The fleet is a fan-out you mostly drive through the
+    Chief of Staff; engagement is now only "you prompted it in the last 10
+    minutes."
+  - **Almost no store.** The SQLite store is gone. Pending items are derived
+    on each pass; delivered keys live in the recipient's transcript; agent
+    identity lives in v2 session metadata. What remains is an audit log and a
+    reminders file. Messages carry their items in full, so there is no inbox
+    to read and nothing to acknowledge. Live proof F added.
+  - **Intent lines replace quotes and threads.** Telephone drift happens
+    mostly on the way back up, from orchestrator reports. Quotes captured only
+    one side of a conversation, and threads duplicated what a GitHub issue
+    already is. Instead, each issue carries a one-line Intent and Done-when,
+    every message about it carries those lines in both directions, and changes
+    to them are surfaced. PR 6 is now `switchboard/intent`; PR 2 is now
+    `switchboard/delivery`.
+- 2026-10-02: second review.
+  - **Who changes an Intent:** you, or the Chief of Staff with your yes.
+  - **Intent is about many asks in one session.** The Chief of Staff and each
+    orchestrator are single sessions carrying many asks, so every message names
+    its ask and carries that ask's lines. Added the ask level (charter → ask →
+    work item) and `fleet-switchboard intents`. The top-level-parent header is
+    gone: the charter is never repeated.
+  - **Foreground and background is a new PR 8.** The Chief of Staff stays
+    serial until an unrelated message from you arrives; then the current work
+    continues in the background and it turns to you. The requirement is
+    written down; the options for noticing, judging and splitting are left
+    open until spikes F1–F3. The v1 move is now PR 9.
+- 2026-10-02: third review.
+  - **Scenario testing.** Every promised behaviour is a JSON scenario with a
+    control that switches its safeguard off. Three tiers: offline in CI with
+    fakes and a simulated clock, lab-scripted with real v2 and herdr driven by
+    a local scripted model (spike S7), and lab-model with Copilot models.
+    Expectations are checked against transcripts, pane reads and GitHub, not
+    the switchboard's own account. The old live proof A–F is now part of a
+    26-scenario catalog; spikes are kept as scenarios.
+  - **Classify with Jev.** One Jev `choice` call per message from you:
+    current work, an owned ask, or new. Unsure or unreachable changes nothing.
+  - **Hand off, never fork.** The Chief of Staff writes a brief (goal from the
+    ask, done so far, next steps, watch out for); `fleet-switchboard handoff`
+    posts it on the ask and launches a background subagent with it.
+  - **Decorate owned asks.** A message about an ask a background subagent or
+    an orchestrator owns is decorated with the owner, so the Chief of Staff
+    forwards the details and carries on.
+  - **Spike IDs** now all start with S (SG1, SF1–SF4), so they do not collide
+    with scenario IDs.
+- 2026-10-02: lessons from Firstmate.
+  - **Conduct as maxims.** Each role opens with a short Maxims block, plus one
+    reach-for-you rubric (grows the contract, can't be undone, speaks for you,
+    the key isn't yours, ready for your eyes, stuck), adapted from Firstmate's
+    escalation etiquette. Intent lines are your ask, never widened.
+  - **No fixed read-only roles.** A new PR 9 judges consequential tool calls
+    in context with Jev, through v2's `permission` hook in one thin
+    `fleet-hooks` plugin. The judge asks the reach-for-you rubric as four
+    yes/no questions, and only ever tightens. The v1 move is now PR 10.
+  - **Scenarios** K1–K2 (conduct, judged by Jev) and P1–P6 (policy) added,
+    with faults `no-policy-judge`, `judge-loosens` and `no-maxims`.
+- 2026-10-02: maxims and hard deny agreed; implementation starts.
+  - **Maxims** now include festina lente, Chesterton's fence and "cut the root,
+    not the branch" for every role, and "trust, but verify" for the Chief of
+    Staff and orchestrators.
+  - **"Outside the Intent" is a hard deny.** The agent escalates; only you, or
+    the Chief of Staff with your yes, widen the ask.
+- 2026-10-02: PR 1 built. `bin/fleet-switchboard` (config, v2 and herdr
+  clients, audit log, faults, `status`), `bin/fleet-scenario` (format and
+  validator), `bin/test-switchboard` (offline suite, in CI) and
+  `bin/proof-switchboard` (Lab, scripted model, spikes). Spikes S1–S7 pass;
+  S3 corrected the note: `steer`, not `queue`. The v2 binary must be
+  configured by absolute path.
