@@ -10,7 +10,7 @@
 
 | PR | Branch | Scope | State |
 |---|---|---|---|
-| 1 | `switchboard/v2-client` | v2 client, isolated lab, spikes S1–S6 | in progress |
+| 1 | `switchboard/v2-client` | v2 client, isolated lab, spikes S1–S6 | draft [#15](https://github.com/adamkaplan/fleet-kit/pull/15) |
 | 2 | `switchboard/inbox` | Inbox, notes vs. wakes, batching | planned |
 | 3 | `switchboard/herdr` | `launch`, herdr plugin, badges, toasts, pane status | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; live proof A–E | planned |
@@ -170,6 +170,11 @@ A check only counts once we have seen it fail with its safeguard switched off.
 - The push remote is `fork` (adamkaplan/fleet-kit), set with
   `git config gh-stack.remote fork` and passed explicitly as `--remote fork`.
   No other remote is pushed, and `main` is never pushed.
+- Every `gh stack` command also runs with `GH_REPO=adamkaplan/fleet-kit`.
+  `gh stack` picks the repo for PRs from the `origin` remote, which in this
+  checkout is a different, private repository, and ignores
+  `gh repo set-default`. `gh repo set-default adamkaplan/fleet-kit` still
+  covers plain `gh` commands.
 - GitHub operations authenticate as the repo owner, one command at a time,
   with `GH_TOKEN` from `gh auth token --user …`. The machine's active gh
   account is never switched.
@@ -214,3 +219,7 @@ calls; changes to `fleet-heartbeat`.
 
 - 2026-10-02: plan agreed; this document committed as the first commit of
   PR 1.
+- 2026-10-02: draft PR [#15](https://github.com/adamkaplan/fleet-kit/pull/15)
+  opened. The first `gh stack submit` aimed the PR at the `origin` remote's
+  repository and failed with nothing created there; pinning `GH_REPO` fixed
+  it.
