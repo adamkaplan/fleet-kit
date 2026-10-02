@@ -1309,7 +1309,13 @@ def cmd_spike(lab, args):
 #               `id` is a name: the same name in one play is the same derived
 #               v2 message id; without it the id derives from session and key
 #   fact        a line in the engine's Lab fact source, $STATE/lab-facts.jsonl,
-#               created at the step's scheduled time
+#               created at the step's scheduled time. In the `fleet-heartbeat`
+#               baseline the runner instead types the wake into the agent's
+#               pane with `herdr agent prompt`, as the old heartbeat did; it
+#               is the only code allowed to type, and only in a Lab pane
+#   launch      `fleet-switchboard launch` for a cast member, into the Lab
+#               workspace; the member has no session until it runs. The runner
+#               closes the pane it opened when the play ends
 #   pass        one `fleet-switchboard run --once`, with the step's faults
 #   kill-daemon, restart-daemon  stop, and start again, the engine's daemon
 #   wait, away  only mark time here
@@ -1332,9 +1338,11 @@ ENGINE_POLL = 5  # seconds between the Lab daemon's passes, as the offline runne
 ENGINE_ACTIONS = ("fact", "pass", "kill-daemon", "restart-daemon")
 # What this tier plays and checks.
 RUN_ACTIONS = ("turn", "message", "draft", "away", "permission", "synthetic", "note", "wake",
-               "wait") + ENGINE_ACTIONS
+               "wait", "launch") + ENGINE_ACTIONS
 RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "delivered",
-                    "message_count", "model_saw", "status_is", "metadata_roundtrip")
+                    "message_count", "model_saw", "status_is", "metadata_roundtrip", "pane_runs_v2",
+                    "no_typing")
+RUN_BASELINES = ("fleet-heartbeat",)
 SYNTHETIC_DEFAULTS = {"note": (False, "steer"), "wake": (True, "queue"),
                       "synthetic": (False, "steer")}
 ROLE_AGENTS = {"orchestrator": "orchestrator", "coder": "coder",
@@ -1388,8 +1396,18 @@ def tui_members(scenario):
 
 
 def uses_engine(scenario):
-    """True when a step needs the switchboard engine: a fact, a pass, the daemon."""
+    """True when a step needs the switchboard engine: a fact, a pass, the daemon, a launch."""
+    return any(step["do"] in ENGINE_ACTIONS or step["do"] == "launch" for step in scenario["steps"])
+
+
+def runs_daemon(scenario):
+    """True when the engine's daemon runs through the play, watching a TUI per cast member."""
     return any(step["do"] in ENGINE_ACTIONS for step in scenario["steps"])
+
+
+def launched_members(scenario):
+    """Cast members `launch` creates: they have no session until it runs."""
+    return sorted({step["agent"] for step in scenario["steps"] if step["do"] == "launch"})
 
 
 def unsupported(scenario, fs):
@@ -1405,7 +1423,11 @@ def unsupported(scenario, fs):
                            % (item.get("name", i), item["that"]))
     control = scenario["control"]
     if "baseline" in control:
-        reasons.append("control baseline %r is not built in this tier yet" % control["baseline"])
+        if control["baseline"] not in RUN_BASELINES:
+            reasons.append("control baseline %r is not built in this tier yet" % control["baseline"])
+        elif not tui_members(scenario) or not any(step["do"] == "fact" for step in scenario["steps"]):
+            reasons.append("baseline %r types into a pane: it needs a fact step and a cast member on screen"
+                           % control["baseline"])
     elif "fault" in control and not uses_engine(scenario):
         reasons.append("control fault %r needs the switchboard engine, and no step runs it"
                        % control["fault"])
@@ -1525,7 +1547,11 @@ class LabEngine:
         os.makedirs(os.path.join(self.config_home, "fleet-switchboard"), exist_ok=True)
         os.makedirs(self.state, mode=0o700, exist_ok=True)
         os.chmod(self.state, 0o700)
-        self.config = {"opencode": lab.wrapper, "herdr": shutil.which("herdr") or "herdr"}
+        # The wrapper execs the real v2, so a pane runs lab.v2_bin; `launch` starts the TUI with the
+        # marker the wrapper needs to keep the pane's herdr identity (its plugin reports status).
+        self.config = {"opencode": lab.wrapper, "opencode_executable": lab.v2_bin,
+                       "launch_env": {"FLEET_SWITCHBOARD_LAB_PANE": "1"},
+                       "herdr": shutil.which("herdr") or "herdr"}
         with open(os.path.join(self.config_home, "fleet-switchboard", "config.json"), "w") as f:
             json.dump(self.config, f, indent=2, sort_keys=True)
         self.log_path = os.path.join(self.root, "daemon.log")
@@ -1559,6 +1585,11 @@ class LabEngine:
             report = None
         return {"rc": p.returncode, "faults": sorted(set(self.faults) | set(faults)), "report": report,
                 "stderr": short(p.stderr, 300)}
+
+    def launch(self, args, timeout=120):
+        """`fleet-switchboard launch ...` on this engine's config and state."""
+        return subprocess.run([sys.executable, ENGINE, "launch"] + list(args), env=self.env(),
+                              capture_output=True, text=True, timeout=timeout)
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
@@ -1657,10 +1688,11 @@ def short(text, width=90):
 class ScenarioRun:
     """One play of a scenario, the run or its control, on fresh sessions."""
 
-    def __init__(self, lab, scenario, label, pane, seconds, faults=()):
+    def __init__(self, lab, scenario, label, pane, seconds, faults=(), baseline=None):
         self.lab, self.v2 = lab, V2(lab)
         self.scenario, self.label, self.pane = scenario, label, pane
-        self.seconds, self.faults = seconds, sorted(faults)
+        self.seconds, self.faults, self.baseline = seconds, sorted(faults), baseline
+        self.launched_panes = []  # panes `launch` opened: the runner closes them
         self.tag = tag()
         self.cast, self.facts = {}, {}
         self.tui = (tui_members(scenario) or [None])[0]
@@ -1686,6 +1718,8 @@ class ScenarioRun:
         askers = {s["actor"] for s in self.scenario["steps"]
                   if s["do"] == "permission" and s["actor"] != "you"}
         for name, member in self.scenario["cast"].items():
+            if name in launched_members(self.scenario):
+                continue  # `launch` creates this one
             fleet = fleet_metadata(name, member)
             ses = self.v2.create_session(
                 "%s %s %s %s" % (sid, self.label, name, self.tag),
@@ -1707,10 +1741,14 @@ class ScenarioRun:
             if not done:
                 raise RunError("%s: the warm-up turn did not finish" % name)
         if uses_engine(self.scenario):
-            self.attach_cast()
+            if runs_daemon(self.scenario):
+                self.attach_cast()
             name = "%s-%s-%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), sid, self.label, self.tag)
             self.engine = LabEngine(self.lab, name, self.faults, self.note)
-            self.note("engine", dir=self.engine.root, config=self.engine.config, faults=self.faults)
+            # The heartbeat baseline is today's system: no switchboard daemon runs in it.
+            self.engine.on = runs_daemon(self.scenario) and not self.baseline
+            self.note("engine", dir=self.engine.root, config=self.engine.config, faults=self.faults,
+                      baseline=self.baseline)
         elif self.tui:
             if not self.pane:
                 raise RunError("no %r workspace pane for the TUI" % LAB_WORKSPACE_LABEL)
@@ -1857,6 +1895,10 @@ class ScenarioRun:
             rec = self.v2.synthetic(ses, step["text"], resume, delivery, keys, msg_id=msg_id)
             return {"via": "session.synthetic", "id": msg_id, "resume": resume,
                     "delivery": delivery, "keys": keys, "returned": rec.get("id")}
+        if do == "launch":
+            return self.launch(step)
+        if do == "fact" and self.baseline:
+            return self.type_wake(step)
         if do == "fact":
             # Created at the step's scheduled time, as the offline runner's clock does.
             return {"via": "lab-facts.jsonl", "fact": self.engine.fact(step, self.t0 + self.seconds(step["at"]))}
@@ -1879,6 +1921,48 @@ class ScenarioRun:
         if do in ("wait", "away"):
             return {do: True}
         raise RunError("cannot play %r" % do)
+
+    def type_wake(self, step):
+        """The `fleet-heartbeat` baseline: deliver the wake as the old heartbeat
+        did, typed with `herdr agent prompt` into the agent's pane. The runner is
+        the only code allowed to type, and only into a pane of the Lab workspace."""
+        pane, agent = self.screens[step["to"]]
+        lab_tui_guard(self.lab, lab_pane_guard(pane))
+        line = "[heartbeat] %s @script reply=ACK" % step["summary"]
+        p = herdr_run("agent", "prompt", agent, line)
+        if p.returncode:
+            raise RunError("herdr agent prompt: %s" % (p.stdout + p.stderr).strip()[:300])
+        return {"via": "herdr agent prompt", "agent": agent, "pane": pane, "text": line}
+
+    def launch(self, step):
+        """`fleet-switchboard launch` for a cast member, into the Lab workspace."""
+        name = step["agent"]
+        member = self.scenario["cast"][name]
+        ws = lab_workspace()
+        if not ws:
+            raise RunError("no %r workspace to launch into" % LAB_WORKSPACE_LABEL)
+        marker = "lab-cast-%s-%s" % (self.tag, name)
+        brief = os.path.join(self.engine.root, "brief-%s.md" % name)
+        with open(brief, "w") as f:  # the runner writes the scripted model's @script line, never the scenario
+            f.write("%s: %s\n@script reply=BRIEFED\n" % (marker, step.get("brief", "begin")))
+        args = [name, "--agent", ROLE_AGENTS.get(member["role"], "coder"), "--dir", self.lab.repo,
+                "--workspace", ws["workspace_id"], "--role", member["role"], "--brief-file", brief]
+        for flag, key in (("--reports-to", "reports_to"), ("--issue", "issue")):
+            if key in member:
+                args += [flag, str(member[key])]
+        p = self.engine.launch(args)
+        try:
+            done = json.loads(p.stdout)
+        except ValueError:
+            raise RunError("launch: rc %s: %s" % (p.returncode, short(p.stderr or p.stdout, 300)))
+        if p.returncode:
+            raise RunError("launch: rc %s: %s" % (p.returncode, short(p.stderr, 300)))
+        self.launched_panes.append(done["pane"])
+        lab_pane_guard(done["pane"])  # whatever was opened must be inside the Lab workspace
+        self.cast[name] = {"session": done["session"], "fleet": fleet_metadata(name, member), "marker": marker}
+        self.screens[name] = (done["pane"], None)
+        self.note("launch", agent=name, **done)
+        return dict(done, via="fleet-switchboard launch")
 
     def settle(self, timeout=120):
         """Until no cast session runs, three reads in a row."""
@@ -2157,6 +2241,44 @@ class ScenarioRun:
         return in_box and not sent, "input box %r; sent in: %s" % (
             short(box.get("text") or "", 80), ", ".join(sent) or "no message")
 
+    def pane_of_session(self, session):
+        """The pane herdr says shows `session`, and its agent entry; found through `agent list`."""
+        for entry in herdr("agent", "list").get("agents") or []:
+            if fleet_session(entry) == session:
+                return entry.get("pane_id"), entry
+        return None, None
+
+    def pane_programs(self, pane):
+        info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+        return info, [p for p in info.get("foreground_processes") or [] if isinstance(p, dict)]
+
+    def check_pane_runs_v2(self, item):
+        """herdr: the agent in the pane that shows the session is opencode, and
+        the pane's process is the Lab's v2 binary on that session."""
+        session = self.agent_facts(item)["session"]
+        pane, entry = self.pane_of_session(session)
+        if not pane:
+            return False, "no herdr agent shows session %s" % session
+        _, programs = self.pane_programs(pane)
+        cmdlines = [p.get("cmdline", "") for p in programs]
+        ok = entry.get("agent") == "opencode" and any(
+            c.startswith(self.lab.v2_bin + " ") and ("-s %s" % session) in c for c in cmdlines)
+        return ok, "pane %s: herdr agent %r on %s; processes %s" % (pane, entry.get("agent"), session, cmdlines)
+
+    def check_no_typing(self, item):
+        """herdr process-info: the pane's first process is the v2 itself. A pane
+        that was typed into has a shell under it, and the shell's pid is not the v2's."""
+        session = self.agent_facts(item)["session"]
+        pane, _ = self.pane_of_session(session)
+        if not pane:
+            return False, "no herdr agent shows session %s" % session
+        info, programs = self.pane_programs(pane)
+        v2 = [p for p in programs if str(p.get("cmdline", "")).startswith(self.lab.v2_bin)]
+        shells = [p.get("name") for p in programs if p.get("name") in ("zsh", "bash", "sh", "fish")]
+        ok = bool(v2) and not shells and all(p.get("pid") == info.get("shell_pid") for p in v2)
+        return ok, "pane %s: v2 pid %s, pane's first process pid %s, shells %s" % (
+            pane, [p.get("pid") for p in v2], info.get("shell_pid"), shells or "none")
+
     def check_tool_outcome(self, item):
         """The transcript's record of the agent's last `tool` call (default
         shell): its final state must be `outcome` (completed, error), and a
@@ -2186,9 +2308,13 @@ class ScenarioRun:
             self.engine.stop("teardown")
         if self.watch and self.watch.is_alive():
             self.watch.stop()
+        for pane in self.launched_panes:  # the pane has no shell: closing it ends the TUI
+            lab_pane_guard(pane)
+            herdr_run("pane", "close", pane)
         if uses_engine(self.scenario):
-            for pane, _ in self.screens.values():
-                lab_shell_ready(self.lab, pane)
+            for name, (pane, _) in self.screens.items():
+                if pane not in self.launched_panes:
+                    lab_shell_ready(self.lab, pane)
             return
         if not self.tui_ready:
             return
@@ -2199,8 +2325,8 @@ class ScenarioRun:
             time.sleep(0.5)
 
 
-def play_scenario(lab, scenario, label, pane, seconds, faults=()):
-    run = ScenarioRun(lab, scenario, label, pane, seconds, faults)
+def play_scenario(lab, scenario, label, pane, seconds, faults=(), baseline=None):
+    run = ScenarioRun(lab, scenario, label, pane, seconds, faults, baseline)
     results = []
     try:
         run.setup()
@@ -2245,14 +2371,19 @@ def write_scenario_evidence(out_dir, scenario, plays, verdict, stamp):
         lines.append("## %s" % ("Run" if label == "run" else "Control"))
         lines.append("")
         if label == "control":
-            how = ("Fault: `%s` on every engine process" % control["fault"] if "fault" in control
-                   else "Variant: `%s`" % json.dumps(control["variant"], sort_keys=True))
+            if "fault" in control:
+                how = "Fault: `%s` on every engine process" % control["fault"]
+            elif "baseline" in control:
+                how = "Baseline: `%s`, the wake typed into the pane" % control["baseline"]
+            else:
+                how = "Variant: `%s`" % json.dumps(control["variant"], sort_keys=True)
             lines.append("%s. It must fail: %s." % (how, ", ".join(control["fails"])))
             lines.append("")
         lines.append("Sessions: %s" % ", ".join("%s `%s`" % (n, m["session"]) for n, m in run.cast.items()))
         if run.screens:
-            lines.append("Lab TUI: %s" % ", ".join("%s in pane `%s` (herdr agent `%s`)" % (n, p, a)
-                                                     for n, (p, a) in sorted(run.screens.items())))
+            lines.append("Lab TUI: %s" % ", ".join(
+                "%s in pane `%s`%s" % (n, p, " (herdr agent `%s`)" % a if a else " (opened by launch)")
+                for n, (p, a) in sorted(run.screens.items())))
         if run.engine:
             lines.append("Engine: `bin/fleet-switchboard`, config and state in `%s`; daemon started %d time(s)%s"
                          % (run.engine.root, run.engine.starts,
@@ -2342,6 +2473,9 @@ def cmd_run(lab, args):
             if "fault" in control:
                 plays["control"] = play_scenario(lab, scenario, "control", pane, fs.duration_seconds,
                                                  [control["fault"]])
+            elif "baseline" in control:
+                plays["control"] = play_scenario(lab, scenario, "control", pane, fs.duration_seconds,
+                                                 baseline=control["baseline"])
             else:
                 variant = fs.apply_variant(scenario, control["variant"])
                 plays["control"] = play_scenario(lab, variant, "control", pane, fs.duration_seconds)

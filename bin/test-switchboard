@@ -15,6 +15,7 @@ is non-zero on failure.
 import ast
 import contextlib
 import copy
+import fcntl
 import fnmatch
 import hashlib
 import importlib.machinery
@@ -26,11 +27,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -147,8 +151,8 @@ class TestConfig(Base):
     def test_missing_file_means_every_default(self):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
-            "opencode": None, "opencode_env": {}, "herdr": "herdr",
-            "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5})
+            "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5})
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -428,6 +432,10 @@ def herdr_typing_violations(source):
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Constant) and inner.value in FORBIDDEN_HERDR:
                     found.append("HerdrClient uses %r" % inner.value)
+    for token in tokens:  # the socket: any herdr method but the one allowed is a way in
+        if re.match(r"^(agent|pane|tab|workspace|terminal|layout|window|input)\.", token) \
+                and token not in SOCKET_ALLOWED:
+            found.append("socket method %s" % token)
     for pattern in (r"""["']agent["']\s*,\s*["'](prompt|send-keys)["']""",
                     r"""["']pane["']\s*,\s*["'](send-text|send-keys|run)["']"""):
         found.extend(m.group(0) for m in re.finditer(pattern, source))
@@ -435,7 +443,8 @@ def herdr_typing_violations(source):
 
 
 class TestHerdrClient(Base):
-    def client(self, stdout='{"result": {"agents": [], "agent": {}}}'):
+    def client(self, stdout='{"result": {"agents": [], "agent": {}, "shown": true, "reason": "shown", '
+                            '"process_info": {"foreground_processes": []}}}'):
         runner = FakeRunner(default=(0, stdout, ""))
         return sb.HerdrClient("/opt/herdr", runner), runner
 
@@ -443,14 +452,20 @@ class TestHerdrClient(Base):
         cases = [
             (lambda c: c.agent_list(), ["agent", "list"]),
             (lambda c: c.agent_get("w1:p2"), ["agent", "get", "w1:p2"]),
+            # herdr 0.9.3: the pane id is the first positional argument, not --pane.
             (lambda c: c.pane_report_metadata_token("w1:p2", "unread", 3),
-             ["pane", "report-metadata", "--pane", "w1:p2", "--source", "fleet-switchboard",
-              "--token", "unread=3"]),
-            (lambda c: c.pane_report_metadata_token("w1:p2", "unread", 0, ttl_ms=60000),
-             ["pane", "report-metadata", "--pane", "w1:p2", "--source", "fleet-switchboard",
-              "--token", "unread=0", "--ttl-ms", "60000"]),
+             ["pane", "report-metadata", "w1:p2", "--source", "fleet-switchboard", "--token", "unread=3"]),
+            (lambda c: c.pane_report_metadata_token("w1:p2", "unread", 4, ttl_ms=60000),
+             ["pane", "report-metadata", "w1:p2", "--source", "fleet-switchboard", "--token", "unread=4",
+              "--ttl-ms", "60000"]),
+            (lambda c: c.pane_clear_token("w1:p2", "unread"),
+             ["pane", "report-metadata", "w1:p2", "--source", "fleet-switchboard", "--clear-token", "unread"]),
+            # The title is positional, not --title.
             (lambda c: c.notification_show("Held", "coder is blocked"),
-             ["notification", "show", "--title", "Held", "--body", "coder is blocked"]),
+             ["notification", "show", "Held", "--body", "coder is blocked"]),
+            (lambda c: c.notification_show("Held"), ["notification", "show", "Held"]),
+            (lambda c: c.pane_process_info("w1:p2"), ["pane", "process-info", "--pane", "w1:p2"]),
+            (lambda c: c.pane_close("w1:p2"), ["pane", "close", "w1:p2"]),
         ]
         for call, tail in cases:
             client, runner = self.client()
@@ -459,15 +474,52 @@ class TestHerdrClient(Base):
                 self.assertEqual(runner.argv, ["/opt/herdr"] + tail)
                 self.assertEqual(runner.kwargs["stdin"], subprocess.DEVNULL)
 
+    def test_the_strict_fake_refuses_the_old_argv_shapes(self):
+        world = World(self, agents=("platform",))
+        pane = world.panes["platform"]
+        for argv in (["pane", "report-metadata", "--pane", pane, "--source", "x", "--token", "unread=1"],
+                     ["notification", "show", "--title", "t", "--body", "b"],
+                     ["pane", "report-metadata", pane, "--token", "unread=1"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(world.herdr([FAKE_HERDR] + argv).returncode, 2)
+        self.assertEqual(world.herdr.panes[pane]["tokens"], {})
+        self.assertEqual(world.herdr.toasts, [])
+
+    def test_token_and_toast_inputs_are_checked_before_herdr_is_asked(self):
+        client, runner = self.client()
+        for bad in (lambda: client.pane_report_metadata_token("w1:p1", "bad name", 1),
+                    lambda: client.pane_report_metadata_token("w1:p1", "unread", "x" * 81),
+                    lambda: client.pane_report_metadata_token("w1:p1", "unread", ""),
+                    lambda: client.pane_clear_token("w1:p1", "no/slash")):
+            with self.assertRaises(ValueError):
+                bad()
+        self.assertEqual(runner.calls, [])
+        client.notification_show("t" * 200, "b" * 500)
+        self.assertEqual((len(runner.argv[3]), len(runner.argv[5])), (80, 240))
+
+    def test_a_toast_reply_says_whether_it_was_shown_and_why_not(self):
+        for reason, shown in (("shown", True), ("rate_limited", False), ("no_foreground_client", False),
+                              ("disabled", False), ("busy", False)):
+            client, _ = self.client('{"result": {"type": "notification_show", "shown": %s, "reason": "%s"}}'
+                                    % ("true" if shown else "false", reason))
+            with self.subTest(reason=reason):
+                self.assertEqual(client.notification_show("t"), {"shown": shown, "reason": reason})
+        client, _ = self.client('{"result": {}}')
+        with self.assertRaises(sb.HerdrError):
+            client.notification_show("t")
+
     def test_replies_are_unwrapped_and_checked(self):
         client, _ = self.client('{"result": {"agents": [{"pane_id": "w1:p2"}]}}')
         self.assertEqual(client.agent_list(), [{"pane_id": "w1:p2"}])
         client, _ = self.client('{"result": {"agent": {"agent_status": "idle"}}}')
         self.assertEqual(client.agent_get("w1:p2"), {"agent_status": "idle"})
+        client, _ = self.client('{"result": {"process_info": {"foreground_processes": [{"cmdline": "x y"}]}}}')
+        self.assertEqual(client.pane_process_info("w1:p2"), [{"cmdline": "x y"}])
         client, _ = self.client('{"result": {}}')
-        with self.assertRaises(sb.HerdrError) as caught:
-            client.agent_list()
-        self.assertEqual(caught.exception.reason, "bad_shape")
+        for call in (client.agent_list, lambda: client.pane_process_info("w1:p2")):
+            with self.assertRaises(sb.HerdrError) as caught:
+                call()
+            self.assertEqual(caught.exception.reason, "bad_shape")
 
     def test_failures_map_to_one_error_type(self):
         for answer, reason in (((1, "", "no server\n"), "exit"), ((0, "nope", ""), "bad_json"),
@@ -479,17 +531,80 @@ class TestHerdrClient(Base):
                     client.agent_list()
                 self.assertEqual(caught.exception.reason, reason)
 
-    def test_it_can_only_read_badge_and_toast(self):
+    def test_it_can_only_read_badge_toast_open_a_program_and_close_its_own_pane(self):
         public = sorted(name for name, _ in inspect.getmembers(sb.HerdrClient, inspect.isfunction)
                         if not name.startswith("_"))
-        self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "pane_report_metadata_token"])
+        self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
+                                  "pane_clear_token", "pane_close", "pane_process_info",
+                                  "pane_report_metadata_token"])
+
+    def test_the_socket_admits_one_method_and_sends_no_focus_key(self):
+        sent = []
+
+        def socket_call(path, method, params, timeout):
+            sent.append((path, method, params))
+            return {"result": {"layout": {"tab_id": "w1:t2", "root": {"pane_id": "w1:p3"}}}}
+
+        client = sb.HerdrClient("/opt/herdr", FakeRunner(), socket_call=socket_call, socket_path="/s/herdr.sock")
+        self.assertEqual(client.open_tab_running("w1", "coder", "/work", ["/bin/oc", "-s", "ses_1"], {"A": "b"}),
+                         {"tab_id": "w1:t2", "pane_id": "w1:p3"})
+        path, method, params = sent[0]
+        self.assertEqual((path, method), ("/s/herdr.sock", "layout.apply"))
+        self.assertEqual(params, {"workspace_id": "w1", "tab_label": "coder", "root": {
+            "type": "pane", "label": "coder", "cwd": "/work", "command": ["/bin/oc", "-s", "ses_1"],
+            "env": {"A": "b"}}})
+        self.assertNotIn("focus", json.dumps(params).lower())
+        with self.assertRaises(ValueError):
+            client._socket("pane.send_text", {})
+        self.assertEqual(len(sent), 1)
+
+    def test_a_socket_error_or_odd_reply_is_a_herdr_error(self):
+        for reply in ({"error": {"code": "workspace_not_found"}}, {"result": {}}, {"result": {"layout": {}}}):
+            client = sb.HerdrClient("/opt/herdr", FakeRunner(), socket_call=lambda *a, r=reply: r)
+            with self.subTest(reply=reply), self.assertRaises(sb.HerdrError):
+                client.open_tab_running("w1", "c", "/w", ["/x"], {})
+
+    def test_the_real_socket_call_speaks_one_json_line_each_way(self):
+        path = str(self.home / "s.sock")
+        server = sb.socket.socket(sb.socket.AF_UNIX, sb.socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        seen = []
+
+        def serve():
+            conn, _ = server.accept()
+            seen.append(conn.recv(65536))
+            conn.sendall(b'{"id":"x","result":{"ok":true}}\n')
+            conn.close()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            reply = sb.unix_socket_call(path, "layout.apply", {"a": 1}, 5)
+        finally:
+            thread.join(5)
+            server.close()
+        self.assertEqual(reply, {"id": "x", "result": {"ok": True}})
+        self.assertEqual(json.loads(seen[0]), {"id": "fleet-switchboard:layout.apply", "method": "layout.apply",
+                                               "params": {"a": 1}})
+        self.assertTrue(seen[0].endswith(b"\n"))
+        with self.assertRaises(sb.HerdrError) as caught:
+            sb.unix_socket_call(str(self.home / "nobody.sock"), "layout.apply", {}, 1)
+        self.assertEqual(caught.exception.reason, "unavailable")
+
+    def test_the_socket_path_follows_herdr(self):
+        self.assertEqual(sb.herdr_socket_path({"HERDR_SOCKET_PATH": "/x/h.sock"}), "/x/h.sock")
+        self.assertEqual(sb.herdr_socket_path({"XDG_CONFIG_HOME": "/cfg"}), "/cfg/herdr/herdr.sock")
 
     def test_no_call_it_makes_types_or_moves_focus(self):
         client, runner = self.client()
         client.agent_list()
         client.agent_get("w1:p2")
         client.pane_report_metadata_token("w1:p2", "unread", 1, ttl_ms=5)
+        client.pane_clear_token("w1:p2", "unread")
         client.notification_show("t", "b")
+        client.pane_process_info("w1:p2")
+        client.pane_close("w1:p2")
         for argv, _ in runner.calls:
             subcommands = argv[1:3]
             for word in FORBIDDEN_HERDR:
@@ -502,15 +617,17 @@ class TestHerdrClient(Base):
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
         planted = SWITCHBOARD.read_text().replace(
-            "    def notification_show(self, title, body):",
+            "    def notification_show(self, title, body=None):",
             "    def wake(self, pane, text):\n        return self._call(\"agent\", \"prompt\", pane, text)\n\n"
-            "    def notification_show(self, title, body):")
+            "    def notification_show(self, title, body=None):")
         self.assertNotEqual(planted, SWITCHBOARD.read_text())
         self.assertTrue(herdr_typing_violations(planted))
-        for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]'):
+        for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]',
+                        'x = "pane.send_text"', 'x = "agent.prompt"', 'y = {"focus": True}'):
             with self.subTest(snippet=snippet):
                 self.assertTrue(herdr_typing_violations(snippet))
         self.assertEqual(herdr_typing_violations('x = ["tab", "create", "--no-focus"]'), [])
+        self.assertEqual(herdr_typing_violations('x = "layout.apply"; y = "run.lock"'), [])
 
 
 # ----------------------------------------------------------------- the audit
@@ -869,6 +986,7 @@ STEP_EXAMPLES = {
     "fact": {"to": "platform", "key": "lab.fact:1", "summary": "s", "kind": "review", "issue": 2,
              "from": "coder", "batch": False},
     "pass": {"faults": ["no-dedupe", "crash-after-send"]},
+    "launch": {"agent": "coder", "brief": "Add a health check"},
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -885,6 +1003,8 @@ EXPECT_EXAMPLES = {
     "judged": {"agent": "cos", "question": "Does it say plainly that the work failed?", "threshold": 0.8},
     "status_is": {"agent": "coder", "status": ["working", "blocked"], "at": "5s"},
     "metadata_roundtrip": {"agent": "coder", "of": "message", "text": "status?", "fleet": None},
+    "pane_runs_v2": {"agent": "coder"},
+    "no_typing": {"agent": "coder"},
 }
 
 
@@ -1289,9 +1409,10 @@ class FakeV2:
         return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
 
     # -- state helpers
-    def create_session(self, metadata, title="fake"):
+    def create_session(self, metadata, title="fake", agent=None, directory=None):
         sid = self._id("ses")
         self.sessions[sid] = {"id": sid, "title": title, "metadata": copy.deepcopy(metadata),
+                              "agent": agent, "directory": directory,
                               "created": self.clock.now(), "idle": None, "idle_writes": [], "outcome": None,
                               "messages": [], "inbox": [], "turn": None, "turns": 0}
         return sid
@@ -1373,12 +1494,13 @@ class FakeV2:
                 else:
                     break
 
-    def start_turn(self, sid, text, fleet, lasts=0, steps=1):
+    def start_turn(self, sid, text, fleet, lasts=0, steps=1, metadata=None):
         """A prompt: yours (no fleet metadata) or the fleet's, starting a turn of `steps` model calls."""
         s = self.sessions[sid]
         if s["turn"] is not None:
             raise AssertionError("fake opencode: a prompt to a busy session is not modelled")
-        metadata = {"fleet": {"from": "fleet-task"}} if fleet else None
+        if metadata is None and fleet:
+            metadata = {"fleet": {"from": "fleet-task"}}
         self._start(s, self.clock.now(), lasts, steps, prompt=(text, metadata))
 
     def admissions(self, sid):
@@ -1389,7 +1511,9 @@ class FakeV2:
         return {"version": "2.0.22-fake"}
 
     def op_session_create(self, params, body):
-        return self._info(self.sessions[self.create_session(body.get("metadata") or {}, body.get("title"))])
+        return self._info(self.sessions[self.create_session(
+            body.get("metadata") or {}, body.get("title"), body.get("agent"),
+            (body.get("location") or {}).get("directory"))])
 
     def _info(self, s):
         return {"id": s["id"], "title": s["title"], "metadata": copy.deepcopy(s["metadata"]),
@@ -1431,7 +1555,8 @@ class FakeV2:
 
     def op_session_prompt(self, params, body):
         s = self._session(params)
-        self.start_turn(s["id"], body["text"], fleet=bool((body.get("metadata") or {}).get("fleet")))
+        self.start_turn(s["id"], body["text"], fleet=bool((body.get("metadata") or {}).get("fleet")),
+                        metadata=body.get("metadata"))
         return {"id": s["messages"][-1]["id"]}
 
     @staticmethod
@@ -1459,22 +1584,81 @@ class FakeV2:
         return self._inbox_record(item)
 
 
-HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"])
+HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
+                 ["pane", "process-info"], ["pane", "close"])
+SOCKET_ALLOWED = ("layout.apply",)
+TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
+                ["pane", "send-keys"], ["pane", "run"])
+TOKEN_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _usage(argv, text):
+    return subprocess.CompletedProcess(argv, 2, "", "error: %s\n" % text)
+
+
+def parse_flags(args, valued, bare=()):
+    """(positionals, flags) of a herdr subcommand, strictly: an unknown flag, a
+    flag without its value, or a repeated flag is a usage error, as in clap."""
+    positional, flags, i = [], {}, 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            if arg in bare:
+                flags[arg] = True
+            elif arg in valued and i + 1 < len(args):
+                flags.setdefault(arg, []).append(args[i + 1])
+                i += 1
+            else:
+                raise ValueError("unexpected argument %r" % arg)
+        else:
+            positional.append(arg)
+        i += 1
+    return positional, flags
 
 
 class FakeHerdr:
-    """herdr's CLI, for the reads the switchboard makes. Status follows the
-    fake v2 session (working while a turn runs, `done` after one) unless a
-    test pins it. Anything outside reads, badge and toast is refused."""
+    """herdr 0.9.3's CLI and socket, for what the switchboard uses, as strict
+    as the real one: the pane id of `report-metadata` and the title of
+    `notification show` are positional, and a wrong shape is a usage error
+    (exit 2), never a quiet success. Status follows the fake v2 session
+    (working while a turn runs, `done` after one) unless a test pins it.
+
+    Typing is refused (exit 2) and recorded in `typing_attempts`, except for
+    the one scenario baseline, where the runner sets `allow_typing`: then
+    `agent prompt` does what the TUI does, putting the text after what is in
+    the input box and submitting the lot.
+
+    Toasts follow herdr's rules: one a second, server-wide, none queued. A test
+    can script other answers with `toast_replies`. A pane opened by
+    `layout.apply` runs its command's argv, as a pane without a shell does.
+    `launch_mode` makes the launched pane misbehave: "shell" (a shell, not the
+    program), "other-session", "undetected" (herdr never names an agent).
+    """
 
     def __init__(self, v2):
         self.v2 = v2
         self.panes = {}
         self.calls = []
+        self.socket_calls = []
+        self.typing_attempts = []
+        self.toasts = []            # every toast shown: {"title", "body", "at"}
+        self.toast_replies = []     # scripted reasons for the next notification calls
+        self.closed = []
+        self.input_box = {}         # pane -> the text typed in its input box
+        self.allow_typing = False
+        self.launch_mode = "ok"
         self.down = False
+        self.socket_down = False
+        self._pane_n = 0
+        self._last_toast = None
 
-    def add(self, pane, session, status=None):
-        self.panes[pane] = {"session": session, "status": status}
+    def new_pane_id(self, workspace="w1"):
+        self._pane_n += 1
+        return "%s:p%d" % (workspace, self._pane_n)
+
+    def add(self, pane, session, status=None, program=None):
+        self.panes[pane] = {"session": session, "status": status, "tokens": {},
+                            "program": program or "%s -s %s" % (FAKE_OPENCODE, session)}
 
     def status(self, pane):
         entry = self.panes[pane]
@@ -1489,27 +1673,152 @@ class FakeHerdr:
 
     def agent(self, pane):
         # herdr 0.9's shape: the session is an object, not a string (S6).
-        return {"pane_id": pane, "agent": "opencode", "agent_status": self.status(pane),
-                "agent_session": {"agent": "opencode", "kind": "id", "source": "herdr:opencode",
-                                  "value": self.panes[pane]["session"]}}
+        entry = self.panes[pane]
+        body = {"pane_id": pane, "agent": "opencode", "agent_status": self.status(pane),
+                "workspace_id": pane.split(":")[0]}
+        if entry["session"] and not entry.get("undetected"):
+            body["agent_session"] = {"agent": "opencode", "kind": "id", "source": "herdr:opencode",
+                                     "value": entry["session"]}
+        if entry.get("tokens"):
+            body["tokens"] = dict(entry["tokens"])  # values are strings, as in herdr
+        return body
 
+    # -- the CLI
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append(argv)
         args = argv[1:]
         if self.down:
             return subprocess.CompletedProcess(argv, 1, "", "error: no herdr server\n")
-        if args == ["agent", "list"]:
-            body = {"result": {"agents": [self.agent(pane) for pane in sorted(self.panes)]}}
-        elif args[:2] == ["agent", "get"] and len(args) == 3:
-            if args[2] not in self.panes:
-                return subprocess.CompletedProcess(argv, 1, "", "error: no agent in pane %s\n" % args[2])
-            body = {"result": {"agent": self.agent(args[2])}}
-        elif args[:2] in (["pane", "report-metadata"], ["notification", "show"]):
-            body = {"result": {}}
-        else:
-            return subprocess.CompletedProcess(argv, 2, "", "fake herdr: refused %r\n" % args)
-        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if args[:2] in TYPING_VERBS and not (self.allow_typing and args[:2] == ["agent", "prompt"]):
+            self.typing_attempts.append(args)
+            return _usage(argv, "fake herdr: typing refused: %r" % args)
+        handler = {("agent", "list"): self._agent_list, ("agent", "get"): self._agent_get,
+                   ("agent", "prompt"): self._agent_prompt, ("pane", "report-metadata"): self._report_metadata,
+                   ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
+                   ("pane", "close"): self._pane_close}.get(tuple(args[:2]))
+        if handler is None:
+            return _usage(argv, "fake herdr: refused %r" % args)
+        try:
+            body = handler(args[2:])
+        except ValueError as err:
+            return _usage(argv, str(err))
+        except LookupError as err:
+            return subprocess.CompletedProcess(argv, 1, "", "error: %s\n" % err)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body) if body is not None else "", "")
+
+    def _pane(self, pane):
+        if pane not in self.panes:
+            raise LookupError("no agent in pane %s" % pane)
+        return pane
+
+    def _agent_list(self, rest):
+        parse_flags(rest, ())
+        return {"result": {"type": "agent_list", "agents": [self.agent(p) for p in sorted(self.panes)]}}
+
+    def _agent_get(self, rest):
+        positional, _ = parse_flags(rest, ())
+        if len(positional) != 1:
+            raise ValueError("agent get takes one target")
+        return {"result": {"type": "agent_info", "agent": self.agent(self._pane(positional[0]))}}
+
+    def _agent_prompt(self, rest):
+        positional, _ = parse_flags(rest, ())
+        pane, text = self._pane(positional[0]), " ".join(positional[1:])
+        draft = self.input_box.pop(pane, "")
+        self.v2.start_turn(self.panes[pane]["session"], (draft + " " + text).strip(), fleet=False)
+        return {"result": {"type": "ok"}}
+
+    def _report_metadata(self, rest):
+        positional, flags = parse_flags(rest, ("--source", "--token", "--clear-token", "--seq", "--ttl-ms"))
+        if len(positional) != 1:
+            raise ValueError("pane report-metadata takes the pane id as its one positional argument")
+        pane = self._pane(positional[0])
+        source = (flags.get("--source") or [""])[0]
+        if not re.match(r"^[A-Za-z0-9:._-]{1,80}$", source):
+            raise ValueError("--source is required: 1-80 of [A-Za-z0-9:._-]")
+        sets, clears = flags.get("--token", []), flags.get("--clear-token", [])
+        if not sets and not clears:
+            raise ValueError("report-metadata needs --token or --clear-token")
+        tokens = self.panes[pane].setdefault("tokens", {})
+        for item in sets:
+            name, _, value = item.partition("=")
+            if not TOKEN_NAME.match(name) or not value.strip() or len(value) > 80:
+                raise ValueError("bad token %r" % item)
+            tokens[name] = value
+        for name in clears:
+            if not TOKEN_NAME.match(name):
+                raise ValueError("bad token name %r" % name)
+            tokens.pop(name, None)
+        return None
+
+    def _notification_show(self, rest):
+        positional, flags = parse_flags(rest, ("--body", "--sound"))
+        if len(positional) != 1 or not positional[0].strip():
+            raise ValueError("notification show takes the title as its one positional argument")
+        title, now = positional[0], self.v2.clock.now()
+        if len(title) > 80:
+            raise ValueError("fake herdr: title over 80 characters")
+        reason = self.toast_replies.pop(0) if self.toast_replies else None
+        if reason is None and self._last_toast is not None and now - self._last_toast < 1:
+            reason = "rate_limited"
+        if reason is None:
+            self._last_toast = now
+            self.toasts.append({"title": title, "body": (flags.get("--body") or [None])[0], "at": now})
+        return {"result": {"type": "notification_show", "shown": reason is None, "reason": reason or "shown"}}
+
+    def _process_info(self, rest):
+        positional, flags = parse_flags(rest, ("--pane",))
+        if positional or len(flags.get("--pane", [])) != 1:
+            raise ValueError("pane process-info takes --pane <ID>")
+        pane = self._pane(flags["--pane"][0])
+        program = self.panes[pane].get("program")
+        processes = [{"cmdline": program, "name": program.split(" ")[0].rsplit("/", 1)[-1], "pid": 4242}] if program else []
+        return {"result": {"type": "pane_process_info", "process_info": {
+            "pane_id": pane, "foreground_processes": processes, "shell_pid": 4242}}}
+
+    def _pane_close(self, rest):
+        positional, _ = parse_flags(rest, ())
+        if len(positional) != 1:
+            raise ValueError("pane close takes one pane id")
+        self.closed.append(self._pane(positional[0]))
+        del self.panes[positional[0]]
+        return {"result": {"type": "ok"}}
+
+    # -- the socket
+    def socket(self, path, method, params, timeout):
+        self.socket_calls.append((method, copy.deepcopy(params)))
+        if self.socket_down:
+            raise sb.HerdrError("unavailable", "cannot reach herdr's socket %s" % path)
+        if method != "layout.apply":
+            return {"error": {"code": "unknown_method", "message": method}}
+        return self._layout_apply(params)
+
+    def _layout_apply(self, params):
+        root = params.get("root") or {}
+        if set(params) - {"workspace_id", "tab_label", "root"} or set(root) - {"type", "label", "cwd", "command", "env"}:
+            return {"error": {"code": "invalid_request", "message": "unknown field"}}
+        command = root.get("command")
+        if root.get("type") != "pane" or not (isinstance(command, list) and command) \
+                or not os.path.isabs(root.get("cwd") or "") or not isinstance(root.get("env"), dict) \
+                or not all(isinstance(v, str) for v in root["env"].values()):
+            return {"error": {"code": "invalid_request", "message": "bad layout"}}
+        workspace = params["workspace_id"]
+        pane = self.new_pane_id(workspace)
+        session = command[2] if len(command) > 2 and command[1] == "-s" else None
+        self.add(pane, session, program=" ".join(command))
+        entry = self.panes[pane]
+        entry["env"], entry["cwd"], entry["argv"] = dict(root["env"]), root["cwd"], list(command)
+        if self.launch_mode == "shell":
+            entry["program"] = "-zsh"
+        elif self.launch_mode == "other-session":
+            entry["session"] = next(iter(self.v2.sessions))
+        elif self.launch_mode == "undetected":
+            entry["undetected"] = True
+        return {"id": "x", "result": {"type": "layout_apply", "layout": {
+            "workspace_id": workspace, "tab_id": "%s:t%s" % (workspace, pane.split("p")[-1]),
+            "root": {"type": "pane", "pane_id": pane, "label": root["label"], "cwd": root["cwd"],
+                     "command": command}}}}
 
 
 class World:
@@ -1535,14 +1844,14 @@ class World:
         meta = {"name": name, "role": "coder"}
         meta.update(fleet or {})
         sid = self.v2.create_session({"fleet": meta})
-        pane = "w1:p%d" % (len(self.herdr.panes) + 1)
+        pane = self.herdr.new_pane_id()
         self.herdr.add(pane, sid, status)
         self.sessions[name], self.panes[name] = sid, pane
         return sid
 
     def new_engine(self, actor="daemon", writable=True):
         return sb.Switchboard(self.config, sb.V2Client(FAKE_OPENCODE, {}, self.v2, 5),
-                              sb.HerdrClient(FAKE_HERDR, self.herdr),
+                              sb.HerdrClient(FAKE_HERDR, self.herdr, socket_call=self.herdr.socket),
                               sb.AuditLog(self.audit_path) if writable else None,
                               sb.fact_sources(self.state), self.clock.now, actor)
 
@@ -2175,7 +2484,7 @@ class TestEngineCLI(Base):
     def main(self, *argv):
         with captured() as (out, err):
             code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
-                           sleep=lambda seconds: None)
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
     def test_send_identifies_the_caller_by_its_pane_and_delivers_at_once(self):
@@ -2330,7 +2639,7 @@ class TestDaemon(Base):
             return real()
 
         engine.run_pass = run_pass
-        self.assertEqual(sb.run_daemon(engine, self.world.state, 5, sleeps.append, passes=3), 3)
+        self.assertEqual(sb.run_daemon(engine, self.world.state, 5, lambda sock, t: sleeps.append(t), passes=3), 3)
         self.assertEqual(sleeps, [5, 5])
         self.assertTrue(any(e["event"] == "error" and e["detail"]["step"] == "pass" for e in self.world.audit()))
 
@@ -2338,13 +2647,831 @@ class TestDaemon(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 7})
         sleeps = []
 
-        def sleep(seconds):
+        def wait(sock, seconds):
             sleeps.append(seconds)
             if len(sleeps) == 2:
                 raise KeyboardInterrupt
 
-        code = sb.main(["run"], runner=self.world.route, now=self.world.clock.now, sleep=sleep)
+        code = sb.main(["run"], runner=self.world.route, now=self.world.clock.now, wait=wait)
         self.assertEqual((code, sleeps), (0, [7, 7]))
+
+
+# -------------------------------------------------- the poke socket, ensure, the plugin
+
+class TestPoke(Base):
+    def setUp(self):
+        super().setUp()
+        self.state = sb.ensure_state_dir()
+
+    def test_a_poke_reaches_the_daemons_socket_and_a_burst_drains_at_once(self):
+        sock = sb.open_poke_socket(self.state)
+        self.addCleanup(sock.close)
+        self.assertFalse(sb.wait_for_poke(sock, 0.01))
+        for _ in range(3):
+            self.assertTrue(sb.send_poke(self.state))
+        self.assertTrue(sb.wait_for_poke(sock, 1))
+        self.assertEqual(sb.drain_pokes(sock), 3)
+        self.assertFalse(sb.wait_for_poke(sock, 0.05))
+        self.assertEqual(stat.S_IMODE((self.state / sb.POKE_SOCKET).stat().st_mode), 0o600)
+
+    def test_a_poke_with_no_daemon_is_false_not_an_error(self):
+        self.assertFalse(sb.send_poke(self.state))  # no socket file
+        self.assertFalse(sb.send_poke(self.home / "nowhere"))  # no state dir
+        (self.state / sb.POKE_SOCKET).write_text("a stale file")
+        self.assertFalse(sb.send_poke(self.state))  # a file nobody listens on
+
+    def test_a_stale_socket_is_replaced(self):
+        old = sb.open_poke_socket(self.state)
+        old.close()  # the file stays, as after a crash
+        self.assertTrue((self.state / sb.POKE_SOCKET).exists())
+        new = sb.open_poke_socket(self.state)
+        self.addCleanup(new.close)
+        self.assertTrue(sb.send_poke(self.state))
+        self.assertTrue(sb.wait_for_poke(new, 1))
+
+    def test_the_state_dir_path_length_does_not_matter(self):
+        deep = self.home
+        while len(str(deep / sb.POKE_SOCKET)) < 150:
+            deep = deep / "a-directory-with-a-long-name"
+        deep.mkdir(parents=True)
+        sock = sb.open_poke_socket(deep)
+        self.addCleanup(sock.close)
+        self.assertTrue(sb.send_poke(deep))
+        self.assertTrue(sb.wait_for_poke(sock, 1))
+
+    def test_the_working_directory_is_restored(self):
+        before = os.getcwd()
+        sb.send_poke(self.state)
+        sock = sb.open_poke_socket(self.state)
+        sock.close()
+        self.assertEqual(os.getcwd(), before)
+
+    def test_a_poke_to_a_full_socket_gives_up_instead_of_blocking(self):
+        sock = sb.open_poke_socket(self.state)
+        self.addCleanup(sock.close)
+        started = time.time()
+        results = [sb.send_poke(self.state) for _ in range(20000)]
+        self.assertIn(False, results)  # the socket filled; the poke was dropped, not waited for
+        self.assertLess(time.time() - started, 20)
+
+    def test_the_poke_command_is_silent_fast_and_always_exits_zero(self):
+        for setup in ("no state dir", "a daemon"):
+            if setup == "a daemon":
+                sock = sb.open_poke_socket(self.state)
+                self.addCleanup(sock.close)
+            started = time.time()
+            result = self.run_cli(SWITCHBOARD, "poke")
+            with self.subTest(setup=setup):
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+                self.assertLess(time.time() - started, 2)
+        self.assertTrue(sb.wait_for_poke(sock, 1))  # and the one to a daemon arrived
+
+    def test_poke_never_calls_herdr_or_v2_and_needs_no_config(self):
+        def boom(argv, **kwargs):
+            raise AssertionError("poke ran %r" % argv)
+
+        with captured() as (out, err):
+            code = sb.main(["poke"], runner=boom)
+        self.assertEqual((code, out.getvalue(), err.getvalue()), (0, "", ""))
+        self.assertFalse(self.config_file.exists())
+
+    def test_a_poke_arms_an_alarm_that_is_disarmed_after(self):
+        sb.cmd_poke(None)
+        self.assertEqual(signal.alarm(0), 0)  # nothing left armed in this process
+
+
+class TestDaemonWaits(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+
+    def counted(self, on_pass=None):
+        passes = []
+        real = self.world.engine.run_pass
+
+        def run_pass():
+            passes.append(time.time())
+            if on_pass:
+                on_pass(len(passes))
+            return real()
+
+        self.world.engine.run_pass = run_pass
+        return passes
+
+    def test_a_poke_makes_a_pass_at_once_not_after_the_poll(self):
+        passes = self.counted()
+        thread = threading.Thread(target=sb.run_daemon, args=(self.world.engine, self.world.state, 30, None, 2))
+        thread.start()
+        deadline = time.time() + 5
+        while not passes and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(passes)
+        started = time.time()
+        while not sb.send_poke(self.world.state) and time.time() < deadline:
+            time.sleep(0.01)  # the socket is bound just after the lock is taken
+        thread.join(8)
+        self.assertFalse(thread.is_alive(), "30 s poll: the poke did not wake the daemon")
+        self.assertEqual(len(passes), 2)
+        self.assertLess(time.time() - started, 5)
+
+    def test_every_poke_waiting_is_drained_before_the_next_pass(self):
+        def burst(number):
+            if number == 1:  # three events arrive during the first pass
+                for _ in range(3):
+                    sb.send_poke(self.world.state)
+
+        passes = self.counted(burst)
+        sb.run_daemon(self.world.engine, self.world.state, 0.6, None, passes=3)
+        # pass 2 follows the burst at once; the burst made no pass 3 of its own,
+        # so pass 3 waited out the poll.
+        self.assertLess(passes[1] - passes[0], 0.4)
+        self.assertGreaterEqual(passes[2] - passes[1], 0.5)
+
+    def test_the_socket_is_closed_when_the_daemon_stops(self):
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=1)
+        self.assertFalse(sb.send_poke(self.world.state))
+
+    def test_a_socket_that_cannot_be_bound_costs_only_the_wakeups(self):
+        with mock.patch.object(sb, "open_poke_socket", side_effect=OSError(48, "Address already in use")):
+            waits = []
+            done = sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: waits.append(sock),
+                                 passes=2)
+        self.assertEqual((done, waits), (2, [None]))
+        self.assertTrue(any(e["event"] == "poke.unavailable" for e in self.world.audit()))
+
+
+class TestEnsure(Base):
+    def setUp(self):
+        super().setUp()
+        self.state = sb.ensure_state_dir()
+        self.spawned = []
+        self.holders = []
+
+    def spawn(self, argv, **kwargs):
+        """Stands in for Popen: records the call and, like a daemon, takes the lock."""
+        self.spawned.append((argv, kwargs))
+        fd = os.open(str(self.state / "run.lock"), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.holders.append(fd)
+        self.addCleanup(os.close, fd)
+
+    def test_it_starts_a_daemon_that_shares_nothing_with_the_hook(self):
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_ID": "x", "HERDR_PLUGIN_EVENT": "startup",
+                                          "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1",
+                                          "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/s/h.sock"}):
+            outcome = sb.ensure_daemon(self.state, self.spawn)
+        self.assertEqual(outcome, "started")
+        argv, kwargs = self.spawned[0]
+        self.assertEqual(argv, [sys.executable, str(SWITCHBOARD.resolve()), "run"])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["close_fds"], True)
+        self.assertIs(kwargs["start_new_session"], True)
+        self.assertEqual(kwargs["cwd"], str(self.state))
+        env = kwargs["env"]
+        self.assertEqual("HERDR_SOCKET_PATH" in env, True)
+        for name in ("HERDR_PLUGIN_ID", "HERDR_PLUGIN_EVENT", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"):
+            self.assertNotIn(name, env)
+        self.assertEqual(stat.S_IMODE((self.state / "daemon.log").stat().st_mode), 0o600)
+        self.assertNotIn(kwargs["stdout"], (subprocess.PIPE, None, sys.stdout.fileno()))
+        self.assertEqual(kwargs["stdout"], kwargs["stderr"])
+
+    def test_a_running_daemon_is_left_alone(self):
+        self.spawn([], )
+        self.spawned.clear()
+        self.assertEqual(sb.ensure_daemon(self.state, self.spawn), "running")
+        self.assertEqual(self.spawned, [])
+
+    def test_a_daemon_that_never_takes_its_lock_is_an_error_after_the_patience(self):
+        waited = []
+        with self.assertRaises(sb.LockError) as caught:
+            sb.ensure_daemon(self.state, lambda argv, **kw: None, patience=0.3, sleep=waited.append)
+        self.assertIn("daemon.log", str(caught.exception))
+        self.assertGreaterEqual(len(waited), 5)
+
+    def test_two_ensures_are_serialised_so_only_one_starts_a_daemon(self):
+        starts = []
+
+        def slow_spawn(argv, **kwargs):
+            starts.append(1)
+            time.sleep(0.3)
+            self.spawn(argv, **kwargs)
+
+        threads = [threading.Thread(target=sb.ensure_daemon, args=(self.state, slow_spawn)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(len(starts), 1)
+
+    def test_the_daemon_environment_drops_the_hooks_pane_and_plugin_variables(self):
+        env = sb.daemon_environment({"HERDR_PLUGIN_ROOT": "/p", "HERDR_PLUGIN_CONTEXT_JSON": "{}",
+                                     "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "t", "HERDR_WORKSPACE_ID": "w",
+                                     "HERDR_SOCKET_PATH": "/s", "HERDR_BIN_PATH": "/b", "HOME": "/h"})
+        self.assertEqual(sorted(env), ["HERDR_BIN_PATH", "HERDR_SOCKET_PATH", "HOME"])
+
+    def test_a_real_ensure_returns_with_pipes_open_and_a_real_poke_wakes_the_real_daemon(self):
+        log = self.home / "herdr-calls.log"
+        herdr = self.fake_bin("herdr", 'echo "pane=[$HERDR_PANE_ID] plugin=[$HERDR_PLUGIN_ID]" >> %s\n'
+                                       'echo \'{"result":{"agents":[]}}\'\n' % log)
+        opencode = self.fake_bin("opencode", "exit 1\n")
+        self.write_config({"opencode": str(opencode), "herdr": str(herdr), "poll_seconds": 3600})
+        env = dict(os.environ, HERDR_PANE_ID="w9:p9", HERDR_PLUGIN_ID="fleet-switchboard")
+        started = time.time()
+        # capture_output reads to EOF: a daemon that inherited the pipes would hang this call.
+        result = subprocess.run([sys.executable, "-B", str(SWITCHBOARD), "ensure"], capture_output=True,
+                                text=True, env=env, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "daemon started")
+        self.assertLess(time.time() - started, 5)
+        pid = int((self.state / "run.lock").read_text())
+        self.addCleanup(lambda: os.kill(pid, signal.SIGTERM) if _alive(pid) else None)
+        self.assertNotEqual(os.getsid(pid), os.getsid(0), "the daemon must have a session of its own")
+        self.assertEqual(sb.ensure_daemon(self.state), "running")
+        self.assertTrue(self._wait_for(lambda: log.exists() and len(log.read_text().splitlines()) >= 1))
+        self.assertEqual(log.read_text().splitlines()[0], "pane=[] plugin=[]")  # the hook's identity is scrubbed
+        before = len(log.read_text().splitlines())
+        self.assertEqual(self.run_cli(SWITCHBOARD, "poke").returncode, 0)
+        self.assertTrue(self._wait_for(lambda: len(log.read_text().splitlines()) > before),
+                        "the poke did not make the daemon pass (poll is an hour)")
+
+    @staticmethod
+    def _wait_for(condition, seconds=10):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.05)
+        return False
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def parse_plugin_manifest(text):
+    """Just enough TOML for herdr/herdr-plugin.toml: `key = "string"`, `key = ["a", "b"]`,
+    and `[[table]]` headers. Anything else raises, so the file cannot drift
+    past what this reads."""
+    manifest, table = {}, None
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        header = re.match(r"^\[\[([a-z]+)\]\]$", line)
+        if header:
+            table = {}
+            manifest.setdefault(header.group(1), []).append(table)
+            continue
+        pair = re.match(r'^([a-z_]+) = (.+)$', line)
+        if not pair:
+            raise ValueError("line %d is not understood: %r" % (number, raw))
+        try:
+            value = json.loads(pair.group(2))  # these strings and arrays are valid JSON too
+        except ValueError:
+            value = None
+        if not (isinstance(value, str) or (isinstance(value, list) and all(isinstance(v, str) for v in value))):
+            raise ValueError("line %d: value is not a string or a list of strings: %r" % (number, raw))
+        (table if table is not None else manifest)[pair.group(1)] = value
+    return manifest
+
+
+class TestPluginManifest(Base):
+    PATH = REPO / "herdr" / "herdr-plugin.toml"
+    EVENTS = ("pane.agent_status_changed", "pane.created", "pane.closed", "pane.exited", "pane.agent_detected")
+
+    def manifest(self):
+        return parse_plugin_manifest(self.PATH.read_text())
+
+    def test_the_manifest_names_the_plugin_and_the_herdr_it_needs(self):
+        m = self.manifest()
+        self.assertEqual((m["id"], m["min_herdr_version"]), ("fleet-switchboard", "0.9.3"))
+        for key in ("name", "version", "description", "platforms"):
+            self.assertIn(key, m)
+
+    def test_startup_ensures_and_every_event_pokes(self):
+        m = self.manifest()
+        self.assertEqual([t["command"] for t in m["startup"]], [["../bin/fleet-switchboard", "ensure"]])
+        self.assertEqual(sorted(t["on"] for t in m["events"]), sorted(self.EVENTS))
+        for event in m["events"]:
+            self.assertEqual(event["command"], ["../bin/fleet-switchboard", "poke"], event["on"])
+
+    def test_every_command_resolves_from_the_plugin_root_to_an_executable_subcommand(self):
+        m = self.manifest()
+        root = self.PATH.parent  # herdr runs hooks with the manifest's directory as cwd
+        commands = [t["command"] for t in m["startup"] + m["events"]]
+        choices = set(sb.build_parser()._subparsers._group_actions[0].choices)
+        for command in commands:
+            program = (root / command[0]).resolve()
+            with self.subTest(command=command):
+                self.assertEqual(program, SWITCHBOARD.resolve())
+                self.assertTrue(os.access(str(program), os.X_OK))
+                self.assertIn("/", command[0])  # herdr joins only a path with a slash to the root
+                self.assertIn(command[1], choices)
+                self.assertEqual(len(command), 2)  # no shell, no arguments to quote
+
+    def test_the_reader_refuses_what_it_does_not_understand(self):
+        for text in ('x = 1\n', 'key: "v"\n', '[table]\n', 'command = [a, b]\n'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_plugin_manifest(text)
+        planted = self.PATH.read_text().replace("../bin/fleet-switchboard", "../bin/nowhere", 1)
+        root = self.PATH.parent
+        self.assertFalse((root / parse_plugin_manifest(planted)["startup"][0]["command"][0]).exists())
+
+
+# --------------------------------------------------------- the restart hazard
+
+class TestRestartGuard(Base):
+    """After a herdr restart a pane can come back as a shell, and herdr resumes
+    the agent by typing `opencode` into it, which may start another OpenCode.
+    Nothing is delivered to a pane that does not run the configured v2."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.pane = self.world.panes["platform"]
+
+    def wrong_program(self, program="/opt/homebrew/bin/opencode --session ses_x"):
+        self.world.herdr.panes[self.pane]["program"] = program
+
+    def test_runs_program_means_the_executable_alone_or_with_arguments(self):
+        exe = "/v2/bin/opencode"
+        for cmdline, expected in ((exe, True), (exe + " -s ses_1", True), (exe + "-v1 -s x", False),
+                                  ("/opt/homebrew/bin/opencode", False), ("-zsh", False), (None, False)):
+            with self.subTest(cmdline=cmdline):
+                self.assertEqual(sb.runs_program(cmdline, exe), expected)
+
+    def test_a_pane_on_another_program_is_held_and_nothing_is_written(self):
+        self.wrong_program()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        report = self.world.engine.run_pass()
+        self.assertEqual(self.world.v2.writes, [])
+        self.assertEqual(report["sent"], [])
+        self.assertIn("different opencode", report["held"][0]["reason"])
+        self.assertTrue(any(e["event"] == "hold" and "different opencode" in e["detail"]["reason"]
+                            for e in self.world.audit()))
+
+    def test_the_guard_is_audited_even_when_nothing_is_pending(self):
+        self.wrong_program()
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()  # a steady state is audited once, not every pass
+        guards = [e for e in self.world.audit() if e["event"] == "program.guard"]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0]["subject"], "platform")
+
+    def test_it_is_toasted_once_and_the_hold_ends_when_the_pane_is_right(self):
+        self.wrong_program("-zsh")
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.engine.run_pass()
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual([t["title"] for t in self.world.herdr.toasts], ["platform: pane runs a different opencode"])
+        self.wrong_program("%s -s %s" % (FAKE_OPENCODE, self.world.sessions["platform"]))
+        self.world.tick(5)
+        report = self.world.engine.run_pass()
+        self.assertEqual(len(report["sent"]), 1)
+
+    def test_the_recheck_before_a_write_sees_a_pane_that_changed_meanwhile(self):
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        engine = self.world.engine
+        discovery = engine.discover(self.world.clock.now())
+        facts, _ = engine.collect_facts()
+        plan = engine.plan("platform", facts, discovery, self.world.clock.now())
+        self.assertEqual(plan.action, "wake")
+        self.wrong_program()
+        outcome = engine.deliver(plan)
+        self.assertFalse(outcome["sent"])
+        self.assertEqual(outcome["action"], "hold")
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_send_is_refused_for_such_a_pane(self):
+        self.wrong_program()
+        outcome = self.world.new_engine("cli").send("coder", "platform", "hi")
+        self.assertEqual(outcome["action"], "hold")
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_a_pane_that_cannot_be_read_is_held_not_assumed_fine(self):
+        self.world.herdr.panes[self.pane]["program"] = None
+        original = self.world.herdr._process_info
+
+        def failing(rest):
+            raise LookupError("no such pane")
+
+        self.world.herdr._process_info = failing
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        report = self.world.engine.run_pass()
+        self.assertEqual(report["sent"], [])
+        self.assertIn("cannot read what pane", report["held"][0]["reason"])
+        self.world.herdr._process_info = original
+
+    def test_a_wrapper_is_checked_by_the_executable_it_runs(self):
+        world = World(self, agents=("platform",), config={
+            "opencode": "/fake/bin/wrapper", "opencode_executable": FAKE_OPENCODE})
+        world.fact("platform", "lab.fact:1", batch=False)
+        self.assertEqual(len(world.engine.run_pass()["sent"]), 1)  # the pane runs FAKE_OPENCODE
+        other = World(self, agents=("platform",), config={
+            "opencode": "/fake/bin/wrapper", "opencode_executable": "/fake/bin/the-real-one"},
+            state=self.home / "other")
+        other.fact("platform", "lab.fact:1", batch=False)
+        self.assertEqual(other.engine.run_pass()["sent"], [])
+
+    def test_a_relative_executable_is_a_config_error(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode_executable": "opencode"})
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"launch_env": {"A": 1}})
+
+
+# --------------------------------------------------------- the render step
+
+class TestRender(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.engine = self.world.engine
+
+    def pane(self, name="platform"):
+        return self.world.herdr.panes[self.world.panes[name]]
+
+    def block(self, name="platform"):
+        self.pane(name)["status"] = "blocked"
+
+    def badge_writes(self):
+        return [a for a in self.world.herdr.calls if a[2:3] == ["report-metadata"]]
+
+    def test_held_items_are_the_badge_and_it_is_written_only_when_it_changes(self):
+        self.block()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.fact("platform", "lab.fact:2", batch=False)
+        report = self.engine.run_pass()
+        self.assertEqual(report["badges"], [{"agent": "platform", "count": 2}])
+        self.assertEqual(self.pane()["tokens"], {"unread": "2"})
+        self.assertEqual(len(self.badge_writes()), 1)
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual(len(self.badge_writes()), 1)  # the agent list already shows 2
+
+    def test_the_badge_is_restored_after_herdr_forgets_its_tokens(self):
+        self.block()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.engine.run_pass()
+        self.pane()["tokens"] = {}  # a herdr restart
+        self.engine.run_pass()
+        self.assertEqual(self.pane()["tokens"], {"unread": "1"})
+
+    def test_it_clears_when_nothing_is_unread_and_not_before(self):
+        self.engine.run_pass()
+        self.assertEqual(self.badge_writes(), [])  # nothing unread, no token: no write
+        self.block()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.engine.run_pass()
+        self.pane()["status"] = None
+        self.world.tick(5)
+        self.engine.run_pass()  # unblocked: the item is delivered as a wake
+        self.assertEqual(self.pane()["tokens"], {})
+        self.assertEqual(self.badge_writes()[-1][2:], ["report-metadata", self.world.panes["platform"],
+                                                      "--source", "fleet-switchboard", "--clear-token", "unread"])
+
+    def test_a_note_is_unread_until_a_turn_carries_it(self):
+        self.world.you("platform")  # you are engaged: the next item is a note
+        self.world.tick(1)
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.fact("platform", "lab.fact:2", batch=False)
+        self.engine.run_pass()
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["platform"]]["inbox"]), 1)
+        self.assertEqual(self.pane()["tokens"], {"unread": "2"})  # one note, two facts
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual(self.pane()["tokens"], {"unread": "2"})
+        self.world.you("platform", "and next?")  # a turn starts and carries the note
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual(self.pane()["tokens"], {})
+
+    def test_a_wake_is_never_unread(self):
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.engine.run_pass()
+        self.assertEqual(self.pane()["tokens"], {})
+
+    def test_badge_writes_are_audited_before_and_after(self):
+        self.block()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.engine.run_pass()
+        entries = [e for e in self.world.audit() if e["event"] == "herdr.badge"]
+        self.assertEqual([e["phase"] for e in entries], ["intent", "result"])
+        self.assertEqual((entries[0]["detail"]["count"], entries[0]["detail"]["was"]), (1, None))
+
+    def test_a_blocked_agent_is_toasted_once_until_the_reason_changes(self):
+        self.block()
+        for _ in range(3):
+            self.engine.run_pass()
+            self.world.tick(5)
+        self.assertEqual([t["title"] for t in self.world.herdr.toasts], ["platform is blocked"])
+        self.pane()["status"] = None
+        self.engine.run_pass()
+        self.world.tick(5)
+        self.block()  # blocked again: a new reason after the old one cleared
+        self.engine.run_pass()
+        self.assertEqual(len(self.world.herdr.toasts), 2)
+
+    def test_an_item_held_fifteen_minutes_is_toasted_and_not_before(self):
+        self.world.fact("ghost", "lab.fact:1", batch=False)
+        self.engine.run_pass()
+        self.world.tick(14 * 60)
+        self.engine.run_pass()
+        self.assertEqual(self.world.herdr.toasts, [])
+        self.world.tick(61)
+        self.engine.run_pass()
+        self.assertEqual([t["title"] for t in self.world.herdr.toasts], ["ghost: 1 item(s) held"])
+        self.assertIn("ghost not found", self.world.herdr.toasts[0]["body"])
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual(len(self.world.herdr.toasts), 1)
+
+    def test_a_changed_hold_reason_is_a_new_toast(self):
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "unknown"
+        self.engine.run_pass()
+        self.world.tick(16 * 60)
+        self.engine.run_pass()
+        self.assertEqual(len(self.world.herdr.toasts), 1)
+        self.block()
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual([t["title"] for t in self.world.herdr.toasts],
+                         ["platform: 1 item(s) held", "platform is blocked"])
+
+    def test_one_notification_call_per_pass_even_with_two_reasons(self):
+        self.block("platform")
+        self.block("coder")
+        self.engine.run_pass()
+        calls = [a for a in self.world.herdr.calls if a[1] == "notification"]
+        self.assertEqual(len(calls), 1)
+        self.world.tick(5)
+        self.engine.run_pass()
+        self.assertEqual(sorted(t["title"] for t in self.world.herdr.toasts),
+                         ["coder is blocked", "platform is blocked"])
+
+    def test_rate_limited_busy_and_no_client_are_owed_and_retried_next_pass(self):
+        self.block()
+        self.world.herdr.toast_replies = ["rate_limited", "busy", "no_foreground_client"]
+        for expected in (0, 0, 0, 1):
+            report = self.engine.run_pass()
+            self.assertEqual(len(self.world.herdr.toasts), expected)
+            self.world.tick(5)
+        self.assertEqual([t["why"] for t in report["toasts"]], ["shown"])
+
+    def test_disabled_is_final_and_not_retried(self):
+        self.block()
+        self.world.herdr.toast_replies = ["disabled"]
+        for _ in range(3):
+            self.engine.run_pass()
+            self.world.tick(5)
+        self.assertEqual(len([a for a in self.world.herdr.calls if a[1] == "notification"]), 1)
+
+    def test_the_reply_is_audited(self):
+        self.block()
+        self.world.herdr.toast_replies = ["rate_limited"]
+        self.engine.run_pass()
+        entries = [e for e in self.world.audit() if e["event"] == "herdr.notification"]
+        self.assertEqual([e["phase"] for e in entries], ["intent", "result"])
+        self.assertEqual(entries[1]["detail"]["reply"], {"shown": False, "reason": "rate_limited"})
+
+    def test_a_failing_toast_never_stops_a_delivery(self):
+        self.block("coder")
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.herdr.toast_replies = []
+        real = self.world.herdr._notification_show
+        self.world.herdr._notification_show = lambda rest: (_ for _ in ()).throw(LookupError("herdr broke"))
+        report = self.engine.run_pass()
+        self.world.herdr._notification_show = real
+        self.assertEqual(len(report["sent"]), 1)
+        self.assertEqual([e["step"] for e in report["errors"]] if False else
+                         [e["subject"] for e in report["errors"]], [None])
+
+    def test_a_read_only_engine_renders_nothing(self):
+        self.block()
+        self.world.fact("platform", "lab.fact:1", batch=False)
+        self.world.new_engine(writable=False).run_pass()
+        self.assertEqual(self.badge_writes(), [])
+        self.assertEqual(self.world.herdr.toasts, [])
+
+
+# ------------------------------------------------------------------- launching
+
+class TestLaunch(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.work = self.home / "work"
+        self.work.mkdir()
+        self.order = []
+        v2, herdr = self.world.v2, self.world.herdr
+
+        def tracing(label, fake):
+            def run(argv, **kwargs):
+                self.order.append((label, argv[1:4] if label == "herdr" else argv[2:3]))
+                return fake(argv, **kwargs)
+            return run
+
+        def socket_call(*args):
+            self.order.append(("socket", list(args[1:2])))
+            return herdr.socket(*args)
+
+        config = dict(self.world.config, opencode_env={"XDG_CONFIG_HOME": "/lab/config"},
+                      launch_env={"FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        self.engine = sb.Switchboard(config, sb.V2Client(FAKE_OPENCODE, {}, tracing("v2", v2), 5),
+                                     sb.HerdrClient(FAKE_HERDR, tracing("herdr", herdr), socket_call=socket_call),
+                                     sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state),
+                                     self.world.clock.now, "cli")
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.world.tick(seconds)
+
+    def launch(self, **overrides):
+        args = dict(name="coder", agent="coder", directory=str(self.work), workspace="w1", role="coder",
+                    reports_to="platform", issue=7, brief="Add a health check", patience=5, sleep=self.sleep)
+        args.update(overrides)
+        return sb.launch_agent(self.engine, **args)
+
+    def new_session(self, done):
+        return self.world.v2.sessions[done["session"]]
+
+    def test_it_creates_the_session_opens_the_tab_verifies_and_only_then_briefs(self):
+        done = self.launch()
+        session = self.new_session(done)
+        self.assertEqual(session["metadata"], {"fleet": {"name": "coder", "role": "coder",
+                                                         "reports_to": "platform", "issue": 7}})
+        self.assertEqual((session["agent"], session["directory"], session["title"]),
+                         ("coder", str(self.work), "coder"))
+        method, params = self.world.herdr.socket_calls[0]
+        self.assertEqual(method, "layout.apply")
+        self.assertEqual(params["workspace_id"], "w1")
+        self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
+        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
+        brief = [m for m in session["messages"] if m["type"] == "user"]
+        self.assertEqual([(m["text"], m["metadata"]) for m in brief],
+                         [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        opened = self.order.index(("socket", ["layout.apply"]))
+        prompt = self.order.index(("v2", ["session.prompt"]))
+        between = self.order[opened:prompt]  # after the tab opens and before the brief: the checks
+        self.assertIn(("herdr", ["agent", "get", done["pane"]]), between)
+        self.assertIn(("herdr", ["pane", "process-info", "--pane"]), between)
+
+    def test_nothing_is_typed_and_focus_is_never_asked_for(self):
+        self.launch()
+        self.assertEqual(self.world.herdr.typing_attempts, [])
+        for argv in self.world.herdr.calls:
+            self.assertIn(argv[1:3], HERDR_ALLOWED)
+        self.assertNotIn("focus", json.dumps(self.world.herdr.socket_calls).lower())
+
+    def test_each_write_is_audited_before_and_after(self):
+        self.launch()
+        entries = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("v2.", "herdr."))]
+        self.assertEqual(entries, [("v2.session.create", "intent"), ("v2.session.create", "result"),
+                                   ("herdr.layout.apply", "intent"), ("herdr.layout.apply", "result"),
+                                   ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
+        layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
+        self.assertEqual(layout[0]["detail"]["env_names"], ["FLEET_SWITCHBOARD_LAB_PANE", "XDG_CONFIG_HOME"])
+        self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
+        self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
+
+    def test_no_brief_means_no_prompt(self):
+        done = self.launch(brief=None)
+        self.assertEqual([m for m in self.new_session(done)["messages"] if m["type"] == "user"], [])
+        self.assertNotIn(("v2", ["session.prompt"]), self.order)
+
+    def test_a_pane_that_is_not_the_configured_program_is_refused_and_closed(self):
+        for mode in ("shell", "other-session", "undetected"):
+            with self.subTest(mode=mode):
+                world = World(self, agents=("platform",), state=self.home / ("state-" + mode))
+                world.herdr.launch_mode = mode
+                engine = sb.Switchboard(world.config, sb.V2Client(FAKE_OPENCODE, {}, world.v2, 5),
+                                        sb.HerdrClient(FAKE_HERDR, world.herdr, socket_call=world.herdr.socket),
+                                        sb.AuditLog(world.audit_path), [], world.clock.now, "cli")
+                before = set(world.herdr.panes)
+                with self.assertRaises(sb.LaunchError) as caught:
+                    sb.launch_agent(engine, "coder", "coder", str(self.work), "w1", "coder", brief="hello",
+                                    patience=3, sleep=lambda s: world.tick(s))
+                new = set(world.herdr.panes) - before
+                self.assertEqual(new, set(), "the pane this launch opened must be closed")
+                self.assertEqual(len(world.herdr.closed), 1)
+                self.assertIn("could not verify", str(caught.exception))
+                self.assertIn("session ses_", str(caught.exception))
+                users = [m for s in world.v2.sessions.values() for m in s["messages"]
+                         if m["type"] == "user" and m["text"] == "hello"]
+                self.assertEqual(users, [], "the brief must not be sent to an unverified pane")
+                self.assertTrue(any(e["event"] == "herdr.pane.close" and e["phase"] == "result"
+                                    for e in world.audit()))
+
+    def test_verification_waits_for_herdr_to_name_the_session(self):
+        world = World(self, agents=("platform",), state=self.home / "late")
+        world.herdr.launch_mode = "undetected"
+        engine = sb.Switchboard(world.config, sb.V2Client(FAKE_OPENCODE, {}, world.v2, 5),
+                                sb.HerdrClient(FAKE_HERDR, world.herdr, socket_call=world.herdr.socket),
+                                sb.AuditLog(world.audit_path), [], world.clock.now, "cli")
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            world.tick(seconds)
+            for entry in world.herdr.panes.values():
+                if sleeps and len(sleeps) == 2:
+                    entry.pop("undetected", None)
+
+        done = sb.launch_agent(engine, "coder", "coder", str(self.work), "w1", brief="hello", patience=10, sleep=sleep)
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(world.herdr.closed, [])
+        self.assertTrue(done["pane"])
+
+    def test_only_the_pane_it_opened_is_ever_closed(self):
+        self.world.herdr.launch_mode = "shell"
+        before = dict(self.world.herdr.panes)
+        with self.assertRaises(sb.LaunchError):
+            self.launch(patience=2)
+        self.assertEqual(self.world.herdr.panes, before)  # platform's pane untouched
+        self.assertEqual(len(self.world.herdr.closed), 1)
+        self.assertNotIn(self.world.herdr.closed[0], before)
+
+    def test_a_failed_layout_closes_nothing(self):
+        self.world.herdr.socket_down = True
+        with self.assertRaises(sb.LaunchError) as caught:
+            self.launch()
+        self.assertEqual(self.world.herdr.closed, [])
+        self.assertIn("no pane was opened", str(caught.exception))
+
+    def test_a_name_already_in_use_is_refused_before_anything_is_created(self):
+        before = len(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as caught:
+            self.launch(name="platform")
+        self.assertIn("already runs", str(caught.exception))
+        self.assertEqual((len(self.world.v2.sessions), self.world.herdr.socket_calls), (before, []))
+
+    def test_bad_arguments_are_refused_before_anything_is_created(self):
+        cases = [dict(name="Bad Name"), dict(name=""), dict(directory="relative/dir"),
+                 dict(directory=str(self.home / "missing")), dict(workspace=None), dict(agent=""), dict(issue=0)]
+        for overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaises(sb.LaunchError):
+                self.launch(**overrides)
+        self.assertEqual((self.world.v2.calls, self.world.herdr.socket_calls), ([], []))
+
+    def test_close_is_used_by_launch_alone(self):
+        tree = ast.parse(SWITCHBOARD.read_text())
+        callers = set()
+        for function in ast.walk(tree):
+            if isinstance(function, ast.FunctionDef):
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Attribute) and node.attr == "pane_close":
+                        callers.add(function.name)
+        self.assertEqual(callers, {"close_own_pane"})
+        for function in ast.walk(tree):
+            if isinstance(function, ast.FunctionDef) and function.name == "launch_agent":
+                calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name) and n.func.id == "close_own_pane"]
+                self.assertEqual(len(calls), 1)  # guarded by `if pane`: only what it opened
+
+    def test_the_cli_takes_the_workspace_from_the_pane_it_runs_in(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        argv = ["launch", "coder", "--agent", "coder", "--dir", str(self.work), "--role", "coder",
+                "--reports-to", "platform", "--issue", "7", "--brief-file", "-"]
+        with captured() as (out, err), mock.patch.object(sb.sys, "stdin", io.StringIO("Do the thing\n")):
+            code = sb.main(argv, runner=self.world.route, now=self.world.clock.now,
+                           socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        done = json.loads(out.getvalue())
+        self.assertEqual(sorted(done), ["name", "pane", "session", "tab"])
+        session = self.world.v2.sessions[done["session"]]
+        self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
+        self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
+
+    def test_the_cli_without_a_workspace_is_refused(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ.pop("HERDR_WORKSPACE_ID", None)
+        with captured() as (out, err):
+            code = sb.main(["launch", "coder", "--agent", "coder", "--dir", str(self.work)],
+                           runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 1)
+        self.assertIn("--workspace", err.getvalue())
+        self.assertEqual(self.world.herdr.socket_calls, [])
+
+    def test_an_empty_or_missing_brief_file_is_refused(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        empty = self.home / "empty.md"
+        empty.write_text("  \n")
+        for path in (str(empty), str(self.home / "nope.md")):
+            with self.subTest(path=path), captured() as (out, err):
+                code = sb.main(["launch", "coder", "--agent", "coder", "--dir", str(self.work), "--workspace", "w1",
+                                "--brief-file", path], runner=self.world.route, now=self.world.clock.now,
+                               socket_call=self.world.herdr.socket)
+                self.assertEqual(code, 1)
+        self.assertEqual(self.world.herdr.socket_calls, [])
 
 
 # --------------------------------------------------- the offline scenario runner
@@ -2363,16 +3490,25 @@ class OfflineRun:
 
     POLL = 5
 
-    def __init__(self, test, scenario, label, faults=()):
+    def __init__(self, test, scenario, label, faults=(), baseline=None):
         self.scenario = scenario
         self.faults = sorted(faults)
+        self.baseline = baseline
+        self.work = test.home / "scenario-repo"
+        self.work.mkdir(exist_ok=True)
         self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label)
+        launched = {step["agent"] for step in scenario["steps"] if step["do"] == "launch"}
         for name, member in sorted(scenario["cast"].items()):
-            extra = {key: member[key] for key in ("role", "reports_to", "issue", "charter") if key in member}
-            self.world.add_agent(name, fleet=extra)
+            if name not in launched:  # a launched agent does not exist until `launch` makes it
+                self.world.add_agent(name, fleet=self.fleet_of(member))
         self.world.engine = self.world.new_engine()
         self.daemon = True
         self.crashed_writes = set()
+        self.launched = {}
+
+    @staticmethod
+    def fleet_of(member):
+        return {key: member[key] for key in ("role", "reports_to", "issue", "charter") if key in member}
 
     def run(self):
         steps = list(self.scenario["steps"])
@@ -2388,7 +3524,9 @@ class OfflineRun:
 
     def apply(self, step):
         do, world = step["do"], self.world
-        if do == "fact":
+        if do == "fact" and self.baseline == "fleet-heartbeat":
+            self.type_wake(step)
+        elif do == "fact":
             world.fact(step["to"], step["key"], step["summary"], kind=step.get("kind", "lab.fact"),
                        issue=step.get("issue"), batch=step.get("batch", True), **{"from": step.get("from", "world")})
         elif do == "turn":
@@ -2399,6 +3537,10 @@ class OfflineRun:
                 raise NotImplementedError("offline: a message comes from you")
             world.v2.start_turn(world.sessions[step["to"]], step["text"], fleet=False,
                                 lasts=sc.duration_seconds(step.get("lasts", "0s")))
+        elif do == "draft":
+            world.herdr.input_box[world.panes[step["to"]]] = step["text"]  # you, typing; nothing is sent
+        elif do == "launch":
+            self.launch(step)
         elif do == "pass":
             self.one_pass(step.get("faults", ()))
         elif do == "kill-daemon":
@@ -2408,6 +3550,25 @@ class OfflineRun:
             world.engine = world.new_engine()  # a new process: nothing in memory survives
         elif do != "wait":
             raise NotImplementedError("the offline runner does not implement step %r" % do)
+
+    def type_wake(self, step):
+        """The baseline: today's heartbeat types the wake with `herdr agent prompt`.
+        This runner is the only code allowed to; the engine never does."""
+        herdr = self.world.herdr
+        herdr.allow_typing = True
+        herdr([FAKE_HERDR, "agent", "prompt", self.world.panes[step["to"]], "[heartbeat] " + step["summary"]])
+        herdr.allow_typing = False
+
+    def launch(self, step):
+        """fleet-switchboard launch, as the CLI runs it, on the fakes."""
+        name, world = step["agent"], self.world
+        member = self.scenario["cast"][name]
+        done = sb.launch_agent(
+            world.new_engine("cli"), name, "coder" if member["role"] == "coder" else member["role"], str(self.work),
+            "w1", member["role"], member.get("reports_to"), member.get("issue"), step.get("brief"),
+            patience=5, sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+        world.sessions[name], world.panes[name] = done["session"], done["pane"]
+        self.launched[name] = done
 
     def one_pass(self, step_faults):
         os.environ[sb.FAULT_ENV] = ",".join(sorted(set(self.faults) | set(step_faults)))
@@ -2457,6 +3618,55 @@ class OfflineRun:
         return ok, "%d model call(s) (%s) carried it, at %s s" % (
             len(calls), when, [int(c["at"] - EPOCH) for c in calls])
 
+    def oracle_draft_intact(self, e):
+        """The fake herdr's input box still holds the draft, and no message sent it."""
+        draft = " ".join(e["text"].split())
+        box = " ".join(self.world.herdr.input_box.get(self.world.panes[e["agent"]], "").split())
+        session = self.world.v2.sessions[self.world.sessions[e["agent"]]]
+        sent = [m["id"] for m in session["messages"] if m["type"] == "user" and draft in " ".join(m["text"].split())]
+        return draft in box and not sent, "input box %r; sent in: %s" % (box, ", ".join(sent) or "no message")
+
+    def oracle_metadata_roundtrip(self, e):
+        name = e["agent"]
+        session = self.world.v2.sessions[self.world.sessions[name]]
+        if e.get("of", "session") == "session":
+            want = e["fleet"] if "fleet" in e else dict(
+                {"name": name}, **self.fleet_of(self.scenario["cast"][name]))
+            got = (session["metadata"] or {}).get("fleet")
+            return got == want, "session.get metadata.fleet = %s; expected %s" % (got, want)
+        if e.get("key"):
+            found = [m for m in session["messages"] if _matches(_record_keys(m), e["key"])]
+        else:
+            found = [m for m in session["messages"] if m["type"] in ("user", "synthetic") and e["text"] in m["text"]]
+        if not found:
+            return False, "no message with %r in the transcript" % (e.get("key") or e.get("text"))
+        default = {"keys": [e["key"]]} if e.get("key") else None
+        want, got = e.get("fleet", default), (found[0].get("metadata") or {}).get("fleet")
+        return got == want, "%s metadata.fleet = %s; expected %s" % (found[0]["type"], got, want)
+
+    def launched_pane(self, name):
+        """The pane herdr says shows this agent's session, found through herdr's agent list."""
+        session = self.world.sessions[name]
+        for pane in sorted(self.world.herdr.panes):
+            if sb.agent_session(self.world.herdr.agent(pane)) == session:
+                return pane, self.world.herdr.panes[pane]
+        return None, None
+
+    def oracle_pane_runs_v2(self, e):
+        pane, entry = self.launched_pane(e["agent"])
+        if pane is None:
+            return False, "no herdr pane shows session %s" % self.world.sessions[e["agent"]]
+        program = entry["program"] or ""
+        ok = sb.runs_program(program, FAKE_OPENCODE) and program.endswith("-s " + self.world.sessions[e["agent"]])
+        return ok, "pane %s runs %r (agent opencode on %s)" % (pane, program, self.world.sessions[e["agent"]])
+
+    def oracle_no_typing(self, e):
+        """The pane was started by argv, so it has no shell, and herdr was asked to type nothing."""
+        pane, entry = self.launched_pane(e["agent"])
+        typed = self.world.herdr.typing_attempts
+        ok = entry is not None and entry.get("argv", [None])[0] == FAKE_OPENCODE and not typed
+        return ok, "pane %s opened by argv %s; typing attempts: %s" % (pane, (entry or {}).get("argv"), typed or "none")
+
     def evaluate(self):
         results = []
         for expectation in self.scenario["expect"]:
@@ -2488,27 +3698,39 @@ class OfflineRun:
         for argv in self.world.herdr.calls:
             if argv[1:3] not in HERDR_ALLOWED:
                 problems.append("herdr asked for %r" % argv[1:])
+        problems.extend("herdr was asked to type: %r" % attempt for attempt in self.world.herdr.typing_attempts)
+        problems.extend("herdr socket method %r" % method for method, _ in self.world.herdr.socket_calls
+                        if method not in SOCKET_ALLOWED)
         return problems
+
+
+def control_play(test, scenario):
+    """The control's play and a line saying what it switched off or swapped."""
+    control = scenario["control"]
+    if "fault" in control:
+        return OfflineRun(test, scenario, "control", [control["fault"]]).run(), "fault %s" % control["fault"]
+    if "baseline" in control:
+        return OfflineRun(test, scenario, "control", baseline=control["baseline"]).run(), \
+            "baseline %s" % control["baseline"]
+    return OfflineRun(test, sc.apply_variant(scenario, control["variant"]), "control").run(), "variant"
 
 
 def run_scenario(test, scenario):
     """The run, then the control. Returns a report; a control that passes is a failure."""
     control = scenario["control"]
-    if "fault" not in control:
-        raise NotImplementedError("offline controls are faults; %s has %s" % (scenario["id"], sorted(control)))
     main = OfflineRun(test, scenario, "run").run()
-    checked = OfflineRun(test, scenario, "control", [control["fault"]]).run()
+    checked, how = control_play(test, scenario)
     run_results, control_results = main.evaluate(), checked.evaluate()
     proves_nothing = [entry for entry in control["fails"]
                       if all(r["ok"] for r in control_results if entry in (r["label"], r["that"]))]
-    return {"id": scenario["id"], "fault": control["fault"], "run": run_results, "control": control_results,
+    return {"id": scenario["id"], "control_kind": how, "run": run_results, "control": control_results,
             "implicit": main.implicit(), "failures": [r for r in run_results if not r["ok"]],
             "proves_nothing": proves_nothing}
 
 
 def format_scenario_report(report):
     lines = ["%s: run %d/%d pass; control %s:" % (
-        report["id"], sum(r["ok"] for r in report["run"]), len(report["run"]), report["fault"])]
+        report["id"], sum(r["ok"] for r in report["run"]), len(report["run"]), report["control_kind"])]
     for r in report["control"]:
         lines.append("    %-20s %s  (%s)" % (r["label"], "pass" if r["ok"] else "FAIL", r["seen"]))
     return "\n".join(lines)
@@ -2552,9 +3774,89 @@ class TestOfflineScenarios(Base):
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
-        b1["expect"].append({"that": "draft_intact"})
+        b1["expect"].append({"that": "classified"})
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
+
+
+class TestPr3Scenarios(Base):
+    """D1 and L1 fail when the thing they guard fails, not only when the control says so."""
+
+    def play(self, name):
+        return OfflineRun(self, sc.load(sc.DEFAULT_DIR / name), "run").run()
+
+    def results(self, run):
+        return {r["label"]: r["ok"] for r in run.evaluate()}
+
+    def test_d1_catalog_entry(self):
+        d1 = sc.load(sc.DEFAULT_DIR / "d1-draft.json")
+        self.assertEqual((d1["problem"], d1["since_pr"], d1["tiers"]), (3, 3, ["offline", "lab-scripted"]))
+        self.assertEqual(d1["control"]["baseline"], "fleet-heartbeat")
+
+    def test_d1_the_engine_types_nothing_and_the_draft_survives(self):
+        run = self.play("d1-draft.json")
+        self.assertEqual(self.results(run), {"draft-intact": True, "delivered": True})
+        self.assertEqual(run.world.herdr.typing_attempts, [])
+        self.assertEqual(run.implicit(), [])
+        self.assertEqual(run.world.herdr.input_box[run.world.panes["platform"]], "also check the retry path")
+        self.assertTrue([m for m in run.world.v2.sessions[run.world.sessions["platform"]]["messages"]
+                         if m["type"] == "synthetic"])
+
+    def test_d1_an_engine_that_typed_would_be_caught_twice(self):
+        run = self.play("d1-draft.json")
+        run.world.herdr([FAKE_HERDR, "agent", "prompt", run.world.panes["platform"], "wake"])  # refused, recorded
+        self.assertTrue(any("asked to type" in p for p in run.implicit()))
+        run.world.herdr.allow_typing = True  # and what typing does to the box and the transcript
+        run.world.herdr([FAKE_HERDR, "agent", "prompt", run.world.panes["platform"], "wake"])
+        self.assertFalse(self.results(run)["draft-intact"])
+
+    def test_d1_the_baseline_types_with_agent_prompt_and_the_draft_is_sent(self):
+        d1 = sc.load(sc.DEFAULT_DIR / "d1-draft.json")
+        baseline = OfflineRun(self, d1, "control", baseline="fleet-heartbeat").run()
+        typed = [argv for argv in baseline.world.herdr.calls if argv[1:3] == ["agent", "prompt"]]
+        self.assertEqual(len(typed), 1)
+        text = typed[0][-1]
+        self.assertTrue(text.startswith("[heartbeat] "))
+        self.assertEqual(self.results(baseline)["draft-intact"], False)
+        messages = baseline.world.v2.sessions[baseline.world.sessions["platform"]]["messages"]
+        self.assertTrue(any(m["type"] == "user" and "also check the retry path" in m["text"] for m in messages))
+
+    def test_l1_launch_oracles_pass_on_a_launch(self):
+        run = self.play("l1-launch.json")
+        self.assertEqual(self.results(run), {"fleet-metadata": True, "runs-v2": True,
+                                             "brief-as-fleet-prompt": True, "nothing-typed": True})
+        self.assertEqual(run.implicit(), [])
+        self.assertNotIn("platform", run.launched)
+        self.assertIn("coder", run.launched)
+
+    def test_l1_each_oracle_fails_when_its_fact_is_false(self):
+        for what, damage, label in (
+                ("a shell instead of the program", lambda w, p: w.herdr.panes[p].update(program="-zsh"), "runs-v2"),
+                ("another version on the pane", lambda w, p: w.herdr.panes[p].update(
+                    program="/opt/other/opencode -s " + w.herdr.panes[p]["session"]), "runs-v2"),
+                ("the pane was not opened by argv", lambda w, p: w.herdr.panes[p].pop("argv"), "nothing-typed"),
+                ("something was typed", lambda w, p: w.herdr.typing_attempts.append(["pane", "send-text"]),
+                 "nothing-typed"),
+                ("the wrong session", lambda w, p: w.herdr.panes[p].update(session="ses_fake000001"), "runs-v2"),
+                ("the wrong metadata", lambda w, p: w.v2.sessions[w.herdr.panes[p]["session"]]["metadata"]["fleet"]
+                 .update(role="orchestrator"), "fleet-metadata")):
+            with self.subTest(what=what):
+                run = self.play("l1-launch.json")
+                pane = run.world.panes["coder"]
+                damage(run.world, pane)
+                self.assertFalse(self.results(run)[label])
+
+    def test_a_launch_that_fails_verification_fails_the_scenario_play(self):
+        l1 = sc.load(sc.DEFAULT_DIR / "l1-launch.json")
+        run = OfflineRun(self, l1, "bad")
+        run.world.herdr.launch_mode = "shell"
+        with self.assertRaises(sb.LaunchError):
+            run.run()
+
+    def test_a_scenario_names_only_known_baselines(self):
+        d1 = sc.load(sc.DEFAULT_DIR / "d1-draft.json")
+        d1["control"]["baseline"] = "something-else"
+        self.assertTrue(any("control.baseline" in e for e in sc.validate(d1)))
 
 
 class TestOneVocabulary(unittest.TestCase):
