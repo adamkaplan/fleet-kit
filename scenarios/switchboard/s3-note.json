@@ -1,0 +1,26 @@
+{
+  "id": "S3",
+  "title": "Spike S3: a note on an idle agent starts no turn and rides your next message",
+  "problem": null,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "note", "to": "platform", "key": "S3-note",
+     "text": "fleet note S3-note: coder finished issue 2"},
+    {"at": "6s", "actor": "you", "do": "message", "to": "platform", "text": "what is new?"}
+  ],
+  "expect": [
+    {"that": "no_machine_turn", "agent": "platform"},
+    {"that": "model_saw", "name": "note-seen", "agent": "platform", "key": "S3-note", "count": 1,
+     "why": "with no_machine_turn: the model saw the note, and only your message started a call"},
+    {"that": "admitted_once", "name": "note-delivered", "to": "platform", "key": "S3-note"}
+  ],
+  "control": {
+    "variant": {"steps": {"0": {"resume": true}}},
+    "fails": ["no_machine_turn"]
+  }
+}

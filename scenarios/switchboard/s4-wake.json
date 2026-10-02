@@ -1,0 +1,35 @@
+{
+  "id": "S4",
+  "title": "Spike S4: a wake starts an idle agent, waits out a busy one, and never touches your draft",
+  "problem": 3,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "draft", "to": "platform", "text": "half typed draft S4"},
+    {"at": "2s", "actor": "world", "do": "wake", "to": "platform", "key": "S4-idle",
+     "text": "fleet wake S4-idle: coder finished issue 2"},
+    {"at": "6s", "actor": "platform", "do": "turn", "lasts": "12s", "steps": 2},
+    {"at": "9s", "actor": "world", "do": "wake", "to": "platform", "key": "S4-busy",
+     "text": "fleet wake S4-busy: coder is blocked",
+     "why": "arrives during the turn's first step, before its tool call"},
+    {"at": "11s", "actor": "you", "do": "draft", "to": "platform", "text": " and more"},
+    {"at": "24s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"that": "within", "name": "idle-wake-starts-a-turn", "agent": "platform", "key": "S4-idle", "step": 1, "seconds": 2},
+    {"that": "model_saw", "name": "idle-wake-is-a-turn", "agent": "platform", "key": "S4-idle", "when": "turn_start"},
+    {"that": "model_saw", "name": "busy-wake-not-between-steps", "agent": "platform", "key": "S4-busy",
+     "when": "between_steps", "count": 0},
+    {"that": "model_saw", "name": "busy-wake-after-final-reply", "agent": "platform", "key": "S4-busy",
+     "when": "after_reply", "count": 1},
+    {"that": "draft_intact", "name": "draft-survives", "agent": "platform", "text": "half typed draft S4 and more"}
+  ],
+  "control": {
+    "variant": {"steps": {"3": {"delivery": "steer"}}},
+    "fails": ["busy-wake-not-between-steps", "busy-wake-after-final-reply"]
+  }
+}

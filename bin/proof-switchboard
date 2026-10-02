@@ -31,6 +31,11 @@ Subcommands:
                                 draft safety, herdr status and the unread
                                 token, in a "Switchboard Lab" pane already
                                 running the Lab TUI on S as herdr agent A
+    run [paths...] [--tier lab-scripted] [--control-only|--no-control] [--pane P]
+                                play scenario files (default: every one in
+                                scenarios/switchboard) in the Lab and play each
+                                control; evidence in scenario-runs/<UTC>/<id>/
+                                (see "Scenario runner" below)
 
 Script directives (one line in the last user message):
 
@@ -44,13 +49,18 @@ Tokens are read in order. `tool=` starts a step; `cmd=`, `args=<json>` and
 `arg.<name>=` fill that step's arguments; `sleep=` delays the step that
 follows it. Each request answers the first step not yet taken, counted by the
 assistant tool calls after the last user message; when every tool step is
-done it replies with `reply=`.
+done it replies with `reply=`. A one-line prompt typed into the TUI carries
+its directive inline: `what is new? @script reply=SAW`.
 
 Python 3.9 standard library only.
 """
 
 import argparse
+import copy
+import fnmatch
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -60,6 +70,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -496,7 +507,11 @@ def parse_script(text):
         if stripped.startswith("@script"):
             line = stripped[len("@script"):]
     if line is None:
-        return None
+        # A prompt typed into the TUI is one line: "what is new? @script reply=X".
+        inline = text.rfind(" @script ")
+        if inline < 0:
+            return None
+        line = text[inline + len(" @script"):].splitlines()[0]
     try:
         tokens = shlex.split(line)
     except ValueError:
@@ -1251,6 +1266,855 @@ def cmd_spike(lab, args):
     return {"s3": spike_s3, "s4": spike_s4, "s5": spike_s5, "s6": spike_s6}[args.which](lab, args)
 
 
+# --------------------------------------------------------------------------
+# Scenario runner: the lab-scripted tier
+#
+# `run` plays scenario files (docs/switchboard.md, "Scenario testing") in the
+# Lab. Each cast member is a fresh Lab v2 session carrying metadata.fleet. The
+# one member whose screen the scenario needs (a draft, herdr status) is shown
+# by the Lab pane's TUI. Steps run in real time. Expectations are checked
+# against the systems that own the facts: v2's transcript, inbox and session
+# record, the scripted model's request log, herdr's agent status and pane
+# reads. What the runner did is evidence, never an oracle. Then the control
+# plays on fresh sessions and must break every expectation it names.
+#
+# Step fields this tier reads, besides at / actor / do. The runner writes the
+# scripted model's `@script` line itself; a scenario never carries one.
+#   turn        (a cast member) [lasts], [steps]: one prompt whose script takes
+#               `lasts`, split over `steps` model steps (steps-1 shell calls,
+#               then the reply DONE)
+#   permission  (a cast member) asks to run a shell command; its session is
+#               created with shell set to ask
+#   permission  (you) to, [decision once|always|reject]: answers the pending ask
+#   message     (you) to, text, [lasts]: through the TUI when `to` is the member
+#               on screen, else session.prompt without metadata.fleet
+#   draft       (you) to, text: herdr pane send-text, no Enter
+#   synthetic | note | wake  to, key, text, [id], [resume], [delivery]
+#               defaults: note = resume false + steer, wake = resume true +
+#               queue, synthetic = resume false + steer. `id` is a name: the
+#               same name in one play is the same derived v2 message id;
+#               without it the id derives from the session and the key
+#   wait, away  only mark time here
+# Expectations, and the system each is checked against:
+#   no_machine_turn  agent: model log; no request triggered by a fleet message
+#   model_saw        agent, key (a glob), [when], [count]: model log, keyed via the
+#                    transcript
+#   within           agent, step, seconds, [key]: transcript and model log times
+#   admitted_once    to, key, [count]: transcript plus inbox
+#   metadata_roundtrip  agent, of session|message, [key|text], [fleet]:
+#                    session.get or message.list
+#   status_is        agent, status, at: herdr agent get, sampled
+#   draft_intact     agent, text: herdr pane read of the input box, transcript
+#   tool_outcome     agent, [tool], outcome: transcript tool record, model log
+# Everything else (delivered, message_count, ...) needs the switchboard engine.
+# A control `variant` patches the scenario: {"steps": {"<index>": {...}},
+# "expect": {"<name or index>": {...}}}.
+
+SCENARIO_DIR = os.path.join(REPO_ROOT, "scenarios", "switchboard")
+RUNS_DIR = os.path.join(REPO_ROOT, "scenario-runs")
+RUN_TIERS = ("lab-scripted",)
+LAB_TUI_AGENT = "lab-tui"
+# What this tier plays and checks without the switchboard engine.
+RUN_ACTIONS = ("turn", "message", "draft", "away", "permission", "synthetic", "note", "wake",
+               "wait")
+RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "admitted_once",
+                    "model_saw", "status_is", "metadata_roundtrip")
+SYNTHETIC_DEFAULTS = {"note": (False, "steer"), "wake": (True, "queue"),
+                      "synthetic": (False, "steer")}
+ROLE_AGENTS = {"orchestrator": "orchestrator", "coder": "coder",
+               "chief-of-staff": "chief-of-staff", "cos-subagent": "coder"}
+# Requests v2 makes on its own (titles, summaries) are nobody's turn.
+UPKEEP_PLANS = ("title", "summary", "maintenance")
+ASK_SHELL = [{"action": "shell", "resource": "*", "effect": "ask"}]
+VARIANT_KEYS = ("steps", "expect")
+
+
+class RunError(RuntimeError):
+    pass
+
+
+def fleet_scenario():
+    """bin/fleet-scenario: the one validator and duration parser."""
+    path = os.path.join(REPO_ROOT, "bin", "fleet-scenario")
+    loader = importlib.machinery.SourceFileLoader("proof_fleet_scenario", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def scenario_paths(paths):
+    files = []
+    for raw in paths:
+        if os.path.isdir(raw):
+            files.extend(sorted(os.path.join(raw, n) for n in os.listdir(raw) if n.endswith(".json")))
+        else:
+            files.append(raw)
+    return files
+
+
+def fleet_metadata(name, member):
+    fleet = {"name": name, "role": member["role"]}
+    for key in ("reports_to", "issue", "charter"):
+        if key in member:
+            fleet[key] = member[key]
+    return fleet
+
+
+def tui_members(scenario):
+    """Cast members whose screen the scenario needs: draft targets, herdr status."""
+    names = [s.get("to") for s in scenario["steps"] if s.get("do") == "draft"]
+    names += [e.get("agent") for e in scenario["expect"]
+              if e.get("that") in ("status_is", "draft_intact")]
+    return sorted(set(n for n in names if n))
+
+
+def apply_variant(scenario, variant):
+    """The scenario with a control variant patched in."""
+    out = copy.deepcopy(scenario)
+    for key in variant:
+        if key not in VARIANT_KEYS:
+            raise RunError("unknown key %r (known: %s)" % (key, ", ".join(VARIANT_KEYS)))
+    for index, patch in (variant.get("steps") or {}).items():
+        try:
+            out["steps"][int(index)].update(patch)
+        except (ValueError, IndexError, TypeError, AttributeError):
+            raise RunError("steps[%s] is not a step to patch" % index)
+    for label, patch in (variant.get("expect") or {}).items():
+        hits = [e for i, e in enumerate(out["expect"]) if e.get("name") == label or str(i) == label]
+        if not hits or not isinstance(patch, dict):
+            raise RunError("expect %r matches no expectation" % label)
+        for item in hits:
+            item.update(patch)
+    return out
+
+
+def unsupported(scenario, validate=None):
+    """Why this tier cannot play the scenario yet (empty when it can)."""
+    reasons = []
+    cast = scenario["cast"]
+    for i, step in enumerate(scenario["steps"]):
+        do = step["do"]
+        if do not in RUN_ACTIONS:
+            reasons.append("step %d `%s` needs the switchboard engine" % (i, do))
+        elif do in ("message", "draft") and step["actor"] != "you":
+            reasons.append("step %d: an agent's `%s` goes through the switchboard engine" % (i, do))
+        elif do in ("message", "draft") + tuple(SYNTHETIC_DEFAULTS) and step.get("to") not in cast:
+            reasons.append("step %d `%s`: `to` must name a cast member" % (i, do))
+        elif do in SYNTHETIC_DEFAULTS and not (step.get("key") and isinstance(step.get("text"), str)):
+            reasons.append("step %d `%s`: needs `key` and `text`" % (i, do))
+        elif do == "permission" and step["actor"] == "you" and step.get("to") not in cast:
+            reasons.append("step %d: your `permission` answer needs `to`" % i)
+    for i, item in enumerate(scenario["expect"]):
+        if item["that"] not in RUN_EXPECTATIONS:
+            reasons.append("expect %s `%s`: not supported in this tier yet"
+                           % (item.get("name", i), item["that"]))
+    control = scenario["control"]
+    if "variant" not in control:
+        kind = "fault" if "fault" in control else "baseline"
+        reasons.append("control %s %r needs the switchboard engine" % (kind, control[kind]))
+    else:
+        try:
+            patched = apply_variant(scenario, control["variant"])
+            errors = validate(patched) if validate else []
+            if errors:
+                reasons.append("control variant makes an invalid scenario: %s" % "; ".join(errors))
+        except RunError as err:
+            reasons.append("control variant: %s" % err)
+    if len(tui_members(scenario)) > 1:
+        reasons.append("more than one agent needs the TUI; the Lab has one pane")
+    return reasons
+
+
+def herdr_run(*args, timeout=30):
+    return subprocess.run(["herdr"] + list(args), capture_output=True, text=True, timeout=timeout)
+
+
+def default_lab_pane():
+    ws = lab_workspace()
+    if not ws:
+        return None
+    panes = herdr("pane", "list", "--workspace", ws["workspace_id"]).get("panes") or []
+    return panes[0]["pane_id"] if panes else None
+
+
+def lab_shell_ready(lab, pane):
+    """Bring the Lab pane to its shell prompt with the Lab's v2 first on PATH.
+    A Lab TUI there is quit with ctrl+c; the first one clears its input box."""
+    lab_pane_guard(pane)
+    for _ in range(4):
+        info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+        cmdlines = [p.get("cmdline", "") for p in info.get("foreground_processes") or []]
+        if not any(c.startswith(lab.v2_bin) for c in cmdlines):
+            break
+        herdr_run("pane", "send-keys", pane, "ctrl+c")
+        time.sleep(1.0)
+    info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+    if not info.get("shell_pid") or info.get("foreground_process_group_id") != info.get("shell_pid"):
+        raise SystemExit("refused: pane %s is not at its shell prompt" % pane)
+    # The user's zsh startup files put v1 ahead of the workspace PATH (S6):
+    # put the Lab first again and prove `opencode` is the Lab wrapper.
+    nonce = "LABPATH-" + tag()
+    herdr_run("pane", "run", pane, 'export PATH=%s:"$PATH"; hash -r; echo %s=$(command -v opencode)'
+              % (shlex.quote(lab.bin_dir), nonce))
+    found = herdr_run("pane", "wait-output", "--match", "%s=%s" % (nonce, lab.wrapper),
+                      "--source", "recent-unwrapped", "--timeout", "8000", pane, timeout=20)
+    if found.returncode:
+        raise SystemExit("refused: in pane %s `opencode` is not the Lab wrapper" % pane)
+
+
+def lab_tui_attach(lab, pane, agent, ses):
+    """Show session `ses` in the Lab pane's TUI, as herdr agent `agent`."""
+    lab_shell_ready(lab, pane)
+    p = herdr_run("agent", "start", agent, "--kind", "opencode", "--pane", pane,
+                  "--timeout", "30000", "--", "-s", ses, timeout=45)
+    lab_tui_guard(lab, pane)
+    if p.returncode:
+        raise RunError("herdr agent start: %s" % (p.stdout + p.stderr).strip()[:300])
+    info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+    if not any(ses in p.get("cmdline", "") for p in info.get("foreground_processes") or []):
+        raise RunError("the Lab TUI in %s is not on %s" % (pane, ses))
+
+
+def input_box(screen):
+    """The TUI's input box from a pane read: the `┃` lines above the `╹`
+    footer. The last of them names the agent and model; the rest are the
+    text waiting to be sent."""
+    lines = screen.splitlines()
+    ends = [i for i, line in enumerate(lines) if line.strip().startswith("\u2579")]
+    if not ends:
+        return None
+    box, i = [], ends[-1] - 1
+    while i >= 0 and lines[i].strip().startswith("\u2503"):
+        box.insert(0, lines[i].strip()[1:].strip())
+        i -= 1
+    return {"text": " ".join(l for l in box[:-1] if l), "status_line": box[-1] if box else ""}
+
+
+def squash(text):
+    return " ".join((text or "").split())
+
+
+def transcript_text(message):
+    text = message.get("text")
+    if text is None:
+        text = " ".join(p.get("text", "") for p in message.get("content") or []
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return text or ""
+
+
+def fleet_of(message):
+    meta = message.get("metadata") or (message.get("payload") or {}).get("metadata") or {}
+    return meta.get("fleet") if isinstance(meta, dict) else None
+
+
+def request_messages(entry):
+    """[(role, text)] of one logged model request; tool calls as `tool_calls <names>`."""
+    out = []
+    for message in entry["request"].get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = message_text(message)
+        if message.get("tool_calls"):
+            text = (text + " tool_calls " + ",".join(
+                (c.get("function") or {}).get("name", "?") for c in message["tool_calls"])).strip()
+        out.append((message.get("role"), text))
+    return out
+
+
+def last_user(entry):
+    users = [text for role, text in request_messages(entry) if role == "user"]
+    return users[-1] if users else ""
+
+
+def short(text, width=90):
+    text = squash(text)
+    return text if len(text) <= width else text[:width - 1] + "\u2026"
+
+
+class ScenarioRun:
+    """One play of a scenario, the run or its control, on fresh sessions."""
+
+    def __init__(self, lab, scenario, label, pane, seconds):
+        self.lab, self.v2 = lab, V2(lab)
+        self.scenario, self.label, self.pane = scenario, label, pane
+        self.seconds = seconds
+        self.tag = tag()
+        self.cast, self.facts = {}, {}
+        self.tui = (tui_members(scenario) or [None])[0]
+        self.tui_ready = False
+        self.timeline, self.step_times, self.step_errors = [], {}, []
+        self.t_setup = time.time()
+        self.t0, self.watch, self.status_changes, self.screen = None, None, [], None
+        self.error = None
+
+    def note(self, kind, when=None, **fields):
+        entry = {"wall": when or time.time(), "run": self.label, "kind": kind}
+        entry.update(fields)
+        self.timeline.append(entry)
+
+    def session(self, name):
+        return self.cast[name]["session"]
+
+    # ---- setup, steps, settle
+
+    def setup(self):
+        sid = self.scenario["id"]
+        askers = {s["actor"] for s in self.scenario["steps"]
+                  if s["do"] == "permission" and s["actor"] != "you"}
+        for name, member in self.scenario["cast"].items():
+            fleet = fleet_metadata(name, member)
+            ses = self.v2.create_session(
+                "%s %s %s %s" % (sid, self.label, name, self.tag),
+                agent=ROLE_AGENTS.get(member["role"], "coder"), fleet=fleet,
+                permissions=ASK_SHELL if name in askers else None)["id"]
+            marker = "lab-cast-%s-%s" % (self.tag, name)
+            self.cast[name] = {"session": ses, "fleet": fleet, "marker": marker}
+            # One finished turn first, so the agent is a normal idle one. Every
+            # later model request repeats this marker, which ties it to the agent.
+            self.v2.prompt(ses, "%s: you are %s in scenario %s\n@script reply=READY"
+                           % (marker, name, sid), metadata={"lab": {"scenario": sid, "setup": name}})
+            self.note("setup", agent=name, session=ses, fleet=fleet, shell_asks=name in askers)
+        for name, member in self.cast.items():
+            ses = member["session"]
+            done, _ = self.v2.wait(lambda: (self.v2.get(ses).get("time") or {}).get("idle")
+                                   and not self.v2.running(ses), 60)
+            if not done:
+                raise RunError("%s: the warm-up turn did not finish" % name)
+        if self.tui:
+            if not self.pane:
+                raise RunError("no %r workspace pane for the TUI" % LAB_WORKSPACE_LABEL)
+            lab_tui_attach(self.lab, self.pane, LAB_TUI_AGENT, self.session(self.tui))
+            self.tui_ready = True
+            time.sleep(1.5)
+            self.note("tui", agent=self.tui, pane=self.pane, herdr_agent=LAB_TUI_AGENT,
+                      session=self.session(self.tui),
+                      status=agent_status(LAB_TUI_AGENT).get("agent_status"))
+
+    def tui_guard(self):
+        lab_tui_guard(self.lab, lab_pane_guard(self.pane))
+        info = agent_status(LAB_TUI_AGENT)
+        if info.get("pane_id") != self.pane:
+            raise SystemExit("refused: herdr agent %s is not in pane %s" % (LAB_TUI_AGENT, self.pane))
+
+    def play(self):
+        steps, expect = self.scenario["steps"], self.scenario["expect"]
+        self.t0 = time.time()
+        if self.tui:
+            self.watch = StatusWatch(LAB_TUI_AGENT)
+            self.watch.start_time = self.t0
+            self.watch.start()
+        for index, step in enumerate(steps):
+            due = self.t0 + self.seconds(step["at"])
+            if due > time.time():
+                time.sleep(due - time.time())
+            when = time.time()
+            self.step_times[index] = when
+            try:
+                result = self.do(index, step)
+            except (V2Error, RunError, subprocess.SubprocessError, KeyError) as err:
+                result = {"error": str(err)[:400]}
+                self.step_errors.append("step %d %s: %s" % (index, step["do"], result["error"]))
+            self.note("step", when, index=index, step=step, result=result)
+        end = max([self.seconds(s["at"]) for s in steps]
+                  + [self.seconds(e["at"]) for e in expect if e.get("at")] + [0])
+        due = self.t0 + end + 1
+        if due > time.time():
+            time.sleep(due - time.time())
+        self.settle()
+
+    def do(self, index, step):
+        do, sid = step["do"], self.scenario["id"]
+        if do in ("turn", "permission") and step["actor"] != "you":
+            if do == "turn":
+                steps = int(step.get("steps", 1))
+                each = self.seconds(step.get("lasts", "0s")) / float(steps)
+                script = " ".join(["sleep=%g tool=bash cmd=%s" % (
+                    each, shlex.quote("echo %s turn %d step %d" % (sid, index, k)))
+                    for k in range(1, steps)] + ["sleep=%g reply=DONE" % each])
+            else:
+                script = "tool=bash cmd=%s reply=DONE" % shlex.quote("echo %s ask %d" % (sid, index))
+            text = "%s by %s, step %d" % (do, step["actor"], index)
+            # The agent's own work: neither your prompt nor a fleet message.
+            rec = self.v2.prompt(self.session(step["actor"]), "%s\n@script %s" % (text, script),
+                                 metadata={"lab": {"scenario": sid, "step": index}})
+            return {"via": "session.prompt", "script": script, "id": rec.get("id")}
+        if do == "permission":
+            ses = self.session(step["to"])
+            asks, took = self.v2.wait(lambda: self.v2.permissions(ses), 10)
+            if not asks:
+                raise RunError("no permission ask pending for %s" % step["to"])
+            decision = step.get("decision", "once")
+            self.v2.permission_reply(ses, asks[0]["id"], decision)
+            return {"answered": asks[0]["id"], "action": asks[0].get("action"),
+                    "resources": asks[0].get("resources"), "decision": decision}
+        if do == "message":
+            script = ("sleep=%d reply=OK" % self.seconds(step["lasts"])) if step.get("lasts") else None
+            if step["to"] == self.tui:
+                self.tui_guard()
+                line = step["text"] + (" @script " + script if script else "")
+                p = herdr_run("agent", "prompt", LAB_TUI_AGENT, line)
+                if p.returncode:
+                    raise RunError("herdr agent prompt: %s" % (p.stdout + p.stderr).strip()[:300])
+                return {"via": "herdr agent prompt", "agent": LAB_TUI_AGENT}
+            text = step["text"] + ("\n@script " + script if script else "")
+            rec = self.v2.prompt(self.session(step["to"]), text)  # yours: no metadata
+            return {"via": "session.prompt", "id": rec.get("id")}
+        if do == "draft":
+            if step["to"] != self.tui:
+                raise RunError("draft to %s, whose TUI is not open" % step["to"])
+            if "\n" in step["text"]:
+                raise RunError("a draft is one line; a newline would send it")
+            self.tui_guard()
+            herdr_run("pane", "send-text", self.pane, step["text"]).check_returncode()
+            time.sleep(0.5)
+            self.note("pane", input_box=input_box(pane_text(self.pane)))
+            return {"via": "herdr pane send-text", "pane": self.pane}
+        if do in SYNTHETIC_DEFAULTS:
+            ses = self.session(step["to"])
+            resume, delivery = SYNTHETIC_DEFAULTS[do]
+            resume, delivery = step.get("resume", resume), step.get("delivery", delivery)
+            keys = [step["key"]]
+            msg_id = message_id(ses, ["lab-id:%s" % step["id"]] if step.get("id") else keys)
+            rec = self.v2.synthetic(ses, step["text"], resume, delivery, keys, msg_id=msg_id)
+            return {"via": "session.synthetic", "id": msg_id, "resume": resume,
+                    "delivery": delivery, "keys": keys, "returned": rec.get("id")}
+        if do in ("wait", "away"):
+            return {do: True}
+        raise RunError("cannot play %r" % do)
+
+    def settle(self, timeout=120):
+        """Until no cast session runs, three reads in a row."""
+        sessions = [m["session"] for m in self.cast.values()]
+        start, calm = time.time(), 0
+        while time.time() - start < timeout and calm < 3:
+            active = self.v2.api("session.active") or {}
+            calm = 0 if any(s in active for s in sessions) else calm + 1
+            time.sleep(0.5)
+        self.note("settled", seconds=round(time.time() - start, 1), quiet=calm >= 3)
+
+    # ---- facts and checks
+
+    def gather(self):
+        log = model_requests(self.lab, self.t_setup)
+        for name, member in self.cast.items():
+            ses = member["session"]
+            transcript = list(reversed(self.v2.messages(ses, limit=200)))
+            requests = [e for e in log if e["time"] >= self.t0
+                        and e.get("plan", {}).get("kind") not in UPKEEP_PLANS
+                        and member["marker"] in json.dumps(e["request"].get("messages"))]
+            self.facts[name] = {"session": ses, "record": self.v2.get(ses),
+                                "transcript": transcript, "inbox": self.v2.inbox(ses),
+                                "requests": requests}
+            for m in transcript:
+                created = (m.get("time") or {}).get("created")
+                if created and created / 1000.0 >= self.t0 - 0.5:
+                    self.note("transcript", created / 1000.0, agent=name,
+                              message=message_outline(m, 120))
+            for e in requests:
+                self.note("model", e["time"], agent=name, plan=e.get("plan", {}).get("kind"),
+                          messages=request_outline(e, 90)[-6:])
+        if self.watch:
+            self.status_changes = self.watch.stop()
+            for t, status in self.status_changes:
+                self.note("status", self.t0 + t, agent=self.tui, herdr_agent=LAB_TUI_AGENT,
+                          agent_status=status)
+        if self.tui_ready:
+            self.screen = pane_text(self.pane)
+            self.note("pane", input_box=input_box(self.screen),
+                      screen_tail=[l.rstrip() for l in self.screen.splitlines() if l.strip()][-12:])
+
+    def evaluate(self):
+        results = []
+        for index, item in enumerate(self.scenario["expect"]):
+            label = item.get("name") or "%s#%d" % (item["that"], index)
+            try:
+                ok, detail = getattr(self, "check_" + item["that"])(item)
+            except (KeyError, IndexError, TypeError, ValueError, V2Error, RunError) as err:
+                ok, detail = False, "could not check: %r" % err
+            results.append({"label": label, "that": item["that"], "name": item.get("name"),
+                            "passed": bool(ok), "detail": detail})
+            self.note("expect", label=label, passed=bool(ok), detail=detail)
+        return results
+
+    def agent_facts(self, item):
+        name = item["agent"]
+        if name not in self.facts:
+            raise RunError("no cast member %r" % name)
+        return self.facts[name]
+
+    def at(self, entry_time):
+        return round(entry_time - self.t0, 2)
+
+    def check_no_machine_turn(self, item):
+        """The scripted model's log: no model request whose triggering input
+        (its last user message) is a fleet message from the transcript."""
+        facts = self.agent_facts(item)
+        fleet_texts = [squash(transcript_text(m)) for m in facts["transcript"]
+                       if m.get("type") == "synthetic" or (m.get("type") == "user" and fleet_of(m))]
+        fleet_texts = [t for t in fleet_texts if t]
+        machine = []
+        for e in facts["requests"]:
+            trigger = squash(last_user(e))
+            if any(t == trigger or t in trigger for t in fleet_texts):
+                machine.append("t=%.2f answered %r" % (self.at(e["time"]), short(trigger, 60)))
+        if machine:
+            return False, "%d model request(s) triggered by a fleet message: %s" % (
+                len(machine), "; ".join(machine[:3]))
+        return True, "%d model request(s) since t0, none triggered by any of %d fleet message(s)" % (
+            len(facts["requests"]), len(fleet_texts))
+
+    def keyed(self, facts, key):
+        """Transcript messages (delivered) with a metadata.fleet key matching
+        the glob `key`."""
+        return [m for m in facts["transcript"]
+                if any(fnmatch.fnmatchcase(k, key) for k in (fleet_of(m) or {}).get("keys") or [])]
+
+    def preceding(self, facts, message):
+        """The transcript message before `message`, skipping other inputs
+        delivered with it: what the agent was doing when it arrived."""
+        before = None
+        for m in facts["transcript"]:
+            if m is message:
+                return before
+            if m.get("type") not in ("user", "synthetic"):
+                before = m
+        return before
+
+    def model_calls(self, facts):
+        """Each logged model request as a call: its new inputs (the user
+        messages after the last reply or tool result, matched to transcript
+        messages) and its phase. between_steps: right after a tool result;
+        after_reply: right after a final reply, in the same busy span (no idle
+        between them in the transcript); turn_start: the agent was idle."""
+        by_text = {}
+        for m in facts["transcript"]:
+            if m.get("type") in ("user", "synthetic"):
+                by_text.setdefault(squash(transcript_text(m)), m)
+        calls = []
+        for e in facts["requests"]:
+            msgs = request_messages(e)
+            i = len(msgs)
+            while i and msgs[i - 1][0] == "user":
+                i -= 1
+            inputs = [by_text.get(squash(t)) for _, t in msgs[i:]]
+            inputs = [m for m in inputs if m is not None]
+            prev = msgs[i - 1][0] if i else None
+            if prev == "tool":
+                phase = "between_steps"
+            elif inputs and (self.preceding(facts, inputs[0]) or {}).get("type") == "assistant":
+                phase = "after_reply"
+            else:
+                phase = "turn_start"
+            calls.append({"time": e["time"], "phase": phase, "inputs": inputs})
+        return calls
+
+    def check_model_saw(self, item):
+        """The scripted model's log, keyed through the transcript: the model
+        calls (of phase `when`, default any) whose new inputs include a
+        message with a key matching `key`; `count` of them, or at least one."""
+        facts, key, when = self.agent_facts(item), item["key"], item.get("when", "any")
+        calls = [c for c in self.model_calls(facts) if when in ("any", c["phase"])
+                 and any(any(fnmatch.fnmatchcase(k, key) for k in (fleet_of(m) or {}).get("keys") or [])
+                         for m in c["inputs"])]
+        ok = len(calls) == item["count"] if "count" in item else bool(calls)
+        every = ["t=%.2f %s" % (self.at(c["time"]), c["phase"]) for c in self.model_calls(facts)
+                 if any(m in self.keyed(facts, key) for m in c["inputs"])]
+        return ok, "%d model call(s) (%s) carried %r; every call that did: %s" % (
+            len(calls), when, key, ", ".join(every) or "none")
+
+    def check_within(self, item):
+        """Transcript and model log against step `step`'s time. With `key`:
+        the message carrying it was delivered, and a model call answered it,
+        within `seconds`. Without: the agent's first final reply after the
+        step was complete within `seconds`."""
+        facts = self.agent_facts(item)
+        t_step = self.step_times.get(int(item["step"]))
+        limit = float(item["seconds"])
+        if t_step is None:
+            return False, "step %s did not run" % item["step"]
+        if item.get("key"):
+            delivered = self.keyed(facts, item["key"])
+            if not delivered:
+                return False, "no message with key %r in the transcript" % item["key"]
+            text = squash(transcript_text(delivered[0]))
+            answered = [e for e in facts["requests"] if squash(last_user(e)) == text]
+            if not answered:
+                return False, "no model call answered the message with key %r" % item["key"]
+            d = delivered[0]["time"]["created"] / 1000.0 - t_step
+            a = answered[0]["time"] - t_step
+            return a <= limit and d <= limit, "delivered %.2f s and answered %.2f s after step %s (limit %g s)" % (
+                d, a, item["step"], limit)
+        replies = [m for m in facts["transcript"] if m.get("type") == "assistant"
+                   and m.get("finish") == "stop"
+                   and (m.get("time") or {}).get("created", 0) / 1000.0 >= t_step - 0.05]
+        if not replies:
+            return False, "no final reply after step %s" % item["step"]
+        done = (replies[0].get("time") or {}).get("completed") or replies[0]["time"]["created"]
+        took = done / 1000.0 - t_step
+        return took <= limit, "reply %r complete %.2f s after step %s (limit %g s)" % (
+            short(transcript_text(replies[0]), 30), took, item["step"], limit)
+
+    def check_admitted_once(self, item):
+        """Transcript plus inbox of `to`: messages with a metadata.fleet key
+        matching the glob `key`; `count` of them, default 1."""
+        facts = self.agent_facts({"agent": item["to"]})
+        key, want = item["key"], int(item.get("count", 1))
+        sent = self.keyed(facts, key)
+        waiting = [i for i in facts["inbox"]
+                   if any(fnmatch.fnmatchcase(k, key) for k in (fleet_of(i) or {}).get("keys") or [])]
+        n = len(sent) + len(waiting)
+        return n == want, "%d in the transcript + %d waiting in the inbox = %d (want %d): %s" % (
+            len(sent), len(waiting), n, want, ", ".join(m.get("id", "?") for m in sent + waiting))
+
+    def check_metadata_roundtrip(self, item):
+        """session.get (of=session) or message.list (of=message, by key or text)
+        returns metadata.fleet exactly; expected from the cast unless given."""
+        facts = self.agent_facts(item)
+        if item.get("of", "session") == "session":
+            want = item["fleet"] if "fleet" in item else fleet_metadata(
+                item["agent"], self.scenario["cast"][item["agent"]])
+            got = (facts["record"].get("metadata") or {}).get("fleet")
+            return got == want, "session.get metadata.fleet = %s; expected %s" % (
+                json.dumps(got, sort_keys=True), json.dumps(want, sort_keys=True))
+        if item.get("key"):
+            found = self.keyed(facts, item["key"])
+        else:
+            found = [m for m in facts["transcript"] if m.get("type") in ("user", "synthetic")
+                     and item["text"] in transcript_text(m)]
+        if not found:
+            return False, "no message with %r in the transcript" % (item.get("key") or item.get("text"))
+        # A message found by key carries at least that key; by text, nothing
+        # unless the scenario says so (your prompts carry no metadata.fleet).
+        default = {"keys": [item["key"]]} if item.get("key") else None
+        want, got = item.get("fleet", default), fleet_of(found[0])
+        return got == want, "%s %s metadata.fleet = %s; expected %s" % (
+            found[0].get("type"), found[0].get("id"), json.dumps(got, sort_keys=True),
+            json.dumps(want, sort_keys=True))
+
+    def check_status_is(self, item):
+        """herdr `agent get` samples: the agent's status at time `at`."""
+        if item["agent"] != self.tui:
+            return False, "%s is not on screen, so herdr has no status for it" % item["agent"]
+        t = self.seconds(item["at"])
+        want = item["status"] if isinstance(item["status"], list) else [item["status"]]
+        seen = [s for when, s in self.status_changes if when <= t]
+        got = seen[-1] if seen else None
+        changes = ", ".join("%.1fs %s" % c for c in self.status_changes)
+        return got in want, "at %s herdr said %r (want %s); changes: %s" % (
+            item["at"], got, "/".join(want), changes)
+
+    def check_draft_intact(self, item):
+        """herdr pane read of the input box holds the draft, and no user
+        message in the transcript contains it."""
+        if item["agent"] != self.tui or self.screen is None:
+            return False, "%s is not on screen" % item["agent"]
+        draft = squash(item["text"])
+        box = input_box(self.screen) or {}
+        in_box = draft in squash(box.get("text"))
+        sent = [m.get("id") for m in self.agent_facts(item)["transcript"]
+                if m.get("type") == "user" and draft in squash(transcript_text(m))]
+        return in_box and not sent, "input box %r; sent in: %s" % (
+            short(box.get("text") or "", 80), ", ".join(sent) or "no message")
+
+    def check_tool_outcome(self, item):
+        """The transcript's record of the agent's last `tool` call (default
+        shell): its final state must be `outcome` (completed, error), and a
+        completed call's result must have gone back to the model (its log)."""
+        facts, tool = self.agent_facts(item), item.get("tool", "shell")
+        calls = [part for m in facts["transcript"] if m.get("type") == "assistant"
+                 for part in m.get("content") or []
+                 if isinstance(part, dict) and part.get("type") == "tool" and part.get("name") == tool]
+        if not calls:
+            return False, "no %s call in the transcript" % tool
+        state = calls[-1].get("state") or {}
+        output = " ".join(c.get("text", "") for c in state.get("content") or [] if isinstance(c, dict))
+        returned = any(r == "tool" and squash(t) == squash(output) and squash(output)
+                       for e in facts["requests"] for r, t in request_messages(e))
+        want = item.get("outcome", "completed")
+        ok = state.get("status") == want and (want != "completed" or returned)
+        return ok, "%s %s: %s, output %r, %s the model" % (
+            tool, json.dumps(state.get("input")), state.get("status"), short(output, 40),
+            "returned to" if returned else "never returned to")
+
+    def teardown(self):
+        """Leave the Lab pane's input box empty for the next play."""
+        if not self.tui_ready:
+            return
+        if self.watch and self.watch.is_alive():
+            self.watch.stop()
+        box = input_box(pane_text(self.pane)) or {}
+        if box.get("text"):
+            self.tui_guard()
+            herdr_run("pane", "send-keys", self.pane, "ctrl+c")
+            time.sleep(0.5)
+
+
+def play_scenario(lab, scenario, label, pane, seconds):
+    run = ScenarioRun(lab, scenario, label, pane, seconds)
+    results = []
+    try:
+        run.setup()
+        run.play()
+        run.gather()
+        results = run.evaluate()
+    except (RunError, V2Error, subprocess.SubprocessError) as err:
+        run.error = str(err)[:400]
+        run.note("error", error=run.error)
+    finally:
+        run.teardown()
+    return run, results
+
+
+def control_verdict(control, results):
+    """{entry: broke?} for each expectation the control names."""
+    broke = {}
+    for entry in control["fails"]:
+        hits = [r for r in results if r["name"] == entry or r["that"] == entry]
+        broke[entry] = bool(hits) and all(not r["passed"] for r in hits)
+    return broke
+
+
+def md_cell(text):
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def write_scenario_evidence(out_dir, scenario, plays, verdict, stamp):
+    os.makedirs(out_dir, exist_ok=True)
+    lines = ["# %s: %s" % (scenario["id"], scenario["title"]), "",
+             "- Verdict: **%s**" % verdict,
+             "- Problem: %s; since PR %d; tiers %s; tags %s" % (
+                 scenario["problem"] if scenario["problem"] is not None else "none",
+                 scenario["since_pr"], ", ".join(scenario["tiers"]),
+                 ", ".join(scenario.get("tags") or []) or "none"),
+             "- Played %s (UTC) in the Lab, tier lab-scripted" % stamp, ""]
+    control = scenario["control"]
+    for label in ("run", "control"):
+        if label not in plays:
+            continue
+        run, results = plays[label]
+        lines.append("## %s" % ("Run" if label == "run" else "Control"))
+        lines.append("")
+        if label == "control":
+            lines.append("Variant: `%s`. It must fail: %s." % (
+                json.dumps(control["variant"], sort_keys=True), ", ".join(control["fails"])))
+            lines.append("")
+        lines.append("Sessions: %s" % ", ".join("%s `%s`" % (n, m["session"]) for n, m in run.cast.items()))
+        if run.tui:
+            lines.append("On screen: %s in pane `%s` (herdr agent `%s`)" % (run.tui, run.pane, LAB_TUI_AGENT))
+        lines.append("")
+        if run.error:
+            lines += ["**Did not finish:** %s" % md_cell(run.error), ""]
+        for err in run.step_errors:
+            lines.append("- Step error: %s" % md_cell(err))
+        must_fail = set(control["fails"]) if label == "control" else set()
+        lines += ["| Expectation | Oracle | Result | Detail |", "|---|---|---|---|"]
+        for r in results:
+            flag = " (must fail)" if (r["name"] in must_fail or r["that"] in must_fail) else ""
+            lines.append("| %s%s | %s | %s | %s |" % (md_cell(r["label"]), flag, r["that"],
+                                                     "pass" if r["passed"] else "FAIL",
+                                                     md_cell(r["detail"])))
+        if label == "control":
+            broke = control_verdict(control, results)
+            lines += ["", "Control %s: %s" % (
+                "failed as it must" if broke and all(broke.values()) and not run.error else "DID NOT FAIL",
+                ", ".join("%s %s" % (k, "broke" if v else "still passed") for k, v in broke.items()))]
+        lines.append("")
+    with open(os.path.join(out_dir, "report.md"), "w") as f:
+        f.write("\n".join(lines))
+    entries = []
+    for label, (run, _) in plays.items():
+        for entry in run.timeline:
+            entry = dict(entry)
+            entry["t"] = round(entry["wall"] - run.t0, 2) if run.t0 else None
+            entries.append(entry)
+    entries.sort(key=lambda e: (e["run"] != "run", e["wall"]))
+    with open(os.path.join(out_dir, "timeline.jsonl"), "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, default=str, sort_keys=True) + "\n")
+
+
+def scripted_model_up(lab):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/health" % lab.port(), timeout=3) as r:
+            return r.status == 200
+    except OSError:
+        return False
+
+
+def cmd_run(lab, args):
+    if args.tier not in RUN_TIERS:
+        sys.stderr.write("proof-switchboard run: tier %s is not built yet (built: %s)\n"
+                         % (args.tier, ", ".join(RUN_TIERS)))
+        return 2
+    if args.control_only and args.no_control:
+        sys.stderr.write("proof-switchboard run: --control-only and --no-control exclude each other\n")
+        return 2
+    if not scripted_model_up(lab):
+        sys.stderr.write("proof-switchboard run: the scripted model is not answering on port %d; "
+                         "start it with `proof-switchboard scripted-model --log %s`\n"
+                         % (lab.port(), model_log_path(lab)))
+        return 2
+    fs = fleet_scenario()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    root = os.path.join(RUNS_DIR, stamp)
+    pane = args.pane or default_lab_pane()
+    rows, failed = [], False
+    for path in scenario_paths(args.paths or [SCENARIO_DIR]):
+        name = os.path.basename(path)
+        try:
+            scenario = fs.load(path)
+        except fs.ScenarioError as err:
+            rows.append((name, "INVALID", "-", "-", str(err)))
+            failed = True
+            continue
+        sid = scenario["id"]
+        if args.tier not in scenario["tiers"]:
+            rows.append((sid, "SKIP", "-", "-", "not in tier %s" % args.tier))
+            continue
+        reasons = unsupported(scenario, fs.validate)
+        if reasons:
+            rows.append((sid, "SKIP", "-", "-", "; ".join(reasons)))
+            print("%s SKIP: %s" % (sid, "; ".join(reasons)), flush=True)
+            continue
+        plays = {}
+        if not args.control_only:
+            print("%s run ..." % sid, flush=True)
+            plays["run"] = play_scenario(lab, scenario, "run", pane, fs.duration_seconds)
+        if not args.no_control:
+            print("%s control ..." % sid, flush=True)
+            variant = apply_variant(scenario, scenario["control"]["variant"])
+            plays["control"] = play_scenario(lab, variant, "control", pane, fs.duration_seconds)
+        run_cell = control_cell = "-"
+        ok = True
+        if "run" in plays:
+            run, results = plays["run"]
+            passed = not run.error and not run.step_errors and results and all(r["passed"] for r in results)
+            run_cell = "pass" if passed else "FAIL"
+            ok &= bool(passed)
+        if "control" in plays:
+            run, results = plays["control"]
+            broke = control_verdict(scenario["control"], results)
+            control_failed = not run.error and bool(broke) and all(broke.values())
+            control_cell = "fails" if control_failed else "PASSES"
+            ok &= control_failed
+        verdict = "PASS" if ok else "FAIL"
+        failed |= not ok
+        out_dir = os.path.join(root, sid)
+        write_scenario_evidence(out_dir, scenario, plays, verdict, stamp)
+        rows.append((sid, verdict, run_cell, control_cell, os.path.relpath(out_dir, REPO_ROOT)))
+        print("%s %s (run %s, control %s) -> %s" % (sid, verdict, run_cell, control_cell,
+                                                    os.path.relpath(out_dir, REPO_ROOT)), flush=True)
+    table = ["| Scenario | Verdict | Run | Control | Evidence or reason |", "|---|---|---|---|---|"]
+    table += ["| %s |" % " | ".join(md_cell(c) for c in row) for row in rows]
+    if any(r[1] not in ("SKIP",) for r in rows):
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "summary.md"), "w") as f:
+            f.write("# Scenario run %s (UTC), tier %s\n\n%s\n" % (stamp, args.tier, "\n".join(table)))
+    print("\n".join(table))
+    return 1 if failed else 0
+
+
 def cmd_session(lab, args):
     v2 = V2(lab)
     if args.session_command == "create":
@@ -1320,6 +2184,14 @@ def main(argv=None):
     t = ses_sub.add_parser("transcript")
     t.add_argument("session")
     t.add_argument("--limit", type=int, default=20)
+    run_p = sub.add_parser("run", help="play scenarios in the Lab (tier lab-scripted)")
+    run_p.add_argument("paths", nargs="*", help="scenario files or directories "
+                       "(default: scenarios/switchboard)")
+    run_p.add_argument("--tier", default="lab-scripted")
+    run_p.add_argument("--control-only", action="store_true", help="play only each control")
+    run_p.add_argument("--no-control", action="store_true", help="play only each run")
+    run_p.add_argument("--pane", help="Lab pane for the TUI (default: the first pane of the %r "
+                       "workspace)" % LAB_WORKSPACE_LABEL)
     mr = sub.add_parser("model-requests", help="scripted-model requests since a time")
     mr.add_argument("--since", type=float, default=0)
     mr.add_argument("--marker")
@@ -1331,6 +2203,8 @@ def main(argv=None):
         return cmd_session(lab, args)
     if args.command == "model-requests":
         return cmd_model_requests(lab, args)
+    if args.command == "run":
+        return cmd_run(lab, args)
     if args.command == "lab":
         handler = {"env": cmd_lab_env, "init": cmd_lab_init, "status": cmd_lab_status}.get(
             args.lab_command)

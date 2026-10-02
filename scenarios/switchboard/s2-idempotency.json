@@ -1,0 +1,29 @@
+{
+  "id": "S2",
+  "title": "Spike S2: a synthetic sent twice with one id is admitted once",
+  "problem": null,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "coder": {"role": "coder", "issue": 2}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "synthetic", "to": "coder", "id": "s2-same", "key": "S2-dup",
+     "text": "fleet note S2-first: PR 12 got a review", "resume": false, "delivery": "steer"},
+    {"at": "2s", "actor": "world", "do": "synthetic", "to": "coder", "id": "s2-same", "key": "S2-dup",
+     "text": "fleet note S2-second: PR 12 got a review", "resume": false, "delivery": "steer",
+     "why": "same id, different text: v2 keeps the first write"},
+    {"at": "4s", "actor": "you", "do": "message", "to": "coder", "text": "what is new?"}
+  ],
+  "expect": [
+    {"that": "admitted_once", "name": "one-admitted", "to": "coder", "key": "S2-dup"},
+    {"that": "model_saw", "name": "one-model-call", "agent": "coder", "key": "S2-dup", "count": 1,
+     "why": "the model got it once, with your message"},
+    {"that": "no_machine_turn", "agent": "coder"}
+  ],
+  "control": {
+    "variant": {"steps": {"1": {"id": "s2-other"}}},
+    "fails": ["one-admitted"]
+  }
+}
