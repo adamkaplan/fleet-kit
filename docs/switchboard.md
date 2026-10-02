@@ -10,7 +10,7 @@
 
 | PR | Branch | Scope | State |
 |---|---|---|---|
-| 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | draft [#15](https://github.com/adamkaplan/fleet-kit/pull/15) |
+| 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | ready for review [#15](https://github.com/adamkaplan/fleet-kit/pull/15); spikes pass |
 | 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send` | planned |
 | 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
@@ -110,7 +110,7 @@ Evidence from real use:
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
 | GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
 | Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
-| Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. Whether it shows in the TUI is settled by S3. |
+| Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. The TUI does not show it (S3); the badge, `status` and the audit log do. |
 | Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
 | Talking to orchestrators | You can talk to any orchestrator directly. Nothing extra is recorded; the issue already carries the intent. |
 | v1 sessions | Imported, not restarted (PR 10). |
@@ -154,8 +154,10 @@ message. A `send` from another agent skips the batch.
 - **You are engaged with the agent → note.** Engaged means you prompted it in
   the last 10 minutes: the newest user message in its transcript that the
   fleet did not send. The switchboard calls `session.synthetic` with
-  `resume: false`. That starts no turn; the agent sees the note alongside your
-  next message.
+  `resume: false` and `delivery: "steer"`. That starts no turn; the note
+  reaches the model in the same request as your next message, just before it
+  (S3). With `queue` it would instead arrive after the agent had answered you,
+  and start a turn of its own.
 - **Otherwise → wake.** `session.synthetic` with `resume: true` and
   `delivery: "queue"`. It never cuts into a running turn.
 - **The message is the delivery.** It contains the items themselves, grouped
@@ -166,8 +168,12 @@ message. A `send` from another agent skips the batch.
 - **Never typed.** The switchboard never calls `herdr agent prompt` and never
   writes into a pane's input box.
 - **A note that outlives your attention.** If 10 minutes pass with no prompt
-  from you and a note is still waiting in v2's inbox, it is switched to
-  `steer`, which starts a turn (verify S3).
+  from you and a note is still waiting in v2's inbox, it becomes a wake:
+  `session.inbox.update` to `queue` and then to `steer`, which starts a turn
+  (S3). v2 refuses to change a waiting steer item to steer directly.
+- **Invisible in the TUI.** v2's TUI shows neither notes nor wakes, only the
+  agent's reply (S3). What was delivered is visible in the herdr badge,
+  `fleet-switchboard status` and the audit log.
 
 ```mermaid
 flowchart TD
@@ -180,7 +186,7 @@ flowchart TD
   engaged -- "yes" --> note["Note<br/>synthetic, resume false<br/>no turn starts"]
   engaged -- "no" --> wake["Wake<br/>synthetic, resume true, delivery queue"]
   note --> lapse{"Still in v2's inbox<br/>after 10 min without you?"}
-  lapse -- "yes" --> steer["Switch it to steer<br/>turn starts"]
+  lapse -- "yes" --> steer["Convert to a wake<br/>turn starts"]
   lapse -- "no: your next message carried it" --> done(["Delivered"])
   wake --> busy{"A busy?"}
   busy -- "yes" --> after["Runs after the current turn"]
@@ -314,17 +320,18 @@ service and handles authentication. One client class owns every call.
 
 | Contract | OpenCode v2 |
 |---|---|
-| launch | `session.create` with the agent, title, location and `metadata.fleet = {name, role, reports_to, issue}`; a herdr tab running the TUI with `-s <session>`; then `session.prompt` with the brief, marked as sent by the fleet |
-| observe `status` | herdr `agent_status` for the pane whose `agent_session` is this session (verify S6) |
+| launch | `session.create` with the agent, title, location and `metadata.fleet = {name, role, reports_to, issue}`; a herdr tab running the TUI with `-s <session>`, started by absolute path and checked with `pane process-info` (S6: a login shell's PATH can resolve `opencode` to v1); then `session.prompt` with the brief, marked as sent by the fleet |
+| observe `status` | herdr `agent_status` for the pane whose `agent_session` is this session (S6). `done` counts as idle: herdr shows `done` after a turn in an unfocused pane |
 | observe `fleet` | `session.get` → `metadata.fleet` (verify S5) |
 | observe `idle_at`, `outcome` | `session.get` → `time.idle`, `outcome` |
 | observe `blocked_on` | `permission.request.list`, `form.list` |
-| observe `last_human_prompt` | `session.message.list`, newest first: the first user message without fleet metadata (verify S5) |
+| observe `last_human_prompt` | `session.message.list`, newest first: the first message of type `user` without `metadata.fleet` (S5). Fleet prompts are also type `user`, so the metadata is what tells them apart |
 | delivered | Synthetic messages newer than `since`, read newest first: their `metadata.fleet.keys`. Plus `session.inbox.list`, for notes not yet delivered (verify S5) |
-| note | `session.synthetic` with `resume: false` and `metadata.fleet.keys` (verify S3) |
-| wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (verify S4) |
-| note → wake | `session.inbox.update` with `delivery: "steer"` on a waiting note (verify S3) |
-| message id | Derived from the recipient and the keys, so a retry reuses it and v2 admits it once (verify S2) |
+| note | `session.synthetic` with `resume: false`, `delivery: "steer"` and `metadata.fleet.keys` (S3) |
+| wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (S4: idle, a turn starts in 0.06 s; busy, it runs after the turn's final reply, never between steps) |
+| note → wake | `session.inbox.update` to `queue`, then to `steer`; or `session.inbox.cancel` and resend the same id as a wake (S3) |
+| message id | Derived from the recipient and the keys (`msg_` and 26 hex digits), so a retry reuses it. v2 admits a repeated id once and returns the original record (S2) |
+| events | `GET /api/event` streams only over direct HTTP to the service (Basic auth, credentials in the service's registration file); `opencode api` buffers the whole response (S2). The switchboard polls, woken early by herdr's status events |
 | move a v1 session | `experimental.session.import` (PR 10) |
 
 Capabilities: all of them, if S3 and S4 pass.
@@ -898,7 +905,7 @@ stateDiagram-v2
   pending --> waiting: note, kept in v2's inbox
   pending --> delivered: wake
   waiting --> delivered: your next message starts a turn
-  waiting --> delivered: 10 min without you, switched to steer
+  waiting --> delivered: 10 min without you, converted to a wake
   delivered --> [*]
 ```
 
@@ -1037,9 +1044,21 @@ flowchart LR
 | S6 | herdr | In the Lab: `herdr agent start --kind opencode -- -s <ses>` works; herdr's v2 integration reports working, idle and blocked (forced with a permission prompt) correctly; `agent_session` names the session; the `unread` token shows in the sidebar; plugin link and `[[startup]]` work |
 | S7 | Scripted model | The Lab's v2 accepts a local OpenAI-compatible provider; a scripted agent runs a shell command, asks a permission, and replies on cue, with streaming; herdr's status follows it as it would a real model |
 
-Each spike is written as a lab scenario tagged `spike` (see
-[Scenario testing](#scenario-testing)), so it can be re-run on every v2 or
-herdr upgrade.
+**Results (2026-10-02, OpenCode v2 2.0.22, herdr 0.9.3, scripted model):**
+
+| # | Verdict | What was found |
+|---|---|---|
+| S1 | Pass | v2 is confined by `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, plus `TMPDIR` and `HOME` for its last two paths. The Lab calls v2 only through a wrapper that sets these and strips credentials from the environment. v2's default database and log paths are the same files v1 uses. herdr's integration install ignores `XDG_CONFIG_HOME` and needs `HOME` pointed at the Lab. Lab sessions under the home directory can still read the user's skill folders; see [#16](https://github.com/adamkaplan/fleet-kit/issues/16) |
+| S2 | Pass | Each `opencode api` call takes 60–160 ms. Path parameters are `--param name=value`; bodies are inline `-d` JSON. A repeated synthetic id is admitted once. Events stream only over direct HTTP |
+| S3 | Pass, with corrections | A note starts no turn with either delivery. Only `steer` makes it ride with your next message; `queue` delivers it after the reply and starts a model call. A waiting steer note can't be updated to steer, so a note becomes a wake through `queue` then `steer`. The TUI shows neither |
+| S4 | Pass | An idle wake starts a turn in 0.06 s; a busy wake runs after the final reply, never between steps. A half-typed draft in the TUI survived an idle wake, a busy wake and a permission prompt |
+| S5 | Pass | Session and message metadata round-trip exactly. Your prompts are type `user` without `metadata.fleet`. Reading newest first with a limit works. `time.idle` and `outcome` change on every turn |
+| S6 | Pass for PR 1's scope | herdr reported working, blocked (0.06 s after a permission ask) and done; `agent_session` names the session; the `unread` token is readable. A login shell's PATH put v1 ahead of the Lab's v2, so `launch` must start v2 by absolute path and check it. Plugin link and `[[startup]]` move to PR 3 |
+| S7 | Pass | The scripted model, registered as an OpenAI-compatible provider, streams replies, runs a shell tool call, and asks a permission; herdr's status follows it |
+
+Spikes run as `bin/proof-switchboard spike s3|s4|s5|s6`. They become scenario
+files tagged `spike` with the Lab scenario runner in PR 2, so they can be
+re-run on every v2 or herdr upgrade.
 
 **Stop rule.** If S3 or S4 fails, work stops and we decide together before
 PR 2. No fallback is built ahead of time. If S7 fails, lab-scripted runs fall
@@ -1207,7 +1226,7 @@ R1.
 | B1 | Five events for one agent within 60 s | 3 | Batching | PR 2 | offline, lab-scripted |
 | R2 | The daemon crashes between sending and reading back | — | Message id derived from the keys (invariant 3) | PR 2 | offline, lab-scripted |
 | N1 | A worker finishes while you are talking to its orchestrator | 3 | Engagement gate | PR 4 | offline, lab-scripted |
-| N2 | A note waits 10 minutes with no message from you | 3 | Note switched to steer | PR 4 | offline, lab-scripted |
+| N2 | A note waits 10 minutes with no message from you | 3 | Note converted to a wake | PR 4 | offline, lab-scripted |
 | W1 | A worker finishes while you are away | 4 | Worker-done fact | PR 4 | offline, lab-scripted |
 | W3 | A worker stops on a permission prompt | 4 | Blocked fact and toast | PR 4 | offline, lab-scripted |
 | Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated), lab-scripted (30 min) |
@@ -1308,11 +1327,6 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
 
 ## Open questions
 
-- S3: are synthetic notes visible in the v2 TUI? If they are, either accept
-  visible, labelled notes or revisit the design.
-- S2: if a repeated message id is admitted twice, the crash window between a
-  write and its read-back needs another guard. Derived pending already covers
-  every other case.
 - Who may change an Intent? Decided: you, or the Chief of Staff with your
   yes. Orchestrators and workers propose; every change is surfaced.
 - Does an ask-level header actually reduce drift and dilution in a session
@@ -1424,3 +1438,9 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     Staff and orchestrators.
   - **"Outside the Intent" is a hard deny.** The agent escalates; only you, or
     the Chief of Staff with your yes, widen the ask.
+- 2026-10-02: PR 1 built. `bin/fleet-switchboard` (config, v2 and herdr
+  clients, audit log, faults, `status`), `bin/fleet-scenario` (format and
+  validator), `bin/test-switchboard` (offline suite, in CI) and
+  `bin/proof-switchboard` (Lab, scripted model, spikes). Spikes S1–S7 pass;
+  S3 corrected the note: `steer`, not `queue`. The v2 binary must be
+  configured by absolute path.
