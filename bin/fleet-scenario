@@ -8,7 +8,7 @@ format is in docs/switchboard.md, section "Scenario testing".
 
     fleet-scenario validate [paths...]   every *.json in scenarios/switchboard/ by default
     fleet-scenario list
-    fleet-scenario coverage [--enforce]  exit 1 when enforced and a problem has no scenario
+    fleet-scenario coverage [--enforce] [--through-pr N]  exit 1 when enforced and a problem due by PR N has no scenario
 
 The test runners import this file for `validate`, `load`, `load_dir` and
 `coverage`. Python 3.9+, standard library only.
@@ -40,6 +40,9 @@ def _load_switchboard():
 KNOWN_FAULTS = tuple(_load_switchboard().KNOWN_FAULTS)
 
 PROBLEMS = (1, 2, 3, 4)
+# The PR whose scenarios first cover each problem (docs/switchboard.md, Catalog):
+# `coverage --through-pr N` enforces only the problems due by PR N.
+PROBLEM_DUE_PR = {3: 2, 4: 4, 1: 6, 2: 7}
 TIERS = ("offline", "lab-scripted", "lab-model")
 ROLES = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
 ACTORS = ("you", "world")
@@ -52,7 +55,7 @@ OF = ("session", "message")
 OUTCOMES = ("completed", "error")
 # The systems a control can run instead of the switchboard. `fleet-heartbeat`
 # is today's: it types a wake into the agent's input box, with `agent prompt`.
-BASELINES = ("fleet-heartbeat",)
+BASELINES = ("fleet-heartbeat", "timer-heartbeat")
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -79,6 +82,7 @@ STEP_FIELDS = {
     "close-pane": {"agent": (True, _CAST)},
     "edit-intent": {"issue": (True, "issue"), "intent": (False, "text_or_null"),
                     "done_when": (False, "text_or_null")},
+    "delete-state": {},
     "synthetic": _SYNTHETIC,
     "note": _SYNTHETIC,
     "wake": _SYNTHETIC,
@@ -95,11 +99,11 @@ STEP_ACTORS = {
     "permission": ("you", "cast"), "comment": ("world",), "kill-daemon": ("world",),
     "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
     "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
-    "fact": ("world",), "pass": ("world",), "launch": ("world",),
+    "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
-                  "count": (False, "count0"), "keys": (False, "count1")},
+                  "count": (False, "count0"), "keys": (False, "count1"), "text": (False, "text")},
     "message_count": {"to": (True, _CAST), "count": (True, "count0")},
     "model_saw": {"agent": (True, _CAST), "key": (True, "name"), "when": (False, "when"),
                   "count": (False, "count0")},
@@ -128,7 +132,7 @@ EXPECT_COMMON = ("that", "name", "why")
 VARIANT_KEYS = ("steps", "expect")
 
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
-OPTIONAL = ("tags", "issues")
+OPTIONAL = ("tags", "issues", "config")
 CAST_KEYS = ("role", "reports_to", "issue", "charter")
 ISSUE_KEYS = ("intent", "done_when", "parent")
 CONTROL_KINDS = ("fault", "baseline", "variant")
@@ -276,6 +280,26 @@ def _validate_issues(issues, errors):
                 errors.append("%s.%s: must be a string or null" % (where, key))
         if "parent" in issue and not (_int(issue["parent"]) and issue["parent"] >= 1):
             errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
+
+
+# ---- scenario-level config (PR 4)
+
+# Timing the engine reads, which a scenario may shorten so the Lab need not wait
+# real minutes; both runners apply it. Each is a positive number, as in the
+# engine's own config.
+CONFIG_KEYS = ("batch_seconds", "engaged_minutes")
+
+
+def _validate_config(config, errors):
+    if not isinstance(config, dict) or not config:
+        errors.append("config: must be a non-empty object (known keys: %s)" % ", ".join(CONFIG_KEYS))
+        return
+    for key in sorted(set(config) - set(CONFIG_KEYS)):
+        errors.append("config: unknown key %r (known: %s)" % (key, ", ".join(CONFIG_KEYS)))
+    for key in CONFIG_KEYS:
+        value = config.get(key)
+        if key in config and not (isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0):
+            errors.append("config.%s: must be a number > 0, got %r" % (key, value))
 
 
 def _validate_steps(steps, cast, errors):
@@ -456,6 +480,8 @@ def validate(obj):
     if "tags" in obj and not (isinstance(obj["tags"], list) and all(isinstance(t, str) and t for t in obj["tags"])):
         errors.append("tags: must be a list of non-empty strings")
 
+    if "config" in obj:
+        _validate_config(obj["config"], errors)
     body = _validate_body(obj)
     errors.extend(body)
     cast = obj["cast"] if isinstance(obj.get("cast"), dict) else {}
@@ -573,9 +599,13 @@ def cmd_coverage(args):
         sys.stderr.write("%s: %s\n" % (PROG, error))
         return 1
     covered = coverage(scenarios)
+    through = getattr(args, "through_pr", None)
     for problem, ids in covered.items():
-        print("problem %d: %s" % (problem, ", ".join(ids) or "(no scenario)"))
-    missing = [problem for problem, ids in covered.items() if not ids]
+        late = through is not None and PROBLEM_DUE_PR[problem] > through
+        print("problem %d: %s" % (problem, ", ".join(ids) or
+                                  ("(not due until PR %d)" % PROBLEM_DUE_PR[problem] if late else "(no scenario)")))
+    missing = [problem for problem, ids in covered.items() if not ids
+               and (through is None or PROBLEM_DUE_PR[problem] <= through)]
     if args.enforce and missing:
         sys.stderr.write("%s: no scenario covers problem(s) %s\n" % (PROG, ", ".join(map(str, missing))))
         return 1
@@ -596,6 +626,8 @@ def build_parser():
         if name == "coverage":
             command.add_argument("--enforce", action="store_true",
                                  help="Exit 1 when any of problems 1-4 has no scenario")
+            command.add_argument("--through-pr", type=int, metavar="N",
+                                 help="Enforce only the problems whose scenarios are due by PR N")
     return parser
 
 

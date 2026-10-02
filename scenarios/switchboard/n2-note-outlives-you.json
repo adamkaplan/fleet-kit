@@ -1,0 +1,31 @@
+{
+  "id": "N2",
+  "title": "A note waits past your attention and becomes a wake",
+  "problem": 3,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "config": {"engaged_minutes": 3},
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "platform", "text": "how is the health check going?",
+     "why": "Engaged for 3 minutes, not the default 10, so the Lab need not wait ten real minutes; the offline suite tests the 10-minute default in TestConversion"},
+    {"at": "2s", "actor": "coder", "do": "turn", "lasts": "10s",
+     "why": "Finishes at about 12 s; the item is ripe at about 102 s, while you are still engaged, so it goes in as a note"},
+    {"at": "2m", "actor": "you", "do": "away",
+     "why": "You prompt nothing more: the engagement window ends at 3 minutes"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "converted", "that": "delivered", "to": "platform", "key": "worker.idle:*", "mode": "wake", "count": 1,
+     "why": "The note became a turn once you had not prompted for the whole window"},
+    {"name": "one-message", "that": "message_count", "to": "platform", "count": 1,
+     "why": "It is the same message, converted in place, not a second one"}
+  ],
+  "control": {"fault": "no-note-conversion", "fails": ["converted"]}
+}

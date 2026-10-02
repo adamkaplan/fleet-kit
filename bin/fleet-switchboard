@@ -14,6 +14,7 @@ delivery rule, and delivers. See docs/switchboard.md, "Delivery rule".
     fleet-switchboard launch <name> ...     a new fleet agent in its own herdr tab
     fleet-switchboard send <name> <text>    deliver to another agent now
     fleet-switchboard pending <name>        what is pending, and why it waits
+    fleet-switchboard remind <name> <when> <text>   a message due later
     fleet-switchboard status                config, clients, fleet agents
 
 Rules this file keeps from the start:
@@ -80,6 +81,7 @@ DEFAULTS = {
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
     "poll_seconds": 5,
+    "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -144,7 +146,8 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
-    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds"):
+    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds",
+                "worker_lookback_hours"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
     config.update(envs)
@@ -204,6 +207,8 @@ KNOWN_FAULTS = (
     "no-policy-judge",
     "judge-loosens",
     "no-maxims",
+    "no-worker-source",
+    "no-note-conversion",
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -443,6 +448,16 @@ class V2Client:
 
     def inbox_list(self, session_id):
         return self._call("session.inbox.list", {"sessionID": session_id})
+
+    def permission_list(self, session_id):
+        """The session's pending permission requests (S2: `session.permission.list`
+        works with the session id alone; `permission.request.list` needs a location)."""
+        return self._call("session.permission.list", {"sessionID": session_id})
+
+    def form_list(self, session_id):
+        """The session's pending forms (questions). UNVERIFIED: the operation name is
+        a guess from `form.list` in the design; no spike has run it."""
+        return self._call("session.form.list", {"sessionID": session_id})
 
     def inbox_update(self, session_id, inbox_id, delivery):
         if delivery not in self.DELIVERIES:
@@ -712,7 +727,7 @@ def fact_sources(state_dir):
     reminders join this list. `send` is not a source: it delivers directly, by
     the same rule, and stores nothing.
     """
-    return [lab_fact_source(state_dir)]
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir)]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -961,7 +976,13 @@ class Switchboard:
         self.engaged_seconds = config["engaged_minutes"] * 60
         self.executable = config["opencode_executable"] or config["opencode"]
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
+        self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
+        self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
+        for source in self.sources:
+            bind = getattr(source, "bind", None)
+            if bind:
+                bind(self)
 
     # -- the audit
 
@@ -1038,6 +1059,7 @@ class Switchboard:
     def discover(self, now, entries=None):
         """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
         found = Discovery()
+        self.discovery = found
         if entries is None:
             try:
                 entries = self.herdr.agent_list()
@@ -1103,7 +1125,10 @@ class Switchboard:
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
         keys = set()
-        page = self._messages(session_id)
+        # Only synthetic messages carry keys; asking for just those keeps the read
+        # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
+        page = self.v2.message_list(session_id, limit=READ_LIMIT, type="synthetic")
+        page = page if isinstance(page, list) else []
         complete = len(page) < READ_LIMIT
         for message in page:
             created = _created(message)
@@ -1157,6 +1182,7 @@ class Switchboard:
                           "keys": [fact.key for fact in plan.pending]}
                 if self.audit is not None:
                     self.audit.append(self.actor, "recheck", plan.recipient, detail)
+                note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
         text, carried = compose(plan.recipient, plan.pending)
@@ -1184,7 +1210,7 @@ class Switchboard:
         engagement window becomes a wake: `inbox.update` to queue, then to
         steer (v2 refuses steer to steer). Only on an idle agent. Returns the
         converted inbox ids."""
-        if hold_reason(observation) or observation.status != "idle":
+        if fault("no-note-conversion") or hold_reason(observation) or observation.status != "idle":
             return []
         if observation.engaged(now, self.engaged_seconds):
             return []
@@ -1226,6 +1252,7 @@ class Switchboard:
         now = self.now()
         report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
                   "badges": [], "toasts": []}
+        self.pass_toasts = {}
         discovery = self.discover(now)
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -1260,6 +1287,7 @@ class Switchboard:
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
+        finish_pass(self, discovery, report)
         return report
 
     # -- render: the sidebar badge and the toast
@@ -1298,6 +1326,9 @@ class Switchboard:
             except Exception as err:
                 self._failed(name, "badge", err, report)
 
+    def source_toasts(self):
+        return collect_source_toasts(self)
+
     def toast_candidates(self, discovery, held, now):
         """[(agent, reason, title, body)], one per agent, most urgent reason first:
         a pane on another program, a blocked agent, items held past the limit."""
@@ -1313,6 +1344,9 @@ class Switchboard:
             elif observation.status == "blocked":
                 wanted[name] = ("blocked", "%s is blocked" % name,
                                 "%s is waiting on a permission request or a question" % name)
+        for name, found in self.source_toasts().items():  # says what is asked, so it wins over the generic one
+            if wanted.get(name, ("",))[0] != "different opencode":
+                wanted[name] = found
         return [(name,) + wanted[name] for name in sorted(wanted)]
 
     def render_toast(self, discovery, held, now, report):
@@ -1676,6 +1710,361 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
 
 
+# ======================================================================
+# Worker events, reminders and toasts (PR 4)
+#
+# Two fact sources, registered in fact_sources(): WorkerFacts derives "a worker
+# finished" and "a worker is blocked" from herdr and v2 on every pass, and
+# ReminderFacts turns the reminders file into facts once they are due. Neither
+# stores anything about delivery. The only new state is reminders.json.
+# Hooks into the engine: Switchboard.__init__ binds each source that has a
+# `bind`, discover() keeps the newest Discovery, deliver() calls
+# note_unreachable, render's toast candidates include source_toasts(), and
+# run_pass() ends with finish_pass.
+# ======================================================================
+
+WORKER_IDLE = "worker.idle"
+WORKER_BLOCKED = "worker.blocked"
+SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
+LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
+REMINDERS = "reminders.json"
+REMINDER_LOCK = "reminders.lock"
+REMINDER_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def worker_horizon(config, now):
+    """The oldest `idle_at` that still counts: `worker_lookback_hours` back, so a
+    restart does not resurface ancient completions. In the Lab, the environment
+    may name a later start (LAB_WORKER_SINCE_ENV, epoch seconds), so the warm-up
+    turns that precede a play are not news; it is ignored outside the Lab."""
+    horizon = now - config["worker_lookback_hours"] * 3600
+    raw = os.environ.get(LAB_WORKER_SINCE_ENV) if os.environ.get(LAB_ENV) == "1" else None
+    if raw:
+        try:
+            horizon = max(horizon, float(raw))
+        except ValueError:
+            raise FactError("%s must be epoch seconds, got %r" % (LAB_WORKER_SINCE_ENV, raw)) from None
+    return horizon
+
+
+def reply_text(message):
+    """The text of one v2 assistant message: `text`, or its text parts."""
+    if not isinstance(message, dict):
+        return ""
+    text = message.get("text")
+    if not isinstance(text, str):
+        parts = message.get("content") if isinstance(message.get("content"), list) else []
+        text = " ".join(part.get("text", "") for part in parts
+                        if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return text
+
+
+def _issue_of(fleet):
+    issue = fleet.get("issue") if isinstance(fleet, dict) else None
+    return issue if isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1 else None
+
+
+def _boss_of(observation):
+    """Who a worker reports to, or None when it reports to nobody (or to itself)."""
+    boss = observation.fleet.get("reports_to")
+    return boss if isinstance(boss, str) and boss and boss != observation.name else None
+
+
+class WorkerFacts:
+    """Facts about workers (fleet agents that have a `reports_to`), derived on every call.
+
+    `worker.idle:<session>:<idle_at ms>`: its turn ended (herdr says idle, v2's
+    `time.idle` is set and within the look-back). For its `reports_to`.
+    `worker.blocked:<session>:<request id>`: herdr says blocked, and v2 lists a
+    pending permission request or form. For its `reports_to`; the human also
+    gets a toast (see `toasts`).
+    Nothing is stored: the same state gives the same facts (invariant 1).
+    """
+
+    __name__ = "worker_facts"
+
+    def __init__(self):
+        self.engine = None
+        self._blocked = []       # toasts of the last call: (agent, reason, title, body)
+        self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
+        self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def toasts(self):
+        return list(self._blocked)
+
+    def __call__(self):
+        self._blocked = []
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None)
+        if engine is None or discovery is None or fault("no-worker-source"):
+            return []
+        horizon = worker_horizon(engine.config, engine.now())
+        facts = []
+        for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
+            boss = _boss_of(observation)
+            if boss is None or observation.conflict or observation.problem:
+                continue
+            try:
+                facts.extend(self.finished(observation, boss, horizon))
+                facts.extend(self.blocked(observation, boss))
+            except V2Error as err:  # one worker's trouble never hides the others
+                engine._note("source.error", "worker_facts:" + observation.name, {"error": _one_line(str(err))})
+        return facts
+
+    def finished(self, observation, boss, horizon):
+        if observation.status != "idle" or observation.idle_at is None or observation.idle_at < horizon:
+            return []
+        idle_ms = int(round(observation.idle_at * 1000))
+        key = "%s:%s:%d" % (WORKER_IDLE, observation.session_id, idle_ms)
+        head = "%s finished its turn (%s)" % (observation.name, observation.outcome or "no outcome recorded")
+        reply = self.last_reply(observation.session_id, idle_ms)
+        return [Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
+                     issue=_issue_of(observation.fleet), sender=observation.name)]
+
+    def last_reply(self, session_id, idle_ms):
+        """The worker's last assistant reply, cut to SUMMARY_CAP; read once per turn."""
+        cached = self._summaries.get((session_id, idle_ms))
+        if cached is not None:
+            return cached
+        page = self.engine.v2.message_list(session_id, limit=1, type="assistant")
+        text = _one_line(reply_text(page[0]) if isinstance(page, list) and page else "", SUMMARY_CAP)
+        if len(self._summaries) > 500:
+            self._summaries.clear()
+        self._summaries[(session_id, idle_ms)] = text
+        return text
+
+    def blocked(self, observation, boss):
+        if observation.status != "blocked":
+            return []
+        facts = []
+        for kind, items in (("permission", self.engine.v2.permission_list(observation.session_id)),
+                            ("question", self.pending_forms(observation))):
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
+                    facts.append(self.blocked_fact(observation, boss, kind, item))
+        return facts
+
+    def pending_forms(self, observation):
+        if self._no_forms:
+            return []
+        try:
+            return self.engine.v2.form_list(observation.session_id)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                self._no_forms = True  # this v2 has no such operation; stop asking
+                return []
+            raise
+
+    def blocked_fact(self, observation, boss, kind, item):
+        key = "%s:%s:%s" % (WORKER_BLOCKED, observation.session_id, item["id"])
+        what = " ".join(str(part) for part in [item.get("action") or item.get("title") or kind]
+                        + [r for r in item.get("resources") or [] if isinstance(r, str)])
+        asked = _created(item)  # when v2 says it asked; without it the fact is urgent, not batched
+        summary = "%s is blocked on a %s request and cannot go on until you answer it: %s" % (
+            observation.name, kind, _one_line(what, 200))
+        issue = _issue_of(observation.fleet)
+        self._blocked.append((observation.name, key, "Fleet: %s is blocked" % observation.name,
+                              _one_line("%s is waiting for you: %s%s" % (
+                                  observation.name, what, " (issue #%d)" % issue if issue else ""), 200)))
+        return Fact(key, boss, WORKER_BLOCKED, summary, asked if asked is not None else self.engine.now(),
+                    issue=issue, batch=asked is not None, sender=observation.name)
+
+
+# ---- toasts
+
+def note_unreachable(engine, recipient, fresh, why):
+    """The re-check could not read the recipient at all (pane closed, session gone):
+    the pass's render step toasts it, once, like every other toast."""
+    if fresh is None:
+        engine.pass_toasts[recipient] = ("unreachable: " + why, "Fleet: %s cannot be reached" % recipient,
+                                         _one_line("Held, nothing sent to %s: %s" % (recipient, why), 200))
+
+
+def collect_source_toasts(engine):
+    """What the fact sources and this pass's re-checks ask the human to be told."""
+    found = {}
+    for source in engine.sources:
+        toasts = getattr(source, "toasts", None)
+        for agent, reason, title, body in toasts() if toasts else []:
+            found[agent] = (reason, title, body)
+    found.update(engine.pass_toasts)
+    return found
+
+
+def finish_pass(engine, discovery, report):
+    """The end of a pass: reminders that reached their recipient are pruned. A failure is
+    audited and never stops the pass."""
+    try:
+        prune_delivered_reminders(engine, discovery)
+    except Exception as err:
+        engine._failed("reminders", "reminders", err, report)
+
+
+# ---- reminders
+
+def parse_when(text, now):
+    """`30m`, `+2h`, `1d` (from now), or an ISO-8601 time with an offset or `Z`. Epoch seconds."""
+    match = re.fullmatch(r"\+?([0-9]+)([smhd])", text.strip())
+    if match:
+        return now + int(match.group(1)) * REMINDER_UNITS[match.group(2)]
+    try:
+        moment = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ReminderError("when must be a delay such as 30m, 2h or 1d, or an ISO time with a zone "
+                            "such as 2030-01-02T09:00:00Z, got %r" % text) from None
+    if moment.tzinfo is None:
+        raise ReminderError("when %r has no time zone; add Z or an offset" % text)
+    return moment.timestamp()
+
+
+class ReminderError(FactError):
+    """reminders.json cannot be read or written, or a reminder cannot be made."""
+
+
+@contextmanager
+def reminders_lock(state_dir):
+    """Serialises the CLI and the daemon around the read-modify-write of reminders.json."""
+    fd = os.open(str(Path(state_dir) / REMINDER_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_reminders(state_dir):
+    path = Path(state_dir) / REMINDERS
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as err:
+        raise ReminderError("cannot read %s: %s" % (path, err)) from None
+    items = raw.get("reminders") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        raise ReminderError("%s must hold {\"reminders\": [...]}" % path)
+    for item in items:
+        if not (isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("to"), str)
+                and _is_number(item.get("at")) and isinstance(item.get("text"), str)):
+            raise ReminderError("%s has a reminder without id, to, at and text: %r" % (path, item))
+    return items
+
+
+def write_reminders(state_dir, items):
+    """Replace reminders.json atomically, mode 0600: a crash leaves the old file or the new one."""
+    path = Path(state_dir) / REMINDERS
+    temp = path.with_name("%s.%d.tmp" % (REMINDERS, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"reminders": items}, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+
+
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None):
+    if not isinstance(to, str) or not to.strip():
+        raise ReminderError("a reminder needs the name of the agent it is for")
+    if not text.strip():
+        raise ReminderError("a reminder needs text")
+    item = {"id": uuid.uuid4().hex[:12], "to": to, "at": float(at), "created": float(created),
+            "text": text, "issue": issue, "from": sender}
+    with reminders_lock(state_dir):
+        write_reminders(state_dir, read_reminders(state_dir) + [item])
+    return item
+
+
+def remove_reminders(state_dir, ids):
+    """Drop these ids from reminders.json. Returns the ids that were there."""
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        gone = [item["id"] for item in items if item["id"] in ids]
+        if gone:
+            write_reminders(state_dir, [item for item in items if item["id"] not in ids])
+    return gone
+
+
+class ReminderFacts:
+    """`reminder:<id>` facts for reminders that are due. A reminder not yet due is no fact.
+
+    A due reminder skips the batch window: it is one event at an exact time.
+    It stays in the file until its key shows in the recipient's transcript or
+    inbox (prune_delivered_reminders), so a crash before delivery loses nothing.
+    """
+
+    __name__ = "reminder_facts"
+
+    def __init__(self, state_dir):
+        self.state_dir, self.engine = Path(state_dir), None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def due(self):
+        now = self.engine.now() if self.engine else time.time()
+        return [item for item in read_reminders(self.state_dir) if item["at"] <= now]
+
+    def __call__(self):
+        return [Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
+                     issue=item.get("issue"), batch=False, sender=item.get("from"))
+                for item in self.due()]
+
+
+def prune_delivered_reminders(engine, discovery):
+    """Forget the due reminders whose key is already in their recipient's transcript or inbox."""
+    source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
+    if source is None:
+        return []
+    by_recipient = {}
+    for item in source.due():
+        by_recipient.setdefault(item["to"], []).append(item)
+    delivered = []
+    for name, items in sorted(by_recipient.items()):
+        observation = discovery.agents.get(name)
+        if observation is None:
+            continue
+        try:
+            keys, _ = engine.delivered_keys(observation.session_id, min(i["at"] for i in items) - SINCE_SLACK)
+        except V2Error:
+            continue
+        delivered += [item["id"] for item in items if "reminder:" + item["id"] in keys]
+    gone = remove_reminders(source.state_dir, set(delivered)) if delivered else []
+    if gone and engine.audit is not None:
+        engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
+    return gone
+
+
+def cmd_remind(args, runner, now):
+    engine, state, _ = build_engine(runner, now, "cli")
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
+                             % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    moment = now()
+    item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
+                        " ".join(args.text).strip(), args.issue, sender)
+    engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
+                                                          "from": sender, "issue": args.issue})
+    print(item["id"])
+    sys.stderr.write("%s: reminder for %s at %s\n" % (PROG, args.name, iso(item["at"])))
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------- the CLI
 
 def _check(probe):
@@ -1996,6 +2385,12 @@ def build_parser():
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    remind = sub.add_parser("remind", help="A message to an agent that is due later")
+    remind.add_argument("name", help="The recipient's fleet name")
+    remind.add_argument("when", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
+    remind.add_argument("text", nargs="+", help="The reminder")
+    remind.add_argument("--issue", type=int, help="The issue the reminder is about")
+    remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -2024,6 +2419,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_send(args, runner, now)
         if args.action == "pending":
             return cmd_pending(args, runner, now)
+        if args.action == "remind":
+            return cmd_remind(args, runner, now)
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH

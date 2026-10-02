@@ -23,6 +23,7 @@ The full format, tiers, oracles and catalog are in
 | `issues` | no | Issue number (as a string) → `intent`, optional `done_when`, `parent`. `intent: null` is an issue with no Intent section |
 | `steps` | yes | Timed actions: `at` (`0s`, `10s`, `2m`, `2h`; never decreasing), `actor` (`you`, `world` or a cast name), `do`, plus the action's own fields |
 | `expect` | yes | What must and must not happen: `that` (the oracle), optional unique `name`, plus the oracle's own fields |
+| `config` | no | Engine timing the scenario shortens (`batch_seconds`, `engaged_minutes`; positive numbers), applied by both runners, so the Lab need not wait real minutes |
 | `control` | yes | Exactly one of `fault` (a known fault name), `baseline` (the system run instead) or `variant` (an object), plus `fails`: the expectations, by `name` or `that`, the control must break |
 
 ## The vocabulary
@@ -50,7 +51,8 @@ is how many.
 | `permission` | you | `to`, [`decision`: `once`, `always`, `reject`] | Your answer to that ask |
 | `comment` | world | `issue`, `body` | A GitHub comment (PR 5) |
 | `edit-intent` | you, world | `issue`, [`intent`], [`done_when`] | An Intent edit (PR 6); `null` removes the line |
-| `close-pane` | world | `agent` | The agent's pane closes (PR 4) |
+| `close-pane` | world | `agent` | Arms a race: the agent's pane closes the moment the engine reads it again just before writing, after it decided to deliver (PR 4). Offline, a herdr runner wrapper; in the Lab, the engine's herdr shim runs `herdr pane close` on the next `agent get` of that pane |
+| `delete-state` | world | none | The engine's state directory is deleted (the daemon is down); the next start makes it again (PR 4) |
 | `synthetic`, `note`, `wake` | world | `to`, `key`, `text`, [`id`], [`resume`], [`delivery`: `queue`, `steer`] | A v2 synthetic message sent directly, without the engine (spikes). `note` defaults to resume false + steer, `wake` to resume true + queue, `synthetic` to resume false + steer. The same `id` name in one play is the same derived message id |
 | `fact` | world | `to`, `key`, `summary`, [`kind`], [`issue`], [`from`], [`batch`] | A fact for the engine: a line in its Lab fact source, `$STATE/lab-facts.jsonl`, read only when `FLEET_SWITCHBOARD_LAB=1` |
 | `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with the cast's role, `reports_to` and issue, into the herdr workspace of the play. The member has no session until the step runs. The brief is the first prompt, once the pane is verified |
@@ -63,7 +65,7 @@ is how many.
 
 | `that` | Fields (optional in brackets) | Passes when |
 |---|---|---|
-| `delivered` | `to`, `key`, [`mode`: `note`, `wake`], [`count`], [`keys`] | The recipient's transcript holds synthetic messages whose `metadata.fleet.keys` match `key`: `count` distinct messages (default: at least one), carrying `keys` distinct matching keys, each reaching the model as `mode`. An item still waiting in v2's inbox is not delivered |
+| `delivered` | `to`, `key`, [`mode`: `note`, `wake`], [`count`], [`keys`], [`text`] | The recipient's transcript holds synthetic messages whose `metadata.fleet.keys` match `key`: `count` distinct messages (default: at least one), carrying `keys` distinct matching keys, each reaching the model as `mode`, and (with `text`) containing `text`. An item still waiting in v2's inbox is not delivered |
 | `message_count` | `to`, `count` | The switchboard wrote `count` distinct messages to the recipient (`metadata.fleet.from` is `switchboard`), in its transcript or waiting in its inbox |
 | `model_saw` | `agent`, `key`, [`when`: `any`, `turn_start`, `between_steps`, `after_reply`], [`count`] | `count` model calls (default: at least one) of that phase had a message carrying `key` among their new inputs |
 | `no_machine_turn` | `agent` | No model call was triggered by a fleet message |
@@ -77,7 +79,7 @@ is how many.
 | `message_has_intent` | `to`, `issue` | The delivered text carries the issue's Intent lines (PR 6) |
 | `classified` | `agent`, `step`, `as` | Jev classified that message so (PR 7) |
 | `handed_off` | `issue` | A brief on the ask and a `cos-subagent` session for it (PR 8) |
-| `toast` | [`agent`], [`text`] | herdr was asked to show such a toast |
+| `toast` | [`agent`], [`text`] | herdr was asked to show a toast naming `agent` in its title or body and carrying `text` in its body. In the Lab, read from the engine's herdr shim, which records each `notification show` |
 | `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
 
 **Mode.** Whether a message was a note or a wake is read from what it did,
@@ -99,7 +101,7 @@ Exactly one of:
 |---|---|---|
 | `fault` | a known fault name | The scenario plays again with `FLEET_SWITCHBOARD_FAULT` set on every engine process; only scenarios that run the engine |
 | `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
-| `baseline` | `fleet-heartbeat` | Today's system delivers instead. The runner, the only code allowed to type and only into Lab panes, types each `fact`'s wake with `herdr agent prompt` (`[heartbeat] <summary>`), and the engine's daemon does not run. The fake herdr's `agent prompt` does what the TUI does: it submits the input box's text followed by the prompt |
+| `baseline` | `fleet-heartbeat` or `timer-heartbeat` | `timer-heartbeat` (offline only, not built in the Lab) is the old timer waking each orchestrator every 30 minutes. `fleet-heartbeat`: today's system delivers instead. The runner, the only code allowed to type and only into Lab panes, types each `fact`'s wake with `herdr agent prompt` (`[heartbeat] <summary>`), and the engine's daemon does not run. The fake herdr's `agent prompt` does what the TUI does: it submits the input box's text followed by the prompt |
 
 plus `fails`: the expectations, by `name` or `that`, the control must break.
 A control that breaks none of them proves nothing, and fails the run.
@@ -153,6 +155,7 @@ never into a verdict. Evidence: `scenario-runs/<UTC>/<id>/report.md` and
 bin/fleet-scenario validate            # every *.json here; CI runs this
 bin/fleet-scenario list
 bin/fleet-scenario coverage --enforce  # exit 1 if a problem has no scenario
+bin/fleet-scenario coverage --enforce --through-pr 4  # only problems due by PR 4; CI runs this
 ```
 
 Runs write evidence to `scenario-runs/`, which is not committed.

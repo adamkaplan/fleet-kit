@@ -1,0 +1,28 @@
+{
+  "id": "R3",
+  "title": "The state directory is deleted while items are pending",
+  "problem": null,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "20s", "why": "Finishes at about 20 s; ripe at about 110 s"},
+    {"at": "40s", "actor": "world", "do": "kill-daemon"},
+    {"at": "50s", "actor": "world", "do": "delete-state",
+     "why": "The audit log, the reminders and the Lab fact file all go; the item is still pending"},
+    {"at": "60s", "actor": "world", "do": "restart-daemon"},
+    {"at": "2m", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:r3-later",
+     "summary": "Another event", "why": "A later message: with no dedupe it would carry the worker's key again"},
+    {"at": "4m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "worker-once", "that": "delivered", "to": "platform", "key": "worker.idle:*", "count": 1, "keys": 1,
+     "why": "What was delivered is a fact of the transcript, not of the state directory"},
+    {"name": "later", "that": "delivered", "to": "platform", "key": "lab.fact:r3-later", "count": 1},
+    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2}
+  ],
+  "control": {"fault": "no-dedupe", "fails": ["worker-once"]}
+}
