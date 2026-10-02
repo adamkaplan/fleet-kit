@@ -17,7 +17,7 @@
     {"that": "no_machine_turn", "agent": "platform"},
     {"that": "model_saw", "name": "note-seen", "agent": "platform", "key": "S3-note", "count": 1,
      "why": "with no_machine_turn: the model saw the note, and only your message started a call"},
-    {"that": "admitted_once", "name": "note-delivered", "to": "platform", "key": "S3-note"}
+    {"that": "delivered", "name": "note-delivered", "to": "platform", "key": "S3-note", "mode": "note", "count": 1}
   ],
   "control": {
     "variant": {"steps": {"0": {"resume": true}}},

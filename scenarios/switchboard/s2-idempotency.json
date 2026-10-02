@@ -17,7 +17,8 @@
     {"at": "4s", "actor": "you", "do": "message", "to": "coder", "text": "what is new?"}
   ],
   "expect": [
-    {"that": "admitted_once", "name": "one-admitted", "to": "coder", "key": "S2-dup"},
+    {"that": "delivered", "name": "one-admitted", "to": "coder", "key": "S2-dup", "count": 1,
+     "why": "one message carries the key: v2 admitted the repeated id once"},
     {"that": "model_saw", "name": "one-model-call", "agent": "coder", "key": "S2-dup", "count": 1,
      "why": "the model got it once, with your message"},
     {"that": "no_machine_turn", "agent": "coder"}

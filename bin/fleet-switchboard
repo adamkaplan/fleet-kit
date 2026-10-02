@@ -611,6 +611,18 @@ SINCE_SLACK = 60    # seconds read back beyond the oldest fact, for clock skew
 MESSAGE_CAP = 4000  # characters in one delivered message
 
 
+def agent_session(entry):
+    """The v2 session id a herdr agent entry names, or None.
+
+    herdr 0.9 reports `agent_session` as an object, `{"kind": "id", "value":
+    "ses_..."}` (S6); a plain string is accepted too.
+    """
+    value = entry.get("agent_session") if isinstance(entry, dict) else None
+    if isinstance(value, dict):
+        value = value.get("value") if value.get("kind", "id") == "id" else None
+    return value if isinstance(value, str) and value else None
+
+
 def _seconds(value):
     """v2 time (epoch milliseconds, or seconds) -> epoch seconds; None if absent."""
     if not _is_number(value):
@@ -619,7 +631,13 @@ def _seconds(value):
 
 
 def _fleet_meta(record):
-    meta = (record or {}).get("metadata") if isinstance(record, dict) else None
+    """`metadata.fleet` of a v2 record: a message has `metadata` at the top;
+    an inbox item (session.inbox.list, 2.0.22) has it under `payload`."""
+    if not isinstance(record, dict):
+        return None
+    meta = record.get("metadata")
+    if meta is None and isinstance(record.get("payload"), dict):
+        meta = record["payload"].get("metadata")
     fleet = meta.get("fleet") if isinstance(meta, dict) else None
     return fleet if isinstance(fleet, dict) else None
 
@@ -851,8 +869,8 @@ class Switchboard:
 
     def _observe_entry(self, entry, now):
         """An Observation for one herdr agent, or None when it is not a fleet agent."""
-        session_id = entry.get("agent_session")
-        if not isinstance(session_id, str) or not session_id:
+        session_id = agent_session(entry)
+        if session_id is None:
             return None
         info = self.v2.session_get(session_id) or {}
         fleet = _fleet_meta(info)
@@ -899,7 +917,7 @@ class Switchboard:
             entry = self.herdr.agent_get(previous.pane)
         except HerdrError as err:
             return None, "pane %s of %s cannot be read: %s" % (previous.pane, previous.name, err)
-        if entry.get("agent_session") != previous.session_id:
+        if agent_session(entry) != previous.session_id:
             return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
         entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
         try:
@@ -1293,7 +1311,7 @@ def identify_caller(herdr, v2, environ):
     pane = environ.get("HERDR_PANE_ID")
     if not pane:
         raise CallerError("HERDR_PANE_ID is not set: run send from a fleet agent's herdr pane")
-    session_id = herdr.agent_get(pane).get("agent_session")
+    session_id = agent_session(herdr.agent_get(pane))
     if not session_id:
         raise CallerError("herdr pane %s shows no agent session" % pane)
     name = (_fleet_meta(v2.session_get(session_id)) or {}).get("name")

@@ -72,6 +72,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 V2_VERSION = "2.0.22"
@@ -990,6 +991,20 @@ def agent_status(name):
     return info.get("agent") or info
 
 
+def iso_epoch(text):
+    """`2026-10-02T17:00:00.123Z` -> epoch seconds; None when it is not one."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def fleet_session(agent):
+    """The session id in a herdr agent's `agent_session` (an object in herdr 0.9)."""
+    value = (agent or {}).get("agent_session")
+    return value.get("value") if isinstance(value, dict) else value
+
+
 def lab_tui_guard(lab, pane):
     """The pane's foreground process must be the Lab's v2. A Lab pane's shell
     re-runs the user's zsh startup files, which put /opt/homebrew/bin (v1)
@@ -1275,50 +1290,51 @@ def cmd_spike(lab, args):
 # by the Lab pane's TUI. Steps run in real time. Expectations are checked
 # against the systems that own the facts: v2's transcript, inbox and session
 # record, the scripted model's request log, herdr's agent status and pane
-# reads. What the runner did is evidence, never an oracle. Then the control
-# plays on fresh sessions and must break every expectation it names.
+# reads. What the runner or the engine did is evidence, never an oracle. Then
+# the control plays on fresh sessions and must break every expectation it
+# names.
 #
-# Step fields this tier reads, besides at / actor / do. The runner writes the
-# scripted model's `@script` line itself; a scenario never carries one.
-#   turn        (a cast member) [lasts], [steps]: one prompt whose script takes
-#               `lasts`, split over `steps` model steps (steps-1 shell calls,
-#               then the reply DONE)
+# The vocabulary (every action, expectation and control, with its fields) is
+# bin/fleet-scenario's, and scenarios/switchboard/README.md explains it. How
+# this tier plays each one:
+#   turn        (a cast member) one fleet prompt whose script takes `lasts`,
+#               split over `steps` model steps (steps-1 shell calls, then DONE)
 #   permission  (a cast member) asks to run a shell command; its session is
-#               created with shell set to ask
-#   permission  (you) to, [decision once|always|reject]: answers the pending ask
-#   message     (you) to, text, [lasts]: through the TUI when `to` is the member
-#               on screen, else session.prompt without metadata.fleet
-#   draft       (you) to, text: herdr pane send-text, no Enter
-#   synthetic | note | wake  to, key, text, [id], [resume], [delivery]
-#               defaults: note = resume false + steer, wake = resume true +
-#               queue, synthetic = resume false + steer. `id` is a name: the
-#               same name in one play is the same derived v2 message id;
-#               without it the id derives from the session and the key
+#               created with shell set to ask. (you) answers the pending ask
+#   message     (you) through the TUI when `to` is the member on screen, else
+#               session.prompt without metadata.fleet
+#   draft       (you) herdr pane send-text, no Enter
+#   synthetic | note | wake  session.synthetic; note = resume false + steer,
+#               wake = resume true + queue, synthetic = resume false + steer.
+#               `id` is a name: the same name in one play is the same derived
+#               v2 message id; without it the id derives from session and key
+#   fact        a line in the engine's Lab fact source, $STATE/lab-facts.jsonl,
+#               created at the step's scheduled time
+#   pass        one `fleet-switchboard run --once`, with the step's faults
+#   kill-daemon, restart-daemon  stop, and start again, the engine's daemon
 #   wait, away  only mark time here
-# Expectations, and the system each is checked against:
-#   no_machine_turn  agent: model log; no request triggered by a fleet message
-#   model_saw        agent, key (a glob), [when], [count]: model log, keyed via the
-#                    transcript
-#   within           agent, step, seconds, [key]: transcript and model log times
-#   admitted_once    to, key, [count]: transcript plus inbox
-#   metadata_roundtrip  agent, of session|message, [key|text], [fleet]:
-#                    session.get or message.list
-#   status_is        agent, status, at: herdr agent get, sampled
-#   draft_intact     agent, text: herdr pane read of the input box, transcript
-#   tool_outcome     agent, [tool], outcome: transcript tool record, model log
-# Everything else (delivered, message_count, ...) needs the switchboard engine.
-# A control `variant` patches the scenario: {"steps": {"<index>": {...}},
-# "expect": {"<name or index>": {...}}}.
+# A scenario with a fact, pass or daemon step runs the real engine
+# (bin/fleet-switchboard) on a private config and state under $LAB/runs/engine,
+# as a daemon polling every ENGINE_POLL seconds from t0 until the last step.
+# Every cast member then runs the Lab TUI in its own "Switchboard Lab" pane,
+# so the engine discovers it as herdr does in the fleet. A `fault` control
+# plays the scenario again with that fault on every engine process.
+# The runner writes the scripted model's `@script` line itself; a scenario
+# never carries one. The warm-up and every `turn` are the fleet's prompts
+# (metadata.fleet), so only `message` counts as you prompting.
 
 SCENARIO_DIR = os.path.join(REPO_ROOT, "scenarios", "switchboard")
 RUNS_DIR = os.path.join(REPO_ROOT, "scenario-runs")
 RUN_TIERS = ("lab-scripted",)
 LAB_TUI_AGENT = "lab-tui"
-# What this tier plays and checks without the switchboard engine.
+ENGINE = os.path.join(REPO_ROOT, "bin", "fleet-switchboard")
+ENGINE_POLL = 5  # seconds between the Lab daemon's passes, as the offline runner's
+ENGINE_ACTIONS = ("fact", "pass", "kill-daemon", "restart-daemon")
+# What this tier plays and checks.
 RUN_ACTIONS = ("turn", "message", "draft", "away", "permission", "synthetic", "note", "wake",
-               "wait")
-RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "admitted_once",
-                    "model_saw", "status_is", "metadata_roundtrip")
+               "wait") + ENGINE_ACTIONS
+RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "delivered",
+                    "message_count", "model_saw", "status_is", "metadata_roundtrip")
 SYNTHETIC_DEFAULTS = {"note": (False, "steer"), "wake": (True, "queue"),
                       "synthetic": (False, "steer")}
 ROLE_AGENTS = {"orchestrator": "orchestrator", "coder": "coder",
@@ -1326,7 +1342,9 @@ ROLE_AGENTS = {"orchestrator": "orchestrator", "coder": "coder",
 # Requests v2 makes on its own (titles, summaries) are nobody's turn.
 UPKEEP_PLANS = ("title", "summary", "maintenance")
 ASK_SHELL = [{"action": "shell", "resource": "*", "effect": "ask"}]
-VARIANT_KEYS = ("steps", "expect")
+# The fleet's own prompts (the warm-up brief, an agent's turn) carry this, so
+# neither the engine nor an oracle takes them for yours.
+RUNNER_FLEET = {"from": "lab-runner"}
 
 
 class RunError(RuntimeError):
@@ -1369,60 +1387,30 @@ def tui_members(scenario):
     return sorted(set(n for n in names if n))
 
 
-def apply_variant(scenario, variant):
-    """The scenario with a control variant patched in."""
-    out = copy.deepcopy(scenario)
-    for key in variant:
-        if key not in VARIANT_KEYS:
-            raise RunError("unknown key %r (known: %s)" % (key, ", ".join(VARIANT_KEYS)))
-    for index, patch in (variant.get("steps") or {}).items():
-        try:
-            out["steps"][int(index)].update(patch)
-        except (ValueError, IndexError, TypeError, AttributeError):
-            raise RunError("steps[%s] is not a step to patch" % index)
-    for label, patch in (variant.get("expect") or {}).items():
-        hits = [e for i, e in enumerate(out["expect"]) if e.get("name") == label or str(i) == label]
-        if not hits or not isinstance(patch, dict):
-            raise RunError("expect %r matches no expectation" % label)
-        for item in hits:
-            item.update(patch)
-    return out
+def uses_engine(scenario):
+    """True when a step needs the switchboard engine: a fact, a pass, the daemon."""
+    return any(step["do"] in ENGINE_ACTIONS for step in scenario["steps"])
 
 
-def unsupported(scenario, validate=None):
-    """Why this tier cannot play the scenario yet (empty when it can)."""
+def unsupported(scenario, fs):
+    """Why this tier cannot play the scenario yet (empty when it can). The
+    fields themselves are checked by fleet-scenario when the file loads."""
     reasons = []
-    cast = scenario["cast"]
     for i, step in enumerate(scenario["steps"]):
-        do = step["do"]
-        if do not in RUN_ACTIONS:
-            reasons.append("step %d `%s` needs the switchboard engine" % (i, do))
-        elif do in ("message", "draft") and step["actor"] != "you":
-            reasons.append("step %d: an agent's `%s` goes through the switchboard engine" % (i, do))
-        elif do in ("message", "draft") + tuple(SYNTHETIC_DEFAULTS) and step.get("to") not in cast:
-            reasons.append("step %d `%s`: `to` must name a cast member" % (i, do))
-        elif do in SYNTHETIC_DEFAULTS and not (step.get("key") and isinstance(step.get("text"), str)):
-            reasons.append("step %d `%s`: needs `key` and `text`" % (i, do))
-        elif do == "permission" and step["actor"] == "you" and step.get("to") not in cast:
-            reasons.append("step %d: your `permission` answer needs `to`" % i)
+        if step["do"] not in RUN_ACTIONS:
+            reasons.append("step %d `%s` is not built in this tier yet" % (i, step["do"]))
     for i, item in enumerate(scenario["expect"]):
         if item["that"] not in RUN_EXPECTATIONS:
             reasons.append("expect %s `%s`: not supported in this tier yet"
                            % (item.get("name", i), item["that"]))
     control = scenario["control"]
-    if "variant" not in control:
-        kind = "fault" if "fault" in control else "baseline"
-        reasons.append("control %s %r needs the switchboard engine" % (kind, control[kind]))
-    else:
-        try:
-            patched = apply_variant(scenario, control["variant"])
-            errors = validate(patched) if validate else []
-            if errors:
-                reasons.append("control variant makes an invalid scenario: %s" % "; ".join(errors))
-        except RunError as err:
-            reasons.append("control variant: %s" % err)
+    if "baseline" in control:
+        reasons.append("control baseline %r is not built in this tier yet" % control["baseline"])
+    elif "fault" in control and not uses_engine(scenario):
+        reasons.append("control fault %r needs the switchboard engine, and no step runs it"
+                       % control["fault"])
     if len(tui_members(scenario)) > 1:
-        reasons.append("more than one agent needs the TUI; the Lab has one pane")
+        reasons.append("more than one agent's screen is checked; the runner watches one")
     return reasons
 
 
@@ -1453,10 +1441,12 @@ def lab_shell_ready(lab, pane):
     if not info.get("shell_pid") or info.get("foreground_process_group_id") != info.get("shell_pid"):
         raise SystemExit("refused: pane %s is not at its shell prompt" % pane)
     # The user's zsh startup files put v1 ahead of the workspace PATH (S6):
-    # put the Lab first again and prove `opencode` is the Lab wrapper.
+    # put the Lab first again and prove `opencode` is the Lab wrapper. The
+    # marker lets the wrapper keep this pane's herdr identity, so the TUI
+    # plugin reports its status (a split pane may not have the workspace env).
     nonce = "LABPATH-" + tag()
-    herdr_run("pane", "run", pane, 'export PATH=%s:"$PATH"; hash -r; echo %s=$(command -v opencode)'
-              % (shlex.quote(lab.bin_dir), nonce))
+    herdr_run("pane", "run", pane, 'export FLEET_SWITCHBOARD_LAB_PANE=1 PATH=%s:"$PATH"; hash -r; '
+              'echo %s=$(command -v opencode)' % (shlex.quote(lab.bin_dir), nonce))
     found = herdr_run("pane", "wait-output", "--match", "%s=%s" % (nonce, lab.wrapper),
                       "--source", "recent-unwrapped", "--timeout", "8000", pane, timeout=20)
     if found.returncode:
@@ -1474,6 +1464,138 @@ def lab_tui_attach(lab, pane, agent, ses):
     info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
     if not any(ses in p.get("cmdline", "") for p in info.get("foreground_processes") or []):
         raise RunError("the Lab TUI in %s is not on %s" % (pane, ses))
+
+
+def lab_panes():
+    """Every pane of the Lab workspace, p1 first."""
+    ws = lab_workspace()
+    if not ws:
+        return []
+    panes = herdr("pane", "list", "--workspace", ws["workspace_id"]).get("panes") or []
+    ids = [p["pane_id"] for p in panes if p.get("workspace_id") == ws["workspace_id"]]
+    return sorted(ids, key=lambda p: (len(p), p))
+
+
+def new_lab_pane(lab, beside):
+    """One more pane in the Lab workspace, split from `beside`, without focus."""
+    lab_pane_guard(beside)
+    p = herdr_run("pane", "split", beside, "--direction", "down", "--no-focus", "--cwd", lab.repo)
+    try:
+        pane = json.loads(p.stdout)["result"]["pane"]["pane_id"]
+    except (ValueError, KeyError, TypeError):
+        raise RunError("herdr pane split: %s" % (p.stdout + p.stderr).strip()[:300])
+    lab_pane_guard(pane)
+    for _ in range(40):  # the new shell runs the user's startup files first
+        info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+        if info.get("shell_pid") and info.get("foreground_process_group_id") == info.get("shell_pid"):
+            break
+        time.sleep(0.25)
+    return pane
+
+
+def herdr_socket():
+    """The herdr server's socket, so the engine's herdr calls reach it while its
+    XDG_CONFIG_HOME points at a scratch dir (herdr finds its socket there)."""
+    if os.environ.get("HERDR_SOCKET_PATH"):
+        return os.environ["HERDR_SOCKET_PATH"]
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "herdr", "herdr.sock")
+
+
+class LabEngine:
+    """bin/fleet-switchboard on a private config and state for one play.
+
+    XDG_CONFIG_HOME and XDG_STATE_HOME point under $LAB/runs/engine/<play>, so
+    the user's own switchboard config and state are never read or written;
+    the config names the Lab's v2 wrapper by absolute path; FLEET_SWITCHBOARD_LAB=1
+    turns the Lab fact source and faults on. The engine never types into a
+    pane: its herdr client cannot. Its output and audit log are evidence only.
+    """
+
+    def __init__(self, lab, name, faults, note):
+        self.lab, self.faults, self.note = lab, sorted(faults), note
+        self.root = os.path.join(lab.runs, "engine", name)
+        self.config_home = os.path.join(self.root, "config")
+        self.state_home = os.path.join(self.root, "state")
+        self.state = os.path.join(self.state_home, "fleet-switchboard")
+        for path in (self.config_home, self.state_home):
+            real = os.path.realpath(path)
+            if not real.startswith(os.path.realpath(lab.root) + os.sep):
+                raise RunError("refused: engine dir %s is outside the Lab" % path)
+        os.makedirs(os.path.join(self.config_home, "fleet-switchboard"), exist_ok=True)
+        os.makedirs(self.state, mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        self.config = {"opencode": lab.wrapper, "herdr": shutil.which("herdr") or "herdr"}
+        with open(os.path.join(self.config_home, "fleet-switchboard", "config.json"), "w") as f:
+            json.dump(self.config, f, indent=2, sort_keys=True)
+        self.log_path = os.path.join(self.root, "daemon.log")
+        self.proc, self.on, self.starts, self.exits = None, True, 0, []
+
+    def env(self, faults=()):
+        env = self.lab.full_env()  # no credentials, no live pane identity, Lab bin first
+        env.pop("FLEET_SWITCHBOARD_LAB_PANE", None)
+        env.update({"XDG_CONFIG_HOME": self.config_home, "XDG_STATE_HOME": self.state_home,
+                    "FLEET_SWITCHBOARD_LAB": "1", "HERDR_SOCKET_PATH": herdr_socket(),
+                    "FLEET_SWITCHBOARD_FAULT": ",".join(sorted(set(self.faults) | set(faults)))})
+        return env
+
+    def fact(self, step, created):
+        line = {"key": step["key"], "recipient": step["to"], "kind": step.get("kind", "lab.fact"),
+                "summary": step["summary"], "created": created, "issue": step.get("issue"),
+                "batch": step.get("batch", True), "from": step.get("from", "world")}
+        with open(os.path.join(self.state, "lab-facts.jsonl"), "a") as f:
+            f.write(json.dumps(line, sort_keys=True) + "\n")
+        return line
+
+    def run_pass(self, faults=()):
+        """One `run --once`. A daemon running now is stopped first (they share a lock)."""
+        if self.running():
+            self.stop("a pass step")
+        p = subprocess.run([sys.executable, ENGINE, "run", "--once", "--json"], env=self.env(faults),
+                           capture_output=True, text=True, timeout=180)
+        try:
+            report = json.loads(p.stdout)
+        except ValueError:
+            report = None
+        return {"rc": p.returncode, "faults": sorted(set(self.faults) | set(faults)), "report": report,
+                "stderr": short(p.stderr, 300)}
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def ensure(self):
+        """The daemon runs while it is on; one that exited (a crash fault) is restarted."""
+        if not self.on or self.running():
+            return
+        if self.proc is not None:
+            self.exits.append(self.proc.returncode)
+            self.note("daemon", event="exited", rc=self.proc.returncode)
+        log = open(self.log_path, "a")
+        self.proc = subprocess.Popen([sys.executable, ENGINE, "run", "--poll", str(ENGINE_POLL)],
+                                     env=self.env(), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     start_new_session=True)
+        log.close()
+        self.starts += 1
+        self.note("daemon", event="started", pid=self.proc.pid, faults=self.faults)
+
+    def stop(self, why):
+        if not self.running():
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(5)
+        self.note("daemon", event="stopped", why=why, rc=self.proc.returncode)
+        self.proc = None
+
+    def audit(self):
+        try:
+            with open(os.path.join(self.state, "audit.jsonl")) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except (OSError, ValueError):
+            return []
 
 
 def input_box(screen):
@@ -1535,14 +1657,15 @@ def short(text, width=90):
 class ScenarioRun:
     """One play of a scenario, the run or its control, on fresh sessions."""
 
-    def __init__(self, lab, scenario, label, pane, seconds):
+    def __init__(self, lab, scenario, label, pane, seconds, faults=()):
         self.lab, self.v2 = lab, V2(lab)
         self.scenario, self.label, self.pane = scenario, label, pane
-        self.seconds = seconds
+        self.seconds, self.faults = seconds, sorted(faults)
         self.tag = tag()
         self.cast, self.facts = {}, {}
         self.tui = (tui_members(scenario) or [None])[0]
         self.tui_ready = False
+        self.engine, self.screens = None, {}  # screens: cast name -> (pane, herdr agent)
         self.timeline, self.step_times, self.step_errors = [], {}, []
         self.t_setup = time.time()
         self.t0, self.watch, self.status_changes, self.screen = None, None, [], None
@@ -1572,8 +1695,10 @@ class ScenarioRun:
             self.cast[name] = {"session": ses, "fleet": fleet, "marker": marker}
             # One finished turn first, so the agent is a normal idle one. Every
             # later model request repeats this marker, which ties it to the agent.
+            # It is the fleet's brief, not your prompt.
             self.v2.prompt(ses, "%s: you are %s in scenario %s\n@script reply=READY"
-                           % (marker, name, sid), metadata={"lab": {"scenario": sid, "setup": name}})
+                           % (marker, name, sid), metadata={"fleet": dict(RUNNER_FLEET, brief=True),
+                                                             "lab": {"scenario": sid, "setup": name}})
             self.note("setup", agent=name, session=ses, fleet=fleet, shell_asks=name in askers)
         for name, member in self.cast.items():
             ses = member["session"]
@@ -1581,15 +1706,57 @@ class ScenarioRun:
                                    and not self.v2.running(ses), 60)
             if not done:
                 raise RunError("%s: the warm-up turn did not finish" % name)
-        if self.tui:
+        if uses_engine(self.scenario):
+            self.attach_cast()
+            name = "%s-%s-%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), sid, self.label, self.tag)
+            self.engine = LabEngine(self.lab, name, self.faults, self.note)
+            self.note("engine", dir=self.engine.root, config=self.engine.config, faults=self.faults)
+        elif self.tui:
             if not self.pane:
                 raise RunError("no %r workspace pane for the TUI" % LAB_WORKSPACE_LABEL)
             lab_tui_attach(self.lab, self.pane, LAB_TUI_AGENT, self.session(self.tui))
+            self.screens[self.tui] = (self.pane, LAB_TUI_AGENT)
             self.tui_ready = True
             time.sleep(1.5)
             self.note("tui", agent=self.tui, pane=self.pane, herdr_agent=LAB_TUI_AGENT,
                       session=self.session(self.tui),
                       status=agent_status(LAB_TUI_AGENT).get("agent_status"))
+
+    def attach_cast(self):
+        """Every cast member in the Lab TUI, each in its own Lab pane, so the
+        engine discovers it as in the fleet: herdr agent -> agent_session ->
+        metadata.fleet.name. The member on screen gets the runner's pane; more
+        panes are split inside the Lab workspace without focus. Every Lab pane
+        is brought back to its shell first, so no earlier play's session
+        stays discoverable under the same name."""
+        if not self.pane:
+            raise RunError("no %r workspace pane for the cast" % LAB_WORKSPACE_LABEL)
+        panes = [self.pane] + [p for p in lab_panes() if p != self.pane]
+        for pane in panes:
+            lab_shell_ready(self.lab, pane)
+        names = ([self.tui] if self.tui else []) + sorted(n for n in self.cast if n != self.tui)
+        for index, name in enumerate(names):
+            if index >= len(panes):
+                panes.append(new_lab_pane(self.lab, panes[-1]))
+                self.note("pane", created=panes[-1])
+            pane = panes[index]
+            agent = LAB_TUI_AGENT if index == 0 else "%s-%d" % (LAB_TUI_AGENT, index + 1)
+            lab_tui_attach(self.lab, pane, agent, self.session(name))  # checks the Lab v2 by path
+            self.screens[name] = (pane, agent)
+        self.tui_ready = bool(self.tui)
+        deadline = time.time() + 20
+        while True:  # herdr must name each session before the engine looks
+            found = {n: agent_status(a) for n, (_, a) in self.screens.items()}
+            named = all(fleet_session(found[n]) == self.session(n) for n in found)
+            if named or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        for name, (pane, agent) in self.screens.items():
+            self.note("tui", agent=name, pane=pane, herdr_agent=agent, session=self.session(name),
+                      herdr_session=fleet_session(found[name]), status=found[name].get("agent_status"))
+        if not named:
+            raise RunError("herdr does not name every cast session: %s" % {
+                n: fleet_session(found[n]) for n in found})
 
     def tui_guard(self):
         lab_tui_guard(self.lab, lab_pane_guard(self.pane))
@@ -1607,7 +1774,7 @@ class ScenarioRun:
         for index, step in enumerate(steps):
             due = self.t0 + self.seconds(step["at"])
             if due > time.time():
-                time.sleep(due - time.time())
+                self.idle_until(due)
             when = time.time()
             self.step_times[index] = when
             try:
@@ -1620,8 +1787,19 @@ class ScenarioRun:
                   + [self.seconds(e["at"]) for e in expect if e.get("at")] + [0])
         due = self.t0 + end + 1
         if due > time.time():
-            time.sleep(due - time.time())
+            self.idle_until(due)
+        if self.engine:
+            self.engine.on = False
+            self.engine.stop("the last step's time has passed")
         self.settle()
+
+    def idle_until(self, due):
+        """Sleep until `due`; meanwhile the engine's daemon runs, if it is on
+        (the offline runner's pass every POLL seconds, in real time)."""
+        while time.time() < due:
+            if self.engine:
+                self.engine.ensure()
+            time.sleep(min(1.0, max(0.0, due - time.time())))
 
     def do(self, index, step):
         do, sid = step["do"], self.scenario["id"]
@@ -1635,9 +1813,9 @@ class ScenarioRun:
             else:
                 script = "tool=bash cmd=%s reply=DONE" % shlex.quote("echo %s ask %d" % (sid, index))
             text = "%s by %s, step %d" % (do, step["actor"], index)
-            # The agent's own work: neither your prompt nor a fleet message.
+            # Work the fleet gave the agent: not your prompt, and no switchboard key.
             rec = self.v2.prompt(self.session(step["actor"]), "%s\n@script %s" % (text, script),
-                                 metadata={"lab": {"scenario": sid, "step": index}})
+                                 metadata={"fleet": dict(RUNNER_FLEET), "lab": {"scenario": sid, "step": index}})
             return {"via": "session.prompt", "script": script, "id": rec.get("id")}
         if do == "permission":
             ses = self.session(step["to"])
@@ -1679,6 +1857,25 @@ class ScenarioRun:
             rec = self.v2.synthetic(ses, step["text"], resume, delivery, keys, msg_id=msg_id)
             return {"via": "session.synthetic", "id": msg_id, "resume": resume,
                     "delivery": delivery, "keys": keys, "returned": rec.get("id")}
+        if do == "fact":
+            # Created at the step's scheduled time, as the offline runner's clock does.
+            return {"via": "lab-facts.jsonl", "fact": self.engine.fact(step, self.t0 + self.seconds(step["at"]))}
+        if do == "pass":
+            result = self.engine.run_pass(step.get("faults", ()))
+            report = result.get("report") or {}
+            result["sent"] = [{"recipient": s.get("recipient"), "action": s.get("action"),
+                               "message_id": s.get("message_id"), "keys": s.get("keys")}
+                              for s in report.get("sent") or []]
+            result.pop("report", None)
+            return dict(result, via="fleet-switchboard run --once")
+        if do == "kill-daemon":
+            self.engine.on = False
+            self.engine.stop("kill-daemon")
+            return {"daemon": "off"}
+        if do == "restart-daemon":
+            self.engine.on = True
+            self.engine.ensure()
+            return {"daemon": "on", "pid": self.engine.proc.pid if self.engine.proc else None}
         if do in ("wait", "away"):
             return {do: True}
         raise RunError("cannot play %r" % do)
@@ -1723,6 +1920,12 @@ class ScenarioRun:
             self.screen = pane_text(self.pane)
             self.note("pane", input_box=input_box(self.screen),
                       screen_tail=[l.rstrip() for l in self.screen.splitlines() if l.strip()][-12:])
+        if self.engine:
+            # Evidence only: what the engine says it did. No oracle reads it.
+            for entry in self.engine.audit():
+                if entry.get("event") in ("v2.synthetic", "v2.inbox.update", "recheck", "hold", "error"):
+                    self.note("audit", iso_epoch(entry.get("ts")), event=entry.get("event"), phase=entry.get("phase"),
+                              subject=entry.get("subject"), detail=entry.get("detail"), error=entry.get("error"))
 
     def evaluate(self):
         results = []
@@ -1855,17 +2058,54 @@ class ScenarioRun:
         return took <= limit, "reply %r complete %.2f s after step %s (limit %g s)" % (
             short(transcript_text(replies[0]), 30), took, item["step"], limit)
 
-    def check_admitted_once(self, item):
-        """Transcript plus inbox of `to`: messages with a metadata.fleet key
-        matching the glob `key`; `count` of them, default 1."""
-        facts = self.agent_facts({"agent": item["to"]})
-        key, want = item["key"], int(item.get("count", 1))
-        sent = self.keyed(facts, key)
-        waiting = [i for i in facts["inbox"]
+    def mode_of(self, facts, message):
+        """How a delivered message reached the model, read from the model log
+        through the transcript: `wake` when it was the input that called the
+        model (the last new input of a call that started a turn from idle, or
+        ran after the turn's final reply); `note` when it rode along with
+        another input (your next message), or was injected between steps.
+        None when no model call carried it."""
+        for call in self.model_calls(facts):
+            if any(m is message for m in call["inputs"]):
+                woke = call["inputs"][-1] is message and call["phase"] in ("turn_start", "after_reply")
+                return ("wake" if woke else "note"), call
+        return None, None
+
+    def check_delivered(self, item):
+        """The recipient's transcript: synthetic messages whose metadata.fleet.keys
+        match the glob `key`. `count` is how many distinct messages, `keys` how
+        many distinct matching keys, `mode` how each reached the model. Items
+        still waiting in v2's inbox are not delivered; they are listed."""
+        facts, key = self.agent_facts({"agent": item["to"]}), item["key"]
+        found, seen = [], []
+        for m in self.keyed(facts, key):
+            if m.get("type") != "synthetic":
+                continue
+            mode, call = self.mode_of(facts, m)
+            seen.append("%s %s%s" % (m.get("id"), mode or "unread",
+                                     " (%s t=%.2f)" % (call["phase"], self.at(call["time"])) if call else ""))
+            if item.get("mode") in (None, mode):
+                found.append(m)
+        keys = {k for m in found for k in (fleet_of(m) or {}).get("keys") or [] if fnmatch.fnmatchcase(k, key)}
+        waiting = [i.get("id") for i in facts["inbox"]
                    if any(fnmatch.fnmatchcase(k, key) for k in (fleet_of(i) or {}).get("keys") or [])]
-        n = len(sent) + len(waiting)
-        return n == want, "%d in the transcript + %d waiting in the inbox = %d (want %d): %s" % (
-            len(sent), len(waiting), n, want, ", ".join(m.get("id", "?") for m in sent + waiting))
+        ok = len(found) == item["count"] if "count" in item else bool(found)
+        if "keys" in item:
+            ok = ok and len(keys) == item["keys"]
+        return ok, "%d message(s)%s carry %d matching key(s); every one: %s; waiting in the inbox: %s" % (
+            len(found), " as %s" % item["mode"] if "mode" in item else "", len(keys),
+            ", ".join(seen) or "none", ", ".join(waiting) or "none")
+
+    def check_message_count(self, item):
+        """The recipient's transcript and inbox: distinct messages the switchboard
+        wrote (metadata.fleet.from == "switchboard")."""
+        facts = self.agent_facts({"agent": item["to"]})
+        ids = []
+        for m in [m for m in facts["transcript"] if m.get("type") == "synthetic"] + list(facts["inbox"]):
+            if (fleet_of(m) or {}).get("from") == "switchboard" and m.get("id") not in ids:
+                ids.append(m.get("id"))
+        return len(ids) == item["count"], "%d switchboard message(s) (want %d): %s" % (
+            len(ids), item["count"], ", ".join(ids) or "none")
 
     def check_metadata_roundtrip(self, item):
         """session.get (of=session) or message.list (of=message, by key or text)
@@ -1938,11 +2178,20 @@ class ScenarioRun:
             "returned to" if returned else "never returned to")
 
     def teardown(self):
-        """Leave the Lab pane's input box empty for the next play."""
-        if not self.tui_ready:
-            return
+        """Stop the engine; leave the Lab pane's input box empty for the next
+        play. After an engine play every cast TUI is quit, so none of its
+        sessions stays discoverable under a cast name."""
+        if self.engine:
+            self.engine.on = False
+            self.engine.stop("teardown")
         if self.watch and self.watch.is_alive():
             self.watch.stop()
+        if uses_engine(self.scenario):
+            for pane, _ in self.screens.values():
+                lab_shell_ready(self.lab, pane)
+            return
+        if not self.tui_ready:
+            return
         box = input_box(pane_text(self.pane)) or {}
         if box.get("text"):
             self.tui_guard()
@@ -1950,8 +2199,8 @@ class ScenarioRun:
             time.sleep(0.5)
 
 
-def play_scenario(lab, scenario, label, pane, seconds):
-    run = ScenarioRun(lab, scenario, label, pane, seconds)
+def play_scenario(lab, scenario, label, pane, seconds, faults=()):
+    run = ScenarioRun(lab, scenario, label, pane, seconds, faults)
     results = []
     try:
         run.setup()
@@ -1996,12 +2245,18 @@ def write_scenario_evidence(out_dir, scenario, plays, verdict, stamp):
         lines.append("## %s" % ("Run" if label == "run" else "Control"))
         lines.append("")
         if label == "control":
-            lines.append("Variant: `%s`. It must fail: %s." % (
-                json.dumps(control["variant"], sort_keys=True), ", ".join(control["fails"])))
+            how = ("Fault: `%s` on every engine process" % control["fault"] if "fault" in control
+                   else "Variant: `%s`" % json.dumps(control["variant"], sort_keys=True))
+            lines.append("%s. It must fail: %s." % (how, ", ".join(control["fails"])))
             lines.append("")
         lines.append("Sessions: %s" % ", ".join("%s `%s`" % (n, m["session"]) for n, m in run.cast.items()))
-        if run.tui:
-            lines.append("On screen: %s in pane `%s` (herdr agent `%s`)" % (run.tui, run.pane, LAB_TUI_AGENT))
+        if run.screens:
+            lines.append("Lab TUI: %s" % ", ".join("%s in pane `%s` (herdr agent `%s`)" % (n, p, a)
+                                                     for n, (p, a) in sorted(run.screens.items())))
+        if run.engine:
+            lines.append("Engine: `bin/fleet-switchboard`, config and state in `%s`; daemon started %d time(s)%s"
+                         % (run.engine.root, run.engine.starts,
+                            "; faults %s" % ", ".join(run.engine.faults) if run.engine.faults else ""))
         lines.append("")
         if run.error:
             lines += ["**Did not finish:** %s" % md_cell(run.error), ""]
@@ -2072,7 +2327,7 @@ def cmd_run(lab, args):
         if args.tier not in scenario["tiers"]:
             rows.append((sid, "SKIP", "-", "-", "not in tier %s" % args.tier))
             continue
-        reasons = unsupported(scenario, fs.validate)
+        reasons = unsupported(scenario, fs)
         if reasons:
             rows.append((sid, "SKIP", "-", "-", "; ".join(reasons)))
             print("%s SKIP: %s" % (sid, "; ".join(reasons)), flush=True)
@@ -2083,8 +2338,13 @@ def cmd_run(lab, args):
             plays["run"] = play_scenario(lab, scenario, "run", pane, fs.duration_seconds)
         if not args.no_control:
             print("%s control ..." % sid, flush=True)
-            variant = apply_variant(scenario, scenario["control"]["variant"])
-            plays["control"] = play_scenario(lab, variant, "control", pane, fs.duration_seconds)
+            control = scenario["control"]
+            if "fault" in control:
+                plays["control"] = play_scenario(lab, scenario, "control", pane, fs.duration_seconds,
+                                                 [control["fault"]])
+            else:
+                variant = fs.apply_variant(scenario, control["variant"])
+                plays["control"] = play_scenario(lab, variant, "control", pane, fs.duration_seconds)
         run_cell = control_cell = "-"
         ok = True
         if "run" in plays:
