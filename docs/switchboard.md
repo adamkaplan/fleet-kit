@@ -15,9 +15,10 @@
 | 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; live proof A–F | planned |
 | 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
-| 6 | `switchboard/intent` | Intent and Done-when lines on every message; intent changes surfaced; Chief of Staff rules | planned |
+| 6 | `switchboard/intent` | Asks with Intent and Done-when; every message names its ask; `intents`; changes surfaced; Chief of Staff and charter rules | planned |
 | 7 | `switchboard/judges` | Cheap judges that log but don't act ("shadow mode") | planned |
-| 8 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
+| 8 | `switchboard/foreground` | Chief of Staff moves unrelated work to the background and turns to you; spikes F1–F3 | planned |
+| 9 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -31,11 +32,11 @@ flowchart LR
   end
   subgraph system["Rest of the system: problems 1 and 2"]
     direction LR
-    p5["5 · GitHub events"] --> p6["6 · intent lines"] --> p7["7 · judges"] --> p8["8 · v1 move"]
+    p5["5 · GitHub events"] --> p6["6 · intent lines"] --> p7["7 · judges"] --> p8["8 · foreground"] --> p9["9 · v1 move"]
   end
   main --> p1
   p4 --> p5
-  p8 -. "one atomic gh stack merge" .-> main
+  p9 -. "one atomic gh stack merge" .-> main
 ```
 
 ## Problems
@@ -52,9 +53,11 @@ not to the agents below it.
    success criteria in front of the Chief of Staff when a report arrives. Also,
    text the Chief of Staff types into an orchestrator's pane looks exactly like
    your typing.
-2. **Serial Chief of Staff.** It has one conversation and handles one request
-   at a time, so a question about B waits for A to finish, and machine wakes
-   take turns in the middle of your conversation with it.
+2. **Serial Chief of Staff.** You think of things to discuss faster than the
+   Chief of Staff can carry them out. It has one conversation and works on one
+   thing at a time, so a question about B waits for A to finish or gets mixed
+   into A, and machine wakes take turns in the middle of your conversation
+   with it.
 3. **Interruptions.** Wakes are typed into the agent's input box.
    - A half-written message of yours can be submitted along with the wake,
      because the empty-box check and the send are not atomic.
@@ -97,14 +100,15 @@ Evidence from real use:
 | State | Almost none. An append-only audit log and a reminders file. Everything else is derived on each pass from herdr, v2 and GitHub, so there is nothing to keep in sync; see [Data](#data). |
 | Status | herdr is authoritative for working, idle and blocked. Its OpenCode integration supports v2 through a pane-local TUI plugin. |
 | Engagement | "You are engaged with an agent" means you prompted it in the last 10 minutes. There is no viewed state. It matters mostly for the Chief of Staff, the agent you talk to. |
-| Intent | Every issue handed to an orchestrator opens with a one-line Intent and a one-line Done-when. Every message about that issue carries those lines, in both directions (PR 6). |
+| Intent | Each request handed to an orchestrator is an ask: an issue under its charter with a one-line Intent and a one-line Done-when. Every message names its ask and carries those lines, in both directions. Only you, or the Chief of Staff with your yes, change them (PR 6). |
+| Chief of Staff attention | Serial by default. A new message from you that is unrelated to the current work moves that work to a background worker, and the Chief of Staff turns to you (PR 8). How is decided after spikes F1–F3. |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
 | GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
 | Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
 | Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. Whether it shows in the TUI is settled by S3. |
 | Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
 | Talking to orchestrators | You can talk to any orchestrator directly. Nothing extra is recorded; the issue already carries the intent. |
-| v1 sessions | Imported, not restarted (PR 8). |
+| v1 sessions | Imported, not restarted (PR 9). |
 
 ## Design
 
@@ -314,7 +318,7 @@ service and handles authentication. One client class owns every call.
 | wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (verify S4) |
 | note → wake | `session.inbox.update` with `delivery: "steer"` on a waiting note (verify S3) |
 | message id | Derived from the recipient and the keys, so a retry reuses it and v2 admits it once (verify S2) |
-| move a v1 session | `experimental.session.import` (PR 8) |
+| move a v1 session | `experimental.session.import` (PR 9) |
 
 Capabilities: all of them, if S3 and S4 pass.
 
@@ -411,7 +415,8 @@ fleet metadata), so `--from` is never typed.
 |---|---|---|
 | `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6 |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
-| `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the issue's Intent and Done-when lines, and its top-level parent's |
+| `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
+| `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -427,15 +432,45 @@ Agents the switchboard manages do not use `heartbeat-ack`.
 | herdr toast | An item held longer than 15 minutes and why; a blocked worker; an Intent change; a switchboard fault |
 | `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
 | `fleet-switchboard audit` | The decision history for one agent or one issue |
-| `fleet-switchboard intent <issue>` | The Intent and Done-when for any issue (PR 6) |
+| `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |
 
 ### Intent lines (PR 6)
 
-The drift in problem 1 happens when a report arrives without the original ask
-next to it. So the ask travels with every message, in both directions.
+The usual pattern for agentic coding is one session per intent. Here the Chief
+of Staff and each orchestrator are single long-lived sessions whose job is to
+carry many intents at once: every ask they are tracking is a sub-intent of that
+job. Every incoming message is a context switch between those asks, and when a
+message does not say which ask it belongs to, the asks bleed into each other.
+The drift in problem 1 is the visible result: a report arrives, and the session
+treats it as being about whatever it was last thinking of, in the reporter's
+framing.
 
-**The convention.** Every issue handed to an orchestrator opens with two
-lines:
+So every message says which ask it belongs to, and carries that ask's intent
+and success criteria with it, in both directions.
+
+**Three levels.**
+
+```mermaid
+flowchart LR
+  charter["Charter<br/>the orchestrator's standing job<br/>never repeated in messages"]
+  ask["Ask<br/>one per request handed off<br/>Intent and Done when<br/>written by the Chief of Staff"]
+  work["Work item, optional<br/>one per worker assignment<br/>Intent<br/>written by the orchestrator"]
+  charter -- "sub-issue" --> ask
+  ask -- "sub-issue" --> work
+```
+
+- **Ask.** Each request the Chief of Staff hands to an orchestrator becomes an
+  issue under that orchestrator's charter, opening with one Intent line and one
+  Done-when line. This is the unit both the Chief of Staff and the orchestrator
+  are accountable for.
+- **Work item.** When an orchestrator splits an ask across workers, each
+  assignment is a sub-issue of the ask with its own one-line Intent. For a
+  single worker the ask itself can be the work item.
+- **Charter.** The orchestrator's standing job. It is the same for every
+  message, so it is never repeated.
+
+This adds the ask level to the fleet-charter skill, which today puts worker
+assignments directly under the charter.
 
 ```markdown
 ## Intent
@@ -443,19 +478,29 @@ Fix the project agents that show "Agent unavailable" in production.
 Done when: both project agents answer a chat message in production.
 ```
 
-- One line each, written when the issue is created. For asks from you, the
-  Chief of Staff writes them at hand-off; orchestrators write them for the
-  sub-issues they create.
-- GitHub is the only copy. The switchboard reads the section from the issue
-  body and caches it in memory by ETag; `issues` webhooks invalidate the cache.
-  It never writes it.
+**Who writes and changes it.** The Chief of Staff writes an ask's lines at
+hand-off; an orchestrator writes a work item's line when it creates one. After
+that, an Intent or Done-when changes only by you, or by the Chief of Staff with
+your yes. Orchestrators and workers propose a change with `send`; they never
+edit it.
+
+GitHub is the only copy. The switchboard reads the section from the issue body
+and caches it in memory by ETag; `issues` webhooks invalidate the cache. It
+never writes it.
 
 **What the switchboard does with it.**
 
-- **Every message names an issue,** and is headed by that issue's Intent and
-  Done-when, plus its top-level parent's if different: at most four lines. This
-  covers GitHub events, a worker finishing, and every `send`, whether from the
-  Chief of Staff to an orchestrator or from an orchestrator back up.
+- **Every message names one issue.** A message covering several asks has one
+  section per ask, never interleaved.
+- **Each section is headed by its ask.** The ask's Intent and Done-when, then
+  the work item's Intent if the message is about a work item under it: at most
+  three lines. This covers GitHub events, a worker finishing, and every `send`,
+  in both directions, so a report coming up to the Chief of Staff carries the
+  same anchor its hand-off went down with.
+- **Open asks at a glance.** `fleet-switchboard intents` lists the caller's
+  open asks, one line each with its Done-when: every ask for the Chief of
+  Staff, the asks under its charter for an orchestrator. It is derived from
+  GitHub on every call.
 - **Missing intent is visible.** A message about an issue without the section
   says "no intent recorded," and `status` lists those issues.
 - **Changes are surfaced, never silent.** An `issues.edited` webhook that
@@ -463,9 +508,8 @@ Done when: both project agents answer a chat message in production.
   old → new, and a toast to you.
 
 **The rules, in the agent definitions.** The Chief of Staff checks every
-orchestrator report against the Intent and Done-when before acting on it or
-summarising it to you, and says so when they diverge. It never rewrites an
-Intent without your explicit yes.
+orchestrator report against its ask's Done-when before acting on it or
+summarising it to you, and says so when they diverge.
 
 ```mermaid
 sequenceDiagram
@@ -475,11 +519,71 @@ sequenceDiagram
   participant GH as GitHub
   participant C as Chief of Staff
   O->>SB: send cos --issue 615 "deployed, one of the two agents fixed"
-  SB->>GH: read issue 615's Intent (cached)
-  SB->>C: [switchboard] from platform, about issue 615<br/>Intent · Done when · then the report
+  SB->>GH: read ask 615's Intent (cached)
+  SB->>C: [switchboard] from platform, about ask 615<br/>Intent · Done when · then the report
   Note over C: report vs. Done when:<br/>"one of two" is not done
   C->>SB: send platform --issue 615 "the second agent is still in scope"
 ```
+
+### Foreground and background (PR 8)
+
+Notes keep machine turns out of your conversation, and intent lines let the
+Chief of Staff answer from a message instead of investigating. That leaves the
+rest of problem 2: you think of things faster than the Chief of Staff carries
+them out.
+
+**What it must do.** The Chief of Staff works serially by default. When a new
+message from you arrives that is unrelated to what it is working on, the work
+in progress continues in the background and the Chief of Staff turns its
+attention to you. When the background work finishes, its result comes back to
+the Chief of Staff like any other report. This applies to the Chief of Staff
+only; orchestrators are driven by the fleet, not by you.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor You
+  participant C as Chief of Staff
+  participant SB as fleet-switchboard
+  participant B as Background worker
+  You->>C: ask A
+  Note over C: working on A
+  You->>C: question B, unrelated to A
+  Note over C,SB: B noticed and judged unrelated
+  C-->>B: A continues in the background
+  C->>You: answer to B
+  Note over B: finishes A
+  SB->>C: A finished, as a note while you are talking, with A's Intent lines
+  C->>You: A's result, when it fits
+```
+
+There are four parts, and more than one way to build each. They are chosen
+after spikes F1–F3, not before.
+
+| Part | The question | Options |
+|---|---|---|
+| Notice | How is your new message caught before it is merged into the running turn? | (a) A message sent while the Chief of Staff is busy waits in v2's inbox with `queue` delivery, where the switchboard can read it; depends on how the v2 TUI submits while busy (F1). (b) The Chief of Staff notices for itself: a steered message reaches it at the next step boundary, and its definition says what to do. (c) A small v2 plugin `prompt` hook makes your prompts to a busy Chief of Staff queue instead of steer. This would be the one plugin in the system |
+| Judge | Is the new message related to the current work? | A cheap judge (PR 7, for example Jev, yes or no) given the current ask's Intent, your previous message and the new one; or the Chief of Staff's own judgement with (b) |
+| Split | How does the current work go on without the foreground? | (i) Fork: `session.fork` copies the session; the copy carries on with A in the background with full context, and the original is interrupted and answers you. (ii) Hand off: interrupt, write a short brief from A's Intent and progress, and launch a fresh background worker. (iii) Background by default: the Chief of Staff starts anything longer than a short turn in a background worker from the outset, so the foreground is always free and nothing needs to be noticed or judged |
+| Return | How does the result come back? | Settled already: the background worker is a fleet agent in its own herdr tab, opened without focus, whose `reports_to` is the Chief of Staff. Its finishing is a worker-done fact like any other (PR 4), delivered as a note while you are talking |
+
+Trade-offs to weigh:
+
+- **Fork** keeps everything, but copies a long history: for a large Chief of
+  Staff session, the background worker's first turn re-reads all of it, which
+  costs time and money (F3).
+- **Hand off** is cheap, but loses whatever the brief leaves out.
+- **Background by default** needs no noticing or judging, but you lose
+  watching and steering a task in the foreground, and the Chief of Staff has to
+  decide what counts as short.
+- **Noticing** with (a) or (c) gives the system a fixed moment to decide; (b)
+  depends on the model's judgement and on when step boundaries fall.
+
+| Spike | Finds out |
+|---|---|
+| F1 | How the v2 TUI submits while the session is busy: steer or queue, which keys do which, and whether the message is visible in `session.inbox.list` before delivery, and for how long |
+| F2 | How accurate a cheap judge is on pairs of (current work, new message) taken from real Chief of Staff transcripts, run in shadow mode |
+| F3 | `session.fork` on a large session: the time and cost of the copy's first turn, and whether interrupting the original leaves it in a clean state |
 
 ### Data
 
@@ -730,7 +834,11 @@ A check only counts once we have seen it fail with its safeguard switched off.
   fallback.
 - **Stacked PRs are reviewed bottom-up.** A fix to a lower PR cascades upward
   through `gh stack rebase`, and every push re-runs CI.
-- **The real cutover (PR 8).** A v2 install outside the Lab shares v1's config
+- **Moving work to the background could cost more than it saves.** Forking a
+  large session re-reads its whole history; a wrong "unrelated" judgement
+  splits work that should have stayed together. F2 and F3 measure both before
+  PR 8 picks an option.
+- **The real cutover (PR 9).** A v2 install outside the Lab shares v1's config
   and data directories and migrates v1 history on its own. The runbook has to
   plan for this, including upgrading herdr's integration for the live fleet.
 
@@ -747,14 +855,14 @@ into individual model calls; changes to `fleet-heartbeat`.
 - S2: if a repeated message id is admitted twice, the crash window between a
   write and its read-back needs another guard. Derived pending already covers
   every other case.
-- Who may change an Intent? Proposed: you, or the Chief of Staff with your
-  explicit yes. Every change is surfaced either way.
-- Is the top-level parent's Intent always worth its two lines, or only when
-  the message comes up to the Chief of Staff?
-- Problem 2 is only partly addressed: notes keep machine turns out of your
-  conversation, and Intent lines let the Chief of Staff answer from the message
-  instead of investigating. Is the rest a Chief of Staff definition change, or
-  does it need more?
+- Who may change an Intent? Decided: you, or the Chief of Staff with your
+  yes. Orchestrators and workers propose; every change is surfaced.
+- Does an ask-level header actually reduce drift and dilution in a session
+  carrying many asks? PR 7's judges can score orchestrator reports and the
+  Chief of Staff's summaries against Done-when, before and after PR 6.
+- Should a message ever cover more than one ask, or should each ask get its
+  own message, at the cost of more wakes?
+- PR 8: which notice, judge and split options? Decided after F1–F3.
 - How long is the audit log kept? Proposed: 30 days, configurable.
 - PR 5: one forwarder per repo, or one per org with `--org`? Per org covers
   every charter repo with a single hook, but needs the `admin:org_hook` scope
@@ -805,3 +913,15 @@ into individual model calls; changes to `fleet-heartbeat`.
     every message about it carries those lines in both directions, and changes
     to them are surfaced. PR 6 is now `switchboard/intent`; PR 2 is now
     `switchboard/delivery`.
+- 2026-10-02: second review.
+  - **Who changes an Intent:** you, or the Chief of Staff with your yes.
+  - **Intent is about many asks in one session.** The Chief of Staff and each
+    orchestrator are single sessions carrying many asks, so every message names
+    its ask and carries that ask's lines. Added the ask level (charter → ask →
+    work item) and `fleet-switchboard intents`. The top-level-parent header is
+    gone: the charter is never repeated.
+  - **Foreground and background is a new PR 8.** The Chief of Staff stays
+    serial until an unrelated message from you arrives; then the current work
+    continues in the background and it turns to you. The requirement is
+    written down; the options for noticing, judging and splitting are left
+    open until spikes F1–F3. The v1 move is now PR 9.
