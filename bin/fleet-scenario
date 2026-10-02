@@ -14,6 +14,7 @@ The test runners import this file for `validate`, `load`, `load_dir` and
 `coverage`. Python 3.9+, standard library only.
 """
 import argparse
+import copy
 import importlib.machinery
 import importlib.util
 import json
@@ -42,11 +43,83 @@ PROBLEMS = (1, 2, 3, 4)
 TIERS = ("offline", "lab-scripted", "lab-model")
 ROLES = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
 ACTORS = ("you", "world")
-ACTIONS = ("turn", "message", "draft", "away", "permission", "comment", "kill-daemon",
-           "restart-daemon", "close-pane", "edit-intent", "synthetic", "note", "wake", "wait")
-EXPECTATIONS = ("delivered", "no_machine_turn", "within", "draft_intact", "message_has_intent",
-                "classified", "handed_off", "toast", "tool_outcome", "judged", "admitted_once",
-                "model_saw", "status_is", "metadata_roundtrip")
+MODES = ("note", "wake")
+WHEN = ("any", "turn_start", "between_steps", "after_reply")
+DECISIONS = ("once", "always", "reject")
+DELIVERIES = ("queue", "steer")
+STATUSES = ("working", "idle", "done", "blocked")
+OF = ("session", "message")
+OUTCOMES = ("completed", "error")
+
+# One vocabulary for every runner: each action and each oracle with its
+# fields, name -> {field: (required, check)}. A step or expectation may carry
+# only its kind's fields, plus `why` (a comment for people), in every tier, so
+# a typo fails validation instead of quietly changing what is checked.
+#
+# Naming: `to` is the agent a step sends to, or the recipient an expectation
+# reads; `agent` is the agent whose own behaviour is checked (its model calls,
+# screen, status, tools) or acted on (`close-pane`); `key` is a fact key, a
+# glob in an expectation; `text` is literal text; `count` is how many.
+_CAST = "cast"  # the check for a field that must name a cast member
+_STEP = "step"  # the check for a field that must be the index of a step
+_SYNTHETIC = {"to": (True, _CAST), "key": (True, "name"), "text": (True, "text"), "id": (False, "name"),
+              "resume": (False, "bool"), "delivery": (False, "delivery")}
+STEP_FIELDS = {
+    "turn": {"lasts": (False, "duration"), "steps": (False, "count1")},
+    "message": {"to": (True, _CAST), "text": (True, "text"), "lasts": (False, "duration")},
+    "draft": {"to": (True, _CAST), "text": (True, "line")},
+    "away": {},
+    "permission": {"to": (False, _CAST), "decision": (False, "decision")},
+    "comment": {"issue": (True, "issue"), "body": (True, "text")},
+    "kill-daemon": {},
+    "restart-daemon": {},
+    "close-pane": {"agent": (True, _CAST)},
+    "edit-intent": {"issue": (True, "issue"), "intent": (False, "text_or_null"),
+                    "done_when": (False, "text_or_null")},
+    "synthetic": _SYNTHETIC,
+    "note": _SYNTHETIC,
+    "wake": _SYNTHETIC,
+    "wait": {},
+    "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
+             "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
+    "pass": {"faults": (False, "faults")},
+}
+ACTIONS = tuple(STEP_FIELDS)
+# Who may take each action: "you", "world", or "cast" (any cast member).
+STEP_ACTORS = {
+    "turn": ("cast",), "message": ("you",), "draft": ("you",), "away": ("you",),
+    "permission": ("you", "cast"), "comment": ("world",), "kill-daemon": ("world",),
+    "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
+    "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
+    "fact": ("world",), "pass": ("world",),
+}
+EXPECT_FIELDS = {
+    "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
+                  "count": (False, "count0"), "keys": (False, "count1")},
+    "message_count": {"to": (True, _CAST), "count": (True, "count0")},
+    "model_saw": {"agent": (True, _CAST), "key": (True, "name"), "when": (False, "when"),
+                  "count": (False, "count0")},
+    "no_machine_turn": {"agent": (True, _CAST)},
+    "within": {"agent": (True, _CAST), "step": (True, _STEP), "seconds": (True, "seconds"),
+               "key": (False, "name")},
+    "draft_intact": {"agent": (True, _CAST), "text": (True, "line")},
+    "message_has_intent": {"to": (True, _CAST), "issue": (True, "issue")},
+    "classified": {"agent": (True, _CAST), "step": (True, _STEP), "as": (True, "name")},
+    "handed_off": {"issue": (True, "issue")},
+    "toast": {"agent": (False, _CAST), "text": (False, "text")},
+    "tool_outcome": {"agent": (True, _CAST), "tool": (False, "name"), "outcome": (True, "outcome")},
+    "judged": {"agent": (True, _CAST), "question": (True, "text"), "threshold": (False, "probability")},
+    "status_is": {"agent": (True, _CAST), "status": (True, "status"), "at": (True, "duration")},
+    "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
+                           "text": (False, "text"), "fleet": (False, "fleet")},
+}
+EXPECTATIONS = tuple(EXPECT_FIELDS)
+STEP_COMMON = ("at", "actor", "do", "why")
+EXPECT_COMMON = ("that", "name", "why")
+# A control variant patches the scenario it controls:
+# {"steps": {"<index>": {field: value}}, "expect": {"<name or index>": {field: value}}}.
+# The patched scenario must itself be valid.
+VARIANT_KEYS = ("steps", "expect")
 
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
 OPTIONAL = ("tags", "issues")
@@ -72,6 +145,83 @@ def duration_seconds(text):
     """'0s', '10s', '2m', '2h' -> seconds. None if it is not a duration."""
     match = DURATION_RE.match(text) if isinstance(text, str) else None
     return int(match.group(1)) * UNIT_SECONDS[match.group(2)] if match else None
+
+
+def _field_ok(check, value, cast, steps=0):
+    if check == _CAST:
+        return isinstance(value, str) and value in cast
+    if check == _STEP:
+        return _int(value) and 0 <= value < steps
+    if check == "duration":
+        return duration_seconds(value) is not None
+    if check == "text":
+        return isinstance(value, str)
+    if check == "line":
+        return isinstance(value, str) and "\n" not in value
+    if check == "text_or_null":
+        return value is None or isinstance(value, str)
+    if check == "name":
+        return isinstance(value, str) and bool(value.strip())
+    if check == "issue":
+        return _int(value) and value >= 1
+    if check == "bool":
+        return isinstance(value, bool)
+    if check == "count0":
+        return _int(value) and value >= 0
+    if check == "count1":
+        return _int(value) and value >= 1
+    if check == "seconds":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+    if check == "probability":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+    if check == "mode":
+        return value in MODES
+    if check == "when":
+        return value in WHEN
+    if check == "decision":
+        return value in DECISIONS
+    if check == "delivery":
+        return value in DELIVERIES
+    if check == "status":
+        values = value if isinstance(value, list) and value else [value]
+        return all(isinstance(v, str) and v in STATUSES for v in values)
+    if check == "of":
+        return value in OF
+    if check == "outcome":
+        return value in OUTCOMES
+    if check == "fleet":
+        return value is None or isinstance(value, dict)
+    if check == "faults":
+        return isinstance(value, list) and bool(value) and all(v in KNOWN_FAULTS for v in value)
+    raise AssertionError("no such check: %s" % check)
+
+
+_CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenario",
+               "duration": "a duration such as \"30s\"", "text": "a string",
+               "line": "a string of one line", "text_or_null": "a string or null",
+               "name": "a non-empty string", "issue": "an issue number (integer >= 1)", "bool": "true or false",
+               "count0": "an integer >= 0", "count1": "an integer >= 1", "seconds": "a number > 0",
+               "probability": "a number from 0 to 1", "mode": " or ".join(MODES),
+               "when": "one of " + ", ".join(WHEN), "decision": "one of " + ", ".join(DECISIONS),
+               "delivery": " or ".join(DELIVERIES),
+               "status": "one of %s, or a non-empty list of them" % ", ".join(STATUSES),
+               "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES), "fleet": "an object or null",
+               "faults": "a non-empty list of known fault names"}
+
+
+def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):
+    """Check `item`'s own fields against `table[kind]`."""
+    if kind not in table:
+        return
+    fields = table[kind]
+    for key in sorted(set(item) - set(fields) - set(common)):
+        errors.append("%s: unknown field %r for %r" % (where, key, kind))
+    for key, (required, check) in sorted(fields.items()):
+        if key not in item:
+            if required:
+                errors.append("%s.%s: required for %r" % (where, key, kind))
+        elif not _field_ok(check, item[key], cast, steps):
+            errors.append("%s.%s: must be %s, got %r" % (where, key, _CHECK_TEXT[check], item[key]))
 
 
 def _validate_cast(cast, errors):
@@ -141,14 +291,26 @@ def _validate_steps(steps, cast, errors):
                           % (where, step["at"]))
         else:
             previous = at
-        actor = step.get("actor")
-        if not (actor in ACTORS or (isinstance(actor, str) and actor in cast)):
+        actor, do = step.get("actor"), step.get("do")
+        is_cast = isinstance(actor, str) and actor in cast and actor not in ACTORS
+        if not (actor in ACTORS or is_cast):
             errors.append("%s.actor: must be \"you\", \"world\" or a cast name, got %r" % (where, actor))
-        if step.get("do") not in ACTIONS:
-            errors.append("%s.do: must be one of %s, got %r" % (where, ", ".join(ACTIONS), step.get("do")))
+        if do not in ACTIONS:
+            errors.append("%s.do: must be one of %s, got %r" % (where, ", ".join(ACTIONS), do))
+            continue
+        allowed = STEP_ACTORS[do]
+        if (actor in ACTORS or is_cast) and ("cast" if is_cast else actor) not in allowed:
+            errors.append("%s.actor: %r cannot %s; allowed: %s" % (
+                where, actor, do, ", ".join("a cast member" if a == "cast" else a for a in allowed)))
+        _validate_fields(where, step, do, STEP_FIELDS, STEP_COMMON, cast, errors)
+        if do == "permission":
+            if actor == "you" and "to" not in step:
+                errors.append("%s.to: required for your answer to a permission ask" % where)
+            if is_cast and ("to" in step or "decision" in step):
+                errors.append("%s: an agent's permission ask takes no `to` or `decision`" % where)
 
 
-def _validate_expect(expect, errors):
+def _validate_expect(expect, cast, steps, errors):
     labels = set()
     if not isinstance(expect, list) or not expect:
         errors.append("expect: must be a non-empty list")
@@ -164,6 +326,11 @@ def _validate_expect(expect, errors):
                           % (where, ", ".join(EXPECTATIONS), item.get("that")))
         else:
             labels.add(item["that"])
+            _validate_fields(where, item, item["that"], EXPECT_FIELDS, EXPECT_COMMON, cast, errors, steps)
+            if item["that"] == "metadata_roundtrip" and item.get("of") == "message" \
+                    and ("key" in item) == ("text" in item):
+                errors.append("%s: a message's metadata_roundtrip names the message by exactly one of "
+                              "`key` or `text`" % where)
         if "name" in item:
             name = item["name"]
             if not isinstance(name, str) or not name:
@@ -176,7 +343,39 @@ def _validate_expect(expect, errors):
     return labels
 
 
-def _validate_control(control, labels, errors):
+class VariantError(ValueError):
+    """A control variant that does not patch this scenario."""
+
+
+def apply_variant(scenario, variant):
+    """The scenario with a control variant patched in. Raises VariantError."""
+    if not isinstance(variant, dict):
+        raise VariantError("must be an object")
+    unknown = sorted(set(variant) - set(VARIANT_KEYS))
+    if unknown:
+        raise VariantError("unknown key(s) %s (known: %s)" % (", ".join(map(repr, unknown)), ", ".join(VARIANT_KEYS)))
+    out = copy.deepcopy(scenario)
+    steps, expect = out.get("steps"), out.get("expect")
+    for index, patch in sorted((variant.get("steps") or {}).items()):
+        if not (isinstance(index, str) and index.isdigit() and isinstance(steps, list)
+                and int(index) < len(steps) and isinstance(steps[int(index)], dict)):
+            raise VariantError("steps: %r is not the index of a step" % (index,))
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("steps.%s: must be a non-empty object of fields" % index)
+        steps[int(index)].update(copy.deepcopy(patch))
+    for label, patch in sorted((variant.get("expect") or {}).items()):
+        hits = [e for i, e in enumerate(expect if isinstance(expect, list) else [])
+                if isinstance(e, dict) and (e.get("name") == label or str(i) == label)]
+        if not hits:
+            raise VariantError("expect: %r matches no expectation's name or index" % (label,))
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("expect.%s: must be a non-empty object of fields" % label)
+        for item in hits:
+            item.update(copy.deepcopy(patch))
+    return out
+
+
+def _validate_control(control, labels, scenario, errors):
     if not isinstance(control, dict):
         errors.append("control: must be an object")
         return
@@ -190,8 +389,15 @@ def _validate_control(control, labels, errors):
         errors.append("control.fault: unknown fault %r (known: %s)" % (control["fault"], ", ".join(KNOWN_FAULTS)))
     if "baseline" in control and not (isinstance(control["baseline"], str) and control["baseline"].strip()):
         errors.append("control.baseline: must be a non-empty string naming the system run instead")
-    if "variant" in control and not isinstance(control["variant"], dict):
+    if "variant" in control and scenario is None and not isinstance(control["variant"], dict):
         errors.append("control.variant: must be an object")
+    elif "variant" in control and scenario is not None:
+        try:
+            patched = apply_variant(scenario, control["variant"])
+        except VariantError as err:
+            errors.append("control.variant: %s" % err)
+        else:
+            errors.extend("control.variant makes %s" % e for e in _validate_body(patched))
     fails = control.get("fails")
     if not isinstance(fails, list) or not fails:
         errors.append("control.fails: must be a non-empty list of the expectations the control breaks")
@@ -199,6 +405,20 @@ def _validate_control(control, labels, errors):
     for entry in fails:
         if entry not in labels:
             errors.append("control.fails: %r matches no expectation's name or 'that'" % (entry,))
+
+
+def _validate_body(obj):
+    """Cast, issues, steps and expect: what a control variant can change. Returns (errors)."""
+    errors = []
+    cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
+    if "issues" in obj:
+        _validate_issues(obj["issues"], errors)
+    if "steps" in obj:
+        _validate_steps(obj["steps"], cast, errors)
+    steps = len(obj["steps"]) if isinstance(obj.get("steps"), list) else 0
+    if "expect" in obj:
+        _validate_expect(obj["expect"], cast, steps, errors)
+    return errors
 
 
 def validate(obj):
@@ -229,14 +449,15 @@ def validate(obj):
     if "tags" in obj and not (isinstance(obj["tags"], list) and all(isinstance(t, str) and t for t in obj["tags"])):
         errors.append("tags: must be a list of non-empty strings")
 
-    cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
-    if "issues" in obj:
-        _validate_issues(obj["issues"], errors)
-    if "steps" in obj:
-        _validate_steps(obj["steps"], cast, errors)
-    labels = _validate_expect(obj["expect"], errors) if "expect" in obj else set()
+    body = _validate_body(obj)
+    errors.extend(body)
+    cast = obj["cast"] if isinstance(obj.get("cast"), dict) else {}
+    steps = len(obj["steps"]) if isinstance(obj.get("steps"), list) else 0
+    labels = _validate_expect(obj["expect"], cast, steps, []) if "expect" in obj else set()
     if "control" in obj:
-        _validate_control(obj["control"], labels, errors)
+        # A variant is patched in and checked only on a scenario that is valid
+        # without it, so each mistake is reported once, where it is.
+        _validate_control(obj["control"], labels, None if body else obj, errors)
     return errors
 
 

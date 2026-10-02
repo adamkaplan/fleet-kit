@@ -25,6 +25,117 @@ The full format, tiers, oracles and catalog are in
 | `expect` | yes | What must and must not happen: `that` (the oracle), optional unique `name`, plus the oracle's own fields |
 | `control` | yes | Exactly one of `fault` (a known fault name), `baseline` (the system run instead) or `variant` (an object), plus `fails`: the expectations, by `name` or `that`, the control must break |
 
+## The vocabulary
+
+One vocabulary for both runners. `bin/fleet-scenario` holds a field table for
+every action and every expectation, and checks each step and expectation
+against it in every tier, so a typo fails `validate`. Each may also carry
+`why`, a comment for people.
+
+Field names mean the same thing everywhere: `to` is the agent a step sends to,
+or the recipient an expectation reads; `agent` is the agent whose own
+behaviour is checked (its model calls, screen, status, tools) or acted on;
+`key` is a fact key, a glob in an expectation; `text` is literal text; `count`
+is how many.
+
+### Steps
+
+| `do` | Actor | Fields (optional in brackets) | What it is |
+|---|---|---|---|
+| `turn` | a cast member | [`lasts`], [`steps`] | Work the fleet gave the agent: one prompt of `steps` model calls over `lasts`. It is the fleet's, so you are not engaged |
+| `message` | you | `to`, `text`, [`lasts`] | A prompt from you |
+| `draft` | you | `to`, `text` (one line) | Typed into the agent's input box, not sent |
+| `away` | you | none | You stop prompting |
+| `permission` | a cast member | none | The agent asks to run a shell command |
+| `permission` | you | `to`, [`decision`: `once`, `always`, `reject`] | Your answer to that ask |
+| `comment` | world | `issue`, `body` | A GitHub comment (PR 5) |
+| `edit-intent` | you, world | `issue`, [`intent`], [`done_when`] | An Intent edit (PR 6); `null` removes the line |
+| `close-pane` | world | `agent` | The agent's pane closes (PR 4) |
+| `synthetic`, `note`, `wake` | world | `to`, `key`, `text`, [`id`], [`resume`], [`delivery`: `queue`, `steer`] | A v2 synthetic message sent directly, without the engine (spikes). `note` defaults to resume false + steer, `wake` to resume true + queue, `synthetic` to resume false + steer. The same `id` name in one play is the same derived message id |
+| `fact` | world | `to`, `key`, `summary`, [`kind`], [`issue`], [`from`], [`batch`] | A fact for the engine: a line in its Lab fact source, `$STATE/lab-facts.jsonl`, read only when `FLEET_SWITCHBOARD_LAB=1` |
+| `pass` | world | [`faults`] | One engine pass with these faults on, such as `crash-after-send` |
+| `kill-daemon`, `restart-daemon` | world | none | While the daemon is down only `pass` steps run the engine; a restart forgets everything in memory |
+| `wait` | world | none | Marks the end of the play |
+
+### Expectations
+
+| `that` | Fields (optional in brackets) | Passes when |
+|---|---|---|
+| `delivered` | `to`, `key`, [`mode`: `note`, `wake`], [`count`], [`keys`] | The recipient's transcript holds synthetic messages whose `metadata.fleet.keys` match `key`: `count` distinct messages (default: at least one), carrying `keys` distinct matching keys, each reaching the model as `mode`. An item still waiting in v2's inbox is not delivered |
+| `message_count` | `to`, `count` | The switchboard wrote `count` distinct messages to the recipient (`metadata.fleet.from` is `switchboard`), in its transcript or waiting in its inbox |
+| `model_saw` | `agent`, `key`, [`when`: `any`, `turn_start`, `between_steps`, `after_reply`], [`count`] | `count` model calls (default: at least one) of that phase had a message carrying `key` among their new inputs |
+| `no_machine_turn` | `agent` | No model call was triggered by a fleet message |
+| `within` | `agent`, `step` (an index), `seconds`, [`key`] | With `key`: the message carrying it was delivered and answered within `seconds` of the step. Without: the agent's next final reply was |
+| `draft_intact` | `agent`, `text` | The input box still holds `text`, and no message contains it |
+| `status_is` | `agent`, `status` (`working`, `idle`, `done`, `blocked`, or a list), `at` | herdr's status at that time |
+| `tool_outcome` | `agent`, [`tool`], `outcome` (`completed`, `error`) | The agent's last call of `tool` (default `shell`) ended so, and a completed result went back to the model |
+| `metadata_roundtrip` | `agent`, `of` (`session`, `message`), [`key` or `text`], [`fleet`] | v2 returns `metadata.fleet` exactly: the cast's, or `fleet`; a message is named by exactly one of `key` or `text` |
+| `message_has_intent` | `to`, `issue` | The delivered text carries the issue's Intent lines (PR 6) |
+| `classified` | `agent`, `step`, `as` | Jev classified that message so (PR 7) |
+| `handed_off` | `issue` | A brief on the ask and a `cos-subagent` session for it (PR 8) |
+| `toast` | [`agent`], [`text`] | herdr was asked to show such a toast |
+| `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
+
+**Mode.** Whether a message was a note or a wake is read from what it did,
+in both runners, not from the flags it was sent with. A message is a **wake**
+when it was the input that called the model: the last new input of a model
+call that started a turn from idle, or that ran after the turn's final reply.
+It is a **note** when it rode along with another input (your next message),
+or was injected between the steps of a running turn. In the Lab the runner
+reads this from the scripted model's request log, matched to the transcript;
+offline, from the fakes' model calls. So a wake sent with `steer` (the
+`steer-not-queue` fault) on a busy agent counts as a note: the agent took it
+mid-turn.
+
+### Controls
+
+Exactly one of:
+
+| Control | Fields | What it does |
+|---|---|---|
+| `fault` | a known fault name | The scenario plays again with `FLEET_SWITCHBOARD_FAULT` set on every engine process; only scenarios that run the engine |
+| `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
+| `baseline` | the system run instead | Not built yet |
+
+plus `fails`: the expectations, by `name` or `that`, the control must break.
+A control that breaks none of them proves nothing, and fails the run.
+
+## The offline runner
+
+`bin/test-switchboard` runs every scenario with the `offline` tier against
+stateful fakes of v2 and herdr and a simulated clock: a daemon pass every 5 s,
+steps at their times. Expectations are judged on the fakes' state
+(transcripts, inbox, model calls), never on the switchboard's report. Then it
+re-runs the scenario with the control's fault, and the test fails if any
+expectation named in `fails` still passes. Every run also checks that each
+write was audited before and after, and that herdr was never asked to type.
+
+## The Lab runner
+
+`bin/proof-switchboard run [paths] --tier lab-scripted` plays each scenario
+with the `lab-scripted` tier in the Lab, in real time, on fresh v2 sessions,
+then plays its control. Every cast member gets a warm-up turn first; that
+brief, and every `turn`, are marked as the fleet's (`metadata.fleet`), so
+only a `message` counts as you prompting.
+
+A scenario with a `fact`, `pass` or daemon step runs the real engine,
+`bin/fleet-switchboard`, with `XDG_CONFIG_HOME` and `XDG_STATE_HOME` in a
+fresh directory under `$LAB/runs/engine/`, `FLEET_SWITCHBOARD_LAB=1`, and a
+config whose `opencode` is the Lab wrapper's absolute path. Its daemon polls
+every 5 s from the start until the last step's time. Every cast member runs
+the Lab TUI in its own pane of the "Switchboard Lab" workspace (more panes
+are split there without focus), checked to run the Lab's v2 binary, so the
+engine finds it as it finds a fleet agent: herdr agent, its session, the
+session's `metadata.fleet.name`. A `fault` control plays again with the fault
+on every engine process; `kill-daemon` and `restart-daemon` stop and start
+the daemon, and `pass` runs one `run --once`, as the offline runner does.
+
+Expectations are read from the systems that own the facts: the recipient's
+v2 transcript and inbox, the scripted model's request log, herdr's status
+and pane reads. The engine's output and audit log go into the evidence,
+never into a verdict. Evidence: `scenario-runs/<UTC>/<id>/report.md` and
+`timeline.jsonl`.
+
 ## Commands
 
 ```bash

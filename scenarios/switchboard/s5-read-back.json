@@ -1,0 +1,28 @@
+{
+  "id": "S5",
+  "title": "Spike S5: session and message metadata read back exactly; your prompts carry none",
+  "problem": null,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 5}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "note", "to": "coder", "key": "S5-note",
+     "text": "fleet note S5-note: issue 5 has a new comment"},
+    {"at": "2s", "actor": "you", "do": "message", "to": "coder", "text": "plain human prompt S5"}
+  ],
+  "expect": [
+    {"that": "metadata_roundtrip", "name": "session-metadata", "agent": "coder", "of": "session"},
+    {"that": "metadata_roundtrip", "name": "orchestrator-metadata", "agent": "platform", "of": "session"},
+    {"that": "metadata_roundtrip", "name": "note-metadata", "agent": "coder", "of": "message", "key": "S5-note"},
+    {"that": "metadata_roundtrip", "name": "your-prompt-unmarked", "agent": "coder", "of": "message",
+     "text": "plain human prompt S5", "fleet": null}
+  ],
+  "control": {
+    "variant": {"expect": {"session-metadata": {"fleet": {"name": "coder", "role": "coder", "reports_to": "platform", "issue": 6}}}},
+    "fails": ["session-metadata"]
+  }
+}

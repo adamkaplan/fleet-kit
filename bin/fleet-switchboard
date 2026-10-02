@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """fleet-switchboard — routes facts to fleet agents as OpenCode v2 messages.
 
-This is the offline core: configuration, the private state directory, the one
-client for OpenCode v2 (`opencode api`), the one client for herdr, the audit
-log, fault gating for the Lab, and the derived message id. Delivery comes in
-later changes; see docs/switchboard.md.
+Configuration, the private state directory, the one client for OpenCode v2
+(`opencode api`), the one client for herdr, the audit log, fault gating for
+the Lab, the derived message id, and the delivery engine: each pass observes
+the fleet, derives what is pending (facts minus the keys already in each
+recipient's transcript or inbox), decides note, wake, wait or hold by the
+delivery rule, and delivers. See docs/switchboard.md, "Delivery rule".
+
+    fleet-switchboard run [--once]          the daemon, or one pass
+    fleet-switchboard send <name> <text>    deliver to another agent now
+    fleet-switchboard pending <name>        what is pending, and why it waits
+    fleet-switchboard status                config, clients, fleet agents
 
 Rules this file keeps from the start:
 
@@ -18,12 +25,16 @@ Rules this file keeps from the start:
      call and the result after it, including when the call raised.
   4. No secret is ever written to the audit log; values under credential-like
      key names are redacted before a line is written.
+  5. Nothing about delivery is stored. Pending is derived on every pass, and
+     a key found in the recipient's transcript or v2 inbox is never delivered
+     again (docs/switchboard.md, Invariants 1 and 2).
 
 Python 3.9+, standard library only.
 """
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -31,6 +42,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import uuid
 
 VERSION = "0.1.0"
@@ -39,6 +51,8 @@ PROG = "fleet-switchboard"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
+EXIT_HELD = 3   # `send`: the delivery rule says hold; nothing was sent
+EXIT_CRASH = 70  # the `crash-after-send` fault stopped the process, as a crash would
 
 # ------------------------------------------------------------------ the config
 
@@ -52,6 +66,7 @@ DEFAULTS = {
     "batch_seconds": 90,
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
+    "poll_seconds": 5,
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -110,7 +125,7 @@ def validate_config(raw, source="config"):
             raise ConfigError("%s: 'opencode_env' has an invalid variable name: %r" % (source, name))
         if not isinstance(value, str):
             raise ConfigError("%s: 'opencode_env' value for %s must be a string" % (source, name))
-    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds"):
+    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
     config["opencode_env"] = dict(env)
@@ -199,6 +214,15 @@ def fault(name):
     return os.environ.get(LAB_ENV) == "1" and name in requested
 
 
+class SimulatedCrash(BaseException):
+    """The `crash-after-send` fault: the process stops here, as if killed.
+
+    A BaseException, so no per-agent `except Exception` in the pass catches
+    it, and AuditLog.external lets it through without writing a result: a
+    crashed process writes nothing after the crash. Scenario R2 is built on it.
+    """
+
+
 # ------------------------------------------------------------- the message id
 
 def derive_message_id(recipient, keys):
@@ -269,13 +293,16 @@ class AuditLog:
         """Audit one write to another system: `intent` before, `result` after.
 
         Yields a dict the caller may fill with what came back; it becomes the
-        result entry's detail. An exception is recorded, then re-raised.
+        result entry's detail. An exception is recorded, then re-raised. A
+        SimulatedCrash is re-raised with nothing recorded, as a real crash.
         """
         call = uuid.uuid4().hex[:12]
         self.append(actor, event, subject, detail, phase="intent", call=call)
         outcome = {}
         try:
             yield outcome
+        except SimulatedCrash:
+            raise
         except BaseException as err:
             self.append(actor, event, subject, outcome or None, phase="result", call=call,
                         ok=False, error="%s: %s" % (type(err).__name__, err))
@@ -474,6 +501,659 @@ class HerdrClient:
         return self._call("notification", "show", "--title", title, "--body", body)
 
 
+# ------------------------------------------------------------------ the facts
+
+class FactError(ValueError):
+    """A fact that cannot be used: a missing field, or a value of the wrong type."""
+
+
+class Fact:
+    """Something one fleet agent should be told.
+
+    `key` names the source fact, such as `send:<from>:<id>` or `lab.fact:<id>`.
+    It is what makes delivery idempotent: every message lists the keys it
+    covers, and a key found in the recipient's transcript or inbox is never
+    delivered again. `created` is epoch seconds. `batch` false skips the batch
+    window, as `send` does.
+    """
+
+    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender")
+
+    def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None):
+        for name, value in (("key", key), ("recipient", recipient), ("kind", kind)):
+            if not isinstance(value, str) or not value.strip():
+                raise FactError("fact %s must be a non-empty string, got %r" % (name, value))
+        if not isinstance(summary, str):
+            raise FactError("fact summary must be a string, got %r" % (summary,))
+        if not _is_number(created):
+            raise FactError("fact created must be epoch seconds, got %r" % (created,))
+        if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
+            raise FactError("fact issue must be an issue number, got %r" % (issue,))
+        if not isinstance(batch, bool):
+            raise FactError("fact batch must be true or false, got %r" % (batch,))
+        if sender is not None and not isinstance(sender, str):
+            raise FactError("fact from must be a string, got %r" % (sender,))
+        self.key, self.recipient, self.kind, self.summary = key, recipient, kind, summary
+        self.created, self.issue, self.batch, self.sender = float(created), issue, batch, sender
+
+    @classmethod
+    def from_json(cls, obj):
+        if not isinstance(obj, dict):
+            raise FactError("a fact must be a JSON object")
+        unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from"})
+        if unknown:
+            raise FactError("fact has unknown field(s): %s" % ", ".join(unknown))
+        missing = [name for name in ("key", "recipient", "kind", "summary", "created") if name not in obj]
+        if missing:
+            raise FactError("fact is missing: %s" % ", ".join(missing))
+        return cls(obj["key"], obj["recipient"], obj["kind"], obj["summary"], obj["created"],
+                   obj.get("issue"), obj.get("batch", True), obj.get("from"))
+
+    def to_json(self):
+        return {"key": self.key, "recipient": self.recipient, "kind": self.kind, "summary": self.summary,
+                "created": self.created, "issue": self.issue, "batch": self.batch, "from": self.sender}
+
+    def __repr__(self):
+        return "Fact(%r -> %r)" % (self.key, self.recipient)
+
+
+LAB_FACTS = "lab-facts.jsonl"
+
+
+def lab_fact_source(state_dir):
+    """The Lab's test seam: facts a scenario runner appends to $STATE/lab-facts.jsonl.
+
+    One JSON object per line, in Fact.to_json's shape. Read only when
+    FLEET_SWITCHBOARD_LAB=1; anywhere else it yields nothing, so a stray file
+    can never cause a delivery. A bad line fails the whole source, loudly: in
+    the Lab a typo must not quietly drop a fact.
+    """
+    path = Path(state_dir) / LAB_FACTS
+
+    def lab_facts():
+        if os.environ.get(LAB_ENV) != "1":
+            return []
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            return []
+        facts = []
+        for number, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                facts.append(Fact.from_json(json.loads(line)))
+            except ValueError as err:
+                raise FactError("%s:%d: %s" % (path, number, err)) from None
+        return facts
+
+    return lab_facts
+
+
+def fact_sources(state_dir):
+    """Every fact source, in order: callables that each return a list of Facts.
+
+    The one registration point. Worker facts (PR 4), GitHub facts (PR 5) and
+    reminders join this list. `send` is not a source: it delivers directly, by
+    the same rule, and stores nothing.
+    """
+    return [lab_fact_source(state_dir)]
+
+
+# --------------------------------------------------------- observing the fleet
+
+# herdr's agent_status -> the switchboard's. `done` is idle that you have not
+# looked at yet; anything not listed is unknown, and unknown holds.
+STATUS = {"working": "working", "idle": "idle", "done": "idle", "blocked": "blocked"}
+
+READ_LIMIT = 200    # transcript messages per read, newest first
+SINCE_SLACK = 60    # seconds read back beyond the oldest fact, for clock skew
+MESSAGE_CAP = 4000  # characters in one delivered message
+
+
+def agent_session(entry):
+    """The v2 session id a herdr agent entry names, or None.
+
+    herdr 0.9 reports `agent_session` as an object, `{"kind": "id", "value":
+    "ses_..."}` (S6); a plain string is accepted too.
+    """
+    value = entry.get("agent_session") if isinstance(entry, dict) else None
+    if isinstance(value, dict):
+        value = value.get("value") if value.get("kind", "id") == "id" else None
+    return value if isinstance(value, str) and value else None
+
+
+def _seconds(value):
+    """v2 time (epoch milliseconds, or seconds) -> epoch seconds; None if absent."""
+    if not _is_number(value):
+        return None
+    return value / 1000.0 if value > 1e11 else float(value)
+
+
+def _fleet_meta(record):
+    """`metadata.fleet` of a v2 record: a message has `metadata` at the top;
+    an inbox item (session.inbox.list, 2.0.22) has it under `payload`."""
+    if not isinstance(record, dict):
+        return None
+    meta = record.get("metadata")
+    if meta is None and isinstance(record.get("payload"), dict):
+        meta = record["payload"].get("metadata")
+    fleet = meta.get("fleet") if isinstance(meta, dict) else None
+    return fleet if isinstance(fleet, dict) else None
+
+
+def _fleet_keys(record):
+    keys = (_fleet_meta(record) or {}).get("keys")
+    return [key for key in keys if isinstance(key, str)] if isinstance(keys, list) else []
+
+
+def _created(record):
+    times = record.get("time") if isinstance(record, dict) else None
+    return _seconds(times.get("created")) if isinstance(times, dict) else None
+
+
+def iso(epoch):
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+class Observation:
+    """One fleet agent as observed now: herdr's status, v2's session.
+
+    `last_human_prompt` is the time of your newest prompt within the
+    engagement window, or None when there is none in it. `problem` is set
+    when something needed for a decision could not be read; it holds.
+    """
+
+    def __init__(self, name, session_id, pane, status, fleet, idle_at=None, outcome=None,
+                 last_human_prompt=None, problem=None):
+        self.name, self.session_id, self.pane, self.status = name, session_id, pane, status
+        self.fleet, self.idle_at, self.outcome = fleet, idle_at, outcome
+        self.last_human_prompt, self.problem = last_human_prompt, problem
+        self.conflict = []  # other sessions that claim the same name
+
+    def engaged(self, now, window):
+        """You prompted this agent within `window` seconds. Off under `no-engagement-gate`."""
+        if fault("no-engagement-gate"):
+            return False
+        return self.last_human_prompt is not None and now - self.last_human_prompt < window
+
+    def to_json(self):
+        return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
+                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
+                "conflict": self.conflict}
+
+
+class Discovery:
+    """Every fleet agent found in one look, by name, and what got in the way."""
+
+    def __init__(self):
+        self.agents = {}
+        self.problems = []
+
+    def add(self, observation):
+        known = self.agents.get(observation.name)
+        if known is None:
+            self.agents[observation.name] = observation
+        elif known.session_id != observation.session_id and observation.session_id not in known.conflict:
+            known.conflict.append(observation.session_id)
+
+    def missing(self, name):
+        """Why `name` has no observation: not running, or something unreadable."""
+        if self.problems:
+            return "%s not found; %s" % (name, "; ".join(self.problems))
+        return "%s not found: no herdr pane shows a v2 session named %s" % (name, name)
+
+
+# ------------------------------------------------------------ the decision
+
+class Plan:
+    """What the delivery rule says for one recipient now.
+
+    action: "wait" (batching), "hold" (reason says why), "note" or "wake".
+    """
+
+    def __init__(self, recipient, action, reason, pending, observation=None, ready_at=None):
+        self.recipient, self.action, self.reason = recipient, action, reason
+        self.pending, self.observation, self.ready_at = pending, observation, ready_at
+
+    def to_json(self):
+        return {"recipient": self.recipient, "action": self.action, "reason": self.reason,
+                "ready_at": iso(self.ready_at), "pending": [fact.to_json() for fact in self.pending]}
+
+
+def hold_reason(observation, missing=None):
+    """Why nothing may be written to this agent now, or None."""
+    if observation is None:
+        return missing or "not found"
+    if observation.conflict:
+        return "%s is claimed by more than one session (%s); fix the fleet metadata" % (
+            observation.name, ", ".join([observation.session_id] + observation.conflict))
+    if observation.problem:
+        return observation.problem
+    if observation.status == "blocked":
+        return "%s is blocked on a permission request or a question" % observation.name
+    if observation.status not in ("idle", "working"):
+        return "%s has status %s in herdr" % (observation.name, observation.status)
+    return None
+
+
+def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds, missing=None):
+    """The delivery rule for one recipient's pending facts. Reads nothing; writes nothing.
+
+    Batch: wait until the oldest pending fact is `batch_seconds` old, unless a
+    pending fact skips batching (`send`), or under `no-batch`. Then hold if
+    the agent is gone, blocked, unknown or unreadable; else a note if you are
+    engaged with it, else a wake.
+    """
+    pending = sorted(pending, key=lambda fact: (fact.created, fact.key))
+    if not pending:
+        return None
+    if not fault("no-batch") and all(fact.batch for fact in pending):
+        ready_at = pending[0].created + batch_seconds
+        if now < ready_at:
+            return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)
+    reason = hold_reason(observation, missing)
+    if reason:
+        return Plan(recipient, "hold", reason, pending, observation)
+    if observation.engaged(now, engaged_seconds):
+        return Plan(recipient, "note", "you prompted %s at %s" % (recipient, iso(observation.last_human_prompt)),
+                    pending, observation)
+    return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
+
+
+def compose(recipient, facts, cap=MESSAGE_CAP):
+    """One message for `facts`, oldest first. Returns (text, the facts it carries).
+
+    The first line names the count and the first item; each item follows in
+    full. Items that do not fit under `cap` stay pending: the message ends with
+    how many, and they go in the next message. A single item longer than the
+    cap is cut, and says so.
+    """
+    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
+    if not facts:
+        raise ValueError("nothing to compose")
+
+    def item(fact):
+        where = " (issue #%d)" % fact.issue if fact.issue else ""
+        body = fact.summary.strip().replace("\n", "\n  ")
+        return "- %s from %s%s: %s" % (fact.kind, fact.sender or "the fleet", where, body)
+
+    def render(count):
+        head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(facts[0].summary, 200))
+        lines = [head] + [item(fact) for fact in facts[:count]]
+        rest = len(facts) - count
+        if rest:
+            lines.append("\u2026 and %d more: run fleet-switchboard pending %s" % (rest, recipient))
+        return "\n".join(lines)
+
+    for count in range(len(facts), 0, -1):
+        text = render(count)
+        if len(text) <= cap:
+            return text, facts[:count]
+    marker = "\n[cut at %d characters]" % cap
+    return text[:cap - len(marker)] + marker, facts[:1]
+
+
+# ---------------------------------------------------------------- the engine
+
+class LockError(Exception):
+    """Another `run` holds the single-instance lock."""
+
+
+@contextmanager
+def single_instance(state_dir):
+    """Hold $STATE/run.lock for the life of the block, or raise LockError at once."""
+    path = Path(state_dir) / "run.lock"
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
+            raise LockError("another %s run holds %s (pid %s)" % (PROG, path, holder)) from None
+        os.ftruncate(fd, 0)
+        os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
+        yield path
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
+class Switchboard:
+    """observe -> derive -> decide -> deliver, for every fleet agent.
+
+    Holds no delivery state. `now` is injected so tests run a simulated clock.
+    `audit` None makes it read-only: `pending` and `status` use it that way,
+    and any write then raises instead of happening unaudited.
+    """
+
+    def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon"):
+        self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
+        self.sources, self.now, self.actor = list(sources), now, actor
+        self.batch_seconds = config["batch_seconds"]
+        self.engaged_seconds = config["engaged_minutes"] * 60
+        self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
+
+    # -- the audit
+
+    def _external(self, event, subject, detail):
+        if self.audit is None:
+            raise RuntimeError("read-only switchboard asked to write: %s %s" % (event, subject))
+        return self.audit.external(self.actor, event, subject, detail)
+
+    def _note(self, event, subject, detail):
+        """Audit a non-write event once per change, not once per pass."""
+        if self.audit is None or self._last.get((event, subject)) == detail:
+            return
+        self._last[(event, subject)] = detail
+        self.audit.append(self.actor, event, subject, detail)
+
+    # -- observe
+
+    def _messages(self, session_id):
+        page = self.v2.message_list(session_id, limit=READ_LIMIT)  # newest first (S5)
+        return page if isinstance(page, list) else []
+
+    def last_human_prompt(self, session_id, now):
+        """Your newest prompt in the engagement window: type `user` without `metadata.fleet`."""
+        start = now - self.engaged_seconds
+        for message in self._messages(session_id):
+            created = _created(message)
+            if created is not None and created < start:
+                break  # older than the window: stop reading
+            if message.get("type") == "user" and _fleet_meta(message) is None:
+                return created
+        return None
+
+    def _observe_entry(self, entry, now):
+        """An Observation for one herdr agent, or None when it is not a fleet agent."""
+        session_id = agent_session(entry)
+        if session_id is None:
+            return None
+        info = self.v2.session_get(session_id) or {}
+        fleet = _fleet_meta(info)
+        if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
+            return None
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
+                                  STATUS.get(entry.get("agent_status"), "unknown"), fleet,
+                                  _seconds(times.get("idle")), info.get("outcome"))
+        try:
+            observation.last_human_prompt = self.last_human_prompt(session_id, now)
+        except V2Error as err:
+            observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
+        return observation
+
+    def discover(self, now, entries=None):
+        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
+        found = Discovery()
+        if entries is None:
+            try:
+                entries = self.herdr.agent_list()
+            except HerdrError as err:
+                found.problems.append("herdr unreachable: %s" % err)
+                return found
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                observation = self._observe_entry(entry, now)
+            except V2Error as err:
+                if err.reason == "http" and err.status == 404:
+                    continue  # the pane names a session v2 no longer has
+                found.problems.append("v2 unreachable: %s" % err)
+                continue
+            if observation is not None:
+                found.add(observation)
+        return found
+
+    def reobserve(self, previous, now):
+        """The same agent, read again just before a write (invariant 4). (Observation, why-not)."""
+        if not previous.pane:
+            return None, "%s has no herdr pane to read again" % previous.name
+        try:
+            entry = self.herdr.agent_get(previous.pane)
+        except HerdrError as err:
+            return None, "pane %s of %s cannot be read: %s" % (previous.pane, previous.name, err)
+        if agent_session(entry) != previous.session_id:
+            return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
+        entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
+        try:
+            fresh = self._observe_entry(entry, now)
+        except V2Error as err:
+            return None, "v2 unreachable: %s" % err
+        if fresh is None or fresh.name != previous.name:
+            return None, "session %s is no longer the fleet agent %s" % (previous.session_id, previous.name)
+        fresh.conflict = list(previous.conflict)
+        return fresh, None
+
+    # -- derive
+
+    def collect_facts(self):
+        """Every fact from every source, first key wins. A failing source is audited and skipped."""
+        facts, seen, problems = [], set(), []
+        for source in self.sources:
+            name = getattr(source, "__name__", "source")
+            try:
+                found = source()
+            except Exception as err:  # one bad source must not stop the others
+                problems.append("%s: %s" % (name, _one_line(str(err))))
+                self._note("source.error", name, {"error": _one_line(str(err))})
+                continue
+            for fact in found:
+                if fact.key not in seen:
+                    seen.add(fact.key)
+                    facts.append(fact)
+        return facts, problems
+
+    def delivered_keys(self, session_id, since):
+        """Keys already in the session: its messages since `since`, read newest
+        first, plus its v2 inbox. Returns (keys, complete); not complete means
+        the read ended before reaching `since`, so a key could be missed."""
+        keys = set()
+        page = self._messages(session_id)
+        complete = len(page) < READ_LIMIT
+        for message in page:
+            created = _created(message)
+            if created is not None and created < since:
+                complete = True
+                break
+            keys.update(_fleet_keys(message))
+        inbox = self.v2.inbox_list(session_id)
+        for item in inbox if isinstance(inbox, list) else []:
+            keys.update(_fleet_keys(item))
+        return keys, complete
+
+    def plan(self, recipient, facts, discovery, now):
+        """Pending = facts minus delivered keys, then the rule. None if nothing is pending."""
+        observation = discovery.agents.get(recipient)
+        if observation is None:
+            return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
+                          discovery.missing(recipient))
+        pending = facts
+        if not fault("no-dedupe"):
+            since = min(fact.created for fact in facts) - SINCE_SLACK
+            try:
+                delivered, complete = self.delivered_keys(observation.session_id, since)
+            except V2Error as err:
+                return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
+                              "cannot read what %s already has: %s" % (recipient, err))
+            pending = [fact for fact in facts if fact.key not in delivered]
+            if pending and not complete:
+                return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
+                              "the last %d messages of %s reach back less than to %s, so what it "
+                              "already has is unknown" % (READ_LIMIT, recipient, iso(since)))
+        return decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+
+    # -- deliver
+
+    def deliver(self, plan):
+        """Write one note or wake for `plan`, after observing the agent again.
+
+        Returns {"sent": bool, ...}. When the fresh look no longer supports the
+        plan, nothing is sent; the next pass decides again.
+        """
+        if plan.action not in ("note", "wake"):
+            raise ValueError("nothing to deliver for action %r" % plan.action)
+        observation = plan.observation
+        if not fault("no-recheck"):
+            fresh, why = self.reobserve(observation, self.now())
+            again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
+                           self.engaged_seconds, why)
+            if again.action != plan.action:
+                detail = {"was": plan.action, "now": again.action, "reason": again.reason,
+                          "keys": [fact.key for fact in plan.pending]}
+                if self.audit is not None:
+                    self.audit.append(self.actor, "recheck", plan.recipient, detail)
+                return {"sent": False, "action": again.action, "reason": again.reason}
+            observation = fresh
+        text, carried = compose(plan.recipient, plan.pending)
+        keys = [fact.key for fact in carried]
+        # The id lives in v2's namespace, so it is derived from the session the
+        # recipient runs now: a relaunched agent is a new recipient for v2.
+        message_id = derive_message_id(observation.session_id, keys)
+        resume = plan.action == "wake"
+        delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
+        detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
+                  "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        with self._external("v2.synthetic", plan.recipient, detail) as result:
+            record = self.v2.synthetic(observation.session_id, text,
+                                       {"fleet": {"keys": keys, "from": "switchboard"}},
+                                       resume, delivery, message_id)
+            if fault("crash-after-send"):
+                raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
+                                     % message_id)
+            result["id"] = record.get("id") if isinstance(record, dict) else None
+        return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
+                "left": len(plan.pending) - len(keys)}
+
+    def convert_lapsed_notes(self, observation, now):
+        """A note still in v2's inbox once you have not prompted for the
+        engagement window becomes a wake: `inbox.update` to queue, then to
+        steer (v2 refuses steer to steer). Only on an idle agent. Returns the
+        converted inbox ids."""
+        if hold_reason(observation) or observation.status != "idle":
+            return []
+        if observation.engaged(now, self.engaged_seconds):
+            return []
+        inbox = self.v2.inbox_list(observation.session_id)
+        notes = [item for item in (inbox if isinstance(inbox, list) else [])
+                 if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
+                 and item.get("delivery") == "steer" and item.get("resume") is not True]
+        converted = []
+        for item in notes:
+            if not fault("no-recheck"):
+                fresh, why = self.reobserve(observation, self.now())
+                if fresh is None or hold_reason(fresh) or fresh.status != "idle" \
+                        or fresh.engaged(self.now(), self.engaged_seconds):
+                    if self.audit is not None:
+                        self.audit.append(self.actor, "recheck", observation.name, {
+                            "was": "convert", "now": "keep", "inbox_id": item.get("id"),
+                            "reason": why or hold_reason(fresh) or "%s is %s or engaged" % (
+                                observation.name, fresh.status)})
+                    break
+            for delivery in ("queue", "steer"):
+                with self._external("v2.inbox.update", observation.name, {
+                        "session": observation.session_id, "inbox_id": item.get("id"),
+                        "delivery": delivery, "keys": _fleet_keys(item), "why": "note outlived engagement"}) as result:
+                    record = self.v2.inbox_update(observation.session_id, item.get("id"), delivery)
+                    result["delivery"] = record.get("delivery") if isinstance(record, dict) else None
+            converted.append(item.get("id"))
+        return converted
+
+    # -- the pass
+
+    def _failed(self, subject, step, err, report):
+        line = "%s: %s" % (type(err).__name__, _one_line(str(err)))
+        report["errors"].append({"subject": subject, "step": step, "error": line})
+        if self.audit is not None:
+            self.audit.append(self.actor, "error", subject, {"step": step, "error": line})
+
+    def run_pass(self):
+        """One pass. One agent's failure is audited and never stops the others."""
+        now = self.now()
+        report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": []}
+        discovery = self.discover(now)
+        for problem in discovery.problems:
+            self._note("observe.problem", None, {"problem": problem})
+        for observation in list(discovery.agents.values()):
+            try:
+                report["converted"].extend(self.convert_lapsed_notes(observation, now))
+            except Exception as err:
+                self._failed(observation.name, "convert", err, report)
+        facts, _ = self.collect_facts()
+        by_recipient = {}
+        for fact in facts:
+            by_recipient.setdefault(fact.recipient, []).append(fact)
+        for recipient in sorted(by_recipient):
+            try:
+                plan = self.plan(recipient, by_recipient[recipient], discovery, now)
+                if plan is None:
+                    continue
+                if plan.action == "wait":
+                    report["waiting"].append(recipient)
+                elif plan.action == "hold":
+                    report["held"].append({"recipient": recipient, "reason": plan.reason})
+                    self._note("hold", recipient, {"reason": plan.reason,
+                                                   "keys": [fact.key for fact in plan.pending]})
+                else:
+                    outcome = self.deliver(plan)
+                    if outcome["sent"]:
+                        report["sent"].append(dict(outcome, recipient=recipient))
+            except Exception as err:
+                self._failed(recipient, "deliver", err, report)
+        return report
+
+    # -- the CLI's entry points
+
+    def send(self, sender, recipient, text, issue=None):
+        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing."""
+        now = self.now()
+        fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
+                    issue=issue, batch=False, sender=sender)
+        plan = self.plan(recipient, [fact], self.discover(now), now)
+        if plan.action == "hold":
+            if self.audit is not None:
+                self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+            return {"sent": False, "action": "hold", "reason": plan.reason}
+        return self.deliver(plan)
+
+    def pending(self, name, discovery=None, facts=None):
+        """Read-only: what is pending for `name`, and what the rule says about it."""
+        now = self.now()
+        discovery = discovery or self.discover(now)
+        problems = []
+        if facts is None:
+            facts, problems = self.collect_facts()
+        mine = [fact for fact in facts if fact.recipient == name]
+        plan = self.plan(name, mine, discovery, now) if mine else None
+        observation = discovery.agents.get(name)
+        return {"name": name, "observation": observation.to_json() if observation else None,
+                "missing": None if observation else discovery.missing(name),
+                "plan": plan.to_json() if plan else None, "source_problems": problems}
+
+
+def run_daemon(engine, state_dir, poll, sleep=time.sleep, passes=None):
+    """`run`: a pass every `poll` seconds under the single-instance lock.
+
+    A pass that raises is audited and the loop goes on; only a SimulatedCrash
+    (or a signal) ends it. `passes` bounds the loop, for `--once` and tests.
+    """
+    with single_instance(state_dir):
+        done = 0
+        while True:
+            try:
+                engine.run_pass()
+            except Exception as err:
+                engine._failed(None, "pass", err, {"errors": []})
+            done += 1
+            if passes is not None and done >= passes:
+                return done
+            sleep(poll)
+
+
 # --------------------------------------------------------------------- the CLI
 
 def _check(probe):
@@ -491,7 +1171,7 @@ def _v2_summary(info):
     return "server.info answered%s" % (", version %s" % version if version else "")
 
 
-def collect_status(runner=subprocess.run):
+def collect_status(runner=subprocess.run, now=time.time):
     report = {"version": VERSION}
     path = config_path()
     config_ok, config = _check(lambda: load_config(path))
@@ -504,6 +1184,7 @@ def collect_status(runner=subprocess.run):
             "batch_seconds": config["batch_seconds"],
             "engaged_minutes": config["engaged_minutes"],
             "call_timeout_seconds": config["call_timeout_seconds"],
+            "poll_seconds": config["poll_seconds"],
         })
     else:
         report["config"]["error"] = config
@@ -520,22 +1201,55 @@ def collect_status(runner=subprocess.run):
     else:
         report["lab"]["error"] = faults
 
+    agents = {"ok": False, "error": "not checked: v2 and herdr must both answer"}
     if config_ok:
         herdr = HerdrClient(config["herdr"], runner)
+        v2 = None
         if config["opencode"] is None:
             v2_ok, v2_line = False, ("not configured: set 'opencode' in %s to the absolute path of "
                                      "the OpenCode v2 binary" % config_path())
         else:
             v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
             v2_ok, v2_line = _check(lambda: _v2_summary(v2.server_info()))
-        herdr_ok, herdr_line = _check(lambda: "%d agent(s)" % len(herdr.agent_list()))
+        herdr_ok, entries = _check(herdr.agent_list)
+        herdr_line = "%d agent(s)" % len(entries) if herdr_ok else entries
+        if v2_ok and herdr_ok and state_ok and faults_ok:
+            engine = Switchboard(config, v2, herdr, None, fact_sources(state), now)
+            agents_ok, overview = _check(lambda: fleet_overview(engine, entries))
+            agents = overview if agents_ok else {"ok": False, "error": overview}
     else:
         v2_ok, v2_line = False, "not checked: config unusable"
         herdr_ok, herdr_line = False, "not checked: config unusable"
     report["v2"] = {"ok": v2_ok, ("detail" if v2_ok else "error"): v2_line}
     report["herdr"] = {"ok": herdr_ok, ("detail" if herdr_ok else "error"): herdr_line}
+    report["agents"] = agents  # informational: an agent's trouble is not the switchboard's
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
     return report
+
+
+def fleet_overview(engine, entries):
+    """Read-only: every fleet agent and every fact recipient, with the rule's answer for each."""
+    discovery = engine.discover(engine.now(), entries)
+    facts, problems = engine.collect_facts()
+    names = sorted(set(discovery.agents) | {fact.recipient for fact in facts})
+    return {"ok": True, "problems": discovery.problems + problems,
+            "list": [engine.pending(name, discovery, facts) for name in names]}
+
+
+def _plan_line(entry):
+    plan = entry["plan"]
+    if plan is None:
+        return "nothing pending"
+    return "%d pending: %s (%s)" % (len(plan["pending"]), plan["action"], plan["reason"])
+
+
+def _agent_line(entry):
+    seen = entry["observation"]
+    if seen is None:
+        return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
+    return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
+        seen["name"], seen["status"], seen["session"], seen["pane"] or "-",
+        seen["last_human_prompt"] or "not in the window", _plan_line(entry))
 
 
 def format_status(report):
@@ -550,8 +1264,9 @@ def format_status(report):
         lines.append("      opencode   %s  env: %s" % (config["opencode"] or "(not configured)",
                                                        ", ".join(config["opencode_env"]) or "none"))
         lines.append("      herdr      %s" % config["herdr"])
-        lines.append("      timing     batch %ss, engaged %s min, call timeout %ss"
-                     % (config["batch_seconds"], config["engaged_minutes"], config["call_timeout_seconds"]))
+        lines.append("      timing     batch %ss, engaged %s min, call timeout %ss, poll %ss"
+                     % (config["batch_seconds"], config["engaged_minutes"], config["call_timeout_seconds"],
+                        config["poll_seconds"]))
     else:
         lines.append("%s config     %s" % (mark(config), config["error"]))
     state = report["state_dir"]
@@ -567,16 +1282,116 @@ def format_status(report):
     for name in ("v2", "herdr"):
         part = report[name]
         lines.append("%s %-10s %s" % (mark(part), name, part["detail"] if part["ok"] else part["error"]))
+    agents = report["agents"]
+    if agents["ok"]:
+        listed = [entry for entry in agents["list"] if entry["observation"]]
+        lines.append("      agents     %d fleet agent(s)" % len(listed))
+        lines.extend("        " + _agent_line(entry) for entry in agents["list"])
+        lines.extend("        problem: %s" % problem for problem in agents["problems"])
+    else:
+        lines.append("      agents     %s" % agents["error"])
     return "\n".join(lines)
 
 
-def cmd_status(args, runner=subprocess.run):
-    report = collect_status(runner)
+def cmd_status(args, runner=subprocess.run, now=time.time):
+    report = collect_status(runner, now)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
     return EXIT_OK if report["ok"] else EXIT_ERROR
+
+
+class CallerError(Exception):
+    """`send` cannot tell which fleet agent is calling."""
+
+
+def identify_caller(herdr, v2, environ):
+    """The caller's fleet name: HERDR_PANE_ID -> herdr agent -> v2 session -> metadata.fleet.name."""
+    pane = environ.get("HERDR_PANE_ID")
+    if not pane:
+        raise CallerError("HERDR_PANE_ID is not set: run send from a fleet agent's herdr pane")
+    session_id = agent_session(herdr.agent_get(pane))
+    if not session_id:
+        raise CallerError("herdr pane %s shows no agent session" % pane)
+    name = (_fleet_meta(v2.session_get(session_id)) or {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise CallerError("session %s in pane %s is not a fleet agent (no metadata.fleet.name)" % (session_id, pane))
+    return name
+
+
+def build_engine(runner, now, actor, writable=True):
+    """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
+    config = load_config()
+    if config["opencode"] is None:
+        raise ConfigError("'opencode' is not configured in %s: set it to the absolute path of the "
+                          "OpenCode v2 binary" % config_path())
+    active_faults()
+    state = ensure_state_dir()
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+    herdr = HerdrClient(config["herdr"], runner)
+    audit = AuditLog(state / "audit.jsonl") if writable else None
+    return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor), state, config
+
+
+def cmd_run(args, runner, now, sleep):
+    engine, state, config = build_engine(runner, now, "daemon")
+    if args.once:
+        with single_instance(state):
+            report = engine.run_pass()
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print("pass at %s: %d sent, %d held, %d waiting, %d converted, %d error(s)" % (
+                report["at"], len(report["sent"]), len(report["held"]), len(report["waiting"]),
+                len(report["converted"]), len(report["errors"])))
+        return EXIT_OK if not report["errors"] else EXIT_ERROR
+    try:
+        run_daemon(engine, state, args.poll or config["poll_seconds"], sleep)
+    except KeyboardInterrupt:
+        return EXIT_OK
+    return EXIT_OK
+
+
+def cmd_send(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli")
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
+                             % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.stderr.write("%s: nothing to send\n" % PROG)
+        return EXIT_USAGE
+    outcome = engine.send(sender, args.name, text, args.issue)
+    if not outcome["sent"]:
+        sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
+        return EXIT_HELD
+    print(outcome["message_id"])
+    sys.stderr.write("%s: %s delivered to %s\n" % (PROG, outcome["action"], args.name))
+    return EXIT_OK
+
+
+def cmd_pending(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    entry = engine.pending(args.name)
+    if args.json:
+        print(json.dumps(entry, indent=2, sort_keys=True))
+        return EXIT_OK
+    print(_agent_line(entry))
+    if entry["missing"]:
+        print("  %s" % entry["missing"])
+    for fact in (entry["plan"] or {}).get("pending", []):
+        where = " issue #%d" % fact["issue"] if fact["issue"] else ""
+        print("  - %s  %s from %s%s at %s: %s" % (fact["key"], fact["kind"], fact["from"] or "the fleet", where,
+                                                 iso(fact["created"]), _one_line(fact["summary"], 200)))
+    for problem in entry["source_problems"]:
+        print("  problem: %s" % problem)
+    return EXIT_OK
 
 
 def build_parser():
@@ -586,13 +1401,25 @@ def build_parser():
         epilog="Config: $XDG_CONFIG_HOME/%s/config.json (optional). "
                "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
     sub = parser.add_subparsers(dest="action", required=True)
-    status = sub.add_parser("status", help="Config, state directory, and whether v2 and herdr answer")
+    status = sub.add_parser("status", help="Config, clients, and every fleet agent with what is pending for it")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    run = sub.add_parser("run", help="The daemon: observe, derive, decide, deliver, every poll seconds")
+    run.add_argument("--once", action="store_true", help="One pass, then exit")
+    run.add_argument("--poll", type=float, help="Seconds between passes (default: config poll_seconds)")
+    run.add_argument("--json", action="store_true", help="With --once: print the pass report as JSON")
+    send = sub.add_parser("send", help="Deliver a message to another fleet agent now, by the delivery rule")
+    send.add_argument("name", help="The recipient's fleet name")
+    send.add_argument("text", nargs="+", help="The message")
+    send.add_argument("--issue", type=int, help="The issue the message is about")
+    send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
+    pending.add_argument("name", help="The agent's fleet name")
+    pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     sub.add_parser("version", help="Print the version")
     return parser
 
 
-def main(argv=None, runner=subprocess.run):
+def main(argv=None, runner=subprocess.run, now=time.time, sleep=time.sleep):
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exit_:
@@ -601,7 +1428,20 @@ def main(argv=None, runner=subprocess.run):
         print("%s %s" % (PROG, VERSION))
         return EXIT_OK
     if args.action == "status":
-        return cmd_status(args, runner)
+        return cmd_status(args, runner, now)
+    try:
+        if args.action == "run":
+            return cmd_run(args, runner, now, sleep)
+        if args.action == "send":
+            return cmd_send(args, runner, now)
+        if args.action == "pending":
+            return cmd_pending(args, runner, now)
+    except SimulatedCrash as crash:
+        sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
+        return EXIT_CRASH
+    except (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError) as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
+        return EXIT_ERROR
     sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))
     return EXIT_USAGE
 
