@@ -159,7 +159,8 @@ class TestConfig(Base):
             "worker_lookback_hours": 24,
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                              "check_suite", "workflow_run"]})
+                              "check_suite", "workflow_run"],
+            "intent_repo": None, "intent_required": True})
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -1013,6 +1014,8 @@ EXPECT_EXAMPLES = {
     "metadata_roundtrip": {"agent": "coder", "of": "message", "text": "status?", "fleet": None},
     "pane_runs_v2": {"agent": "coder"},
     "no_typing": {"agent": "coder"},
+    "message_shows": {"to": "platform", "text": "no intent recorded"},  # PR 6
+    "intent_gap": {"issue": 2},
 }
 
 
@@ -1863,7 +1866,8 @@ class World:
         return sb.Switchboard(self.config, sb.V2Client(FAKE_OPENCODE, {}, self.v2, 5),
                               sb.HerdrClient(FAKE_HERDR, self.herdr, socket_call=self.herdr.socket),
                               sb.AuditLog(self.audit_path) if writable else None,
-                              sb.fact_sources(self.state), self.clock.now, actor)
+                              sb.fact_sources(self.state), self.clock.now, actor,
+                              intents=getattr(self, "intents", None))
 
     def route(self, argv, **kwargs):
         """One runner for the CLI: each fake answers its own binary; nothing else runs."""
@@ -3512,6 +3516,7 @@ class OfflineRun:
         for name, member in sorted(scenario["cast"].items()):
             if name not in launched:  # a launched agent does not exist until `launch` makes it
                 self.world.add_agent(name, fleet=self.fleet_of(member))
+        attach_intent_lab(self)  # PR 6: a fake GitHub when the scenario has issues
         self.world.engine = self.world.new_engine()
         self.daemon = True
         self.crashed_writes = set()
@@ -3561,6 +3566,8 @@ class OfflineRun:
             world.engine = world.new_engine()  # a new process: nothing in memory survives
         elif do in WORKER_STEPS:
             apply_worker_step(self, step)
+        elif do == "edit-intent":
+            apply_edit_intent(self, step)
         elif do != "wait":
             raise NotImplementedError("the offline runner does not implement step %r" % do)
 
@@ -3788,7 +3795,7 @@ class TestOfflineScenarios(Base):
 
     def test_an_unknown_step_or_oracle_is_refused_not_skipped(self):
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
-        b1["steps"].append({"at": "6m", "actor": "world", "do": "edit-intent"})
+        b1["steps"].append({"at": "6m", "actor": "world", "do": "no-such-step"})
         with self.assertRaises(NotImplementedError):
             run_scenario(self, b1)
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
@@ -5272,8 +5279,7 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("run: bin/fleet-scenario validate", workflow)
 
 
-# ======================================================================
-# PR 4: worker events, reminders, toasts and their scenarios
+# ===============================================================# PR 4: worker events, reminders, toasts and their scenarios
 #
 # Everything below extends the fakes and the offline scenario runner by
 # attachment (`adds_to`), so the shared classes above stay as they were.
@@ -5394,7 +5400,7 @@ def _toasts(world):
 @adds_to(OfflineRun)
 def oracle_toast(self, e):
     shown = [t for t in _toasts(self.world)
-             if e.get("agent", "") in t["title"] + " " + t["body"] and e.get("text", "") in t["body"]]
+             if e.get("agent", "") in t["title"] + " " + t["body"] and e.get("text", "") in t["title"] + " " + t["body"]]
     return bool(shown), "%d matching toast(s) of %d: %s" % (
         len(shown), len(_toasts(self.world)), [t["title"] for t in shown][:3])
 
@@ -6263,6 +6269,649 @@ class TestLabHerdrShim(Base):
         self.run_shim("agent", "get", "w1:p2")
         self.assertEqual(self.calls(), ["agent get w1:p2"])
 
+# =========================================================== PR 6: intent lines
+#
+# One section: a fake GitHub, the offline runner's intent steps and oracles,
+# and the tests. Nothing here reaches a real gh, herdr or OpenCode: every
+# transport is a fake, and the base class's PATH holds none of them.
+
+import datetime  # noqa: E402  (this section's only import)
+
+FAKE_GH = "/fake/bin/gh"
+FAKE_REPO = "acme/fleet"
+ISSUES_API = "repos/%s/issues/" % FAKE_REPO
+
+
+def _utc(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def intent_body(intent, done_when, revision=0):
+    """An issue body: an `## Intent` section when either line is given."""
+    parts = ["Some text before.\n"]
+    if intent is not None or done_when is not None:
+        parts.append("## Intent\n")
+        if intent is not None:
+            parts.append(intent + "\n")
+        if done_when is not None:
+            parts.append("Done when: %s\n" % done_when)
+    if revision:
+        parts.append("\n## Notes\nrevision %d\n" % revision)
+    return "".join(parts)
+
+
+class FakeGH:
+    """`gh api` over a scenario's issues. A runner, like the other fakes.
+
+    Serves GET only, by path: an issue, its parent (404 without one) and a
+    charter's sub-issues. Any other shape of call raises, so a write cannot
+    pass for a read. `issues` is a scenario's table: number -> intent,
+    done_when, parent. A charter's body is its yaml block.
+    """
+
+    def __init__(self, issues, charters, clock):
+        self.issues = {int(n): dict(v) for n, v in issues.items()}
+        self.charters, self.clock = set(charters), clock
+        self.revision, self.updated = {}, {}
+        self.calls, self.down = [], False
+
+    def body(self, number):
+        if number in self.charters:
+            return "```yaml\norchestrator: platform\nstatus: active\n```\n\nThe charter.\n"
+        issue = self.issues[number]
+        return intent_body(issue.get("intent"), issue.get("done_when"), self.revision.get(number, 0))
+
+    def record(self, number):
+        return {"number": number, "state": self.issues[number].get("state", "open"),
+                "title": "Issue %d" % number, "body": self.body(number),
+                "updated_at": self.updated.get(number, "2027-01-01T00:00:00Z")}
+
+    def edit(self, number, **fields):
+        """Edit the intent fields (None removes a line); the body always changes. (old, new) bodies."""
+        old = self.body(number)
+        self.issues[number].update(fields)
+        self.revision[number] = self.revision.get(number, 0) + 1
+        self.updated[number] = _utc(self.clock.now())
+        return old, self.body(number)
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+        if len(argv) != 3 or argv[:2] != [FAKE_GH, "api"]:
+            raise AssertionError("fake gh serves `gh api <path>` only, a GET; got %r" % argv)
+        if self.down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
+        match = re.match(r"^%s(\d+)(/parent|/sub_issues\?per_page=100)?$" % re.escape(ISSUES_API), argv[2])
+        if not match or int(match.group(1)) not in self.issues:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        number, tail = int(match.group(1)), match.group(2)
+        if tail == "/parent":
+            parent = self.issues[number].get("parent")
+            body = self.record(parent) if parent in self.issues else None
+        elif tail:
+            body = [self.record(n) for n in sorted(self.issues) if self.issues[n].get("parent") == number]
+        else:
+            body = self.record(number)
+        if body is None:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+
+def attach_intent_lab(run):
+    """The offline runner's seam: a scenario with `issues` gets a fake GitHub and a reader over it."""
+    run.ask_gh = None
+    if "issues" not in run.scenario:
+        return
+    charters = {m["charter"] for m in run.scenario["cast"].values() if "charter" in m}
+    run.ask_gh = FakeGH(run.scenario["issues"], charters, run.world.clock)
+    run.world.intents = sb.IntentReader(FAKE_GH, FAKE_REPO, run.ask_gh, run.world.clock.now, 5)
+
+
+def apply_edit_intent(run, step):
+    """`edit-intent`: edit the fake issue, then do what PR 5's webhook handler
+    will do: invalidate the cache, and turn the event into an item for the
+    Chief of Staff and a toast for you, with the pure functions under test."""
+    world = run.world
+    fields = {name: step[name] for name in ("intent", "done_when") if name in step}
+    old, new = run.ask_gh.edit(step["issue"], **fields)
+    world.intents.invalidate(step["issue"])
+    payload = {"action": "edited", "changes": {"body": {"from": old}}, "sender": {"login": "you"},
+               "issue": {"number": step["issue"], "body": new, "updated_at": run.ask_gh.updated[step["issue"]]}}
+    cos = next(name for name, member in sorted(run.scenario["cast"].items()) if member["role"] == "chief-of-staff")
+    change = sb.intent_change_fact(payload, cos)
+    if change is not None:
+        with open(str(world.state / sb.LAB_FACTS), "a") as handle:
+            handle.write(json.dumps(change.to_json()) + "\n")
+    toast = sb.intent_change_toast(payload)
+    if toast is not None:
+        with world.engine.audit.external("daemon", "herdr.notification", "you", toast):
+            world.engine.herdr.notification_show(toast["title"], toast["body"])
+
+
+def _delivered_texts(run, name):
+    return [a["text"] for a in run.world.admissions(name) if a["delivered_at"] is not None]
+
+
+def _ask_of(issues, number):
+    parent = (issues.get(str(number)) or {}).get("parent")
+    if parent and (issues.get(str(parent)) or {}).get("parent"):
+        return parent, number
+    return number, None
+
+
+def _oracle_message_has_intent(self, e):
+    issues = self.scenario["issues"]
+    ask, work = _ask_of(issues, e["issue"])
+    need = [issues[str(ask)]["intent"] or "no intent recorded"]
+    if issues[str(ask)].get("done_when"):
+        need.append("Done when: %s" % issues[str(ask)]["done_when"])
+    if work:
+        need.append(issues[str(work)]["intent"] or "no intent recorded")
+    texts = _delivered_texts(self, e["to"])
+    ok = any(all(part in text for part in need) for text in texts)
+    return ok, "%d delivered message(s); one must carry %r" % (len(texts), need)
+
+
+def _oracle_message_shows(self, e):
+    texts = _delivered_texts(self, e["to"])
+    return any(e["text"] in text for text in texts), "%d delivered message(s) to %s" % (len(texts), e["to"])
+
+
+def _oracle_intent_gap(self, e):
+    gaps = sb.fleet_overview(self.world.engine, None).get("intent_gaps", [])
+    return e["issue"] in gaps, "status lists %s as lacking an Intent section" % (gaps,)
+
+
+def _oracle_judged(self, e):
+    return True, "not evaluated offline: a model's text is judged only in the lab-model tier"
+
+
+for _oracle in (_oracle_message_has_intent, _oracle_message_shows, _oracle_intent_gap, _oracle_judged):
+    setattr(OfflineRun, _oracle.__name__[1:], _oracle)
+
+
+# ------------------------------------------------------------------ the tests
+
+CHARTER_BODY = "```yaml\norchestrator: platform\nstatus: active\n```\n"
+
+
+class TestIntentParsing(unittest.TestCase):
+    def test_the_first_line_is_the_intent_and_done_when_is_its_own_line(self):
+        body = "Intro\n\n## Intent\nFix the agents.\nDone when: both answer.\n\n## Notes\nx\n"
+        self.assertEqual(sb.parse_intent(body), ("Fix the agents.", "both answer."))
+
+    def test_missing_parts_are_none(self):
+        self.assertEqual(sb.parse_intent("no section at all"), (None, None))
+        self.assertEqual(sb.parse_intent("## Intent\nJust this\n"), ("Just this", None))
+        self.assertEqual(sb.parse_intent("## Intent\nDone when: later\n"), (None, "later"))
+        self.assertEqual(sb.parse_intent("## Intent\n\n## Next\nDone when: not mine\n"), (None, None))
+        self.assertEqual(sb.parse_intent(None), (None, None))
+
+    def test_tolerates_crlf_heading_levels_case_and_bullets(self):
+        body = "### intent  \r\n- Make it work\r\n- **Done when:** it works\r\n"
+        self.assertEqual(sb.parse_intent(body), ("- Make it work", "it works"))
+
+    def test_the_section_ends_at_the_next_heading_and_fences_are_ignored(self):
+        body = "```\n## Intent\nnot this\n```\n## Intent\nthis\n```\n## Other\n```\nDone when: x\n## After\nno\n"
+        self.assertEqual(sb.parse_intent(body), ("this", "x"))
+
+
+class IntentCase(Base):
+    """A world with a fake GitHub: charter 1, ask 2 under it, work item 3 under the ask."""
+
+    ISSUES = {
+        "1": {"intent": None},
+        "2": {"intent": "Fix the agents", "done_when": "both answer", "parent": 1},
+        "3": {"intent": "Fix the second one", "parent": 2},
+        "4": {"intent": None, "parent": 1},
+        "5": {"intent": "Another ask", "done_when": "it is done", "parent": 1},
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.config = {"gh": FAKE_GH, "intent_repo": FAKE_REPO}
+        self.world = World(self, agents=("platform", "coder"), config=self.config)
+        self.gh = FakeGH(self.ISSUES, {1}, self.world.clock)
+        self.reader = sb.IntentReader(FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5)
+        self.world.intents = self.reader
+        self.world.engine = self.world.new_engine()
+
+    def tick(self, seconds):
+        self.world.tick(seconds)
+
+
+class TestIntentReader(IntentCase):
+    def test_reads_the_intent_lines_of_an_issue(self):
+        issue = self.reader.issue(2)
+        self.assertEqual((issue.intent, issue.done_when, issue.charter), ("Fix the agents", "both answer", False))
+        self.assertTrue(self.reader.issue(1).charter)
+
+    def test_a_work_item_resolves_to_its_ask_and_the_charter_is_never_repeated(self):
+        self.assertEqual(self.reader.ask_of(3), (2, 3))
+        self.assertEqual(self.reader.ask_of(2), (2, None))
+        ask, ask_lines, work, work_lines = self.reader.header(3)
+        self.assertEqual((ask, work), (2, 3))
+        self.assertEqual(ask_lines, ["Ask #2 Intent: Fix the agents", "Done when: both answer"])
+        self.assertEqual(work_lines, ["Work item #3 Intent: Fix the second one"])
+        self.assertIsNone(self.reader.header(1))
+
+    def test_missing_intent_renders_as_such(self):
+        self.assertEqual(self.reader.header(4)[1], ["Ask #4: no intent recorded"])
+        self.gh.issues[2]["done_when"] = None
+        self.reader.invalidate(2)
+        self.assertEqual(self.reader.header(2)[1], ["Ask #2 Intent: Fix the agents", "Done when: not recorded"])
+
+    def test_the_cache_serves_until_invalidated_or_expired(self):
+        self.reader.issue(2)
+        calls = len(self.gh.calls)
+        self.gh.edit(2, intent="Changed")
+        self.assertEqual(self.reader.issue(2).intent, "Fix the agents")
+        self.assertEqual(len(self.gh.calls), calls)
+        self.reader.invalidate(2)
+        self.assertEqual(self.reader.issue(2).intent, "Changed")
+        self.assertEqual(self.reader.issue(2).updated_at, self.gh.updated[2])
+        self.world.clock.t += sb.INTENT_TTL + 1
+        self.gh.edit(2, intent="Again")
+        self.assertEqual(self.reader.issue(2).intent, "Again")
+
+    def test_a_failed_read_is_not_cached(self):
+        self.gh.down = True
+        with self.assertRaises(sb.IntentError):
+            self.reader.issue(2)
+        self.gh.down = False
+        self.assertEqual(self.reader.issue(2).intent, "Fix the agents")
+
+    def test_it_only_ever_issues_plain_gets(self):
+        self.reader.header(3)
+        self.reader.open_asks(1)
+        for argv in self.gh.calls:
+            self.assertEqual(argv[:2], [FAKE_GH, "api"])
+            self.assertEqual(len(argv), 3, argv)  # no -X, -f, -F, --input or --method
+        self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
+
+    def test_open_asks_are_the_open_sub_issues_of_a_charter(self):
+        self.gh.issues[5]["state"] = "closed"
+        self.assertEqual([i.number for i in self.reader.open_asks(1)], [2, 4])
+
+    def test_missing_intent_lists_the_chain_without_the_charter(self):
+        self.assertEqual(self.reader.missing_intent(4), [4])
+        self.assertEqual(self.reader.missing_intent(3), [])
+        self.assertEqual(self.reader.missing_intent(1), [])
+
+    def test_invalid_config_is_refused(self):
+        for raw in ({"intent_repo": "not a repo"}, {"intent_repo": 7}, {"intent_required": "yes"}, {"gh": ""}):
+            with self.subTest(raw=raw), self.assertRaises(sb.ConfigError):
+                sb.validate_config(raw)
+        self.assertEqual(sb.validate_config({"intent_repo": "a/b"})["intent_required"], True)
+
+
+class TestIntentCompose(IntentCase):
+    def section(self):
+        return sb.section_resolver(self.world.engine, None)
+
+    def compose(self, facts):
+        return sb.compose("platform", facts, section=self.section())
+
+    def test_an_item_about_a_work_item_sits_under_its_ask(self):
+        text, _ = self.compose([fact("a", issue=3, sender="coder", summary="PR up")])
+        self.assertEqual(text.splitlines()[1:], [
+            "", "Ask #2 Intent: Fix the agents", "Done when: both answer",
+            "Work item #3 Intent: Fix the second one", "- lab.fact from coder (issue #3): PR up"])
+
+    def test_several_asks_get_one_section_each_never_interleaved(self):
+        text, _ = self.compose([
+            fact("a", EPOCH, issue=2), fact("b", EPOCH + 1, issue=5), fact("c", EPOCH + 2, issue=2),
+            fact("d", EPOCH + 3, issue=3)])
+        lines = text.splitlines()
+        heads = [i for i, line in enumerate(lines) if line.startswith("Ask #")]
+        self.assertEqual([lines[i][:6] for i in heads], ["Ask #2", "Ask #5"])
+        ask2, ask5 = lines[heads[0]:heads[1]], lines[heads[1]:]
+        self.assertEqual(sum("(issue #" in line for line in ask2), 3)
+        self.assertEqual(sum("(issue #" in line for line in ask5), 1)
+        self.assertTrue(all("issue #5" not in line for line in ask2))
+        self.assertLessEqual(len([line for line in ask2 if line and not line.startswith("- ")]), 4)
+
+    def test_facts_without_an_issue_get_no_header_and_come_first(self):
+        text, _ = self.compose([fact("a", EPOCH + 1, issue=2), fact("b", EPOCH)])
+        lines = text.splitlines()
+        self.assertEqual(lines[1], "- lab.fact from the fleet: s b")
+        self.assertEqual(sum(line.startswith("Ask #") for line in lines), 1)
+
+    def test_the_charter_is_never_repeated(self):
+        text, _ = self.compose([fact("a", issue=1)])
+        self.assertNotIn("Ask #", text)
+        self.assertIn("(issue #1)", text)
+
+    def test_missing_intent_says_so(self):
+        text, _ = self.compose([fact("a", issue=4)])
+        self.assertIn("Ask #4: no intent recorded", text)
+
+    def test_an_unreachable_github_does_not_stop_the_message(self):
+        self.gh.down = True
+        text, carried = self.compose([fact("a", issue=2)])
+        self.assertIn("Ask #2: intent unavailable", text)
+        self.assertEqual(len(carried), 1)
+
+    def test_no_intent_header_fault_omits_headers(self):
+        os.environ[sb.FAULT_ENV] = "no-intent-header"
+        self.assertIsNone(self.section())
+        text, _ = sb.compose("platform", [fact("a", issue=2)], section=self.section())
+        self.assertNotIn("Ask #", text)
+
+    def test_the_fault_only_works_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "no-intent-header"
+        os.environ.pop(sb.LAB_ENV)
+        self.assertIsNotNone(self.section())
+
+    def test_the_engine_delivers_with_the_headers(self):
+        self.world.fact("platform", "lab.fact:1", "hello", issue=3, **{"from": "coder"})
+        self.tick(90)
+        self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("Ask #2 Intent: Fix the agents", admitted["text"])
+
+    def test_without_an_ask_repo_nothing_changes(self):
+        world = World(self)
+        self.assertIsNone(world.engine.intents)
+        self.assertIsNone(sb.section_resolver(world.engine, None))
+
+
+class TestIntentSend(IntentCase):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+
+    def route(self, argv, **kwargs):
+        return self.gh(argv) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.route, now=self.world.clock.now, wait=lambda sock, s: False)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_send_refuses_without_an_issue_and_writes_nothing(self):
+        code, _, err = self.main("send", "platform", "--from", "coder", "hi")
+        self.assertEqual(code, sb.EXIT_USAGE)
+        self.assertIn("send needs --issue", err)
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_send_with_an_issue_delivers_under_its_ask(self):
+        os.environ[sb.LAB_ENV] = "1"
+        code, _, err = self.main("send", "platform", "--from", "coder", "--issue", "3", "PR", "is", "up")
+        self.assertEqual(code, 0, err)
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("Ask #2 Intent: Fix the agents\nDone when: both answer\nWork item #3", admitted["text"])
+
+    def test_intent_required_false_turns_the_refusal_off(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH,
+                           "intent_repo": FAKE_REPO, "intent_required": False})
+        self.assertEqual(self.main("send", "platform", "--from", "coder", "hi")[0], 0)
+
+    def test_without_an_ask_repo_send_needs_no_issue(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertEqual(self.main("send", "platform", "--from", "coder", "hi")[0], 0)
+
+    def test_the_refusal_is_the_safeguard(self):
+        with mock.patch.object(sb, "intent_refusal", lambda config, issue: None):
+            self.assertEqual(self.main("send", "platform", "--from", "coder", "hi")[0], 0)
+
+
+class TestIntentCLI(IntentCase):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.cos = self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("platform2", fleet={"role": "orchestrator", "charter": 1})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 3})
+
+    def main(self, *argv):
+        def route(argv, **kwargs):
+            return self.gh(argv) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def test_intent_prints_the_ask_and_the_work_item(self):
+        code, out, _ = self.main("intent", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), ["Ask #2 Intent: Fix the agents", "Done when: both answer",
+                                            "Work item #3 Intent: Fix the second one"])
+        self.assertIn("is a charter", self.main("intent", "1")[1])
+        self.assertIn("no intent recorded", self.main("intent", "4")[1])
+
+    def test_intent_without_an_ask_repo_says_what_to_set(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        code, _, err = self.main("intent", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("intent_repo", err)
+
+    def test_an_orchestrator_sees_the_asks_under_its_charter(self):
+        self.as_agent("orch")
+        code, out, _ = self.main("intents")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), [
+            "#2  [orch]  Fix the agents  | Done when: both answer",
+            "#4  [orch]  no intent recorded  | Done when: not recorded",
+            "#5  [orch]  Another ask  | Done when: it is done"])
+
+    def test_closed_asks_are_left_out(self):
+        self.gh.issues[2]["state"] = "closed"
+        self.as_agent("orch")
+        self.assertNotIn("#2 ", self.main("intents")[1])
+
+    def test_the_chief_of_staff_sees_every_orchestrators_asks(self):
+        self.as_agent("chief-of-staff")
+        out = self.main("intents")[1].splitlines()
+        self.assertEqual(len(out), 6)
+        self.assertEqual({line.split("  ")[1] for line in out}, {"[orch]", "[platform2]"})
+
+    def test_a_coder_sees_the_ask_of_its_issue(self):
+        self.as_agent("worker")
+        self.assertEqual(self.main("intents")[1].splitlines(), ["#2  [worker]  Fix the agents  | Done when: both answer"])
+
+    def test_intents_needs_a_fleet_caller(self):
+        code, _, err = self.main("intents")
+        self.assertEqual(code, 1)
+        self.assertIn("HERDR_PANE_ID", err)
+
+    def test_status_lists_the_issues_agents_refer_to_that_lack_an_intent(self):
+        self.world.fact("platform", "lab.fact:1", issue=4)
+        self.world.add_agent("holder", fleet={"role": "coder", "issue": 4})
+        code, out, _ = self.main("status")
+        self.assertIn("no Intent section: #4", out)
+        report = json.loads(self.main("status", "--json")[1])
+        self.assertEqual(report["agents"]["intent_gaps"], [4])
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_status_is_unchanged_without_an_ask_repo(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertNotIn("intent_gaps", json.loads(self.main("status", "--json")[1])["agents"])
+
+
+class TestIntentChange(unittest.TestCase):
+    def payload(self, old, new, action="edited", updated="2027-01-15T08:00:00Z", **extra):
+        body = {"action": action, "issue": {"number": 7, "body": new, "updated_at": updated},
+                "sender": {"login": "alice"}, "changes": {"body": {"from": old}}}
+        body.update(extra)
+        return body
+
+    OLD = "## Intent\nAdd a health check\nDone when: GET /health returns 200\n"
+
+    def test_an_intent_edit_is_an_item_for_the_chief_of_staff_showing_old_and_new(self):
+        new = "## Intent\nAdd a readiness check\nDone when: GET /health returns 200\n"
+        change = sb.intent_change_fact(self.payload(self.OLD, new))
+        self.assertEqual((change.key, change.recipient, change.issue, change.kind, change.sender),
+                         ("intent.edit:7:2027-01-15T08:00:00Z", "chief-of-staff", 7, "intent.edit", "alice"))
+        self.assertEqual(change.summary.splitlines(), [
+            "The Intent section of #7 was edited on GitHub:", "Intent: Add a health check -> Add a readiness check"])
+        self.assertEqual(change.created, datetime.datetime(2027, 1, 15, 8, 0, tzinfo=datetime.timezone.utc).timestamp())
+
+    def test_a_done_when_change_is_shown_too_and_a_missing_side_is_none(self):
+        new = "## Intent\nAdd a health check\n"
+        summary = sb.intent_change_fact(self.payload(self.OLD, new), "cos").summary
+        self.assertIn("Done when: GET /health returns 200 -> (none)", summary)
+        self.assertNotIn("Intent: Add a health check ->", summary)
+        added = sb.intent_change_fact(self.payload("nothing here", self.OLD)).summary
+        self.assertIn("Intent: (none) -> Add a health check", added)
+
+    def test_an_edit_that_leaves_the_intent_alone_is_nothing(self):
+        new = self.OLD + "\n## Notes\nmore text\n"
+        self.assertIsNone(sb.intent_change_fact(self.payload(self.OLD, new)))
+        self.assertIsNone(sb.intent_change_toast(self.payload(self.OLD, new)))
+
+    def test_other_events_are_nothing(self):
+        new = "## Intent\nChanged\n"
+        self.assertIsNone(sb.intent_change_fact(self.payload(self.OLD, new, action="opened")))
+        title_edit = self.payload(self.OLD, new)
+        del title_edit["changes"]["body"]
+        self.assertIsNone(sb.intent_change_fact(title_edit))
+        self.assertIsNone(sb.intent_change_fact("not a payload"))
+
+    def test_the_toast_is_a_title_and_a_body(self):
+        toast = sb.intent_change_toast(self.payload(self.OLD, "## Intent\nNew\nDone when: GET /health returns 200\n"))
+        self.assertEqual(toast, {"title": "Intent changed on #7", "body": "Intent: Add a health check -> New"})
+
+    def test_the_key_makes_a_redelivered_event_one_item(self):
+        new = "## Intent\nNew\n"
+        a = sb.intent_change_fact(self.payload(self.OLD, new))
+        b = sb.intent_change_fact(self.payload(self.OLD, new))
+        c = sb.intent_change_fact(self.payload(self.OLD, new, updated="2027-01-15T09:00:00Z"))
+        self.assertEqual(a.key, b.key)
+        self.assertNotEqual(a.key, c.key)
+
+    def test_a_payload_without_updated_at_is_refused(self):
+        bad = self.payload(self.OLD, "## Intent\nNew\n", updated=None)
+        with self.assertRaises(sb.FactError):
+            sb.intent_change_fact(bad)
+
+
+AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
+                    + sorted((REPO / "agents" / "copilot").glob("*.agent.md")))
+SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
+                 "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
+                 "Permission doesn't travel", "An empty queue is not a mandate")
+COS_ONLY_MAXIMS = ("The last message stands alone", "No change, no message",
+                   "Evidence, consequence, options, recommendation")
+RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
+          "ready for your principal's eyes", "stuck after trying")
+ROLE_LINE_LIMITS = {"coder": 120, "orchestrator": 178, "chief-of-staff": 162}  # lines; they must not grow
+ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8300}
+
+
+def role_of(path):
+    return path.name.split(".")[0]
+
+
+def maxims_block(text):
+    match = re.search(r"^## Maxims\n(.*?)(?=^## )", text, re.S | re.M)
+    return match.group(1) if match else ""
+
+
+class TestAgentDefinitions(unittest.TestCase):
+    def test_there_are_six_role_files(self):
+        self.assertEqual(sorted(role_of(p) for p in AGENT_FILES),
+                         sorted(["coder", "orchestrator", "chief-of-staff"] * 2))
+
+    def test_each_has_a_short_maxims_block_with_its_roles_phrases(self):
+        for path in AGENT_FILES:
+            with self.subTest(file=str(path.relative_to(REPO))):
+                block = maxims_block(path.read_text())
+                self.assertTrue(block, "no ## Maxims block")
+                self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
+                role = role_of(path)
+                for phrase in SHARED_MAXIMS:
+                    self.assertIn(phrase, block)
+                self.assertEqual("Trust, but verify" in block, role != "coder")
+                for phrase in COS_ONLY_MAXIMS:
+                    self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
+
+    def test_the_maxims_come_before_the_rest_of_the_body(self):
+        for path in AGENT_FILES:
+            with self.subTest(file=path.name):
+                headings = re.findall(r"^## (.*)$", path.read_text(), re.M)
+                self.assertEqual(headings[0], "Maxims")
+
+    def test_chief_of_staff_and_orchestrator_carry_the_rubric(self):
+        for path in AGENT_FILES:
+            text = path.read_text()
+            with self.subTest(file=path.name):
+                for phrase in RUBRIC:
+                    self.assertEqual(phrase in text, role_of(path) != "coder", phrase)
+
+    def test_each_explains_a_switchboard_message_and_forbids_typing_into_a_pane(self):
+        for path in AGENT_FILES:
+            text = path.read_text()
+            with self.subTest(file=path.name):
+                self.assertIn("[switchboard]", text)
+                self.assertIn("fleet-switchboard send", text)
+                self.assertRegex(text, r"never by typing")
+        for path in AGENT_FILES:
+            if role_of(path) == "chief-of-staff":
+                self.assertIn("Done when", path.read_text())
+
+    def test_the_role_files_keep_their_frontmatter_and_placeholders(self):
+        for path in AGENT_FILES:
+            text = path.read_text()
+            with self.subTest(file=path.name):
+                self.assertTrue(text.startswith("---\n"))
+                self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
+                self.assertRegex(text, r"(?m)^model: __(PROVIDER__/__MODEL_ID|MODEL_ID)__$")
+
+    def test_the_role_files_do_not_grow(self):
+        for path in AGENT_FILES:
+            text = path.read_text()
+            role = role_of(path)
+            with self.subTest(file=path.name):
+                self.assertLessEqual(len(text.splitlines()), ROLE_LINE_LIMITS[role])
+                self.assertLessEqual(len(text.encode("utf-8")), ROLE_BYTE_LIMITS[role])
+
+    def test_the_skills_carry_the_ask_level(self):
+        charter = (REPO / "skills" / "fleet-charter" / "SKILL.md").read_text()
+        for phrase in ("## Intent", "Done when:", "ask", "work item", "never widen"):
+            self.assertIn(phrase, charter, phrase)
+        coordination = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        for phrase in ("ASK:", "fleet-switchboard intent"):
+            self.assertIn(phrase, coordination, phrase)
+
+
+class TestIntentScenarios(Base):
+    def test_a_variant_may_patch_the_issues(self):
+        i2 = sc.load(sc.DEFAULT_DIR / "i2-no-intent-recorded.json")
+        patched = sc.apply_variant(i2, i2["control"]["variant"])
+        self.assertEqual(patched["issues"]["2"]["intent"], "Add a health check")
+        self.assertIsNone(i2["issues"]["2"]["intent"])
+        with self.assertRaises(sc.VariantError):
+            sc.apply_variant(i2, {"issues": {"2": {}}})
+
+    def test_the_pr6_catalog_is_present(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, tiers in (("I1", {"offline", "lab-model"}), ("I2", {"offline"}),  # the Lab runner cannot yet play
+                           ("I3", {"offline"}),  # `message_shows` and `edit-intent`
+                           ("I4", {"lab-model"}),
+                           ("K1", {"lab-model"}), ("K2", {"lab-model"})):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(set(found[sid]["tiers"]), tiers)
+                self.assertEqual(found[sid]["since_pr"], 6)
+        for sid in ("K1", "K2", "I4"):
+            self.assertEqual(found[sid]["control"]["fault"], "no-maxims")
+        self.assertEqual(found["I1"]["control"]["fault"], "no-intent-header")
+
+    def test_i3_surfaces_the_change_and_its_control_does_not(self):
+        report = run_scenario(self, sc.load(sc.DEFAULT_DIR / "i3-intent-edited.json"))
+        self.assertEqual([r["label"] for r in report["control"] if r["ok"]], [])
+        self.assertEqual(report["failures"], [])
+
+    def test_the_offline_runner_does_not_pass_judged_off_as_a_control_failure(self):
+        report = run_scenario(self, sc.load(sc.DEFAULT_DIR / "i1-report-carries-intent.json"))
+        judged = [r for r in report["run"] if r["that"] == "judged"]
+        self.assertEqual(len(judged), 1)
+        self.assertIn("not evaluated offline", judged[0]["seen"])
+        self.assertNotIn("flags-divergence", report["proves_nothing"])
 
 
 # ---------------------------------------------------------------------- runner

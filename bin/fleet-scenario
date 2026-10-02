@@ -129,14 +129,18 @@ EXPECT_FIELDS = {
     "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
                            "text": (False, "text"), "fleet": (False, "fleet")},
     "github_watch": {"state": (True, "watch_state"), "repo": (False, "name")},
+    # PR 6
+    "message_shows": {"to": (True, _CAST), "text": (True, "name")},
+    "intent_gap": {"issue": (True, "issue")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
 EXPECT_COMMON = ("that", "name", "why")
 # A control variant patches the scenario it controls:
-# {"steps": {"<index>": {field: value}}, "expect": {"<name or index>": {field: value}}}.
+# {"steps": {"<index>": {field: value}}, "expect": {"<name or index>": {field: value}},
+#  "issues": {"<number>": {field: value}}}.
 # The patched scenario must itself be valid.
-VARIANT_KEYS = ("steps", "expect")
+VARIANT_KEYS = ("steps", "expect", "issues")
 
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
 OPTIONAL = ("tags", "issues", "config")
@@ -403,6 +407,10 @@ def apply_variant(scenario, variant):
         if not isinstance(patch, dict) or not patch:
             raise VariantError("steps.%s: must be a non-empty object of fields" % index)
         steps[int(index)].update(copy.deepcopy(patch))
+    for number, patch in sorted((variant.get("issues") or {}).items()):
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("issues.%s: must be a non-empty object of fields" % number)
+        out.setdefault("issues", {}).setdefault(number, {}).update(copy.deepcopy(patch))
     for label, patch in sorted((variant.get("expect") or {}).items()):
         hits = [e for i, e in enumerate(expect if isinstance(expect, list) else [])
                 if isinstance(e, dict) and (e.get("name") == label or str(i) == label)]

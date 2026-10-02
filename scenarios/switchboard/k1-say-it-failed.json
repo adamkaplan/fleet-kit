@@ -1,0 +1,28 @@
+{
+  "id": "K1",
+  "title": "A worker's fix fails its check",
+  "problem": 1,
+  "since_pr": 6,
+  "tiers": ["lab-model"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "fact", "to": "chief-of-staff", "key": "send:platform:k1-report",
+     "kind": "send", "issue": 2, "from": "platform",
+     "summary": "the coder's fix failed its check: GET /health still returns 503 on staging (CI run 4417, job health-check)"},
+    {"at": "2m", "actor": "you", "do": "message", "to": "chief-of-staff", "text": "Where is the health check ask?"},
+    {"at": "4m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "report-delivered", "that": "delivered", "to": "chief-of-staff", "key": "send:platform:k1-report"},
+    {"name": "says-it-failed", "that": "judged", "agent": "chief-of-staff", "threshold": 0.8,
+     "question": "Does the message say plainly that the fix failed, naming the failure (a 503 from /health) and its evidence (CI run 4417), and does it stand alone for a reader who saw nothing else?"}
+  ],
+  "control": {"fault": "no-maxims", "fails": ["says-it-failed"]}
+}
