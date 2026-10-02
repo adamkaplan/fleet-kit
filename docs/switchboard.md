@@ -14,7 +14,7 @@
 | 2 | `switchboard/inbox` | Inbox, notes vs. wakes, batching | planned |
 | 3 | `switchboard/herdr` | `launch`, herdr plugin, badges, toasts, pane status | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; live proof A–E | planned |
-| 5 | `switchboard/github-events` | GitHub poller | planned |
+| 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
 | 6 | `switchboard/threads` | Thread ledger, relaying your exact words, Chief of Staff rewrite | planned |
 | 7 | `switchboard/judges` | Cheap judges that log but don't act ("shadow mode") | planned |
 | 8 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
@@ -82,6 +82,7 @@ Evidence from real use:
 | Location | `bin/fleet-switchboard` (stdlib Python) plus a herdr plugin manifest, both in this repo. |
 | State | One SQLite file (stdlib `sqlite3`) owned by the switchboard. The harness, herdr and GitHub stay the sources of truth; see [Data](#data). |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
+| GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
 | Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
 | Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. Whether it shows in the TUI is settled by S3. |
 | Thread ledger | Kept locally, promoted to a GitHub issue once a request becomes work (PR 6). |
@@ -96,7 +97,7 @@ flowchart LR
     direction TB
     herdr_in["herdr<br/>focus · panes"]
     oc_in["OpenCode v2<br/>busy · idle · viewed<br/>your prompts<br/>permission requests"]
-    gh_in["GitHub, PR 5 on<br/>comments · PRs<br/>checks · labels"]
+    gh_in["GitHub, PR 5 on<br/>webhooks via<br/>gh webhook forward"]
     cli_in["Agents and you<br/>send · remind · inbox"]
   end
   subgraph daemon["fleet-switchboard daemon"]
@@ -169,6 +170,7 @@ depends on it.
 | Harness adapter | A class inside the daemon, one per harness kind | Everything harness-specific: launch, observe, note, wake |
 | herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon and forwards pane events as pokes |
 | State store | One SQLite file (stdlib `sqlite3`, WAL mode) under `$XDG_STATE_HOME/fleet-switchboard/`, directory mode 0700. Config is a separate `config.json`, because the kit supports Python 3.9, which has no `tomllib`. | Every record in [Data](#data) |
+| GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon. The daemon receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
 
 The daemon runs one loop with five steps:
 
@@ -310,12 +312,67 @@ against a weaker harness.
 
 #### GitHub (PR 5)
 
-Polled with `gh api` using conditional requests (ETags), once per charter in the
-registry: comments on the charter and its sub-issues, linked PRs, check runs,
-reviews, and `awaiting-user` label changes. Each change becomes an inbox item
-for the charter's orchestrator. The switchboard does not write to GitHub
-through PR 5; PR 6 decides whether promoting a thread to an issue is done by the
-switchboard or by the Chief of Staff.
+GitHub events arrive as webhooks, relayed by the `gh webhook forward`
+extension ([cli/gh-webhook](https://github.com/cli/gh-webhook)). Nothing is
+polled on a timer.
+
+- **One forwarder per watched repo,** started and supervised by the daemon as a
+  child process. Watched repos are the ones holding a charter in the registry.
+  The forwarder runs
+  `gh webhook forward --repo=<repo> --events=<list> --url=http://127.0.0.1:<port>/github --secret=<secret>`,
+  where `<port>` belongs to a listener the daemon opens on localhost only.
+- **Events:** `issues` (including label changes such as `awaiting-user`),
+  `issue_comment`, `sub_issues`, `pull_request`, `pull_request_review`,
+  `check_suite` and `workflow_run`. Verify G1 for `sub_issues`.
+- **Verification:** the daemon checks `X-Hub-Signature-256` against the secret
+  before reading the body. That stops any local process from posting fake
+  events.
+- **Routing:** an event becomes an inbox item for the orchestrator whose
+  charter it touches. Issue events match on the issue number against the
+  charter and its sub-issues. PR events match through the issues the PR
+  closes, read once when the PR event arrives. Check and workflow events match
+  through the PRs listed in their payload.
+- **Catching up after a gap:** the forwarder never replays what it missed. It
+  reconnects 3 times, 5 s apart, then exits, and anything that happens while it
+  is down is lost. So each time a forwarder starts or restarts, the daemon makes
+  one catch-up read with `gh api`, covering activity since the last event it
+  saw for that repo. That read fills a gap; it is not a poll. Dedupe keys come
+  from GitHub object ids, not delivery ids, so an event seen both ways becomes
+  one item.
+- **Writes:** none through PR 5. PR 6 decides whether the switchboard or the
+  Chief of Staff promotes a thread to an issue.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant GH as GitHub
+  participant F as gh webhook forward
+  participant SB as fleet-switchboard
+  participant O as Orchestrator
+  SB->>F: start for one repo, pointing at 127.0.0.1 with a fresh secret
+  F->>GH: create the repo's cli hook, connect, activate
+  SB->>GH: catch-up read since the last event seen
+  GH-->>F: event, over the websocket
+  F->>SB: POST /github with X-GitHub-Delivery and signature
+  SB->>SB: verify, route to a charter, ingest with an object-id dedupe key
+  Note over SB,O: from here the delivery rule applies, as for any item
+  F-xSB: exits after 3 failed reconnects
+  SB->>F: restart with backoff, then catch up again
+```
+
+**Constraints from GitHub's docs and the extension's source.** Settled by spike
+G1 before PR 5 builds on them.
+
+| Constraint | Consequence |
+|---|---|
+| "Webhook forwarding is only designed for use during testing and development. It is not supported for use in production environments." | Acceptable for one person's local fleet. If GitHub withdraws it, fall back to the catch-up read on a long interval |
+| "Only one person can use webhook forwarding at a time for each repository and organization." A second forwarder gets `Hook already exists` | The daemon reports the conflict in `status` and a toast, and falls back to catch-up reads for that repo |
+| Creating the hook requires admin on the repo; `--org` needs the `admin:org_hook` scope | `fleet-doctor` checks for admin before a repo is watched |
+| `--secret` is passed on the command line, so other local users can see it in `ps` | A new secret for every forwarder start, never stored. Acceptable on a single-user machine |
+
+| Spike | Passes when |
+|---|---|
+| G1 | On a scratch repo: the forwarder creates and activates the hook; events arrive signed; `sub_issues` is accepted; a second forwarder gets `Hook already exists`; after the forwarder is killed, the hook is cleaned up or left inactive, and that is recorded; events sent while it is down are absent, and the catch-up read recovers them |
 
 #### Agents
 
@@ -350,7 +407,7 @@ manages do not use `heartbeat-ack`.
 |---|---|---|
 | OpenCode v2 service | Sessions, transcripts, turn state, viewed state, its own delivery queue | Observed every tick; never copied as truth |
 | herdr | Panes, tabs, workspaces, focus | Observed every tick; pane ids recorded at launch and re-checked |
-| GitHub | Charters, issues, PRs, checks, reviews: the work record | Polled (PR 5) |
+| GitHub | Charters, issues, PRs, checks, reviews: the work record | Webhooks (PR 5), plus one catch-up read after each forwarder gap |
 
 A decision about an agent is made from a fresh read of these sources, taken
 immediately before the write it leads to. The switchboard's own records say
@@ -366,6 +423,7 @@ what it has seen and done, never what is true now.
 | **Observation cursor** | 2 | Daemon | Per agent: the last observation, and the last source fact already ingested (for example the `idle_at` already turned into an item) | Cache; safe to delete |
 | **Registry** | 3 | `launch`, later `adopt` | Name, harness kind, session id, pane id, workspace, role, `reports_to`, charter (optional), launched and retired times | Durable |
 | **Reminders** | 4 | `remind` | Id, to, due, text, fired item id | Durable |
+| **GitHub watches** | 5 | Daemon | Repo, events, forwarder state (`running`, `restarting`, `conflict`, `stopped`), time of the last event seen, last catch-up time | Durable |
 | **Quotes** | 6 | Daemon, from observed human prompts | Id, agent, session, message id, time, exact text | Durable, immutable |
 | **Threads** | 6 | Chief of Staff, through the CLI | Id, title, quote ids, owner, status, GitHub issue once promoted, updated | Durable |
 | **Judge decisions** | 7 | Daemon | Question, input hash, answer, model, cost, later outcome | Durable, append-only |
@@ -381,6 +439,7 @@ erDiagram
   REGISTRY ||--o| OBSERVATION_CURSOR : "last seen as"
   REGISTRY ||--o{ REMINDER : "scheduled for"
   REMINDER ||--o| INBOX_ITEM : "fires as"
+  GITHUB_WATCH ||--o{ INBOX_ITEM : raises
   REGISTRY ||--o{ QUOTE : "captured from"
   REGISTRY ||--o{ THREAD : owns
   THREAD }o--|{ QUOTE : cites
@@ -416,7 +475,8 @@ erDiagram
 
 Dedupe keys name the source fact, for example
 `worker.idle:<session>:<idle_at>`, `worker.blocked:<session>:<request id>` and
-`github.comment:<comment id>`.
+`github.comment:<comment id>`. GitHub keys use object ids rather than webhook
+delivery ids, so a webhook and a catch-up read of the same fact converge.
 
 #### Inbox item lifecycle
 
@@ -454,7 +514,9 @@ stateDiagram-v2
 5. **Your words are copied, never retyped** (PR 6). Quotes are stored
    byte-for-byte from the transcript and referred to by id.
 6. **No secrets in the store or the audit log.** OpenCode authentication stays
-   inside `opencode api`, GitHub authentication inside `gh`.
+   inside `opencode api`, GitHub authentication inside `gh`. The webhook secret
+   (PR 5) lives only in the daemon's memory and the forwarder's arguments, and
+   a new one is made for every forwarder start.
 7. **The cache is disposable.** Deleting the observation cursor can only
    re-read facts whose dedupe keys already exist, so it creates nothing.
 
@@ -503,6 +565,8 @@ blocked: items stay pending, every hold is audited with its reason, and after
 |---|---|
 | v2 service down | No deliveries; items accumulate; toast after 15 minutes; `status` shows it |
 | herdr down | Deliveries continue, because they go through v2; badges and toasts resume when herdr returns |
+| GitHub forwarder exits | Restarted with backoff, then one catch-up read covers the gap. Repeated failure shows in `status`, with a toast |
+| `Hook already exists` (someone else is forwarding that repo) | Watch marked `conflict`; catch-up reads on a long interval until it clears; toast |
 | Daemon down | The CLI and hooks still record items, but nothing is delivered. `status` (and later `fleet-doctor`) reports a stale daemon |
 | Agent never reads its inbox | Woken again after 30 minutes, doubling, at most 3 times; then a toast to you |
 | Pane closed or session gone | The agent is marked detached; its items are held; toast |
@@ -603,6 +667,9 @@ A check only counts once we have seen it fail with its safeguard switched off.
   version and keep all v2 calls in one client class.
 - **v2's event names are not documented.** The switchboard polls first and
   switches to streaming only if S2 shows it works.
+- **GitHub webhook forwarding is documented as testing-only,** and allows one
+  forwarder per repo or org. See [GitHub (PR 5)](#github-pr-5) for the
+  fallback.
 - **herdr has no status hook for v2 panes.** The switchboard reports their
   status instead.
 - **Stacked PRs are reviewed bottom-up.** A fix to a lower PR cascades upward
@@ -628,6 +695,9 @@ into individual model calls; changes to `fleet-heartbeat`.
   configurable.
 - PR 6: does the switchboard or the Chief of Staff promote a thread to a GitHub
   issue?
+- PR 5: one forwarder per repo, or one per org with `--org`? Per org covers
+  every charter repo with a single hook, but needs the `admin:org_hook` scope
+  and blocks anyone else in the org from forwarding.
 - Who reviews the stack?
 - Should this document stay in `main` after the final merge? Precedent: the
   kit's earlier `PROPOSAL.md` was deleted once its work landed. Until we decide
@@ -650,3 +720,8 @@ into individual model calls; changes to `fleet-heartbeat`.
   item lifecycle, the worker-finishes sequence, and the Lab's isolation. Each
   one renders with mermaid-cli 12. Inbox items now track their latest delivery,
   since a note can be followed by one wake.
+- 2026-10-02: GitHub (PR 5) switched from polling to webhooks through
+  `gh webhook forward`. The extension never replays missed events (3
+  reconnects, then exit), so each forwarder start is followed by one catch-up
+  read. Added the forwarder component, the GitHub watch record, spike G1, the
+  constraints from GitHub's docs, and the failure rows.
