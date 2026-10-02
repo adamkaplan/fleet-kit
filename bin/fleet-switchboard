@@ -16,6 +16,8 @@ delivery rule, and delivers. See docs/switchboard.md, "Delivery rule".
     fleet-switchboard pending <name>        what is pending, and why it waits
     fleet-switchboard remind <name> <when> <text>   a message due later
     fleet-switchboard status                config, clients, fleet agents
+    fleet-switchboard intent <issue>        the ask's Intent and Done-when (PR 6)
+    fleet-switchboard intents               your open asks, one line each (PR 6)
 
 Rules this file keeps from the start:
 
@@ -161,6 +163,7 @@ def validate_config(raw, source="config"):
                 "worker_lookback_hours"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    validate_intent_config(config, source)
     _validate_github(config, source)
     config.update(envs)
     return config
@@ -916,13 +919,14 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None):
     """One message for `facts`, oldest first. Returns (text, the facts it carries).
 
     The first line names the count and the first item; each item follows in
     full. Items that do not fit under `cap` stay pending: the message ends with
     how many, and they go in the next message. A single item longer than the
-    cap is cut, and says so.
+    cap is cut, and says so. With `section` (PR 6, see sectioned_lines) every
+    item that names an issue sits under its ask's Intent lines.
     """
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     if not facts:
@@ -935,7 +939,8 @@ def compose(recipient, facts, cap=MESSAGE_CAP):
 
     def render(count):
         head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(facts[0].summary, 200))
-        lines = [head] + [item(fact) for fact in facts[:count]]
+        lines = [head] + (sectioned_lines(facts[:count], section, item) if section
+                          else [item(fact) for fact in facts[:count]])
         rest = len(facts) - count
         if rest:
             lines.append("\u2026 and %d more: run fleet-switchboard pending %s" % (rest, recipient))
@@ -981,8 +986,9 @@ class Switchboard:
     and any write then raises instead of happening unaudited.
     """
 
-    def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon"):
+    def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon", intents=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
+        self.intents = intents  # an IntentReader (PR 6), or None when no ask repo is configured
         self.sources, self.now, self.actor = list(sources), now, actor
         self.batch_seconds = config["batch_seconds"]
         self.engaged_seconds = config["engaged_minutes"] * 60
@@ -1205,7 +1211,7 @@ class Switchboard:
                 note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
-        text, carried = compose(plan.recipient, plan.pending)
+        text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation))
         keys = [fact.key for fact in carried]
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
@@ -3078,7 +3084,8 @@ def collect_status(runner=subprocess.run, now=time.time):
         herdr_ok, entries = _check(herdr.agent_list)
         herdr_line = "%d agent(s)" % len(entries) if herdr_ok else entries
         if v2_ok and herdr_ok and state_ok and faults_ok:
-            engine = Switchboard(config, v2, herdr, None, fact_sources(state), now)
+            engine = Switchboard(config, v2, herdr, None, fact_sources(state), now,
+                                 intents=intent_reader_for(config, runner, now))
             agents_ok, overview = _check(lambda: fleet_overview(engine, entries))
             agents = overview if agents_ok else {"ok": False, "error": overview}
     else:
@@ -3098,8 +3105,10 @@ def fleet_overview(engine, entries):
     discovery = engine.discover(engine.now(), entries)
     facts, problems = engine.collect_facts()
     names = sorted(set(discovery.agents) | {fact.recipient for fact in facts})
-    return {"ok": True, "problems": discovery.problems + problems,
-            "list": [engine.pending(name, discovery, facts) for name in names]}
+    overview = {"ok": True, "problems": discovery.problems + problems,
+                "list": [engine.pending(name, discovery, facts) for name in names]}
+    overview.update(intent_gap_report(engine, discovery, facts))
+    return overview
 
 
 def _plan_line(entry):
@@ -3156,6 +3165,7 @@ def format_status(report):
         lines.append("      agents     %d fleet agent(s)" % len(listed))
         lines.extend("        " + _agent_line(entry) for entry in agents["list"])
         lines.extend("        problem: %s" % problem for problem in agents["problems"])
+        lines.extend(intent_gap_lines(agents))
     else:
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
@@ -3200,7 +3210,8 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
-    return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor), state, config
+    return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
+                       intents=intent_reader_for(config, runner, now)), state, config
 
 
 def cmd_run(args, runner, now, wait):
@@ -3271,7 +3282,11 @@ def cmd_launch(args, runner, now, socket_call=None):
 
 
 def cmd_send(args, runner, now):
-    engine, _, _ = build_engine(runner, now, "cli")
+    engine, _, config = build_engine(runner, now, "cli")
+    refusal = intent_refusal(config, args.issue)
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_USAGE
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
@@ -3309,6 +3324,492 @@ def cmd_pending(args, runner, now):
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     return EXIT_OK
+
+
+# ------------------------------------------------- intent lines (PR 6)
+#
+# Every message names its ask and carries the ask's Intent and Done-when
+# (docs/switchboard.md, "Intent lines"). GitHub is the only copy: this section
+# reads an issue's `## Intent` section through `gh api` (GET only, invariant 6)
+# and never writes it. Three levels: a charter (never repeated), an ask under
+# it (Intent + Done when, written by the Chief of Staff), and optionally a work
+# item under the ask (its own Intent line, written by the orchestrator).
+
+INTENT_DEFAULTS = {
+    "intent_repo": None,     # OWNER/REPO holding charters, asks and work items; None = no ask machinery
+    "intent_required": True,  # with intent_repo set, `send` needs --issue
+}
+DEFAULTS.update(INTENT_DEFAULTS)
+
+NO_INTENT = "no intent recorded"
+INTENT_TTL = 300        # seconds a cached issue is trusted; a webhook invalidates it sooner
+INTENT_LINE_LIMIT = 240  # characters per header line
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def validate_intent_config(config, source):
+    repo = config["intent_repo"]
+    if repo is not None and not (isinstance(repo, str) and REPO_RE.match(repo)):
+        raise ConfigError("%s: 'intent_repo' must be OWNER/REPO or null, got %r" % (source, repo))
+    if not isinstance(config["intent_required"], bool):
+        raise ConfigError("%s: 'intent_required' must be true or false, got %r" % (source, config["intent_required"]))
+
+
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+_DONE_WHEN = re.compile(r"^(?:[-*]\s+)?\**done when\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
+_CHARTER_BLOCK = re.compile(r"```ya?ml\s*\n\s*orchestrator\s*:", re.IGNORECASE)
+
+
+def parse_intent(body):
+    """(intent, done_when) from the `## Intent` section of an issue body.
+
+    The first line of the section is the Intent; a line starting `Done when:`
+    is the Done-when. Either may be missing (None). Fenced code is ignored,
+    the section ends at the next heading, and CRLF bodies are fine.
+    """
+    intent = done_when = None
+    inside = fenced = False
+    for line in (body or "").splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        heading = _HEADING.match(line)
+        if heading:
+            if inside:
+                break
+            inside = heading.group(1).strip().lower() == "intent"
+            continue
+        text = line.strip()
+        if not inside or not text:
+            continue
+        match = _DONE_WHEN.match(text)
+        if match:
+            done_when = done_when or match.group(1).strip() or None
+        elif intent is None:
+            intent = text
+    return intent, done_when
+
+
+class IntentError(Exception):
+    """GitHub could not answer. reason: "not_found", "unavailable" or "gh"."""
+
+    def __init__(self, reason, detail=None):
+        self.reason = reason
+        super().__init__("%s: %s" % (reason, detail) if detail else reason)
+
+
+class IssueIntent:
+    """What the switchboard knows of one issue: its Intent lines, and what kind it is."""
+
+    def __init__(self, number, state, title, intent, done_when, updated_at, charter):
+        self.number, self.state, self.title = number, state, title
+        self.intent, self.done_when, self.updated_at, self.charter = intent, done_when, updated_at, charter
+
+    @classmethod
+    def from_api(cls, data):
+        number = data.get("number") if isinstance(data, dict) else None
+        if not (isinstance(number, int) and not isinstance(number, bool)):
+            raise IntentError("gh", "an issue came back without a number")
+        body = data.get("body") if isinstance(data.get("body"), str) else ""
+        intent, done_when = parse_intent(body)
+        return cls(number, data.get("state"), data.get("title") or "", intent, done_when,
+                   data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
+
+
+def _header_line(text):
+    return _one_line(text, INTENT_LINE_LIMIT)
+
+
+def ask_lines(issue):
+    """The ask's header lines: Intent, then Done when; one line when neither is recorded."""
+    if issue.intent is None and issue.done_when is None:
+        return [_header_line("Ask #%d: %s" % (issue.number, NO_INTENT))]
+    return [_header_line("Ask #%d Intent: %s" % (issue.number, issue.intent or NO_INTENT)),
+            _header_line("Done when: %s" % (issue.done_when or "not recorded"))]
+
+
+def work_lines(issue):
+    return [_header_line("Work item #%d Intent: %s" % (issue.number, issue.intent or NO_INTENT))]
+
+
+class IntentReader:
+    """Reads Intent lines from GitHub, with an in-memory cache.
+
+    Only ever runs `<gh> api <path>`: a GET, with no method, field or input
+    flag, so there is nothing here that can write. Entries are keyed by repo
+    and issue, remember the issue's `updated_at`, and expire after `ttl`
+    seconds; `invalidate(issue)` drops them at once (the webhook handler's
+    call, PR 5). A failed read is never cached.
+    """
+
+    def __init__(self, gh, repo, runner=subprocess.run, now=time.time, timeout=20, ttl=INTENT_TTL):
+        self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
+        self.timeout, self.ttl = timeout, ttl
+        self._cache = {}
+
+    # -- GitHub
+
+    def _api(self, path):
+        argv = [self.gh, "api", path]
+        try:
+            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
+                                 stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if result.returncode != 0:
+            detail = _one_line(result.stderr) or _one_line(result.stdout) or "exit %d" % result.returncode
+            if re.search(r"\b404\b|Not Found", detail):
+                raise IntentError("not_found", detail)
+            raise IntentError("gh", detail)
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
+
+    def _cached(self, key, fetch):
+        hit = self._cache.get(key)
+        if hit is not None and self.now() - hit[0] < self.ttl:
+            return hit[1]
+        value = fetch()
+        self._cache[key] = (self.now(), value)
+        return value
+
+    def invalidate(self, issue, repo=None):
+        """Forget what is cached about `issue`; the next read asks GitHub again."""
+        repo = repo or self.repo
+        for kind in ("issue", "parent"):
+            self._cache.pop((kind, repo, issue), None)
+
+    # -- reading
+
+    def issue(self, number, repo=None):
+        repo = repo or self.repo
+        return self._cached(("issue", repo, number), lambda: IssueIntent.from_api(
+            self._api("repos/%s/issues/%d" % (repo, number))))
+
+    def parent(self, number, repo=None):
+        """The parent issue's number, or None when the issue has no parent."""
+        repo = repo or self.repo
+
+        def fetch():
+            try:
+                found = self._api("repos/%s/issues/%d/parent" % (repo, number))
+            except IntentError as err:
+                if err.reason == "not_found":
+                    return None
+                raise
+            return IssueIntent.from_api(found).number
+
+        return self._cached(("parent", repo, number), fetch)
+
+    def ask_of(self, number, repo=None):
+        """(ask, work item) for an issue: a work item's ask is its parent.
+
+        A parent counts as the ask when it has a parent of its own (the
+        charter); under the charter itself, the issue is the ask.
+        """
+        parent = self.parent(number, repo)
+        if parent is not None and self.parent(parent, repo) is not None:
+            return parent, number
+        return number, None
+
+    def header(self, number, repo=None):
+        """(ask, ask lines, work item, work lines) for a message about `number`, at most
+        three lines; None for a charter, which is never repeated."""
+        if self.issue(number, repo).charter:
+            return None
+        ask, work = self.ask_of(number, repo)
+        ask_issue = self.issue(ask, repo)
+        if ask_issue.charter:
+            return None
+        if work is None:
+            return ask, ask_lines(ask_issue), None, []
+        return ask, ask_lines(ask_issue), work, work_lines(self.issue(work, repo))
+
+    def missing_intent(self, number, repo=None):
+        """The issues in this one's ask chain (ask, work item) with no Intent line. Charters are exempt."""
+        if self.issue(number, repo).charter:
+            return []
+        ask, work = self.ask_of(number, repo)
+        chain = [self.issue(n, repo) for n in ([ask] if work is None else [ask, work])]
+        return [issue.number for issue in chain if issue.intent is None and not issue.charter]
+
+    def open_asks(self, charter, repo=None):
+        """The open sub-issues of a charter, derived from GitHub on every call."""
+        repo = repo or self.repo
+        found = self._api("repos/%s/issues/%d/sub_issues?per_page=100" % (repo, charter))
+        asks = []
+        for data in found if isinstance(found, list) else []:
+            issue = IssueIntent.from_api(data)
+            self._cache[("issue", repo, issue.number)] = (self.now(), issue)
+            if issue.state == "open":
+                asks.append(issue)
+        return asks
+
+
+def intent_reader_for(config, runner=subprocess.run, now=time.time):
+    """The IntentReader the config asks for, or None when no `intent_repo` is set."""
+    if not config.get("intent_repo"):
+        return None
+    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"])
+
+
+# -- composing: one section per ask
+
+def section_resolver(engine, observation):
+    """issue -> (ask, ask lines, work item, work lines) for compose, or None.
+
+    None (no sections at all) when no ask machinery is configured or under the
+    `no-intent-header` fault. A header GitHub cannot supply says so instead of
+    stopping the delivery: an unreachable GitHub must not hold your agents'
+    messages. The repo comes from the recipient's fleet metadata when it names
+    one, else the config's `intent_repo`.
+    """
+    reader = getattr(engine, "intents", None)
+    if reader is None or fault("no-intent-header"):
+        return None
+    repo = ((observation.fleet or {}).get("repo") if observation else None) or reader.repo
+
+    def section(issue):
+        try:
+            return reader.header(issue, repo)
+        except IntentError as err:
+            return issue, [_header_line("Ask #%d: intent unavailable (%s)" % (issue, err))], None, []
+
+    return section
+
+
+def sectioned_lines(facts, section, item):
+    """The body of a message: items that name no issue (or a charter) first, then
+    one section per ask, never interleaved. A section is the ask's lines, its
+    own items, then each work item's line followed by that work item's items."""
+    lines, asks = [], {}
+    for fact in facts:
+        found = section(fact.issue) if fact.issue else None
+        if found is None:
+            lines.append(item(fact))
+            continue
+        ask, ask_header, work, work_header = found
+        entry = asks.setdefault(ask, {"header": ask_header, "direct": [], "work": {}})
+        if work is None:
+            entry["direct"].append(item(fact))
+        else:
+            entry["work"].setdefault(work, (work_header, []))[1].append(item(fact))
+    for entry in asks.values():
+        lines.append("")
+        lines.extend(entry["header"] + entry["direct"])
+        for work_header, items in entry["work"].values():
+            lines.extend(work_header + items)
+    return lines
+
+
+# -- change surfacing: pure functions over an `issues` webhook payload (PR 5 wires them)
+
+def intent_diff(payload):
+    """[(label, old, new)] for the Intent and Done-when an `issues.edited` payload
+    actually changed; [] for any other event, or an edit that left them alone."""
+    if not isinstance(payload, dict) or payload.get("action") != "edited":
+        return []
+    old = ((payload.get("changes") or {}).get("body") or {}).get("from")
+    if not isinstance(old, str):
+        return []  # the body was not edited (a title or label edit)
+    new = (payload.get("issue") or {}).get("body")
+    old_intent, old_done = parse_intent(old)
+    new_intent, new_done = parse_intent(new if isinstance(new, str) else "")
+    changes = []
+    if old_intent != new_intent:
+        changes.append(("Intent", old_intent, new_intent))
+    if old_done != new_done:
+        changes.append(("Done when", old_done, new_done))
+    return changes
+
+
+def _change_lines(changes):
+    return ["%s: %s -> %s" % (label, old or "(none)", new or "(none)") for label, old, new in changes]
+
+
+def _payload_issue(payload):
+    issue = payload.get("issue") or {}
+    number, updated = issue.get("number"), issue.get("updated_at")
+    if not (isinstance(number, int) and not isinstance(number, bool) and number >= 1):
+        raise FactError("an issues event without an issue number")
+    try:
+        created = datetime.strptime(updated, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        raise FactError("an issues event without a usable issue.updated_at: %r" % (updated,)) from None
+    return number, updated, created
+
+
+def intent_change_fact(payload, recipient="chief-of-staff"):
+    """The Chief of Staff's item for an Intent edit, or None when the edit left
+    the Intent section alone. Key `intent.edit:<issue>:<updated_at>`, so a
+    redelivered webhook is one item."""
+    changes = intent_diff(payload)
+    if not changes:
+        return None
+    number, updated, created = _payload_issue(payload)
+    login = (payload.get("sender") or {}).get("login")
+    summary = "\n".join(["The Intent section of #%d was edited on GitHub:" % number] + _change_lines(changes))
+    return Fact("intent.edit:%d:%s" % (number, updated), recipient, "intent.edit", summary, created,
+                issue=number, sender=login if isinstance(login, str) and login else "github")
+
+
+def intent_change_toast(payload):
+    """What to tell you when an Intent changed: {"title", "body"} for
+    HerdrClient.notification_show, or None."""
+    changes = intent_diff(payload)
+    if not changes:
+        return None
+    number, _, _ = _payload_issue(payload)
+    return {"title": "Intent changed on #%d" % number, "body": _one_line("; ".join(_change_lines(changes)), 300)}
+
+
+# -- `send` needs an issue
+
+def intent_refusal(config, issue):
+    """Why `send` must refuse without --issue, or None."""
+    if config.get("intent_repo") and config.get("intent_required") and issue is None:
+        return ("send needs --issue <n>: every message names the ask it belongs to "
+                "(run `%s intent <n>`; set intent_required to false in the config to turn this off)" % PROG)
+    return None
+
+
+# -- status: issues agents refer to that have no Intent section
+
+def referenced_issues(discovery, facts):
+    """Issue numbers agents refer to: the issue each fleet agent works on, and
+    each pending fact's issue. Charters are exempt when they are looked at."""
+    numbers = {fact.issue for fact in facts if fact.issue}
+    for agent in discovery.agents.values():
+        issue = (agent.fleet or {}).get("issue")
+        if isinstance(issue, int) and not isinstance(issue, bool):
+            numbers.add(issue)
+    return sorted(numbers)
+
+
+def intent_gap_report(engine, discovery, facts):
+    """{"intent_gaps": [issue...], "intent_errors": [text...]}; empty when no ask repo is configured."""
+    reader = getattr(engine, "intents", None)
+    if reader is None:
+        return {}
+    gaps, errors = set(), []
+    for number in referenced_issues(discovery, facts):
+        try:
+            gaps.update(reader.missing_intent(number))
+        except IntentError as err:
+            errors.append("#%d: %s" % (number, err))
+    return {"intent_gaps": sorted(gaps), "intent_errors": errors}
+
+
+def intent_gap_lines(agents):
+    lines = []
+    if agents.get("intent_gaps"):
+        lines.append("      intent     no Intent section: %s" % ", ".join("#%d" % n for n in agents["intent_gaps"]))
+    lines.extend("        intent problem: %s" % error for error in agents.get("intent_errors", []))
+    return lines
+
+
+# -- the CLI: `intent` and `intents`
+
+def _intent_reader(runner, now):
+    config = load_config()
+    active_faults()
+    reader = intent_reader_for(config, runner, now)
+    if reader is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO, the repo that "
+                          "holds charters, asks and work items" % config_path())
+    return reader
+
+
+def cmd_intent(args, runner, now):
+    """Print the ask's Intent and Done-when, and the work item's Intent line."""
+    reader = _intent_reader(runner, now)
+    found = reader.header(args.issue)
+    if found is None:
+        print("#%d is a charter: its standing job is not repeated in messages. Ask for an ask under it."
+              % args.issue)
+        return EXIT_OK
+    _, ask_header, _, work_header = found
+    print("\n".join(ask_header + work_header))
+    return EXIT_OK
+
+
+def caller_fleet(herdr, v2, environ):
+    """The caller's `metadata.fleet`: HERDR_PANE_ID -> herdr agent -> v2 session."""
+    pane = environ.get("HERDR_PANE_ID")
+    if not pane:
+        raise CallerError("HERDR_PANE_ID is not set: run intents from a fleet agent's herdr pane")
+    session_id = agent_session(herdr.agent_get(pane))
+    fleet = _fleet_meta(v2.session_get(session_id)) if session_id else None
+    if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
+        raise CallerError("pane %s is not a fleet agent (no metadata.fleet.name)" % pane)
+    return fleet
+
+
+def _is_issue_number(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def asks_of_caller(engine, fleet, now):
+    """[(owner, IssueIntent)] the caller is accountable for, from GitHub now.
+
+    The rule: an ask is an open sub-issue of an orchestrator's charter. A
+    Chief of Staff sees the asks under every orchestrator's charter, found
+    from fleet metadata (`role` orchestrator, `charter` an issue number); an
+    orchestrator sees the asks under its own charter; any other role sees the
+    ask of the issue it works on.
+    """
+    reader = engine.intents
+    repo = fleet.get("repo") or reader.repo
+    if fleet.get("role") == "chief-of-staff":
+        charters = [(agent.name, (agent.fleet or {}).get("charter"))
+                    for agent in sorted(engine.discover(now).agents.values(), key=lambda a: a.name)
+                    if (agent.fleet or {}).get("role") == "orchestrator"]
+    elif fleet.get("role") == "orchestrator":
+        charters = [(fleet["name"], fleet.get("charter"))]
+    else:
+        issue = fleet.get("issue")
+        if not _is_issue_number(issue):
+            return []
+        ask, _ = reader.ask_of(issue, repo)
+        return [(fleet["name"], reader.issue(ask, repo))]
+    asks = []
+    for owner, charter in charters:
+        if _is_issue_number(charter):
+            asks.extend((owner, issue) for issue in reader.open_asks(charter, repo))
+    return asks
+
+
+def ask_row(owner, issue):
+    return "#%d  [%s]  %s  | Done when: %s" % (issue.number, owner, issue.intent or NO_INTENT,
+                                              issue.done_when or "not recorded")
+
+
+def cmd_intents(args, runner, now):
+    """The caller's open asks, one line each with its Done-when."""
+    engine, _, config = build_engine(runner, now, "cli", writable=False)
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+    rows = asks_of_caller(engine, fleet, engine.now())
+    if not rows:
+        print("no open asks for %s" % fleet["name"])
+    for owner, issue in rows:
+        print(ask_row(owner, issue))
+    return EXIT_OK
+
+
+INTENT_COMMANDS = {"intent": cmd_intent, "intents": cmd_intents}
+
+
+def add_intent_parsers(sub):
+    intent = sub.add_parser("intent", help="Print an issue's ask: its Intent and Done-when, and the work item's Intent")
+    intent.add_argument("issue", type=int, help="The issue number")
+    sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
 
 
 def build_parser():
@@ -3349,6 +3850,7 @@ def build_parser():
     remind.add_argument("text", nargs="+", help="The reminder")
     remind.add_argument("--issue", type=int, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    add_intent_parsers(sub)
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -3379,11 +3881,13 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_pending(args, runner, now)
         if args.action == "remind":
             return cmd_remind(args, runner, now)
+        if args.action in INTENT_COMMANDS:
+            return INTENT_COMMANDS[args.action](args, runner, now)
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
     except (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError,
-            LaunchError) as err:
+            LaunchError, IntentError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
     sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))

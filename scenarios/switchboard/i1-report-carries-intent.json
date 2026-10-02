@@ -1,0 +1,32 @@
+{
+  "id": "I1",
+  "title": "An orchestrator reports \"one of two fixed\"",
+  "problem": 1,
+  "since_pr": 6,
+  "tiers": ["offline", "lab-model"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Fix the project agents that show \"Agent unavailable\" in production",
+          "done_when": "both project agents answer a chat message in production", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "fact", "to": "chief-of-staff", "key": "send:platform:i1-report",
+     "kind": "send", "issue": 2, "from": "platform", "summary": "deployed, one of the two agents fixed"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "delivered-once", "that": "delivered", "to": "chief-of-staff", "key": "send:platform:i1-report", "count": 1},
+    {"name": "intent-header", "that": "message_has_intent", "to": "chief-of-staff", "issue": 2,
+     "why": "The report comes up carrying the same anchor the hand-off went down with"},
+    {"name": "done-when-shown", "that": "message_shows", "to": "chief-of-staff",
+     "text": "Done when: both project agents answer a chat message in production"},
+    {"name": "flags-divergence", "that": "judged", "agent": "chief-of-staff", "threshold": 0.8,
+     "question": "Does the Chief of Staff say that \"one of the two agents fixed\" does not meet the ask's Done when (both agents answer), instead of accepting the report as done?",
+     "why": "lab-model only; not evaluated offline"}
+  ],
+  "control": {"fault": "no-intent-header", "fails": ["intent-header", "done-when-shown"]}
+}

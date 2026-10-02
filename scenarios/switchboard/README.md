@@ -77,6 +77,8 @@ is how many.
 | `tool_outcome` | `agent`, [`tool`], `outcome` (`completed`, `error`) | The agent's last call of `tool` (default `shell`) ended so, and a completed result went back to the model |
 | `metadata_roundtrip` | `agent`, `of` (`session`, `message`), [`key` or `text`], [`fleet`] | v2 returns `metadata.fleet` exactly: the cast's, or `fleet`; a message is named by exactly one of `key` or `text` |
 | `message_has_intent` | `to`, `issue` | The delivered text carries the issue's Intent lines (PR 6) |
+| `message_shows` | `to`, `text` | A message delivered to the recipient contains `text` (PR 6) |
+| `intent_gap` | `issue` | `fleet-switchboard status` lists the issue as referenced by an agent but lacking an Intent section (PR 6) |
 | `classified` | `agent`, `step`, `as` | Jev classified that message so (PR 7) |
 | `handed_off` | `issue` | A brief on the ask and a `cos-subagent` session for it (PR 8) |
 | `toast` | [`agent`], [`text`] | herdr was asked to show a toast naming `agent` in its title or body and carrying `text` in its body. In the Lab, read from the engine's herdr shim, which records each `notification show` |
@@ -100,13 +102,15 @@ Exactly one of:
 | Control | Fields | What it does |
 |---|---|---|
 | `fault` | a known fault name | The scenario plays again with `FLEET_SWITCHBOARD_FAULT` set on every engine process; only scenarios that run the engine |
-| `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
+| `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}, "issues": {"<number>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
 | `baseline` | `fleet-heartbeat` or `timer-heartbeat` | `timer-heartbeat` (offline only, not built in the Lab) is the old timer waking each orchestrator every 30 minutes. `fleet-heartbeat`: today's system delivers instead. The runner, the only code allowed to type and only into Lab panes, types each `fact`'s wake with `herdr agent prompt` (`[heartbeat] <summary>`), and the engine's daemon does not run. The fake herdr's `agent prompt` does what the TUI does: it submits the input box's text followed by the prompt |
 
 plus `fails`: the expectations, by `name` or `that`, the control must break.
 A control that breaks none of them proves nothing, and fails the run.
 
 ## The offline runner
+
+A scenario with `issues` gets a fake GitHub (`gh api` GETs only) and an `edit-intent` step feeds `intent_change_fact`; `judged` is not evaluated offline.
 
 `bin/test-switchboard` runs every scenario with the `offline` tier against
 stateful fakes of v2 and herdr and a simulated clock: a daemon pass every 5 s,

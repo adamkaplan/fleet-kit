@@ -1,6 +1,6 @@
 ---
 name: fleet-charter
-description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing work as native sub-issues, applying or removing the `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
+description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing asks and work items as native sub-issues (charter -> ask -> work item, with Intent and Done when), applying or removing the `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
 ---
 
 # Fleet Charter Convention
@@ -46,16 +46,40 @@ An issue that names your pane but carries no `<user>:orchestrator` label is not 
 charter. It is one label away from being one, and until that label is on, nothing
 supervising the fleet can see it.
 
-## 2. Sub-issues are your queue
+## 2. Sub-issues are your queue: charter, ask, work item
 
-Every coder assignment is a **native sub-issue** of your charter. Not a checkbox,
-not a comment, not a local todo file.
+Three levels, each a **native sub-issue** of the one above. Not a checkbox, not a
+comment, not a local todo file.
+
+- **Charter** — your standing job. It is the same for every message, so it is
+  never repeated in one.
+- **Ask** — one per request the Chief of Staff hands you: a sub-issue of your
+  charter that opens with an Intent and a Done when.
+- **Work item** — one per coder assignment when you split an ask: a sub-issue of
+  the ask, opening with its own one-line Intent that you write. For a single
+  coder the ask itself can be the work item.
+
+````
+## Intent
+Fix the project agents that show "Agent unavailable" in production.
+Done when: both project agents answer a chat message in production.
+````
+
+The Chief of Staff writes an ask's Intent and Done when at hand-off, in the
+person's terms, and **never widens** them into a general goal or a coverage list:
+Done when is what every report is held to. After that, only the person you report
+to, or the Chief of Staff with their yes, changes either line. You do not edit
+them. If one is wrong or too small, propose the change with
+`fleet-switchboard send <chief-of-staff> --issue <ask> "<proposal>"`, and carry
+on inside the ask as written. The switchboard reads these lines from the issue
+body and heads every message about it with them, so keep them to one Intent line
+and one Done-when line.
 
 ```
 gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
 # sub_issue_id is the issue's DATABASE id, not its number. Fetch it, do not guess:
 id=$(gh api repos/OWNER/REPO/issues/<new-number> --jq .id)
-gh api repos/OWNER/REPO/issues/<charter-number>/sub_issues -F sub_issue_id=$id
+gh api repos/OWNER/REPO/issues/<parent-number>/sub_issues -F sub_issue_id=$id
 ```
 
 This gives a progress rollup for free and makes your queue readable without

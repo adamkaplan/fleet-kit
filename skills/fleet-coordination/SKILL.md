@@ -22,6 +22,7 @@ first one cannot.
 
 ```text
 ISSUE:      <full repository-qualified GitHub issue URL>
+ASK:        <the ask's Intent and Done when, copied verbatim from its issue>
 GOAL:       <the outcome, in one sentence>
 DONE:       <what actually counts as accepted — the test, not the intention>
 SCOPE:      <the work that is included>
@@ -30,6 +31,13 @@ NEXT:       <the next deliverable and who owns it>
 AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
+
+`ASK` carries the Intent and Done when of the ask this assignment serves
+(`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
+charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this
+assignment; they never widen it, and a report is held to the ask's Done when as
+well as to `DONE`. Reports and questions go to the orchestrator with
+`fleet-switchboard send <name> --issue <n> "<text>"`, never by typing into a pane.
 
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
