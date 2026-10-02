@@ -62,3 +62,7 @@ jobs:
       - name: bin/fleet-scenario validate
         if: ${{ !cancelled() }}
         run: bin/fleet-scenario validate
+
+      - name: bin/fleet-scenario coverage
+        if: ${{ !cancelled() }}
+        run: bin/fleet-scenario coverage --enforce --through-pr 4

@@ -35,6 +35,7 @@ import sysconfig
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -152,7 +153,8 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5})
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
+            "worker_lookback_hours": 24})
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -722,7 +724,7 @@ class TestAuditLog(Base):
 
 DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue", "no-batch",
               "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
-              "judge-loosens", "no-maxims")
+              "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion")
 
 
 class TestFaults(Base):
@@ -975,6 +977,7 @@ STEP_EXAMPLES = {
     "message": {"to": "platform", "text": "status?", "lasts": "5s"},
     "draft": {"to": "platform", "text": "half typed"},
     "away": {},
+    "delete-state": {},
     "permission": {"to": "coder", "decision": "always"},
     "comment": {"issue": 2, "body": "looks good"},
     "kill-daemon": {}, "restart-daemon": {}, "wait": {},
@@ -1530,6 +1533,8 @@ class FakeV2:
     def op_session_message_list(self, params, body):
         s = self._session(params)
         messages = list(s["messages"]) if params.get("order") == "asc" else list(reversed(s["messages"]))
+        if "type" in params:
+            messages = [m for m in messages if m["type"] == params["type"]]
         if "limit" in params:
             messages = messages[:int(params["limit"])]
         return copy.deepcopy(messages)
@@ -2033,7 +2038,7 @@ class TestFacts(Base):
         self.assertIn(":2:", str(caught.exception))
 
     def test_the_registration_point_lists_the_lab_source(self):
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts"])
+        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -3496,7 +3501,8 @@ class OfflineRun:
         self.baseline = baseline
         self.work = test.home / "scenario-repo"
         self.work.mkdir(exist_ok=True)
-        self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label)
+        self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
+                           config=scenario.get("config"))
         launched = {step["agent"] for step in scenario["steps"] if step["do"] == "launch"}
         for name, member in sorted(scenario["cast"].items()):
             if name not in launched:  # a launched agent does not exist until `launch` makes it
@@ -3548,6 +3554,8 @@ class OfflineRun:
         elif do == "restart-daemon":
             self.daemon = True
             world.engine = world.new_engine()  # a new process: nothing in memory survives
+        elif do in WORKER_STEPS:
+            apply_worker_step(self, step)
         elif do != "wait":
             raise NotImplementedError("the offline runner does not implement step %r" % do)
 
@@ -3600,6 +3608,8 @@ class OfflineRun:
                  if a["delivered_at"] is not None and _matches(a["keys"], e["key"])]
         if "mode" in e:
             found = [a for a in found if self.mode_of(e["to"], a["id"]) == e["mode"]]
+        if "text" in e:
+            found = [a for a in found if e["text"] in a["text"]]
         keys = {key for a in found for key in a["keys"] if fnmatch.fnmatchcase(key, e["key"])}
         ok = len(found) == e["count"] if "count" in e else bool(found)
         if "keys" in e:
@@ -3709,6 +3719,9 @@ def control_play(test, scenario):
     control = scenario["control"]
     if "fault" in control:
         return OfflineRun(test, scenario, "control", [control["fault"]]).run(), "fault %s" % control["fault"]
+    if control.get("baseline") == "timer-heartbeat":  # the old timer, added to the play (PR 4)
+        return OfflineRun(test, with_baseline(scenario, "timer-heartbeat"), "control").run(), \
+            "baseline timer-heartbeat"
     if "baseline" in control:
         return OfflineRun(test, scenario, "control", baseline=control["baseline"]).run(), \
             "baseline %s" % control["baseline"]
@@ -3959,6 +3972,999 @@ class TestHygiene(unittest.TestCase):
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
         self.assertIn("bin/test-switchboard 2>&1", workflow)
         self.assertIn("run: bin/fleet-scenario validate", workflow)
+
+
+# ======================================================================
+# PR 4: worker events, reminders, toasts and their scenarios
+#
+# Everything below extends the fakes and the offline scenario runner by
+# attachment (`adds_to`), so the shared classes above stay as they were.
+# ======================================================================
+
+def adds_to(cls):
+    """Attach the decorated function to `cls` under its own name."""
+    def attach(function):
+        setattr(cls, function.__name__, function)
+        return function
+    return attach
+
+
+# ---- the fakes learn permission asks and forms
+
+@adds_to(FakeV2)
+def ask_permission(self, sid, action="shell", resources=("echo hi",), timed=False):
+    """A pending permission request, as `session.permission.list` shows it."""
+    asks = self.__dict__.setdefault("asks", {})
+    ask = {"id": self._id("per"), "sessionID": sid, "action": action, "resources": list(resources)}
+    if timed:
+        ask["time"] = {"created": self.clock.ms()}
+    asks.setdefault(sid, []).append(ask)
+    return ask
+
+
+@adds_to(FakeV2)
+def answer_permissions(self, sid):
+    """You answer: the asks go, and the blocked turn goes on to its end."""
+    self.__dict__.setdefault("asks", {}).pop(sid, None)
+    turn = self.sessions[sid]["turn"]
+    if turn is not None:
+        turn["steps"], turn["end"] = [], self.clock.now()
+    self.advance()
+
+
+@adds_to(FakeV2)
+def op_session_permission_list(self, params, body):
+    self._session(params)
+    return copy.deepcopy(self.__dict__.setdefault("asks", {}).get(params["sessionID"], []))
+
+
+@adds_to(FakeV2)
+def op_session_form_list(self, params, body):
+    self._session(params)
+    return copy.deepcopy(self.__dict__.setdefault("forms", {}).get(params["sessionID"], []))
+
+
+class ClosingRunner:
+    """herdr's runner that closes a pane the moment the engine reads it with
+    `agent get`: the pane closes between the decision and the delivery."""
+
+    def __init__(self, herdr, pane):
+        self.herdr, self.pane, self.fired = herdr, pane, False
+
+    def __call__(self, argv, **kwargs):
+        if list(argv[1:3]) == ["agent", "get"] and argv[3:4] == [self.pane] and not self.fired:
+            self.fired = True
+            del self.herdr.panes[self.pane]
+        return self.herdr(argv, **kwargs)
+
+
+# ---- the offline runner learns the PR 4 steps and oracles
+
+WORKER_STEPS = ("away", "permission", "close-pane", "delete-state", "timer-heartbeat")
+HEARTBEAT_EVERY = 30 * 60  # the old timer's cadence, for the Q1 baseline
+
+
+def apply_worker_step(run, step):
+    world, do = run.world, step["do"]
+    if do == "away":
+        return  # you simply prompt nothing more
+    if do == "permission" and step["actor"] != "you":
+        name = step["actor"]  # a turn that cannot finish until you answer
+        world.v2.start_turn(world.sessions[name], "fleet task", fleet=True, lasts=86400)
+        world.v2.ask_permission(world.sessions[name])
+        world.herdr.panes[world.panes[name]]["status"] = "blocked"
+    elif do == "permission":
+        name = step["to"]
+        world.herdr.panes[world.panes[name]]["status"] = None
+        world.v2.answer_permissions(world.sessions[name])
+    elif do == "close-pane":
+        world.engine.herdr.runner = ClosingRunner(world.herdr, world.panes[step["agent"]])
+    elif do == "delete-state":
+        shutil.rmtree(str(world.state))
+        sb.ensure_state_dir(world.state)  # what the next start of the daemon does first
+    else:  # timer-heartbeat: the old fleet-heartbeat wakes each orchestrator whether or not anything happened
+        for name, member in sorted(run.scenario["cast"].items()):
+            if member["role"] in ("orchestrator", "chief-of-staff"):
+                ses = world.sessions[name]
+                keys = ["heartbeat:%s:%d" % (name, world.clock.now())]
+                world.engine.v2.synthetic(ses, "heartbeat: anything new?", {"fleet": {"keys": keys, "from": "fleet-heartbeat"}},
+                                          True, "queue", sb.derive_message_id(ses, keys))
+
+
+def with_baseline(scenario, baseline):
+    """The scenario as the control plays it: itself, or the old timer heartbeat added to it."""
+    if baseline is None:
+        return scenario
+    if baseline != "timer-heartbeat":
+        raise NotImplementedError("the offline runner has no baseline %r" % baseline)
+    played = copy.deepcopy(scenario)
+    end = max(sc.duration_seconds(step["at"]) for step in played["steps"])
+    beats = [{"at": "%ds" % at, "actor": "world", "do": "timer-heartbeat"}
+             for at in range(HEARTBEAT_EVERY, end + 1, HEARTBEAT_EVERY)]
+    played["steps"] = sorted(played["steps"] + beats, key=lambda step: sc.duration_seconds(step["at"]))
+    return played
+
+
+def _toasts(world):
+    shown = []
+    for argv in world.herdr.calls:
+        if argv[1:3] == ["notification", "show"]:
+            shown.append({"title": argv[3], "body": argv[argv.index("--body") + 1] if "--body" in argv else ""})
+    return shown
+
+
+@adds_to(OfflineRun)
+def oracle_toast(self, e):
+    shown = [t for t in _toasts(self.world)
+             if e.get("agent", "") in t["title"] + " " + t["body"] and e.get("text", "") in t["body"]]
+    return bool(shown), "%d matching toast(s) of %d: %s" % (
+        len(shown), len(_toasts(self.world)), [t["title"] for t in shown][:3])
+
+
+@adds_to(OfflineRun)
+def oracle_no_machine_turn(self, e):
+    """A model call a fleet message started: a turn from idle, or a continuation after the final reply,
+    whose last input is a synthetic message or a prompt the fleet sent."""
+    sid = self.world.sessions[e["agent"]]
+    messages = {m["id"]: m for m in self.world.v2.sessions[sid]["messages"]}
+    machine = []
+    for call in self.world.model_calls(e["agent"]):
+        last = messages.get(call["inputs"][-1]["id"]) if call["inputs"] else None
+        if call["phase"] in ("turn_start", "after_reply") and last is not None and (
+                last["type"] == "synthetic" or (last["type"] == "user" and "fleet" in (last.get("metadata") or {}))):
+            machine.append(int(call["at"] - EPOCH))
+    return not machine, "%d model call(s), %d started by a fleet message, at %s s" % (
+        len(self.world.model_calls(e["agent"])), len(machine), machine[:5])
+
+
+@adds_to(OfflineRun)
+def oracle_within(self, e):
+    if "key" not in e:
+        raise NotImplementedError("the offline runner's `within` needs a key")
+    step_at = EPOCH + sc.duration_seconds(self.scenario["steps"][e["step"]]["at"])
+    found = [a for a in self.world.admissions(e["agent"]) if a["delivered_at"] is not None and _matches(a["keys"], e["key"])]
+    if not found:
+        return False, "no message with key %r was delivered" % e["key"]
+    answered = [c["at"] for c in self.world.model_calls(e["agent"])
+                if any(i["id"] == found[0]["id"] for i in c["inputs"])]
+    delivered = found[0]["delivered_at"] - step_at
+    took = min(answered) - step_at if answered else None
+    return (took is not None and delivered <= e["seconds"] and took <= e["seconds"],
+            "delivered %.0f s and answered %s s after step %d (limit %g s)" % (
+                delivered, "never" if took is None else "%.0f" % took, e["step"], e["seconds"]))
+
+
+# ---- worker facts
+
+class PR4Base(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = self.make_world()
+        self.coder = self.world.sessions["coder"]
+
+    def make_world(self, **kwargs):
+        world = World(self, agents=("platform",), **kwargs)
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "platform", "issue": 2})
+        return world
+
+    def source(self, kind=None):
+        return next(s for s in self.world.engine.sources if isinstance(s, kind or sb.WorkerFacts))
+
+    def derive(self, world=None):
+        world = world or self.world
+        world.engine.discover(world.clock.now())
+        return next(s for s in world.engine.sources if isinstance(s, sb.WorkerFacts))()
+
+    def finish_turn(self, name="coder", lasts=0):
+        self.world.v2.start_turn(self.world.sessions[name], "fleet task", fleet=True, lasts=lasts)
+
+    def block(self, name="coder", **kwargs):
+        self.world.v2.start_turn(self.world.sessions[name], "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes[name]]["status"] = "blocked"
+        return self.world.v2.ask_permission(self.world.sessions[name], **kwargs)
+
+    def toasts(self):
+        return _toasts(self.world)
+
+
+class TestWorkerIdleFacts(PR4Base):
+    def test_a_finished_worker_is_a_fact_for_the_one_it_reports_to(self):
+        self.finish_turn()
+        (found,) = self.derive()
+        self.assertEqual(found.key, "worker.idle:%s:%d" % (self.coder, EPOCH * 1000))
+        self.assertEqual((found.recipient, found.kind, found.issue, found.sender), ("platform", "worker.idle", 2, "coder"))
+        self.assertEqual(found.created, EPOCH)
+        self.assertIn("coder finished its turn (success): reply", found.summary)
+
+    def test_deriving_again_gives_the_same_facts_and_writes_nothing(self):
+        self.finish_turn()
+        first = [f.to_json() for f in self.derive()]
+        self.world.tick(30)
+        self.assertEqual([f.to_json() for f in self.derive()], first)
+        self.assertEqual(self.world.v2.writes, [])
+        self.assertEqual(self.world.audit(), [])
+
+    def test_each_turn_has_its_own_key(self):
+        self.finish_turn()
+        (one,) = self.derive()
+        self.world.tick(60)
+        self.finish_turn()
+        (two,) = self.derive()
+        self.assertNotEqual(one.key, two.key)
+
+    def test_a_completion_older_than_the_look_back_is_not_news(self):
+        self.finish_turn()
+        self.world.clock.t += 25 * 3600
+        self.assertEqual(self.derive(), [])
+
+    def test_the_look_back_is_configurable(self):
+        world = self.make_world(config={"worker_lookback_hours": 48})
+        world.v2.start_turn(world.sessions["coder"], "fleet task", fleet=True)
+        world.clock.t += 25 * 3600
+        self.assertEqual(len(self.derive(world)), 1)
+        world.clock.t += 24 * 3600
+        self.assertEqual(self.derive(world), [])
+
+    def test_the_look_back_must_be_a_positive_number(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"worker_lookback_hours": 0})
+
+    def test_a_worker_that_is_working_or_blocked_is_not_idle(self):
+        self.finish_turn()
+        self.world.tick(5)
+        self.finish_turn(lasts=100)
+        self.assertEqual(self.derive(), [])
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = "blocked"
+        self.assertEqual(self.derive(), [])
+
+    def test_only_agents_with_a_reports_to_are_workers(self):
+        self.finish_turn("platform")
+        self.assertEqual(self.derive(), [])
+        world = World(self, agents=(), state=self.home / "other-state")
+        world.add_agent("loner", fleet={"reports_to": "loner"})
+        world.v2.start_turn(world.sessions["loner"], "fleet task", fleet=True)
+        self.assertEqual(self.derive(world), [])
+
+    def test_an_ambiguous_worker_is_skipped(self):
+        self.finish_turn()
+        twin = self.world.add_agent("twin", fleet={"reports_to": "platform"})
+        self.world.v2.sessions[twin]["metadata"]["fleet"]["name"] = "coder"
+        self.world.v2.start_turn(twin, "fleet task", fleet=True)
+        self.assertEqual(self.derive(), [])
+
+    def test_the_summary_is_the_last_reply_cut_short_and_read_once_per_turn(self):
+        self.finish_turn()
+        self.world.v2.sessions[self.coder]["messages"][-1]["text"] = "word " * 400
+        (found,) = self.derive()
+        self.assertLessEqual(len(found.summary), len("coder finished its turn (success): ") + sb.SUMMARY_CAP)
+        self.assertTrue(found.summary.endswith("\u2026"))
+        self.derive()
+        reads = [c for c in self.world.v2.calls if "type=assistant" in c and "sessionID=" + self.coder in c]
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reply_in_content_parts_is_read_too(self):
+        self.finish_turn()
+        message = self.world.v2.sessions[self.coder]["messages"][-1]
+        message.pop("text")
+        message["content"] = [{"type": "text", "text": "PONG"}, {"type": "tool"}]
+        (found,) = self.derive()
+        self.assertTrue(found.summary.endswith(": PONG"))
+
+    def test_one_workers_trouble_never_hides_another(self):
+        self.finish_turn()
+        other = self.world.add_agent("coder2", fleet={"reports_to": "platform"})
+        self.world.v2.start_turn(other, "fleet task", fleet=True)
+        real = self.world.engine.v2.message_list
+
+        def flaky(session_id, **kwargs):
+            if session_id == self.coder and kwargs.get("type") == "assistant":
+                raise sb.V2Error("timeout", None, "slow")
+            return real(session_id, **kwargs)
+
+        with mock.patch.object(self.world.engine.v2, "message_list", flaky):
+            facts = self.derive()
+        self.assertEqual([f.sender for f in facts], ["coder2"])
+        self.assertIn("source.error", [e["event"] for e in self.world.audit()])
+
+    def test_the_worker_source_is_the_one_a_fault_removes(self):
+        self.finish_turn()
+        os.environ[sb.FAULT_ENV] = "no-worker-source"
+        self.assertEqual(self.derive(), [])
+        os.environ.pop(sb.FAULT_ENV)
+        self.assertEqual(len(self.derive()), 1)
+
+    def test_the_lab_can_ignore_what_happened_before_a_play(self):
+        self.finish_turn()
+        os.environ[sb.LAB_WORKER_SINCE_ENV] = str(EPOCH + 10)
+        self.assertEqual(self.derive(), [])
+        os.environ[sb.LAB_WORKER_SINCE_ENV] = str(EPOCH - 10)
+        self.assertEqual(len(self.derive()), 1)
+        os.environ[sb.LAB_WORKER_SINCE_ENV] = "soon"
+        with self.assertRaises(sb.FactError):
+            self.derive()
+
+    def test_outside_the_lab_the_since_variable_is_ignored(self):
+        self.finish_turn()
+        os.environ.pop(sb.LAB_ENV)
+        os.environ[sb.LAB_WORKER_SINCE_ENV] = str(EPOCH + 10)
+        self.assertEqual(len(self.derive()), 1)
+
+    def test_a_read_only_engine_derives_without_writing(self):
+        self.finish_turn()
+        engine = self.world.new_engine(writable=False)
+        engine.discover(self.world.clock.now())
+        self.assertEqual(len(engine.collect_facts()[0]), 1)
+        self.assertEqual(self.world.v2.writes, [])
+
+
+class TestWorkerDelivery(PR4Base):
+    def test_a_worker_finishing_is_delivered_once_as_a_wake_with_its_issue(self):
+        self.finish_turn()
+        self.world.tick(90)
+        report = self.world.engine.run_pass()
+        self.assertEqual([s["action"] for s in report["sent"]], ["wake"])
+        (message,) = self.world.admissions("platform")
+        self.assertEqual(message["keys"], ["worker.idle:%s:%d" % (self.coder, EPOCH * 1000)])
+        self.assertIn("(issue #2)", message["text"])
+        self.assertIn("worker.idle from coder", message["text"])
+        for _ in range(3):
+            self.world.tick(5)
+            self.assertEqual(self.world.engine.run_pass()["sent"], [])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def test_a_restarted_daemon_does_not_resend_what_the_transcript_holds(self):
+        self.finish_turn()
+        self.world.tick(90)
+        self.world.engine.run_pass()
+        self.world.engine = self.world.new_engine()
+        self.world.tick(30)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def worker_keys_sent(self):
+        return [k for a in self.world.admissions("platform") for k in a["keys"] if k.startswith("worker.idle")]
+
+    def deliver_then_a_later_fact(self, fault=None):
+        self.finish_turn()
+        self.world.tick(90)
+        self.world.engine.run_pass()
+        self.world.fact("platform", "lab.fact:later")
+        self.world.tick(90)
+        if fault:
+            os.environ[sb.FAULT_ENV] = fault
+        self.world.engine.run_pass()
+
+    def test_a_key_in_the_transcript_is_never_sent_again_in_a_later_message(self):
+        self.deliver_then_a_later_fact()
+        self.assertEqual(len(self.worker_keys_sent()), 1)
+
+    def test_without_that_check_the_later_message_carries_it_again(self):
+        self.deliver_then_a_later_fact("no-dedupe")
+        self.assertEqual(len(self.worker_keys_sent()), 2)
+
+    def test_an_orchestrator_that_is_gone_holds_the_item(self):
+        self.finish_turn()
+        del self.world.herdr.panes[self.world.panes["platform"]]
+        self.world.tick(90)
+        report = self.world.engine.run_pass()
+        self.assertEqual(report["sent"], [])
+        self.assertEqual(report["held"][0]["recipient"], "platform")
+
+    def test_engaged_with_the_orchestrator_the_item_is_a_note(self):
+        self.world.you("platform")
+        self.finish_turn()
+        self.world.tick(90)
+        self.assertEqual([s["action"] for s in self.world.engine.run_pass()["sent"]], ["note"])
+        self.assertEqual(self.world.model_calls("platform", "turn_start")[-1]["inputs"][0]["type"], "user")
+
+    def test_a_long_transcript_does_not_hide_an_old_delivery(self):
+        # Only synthetic messages are read for keys, so chatter cannot push a delivery out of the read.
+        self.finish_turn()
+        self.world.tick(90)
+        self.world.engine.run_pass()
+        for n in range(sb.READ_LIMIT + 20):
+            self.world.v2._message(self.world.v2.sessions[self.world.sessions["platform"]], "assistant", "chat", None,
+                                   self.world.clock.now())
+        self.world.tick(5)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+        self.assertEqual(self.world.engine.run_pass()["held"], [])
+        reads = [c for c in self.world.v2.calls if "type=synthetic" in c]
+        self.assertTrue(reads)
+
+
+class TestWorkerBlockedFacts(PR4Base):
+    def test_a_pending_permission_request_is_a_blocked_fact(self):
+        ask = self.block()
+        (found,) = self.derive()
+        self.assertEqual(found.key, "worker.blocked:%s:%s" % (self.coder, ask["id"]))
+        self.assertEqual((found.recipient, found.kind, found.issue, found.sender, found.batch),
+                         ("platform", "worker.blocked", 2, "coder", False))
+        self.assertIn("shell echo hi", found.summary)
+
+    def test_a_request_with_its_time_is_batched_from_that_time(self):
+        self.block(timed=True)
+        (found,) = self.derive()
+        self.assertTrue(found.batch)
+        self.assertEqual(found.created, EPOCH)
+
+    def test_only_a_blocked_worker_is_asked(self):
+        self.world.v2.ask_permission(self.coder)  # herdr says idle: nothing is read
+        self.assertEqual(self.derive(), [])
+        self.assertFalse([c for c in self.world.v2.calls if "session.permission.list" in c])
+
+    def test_when_you_answer_the_fact_is_gone(self):
+        self.block()
+        self.assertEqual(len(self.derive()), 1)
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = None
+        self.world.v2.answer_permissions(self.coder)
+        kinds = [f.kind for f in self.derive()]
+        self.assertEqual(kinds, ["worker.idle"])
+
+    def test_the_blocked_fact_reaches_the_orchestrator_at_once_and_the_human_gets_one_toast(self):
+        self.block()
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        (toast,) = self.toasts()
+        self.assertIn("coder", toast["title"])
+        self.assertIn("shell echo hi", toast["body"])
+        self.assertIn("issue #2", toast["body"])
+        for _ in range(3):
+            self.world.tick(5)
+            self.world.engine.run_pass()
+        self.assertEqual(len(self.toasts()), 1, "once per request, not once per pass")
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"] == "herdr.notification"]
+        self.assertEqual(events, [("herdr.notification", "intent"), ("herdr.notification", "result")])
+
+    def test_a_new_request_after_the_answer_is_a_new_toast(self):
+        self.block()
+        self.world.engine.run_pass()
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = None
+        self.world.v2.answer_permissions(self.coder)
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.block()
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.toasts()), 2)
+
+    def test_a_toast_that_failed_is_tried_again_next_pass(self):
+        self.block()
+        failing = mock.patch.object(self.world.engine.herdr, "notification_show",
+                                    side_effect=[sb.HerdrError("exit", "no ui"), {"shown": True, "reason": None}])
+        with failing as shown:
+            self.world.engine.run_pass()
+            self.world.tick(5)
+            self.world.engine.run_pass()
+            self.world.tick(5)
+            self.world.engine.run_pass()
+        self.assertEqual(shown.call_count, 2)
+        results = [e["ok"] for e in self.world.audit() if e["event"] == "herdr.notification" and e["phase"] == "result"]
+        self.assertEqual(results, [False, True])
+
+    def test_a_read_only_engine_never_toasts(self):
+        self.block()
+        engine = self.world.new_engine(writable=False)
+        engine.run_pass()
+        self.assertEqual(self.toasts(), [])
+
+    def test_there_is_one_toast_path_the_render_step(self):
+        """PR 3's render owns every toast; a second mechanism would be a second way to do it."""
+        source = SWITCHBOARD.read_text()
+        self.assertNotIn("ToastBoard", source)
+        calls = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr == "notification_show"]
+        self.assertEqual(len(calls), 1, "only render_toast asks herdr for a toast")
+
+    def test_a_reason_toasts_once_and_toasts_again_after_it_lapses(self):
+        ask = self.block()
+        self.world.engine.run_pass()
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.toasts()), 1, "a steady reason is toasted once")
+        self.world.v2.answer_permissions(self.world.sessions["coder"])
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = None
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.world.tick(5)
+        self.block()
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.toasts()), 2, "the reason came back after it lapsed")
+
+    def test_questions_are_blocked_facts_too(self):
+        self.block()
+        self.world.v2.__dict__.setdefault("forms", {})[self.coder] = [{"id": "frm_1", "title": "Which database?"}]
+        found = self.derive()
+        self.assertEqual(len(found), 2)
+        question = next(f for f in found if f.key.endswith(":frm_1"))
+        self.assertIn("question", question.summary)
+        self.assertIn("Which database?", question.summary)
+
+    def test_a_v2_without_the_form_operation_is_asked_once(self):
+        self.block()
+        with mock.patch.object(FakeV2, "op_session_form_list", None):
+            self.assertEqual(len(self.derive()), 1)
+            self.derive()
+            self.derive()
+        self.assertTrue(self.source()._no_forms)
+        self.assertEqual(len([c for c in self.world.v2.calls if "session.form.list" in c]), 1)
+
+    def test_one_workers_permission_failure_never_hides_another(self):
+        self.block()
+        other = self.world.add_agent("coder2", fleet={"reports_to": "platform"})
+        self.world.v2.start_turn(other, "fleet task", fleet=True)
+        real = self.world.engine.v2.permission_list
+
+        def failing(session_id):
+            raise sb.V2Error("timeout", None, "slow")
+
+        with mock.patch.object(self.world.engine.v2, "permission_list", failing):
+            facts = self.derive()
+        self.assertEqual([f.sender for f in facts], ["coder2"])
+        self.assertEqual(self.source().toasts(), [])
+
+
+class TestV2ClientPR4(Base):
+    def test_argv_of_the_two_new_reads(self):
+        for call, op in ((lambda c: c.permission_list(SES), "session.permission.list"),
+                         (lambda c: c.form_list(SES), "session.form.list")):
+            runner = FakeRunner()
+            call(sb.V2Client("/opt/lab/bin/opencode", {}, runner, 7))
+            self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api", op, "--param", "sessionID=" + SES])
+        self.assertEqual(class_source("V2Client").count("self.runner("), 1)
+
+
+class TestUnreachableToast(PR4Base):
+    def close_before_the_recheck(self):
+        self.world.engine.herdr.runner = ClosingRunner(self.world.herdr, self.world.panes["platform"])
+
+    def test_a_pane_closed_between_deciding_and_delivering_holds_and_toasts(self):
+        self.finish_turn()
+        self.world.tick(90)
+        self.close_before_the_recheck()
+        report = self.world.engine.run_pass()
+        self.assertEqual((report["sent"], self.world.admissions("platform")), ([], []))
+        (toast,) = self.toasts()
+        self.assertIn("platform", toast["title"])
+        self.assertIn("nothing sent", toast["body"])
+        self.assertIn("recheck", [e["event"] for e in self.world.audit()])
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.toasts()), 1, "later passes hold quietly")
+
+    def test_without_the_recheck_it_is_sent_anyway(self):
+        self.finish_turn()
+        self.world.tick(90)
+        self.close_before_the_recheck()
+        os.environ[sb.FAULT_ENV] = "no-recheck"
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.toasts(), [])
+
+    def test_a_recheck_that_found_the_agent_busy_again_is_not_a_toast(self):
+        self.finish_turn()
+        self.world.tick(90)
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = None
+        real = self.world.engine.reobserve
+
+        def blocked_now(previous, now):
+            fresh, why = real(previous, now)
+            fresh.status = "blocked"
+            return fresh, why
+
+        with mock.patch.object(self.world.engine, "reobserve", blocked_now):
+            self.world.engine.run_pass()
+        self.assertEqual(self.toasts(), [])
+
+
+class TestNoteConversionFault(Base):
+    def test_the_fault_leaves_the_note_waiting(self):
+        world = World(self, agents=("platform",))
+        world.you("platform")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        world.engine.run_pass()
+        world.tick(600)
+        os.environ[sb.FAULT_ENV] = "no-note-conversion"
+        self.assertEqual(world.engine.run_pass()["converted"], [])
+        os.environ.pop(sb.FAULT_ENV)
+        self.assertEqual(len(world.engine.run_pass()["converted"]), 1)
+
+
+# ---- reminders
+
+class TestReminders(PR4Base):
+    def remind(self, to="platform", delay=600, text="look at the build", **kwargs):
+        return sb.add_reminder(self.world.state, to, self.world.clock.now() + delay, self.world.clock.now(),
+                               text, **kwargs)
+
+    def reminder_facts(self):
+        return self.source(sb.ReminderFacts)()
+
+    def test_when_is_a_delay_or_a_zoned_time(self):
+        self.assertEqual(sb.parse_when("30m", 100), 100 + 1800)
+        self.assertEqual(sb.parse_when("+2h", 0), 7200)
+        self.assertEqual(sb.parse_when("1d", 0), 86400)
+        self.assertEqual(sb.parse_when("45s", 5), 50)
+        self.assertEqual(sb.parse_when("2030-01-02T09:00:00Z", 0), 1893574800.0)
+        self.assertEqual(sb.parse_when("2030-01-02T10:00:00+01:00", 0), 1893574800.0)
+        for bad in ("soon", "30", "30x", "2030-01-02T09:00:00", "-5m", ""):
+            with self.subTest(bad=bad), self.assertRaises(sb.ReminderError):
+                sb.parse_when(bad, 0)
+
+    def test_the_file_is_private_and_written_whole(self):
+        self.remind()
+        path = self.world.state / sb.REMINDERS
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(len(json.loads(path.read_text())["reminders"]), 1)
+        self.assertEqual([p.name for p in self.world.state.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(self):
+        self.remind(text="first")
+        path = self.world.state / sb.REMINDERS
+        before = path.read_text()
+        with mock.patch.object(sb.json, "dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.remind(text="second")
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual([p.name for p in self.world.state.iterdir() if ".tmp" in p.name], [])
+
+    def test_a_reminder_is_a_fact_only_once_it_is_due(self):
+        self.remind(delay=600, issue=2, sender="coder")
+        self.assertEqual(self.reminder_facts(), [])
+        self.world.tick(600)
+        (found,) = self.reminder_facts()
+        self.assertTrue(found.key.startswith("reminder:"))
+        self.assertEqual((found.recipient, found.kind, found.issue, found.sender, found.batch, found.created),
+                         ("platform", "reminder", 2, "coder", False, EPOCH + 600))
+        self.assertEqual(found.summary, "look at the build")
+
+    def test_a_due_reminder_is_delivered_then_pruned_once_it_is_in_the_transcript(self):
+        item = self.remind(delay=10)
+        self.world.tick(10)
+        report = self.world.engine.run_pass()
+        self.assertEqual(len(report["sent"]), 1)
+        (message,) = self.world.admissions("platform")
+        self.assertEqual(message["keys"], ["reminder:" + item["id"]])
+        self.assertEqual(sb.read_reminders(self.world.state), [], "pruned in the pass that saw it delivered")
+        self.assertIn("reminder.prune", [e["event"] for e in self.world.audit()])
+        self.world.tick(5)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+
+    def test_a_reminder_stays_until_it_is_delivered(self):
+        self.remind(delay=10)
+        del self.world.herdr.panes[self.world.panes["platform"]]
+        self.world.tick(10)
+        self.world.engine.run_pass()
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+
+    def test_pruning_removes_only_the_delivered_ones(self):
+        one, two = self.remind(delay=10), self.remind(to="coder", delay=10)
+        self.world.tick(10)
+        del self.world.herdr.panes[self.world.panes["coder"]]
+        self.world.engine.run_pass()
+        self.assertEqual([r["id"] for r in sb.read_reminders(self.world.state)], [two["id"]])
+
+    def test_a_crash_between_delivery_and_pruning_sends_nothing_twice(self):
+        item = self.remind(delay=10)
+        self.world.tick(10)
+        with mock.patch.object(sb, "prune_delivered_reminders", side_effect=RuntimeError("killed")):
+            self.world.engine.run_pass()
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+        self.world.engine = self.world.new_engine()
+        self.world.tick(5)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def test_a_corrupt_file_is_reported_and_never_overwritten(self):
+        path = self.world.state / sb.REMINDERS
+        path.write_text("{not json")
+        self.assertEqual(self.world.engine.collect_facts()[1][0].split(":")[0], "reminder_facts")
+        self.assertIn("source.error", [e["event"] for e in self.world.audit()])
+        with self.assertRaises(sb.ReminderError):
+            self.remind()
+        self.assertEqual(path.read_text(), "{not json")
+
+    def test_a_reminder_needs_a_recipient_and_text(self):
+        for to, text in (("", "x"), ("platform", "  ")):
+            with self.assertRaises(sb.ReminderError):
+                sb.add_reminder(self.world.state, to, 1, 0, text)
+
+    def test_deleting_the_state_directory_loses_the_audit_and_reminders_not_yet_due_and_nothing_else(self):
+        self.finish_turn()
+        self.remind(delay=3600)
+        self.world.tick(60)
+        self.world.engine.run_pass()      # nothing is due yet
+        self.world.engine.audit.append("daemon", "note", None, {"n": 1})
+        self.assertTrue(self.world.audit())
+        shutil.rmtree(str(self.world.state))
+        sb.ensure_state_dir(self.world.state)
+        self.world.engine = self.world.new_engine()
+        self.world.tick(60)
+        report = self.world.engine.run_pass()
+        self.assertEqual(len(report["sent"]), 1, "the worker's finished turn is still delivered")
+        self.world.tick(5)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(sb.read_reminders(self.world.state), [], "the reminder is the loss")
+        self.world.tick(3600)
+        self.assertEqual(self.world.engine.run_pass()["sent"], [])
+
+
+class TestRemindCLI(PR4Base):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.state_dir = self.world.state
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), self.world.route, self.world.clock.now, lambda s: None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_remind_stores_one_reminder_and_audits_it(self):
+        code, out, err = self.main("remind", "platform", "30m", "--issue", "2", "--from", "coder", "check", "the", "build")
+        self.assertEqual(code, 0, err)
+        (item,) = sb.read_reminders(self.world.state)
+        self.assertEqual((item["to"], item["text"], item["issue"], item["from"], item["at"]),
+                         ("platform", "check the build", 2, "coder", EPOCH + 1800))
+        self.assertEqual(out.strip(), item["id"])
+        self.assertIn("reminder.add", [e["event"] for e in self.world.audit()])
+
+    def test_remind_identifies_the_caller_by_its_pane(self):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        code, _, err = self.main("remind", "platform", "1h", "later")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sb.read_reminders(self.world.state)[0]["from"], "coder")
+
+    def test_from_is_only_for_the_lab(self):
+        os.environ.pop(sb.LAB_ENV)
+        code, _, err = self.main("remind", "platform", "1h", "--from", "coder", "later")
+        self.assertEqual(code, 2)
+        self.assertIn("only for the Lab", err)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_a_bad_when_is_one_line_and_stores_nothing(self):
+        code, _, err = self.main("remind", "platform", "tomorrow-ish", "--from", "coder", "later")
+        self.assertEqual(code, 1)
+        self.assertIn("when must be", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_without_a_pane_it_says_so(self):
+        code, _, err = self.main("remind", "platform", "1h", "later")
+        self.assertEqual(code, 1)
+        self.assertIn("HERDR_PANE_ID", err)
+
+
+# ---- the scenarios and the validator
+
+PR4_CATALOG = {"N1": 3, "N2": 3, "W1": 4, "W3": 4, "Q1": 3, "R1": 4, "H1": None, "R3": None}
+
+
+class TestScenarioVocabularyPR4(Base):
+    def put(self, name, obj, directory=None):
+        directory = directory or (self.home / "scenarios")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(json.dumps(obj))
+        return path
+
+    def test_a_scenario_may_shorten_the_engine_timing(self):
+        scenario = mutate(lambda o: o.update(config={"engaged_minutes": 3, "batch_seconds": 30}))
+        self.assertEqual(sc.validate(scenario), [])
+
+    def test_bad_config_is_refused_field_by_field(self):
+        for config, word in (({}, "non-empty"), ([], "non-empty"), ({"poll_seconds": 5}, "unknown key"),
+                             ({"engaged_minutes": 0}, "engaged_minutes"), ({"batch_seconds": "90"}, "batch_seconds"),
+                             ({"engaged_minutes": True}, "engaged_minutes")):
+            with self.subTest(config=config):
+                errors = sc.validate(mutate(lambda o, c=config: o.update(config=c)))
+                self.assertTrue(any(word in e for e in errors), errors)
+
+    def test_every_config_key_is_one_the_engine_reads(self):
+        self.assertLessEqual(set(sc.CONFIG_KEYS), set(sb.DEFAULTS))
+
+    def test_delete_state_is_a_world_step_without_fields(self):
+        step = {"at": "100h", "actor": "world", "do": "delete-state"}
+        self.assertEqual(sc.validate(mutate(lambda o: o["steps"].append(step))), [])
+        errors = sc.validate(mutate(lambda o: o["steps"].append(dict(step, actor="you"))))
+        self.assertTrue(any("cannot delete-state" in e for e in errors), errors)
+        errors = sc.validate(mutate(lambda o: o["steps"].append(dict(step, path="/"))))
+        self.assertTrue(any("unknown field" in e for e in errors), errors)
+
+    def test_delivered_may_name_text_it_must_carry(self):
+        self.assertEqual(sc.validate(mutate(lambda o: o["expect"][0].update(text="issue #2"))), [])
+        self.assertTrue(sc.validate(mutate(lambda o: o["expect"][0].update(text=2))))
+
+    def test_coverage_through_a_pr_enforces_only_the_problems_due_by_then(self):
+        directory = self.home / "scenarios"
+        self.put("a.json", mutate(lambda o: o.update(id="A1", problem=3)))
+        run = lambda *a: self.run_cli(SCENARIO, "coverage", "--dir", str(directory), *a)
+        self.assertEqual(run("--enforce", "--through-pr", "2").returncode, 0)
+        late = run("--enforce", "--through-pr", "4")
+        self.assertEqual(late.returncode, 1)
+        self.assertIn("problem(s) 4", late.stderr)
+        self.assertEqual(run("--enforce").returncode, 1)
+        self.assertIn("not due until PR 4", run("--through-pr", "2").stdout)
+        self.put("b.json", mutate(lambda o: o.update(id="B1", problem=4)))
+        self.assertEqual(run("--enforce", "--through-pr", "4").returncode, 0)
+        self.assertEqual(run("--enforce", "--through-pr", "7").returncode, 1)
+
+    def test_the_repo_covers_problems_3_and_4_by_pr_4(self):
+        proc = self.run_cli(SCENARIO, "coverage", "--enforce", "--through-pr", "4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.run_cli(SCENARIO, "coverage", "--enforce", "--through-pr", "1").returncode, 0)
+
+    def test_due_prs_follow_the_catalog(self):
+        self.assertEqual(set(sc.PROBLEM_DUE_PR), set(sc.PROBLEMS))
+        found = sc.load_dir()
+        firsts = [s["since_pr"] for s in found if s["problem"] == 4]
+        self.assertEqual(min(firsts), sc.PROBLEM_DUE_PR[4])
+
+
+class TestPR4Catalog(unittest.TestCase):
+    def test_every_catalog_row_is_present_with_its_control(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, problem in PR4_CATALOG.items():
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 4)
+                self.assertEqual(found[sid]["problem"], problem)
+                self.assertIn("offline", found[sid]["tiers"])
+                self.assertTrue(set(found[sid]["control"]) & {"fault", "baseline"})
+
+    def test_the_lab_tier_can_play_every_scenario_that_claims_it(self):
+        lab = _load("t_proof_pr4", BIN / "proof-switchboard")
+        fs = lab.fleet_scenario()
+        for path in sc.scenario_files(sc.DEFAULT_DIR):
+            scenario = sc.load(path)
+            if "lab-scripted" in scenario["tiers"] and scenario["since_pr"] >= 4:
+                with self.subTest(scenario=scenario["id"]):
+                    self.assertEqual(lab.unsupported(scenario, fs), [])
+                    self.assertTrue(lab.uses_engine(scenario))
+
+    def test_the_two_hour_scenario_is_offline_only_for_now(self):
+        self.assertEqual(sc.load(sc.DEFAULT_DIR / "q1-quiet-two-hours.json")["tiers"], ["offline"])
+
+
+class TestOfflineScenariosPR4(Base):
+    def run_named(self, name, edit=None):
+        scenario = sc.load(sc.DEFAULT_DIR / name)
+        if edit:
+            edit(scenario)
+        return run_scenario(self, scenario)
+
+    def test_the_baseline_is_the_old_timer_not_a_fault(self):
+        scenario = sc.load(sc.DEFAULT_DIR / "q1-quiet-two-hours.json")
+        played = with_baseline(scenario, "timer-heartbeat")
+        beats = [s for s in played["steps"] if s["do"] == "timer-heartbeat"]
+        self.assertEqual([sc.duration_seconds(s["at"]) for s in beats], [1800, 3600, 5400, 7200])
+        self.assertEqual(with_baseline(scenario, None), scenario)
+        with self.assertRaises(NotImplementedError):
+            with_baseline(scenario, "something-else")
+
+    def test_a_quiet_two_hours_fails_under_the_old_timer_and_passes_without_it(self):
+        report = self.run_named("q1-quiet-two-hours.json")
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["proves_nothing"], [])
+        self.assertFalse(next(r for r in report["control"] if r["label"] == "no-turns")["ok"])
+
+    def test_n2_converts_the_note_and_its_control_leaves_it_waiting(self):
+        report = self.run_named("n2-note-outlives-you.json")
+        self.assertEqual(report["failures"], [])
+        self.assertFalse(next(r for r in report["control"] if r["label"] == "converted")["ok"])
+
+    def test_n1_with_the_gate_removed_wakes_the_orchestrator(self):
+        report = self.run_named("n1-note-while-engaged.json")
+        control = {r["label"]: r["ok"] for r in report["control"]}
+        self.assertFalse(control["no-machine-turn"])
+        self.assertFalse(control["noted"])
+
+    def test_the_scenario_config_reaches_the_engine(self):
+        scenario = sc.load(sc.DEFAULT_DIR / "n2-note-outlives-you.json")
+        run = OfflineRun(self, scenario, "probe")
+        self.assertEqual(run.world.engine.engaged_seconds, scenario["config"]["engaged_minutes"] * 60)
+
+    def test_the_within_oracle_judges_delivery_and_answer_against_a_step(self):
+        scenario = sc.load(sc.DEFAULT_DIR / "w1-worker-done-away.json")
+        run = OfflineRun(self, scenario, "within").run()
+        e = {"that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.idle:*"}
+        self.assertTrue(run.oracle_within(e)[0])
+        self.assertFalse(run.oracle_within(dict(e, seconds=60))[0], "batching alone takes 90 s")
+        self.assertFalse(run.oracle_within(dict(e, key="nothing:*"))[0])
+        with self.assertRaises(NotImplementedError):
+            run.oracle_within({k: v for k, v in e.items() if k != "key"})
+
+    def test_the_toast_oracle_matches_agent_and_text(self):
+        scenario = sc.load(sc.DEFAULT_DIR / "w3-worker-blocked.json")
+        run = OfflineRun(self, scenario, "toast").run()
+        self.assertTrue(run.oracle_toast({"that": "toast", "agent": "coder", "text": "shell"})[0])
+        self.assertFalse(run.oracle_toast({"that": "toast", "agent": "platform"})[0])
+        self.assertFalse(run.oracle_toast({"that": "toast", "text": "no such words"})[0])
+
+    def test_the_lab_toast_oracle_reads_the_argv_the_real_client_writes(self):
+        """The shim logs the argv the engine's HerdrClient built; the Lab oracle must read that shape."""
+        lab = _load("t_proof_toast", BIN / "proof-switchboard")
+        runner = FakeRunner((0, '{"result": {"type": "notification_show", "shown": true, "reason": "shown"}}', ""))
+        sb.HerdrClient("herdr", runner, 5).notification_show("Fleet: coder is blocked", "coder is waiting: shell")
+        engine = types.SimpleNamespace(shim_log=lambda: [{"kind": "toast", "argv": runner.argv[1:]}])
+        run = types.SimpleNamespace(engine=engine)
+        for item, want in (({"agent": "coder", "text": "waiting"}, True), ({"text": "is blocked"}, True),
+                           ({"agent": "platform"}, False), ({"text": "no such words"}, False)):
+            self.assertEqual(lab.ScenarioRun.check_toast(run, item)[0], want, item)
+
+    def test_no_machine_turn_sees_a_wake_and_ignores_a_note_and_your_prompt(self):
+        world = World(self, agents=("platform",))
+        run = type("Run", (), {})()
+        run.world = world
+        check = lambda: OfflineRun.oracle_no_machine_turn(run, {"agent": "platform"})[0]
+        world.you("platform")
+        self.assertTrue(check())
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        world.engine.run_pass()   # a note: you are engaged
+        self.assertTrue(check())
+        world.tick(700)
+        world.engine.run_pass()   # converted to a wake
+        self.assertFalse(check())
+
+    def test_h1_closes_the_pane_in_the_race_and_every_write_is_audited(self):
+        report = self.run_named("h1-pane-closed-mid-delivery.json")
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["implicit"], [])
+
+
+# ---- the Lab runner's herdr shim (the Lab itself cannot run here)
+
+class TestLabHerdrShim(Base):
+    def setUp(self):
+        super().setUp()
+        self.lab = _load("t_proof_shim", BIN / "proof-switchboard")
+        self.real = self.fake_bin("real-herdr", 'echo "$@" >> "$0.calls"; echo \'{"result": {}}\'\n')
+        self.shim = self.home / "herdr-shim"
+        self.lab.write_herdr_shim(str(self.shim), str(self.home), str(self.real))
+
+    def run_shim(self, *args):
+        return subprocess.run([str(self.shim), *args], capture_output=True, text=True, env=dict(os.environ))
+
+    def calls(self):
+        path = Path(str(self.real) + ".calls")
+        return path.read_text().splitlines() if path.exists() else []
+
+    def log(self):
+        path = self.home / self.lab.SHIM_LOG
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_it_passes_everything_through_untouched(self):
+        proc = self.run_shim("agent", "list")
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, '{"result": {}}'))
+        self.assertEqual(self.calls(), ["agent list"])
+        self.assertEqual(self.log(), [])
+
+    def test_it_records_each_toast_it_is_asked_for_and_still_passes_it_on(self):
+        self.run_shim("notification", "show", "--title", "Fleet: coder is blocked", "--body", "waiting")
+        (entry,) = self.log()
+        self.assertEqual(entry["kind"], "toast")
+        self.assertEqual(entry["argv"], ["notification", "show", "--title", "Fleet: coder is blocked", "--body", "waiting"])
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_an_armed_close_fires_once_on_the_next_read_of_that_pane(self):
+        (self.home / self.lab.SHIM_ARM).write_text("w1:p2\n")
+        self.run_shim("agent", "get", "w1:p1")
+        self.assertEqual(self.calls(), ["agent get w1:p1"], "another pane is left alone")
+        self.run_shim("agent", "get", "w1:p2")
+        self.assertEqual(self.calls(), ["agent get w1:p1", "pane close w1:p2", "agent get w1:p2"])
+        self.assertEqual([e["kind"] for e in self.log()], ["closed"])
+        self.run_shim("agent", "get", "w1:p2")
+        self.assertEqual(self.calls()[-1], "agent get w1:p2")
+        self.assertEqual(len([c for c in self.calls() if c.startswith("pane close")]), 1)
+
+    def test_nothing_is_closed_unless_armed(self):
+        self.run_shim("agent", "get", "w1:p2")
+        self.assertEqual(self.calls(), ["agent get w1:p2"])
+
 
 
 # ---------------------------------------------------------------------- runner

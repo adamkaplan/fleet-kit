@@ -1,0 +1,23 @@
+{
+  "id": "H1",
+  "title": "A pane is closed between deciding and delivering",
+  "problem": null,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "20s"},
+    {"at": "100s", "actor": "world", "do": "close-pane", "agent": "platform",
+     "why": "Arms the race: the orchestrator's pane closes the moment the engine reads it again before writing, after it has decided to wake it. The item is ripe at about 110 s"},
+    {"at": "3m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "nothing-sent", "that": "message_count", "to": "platform", "count": 0},
+    {"name": "not-delivered", "that": "delivered", "to": "platform", "key": "worker.idle:*", "count": 0},
+    {"name": "toast", "that": "toast", "agent": "platform", "text": "nothing sent"}
+  ],
+  "control": {"fault": "no-recheck", "fails": ["nothing-sent", "not-delivered", "toast"]}
+}

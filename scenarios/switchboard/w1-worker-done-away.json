@@ -1,0 +1,27 @@
+{
+  "id": "W1",
+  "title": "A worker finishes while you are away",
+  "problem": 4,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "away", "why": "You have not prompted the orchestrator"},
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "20s",
+     "why": "Step 1: the worker finishes at about 20 s. Nobody tells the orchestrator but the switchboard"},
+    {"at": "3m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "woken", "that": "delivered", "to": "platform", "key": "worker.idle:*", "mode": "wake", "count": 1,
+     "text": "issue #2"},
+    {"name": "prompt", "that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.idle:*",
+     "why": "20 s of work, 90 s of batching, one poll and a reply, with slack for the Lab"}
+  ],
+  "control": {"fault": "no-worker-source", "fails": ["woken", "prompt"]}
+}
