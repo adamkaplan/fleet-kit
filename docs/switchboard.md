@@ -22,6 +22,22 @@
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
 
+```mermaid
+flowchart LR
+  main(["main"])
+  subgraph substrate["Substrate: closes problems 3 and 4"]
+    direction LR
+    p1["1 · v2 client + spikes"] --> p2["2 · inbox"] --> p3["3 · herdr"] --> p4["4 · worker events + live proof"]
+  end
+  subgraph system["Rest of the system: problems 1 and 2"]
+    direction LR
+    p5["5 · GitHub events"] --> p6["6 · threads"] --> p7["7 · judges"] --> p8["8 · v1 move"]
+  end
+  main --> p1
+  p4 --> p5
+  p8 -. "one atomic gh stack merge" .-> main
+```
+
 ## Problems
 
 1. **Telephone.** Requests pass from Chief of Staff to orchestrator to worker
@@ -36,6 +52,19 @@ one atomic `gh stack merge`, and only once the system is complete.
      agent.
 4. **Silent completions.** A worker finishing wakes nobody. Its orchestrator
    only finds out on the next timer.
+
+How it works today, with each problem marked where it happens:
+
+```mermaid
+flowchart LR
+  you(["You"]) -- "types" --> cos["Chief of Staff<br/>2 · one conversation,<br/>one request at a time"]
+  cos -- "1 · retypes in its own words,<br/>as if it were you" --> orch["Orchestrator"]
+  orch -- "1 · retypes again" --> worker["Coder"]
+  timer["Heartbeat timer"] -. "3 · pastes into the input box,<br/>presses Enter" .-> cos
+  timer -. "3 · same, even mid-conversation" .-> orch
+  worker -- "finishes, comments" --> gh[("GitHub issue")]
+  gh -. "4 · nobody is told<br/>until the next timer" .-> orch
+```
 
 Evidence from real use:
 
@@ -61,17 +90,32 @@ Evidence from real use:
 
 ## Design
 
-```text
-herdr socket ──────────┐  focus, pane lifecycle
-OpenCode v2 service ───┤  busy · idle · viewed · your prompts · permission requests
-GitHub (PR 5) ─────────┤  comments · PRs · checks · labels
-fleet-switchboard send ┘
-            │
-   fleet-switchboard daemon ── inbox · audit log · delivery rule
-            │
-   ┌────────┴────────────────┐
- OpenCode v2 API              herdr
- note / wake (synthetic)      badge · toast · pane status
+```mermaid
+flowchart LR
+  subgraph inputs["Read"]
+    direction TB
+    herdr_in["herdr<br/>focus · panes"]
+    oc_in["OpenCode v2<br/>busy · idle · viewed<br/>your prompts<br/>permission requests"]
+    gh_in["GitHub, PR 5 on<br/>comments · PRs<br/>checks · labels"]
+    cli_in["Agents and you<br/>send · remind · inbox"]
+  end
+  subgraph daemon["fleet-switchboard daemon"]
+    direction TB
+    loop["observe → ingest<br/>→ decide → deliver<br/>→ render"]
+    store[("SQLite store<br/>inbox · deliveries<br/>audit log · …")]
+    loop <--> store
+  end
+  subgraph outputs["Write"]
+    direction TB
+    oc_out["OpenCode v2 API<br/>note or wake<br/>as a synthetic message"]
+    herdr_out["herdr<br/>badge · toast<br/>pane status"]
+  end
+  herdr_in --> loop
+  oc_in --> loop
+  gh_in --> loop
+  cli_in <--> store
+  loop --> oc_out
+  loop --> herdr_out
 ```
 
 ### Delivery rule
@@ -92,6 +136,23 @@ Items for an agent are collected for 90 s, then delivered in one of two ways.
   writes into a pane's input box.
 - **A note is not the end.** Items delivered as a note but still unread when
   you stop being engaged become eligible for one wake.
+
+```mermaid
+flowchart TD
+  item["New item for agent A"] --> batch["Batch for 90 s"]
+  batch --> recheck["Observe A again"]
+  recheck --> blocked{"A blocked or detached,<br/>or v2 unreachable?"}
+  blocked -- "yes" --> hold["Hold the items<br/>audit why · toast after 15 min"]
+  hold -. "next tick" .-> recheck
+  blocked -- "no" --> engaged{"You engaged<br/>with A?"}
+  engaged -- "yes: you prompted it in the last 10 min,<br/>or it has an unviewed reply under 15 min old" --> note["Note<br/>synthetic, resume false<br/>no turn starts"]
+  engaged -- "no" --> wake["Wake<br/>synthetic, resume true, delivery queue"]
+  note --> unread{"Still unread when<br/>you stop being engaged?"}
+  unread -- "yes, once" --> wake
+  wake --> busy{"A busy?"}
+  busy -- "yes" --> after["Runs after the current turn"]
+  busy -- "no" --> now["Turn starts now"]
+```
 
 ## System design
 
@@ -176,6 +237,35 @@ The delivery rule degrades by capability, not by harness:
   items up at its next turn boundary. A typed wake is not part of the
   contract.
 - **No `viewed_at`.** "Engaged" falls back to your recent prompts alone.
+
+The two adapters this document describes, side by side:
+
+```mermaid
+classDiagram
+  direction LR
+  class HarnessAdapter {
+    <<interface>>
+    +capabilities
+    +launch(name, agent, directory, brief) SessionRef
+    +observe(ref) Observation
+    +note(ref, text, delivery_id) Receipt
+    +wake(ref, text, delivery_id) Receipt
+  }
+  class OpenCodeV2Adapter {
+    <<built>>
+    note via synthetic, resume false
+    wake via synthetic, resume true, queue
+    viewed_at via Session.Info.time.viewed
+  }
+  class HookAdapter {
+    <<specified only>>
+    note via prompt-submit hook context
+    wake via stop hook, busy-to-idle only
+    viewed_at not available
+  }
+  HarnessAdapter <|.. OpenCodeV2Adapter
+  HarnessAdapter <|.. HookAdapter
+```
 
 #### OpenCode v2 adapter (built)
 
@@ -271,7 +361,7 @@ what it has seen and done, never what is true now.
 | Record | From PR | Written by | Fields | Kind |
 |---|---|---|---|---|
 | **Audit log** | 1 | Every component | Time, actor, event, subject, detail (JSON) | Durable, append-only |
-| **Inbox items** | 2 | Daemon ingest, `send`, `remind`, hooks | Id, to, from, kind, summary, link, dedupe key, created, state (`pending` → `delivered` → `read`), delivery id, read time | Durable |
+| **Inbox items** | 2 | Daemon ingest, `send`, `remind`, hooks | Id, to, from, kind, summary, link, dedupe key, created, state (see the lifecycle below), latest delivery id, read time | Durable |
 | **Deliveries** | 2 | Daemon | Id (used as the harness message id), to, mode (`note` or `wake`), item ids, rule inputs and reason, state (`sending` → `sent`), sent time, receipt | Durable |
 | **Observation cursor** | 2 | Daemon | Per agent: the last observation, and the last source fact already ingested (for example the `idle_at` already turned into an item) | Cache; safe to delete |
 | **Registry** | 3 | `launch`, later `adopt` | Name, harness kind, session id, pane id, workspace, role, `reports_to`, charter (optional), launched and retired times | Durable |
@@ -280,9 +370,73 @@ what it has seen and done, never what is true now.
 | **Threads** | 6 | Chief of Staff, through the CLI | Id, title, quote ids, owner, status, GitHub issue once promoted, updated | Durable |
 | **Judge decisions** | 7 | Daemon | Question, input hash, answer, model, cost, later outcome | Durable, append-only |
 
+How the records relate, with the key fields:
+
+```mermaid
+erDiagram
+  REGISTRY |o--o{ REGISTRY : "reports to"
+  REGISTRY ||--o{ INBOX_ITEM : "addressed to"
+  REGISTRY ||--o{ DELIVERY : receives
+  DELIVERY }o--|{ INBOX_ITEM : carries
+  REGISTRY ||--o| OBSERVATION_CURSOR : "last seen as"
+  REGISTRY ||--o{ REMINDER : "scheduled for"
+  REMINDER ||--o| INBOX_ITEM : "fires as"
+  REGISTRY ||--o{ QUOTE : "captured from"
+  REGISTRY ||--o{ THREAD : owns
+  THREAD }o--|{ QUOTE : cites
+  INBOX_ITEM ||--o{ AUDIT_LOG : "traced by"
+  DELIVERY ||--o{ AUDIT_LOG : "traced by"
+  INBOX_ITEM ||--o{ JUDGE_DECISION : "judged by"
+
+  REGISTRY {
+    text name PK
+    text harness
+    text session_id
+    text pane_id
+    text reports_to FK
+  }
+  INBOX_ITEM {
+    text id PK
+    text to FK
+    text dedupe_key UK
+    text state
+  }
+  DELIVERY {
+    text id PK "also the harness message id"
+    text to FK
+    text mode "note or wake"
+    text state "sending or sent"
+  }
+  QUOTE {
+    text id PK
+    text message_id
+    text exact_text "byte-for-byte"
+  }
+```
+
 Dedupe keys name the source fact, for example
 `worker.idle:<session>:<idle_at>`, `worker.blocked:<session>:<request id>` and
 `github.comment:<comment id>`.
+
+#### Inbox item lifecycle
+
+An item is acknowledged only when the agent reads it. Being delivered is not
+enough.
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: ingest, send, remind or hook
+  pending --> pending: held, reason audited
+  pending --> noted: delivered as a note
+  pending --> woken: delivered as a wake
+  noted --> woken: still unread when you stop being engaged, once
+  noted --> read: agent runs inbox
+  woken --> woken: re-woken after 30 min, doubling, at most 3 times
+  woken --> escalated: still unread after 3 re-wakes, toast to you
+  woken --> read: agent runs inbox
+  escalated --> read: agent runs inbox
+  read --> [*]
+```
 
 #### Invariants
 
@@ -306,22 +460,38 @@ Dedupe keys name the source fact, for example
 
 ### Key flows
 
-**A worker finishes while you are away.**
+**A worker finishes.** The coder's turn ends, and what happens next depends on
+whether you are talking to its orchestrator.
 
-1. A tick sees the coder's session go from busy to idle with a new `idle_at`.
-   Ingest creates `worker.idle:<session>:<idle_at>` for the coder's
-   `reports_to`.
-2. After the 90 s batch window, the daemon re-observes the orchestrator: not
-   engaged, so wake.
-3. It writes the delivery row, calls `session.synthetic` (`resume: true`,
-   `delivery: "queue"`, the delivery id), audits it, and sets the badge to 1.
-4. The orchestrator's turn runs `fleet-switchboard inbox <name>`. The item is
-   marked read and the badge clears.
+```mermaid
+sequenceDiagram
+  autonumber
+  actor You
+  participant C as Coder session
+  participant SB as fleet-switchboard
+  participant O as Orchestrator session
+  participant H as herdr
+  C->>C: turn ends, time.idle set
+  SB->>C: observe: session.active, session.get
+  Note over SB: ingest worker.idle:{session}:{idle_at}<br/>for the coder's reports_to
+  Note over SB: wait out the 90 s batch window
+  SB->>O: observe again
+  alt you are talking to the orchestrator
+    SB->>O: note: synthetic, resume=false
+    SB->>H: badge unread=1
+    You->>O: your next message
+    O-->>You: reply that mentions the item
+  else you are away
+    SB->>O: wake: synthetic, resume=true, delivery=queue
+    SB->>H: badge unread=1
+    O->>O: turn starts
+  end
+  O->>SB: fleet-switchboard inbox orchestrator
+  SB->>H: badge cleared
+```
 
-**A worker finishes while you are talking to its orchestrator.** The same,
-except the decision is a note: no turn starts, and your next message carries
-it. If the item is still unread when you stop being engaged, it becomes
-eligible for one wake.
+Every write in this flow is audited before and after. If the item is still
+unread when you stop being engaged, a note becomes eligible for one wake.
 
 **A delivery is held.** The v2 service is unreachable, or the agent is
 blocked: items stay pending, every hold is audited with its reason, and after
@@ -340,6 +510,24 @@ blocked: items stay pending, every hold is audited with its reason, and after
 ## Lab: isolation from the live fleet
 
 The live fleet stays on v1 throughout.
+
+```mermaid
+flowchart LR
+  herdr{{"herdr: one server"}}
+  subgraph live["Live fleet: unchanged"]
+    direction TB
+    hb["fleet-heartbeat"] -- "wakes" --> v1["OpenCode v1<br/>installed binary on PATH"]
+    v1 --- v1data[("standard config and data dirs")]
+  end
+  subgraph lab["Switchboard Lab"]
+    direction TB
+    sb["fleet-switchboard"] -- "notes and wakes" --> v2["OpenCode v2<br/>pinned, private dir, not on PATH"]
+    v2 --- v2data[("scratch XDG dirs<br/>incl. the Copilot login")]
+    v2 --- repo[("scratch git repo")]
+  end
+  herdr ---|"hosts the panes"| v1
+  herdr ---|"hosts the panes"| v2
+```
 
 - **v2 binary.** A pinned version, installed into a private directory that is
   not on `PATH`. Never installed with `npm -g` or the curl installer, because
@@ -457,3 +645,8 @@ into individual model calls; changes to `fleet-heartbeat`.
   (herdr, the harness adapter contract, OpenCode v2, a hook-based harness,
   GitHub, agents, you), data sources and records, invariants, key flows and
   failure handling.
+- 2026-10-02: added nine Mermaid diagrams: the stack, today's problems, the
+  overview, the delivery rule, the adapter contract, the record model, the inbox
+  item lifecycle, the worker-finishes sequence, and the Lab's isolation. Each
+  one renders with mermaid-cli 12. Inbox items now track their latest delivery,
+  since a note can be followed by one wake.
