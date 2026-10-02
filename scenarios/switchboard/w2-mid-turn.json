@@ -1,0 +1,33 @@
+{
+  "id": "W2",
+  "title": "An item arrives in the middle of a turn",
+  "problem": 3,
+  "since_pr": 2,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "6m", "steps": 3,
+     "why": "A three-step turn the fleet started, so you are not engaged with the coder: model calls at 0, 2 and 4 minutes, final reply at 6"},
+    {"at": "10s", "actor": "world", "do": "fact", "to": "coder", "key": "lab.fact:w2-review",
+     "kind": "review", "from": "platform", "issue": 2,
+     "summary": "Review comments are in on the health check",
+     "why": "Past the batch window at 100 s, while the coder is between its first and second steps"},
+    {"at": "8m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "one-wake", "that": "delivered", "to": "coder", "key": "lab.fact:w2-*", "mode": "wake", "count": 1},
+    {"name": "not-between-steps", "that": "model_saw", "agent": "coder", "key": "lab.fact:w2-*",
+     "when": "between_steps", "count": 0,
+     "why": "Queue, not steer: the item never reaches a model call inside the running turn"},
+    {"name": "after-the-reply", "that": "model_saw", "agent": "coder", "key": "lab.fact:w2-*",
+     "when": "after_reply", "count": 1,
+     "why": "It runs once the turn's final reply is written, in the same busy span"}
+  ],
+  "control": {"fault": "steer-not-queue", "fails": ["not-between-steps", "after-the-reply"]}
+}

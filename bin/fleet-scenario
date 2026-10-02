@@ -43,10 +43,40 @@ TIERS = ("offline", "lab-scripted", "lab-model")
 ROLES = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
 ACTORS = ("you", "world")
 ACTIONS = ("turn", "message", "draft", "away", "permission", "comment", "kill-daemon",
-           "restart-daemon", "close-pane", "edit-intent", "synthetic", "note", "wake", "wait")
+           "restart-daemon", "close-pane", "edit-intent", "synthetic", "note", "wake", "wait",
+           "fact", "pass")
 EXPECTATIONS = ("delivered", "no_machine_turn", "within", "draft_intact", "message_has_intent",
                 "classified", "handed_off", "toast", "tool_outcome", "judged", "admitted_once",
-                "model_saw", "status_is", "metadata_roundtrip")
+                "model_saw", "status_is", "metadata_roundtrip", "message_count")
+MODES = ("note", "wake")
+WHEN = ("any", "turn_start", "between_steps", "after_reply")
+
+# The fields of each action and oracle the offline runner implements:
+# name -> {field: (required, check)}. In a scenario with the offline tier, a
+# step or expectation of one of these kinds may carry only these fields, plus
+# `why` (a comment for people), so a typo fails validation instead of
+# quietly changing what is checked. Lab-only scenarios are not checked field
+# by field: the Lab runner (bin/proof-switchboard) owns their extra fields.
+_CAST = "cast"  # the check for a field that must name a cast member
+STEP_FIELDS = {
+    "turn": {"lasts": (False, "duration"), "steps": (False, "count1")},
+    "message": {"to": (True, _CAST), "text": (True, "text"), "lasts": (False, "duration")},
+    "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
+             "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
+    "pass": {"faults": (False, "faults")},
+    "kill-daemon": {},
+    "restart-daemon": {},
+    "wait": {},
+}
+EXPECT_FIELDS = {
+    "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
+                  "count": (False, "count0"), "keys": (False, "count1")},
+    "message_count": {"to": (True, _CAST), "count": (True, "count0")},
+    "model_saw": {"agent": (True, _CAST), "key": (True, "name"), "when": (False, "when"),
+                  "count": (False, "count0")},
+}
+STEP_COMMON = ("at", "actor", "do", "why")
+EXPECT_COMMON = ("that", "name", "why")
 
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
 OPTIONAL = ("tags", "issues")
@@ -72,6 +102,53 @@ def duration_seconds(text):
     """'0s', '10s', '2m', '2h' -> seconds. None if it is not a duration."""
     match = DURATION_RE.match(text) if isinstance(text, str) else None
     return int(match.group(1)) * UNIT_SECONDS[match.group(2)] if match else None
+
+
+def _field_ok(check, value, cast):
+    if check == _CAST:
+        return isinstance(value, str) and value in cast
+    if check == "duration":
+        return duration_seconds(value) is not None
+    if check == "text":
+        return isinstance(value, str)
+    if check == "name":
+        return isinstance(value, str) and bool(value.strip())
+    if check == "issue":
+        return _int(value) and value >= 1
+    if check == "bool":
+        return isinstance(value, bool)
+    if check == "count0":
+        return _int(value) and value >= 0
+    if check == "count1":
+        return _int(value) and value >= 1
+    if check == "mode":
+        return value in MODES
+    if check == "when":
+        return value in WHEN
+    if check == "faults":
+        return isinstance(value, list) and bool(value) and all(v in KNOWN_FAULTS for v in value)
+    raise AssertionError("no such check: %s" % check)
+
+
+_CHECK_TEXT = {_CAST: "a cast name", "duration": "a duration such as \"30s\"", "text": "a string",
+               "name": "a non-empty string", "issue": "an issue number (integer >= 1)", "bool": "true or false",
+               "count0": "an integer >= 0", "count1": "an integer >= 1", "mode": " or ".join(MODES),
+               "when": "one of " + ", ".join(WHEN), "faults": "a non-empty list of known fault names"}
+
+
+def _validate_fields(where, item, kind, table, common, cast, errors):
+    """Check `item`'s own fields against `table[kind]`, when the kind has a table."""
+    if kind not in table:
+        return
+    fields = table[kind]
+    for key in sorted(set(item) - set(fields) - set(common)):
+        errors.append("%s: unknown field %r for %r" % (where, key, kind))
+    for key, (required, check) in sorted(fields.items()):
+        if key not in item:
+            if required:
+                errors.append("%s.%s: required for %r" % (where, key, kind))
+        elif not _field_ok(check, item[key], cast):
+            errors.append("%s.%s: must be %s, got %r" % (where, key, _CHECK_TEXT[check], item[key]))
 
 
 def _validate_cast(cast, errors):
@@ -122,7 +199,7 @@ def _validate_issues(issues, errors):
             errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
 
 
-def _validate_steps(steps, cast, errors):
+def _validate_steps(steps, cast, offline, errors):
     if not isinstance(steps, list):
         errors.append("steps: must be a list")
         return
@@ -146,9 +223,11 @@ def _validate_steps(steps, cast, errors):
             errors.append("%s.actor: must be \"you\", \"world\" or a cast name, got %r" % (where, actor))
         if step.get("do") not in ACTIONS:
             errors.append("%s.do: must be one of %s, got %r" % (where, ", ".join(ACTIONS), step.get("do")))
+        if offline:
+            _validate_fields(where, step, step.get("do"), STEP_FIELDS, STEP_COMMON, cast, errors)
 
 
-def _validate_expect(expect, errors):
+def _validate_expect(expect, cast, offline, errors):
     labels = set()
     if not isinstance(expect, list) or not expect:
         errors.append("expect: must be a non-empty list")
@@ -164,6 +243,8 @@ def _validate_expect(expect, errors):
                           % (where, ", ".join(EXPECTATIONS), item.get("that")))
         else:
             labels.add(item["that"])
+        if offline:
+            _validate_fields(where, item, item.get("that"), EXPECT_FIELDS, EXPECT_COMMON, cast, errors)
         if "name" in item:
             name = item["name"]
             if not isinstance(name, str) or not name:
@@ -230,11 +311,12 @@ def validate(obj):
         errors.append("tags: must be a list of non-empty strings")
 
     cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
+    offline = isinstance(obj.get("tiers"), list) and "offline" in obj["tiers"]
     if "issues" in obj:
         _validate_issues(obj["issues"], errors)
     if "steps" in obj:
-        _validate_steps(obj["steps"], cast, errors)
-    labels = _validate_expect(obj["expect"], errors) if "expect" in obj else set()
+        _validate_steps(obj["steps"], cast, offline, errors)
+    labels = _validate_expect(obj["expect"], cast, offline, errors) if "expect" in obj else set()
     if "control" in obj:
         _validate_control(obj["control"], labels, errors)
     return errors

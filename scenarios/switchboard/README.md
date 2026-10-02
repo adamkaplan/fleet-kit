@@ -25,6 +25,33 @@ The full format, tiers, oracles and catalog are in
 | `expect` | yes | What must and must not happen: `that` (the oracle), optional unique `name`, plus the oracle's own fields |
 | `control` | yes | Exactly one of `fault` (a known fault name), `baseline` (the system run instead) or `variant` (an object), plus `fails`: the expectations, by `name` or `that`, the control must break |
 
+## The offline runner
+
+`bin/test-switchboard` runs every scenario with the `offline` tier against
+stateful fakes of v2 and herdr and a simulated clock: a daemon pass every 5 s,
+steps at their times. Expectations are judged on the fakes' state
+(transcripts, inbox, model calls), never on the switchboard's report. Then it
+re-runs the scenario with the control's fault, and the test fails if any
+expectation named in `fails` still passes. Every run also checks that each
+write was audited before and after, and that herdr was never asked to type.
+
+In a scenario with the `offline` tier, these kinds may carry only these
+fields (plus `why`, a comment), so a typo fails `validate`:
+
+| Kind | Fields |
+|---|---|
+| step `fact` | `to`, `key`, `summary`; optional `kind`, `issue`, `from`, `batch`. Appends a fact to the Lab fact source, `$STATE/lab-facts.jsonl`, read only when `FLEET_SWITCHBOARD_LAB=1` |
+| step `turn` | optional `lasts` (a duration), `steps` (model calls in the turn). A turn the fleet started, so you are not engaged |
+| step `message` | `to`, `text`; optional `lasts`. A prompt from you |
+| step `pass` | optional `faults`: one pass with these faults on, such as `crash-after-send` |
+| step `kill-daemon`, `restart-daemon`, `wait` | none. While the daemon is down only `pass` steps run; a restart forgets everything in memory |
+| `delivered` | `to`, `key` (a glob); optional `mode` (`note`, `wake`), `count` (messages in the transcript carrying a match), `keys` (distinct matching keys) |
+| `message_count` | `to`, `count`: messages the switchboard wrote to that agent |
+| `model_saw` | `agent`, `key`; optional `when` (`any`, `turn_start`, `between_steps`, `after_reply`), `count`: model calls that carried a match |
+
+Lab-only scenarios (the spikes) are not checked field by field; the Lab
+runner owns their extra fields.
+
 ## Commands
 
 ```bash
