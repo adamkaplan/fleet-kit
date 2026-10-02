@@ -10,14 +10,14 @@
 
 | PR | Branch | Scope | State |
 |---|---|---|---|
-| 1 | `switchboard/v2-client` | v2 client, isolated lab, spikes S1–S6 | draft [#15](https://github.com/adamkaplan/fleet-kit/pull/15) |
+| 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | draft [#15](https://github.com/adamkaplan/fleet-kit/pull/15) |
 | 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send` | planned |
 | 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
-| 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; live proof A–F | planned |
+| 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
 | 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
 | 6 | `switchboard/intent` | Asks with Intent and Done-when; every message names its ask; `intents`; changes surfaced; Chief of Staff and charter rules | planned |
-| 7 | `switchboard/judges` | Cheap judges that log but don't act ("shadow mode") | planned |
-| 8 | `switchboard/foreground` | Chief of Staff moves unrelated work to the background and turns to you; spikes F1–F3 | planned |
+| 7 | `switchboard/judges` | Jev decision-model client; the classifier and other judges in shadow mode | planned |
+| 8 | `switchboard/foreground` | Classify your messages; hand unrelated work to a background subagent; decorate messages about owned asks; spikes SF1–SF4 | planned |
 | 9 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | planned |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
@@ -28,7 +28,7 @@ flowchart LR
   main(["main"])
   subgraph substrate["Substrate: closes problems 3 and 4"]
     direction LR
-    p1["1 · v2 client + spikes"] --> p2["2 · delivery"] --> p3["3 · herdr"] --> p4["4 · worker events + live proof"]
+    p1["1 · v2 client, scenarios, spikes"] --> p2["2 · delivery"] --> p3["3 · herdr"] --> p4["4 · worker events, substrate scenarios"]
   end
   subgraph system["Rest of the system: problems 1 and 2"]
     direction LR
@@ -101,7 +101,9 @@ Evidence from real use:
 | Status | herdr is authoritative for working, idle and blocked. Its OpenCode integration supports v2 through a pane-local TUI plugin. |
 | Engagement | "You are engaged with an agent" means you prompted it in the last 10 minutes. There is no viewed state. It matters mostly for the Chief of Staff, the agent you talk to. |
 | Intent | Each request handed to an orchestrator is an ask: an issue under its charter with a one-line Intent and a one-line Done-when. Every message names its ask and carries those lines, in both directions. Only you, or the Chief of Staff with your yes, change them (PR 6). |
-| Chief of Staff attention | Serial by default. A new message from you that is unrelated to the current work moves that work to a background worker, and the Chief of Staff turns to you (PR 8). How is decided after spikes F1–F3. |
+| Chief of Staff attention | Serial by default. Jev classifies each message from you against the asks in flight. Unrelated work in progress is handed to a background subagent with a written brief, never a forked session; a message about an ask that already has an owner is decorated so the Chief of Staff forwards it (PR 8). |
+| Decision model | Jev (`typesafe/jev-1.13` on OpenRouter) for yes/no and pick-one judgements: cheap, fast, probabilities instead of text. Shadow mode first (PR 7). Unsure or unreachable means change nothing. |
+| Testing | Every promised behaviour is a scenario, run offline in CI against fakes and in the Lab against real v2 and herdr. Each scenario's control, with its safeguard switched off, must fail. See [Scenario testing](#scenario-testing). |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
 | GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
 | Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
@@ -200,6 +202,7 @@ depends on it.
 | Harness adapter | A class shared by the daemon and the CLI, one per harness kind | Everything harness-specific: launch, observe, note, wake |
 | herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon; turns herdr events into pokes |
 | Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
+| Decision model client (PR 7) | A class in `bin/fleet-switchboard`, stdlib `urllib`. The OpenRouter key comes from the switchboard's config and never enters an agent's environment | Jev calls for the classifier and the shadow judges |
 | GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon, which receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
 
 The daemon runs one loop with five steps:
@@ -355,7 +358,7 @@ polled on a timer.
   where `<port>` belongs to a listener the daemon opens on localhost only.
 - **Events:** `issues` (including edits and label changes such as
   `awaiting-user`), `issue_comment`, `sub_issues`, `pull_request`,
-  `pull_request_review`, `check_suite` and `workflow_run`. Verify G1 for
+  `pull_request_review`, `check_suite` and `workflow_run`. Verify SG1 for
   `sub_issues`.
 - **Verification:** the daemon checks `X-Hub-Signature-256` against the secret
   before reading the body. That stops any local process from posting fake
@@ -392,7 +395,7 @@ sequenceDiagram
 ```
 
 **Constraints from GitHub's docs and the extension's source.** Settled by spike
-G1 before PR 5 builds on them.
+SG1 before PR 5 builds on them.
 
 | Constraint | Consequence |
 |---|---|
@@ -403,7 +406,7 @@ G1 before PR 5 builds on them.
 
 | Spike | Passes when |
 |---|---|
-| G1 | On a scratch repo: the forwarder creates and activates the hook; events arrive signed; `sub_issues` is accepted; a second forwarder gets `Hook already exists`; after the forwarder is killed, the hook is cleaned up or left inactive, and that is recorded; events sent while it is down are absent, and the catch-up read recovers them |
+| SG1 | On a scratch repo: the forwarder creates and activates the hook; events arrive signed; `sub_issues` is accepted; a second forwarder gets `Hook already exists`; after the forwarder is killed, the hook is cleaned up or left inactive, and that is recorded; events sent while it is down are absent, and the catch-up read recovers them |
 
 #### Agents
 
@@ -417,6 +420,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
+| `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -532,12 +536,89 @@ Chief of Staff answer from a message instead of investigating. That leaves the
 rest of problem 2: you think of things faster than the Chief of Staff carries
 them out.
 
-**What it must do.** The Chief of Staff works serially by default. When a new
-message from you arrives that is unrelated to what it is working on, the work
-in progress continues in the background and the Chief of Staff turns its
-attention to you. When the background work finishes, its result comes back to
-the Chief of Staff like any other report. This applies to the Chief of Staff
-only; orchestrators are driven by the fleet, not by you.
+**What it must do.** The Chief of Staff works serially by default. Each message
+from you is classified against the asks already in flight, and what happens
+depends on the answer:
+
+| Your message is about | What happens |
+|---|---|
+| The work the Chief of Staff is doing now | Nothing extra; it reaches the Chief of Staff as usual |
+| An ask that already has an owner: a background subagent or an orchestrator | The message is decorated with that ask and its owner. The Chief of Staff sends the owner anything relevant with `send`, then carries on with what it was doing |
+| Something new, while the Chief of Staff is busy | The message is decorated "hand off first". The Chief of Staff hands its current work to a background subagent, then turns to you |
+| Something new, while the Chief of Staff is idle | Nothing extra; it becomes the foreground work |
+
+This applies to the Chief of Staff only; orchestrators are driven by the fleet,
+not by you.
+
+```mermaid
+flowchart TD
+  msg["Your message"] --> any{"Anything to choose between?<br/>Chief of Staff busy,<br/>or other open asks"}
+  any -- "no" --> plain["Delivered as usual"]
+  any -- "yes" --> jev["Classify: one Jev call"]
+  jev --> conf{"Confident?"}
+  conf -- "no" --> plain
+  conf -- "yes" --> which{"About what?"}
+  which -- "the current work" --> plain
+  which -- "an ask with an owner" --> dec["Decorated with the ask and its owner<br/>Chief of Staff forwards details with send,<br/>then carries on"]
+  which -- "something new,<br/>Chief of Staff busy" --> ho["Decorated: hand off first<br/>Chief of Staff writes a handoff brief,<br/>a background subagent takes the work,<br/>then it answers you"]
+  which -- "something new,<br/>Chief of Staff idle" --> plain
+```
+
+#### Classify: a decision model
+
+One call to Jev per message from you, made only when there is something to
+choose between. Jev (`typesafe/jev-1.13` on OpenRouter's System One endpoint,
+`POST /api/v1/systemone`) answers typed questions with probabilities instead
+of text. Here it gets one `choice` question:
+
+- **State:** your new message and your previous one; the current ask's Intent
+  and Done-when; one line per open ask, with its Intent and owner, from
+  `fleet-switchboard intents`.
+- **Options:** `current`, one option per open ask, and `new`.
+- **Answer:** the chosen option and the probability of each.
+
+It is cheap and fast: about $0.00003 per call where it has been used before,
+because only input tokens are billed. Its latency here is measured by SF2. When
+the top probability is below a threshold, or Jev is unreachable, the answer is
+`current`: the safe default is to change nothing. Every question and answer is
+written to the audit log. The OpenRouter key is read by the switchboard only
+and never enters an agent's environment.
+
+The classifier runs in shadow mode first (PR 7): logged, never acted on, until
+its answers match labelled cases from real Chief of Staff transcripts (SF2).
+
+#### Hand off: a brief, not a fork
+
+The session is not forked. The Chief of Staff's history is long and full of
+other asks, and a copy would carry all of that into the subagent. Instead the
+Chief of Staff writes a short handoff brief, and a fresh background subagent
+continues from it:
+
+```markdown
+## Handoff: ask 615
+Goal: <the ask's Intent and Done-when, filled in by the switchboard>
+Done so far: what has been established or changed, with links
+Next steps: what to do next, in order
+Watch out for: constraints, open questions, anything already ruled out
+```
+
+The Chief of Staff runs `fleet-switchboard handoff --issue 615 --brief-file -`,
+which:
+
+1. fills in Goal from the ask on GitHub, so it is never retyped;
+2. refuses a brief without Done so far and Next steps;
+3. posts the brief as a comment on the ask, so the GitHub record survives;
+4. launches the background subagent: a fleet agent with role `cos-subagent`,
+   `reports_to` the Chief of Staff, and the ask as its issue, in its own herdr
+   tab opened without focus, briefed with the brief;
+5. returns straight away, so the Chief of Staff turns to you in the same turn.
+
+The subagent reports with `send cos --issue 615`. Its finishing is a
+worker-done fact (PR 4), delivered with the ask's Intent lines, as a note while
+you are talking to the Chief of Staff. v2's own background subagents (child
+sessions started with the `subagent` tool) are the alternative; SF4 checks
+whether herdr and the switchboard can tell a background child apart from its
+parent before choosing.
 
 ```mermaid
 sequenceDiagram
@@ -545,45 +626,60 @@ sequenceDiagram
   actor You
   participant C as Chief of Staff
   participant SB as fleet-switchboard
-  participant B as Background worker
-  You->>C: ask A
+  participant J as Jev
+  participant S as Background subagent
+  You->>C: ask A, handed to nobody yet
   Note over C: working on A
-  You->>C: question B, unrelated to A
-  Note over C,SB: B noticed and judged unrelated
-  C-->>B: A continues in the background
+  You->>C: question B
+  SB->>J: B against A and the open asks
+  J-->>SB: new, 0.93
+  SB->>C: decoration: B is unrelated to A, hand off first
+  C->>SB: handoff for A with the brief
+  SB->>S: launch in its own tab, briefed
   C->>You: answer to B
-  Note over B: finishes A
-  SB->>C: A finished, as a note while you are talking, with A's Intent lines
+  S->>SB: send cos about A, with the result
+  SB->>C: note with A's Intent lines and the result
   C->>You: A's result, when it fits
 ```
 
-There are four parts, and more than one way to build each. They are chosen
-after spikes F1–F3, not before.
+#### Decorate: work that already has an owner
 
-| Part | The question | Options |
-|---|---|---|
-| Notice | How is your new message caught before it is merged into the running turn? | (a) A message sent while the Chief of Staff is busy waits in v2's inbox with `queue` delivery, where the switchboard can read it; depends on how the v2 TUI submits while busy (F1). (b) The Chief of Staff notices for itself: a steered message reaches it at the next step boundary, and its definition says what to do. (c) A small v2 plugin `prompt` hook makes your prompts to a busy Chief of Staff queue instead of steer. This would be the one plugin in the system |
-| Judge | Is the new message related to the current work? | A cheap judge (PR 7, for example Jev, yes or no) given the current ask's Intent, your previous message and the new one; or the Chief of Staff's own judgement with (b) |
-| Split | How does the current work go on without the foreground? | (i) Fork: `session.fork` copies the session; the copy carries on with A in the background with full context, and the original is interrupted and answers you. (ii) Hand off: interrupt, write a short brief from A's Intent and progress, and launch a fresh background worker. (iii) Background by default: the Chief of Staff starts anything longer than a short turn in a background worker from the outset, so the foreground is always free and nothing needs to be noticed or judged |
-| Return | How does the result come back? | Settled already: the background worker is a fleet agent in its own herdr tab, opened without focus, whose `reports_to` is the Chief of Staff. Its finishing is a worker-done fact like any other (PR 4), delivered as a note while you are talking |
+When your message is about an ask someone already owns, the Chief of Staff
+should not start on it itself. The decoration says who owns it:
 
-Trade-offs to weigh:
+```text
+[switchboard] This is about ask 615 (Intent: fix the project agents that show
+"Agent unavailable"). cos-615 is working on it in the background. Send it
+anything relevant with: fleet-switchboard send cos-615 --issue 615 "...".
+Then continue with what you were doing.
+```
 
-- **Fork** keeps everything, but copies a long history: for a large Chief of
-  Staff session, the background worker's first turn re-reads all of it, which
-  costs time and money (F3).
-- **Hand off** is cheap, but loses whatever the brief leaves out.
-- **Background by default** needs no noticing or judging, but you lose
-  watching and steering a task in the foreground, and the Chief of Staff has to
-  decide what counts as short.
-- **Noticing** with (a) or (c) gives the system a fixed moment to decide; (b)
-  depends on the model's judgement and on when step boundaries fall.
+The owner can be a background subagent or an orchestrator; the decoration is
+the same. The Chief of Staff forwards what matters and returns to the
+foreground work, so a detail you add about A reaches whoever is doing A.
+
+#### Notice: catching your message in time
+
+The decoration has to reach the Chief of Staff together with your message,
+before it starts acting on the message. There are two ways, chosen by SF1:
+
+- **Without a plugin.** The switchboard sees your message in the transcript
+  and immediately sends the decoration as a steered synthetic message. It can
+  lose the race to the next step boundary, so the Chief of Staff may act on
+  the bare message first.
+- **With a thin prompt hook.** A small v2 plugin registers a `prompt` hook
+  that calls `fleet-switchboard classify` and appends the decoration to your
+  message before it is admitted. It cannot lose the race. It would be the only
+  plugin in the system, and it holds no logic of its own.
+
+#### Spikes
 
 | Spike | Finds out |
 |---|---|
-| F1 | How the v2 TUI submits while the session is busy: steer or queue, which keys do which, and whether the message is visible in `session.inbox.list` before delivery, and for how long |
-| F2 | How accurate a cheap judge is on pairs of (current work, new message) taken from real Chief of Staff transcripts, run in shadow mode |
-| F3 | `session.fork` on a large session: the time and cost of the copy's first turn, and whether interrupting the original leaves it in a clean state |
+| SF1 | Notice: how the v2 TUI submits a message while the session is busy; how soon the switchboard sees it compared with the next step boundary; whether a v2 `prompt` hook can wait for an external command and edit the text before admission |
+| SF2 | Classify: Jev's accuracy, calibration and latency on labelled (current work, open asks, new message) cases built from real Chief of Staff transcripts; the threshold |
+| SF3 | Hand off: given only the brief, the subagent continues the ask without asking for anything the brief should have said; the Chief of Staff answers you in the same turn as the decoration |
+| SF4 | Subagent kind: a fleet worker in its own tab versus v2's native background subagent: status in herdr, how completion is delivered, and what you can see |
 
 ### Data
 
@@ -675,7 +771,8 @@ Delivered means in the recipient's transcript. Its keys are never sent again.
 7. **No secrets in either file.** OpenCode authentication stays inside
    `opencode api`, GitHub authentication inside `gh`. The webhook secret (PR 5)
    lives only in the daemon's memory and the forwarder's arguments, and a new
-   one is made for every forwarder start.
+   one is made for every forwarder start. The OpenRouter key (PR 7) is read
+   from the switchboard's config and never passed to an agent.
 8. **Deleting the state directory is safe.** It loses the audit history and
    reminders not yet due. Nothing else changes.
 
@@ -744,6 +841,8 @@ flowchart LR
     sb["fleet-switchboard"] -- "notes and wakes" --> v2["OpenCode v2<br/>pinned, private dir, not on PATH"]
     v2 --- v2data[("scratch XDG dirs<br/>incl. the Copilot login and<br/>herdr's v2 integration")]
     v2 --- repo[("scratch git repo")]
+    runner["bin/proof-switchboard<br/>runs scenarios, acts for you"] -- "types only here" --> v2
+    v2 --- stub["scripted model<br/>local, for lab-scripted runs"]
   end
   herdr ---|"hosts the panes"| v1
   herdr ---|"hosts the panes"| v2
@@ -764,7 +863,12 @@ flowchart LR
 - **herdr plugin.** Linked to the single herdr server. The switchboard only
   manages sessions that carry fleet metadata.
 - **Models.** GitHub Copilot, through a one-time device login inside the
-  scratch profile. Real credentials are never read or copied.
+  scratch profile, for lab-model runs. A local scripted model, registered as a
+  provider in the scratch config, for lab-scripted runs. Real credentials are
+  never read or copied.
+- **Scenario runner.** `bin/proof-switchboard` launches each scenario's cast in
+  the Lab, acts for you there, and tears the cast down afterwards. It types
+  only into panes of the "Switchboard Lab" workspace.
 - **Work.** A local scratch git repo. No GitHub until PR 5.
 
 ## Spikes (PR 1)
@@ -777,25 +881,195 @@ flowchart LR
 | S4 | Wake | With `resume: true` and `queue`: an idle agent starts a turn; a busy agent runs it after the current turn; a draft in the TUI survives both cases |
 | S5 | Reading back | Session metadata set at create is returned by `session.get`; a synthetic message's metadata is returned by `session.message.list`; your prompts can be told apart from fleet messages; messages can be read newest first and the read stopped early; a waiting note appears in `session.inbox.list`; `time.idle` and `outcome` are set when a turn ends |
 | S6 | herdr | In the Lab: `herdr agent start --kind opencode -- -s <ses>` works; herdr's v2 integration reports working, idle and blocked (forced with a permission prompt) correctly; `agent_session` names the session; the `unread` token shows in the sidebar; plugin link and `[[startup]]` work |
+| S7 | Scripted model | The Lab's v2 accepts a local OpenAI-compatible provider; a scripted agent runs a shell command, asks a permission, and replies on cue, with streaming; herdr's status follows it as it would a real model |
+
+Each spike is written as a lab scenario tagged `spike` (see
+[Scenario testing](#scenario-testing)), so it can be re-run on every v2 or
+herdr upgrade.
 
 **Stop rule.** If S3 or S4 fails, work stops and we decide together before
-PR 2. No fallback is built ahead of time.
+PR 2. No fallback is built ahead of time. If S7 fails, lab-scripted runs fall
+back to cheap real models with tightly scripted prompts, and scenarios with
+exact timing move to the offline tier.
 
-## Live proof (PR 4)
+## Scenario testing
 
-`bin/proof-switchboard live` runs in the Lab, not in CI. It simulates your
-actions by typing into Lab panes, and you also do one manual pass.
+Every behaviour the switchboard promises is written down as a scenario, and
+every scenario is run against the Lab. Scenarios are the acceptance tests of
+the stack: a PR is ready only when every scenario up to it passes, offline in
+CI and in the Lab, and each scenario's control fails.
 
-| | Scenario | Must hold |
-|---|---|---|
-| A | A draft is in the orchestrator's input box when an item arrives | The draft is intact |
-| B | You are mid-conversation with the orchestrator when the coder finishes | Only a note is delivered, no machine turn starts, and the orchestrator's next reply takes it into account |
-| C | You are away when the coder finishes | The orchestrator is woken within about 2 minutes, with the item in the message |
-| D | An item arrives in the middle of a turn | It runs after that turn |
-| E | 2 hours with no events | Zero machine turns |
-| F | The daemon is killed while the coder finishes, then restarted | The item is delivered exactly once |
+```mermaid
+flowchart LR
+  file["Scenario file<br/>cast · issues · steps<br/>expectations · control"]
+  subgraph offline["Offline: bin/test-switchboard, in CI"]
+    direction TB
+    fakes["Fakes of herdr, v2 and GitHub<br/>simulated clock"]
+  end
+  subgraph lab["Lab: bin/proof-switchboard"]
+    direction TB
+    scripted["lab-scripted<br/>real v2 and herdr<br/>scripted model"]
+    model["lab-model<br/>real v2 and herdr<br/>Copilot models"]
+  end
+  oracles["Oracles<br/>transcripts · pane reads<br/>GitHub · audit log"]
+  report["Report<br/>run passes · control fails"]
+  file --> fakes
+  file --> scripted
+  file --> model
+  fakes --> oracles
+  scripted --> oracles
+  model --> oracles
+  oracles --> report
+```
 
-A check only counts once we have seen it fail with its safeguard switched off.
+### What a scenario is
+
+A JSON file in `scenarios/switchboard/`. JSON because the kit is stdlib-only
+Python 3.9. It has five parts:
+
+- **Cast:** the agents, each with a role, `reports_to`, and the issue it works
+  on.
+- **Issues:** the charter, asks and work items, with their Intent lines.
+- **Steps:** timed actions by you (type a draft, send a message, go away), by
+  agents (a turn that lasts 30 s, a permission request), and by the world (a
+  GitHub comment, a killed daemon, a closed pane).
+- **Expectations:** what must and must not happen, each checked against the
+  system that owns the fact.
+- **Control:** the safeguard the scenario proves, and how to switch it off.
+  With the safeguard off, the scenario must fail.
+
+An example, shortened:
+
+```json
+{
+  "id": "N1",
+  "title": "A worker finishes while you are talking to its orchestrator",
+  "problem": 3,
+  "since_pr": 4,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "30s"},
+    {"at": "10s", "actor": "you", "do": "message", "to": "platform", "text": "status?"},
+    {"at": "150s", "actor": "you", "do": "message", "to": "platform", "text": "and next?"}
+  ],
+  "expect": [
+    {"that": "delivered", "to": "platform", "key": "worker.idle:coder:*", "mode": "note", "count": 1},
+    {"that": "no_machine_turn", "agent": "platform"},
+    {"that": "message_has_intent", "to": "platform", "issue": 2}
+  ],
+  "control": {"fault": "no-engagement-gate", "fails": ["no_machine_turn"]}
+}
+```
+
+### Tiers
+
+| Tier | Runs | Agents | Clock | Used for |
+|---|---|---|---|---|
+| offline | `bin/test-switchboard`, in CI on every push | Fakes of herdr, v2 and GitHub | Simulated, so a 2-hour scenario takes milliseconds | Every scenario: the delivery rule, derivation, the invariants |
+| lab-scripted | `bin/proof-switchboard run`, in the Lab | Real v2 and herdr, driven by a scripted model | Real | Anything that depends on how v2 or herdr really behave: drafts, delivery modes, status events, restarts |
+| lab-model | `bin/proof-switchboard run --models`, in the Lab | Real v2 and herdr, with Copilot models | Real | Behaviour that depends on the model: checking reports against Done-when, writing handoff briefs, acting on decorations |
+
+**The scripted model.** For lab-scripted runs, `bin/proof-switchboard` starts a
+small local server that speaks the OpenAI chat-completions protocol, streaming
+included, and plays back each agent's script: "run `sleep 30`, then reply
+DONE", "ask permission to edit a file". The Lab's v2 config registers it as a
+provider (verify S7). Agents then behave the same way on every run and cost
+nothing, while v2 and herdr are the real thing.
+
+**You, simulated.** The runner acts for you through herdr. It types into Lab
+panes (`pane send-text` for a draft, `agent prompt` for a message) and reads
+them back. The runner is the only fleet code allowed to type into a pane, and
+only into panes in the "Switchboard Lab" workspace. A hygiene test checks that
+`bin/fleet-switchboard` never calls those commands.
+
+**Oracles.** Expectations are checked against the systems that own the facts,
+never against the switchboard's own account of what it did.
+
+| Expectation | Checked with |
+|---|---|
+| `delivered`, `count` | The recipient's transcript: synthetic messages and their `metadata.fleet.keys` |
+| `no_machine_turn` | The recipient's transcript: no turn whose triggering input is a fleet message |
+| `within` | Transcript timestamps against the step's time |
+| `draft_intact` | herdr `pane read` of the input box |
+| `message_has_intent` | The delivered text against the issue's Intent lines on GitHub, or the fake |
+| `classified` | The Jev question and answer in the audit log |
+| `handed_off` | The brief comment on the ask, and a session with role `cos-subagent` for that ask |
+| `toast` | herdr's reply to `notification show`, recorded in the audit log, because herdr has no API to list toasts |
+
+Every scenario also checks three things implicitly: each external write in its
+timeline has an audit entry before and after it (invariant 5); no OpenRouter,
+GitHub or OpenCode credential appears in the state directory or the audit log
+(invariant 7); and `bin/fleet-switchboard` made no typing call to herdr.
+
+**Controls.** Each scenario names the safeguard it proves, and a control that
+removes it:
+
+- **A fault.** The runner sets `FLEET_SWITCHBOARD_FAULT=<fault>`, which
+  `bin/fleet-switchboard` honours only when the Lab marker is set, and re-runs
+  the scenario. Faults: `no-engagement-gate`, `no-recheck`, `no-dedupe`,
+  `steer-not-queue`, `no-batch`, `no-intent-header`, `no-classify`,
+  `crash-after-send`.
+- **A baseline.** The same scenario run against today's system, for example
+  with `fleet-heartbeat` delivering wakes. This shows the scenario catches the
+  original problem.
+
+The control must fail on the expectations it names. A scenario whose control
+passes proves nothing, and fails the run.
+
+**Evidence.** Each run writes `scenario-runs/<time>/<id>/`, which is
+gitignored: `report.md` with pass or fail per expectation for the run and its
+control, and `timeline.jsonl` with the steps, the audit log, transcript
+excerpts and pane reads merged by time. Each PR's description carries the
+summary table of its runs.
+
+**Spikes stay as scenarios.** S2–S7 are kept as lab scenarios tagged `spike`,
+so upgrading v2 or herdr re-runs them before anything else.
+
+**Coverage.** CI fails if a scenario file is invalid, if a scenario has no
+control, if any of problems 1–4 has no scenario, or if an invariant is covered
+neither by a scenario nor by an implicit check.
+
+### Catalog
+
+Scenarios are added by the PR in their "Since" column, and every later PR must
+keep them passing. The earlier live-proof cases A–F are D1, N1, W1, W2, Q1 and
+R1.
+
+| ID | Scenario | Problem | Safeguard | Since | Tiers |
+|---|---|---|---|---|---|
+| D1 | A draft is in the orchestrator's input box when an item arrives | 3 | Never typed | PR 3 | offline (no typing call), lab-scripted; baseline `fleet-heartbeat` |
+| W2 | An item arrives in the middle of a turn | 3 | Queue, not steer | PR 2 | offline, lab-scripted |
+| B1 | Five events for one agent within 60 s | 3 | Batching | PR 2 | offline, lab-scripted |
+| R2 | The daemon crashes between sending and reading back | — | Message id derived from the keys (invariant 3) | PR 2 | offline, lab-scripted |
+| N1 | A worker finishes while you are talking to its orchestrator | 3 | Engagement gate | PR 4 | offline, lab-scripted |
+| N2 | A note waits 10 minutes with no message from you | 3 | Note switched to steer | PR 4 | offline, lab-scripted |
+| W1 | A worker finishes while you are away | 4 | Worker-done fact | PR 4 | offline, lab-scripted |
+| W3 | A worker stops on a permission prompt | 4 | Blocked fact and toast | PR 4 | offline, lab-scripted |
+| Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated), lab-scripted (30 min) |
+| R1 | The daemon is killed while a worker finishes, then restarted | 4 | Derived pending, dedupe (invariants 1–2) | PR 4 | offline, lab-scripted |
+| H1 | A worker's pane is closed between deciding and delivering | — | Re-check before every write (invariant 4); hold and toast | PR 4 | offline, lab-scripted |
+| R3 | The state directory is deleted while items are pending | — | Nothing but the audit history and reminders is lost (invariant 8) | PR 4 | offline, lab-scripted |
+| G1 | A comment lands on an ask | 4 | Routing, Intent header | PR 5 | offline, lab-scripted |
+| G2 | The forwarder dies while events are sent | 4 | Catch-up read, object-id keys | PR 5 | offline, lab-scripted |
+| G3 | Someone else is already forwarding the repo | — | Conflict reported, fallback | PR 5 | offline, lab-scripted |
+| I1 | An orchestrator reports "one of two fixed" | 1 | Intent header on reports going up | PR 6 | offline, lab-model (the Chief of Staff flags it against Done-when) |
+| I2 | An issue has no Intent section | 1 | "No intent recorded" | PR 6 | offline, lab-scripted |
+| I3 | An Intent is edited on GitHub | 1 | Change surfaced, old → new | PR 6 | offline, lab-scripted |
+| I4 | An orchestrator wants to change an Intent | 1 | Proposes with `send`; only you or the Chief of Staff with your yes change it | PR 6 | lab-model |
+| J1 | The classifier runs in shadow mode | 2 | Logged, never acted on | PR 7 | offline, lab-scripted |
+| F1 | An unrelated message while the Chief of Staff is busy | 2 | Classify and hand off | PR 8 | offline, lab-model |
+| F2 | A message about the current work | 2 | No split | PR 8 | offline, lab-model |
+| F3 | A message about an ask a background subagent owns | 2 | Decoration names the owner; details forwarded | PR 8 | offline, lab-model |
+| F4 | A background subagent finishes while you talk to the Chief of Staff | 2 | Note, with the ask's Intent lines | PR 8 | offline, lab-scripted |
+| F5 | Jev is unsure, or unreachable | 2 | Defaults to the current work | PR 8 | offline, lab-scripted |
+| M1 | A v1 Chief of Staff session is imported | — | Same messages; open asks listed | PR 9 | lab-model |
 
 ## Repo and PR conventions
 
@@ -817,7 +1091,11 @@ A check only counts once we have seen it fail with its safeguard switched off.
 - Commit messages follow the repo's style (`fleet-switchboard: …`,
   `README: …`, `CI: …`, `docs: …`). Tests pass at every commit.
 - `bin/test-switchboard` runs in CI from PR 1. It is stdlib only, uses fakes
-  for herdr and `opencode api`, and includes the hygiene checks.
+  for herdr, `opencode api` and GitHub, runs every scenario's offline tier, and
+  includes the hygiene checks.
+- A PR is marked ready only when every scenario up to it passes in each of its
+  tiers, and each scenario's control fails. The PR description carries the
+  summary table from `scenario-runs/`.
 - Docs land in the same PR as the feature they describe. Each PR links this
   document and carries its own evidence.
 
@@ -834,10 +1112,17 @@ A check only counts once we have seen it fail with its safeguard switched off.
   fallback.
 - **Stacked PRs are reviewed bottom-up.** A fix to a lower PR cascades upward
   through `gh stack rebase`, and every push re-runs CI.
-- **Moving work to the background could cost more than it saves.** Forking a
-  large session re-reads its whole history; a wrong "unrelated" judgement
-  splits work that should have stayed together. F2 and F3 measure both before
-  PR 8 picks an option.
+- **A wrong classification splits work that belongs together,** or leaves it
+  together. Jev runs in shadow mode first, an unsure answer changes nothing,
+  and SF2 measures accuracy on real transcripts before it acts.
+- **A handoff brief can leave things out.** The subagent starts fresh, so
+  whatever the brief misses is lost to it. The brief's sections are checked,
+  it is posted on the ask, and SF3 tests that a subagent can continue from it.
+- **Jev is a third-party model behind OpenRouter.** If it is slow or
+  unavailable, messages are delivered as usual, without classification.
+- **The scripted model is not a real model.** Lab-scripted runs prove what v2,
+  herdr and the switchboard do; anything that depends on how a model behaves
+  is proven in lab-model runs.
 - **The real cutover (PR 9).** A v2 install outside the Lab shares v1's config
   and data directories and migrates v1 history on its own. The runbook has to
   plan for this, including upgrading herdr's integration for the live fleet.
@@ -846,7 +1131,7 @@ A check only counts once we have seen it fail with its safeguard switched off.
 
 Building any adapter other than OpenCode v2 (the hook-based adapter is
 specified in [System design](#system-design) but not built); injecting context
-into individual model calls; changes to `fleet-heartbeat`.
+into individual model calls; forking sessions; changes to `fleet-heartbeat`.
 
 ## Open questions
 
@@ -862,7 +1147,12 @@ into individual model calls; changes to `fleet-heartbeat`.
   Chief of Staff's summaries against Done-when, before and after PR 6.
 - Should a message ever cover more than one ask, or should each ask get its
   own message, at the cost of more wakes?
-- PR 8: which notice, judge and split options? Decided after F1–F3.
+- PR 8: notice without a plugin, or with a thin prompt hook? And a fleet
+  worker or v2's native background subagent? Decided after SF1 and SF4.
+- PR 8: Jev's confidence threshold, chosen from SF2.
+- How many lab-model runs per PR? They take minutes each and use real model
+  quota; proposed: every lab-model scenario once per PR, re-run only when it
+  fails.
 - How long is the audit log kept? Proposed: 30 days, configurable.
 - PR 5: one forwarder per repo, or one per org with `--org`? Per org covers
   every charter repo with a single hook, but needs the `admin:org_hook` scope
@@ -925,3 +1215,21 @@ into individual model calls; changes to `fleet-heartbeat`.
     continues in the background and it turns to you. The requirement is
     written down; the options for noticing, judging and splitting are left
     open until spikes F1–F3. The v1 move is now PR 9.
+- 2026-10-02: third review.
+  - **Scenario testing.** Every promised behaviour is a JSON scenario with a
+    control that switches its safeguard off. Three tiers: offline in CI with
+    fakes and a simulated clock, lab-scripted with real v2 and herdr driven by
+    a local scripted model (spike S7), and lab-model with Copilot models.
+    Expectations are checked against transcripts, pane reads and GitHub, not
+    the switchboard's own account. The old live proof A–F is now part of a
+    26-scenario catalog; spikes are kept as scenarios.
+  - **Classify with Jev.** One Jev `choice` call per message from you:
+    current work, an owned ask, or new. Unsure or unreachable changes nothing.
+  - **Hand off, never fork.** The Chief of Staff writes a brief (goal from the
+    ask, done so far, next steps, watch out for); `fleet-switchboard handoff`
+    posts it on the ask and launches a background subagent with it.
+  - **Decorate owned asks.** A message about an ask a background subagent or
+    an orchestrator owns is decorated with the owner, so the Chief of Staff
+    forwards the details and carries on.
+  - **Spike IDs** now all start with S (SG1, SF1–SF4), so they do not collide
+    with scenario IDs.
