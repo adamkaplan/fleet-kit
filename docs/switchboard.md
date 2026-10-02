@@ -11,7 +11,7 @@
 | PR | Branch | Scope | State |
 |---|---|---|---|
 | 1 | `switchboard/v2-client` | v2 client, isolated lab, scenario format and runners, spikes S1–S7 | ready for review [#15](https://github.com/adamkaplan/fleet-kit/pull/15); spikes pass |
-| 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send`; the Lab scenario runner; spikes as scenarios | draft; offline and spike scenarios pass, the Lab tier of W2, B1 and R2 is next |
+| 2 | `switchboard/delivery` | Delivery rule: pending derived from sources, notes vs. wakes, batching, `send`; the Lab scenario runner; spikes as scenarios | ready for review [#17](https://github.com/adamkaplan/fleet-kit/pull/17); W2, B1, R2 and S2–S7 pass offline and in the Lab |
 | 3 | `switchboard/herdr` | `launch`, herdr's OpenCode integration, status-change events, badges, toasts | planned |
 | 4 | `switchboard/worker-events` | Worker done or blocked → its orchestrator; the substrate scenarios pass in the Lab | planned |
 | 5 | `switchboard/github-events` | GitHub events via `gh webhook forward`; catch-up read after gaps | planned |
@@ -321,12 +321,12 @@ service and handles authentication. One client class owns every call.
 | Contract | OpenCode v2 |
 |---|---|
 | launch | `session.create` with the agent, title, location and `metadata.fleet = {name, role, reports_to, issue}`; a herdr tab running the TUI with `-s <session>`, started by absolute path and checked with `pane process-info` (S6: a login shell's PATH can resolve `opencode` to v1); then `session.prompt` with the brief, marked as sent by the fleet |
-| observe `status` | herdr `agent_status` for the pane whose `agent_session` is this session (S6). `done` counts as idle: herdr shows `done` after a turn in an unfocused pane |
+| observe `status` | herdr `agent_status` for the pane whose `agent_session` (an object, `{kind, value}`) names this session (S6). `done` counts as idle: herdr shows `done` after a turn in an unfocused pane |
 | observe `fleet` | `session.get` → `metadata.fleet` (verify S5) |
 | observe `idle_at`, `outcome` | `session.get` → `time.idle`, `outcome` |
 | observe `blocked_on` | `permission.request.list`, `form.list` |
 | observe `last_human_prompt` | `session.message.list`, newest first: the first message of type `user` without `metadata.fleet` (S5). Fleet prompts are also type `user`, so the metadata is what tells them apart |
-| delivered | Synthetic messages newer than `since`, read newest first: their `metadata.fleet.keys`. Plus `session.inbox.list`, for notes not yet delivered (verify S5) |
+| delivered | Synthetic messages newer than `since`, read newest first: their `metadata.fleet.keys`. Plus `session.inbox.list`, for items not yet delivered, whose metadata is under `payload.metadata` |
 | note | `session.synthetic` with `resume: false`, `delivery: "steer"` and `metadata.fleet.keys` (S3) |
 | wake | `session.synthetic` with `resume: true`, `delivery: "queue"` and `metadata.fleet.keys` (S4: idle, a turn starts in 0.06 s; busy, it runs after the turn's final reply, never between steps) |
 | note → wake | `session.inbox.update` to `queue`, then to `steer`; or `session.inbox.cancel` and resend the same id as a wake (S3) |
@@ -1461,3 +1461,9 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   recipient's session, not its name. The Lab tier of W2, B1 and R2 needs the
   runner to drive the engine; that is next. Scenario vocabulary still has two
   `model_saw` selector styles to reconcile.
+- 2026-10-02: PR 2 ready for review. The Lab runner now drives the real
+  engine; W2, B1 and R2 pass in the Lab as well as offline. Running against
+  real herdr and v2 found two shape errors the fakes had hidden: herdr's
+  `agent_session` is an object, and v2 keeps a waiting item's metadata under
+  `payload.metadata`. Both fixed, and the fakes now use the real shapes. The
+  two runners share one scenario vocabulary.
