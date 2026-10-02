@@ -1,0 +1,11 @@
+{
+  "note": "Hand-written answers for the offline and lab-scripted scenarios. The decision model client replays this file when the config names it as jev.replay. A rule matches a message that contains its text; the first match wins; the last rule matches anything. No real call was recorded here.",
+  "rules": [
+    {"contains": "billing export",
+     "choice": {"current": 0.03, "new": 0.95, "615": 0.02}},
+    {"contains": "other thing",
+     "choice": {"current": 0.4, "new": 0.55, "615": 0.05}},
+    {"contains": "status page", "error": "unreachable"},
+    {"choice": {"current": 0.9, "new": 0.08, "615": 0.02}}
+  ]
+}
