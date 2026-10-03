@@ -20,7 +20,7 @@ The full format, tiers, oracles and catalog are in
 | `tiers` | yes | Any of `offline`, `lab-scripted`, `lab-model` |
 | `tags` | no | Free labels, such as `spike` |
 | `cast` | yes | Agent name → `role` (`chief-of-staff`, `orchestrator`, `coder`, `cos-subagent`), optional `reports_to` (another cast name), `issue`, `charter` |
-| `issues` | no | Issue number (as a string) → `intent`, optional `done_when`, `parent`. `intent: null` is an issue with no Intent section |
+| `issues` | no | Issue number (as a string) → `intent`, optional `done_when`, `parent`, `authority` (a charter's `Standing authority:` line). `intent: null` is an issue with no Intent section |
 | `steps` | yes | Timed actions: `at` (`0s`, `10s`, `2m`, `2h`; never decreasing), `actor` (`you`, `world` or a cast name), `do`, plus the action's own fields |
 | `expect` | yes | What must and must not happen: `that` (the oracle), optional unique `name`, plus the oracle's own fields |
 | `config` | no | Engine timing the scenario shortens (`batch_seconds`, `engaged_minutes`; positive numbers), applied by both runners, so the Lab need not wait real minutes |
@@ -59,6 +59,7 @@ is how many.
 | `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with its role, `reports_to` and issue from the cast, into the play's herdr workspace. The member has no session until the step runs. The brief is the first prompt, sent once the pane is verified |
 | `pass` | world | [`faults`] | One engine pass with these faults on, such as `crash-after-send` |
 | `kill-daemon`, `restart-daemon` | world | none | While the daemon is down only `pass` steps run the engine; a restart forgets everything in memory |
+| `tool-call` | a cast member | `tool` (`shell`, `edit`, `webfetch`, `subagent`, `read`, `glob`, `grep`, `skill`, `other`), `arguments`, [`configured`: `allow`, `ask`, `deny`] | The agent makes a tool call; the offline runner sends it through `judge-tool`'s own path against fakes and Jev's replay answers (`scenarios/jev/policy.json`). An `ask` blocks the agent as v2 does (PR 9). Offline only: the Lab tier is owed to the real plugin |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations
@@ -82,6 +83,7 @@ is how many.
 | `classified` | `agent`, `step`, `as` | Jev classified that message so (PR 7) |
 | `handed_off` | `issue` | A brief on the ask and a `cos-subagent` session for it (PR 8) |
 | `toast` | [`agent`], [`text`] | herdr was asked to show a toast naming `agent` in its title or body and carrying `text` in its body. In the Lab, read from the engine's herdr shim, which records each `notification show` |
+| `policy_outcome` | `agent`, `step`, `outcome` (`allow`, `ask`, `deny`), [`reason`], [`judged`], [`cached`], [`jev_calls`] | What `judge-tool` answered for that `tool-call` step: the outcome, a reason containing `reason`, whether Jev's verdict was used, whether it was cached, and how many times Jev was asked (PR 9; offline) |
 | `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
 
 **Mode.** Whether a message was a note or a wake is read from what it did,

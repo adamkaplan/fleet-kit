@@ -168,6 +168,7 @@ def validate_config(raw, source="config"):
     config.update(envs)
     validate_jev_config(config, raw, source)
     validate_foreground_config(config, source)  # PR 8
+    validate_policy_config(config, source)  # PR 9
     return config
 
 
@@ -2905,10 +2906,15 @@ class WorkerFacts:
         asked = _created(item)  # when v2 says it asked; without it the fact is urgent, not batched
         summary = "%s is blocked on a %s request and cannot go on until you answer it: %s" % (
             observation.name, kind, _one_line(what, 200))
+        if isinstance(item.get("message"), str) and item["message"].strip():
+            summary += " (reason given: %s)" % _one_line(item["message"], 200)
         issue = _issue_of(observation.fleet)
+        # A hook's message (PR 9: the policy judge's reason) is on the request as `message`: say it first.
+        note = _one_line(item["message"], 120) if isinstance(item.get("message"), str) else ""
+        shown = "%s (%s)" % (note, _one_line(what, 60)) if note else what
         self._blocked.append((observation.name, key, "Fleet: %s is blocked" % observation.name,
                               _one_line("%s is waiting for you: %s%s" % (
-                                  observation.name, what, " (issue #%d)" % issue if issue else ""), 200)))
+                                  observation.name, shown, " (issue #%d)" % issue if issue else ""), 200)))
         return Fact(key, boss, WORKER_BLOCKED, summary, asked if asked is not None else self.engine.now(),
                     issue=issue, batch=asked is not None, sender=observation.name)
 
@@ -4240,6 +4246,7 @@ def cmd_run(args, runner, now, wait):
                 len(report["converted"]), len(report["errors"])))
         return EXIT_OK if not report["errors"] else EXIT_ERROR
     hub = attach_github(engine, config, state, runner, now)
+    judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait)
     except KeyboardInterrupt:
@@ -4247,6 +4254,8 @@ def cmd_run(args, runner, now, wait):
     finally:
         if hub is not None:
             hub.stop()
+        if judge_server is not None:
+            judge_server.stop()
     return EXIT_OK
 
 
@@ -4825,6 +4834,716 @@ def add_intent_parsers(sub):
     sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
 
 
+# ============================================================================
+# PR 9: the tool-call policy judge
+#
+# One section, so the stack rebases cleanly. docs/switchboard.md, "Tool-call
+# policy (PR 9)" and invariant 9. `fleet-switchboard judge-tool` is what the
+# `fleet-hooks` plugin runs, once per tool call, with one JSON object on stdin;
+# it prints one JSON line and exits 0 whatever happens, because the judge only
+# tightens: when it cannot answer, the configured outcome stands.
+#
+# The daemon, not v2, holds the OpenRouter key: `judge-tool` runs in v2's
+# environment (every agent's shell sees it), so it never reads the key and
+# never calls Jev. It asks the daemon over $STATE/judge.sock (see "the judge
+# socket" below), and the daemon runs the judgement.
+#
+# Registered in six places: DEFAULTS (here), `validate_config`
+# (`validate_policy_config`), `build_parser` (`add_policy_parsers`), `main`
+# (the `judge-tool` branch), `cmd_run` (`start_judge_server`) and the fault
+# list (`no-policy-judge`).
+#
+# This section reads GitHub (the ask's Intent, the charter's standing
+# authority) through IntentReader, which can only GET, and reads and writes
+# nothing else but its two cache files and the audit log. It never touches
+# herdr and never writes to GitHub.
+# ============================================================================
+POLICY_TOOLS = ("shell", "edit", "webfetch", "subagent", "read", "glob", "grep", "skill", "other")
+POLICY_PASS_THROUGH = ("read", "glob", "grep", "skill")  # never judged, never sent to Jev
+POLICY_REQUEST_OUTCOMES = ("allow", "ask", "deny")       # what the plugin can configure and be told
+POLICY_DEFAULTS = {
+    "enabled": False,       # off until the plugin is installed and a `jev` object is configured
+    "budget_ms": 900,       # the whole judgement, ask lookup included; no answer in time keeps the configured outcome
+    "thresholds": {},       # question id -> probability at which it fires (default POLICY_THRESHOLD)
+    "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
+    "cache_entries": 200,   # entries kept in each cache file
+}
+DEFAULTS["policy"] = None   # None means POLICY_DEFAULTS
+POLICY_STDIN_LIMIT = 65536  # bytes of request read from stdin
+POLICY_ARG_LIMIT = 4000     # characters of a tool's arguments kept
+POLICY_WARM_SECONDS = 8     # after replying, how long a late lookup may go on filling the caches
+POLICY_CACHE_BYTES = 1 << 20
+POLICY_VERDICT_FILE = "policy-verdicts.json"  # hashes and probabilities only
+POLICY_CONTEXT_FILE = "policy-context.json"   # resolved asks and sessions: a disposable copy of what GitHub and v2 say
+POLICY_SESSION_RE = re.compile(r"^ses_[A-Za-z0-9]{1,80}$")
+NO_STANDING_AUTHORITY = ("none stated: nothing is pre-authorised, so treat any merge, deploy, publish, "
+                         "message to others or spend as not covered")
+POLICY_FIRED_TEXT = {"hard_to_reverse": "hard to reverse",
+                     "speaks_for_you": "speaks for you, which the standing authority does not cover",
+                     "outside_scope": "outside this agent's assignment"}
+POLICY_ACTOR = "judge-tool"
+
+
+def validate_policy_config(config, source):
+    """Check and complete `policy`: unknown subkeys are refused, every value is checked."""
+    raw = config.get("policy")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'policy' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(POLICY_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'policy' contains key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(POLICY_DEFAULTS)))
+    settings = dict(POLICY_DEFAULTS, **raw)
+    if not isinstance(settings["enabled"], bool):
+        raise ConfigError("%s: 'policy.enabled' must be true or false, got %r" % (source, settings["enabled"]))
+    for name in ("budget_ms", "cache_seconds"):
+        value = settings[name]
+        if not _is_number(value) or value < 0 or (name == "budget_ms" and value <= 0):
+            raise ConfigError("%s: 'policy.%s' must be a %s number, got %r"
+                              % (source, name, "positive" if name == "budget_ms" else "non-negative", value))
+    entries = settings["cache_entries"]
+    if not (isinstance(entries, int) and not isinstance(entries, bool) and 1 <= entries <= 5000):
+        raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
+    settings["thresholds"] = _checked_policy_thresholds(settings["thresholds"], source)
+    if settings["enabled"] and not config.get("jev"):
+        raise ConfigError("%s: 'policy.enabled' needs a 'jev' object: there is no decision model to ask" % source)
+    config["policy"] = settings
+
+
+def _checked_policy_thresholds(thresholds, source):
+    if not isinstance(thresholds, dict):
+        raise ConfigError("%s: 'policy.thresholds' must be an object of question id -> probability" % source)
+    for name, value in thresholds.items():
+        if name not in POLICY_QUESTIONS:
+            raise ConfigError("%s: 'policy.thresholds' names no question %r (known: %s)"
+                              % (source, name, ", ".join(POLICY_QUESTIONS)))
+        if not _is_number(value) or not 0 < value <= 1:
+            raise ConfigError("%s: 'policy.thresholds.%s' must be a number above 0 and at most 1, got %r"
+                              % (source, name, value))
+    return dict(thresholds)
+
+
+# ------------------------------------------------------------- the request
+
+class PolicyRequestError(ValueError):
+    """What `judge-tool` was given on stdin is not a usable request."""
+
+
+def parse_policy_request(text):
+    """{"session", "tool", "arguments", "configured"} from the plugin's JSON, or PolicyRequestError."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        raise PolicyRequestError("the request is not JSON") from None
+    if not isinstance(data, dict):
+        raise PolicyRequestError("the request must be a JSON object")
+    session = data.get("sessionID")
+    if not isinstance(session, str) or not POLICY_SESSION_RE.match(session):
+        raise PolicyRequestError("sessionID must be a v2 session id (ses_...)")
+    if data.get("tool") not in POLICY_TOOLS:
+        raise PolicyRequestError("tool must be one of %s" % ", ".join(POLICY_TOOLS))
+    if data.get("outcome") not in POLICY_REQUEST_OUTCOMES:
+        raise PolicyRequestError("outcome must be one of %s" % ", ".join(POLICY_REQUEST_OUTCOMES))
+    arguments = data.get("arguments", "")
+    if arguments is None:
+        arguments = ""
+    elif not isinstance(arguments, str):
+        arguments = _canonical(arguments)
+    return {"session": session, "tool": data["tool"], "arguments": arguments[:POLICY_ARG_LIMIT],
+            "configured": data["outcome"]}
+
+
+def _guess_configured(text):
+    """The configured outcome in a request we could not use, or `allow`, which no plugin applies."""
+    try:
+        outcome = json.loads(text).get("outcome")
+    except (TypeError, ValueError, AttributeError):
+        return "allow"
+    return outcome if outcome in POLICY_REQUEST_OUTCOMES else "allow"
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
+                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
+                r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+)
+
+
+def redact_command_text(text, extra=()):
+    """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed.
+
+    A tool's arguments go to a third-party model and to the audit log; neither
+    may see a credential. This is a net, not a promise: it catches the usual shapes.
+    """
+    text = "" if text is None else str(text)
+    for secret in extra:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ------------------------------------------------------- standing authority
+
+_STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
+
+
+def parse_standing_authority(body):
+    """The charter's one-line `Standing authority:` text, or None when it states none.
+
+    It lives in the charter issue's prose, below the yaml block; fenced code is
+    ignored, the first such line wins, and "none" counts as none stated.
+    """
+    fenced = False
+    for line in (body or "").splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        match = None if fenced else _STANDING_AUTHORITY.match(line.strip())
+        if match:
+            text = match.group(1).strip()
+            return None if not text or text.lower().rstrip(".") in ("none", "none stated", "n/a") else text
+    return None
+
+
+def fetch_standing_authority(reader, charter, repo):
+    """The charter issue's standing authority through the reader's GET-only `gh api`."""
+    data = reader._api("repos/%s/issues/%d" % (repo, charter))
+    return parse_standing_authority(data.get("body") if isinstance(data, dict) else None)
+
+
+def resolve_policy_context(reader, fleet):
+    """{"issue", "intent", "done_when", "authority"} for the agent's ask, from GitHub (IntentError on failure).
+
+    The ask is the agent's issue, or its parent when the issue is a work item;
+    an orchestrator with only a charter has no ask (`issue` None). The
+    authority comes from the charter above the ask, or the charter itself.
+    """
+    repo = fleet.get("repo") or reader.repo
+    issue, charter = fleet.get("issue"), fleet.get("charter")
+    ask = intent = done_when = None
+    if _is_issue_number(issue) and reader.issue(issue, repo).charter:
+        issue, charter = None, issue
+    if _is_issue_number(issue):
+        ask, work = reader.ask_of(issue, repo)
+        found = reader.issue(ask, repo)
+        intent, done_when = found.intent, found.done_when
+        if work is not None and reader.issue(work, repo).intent:
+            intent = "%s (work item: %s)" % (intent or NO_INTENT, reader.issue(work, repo).intent)
+        charter = reader.parent(ask, repo)
+    authority = fetch_standing_authority(reader, charter, repo) if _is_issue_number(charter) else None
+    return {"issue": ask if intent else None, "intent": intent, "done_when": done_when, "authority": authority}
+
+
+# ------------------------------------------------------------------ the caches
+
+class BoundedFileCache:
+    """A small JSON file of {key: {at, value}}: bounded, expiring, private, replaceable.
+
+    It is a cache and nothing else: deleting it loses only speed (invariant 8).
+    Written atomically (a temp file, mode 0600, then rename); a missing,
+    oversized or corrupt file reads as empty; a write that fails is not an error.
+    A ttl of 0 turns it off.
+    """
+
+    def __init__(self, path, now, ttl, limit):
+        self.path, self.now, self.ttl, self.limit = Path(path), now, ttl, limit
+
+    def _fresh(self):
+        if not self.ttl:
+            return {}
+        try:
+            if self.path.stat().st_size > POLICY_CACHE_BYTES:
+                return {}
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        return {key: entry for key, entry in entries.items()
+                if isinstance(entry, dict) and _is_number(entry.get("at")) and self.now() - entry["at"] < self.ttl
+                and self.now() >= entry["at"]}
+
+    def get(self, key):
+        entry = self._fresh().get(key)
+        return entry["value"] if entry else None
+
+    def put(self, key, value):
+        """Store one entry, dropping the oldest beyond the limit. True when it was written."""
+        if not self.ttl:
+            return False
+        entries = self._fresh()
+        entries[key] = {"at": self.now(), "value": value}
+        for old in sorted(entries, key=lambda k: entries[k]["at"])[:max(0, len(entries) - self.limit)]:
+            del entries[old]
+        temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
+        try:
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"entries": entries}, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(self.path))
+            return True
+        except OSError:
+            try:
+                os.unlink(str(temp))
+            except OSError:
+                pass
+            return False
+
+
+# ------------------------------------------------------------------- the reply
+
+def policy_reply(outcome, reason, judged=False, cached=False, latency_ms=0):
+    """The one JSON line `judge-tool` prints."""
+    return {"outcome": outcome, "reason": _one_line(reason, 600), "judged": bool(judged),
+            "cached": bool(cached), "latency_ms": int(latency_ms)}
+
+
+def policy_unjudged_reason(config, request):
+    """Why this call is not judged at all (a sentence), or None when it is to be judged."""
+    if request["configured"] == "deny":
+        return "a configured deny is final: the judge was not consulted"
+    if request["tool"] in POLICY_PASS_THROUGH:
+        return "not judged: a %s passes straight through" % request["tool"]
+    if not config["policy"]["enabled"]:
+        return "the policy judge is not enabled"
+    if fault("no-policy-judge"):
+        return "no-policy-judge fault: the judge is off"
+    return None
+
+
+def _what_text(request):
+    return "%s: %s" % (request["tool"], _one_line(request["arguments"], 100))
+
+
+def escalation_reason(fleet, ask, request):
+    """The denial text for a call outside the ask's Intent: escalate, never argue."""
+    where = " (ask #%d)" % ask if ask else ""
+    route = ("Send the Chief of Staff the proposal with `%s send <chief-of-staff> --issue <n> \"...\"`" % PROG)
+    if (fleet or {}).get("role") == "orchestrator":
+        route += ", or label your charter awaiting-user with a Decision required section"
+    return ("Denied: this call is outside the ask's Intent%s (%s). Do not retry it or work around it. Escalate: "
+            "%s. Only the person you report to widens the ask." % (where, _what_text(request), route))
+
+
+def tightened_reason(combined, fleet, ask, request):
+    """The sentence for the outcome the judge reached, for the agent or for you."""
+    fired = combined["fired"]
+    if "outside_intent" in fired and combined["outcome"] in ("deny", "hard-deny"):
+        return escalation_reason(fleet, ask, request)
+    if fired and combined["outcome"] != "allow":
+        return "Needs your yes: %s (%s)." % ("; ".join(POLICY_FIRED_TEXT[n] for n in fired if n in POLICY_FIRED_TEXT),
+                                            _what_text(request))
+    return "judge: nothing at its threshold; the configured outcome stands"
+
+
+def policy_verdict_key(request, fleet_name, context, role):
+    """A hash of everything the verdict depends on, for the cache: no text is kept."""
+    parts = {"session": request["session"], "agent": fleet_name, "role": role, "ask": context["issue"],
+             "intent": context["intent"], "done_when": context["done_when"], "authority": context["authority"],
+             "tool": request["tool"], "arguments": request["arguments"]}
+    return hashlib.sha256(_canonical(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _valid_answers(value):
+    answers = value.get("answers") if isinstance(value, dict) else None
+    ok = isinstance(answers, dict) and set(answers) == set(POLICY_QUESTIONS) \
+        and all(_is_probability(p) for p in answers.values())
+    return answers if ok else None
+
+
+def _valid_session_fleet(value):
+    fleet = value.get("fleet") if isinstance(value, dict) else None
+    return fleet if isinstance(fleet, dict) and isinstance(fleet.get("name"), str) else None
+
+
+def _valid_context(value):
+    keys = ("issue", "intent", "done_when", "authority")
+    ok = isinstance(value, dict) and all(k in value for k in keys) \
+        and all(value[k] is None or isinstance(value[k], str) for k in keys[1:]) \
+        and (value["issue"] is None or _is_issue_number(value["issue"]))
+    return {k: value[k] for k in keys} if ok else None
+
+
+# ------------------------------------------------------------------ the judge
+
+class PolicyJudge:
+    """Judges one tool call: who the agent is, what its ask is, what Jev says, what the code allows.
+
+    Every collaborator is injected, so a test never reaches a real binary. The
+    whole judgement runs in one worker thread against `budget_ms`: when it has
+    not finished in time the configured outcome is the reply, and the worker
+    is left to finish filling the caches, so the next call is fast.
+    """
+
+    def __init__(self, config, v2, reader, jev, audit, state, now=time.time, monotonic=time.monotonic, environ=None):
+        self.config, self.settings = config, config["policy"]
+        self.v2, self.reader, self.jev, self.audit = v2, reader, jev, audit
+        self.now, self.monotonic = now, monotonic
+        self.environ = os.environ if environ is None else environ
+        ttl, limit = self.settings["cache_seconds"], self.settings["cache_entries"]
+        self.verdicts = BoundedFileCache(Path(state) / POLICY_VERDICT_FILE, now, ttl, limit)
+        self.contexts = BoundedFileCache(Path(state) / POLICY_CONTEXT_FILE, now, ttl, limit)
+        self._worker = None
+
+    # -- the whole judgement, against the budget
+
+    def decide(self, request):
+        started = self.monotonic()
+        box = {"stage": "identifying the agent", "detail": {}}
+        worker = threading.Thread(target=self._work, args=(request, box), daemon=True)
+        worker.start()
+        worker.join(self.settings["budget_ms"] / 1000.0)
+        elapsed = int((self.monotonic() - started) * 1000)
+        if worker.is_alive():
+            self._worker = worker
+            reply = policy_reply(request["configured"], "no answer within %d ms (still %s): the configured "
+                                 "outcome stands" % (self.settings["budget_ms"], box["stage"]), False, False, elapsed)
+        else:
+            reply = box.get("reply") or policy_reply(request["configured"], "the judge failed: the configured "
+                                                     "outcome stands", False, False, elapsed)
+            reply["latency_ms"] = elapsed
+        self._audit(request, reply, box)
+        return reply
+
+    def finish_late(self, seconds=POLICY_WARM_SECONDS):
+        """Wait for a judgement that missed its budget to finish and fill the caches (tests use it)."""
+        if self._worker is not None:
+            self._worker.join(seconds)
+
+    def _work(self, request, box):
+        try:
+            box["reply"] = self._judge(request, box)
+        except Exception as err:  # a worker thread must never leak a traceback or die without a reply
+            box["detail"]["error"] = _one_line("%s: %s" % (type(err).__name__, err), 200)
+            box["reply"] = policy_reply(request["configured"], "could not judge while %s (%s): the configured "
+                                        "outcome stands" % (box["stage"], _one_line(str(err), 120)))
+
+    def _judge(self, request, box):
+        fleet = self.identify(request["session"])
+        if fleet is None:
+            return policy_reply(request["configured"], "not a fleet agent (no metadata.fleet): not judged")
+        box["stage"] = "resolving the ask"
+        context = self.context_of(fleet)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
+        request = dict(request, arguments=self.redacted(request["arguments"]))  # from here on, nothing sees a credential
+        key = policy_verdict_key(request, fleet["name"], context, fleet.get("role"))
+        thresholds = dict(self.settings["thresholds"])
+        if context["issue"] is None:
+            thresholds["outside_intent"] = 2.0  # with no ask there is nothing to be outside of: that question cannot fire
+        cached = _valid_answers(self.verdicts.get(key))
+        if cached is not None:
+            combined = combine_policy(cached, thresholds, request["configured"])
+            combined.update(answers=cached, latency_ms=0, usage={}, model=None)
+        else:
+            box["stage"] = "asking the decision model"
+            state = self.state_of(request, fleet, context)
+            box["detail"]["state"] = state
+            combined = judge_tool_call(self.jev, request["configured"], state, thresholds)
+            if "answers" in combined:
+                self.verdicts.put(key, {"answers": combined["answers"]})
+        box["detail"].update(combined=combined, cached=cached is not None, thresholds=thresholds)
+        return self.reply_of(combined, cached is not None, fleet, context, request)
+
+    # -- the pieces
+
+    def identify(self, session):
+        known = _valid_session_fleet(self.contexts.get("session:" + session))
+        if known is not None:
+            return known
+        fleet = _fleet_meta(self.v2.session_get(session))
+        if fleet is None or not isinstance(fleet.get("name"), str):
+            return None
+        kept = {k: fleet[k] for k in ("name", "role", "reports_to", "issue", "charter", "repo") if k in fleet}
+        self.contexts.put("session:" + session, {"fleet": kept})
+        return kept
+
+    def context_of(self, fleet):
+        if self.reader is None:
+            return {"issue": None, "intent": None, "done_when": None, "authority": None}
+        key = "ask:%s:%s:%s" % (fleet.get("repo") or self.reader.repo, fleet.get("issue"), fleet.get("charter"))
+        known = _valid_context(self.contexts.get(key))
+        if known is not None:
+            return known
+        context = resolve_policy_context(self.reader, fleet)
+        self.contexts.put(key, context)
+        return context
+
+    def redacted(self, text):
+        secrets = [self.environ.get(self.config["jev"]["key_env"])] if self.config.get("jev") else []
+        return redact_command_text(text, secrets)
+
+    def state_of(self, request, fleet, context):
+        return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
+                            context["done_when"] or "not stated", context["authority"] or NO_STANDING_AUTHORITY,
+                            request["tool"], request["arguments"])
+
+    def reply_of(self, combined, cached, fleet, context, request):
+        outcome = combined["outcome"]
+        judged = "answers" in combined
+        reason = tightened_reason(combined, fleet, context["issue"], request) if judged else combined["reason"]
+        return policy_reply("deny" if outcome == "hard-deny" else outcome, reason, judged, cached,
+                            combined.get("latency_ms") or 0)
+
+    def _audit(self, request, reply, box):
+        detail, combined = box["detail"], box["detail"].get("combined") or {}
+        state = dict(detail.get("state") or {})
+        state["arguments"] = _one_line(state.get("arguments"), 300)
+        entry = {"agent": detail.get("agent"), "role": detail.get("role"), "session": request["session"],
+                 "tool": request["tool"], "configured": request["configured"], "outcome": reply["outcome"],
+                 "judged": reply["judged"], "cached": reply["cached"], "reason": reply["reason"],
+                 "latency_ms": reply["latency_ms"], "ask": detail.get("ask"), "fired": combined.get("fired"),
+                 "answers": combined.get("answers"), "thresholds": detail.get("thresholds"),
+                 "question": {"state": state, "ids": list(POLICY_QUESTIONS)} if state else None,
+                 "model": combined.get("model"), "usage": combined.get("usage"), "error": detail.get("error")}
+        try:
+            self.audit.append(POLICY_ACTOR, "policy.judge", "tool:%s:%s" % (request["session"], request["tool"]), entry)
+        except OSError:
+            pass  # the audit is best effort here: a full disk must not stop a tool call
+
+
+def judge_request(request, config, build_judge):
+    """(reply, judge): the reply for one parsed request, and the judge that made it (None when none was needed).
+
+    `build_judge()` makes the PolicyJudge and is called only for a call that is to be judged.
+    """
+    why = policy_unjudged_reason(config, request)
+    if why is not None:
+        return policy_reply(request["configured"], why), None
+    judge = build_judge()
+    return judge.decide(request), judge
+
+
+def build_policy_judge(config, runner, now):
+    """The PolicyJudge over the configured clients: v2, the ask reader, Jev, the audit log."""
+    if config["opencode"] is None:
+        raise ConfigError("'opencode' is not configured: the judge cannot identify an agent without v2")
+    state = ensure_state_dir()
+    settings = config["policy"]
+    jev_settings = dict(config["jev"], timeout_seconds=min(config["jev"]["timeout_seconds"], POLICY_WARM_SECONDS))
+    jev = build_jev(dict(config, jev=jev_settings))
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS))
+    return PolicyJudge(config, v2, intent_reader_for(config, runner, now), jev, AuditLog(state / "audit.jsonl"), state, now)
+
+
+# ------------------------------------------- the judge socket: the daemon holds the key
+
+# `judge-tool` runs inside whatever process the v2 plugin lives in, and its
+# environment is the environment of every agent's shell tool. So it never
+# reads the OpenRouter key, and never calls Jev: it sends the request over a
+# local unix stream socket to the switchboard DAEMON, which holds the key in
+# its own environment, judges, and answers with the same one JSON line. The
+# daemon, not v2, holds the key.
+POLICY_SOCKET = "judge.sock"
+POLICY_READ_SECONDS = 2      # the daemon's wait for a request to arrive
+POLICY_CLIENT_SLACK = 0.4    # seconds past the budget `judge-tool` waits for the daemon
+POLICY_CONNECTIONS = 16      # judgements the daemon runs at once
+
+
+class PolicyDaemonError(Exception):
+    """The daemon could not be reached, or did not answer in time."""
+
+
+def read_judge_line(conn, limit):
+    """Bytes up to a newline or EOF, at most limit + 1 of them; times out with the socket's timeout."""
+    data = b""
+    while len(data) <= limit and b"\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def ask_judge_daemon(state_dir, text, timeout):
+    """The daemon's reply (a dict) to the request text, or PolicyDaemonError. Never reads any environment variable."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        with in_directory(state_dir):
+            sock.connect(POLICY_SOCKET)
+        sock.sendall(text.encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        raw = read_judge_line(sock, POLICY_STDIN_LIMIT)
+    except (socket.timeout, TimeoutError):
+        raise PolicyDaemonError("the daemon did not answer in time") from None
+    except OSError as err:
+        raise PolicyDaemonError("the daemon is not reachable (%s)" % (err.strerror or err)) from None
+    finally:
+        sock.close()
+    try:
+        reply = json.loads(raw.decode("utf-8", "replace").splitlines()[0])
+    except (ValueError, IndexError):
+        raise PolicyDaemonError("the daemon's answer is not JSON") from None
+    if not isinstance(reply, dict) or reply.get("outcome") not in POLICY_REQUEST_OUTCOMES:
+        raise PolicyDaemonError("the daemon's answer has no usable outcome")
+    return reply
+
+
+def never_looser(reply, configured):
+    """The reply, made no looser than `configured`: the client's own guard, as the plugin has its own."""
+    if POLICY_REQUEST_OUTCOMES.index(reply["outcome"]) >= POLICY_REQUEST_OUTCOMES.index(configured):
+        return policy_reply(reply["outcome"], reply.get("reason") or "", reply.get("judged"), reply.get("cached"),
+                            reply.get("latency_ms") if isinstance(reply.get("latency_ms"), int) else 0)
+    return policy_reply(configured, "the daemon answered looser than the configured outcome: ignored")
+
+
+class JudgeServer:
+    """The daemon's end of the judge socket: one request and one reply per connection.
+
+    `handle(text)` returns the reply dict. The socket is $STATE/judge.sock, mode
+    0600, a stale one replaced; every connection runs in its own thread, so a
+    slow judgement never delays a pass or another judgement.
+    """
+
+    def __init__(self, state_dir, handle):
+        self.state_dir, self.handle = state_dir, handle
+        self.sock = self.thread = None
+        self.slots = threading.BoundedSemaphore(POLICY_CONNECTIONS)
+        self.stopping = threading.Event()
+
+    def start(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        before = os.umask(0o177)  # the socket is born private, not chmod-ed after anyone could connect
+        try:
+            with in_directory(self.state_dir):
+                try:
+                    os.unlink(POLICY_SOCKET)
+                except FileNotFoundError:
+                    pass
+                sock.bind(POLICY_SOCKET)
+                os.chmod(POLICY_SOCKET, 0o600)
+            sock.listen(POLICY_CONNECTIONS)
+            sock.settimeout(0.2)
+        except BaseException:
+            sock.close()
+            raise
+        finally:
+            os.umask(before)
+        self.sock = sock
+        self.thread = threading.Thread(target=self._accept, daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self):
+        self.stopping.set()
+        if self.thread is not None:
+            self.thread.join(2)
+        if self.sock is not None:
+            self.sock.close()
+            try:
+                with in_directory(self.state_dir):
+                    os.unlink(POLICY_SOCKET)
+            except OSError:
+                pass
+
+    def _accept(self):
+        while not self.stopping.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not self.slots.acquire(blocking=False):
+                conn.close()  # too many at once: that caller keeps its configured outcome
+                continue
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            conn.settimeout(POLICY_READ_SECONDS)
+            raw = read_judge_line(conn, POLICY_STDIN_LIMIT)
+            text = raw.decode("utf-8", "replace")
+            if len(raw) > POLICY_STDIN_LIMIT:
+                reply = policy_reply(_guess_configured(text), "unusable request (larger than %d bytes): no change"
+                                     % POLICY_STDIN_LIMIT)
+            else:
+                reply = self.handle(text)
+            conn.sendall((json.dumps(reply, sort_keys=True) + "\n").encode("utf-8"))
+        except (OSError, ValueError):
+            pass  # a caller that went away or sent nothing in time: nothing to answer
+        finally:
+            conn.close()
+            self.slots.release()
+
+
+def make_judge_handler(runner, now):
+    """handle(text) for the daemon: parse, judge with the daemon's own key and clients, reply. Never raises."""
+    def handle(text):
+        try:
+            request = parse_policy_request(text)
+            config = load_config()  # read at each call, so an edit to `policy` takes effect without a restart
+            active_faults()
+            return judge_request(request, config, lambda: build_policy_judge(config, runner, now))[0]
+        except PolicyRequestError as err:
+            return policy_reply(_guess_configured(text), "unusable request (%s): no change" % err)
+        except Exception as err:  # the judge only tightens: whatever fails, the configured outcome stands
+            return policy_reply(_guess_configured(text), "the judge failed (%s: %s): the configured outcome stands"
+                                % (type(err).__name__, _one_line(str(err), 120)))
+    return handle
+
+
+def start_judge_server(config, state, runner, now):
+    """The daemon's judge socket when `policy.enabled`, else None."""
+    if not config["policy"]["enabled"]:
+        return None
+    return JudgeServer(state, make_judge_handler(runner, now)).start()
+
+
+def cmd_judge_tool(args, runner, now, stdin=None):
+    """Read one request, print one JSON line, exit 0 whatever happens (invariant 9).
+
+    Decides locally only what needs no model (a read, a configured deny, the
+    judge off); everything else goes to the daemon. It reads no environment
+    variable of its own accord: the key is the daemon's.
+    """
+    text = ""
+    try:
+        text = (stdin or sys.stdin).read(POLICY_STDIN_LIMIT + 1)
+        if len(text) > POLICY_STDIN_LIMIT:
+            raise PolicyRequestError("the request is larger than %d bytes" % POLICY_STDIN_LIMIT)
+        request = parse_policy_request(text)
+        config = load_config()
+        active_faults()
+        why = policy_unjudged_reason(config, request)
+        if why is not None:
+            reply = policy_reply(request["configured"], why)
+        else:
+            wait = config["policy"]["budget_ms"] / 1000.0 + POLICY_CLIENT_SLACK
+            reply = never_looser(ask_judge_daemon(state_dir_path(), text, wait), request["configured"])
+    except PolicyRequestError as err:
+        reply = policy_reply(_guess_configured(text), "unusable request (%s): no change" % err)
+    except PolicyDaemonError as err:
+        reply = policy_reply(request["configured"], "%s: the configured outcome stands" % err)
+    except Exception as err:  # nothing the judge does may stop a tool call: the configured outcome stands
+        reply = policy_reply(_guess_configured(text), "the judge failed (%s: %s): the configured outcome stands"
+                             % (type(err).__name__, _one_line(str(err), 120)))
+    try:
+        print(json.dumps(reply, sort_keys=True))
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass  # the plugin stopped listening
+    return EXIT_OK
+
+
+POLICY_COMMANDS = {"judge-tool": cmd_judge_tool}
+
+
+def add_policy_parsers(sub):
+    sub.add_parser("judge-tool", help="Judge one tool call: JSON on stdin, one JSON line out, exit 0 "
+                                      "(the fleet-hooks plugin runs this; the judge only tightens)")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -4865,6 +5584,7 @@ def build_parser():
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     add_intent_parsers(sub)
     add_foreground_parsers(sub)  # PR 8
+    add_policy_parsers(sub)  # PR 9
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -4882,6 +5602,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_status(args, runner, now)
     if args.action == "poke":
         return cmd_poke(args)
+    if args.action in POLICY_COMMANDS:  # PR 9: prints one JSON line and exits 0 whatever happens
+        return POLICY_COMMANDS[args.action](args, runner, now)
     try:
         if args.action == "ensure":
             return cmd_ensure(args, spawn)

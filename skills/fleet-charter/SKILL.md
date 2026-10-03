@@ -42,6 +42,14 @@ Rules that matter:
 - Below the block: your charter (what you own), your authority, and your STOP
   list. Keep it short enough to stay true.
 
+Say your standing authority on one line below the block, starting
+`Standing authority:`, for example `Standing authority: may merge green PRs in
+this repo`. The switchboard's tool-call judge reads that line, and only that
+line, from the charter's body (the yaml block stays flat) and asks the person
+you report to about any merge, deploy, publish, message to others or spend it
+does not cover. With no such line it reads "none stated", and nothing of that
+kind is pre-authorised.
+
 An issue that names your pane but carries no `<user>:orchestrator` label is not a
 charter. It is one label away from being one, and until that label is on, nothing
 supervising the fleet can see it.
