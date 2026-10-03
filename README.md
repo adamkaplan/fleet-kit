@@ -300,7 +300,8 @@ line and one Done-when line. Every message about it carries those lines, so a
 report is read against what you asked for, and only you, or the Chief of Staff
 with your yes, change them. Each role definition opens with a few maxims and one
 rubric for when to reach you. The design is in
-[docs/switchboard.md](docs/switchboard.md).
+[docs/switchboard.md](docs/switchboard.md); moving a live fleet from OpenCode v1 is
+in [docs/switchboard-cutover.md](docs/switchboard-cutover.md).
 
 ---
 

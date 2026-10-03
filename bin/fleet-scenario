@@ -104,6 +104,8 @@ STEP_FIELDS = {
     # PR 9: a cast member's tool call, judged by `judge-tool`; `configured` is the outcome the rules chose
     "tool-call": {"tool": (True, "policy_tool"), "arguments": (True, "text"),
                   "configured": (False, "policy_result")},
+    # PR 10: copy a v1 session into v2, from a fixture file (a path under the repo's scenarios/)
+    "import-v1": {"agent": (True, _CAST), "fixture": (True, "name")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -116,6 +118,7 @@ STEP_ACTORS = {
     "kill-forwarder": ("world",), "occupy-hook": ("world",),
     "handoff": ("cast",),
     "tool-call": ("cast",),  # PR 9
+    "import-v1": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -146,6 +149,9 @@ EXPECT_FIELDS = {
     "policy_outcome": {"agent": (True, _CAST), "step": (True, _STEP), "outcome": (True, "policy_result"),
                        "reason": (False, "text"), "judged": (False, "bool"), "cached": (False, "bool"),
                        "jev_calls": (False, "count0")},
+    # PR 10
+    "imported_messages": {"agent": (True, _CAST), "count": (False, "count0")},
+    "lists_asks": {"agent": (True, _CAST), "issue": (True, "issue")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
