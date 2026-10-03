@@ -162,7 +162,8 @@ class TestConfig(Base):
                               "check_suite", "workflow_run"],
             "intent_repo": None, "intent_required": True,
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
-            "policy": sb.POLICY_DEFAULTS})  # PR 9
+            "policy": sb.POLICY_DEFAULTS,  # PR 9
+            **sb.V1_MOVE_DEFAULTS})  # PR 10: pinned in TestImportV1Config
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -732,7 +733,8 @@ class TestAuditLog(Base):
 
 DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue", "no-batch",
               "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
-              "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion")
+              "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion",
+              "no-import-metadata")
 
 
 class TestFaults(Base):
@@ -3572,7 +3574,7 @@ class OfflineRun:
         self.work.mkdir(exist_ok=True)
         self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
                            config=dict(JEV_SCENARIO_CONFIG, **(scenario.get("config") or {})))
-        launched = {step["agent"] for step in scenario["steps"] if step["do"] == "launch"}
+        launched = {step["agent"] for step in scenario["steps"] if step["do"] in ("launch", "import-v1")}
         for name, member in sorted(scenario["cast"].items()):
             if name not in launched:  # a launched agent does not exist until `launch` makes it
                 self.world.add_agent(name, fleet=self.fleet_of(member))
@@ -5343,7 +5345,8 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("run: bin/fleet-scenario validate", workflow)
 
 
-# ===============================================================# PR 4: worker events, reminders, toasts and their scenarios
+# ======================================================================
+# PR 4: worker events, reminders, toasts and their scenarios
 #
 # Everything below extends the fakes and the offline scenario runner by
 # attachment (`adds_to`), so the shared classes above stay as they were.
@@ -7726,7 +7729,8 @@ class TestPR7Source(unittest.TestCase):
             self.assertNotIn(fragment, text)
 
 
-# ===============================================================# PR 8: foreground and background
+# ======================================================================
+# PR 8: foreground and background
 #
 # One section, so the stack rebases cleanly: cursor paging, the acting
 # classifier and its decoration, the handoff command, the cos-subagent
@@ -9896,6 +9900,1175 @@ class TestFleetHooksSource(unittest.TestCase):
         for path in files:
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(pattern.search(line), "%s:%d %s" % (path.name, number, line))
+# ======================================================================
+# PR 10: moving a v1 session into v2 (import-v1), the cutover runbook, M1
+#
+# One section. It extends the fakes and the offline runner by attachment, so
+# nothing above changes except one line in OfflineRun.__init__ (an agent that
+# an `import-v1` step creates does not exist beforehand, as with `launch`).
+# Nothing here runs a real binary: v1 is a fake that answers `export` only.
+# ======================================================================
+FAKE_V1 = "/fake/bin/opencode-v1"
+V1_FIXTURES = REPO / "scenarios" / "v1-fixtures"
+V1_MAIN = V1_FIXTURES / "chief-of-staff-export.json"
+V1_CHILD = V1_FIXTURES / "subagent-export.json"
+V1_MAIN_ID, V1_CHILD_ID = "ses_fixture00000000000001", "ses_fixture00000000000002"
+CUTOVER_DOC = REPO / "docs" / "switchboard-cutover.md"
+
+
+def v1_export(path=V1_MAIN):
+    return json.loads(path.read_text())
+
+
+class FakeV1:
+    """The OpenCode v1 binary as the import sees it: it answers `export <id>` from
+    a table of exports and refuses to be asked anything else, so a test fails if
+    the command ever runs v1 for another purpose."""
+
+    def __init__(self, exports=None):
+        self.exports = {i: json.dumps(e) for i, e in (exports or {}).items()}
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+        if len(argv) != 3 or argv[:2] != [FAKE_V1, "export"]:
+            raise AssertionError("v1 may only be asked `export <id>`; got %r" % argv)
+        if argv[2] not in self.exports:
+            return subprocess.CompletedProcess(argv, 1, "", "Session not found: %s\n" % argv[2])
+        return subprocess.CompletedProcess(argv, 0, self.exports[argv[2]], "")
+
+
+# ---- an independent statement of what v2's import accepts (from its OpenAPI
+# document), so the fake does not just re-run the converter's own checker
+
+FAKE_IMPORT_FIELDS = {
+    "body": {"info", "messages", "location"},
+    "info": {"id", "parentID", "fork", "projectID", "agent", "model", "cost", "tokens", "outcome", "time", "title",
+             "subpath", "metadata", "permissions", "revert", "location"},
+    "user": {"id", "metadata", "time", "text", "files", "agents", "skills", "type"},
+    "assistant": {"id", "metadata", "time", "type", "agent", "model", "content", "snapshot", "finish", "rawFinish",
+                  "providerState", "cost", "tokens", "error", "retry"},
+    "text": {"type", "text", "state"}, "reasoning": {"type", "text", "state", "time"},
+    "tool": {"type", "id", "name", "executed", "providerState", "providerResultState", "state", "time"},
+}
+
+
+def _unknown_fields(item, kind):
+    return ["%s: %s" % (kind, name) for name in sorted(set(item) - FAKE_IMPORT_FIELDS[kind])]
+
+
+def _fake_message_problems(message):
+    kind = message.get("type") if isinstance(message, dict) else None
+    if kind not in ("user", "assistant"):
+        return ["message of type %r (the fake models user and assistant)" % kind]
+    problems = _unknown_fields(message, kind)
+    if not str(message.get("id", "")).startswith("msg_"):
+        problems.append("message id must start with msg_")
+    if not _is_ms(message.get("time", {}).get("created")):
+        problems.append("message time.created must be a number")
+    if kind == "user" and not isinstance(message.get("text"), str):
+        problems.append("user text must be a string")
+    for part in message.get("content", []) if kind == "assistant" else []:
+        ptype = part.get("type")
+        if ptype not in ("text", "reasoning", "tool"):
+            problems.append("content of type %r" % ptype)
+        else:
+            problems.extend(_unknown_fields(part, ptype))
+        if ptype == "tool" and part.get("state", {}).get("status") not in ("streaming", "running", "completed", "error"):
+            problems.append("tool state %r" % part.get("state"))
+    if kind == "assistant" and not all(isinstance(message.get(k), t) for k, t in (("agent", str), ("model", dict), ("content", list))):
+        problems.append("assistant needs agent, model and content")
+    return problems
+
+
+def _is_ms(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def fake_import_problems(body):
+    """Everything the fake v2 refuses in an import body."""
+    if not isinstance(body, dict):
+        return ["body must be an object"]
+    problems = ["body: " + n for n in sorted(set(body) - FAKE_IMPORT_FIELDS["body"])]
+    info, messages = body.get("info"), body.get("messages")
+    if not isinstance(info, dict) or not isinstance(messages, list):
+        return problems + ["info and messages are required"]
+    problems.extend(_unknown_fields(info, "info"))
+    for name in ("id", "projectID", "cost", "tokens", "time", "location"):
+        if name not in info:
+            problems.append("info.%s is required" % name)
+    if not str(info.get("id", "")).startswith("ses"):
+        problems.append("info.id must start with ses")
+    if not _is_ms(info.get("time", {}).get("created")) or not _is_ms(info.get("time", {}).get("updated")):
+        problems.append("info.time needs created and updated numbers")
+    if not isinstance(info.get("location", {}).get("directory"), str):
+        problems.append("info.location.directory must be a string")
+    for message in messages:
+        problems.extend(_fake_message_problems(message))
+    return problems
+
+
+@adds_to(FakeV2)
+def op_experimental_session_import(self, params, body):
+    """Strict: a bad body is 400, a repeated session id 409, a missing parent 404 (OpenAPI)."""
+    problems = fake_import_problems(body)
+    if problems:
+        raise FakeHTTP(400, "InvalidRequestError", "; ".join(problems[:4]))
+    info = body["info"]
+    if info["id"] in self.sessions:
+        raise FakeHTTP(409, "ConflictError", "session %s exists" % info["id"])
+    if info.get("parentID") and info["parentID"] not in self.sessions:
+        raise FakeHTTP(404, "SessionNotFoundError", "parent %s does not exist" % info["parentID"])
+    lines = len(Path(self.audit_path).read_text().splitlines()) if self.audit_path and Path(self.audit_path).exists() else 0
+    self.__dict__.setdefault("import_writes", []).append({"session": info["id"], "audit_lines": lines,
+                                                          "body": copy.deepcopy(body)})
+    self.sessions[info["id"]] = {
+        "id": info["id"], "title": info.get("title"), "metadata": copy.deepcopy(info.get("metadata") or {}),
+        "agent": info.get("agent"), "directory": info["location"]["directory"],
+        "created": info["time"]["created"] / 1000.0, "idle": None, "idle_writes": [], "outcome": None,
+        "messages": [dict(copy.deepcopy(m), sessionID=info["id"]) for m in body["messages"]],
+        "inbox": [], "turn": None, "turns": 0, "parentID": info.get("parentID")}
+    return self._info(self.sessions[info["id"]])
+
+
+def _fake_list_page(self, argv):
+    params = dict(value.partition("=")[::2] for flag, value in zip(argv[3::2], argv[4::2]) if flag == "--param")
+    rows = [s for s in reversed(list(self.sessions.values()))
+            if "directory" not in params or s["directory"] in (None, params["directory"])]
+    size = min(int(params.get("limit", 50)), self.__dict__.get("list_page_cap", 1000))
+    start = int(params.get("cursor") or 0)
+    following = str(start + size) if start + size < len(rows) else None
+    body = {"data": [self._info(s) for s in rows[start:start + size]], "cursor": {"previous": None, "next": following}}
+    return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+
+_fake_call_before_pr10 = FakeV2.__call__
+
+
+def _fake_call_with_session_list(self, argv, **kwargs):
+    if not self.down and list(argv[1:3]) == ["api", "session.list"]:
+        self.calls.append(list(argv))
+        return _fake_list_page(self, list(argv))
+    return _fake_call_before_pr10(self, argv, **kwargs)
+
+
+FakeV2.__call__ = _fake_call_with_session_list
+
+
+# ---- the offline runner: the `import-v1` step and its two oracles
+
+def _import_fleet_of(name, member):
+    fleet = sb.fleet_record(name, member["role"], member.get("reports_to"), member.get("issue"))
+    if "charter" in member:
+        fleet["charter"] = member["charter"]
+    return fleet
+
+
+def _fixture_path(name):
+    path = (REPO / "scenarios" / name).resolve()
+    if (REPO / "scenarios").resolve() not in path.parents:
+        raise ValueError("a scenario fixture must live under scenarios/: %s" % name)
+    return path
+
+
+def apply_import_v1(run, step):
+    """`import-v1`: the command's own function on the fakes, then the pane a person opens on the imported
+    session (the runbook's step; the engine never does it), so herdr names the agent."""
+    world, name = run.world, step["agent"]
+    export = json.loads(_fixture_path(step["fixture"]).read_text())
+    engine = world.new_engine("cli")
+    with mock.patch.dict(os.environ, {sb.FAULT_ENV: ",".join(run.faults)}):
+        report = sb.import_v1_session(engine.v2, engine.audit, export,
+                                      _import_fleet_of(name, run.scenario["cast"][name]),
+                                      world.config["import_body_limit_bytes"])
+    pane = world.herdr.new_pane_id()
+    world.herdr.add(pane, report["v2_session"])
+    world.sessions[name], world.panes[name] = report["v2_session"], pane
+    run.__dict__.setdefault("imports", {})[name] = {"export": export, "report": report}
+
+
+def _import_oracle_imported_messages(self, e):
+    """v2 holds the session with one message per v1 message, same order and timestamps, and the typed text."""
+    record = self.__dict__.get("imports", {}).get(e["agent"])
+    if record is None:
+        return False, "no import-v1 step ran for %s" % e["agent"]
+    source = record["export"]["messages"]
+    held = self.world.v2.sessions[self.world.sessions[e["agent"]]]["messages"]
+    want = [({"user": "user", "assistant": "assistant"}[m["info"]["role"]], m["info"]["time"]["created"]) for m in source]
+    got = [(m["type"], m["time"]["created"]) for m in held]
+    typed = [" ".join(p["text"] for p in m["parts"] if p["type"] == "text" and not p.get("synthetic") and not p.get("ignored"))
+             for m in source if m["info"]["role"] == "user"]
+    held_text = [m["text"].replace("\n\n", " ") for m in held if m["type"] == "user"]
+    ok = got == want and typed == held_text and len(held) == e.get("count", len(source))
+    return ok, "v2 holds %d message(s) of %d in v1; same order and timestamps: %s; same typed text: %s" % (
+        len(held), len(source), got == want, typed == held_text)
+
+
+def _import_oracle_lists_asks(self, e):
+    """`intents`, run as the agent, lists the ask: found as the command finds it (pane -> session -> fleet)."""
+    world = self.world
+    try:
+        fleet = sb.caller_fleet(world.engine.herdr, world.engine.v2, {"HERDR_PANE_ID": world.panes[e["agent"]]})
+    except (sb.CallerError, sb.V2Error, KeyError) as err:
+        return False, "`intents` cannot tell who %s is: %s" % (e["agent"], err)
+    rows = sb.asks_of_caller(world.engine, fleet, world.clock.now())
+    return e["issue"] in [issue.number for _, issue in rows], "`intents` lists %s for %s" % (
+        ["#%d" % issue.number for _, issue in rows], fleet["name"])
+
+
+def _import_extend_offline_run():
+    """Give OfflineRun `import-v1`, `imported_messages` and `lists_asks`, and one more implicit check: every
+    import was audited before it was sent. Wraps `apply` and `implicit`; nothing else is touched."""
+    original_apply, original_implicit = OfflineRun.apply, OfflineRun.implicit
+
+    def apply(self, step):
+        if step["do"] == "import-v1":
+            apply_import_v1(self, step)
+        else:
+            original_apply(self, step)
+
+    def implicit(self):
+        problems = original_implicit(self)
+        entries = self.world.audit()
+        for write in getattr(self.world.v2, "import_writes", []):
+            before = [e for e in entries[:write["audit_lines"]] if e.get("event") == "v2.session.import"
+                      and e.get("phase") == "intent" and (e.get("detail") or {}).get("v2_session") == write["session"]]
+            after = [e for e in entries if e.get("event") == "v2.session.import" and e.get("phase") == "result"
+                     and e.get("ok") and e.get("call") in {b["call"] for b in before}]
+            if not before or not after:
+                problems.append("import of %s was not audited before and after" % write["session"])
+        return problems
+
+    OfflineRun.apply, OfflineRun.implicit = apply, implicit
+    OfflineRun.oracle_imported_messages = _import_oracle_imported_messages
+    OfflineRun.oracle_lists_asks = _import_oracle_lists_asks
+
+
+_import_extend_offline_run()
+STEP_EXAMPLES["import-v1"] = {"agent": "coder", "fixture": "v1-fixtures/chief-of-staff-export.json"}
+EXPECT_EXAMPLES["imported_messages"] = {"agent": "coder", "count": 7}
+EXPECT_EXAMPLES["lists_asks"] = {"agent": "coder", "issue": 2}
+
+
+# ---- the converter
+
+def convert(export=None, **kwargs):
+    return sb.convert_v1_export(v1_export() if export is None else export, kwargs.pop("fleet", {"name": "chief", "role": "chief-of-staff"}),
+                                **kwargs)
+
+
+class TestImportV1Converter(unittest.TestCase):
+    def setUp(self):
+        self.export = v1_export()
+        self.out = convert(self.export)
+
+    def test_one_v2_message_per_v1_message_in_the_same_order_with_the_same_times(self):
+        source = self.export["messages"]
+        got = self.out["messages"]
+        self.assertEqual(len(got), len(source))
+        self.assertEqual([m["type"] for m in got], [m["info"]["role"] for m in source])
+        self.assertEqual([m["time"]["created"] for m in got], [m["info"]["time"]["created"] for m in source])
+        self.assertEqual(got[1]["time"]["completed"], source[1]["info"]["time"]["completed"])
+
+    def test_ids_are_v2s_and_the_same_every_time(self):
+        again = convert(v1_export())
+        self.assertEqual(self.out["info"]["id"], again["info"]["id"])
+        self.assertRegex(self.out["info"]["id"], r"^ses_[0-9a-f]{26}$")
+        ids = [m["id"] for m in self.out["messages"]]
+        self.assertEqual(ids, [m["id"] for m in again["messages"]])
+        for i in ids:
+            self.assertRegex(i, r"^msg_[0-9a-f]{26}$")
+        self.assertEqual(ids, sorted(ids), "sorting by id keeps the order")
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_another_session_gets_other_ids(self):
+        other = v1_export()
+        other["info"]["id"] = "ses_fixture00000000000009"
+        self.assertNotEqual(convert(other)["info"]["id"], self.out["info"]["id"])
+        self.assertNotEqual(convert(other)["messages"][0]["id"], self.out["messages"][0]["id"])
+
+    def test_the_fleet_metadata_is_stamped_with_where_it_came_from(self):
+        self.assertEqual(self.out["info"]["metadata"],
+                         {"fleet": {"name": "chief", "role": "chief-of-staff", "imported_from": "v1:" + V1_MAIN_ID}})
+
+    def test_no_fleet_means_no_metadata(self):
+        self.assertNotIn("metadata", convert(fleet=None)["info"])
+
+    def test_the_fault_removes_the_metadata_only_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "no-import-metadata"
+        self.assertIn("metadata", convert()["info"])
+        os.environ[sb.LAB_ENV] = "1"
+        try:
+            self.assertNotIn("metadata", convert()["info"])
+        finally:
+            os.environ.pop(sb.LAB_ENV)
+            os.environ.pop(sb.FAULT_ENV)
+
+    def test_the_session_info_is_summed_and_located(self):
+        info = self.out["info"]
+        self.assertEqual(info["location"], {"directory": "/work/example-repo"})
+        self.assertEqual(info["projectID"], "fixture-project")
+        self.assertEqual(info["title"], "Chief of Staff (fixture)")
+        self.assertAlmostEqual(info["cost"], 4 * 0.0125)
+        self.assertEqual(info["tokens"]["input"], 4 * 1200)
+        self.assertEqual(info["time"]["created"], self.export["info"]["time"]["created"])
+        self.assertGreaterEqual(info["time"]["updated"], self.out["messages"][-1]["time"]["created"])
+        self.assertNotIn("idle", info["time"], "an import must not look like a finished worker turn")
+        self.assertNotIn("parentID", info)
+
+    def test_the_converted_session_passes_the_schema(self):
+        info = self.out["info"]
+        self.assertEqual(sb.v2_import_problems(info, self.out["messages"], info["location"]), [])
+
+    def test_user_text_files_and_agents(self):
+        first = self.out["messages"][0]
+        self.assertEqual(first["text"], "Plan the work for the platform charter and list what is open.")
+        inline, reference = first["files"]
+        self.assertEqual(inline, {"mime": "text/plain", "data": "aGVsbG8gd29ybGQ=", "source": {"type": "inline"},
+                                  "name": "note.txt"})
+        self.assertEqual(reference["source"], {"type": "uri", "uri": "file:///work/example-repo/PLAN.md"})
+        self.assertEqual(reference["mention"], {"start": 0, "end": 8, "text": "@PLAN.md"})
+        self.assertEqual(first["agents"], [{"name": "explore", "mention": {"start": 9, "end": 17, "text": "@explore"}}])
+
+    def test_assistant_content_keeps_its_order_and_tool_calls(self):
+        content = self.out["messages"][1]["content"]
+        self.assertEqual([c["type"] for c in content], ["reasoning", "text", "tool", "tool"])
+        self.assertEqual(content[0]["time"], {"created": 1790000002100, "completed": 1790000002400})
+        done, failed = content[2], content[3]
+        self.assertEqual((done["id"], done["name"], done["state"]["status"]), ("call_1", "read", "completed"))
+        self.assertEqual(done["state"]["input"], {"filePath": "/work/example-repo/PLAN.md"})
+        self.assertEqual(done["state"]["content"], [
+            {"type": "text", "text": "# Plan\nTwo asks are open."},
+            {"type": "file", "uri": "data:image/png;base64,iVBORw0KGgo=", "mime": "image/png", "name": "chart.png"}])
+        self.assertEqual(done["state"]["metadata"], {"preview": "# Plan", "title": "PLAN.md"})
+        self.assertEqual(done["time"], {"created": 1790000002500, "ran": 1790000002500, "completed": 1790000002600})
+        self.assertEqual(failed["state"], {"status": "error", "input": {"command": "false"},
+                                           "error": {"type": "error", "message": "Command exited with code 1"}})
+
+    def test_pending_and_running_tools_and_a_snapshot(self):
+        third = self.out["messages"][2]
+        self.assertEqual(third["content"][0]["state"], {"status": "streaming", "input": "{\"pattern\": \"ask"})
+        self.assertEqual(third["content"][1]["state"]["status"], "running")
+        second = self.out["messages"][1]
+        self.assertEqual(second["snapshot"], {"start": "snap-aaaa", "end": "snap-bbbb", "files": ["PLAN.md", "notes/todo.md"]})
+
+    def test_finish_error_and_retry_are_mapped(self):
+        fifth = self.out["messages"][4]
+        self.assertEqual(fifth["finish"], "length")
+        self.assertEqual(fifth["error"], {"type": "MessageAbortedError", "message": "The operation was aborted"})
+        self.assertEqual(fifth["retry"], {"attempt": 2, "at": 1790000062500,
+                                          "error": {"type": "APIError", "message": "rate limited"}})
+        odd = v1_export()
+        odd["messages"][1]["info"]["finish"] = "other"
+        got = convert(odd)["messages"][1]
+        self.assertEqual((got["finish"], got["rawFinish"]), ("unknown", "other"))
+
+    def test_what_has_no_equivalent_is_listed_not_lost(self):
+        kinds = sorted((d["kind"], d["message"][-2:]) for d in self.out["dropped"])
+        self.assertEqual(kinds, [
+            ("compaction", "04"), ("ignored-text", "04"), ("snapshot", "02"), ("step-marker", "02"),
+            ("step-marker", "02"), ("step-marker", "03"), ("step-marker", "03"), ("subtask", "04"),
+            ("synthetic-text", "01"), ("unknown:future-kind", "05")])
+        for item in self.out["dropped"]:
+            self.assertEqual(sorted(item), ["kind", "message", "part", "reason"])
+            self.assertTrue(item["message"].startswith("msg_fixture"), "named by the v1 id")
+            self.assertTrue(item["reason"])
+
+    def test_what_was_filled_in_is_listed(self):
+        self.assertEqual([(d["field"], d["message"][-2:]) for d in self.out["defaulted"]], [("file.data", "01")])
+        bare = v1_export()
+        for key in ("agent", "mode", "modelID", "providerID"):
+            bare["messages"][6]["info"].pop(key, None)
+        got = convert(bare)
+        self.assertEqual(got["messages"][6]["agent"], "build")
+        self.assertEqual(got["messages"][6]["model"], {"id": "unknown", "providerID": "unknown"})
+        self.assertEqual({"agent", "model"}, {d["field"] for d in got["defaulted"] if d["message"].endswith("07")})
+
+    def test_the_tool_output_limit_cuts_and_says_so(self):
+        got = convert(tool_output_limit=5)
+        self.assertEqual(got["messages"][1]["content"][2]["state"]["content"][0]["text"], "# Pla")
+        self.assertIn("tool.output", [d["field"] for d in got["defaulted"]])
+
+    def test_a_summary_counts_by_kind(self):
+        rows = sb.summarise_dropped(self.out["dropped"])
+        self.assertEqual(rows[0]["kind"], "step-marker")
+        self.assertEqual(rows[0]["count"], 4)
+        self.assertEqual(sum(r["count"] for r in rows), len(self.out["dropped"]))
+
+    def test_an_export_that_would_lose_a_message_is_refused(self):
+        cases = {
+            "not an object": lambda e: [],
+            "no messages": lambda e: {"info": e["info"]},
+            "bad session id": lambda e: e["info"].update(id="x"),
+            "no directory": lambda e: e["info"].pop("directory"),
+            "relative directory": lambda e: e["info"].update(directory="work"),
+            "no info on a message": lambda e: e["messages"][0].pop("info"),
+            "unknown role": lambda e: e["messages"][0]["info"].update(role="system"),
+            "no time": lambda e: e["messages"][0]["info"].pop("time"),
+            "no id": lambda e: e["messages"][0]["info"].pop("id"),
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                export = v1_export()
+                replaced = change(export)
+                if isinstance(replaced, (list, dict)) and name in ("not an object", "no messages"):
+                    export = replaced
+                with self.assertRaises(sb.ImportV1Error):
+                    convert(export)
+
+    def test_the_fixture_has_no_personal_text(self):
+        for path in (V1_MAIN, V1_CHILD):
+            text = path.read_text().lower()
+            for fragment in ("/us" + "ers/", "/ho" + "me/", "@", "sk-", "bearer", "http"):
+                self.assertNotIn(fragment, text.replace("@plan.md", "").replace("@explore", ""), (path.name, fragment))
+
+    def test_every_part_kind_the_converter_handles_is_in_the_fixture(self):
+        kinds = {p["type"] for m in v1_export()["messages"] for p in m["parts"]}
+        self.assertLessEqual({"text", "reasoning", "tool", "file", "agent", "step-start", "step-finish", "patch",
+                              "snapshot", "retry", "subtask", "compaction"}, kinds)
+        states = {p["state"]["status"] for m in v1_export()["messages"] for p in m["parts"] if p["type"] == "tool"}
+        self.assertEqual(states, {"pending", "running", "completed", "error"})
+
+
+class TestImportOrder(unittest.TestCase):
+    def test_a_parent_comes_before_its_child_whatever_the_input_order(self):
+        parent, child = v1_export(), v1_export(V1_CHILD)
+        for given in ([child, parent], [parent, child]):
+            self.assertEqual([e["info"]["id"] for e in sb.import_order(given)], [V1_MAIN_ID, V1_CHILD_ID])
+
+    def test_a_parent_outside_the_batch_is_assumed_to_exist(self):
+        self.assertEqual([e["info"]["id"] for e in sb.import_order([v1_export(V1_CHILD)])], [V1_CHILD_ID])
+
+    def test_a_cycle_is_refused(self):
+        a, b = v1_export(), v1_export(V1_CHILD)
+        a["info"]["parentID"] = V1_CHILD_ID
+        with self.assertRaises(sb.ImportV1Error):
+            sb.import_order([a, b])
+
+    def test_the_child_points_at_the_parents_new_id(self):
+        child = convert(v1_export(V1_CHILD), fleet=None)["info"]
+        self.assertEqual(child["parentID"], convert()["info"]["id"])
+
+
+# ---- the schema checker
+
+def converted_body():
+    out = convert()
+    return copy.deepcopy(out["info"]), copy.deepcopy(out["messages"])
+
+
+class TestImportSchemaChecker(unittest.TestCase):
+    """Each case breaks one thing v2 would refuse; the checker must name it."""
+
+    def problems(self, change):
+        info, messages = converted_body()
+        location = change(info, messages, {"directory": info["location"]["directory"]})
+        return sb.v2_import_problems(info, messages, location if isinstance(location, dict) else None)
+
+    def test_the_untouched_conversion_is_clean(self):
+        self.assertEqual(self.problems(lambda i, m, l: None), [])
+
+    def test_each_malformed_case_is_rejected_and_named(self):
+        cases = [
+            ("session id without ses", lambda i, m, l: i.update(id="abc"), "$.info.id"),
+            ("no projectID", lambda i, m, l: i.pop("projectID"), "$.info.projectID: required"),
+            ("no location", lambda i, m, l: i.pop("location"), "$.info.location: required"),
+            ("cost as text", lambda i, m, l: i.update(cost="1"), "$.info.cost"),
+            ("tokens missing a field", lambda i, m, l: i["tokens"].pop("reasoning"), "$.info.tokens.reasoning: required"),
+            ("an unknown session field", lambda i, m, l: i.update(slug="x"), "$.info.slug: not a field"),
+            ("time not a number", lambda i, m, l: i["time"].update(created="now"), "$.info.time.created"),
+            ("metadata not an object", lambda i, m, l: i.update(metadata=[]), "$.info.metadata"),
+            ("NaN cost", lambda i, m, l: i.update(cost=float("nan")), "not plain JSON"),
+            ("message id without msg_", lambda i, m, l: m[0].update(id="x"), "$.messages[0]"),
+            ("message with no text", lambda i, m, l: m[0].pop("text"), "text: required"),
+            ("an unknown message field", lambda i, m, l: m[0].update(role="user"), "role: not a field"),
+            ("an unknown message type", lambda i, m, l: m[0].update(type="human"), "matches none"),
+            ("a boolean as a time", lambda i, m, l: m[0]["time"].update(created=True), "$.messages[0].time.created"),
+            ("assistant without a model", lambda i, m, l: m[1].pop("model"), "model: required"),
+            ("assistant content not a list", lambda i, m, l: m[1].update(content="x"), "content"),
+            ("an unknown content type", lambda i, m, l: m[1]["content"].append({"type": "image"}), "matches none"),
+            ("a tool without a name", lambda i, m, l: m[1]["content"][2].pop("name"), "name: required"),
+            ("an unknown tool status", lambda i, m, l: m[1]["content"][2]["state"].update(status="done"),
+             "$.messages[1].content[2].state: matches none"),
+            ("a completed tool with text content", lambda i, m, l: m[1]["content"][2]["state"].update(content="x"), "content"),
+            ("a tool error as a bare string", lambda i, m, l: m[1]["content"][3]["state"].update(error="x"), "error"),
+            ("a finish v2 does not know", lambda i, m, l: m[1].update(finish="other"), "finish"),
+            ("file data that is not base64", lambda i, m, l: m[0]["files"][0].update(data="not base64!"), "data"),
+            ("a file source of an unknown kind", lambda i, m, l: m[0]["files"][0].update(source={"type": "x"}), "files"),
+            ("a uri source without its uri", lambda i, m, l: m[0]["files"][1].update(source={"type": "uri"}), "uri"),
+            ("agents as text", lambda i, m, l: m[0].update(agents="explore"), "agents"),
+            ("a repeated message id", lambda i, m, l: m[1].update(id=m[0]["id"]), "used twice"),
+            ("a retry without its attempt", lambda i, m, l: m[4]["retry"].pop("attempt"), "attempt"),
+            ("a location without a directory", lambda i, m, l: l.clear() or l, "directory: required"),
+        ]
+        for name, change, needle in cases:
+            with self.subTest(case=name):
+                found = self.problems(change)
+                self.assertTrue(found, "accepted: %s" % name)
+                self.assertTrue(any(needle in p for p in found), "%s: %s" % (name, found))
+
+    def test_the_checker_is_independent_of_the_fakes_check_and_agrees_with_it(self):
+        info, messages = converted_body()
+        self.assertEqual(fake_import_problems({"info": info, "messages": messages, "location": info["location"]}), [])
+        info["slug"] = "x"
+        self.assertTrue(fake_import_problems({"info": info, "messages": messages}))
+
+    def test_a_union_names_the_branch_the_tag_selects(self):
+        found = self.problems(lambda i, m, l: m[1]["content"][2]["state"].update(status="completed", content="x"))
+        self.assertTrue(any("$.messages[1].content[2].state.content" in p for p in found), found)
+
+
+# ---- the client
+
+class TestImportV1Client(Base):
+    def client(self, **kwargs):
+        runner = FakeRunner(**kwargs)
+        return sb.V2Client("/opt/lab/bin/opencode", {}, runner, 7), runner
+
+    def test_argv_of_the_import(self):
+        client, runner = self.client()
+        info, messages = {"id": "ses_a"}, [{"id": "msg_a"}]
+        client.session_import(info, messages, {"directory": "/work"})
+        self.assertEqual(runner.argv[:3], ["/opt/lab/bin/opencode", "api", "experimental.session.import"])
+        self.assertEqual(runner.argv[3], "-d")
+        self.assertEqual(json.loads(runner.argv[4]), {"info": info, "messages": messages, "location": {"directory": "/work"}})
+        self.assertEqual(len(runner.argv), 5, "no --param: the body names the session")
+
+    def test_the_location_is_left_out_when_not_given(self):
+        client, runner = self.client()
+        client.session_import({"id": "ses_a"}, [])
+        self.assertNotIn("location", json.loads(runner.argv[4]))
+
+    def test_the_arguments_are_checked_before_anything_runs(self):
+        client, runner = self.client()
+        for call in (lambda: client.session_import({"id": "x"}, []), lambda: client.session_import({}, []),
+                     lambda: client.session_import("ses_a", []), lambda: client.session_import({"id": "ses_a"}, "x")):
+            with self.assertRaises(ValueError):
+                call()
+        self.assertEqual(runner.calls, [])
+
+    def test_the_list_keeps_its_cursor(self):
+        body = {"data": [{"id": "ses_1"}], "cursor": {"previous": None, "next": "c2"}}
+        client, runner = self.client(default=(0, json.dumps(body), ""))
+        self.assertEqual(client.session_list_page("/work", "c1", 50), ([{"id": "ses_1"}], "c2"))
+        self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api", "session.list", "--param", "limit=50",
+                                       "--param", "directory=/work", "--param", "cursor=c1"])
+        last = {"data": [], "cursor": {"previous": "p", "next": None}}
+        client, _ = self.client(default=(0, json.dumps(last), ""))
+        self.assertEqual(client.session_list_page(), ([], None))
+
+    def test_a_list_without_data_is_an_error(self):
+        client, _ = self.client(default=(0, "{}", ""))
+        with self.assertRaises(sb.V2Error):
+            client.session_list_page()
+
+    def test_the_other_calls_still_unwrap_data(self):
+        client, _ = self.client(default=(0, '{"data": {"id": "ses_1"}, "cursor": {}}', ""))
+        self.assertEqual(client.session_get("ses_1"), {"id": "ses_1"})
+
+    def test_still_one_runner_call(self):
+        self.assertEqual(class_source("V2Client").count("self.runner("), 1)
+
+
+class TestImportV1Config(Base):
+    def test_the_defaults(self):
+        self.assertEqual(sb.V1_MOVE_DEFAULTS, {"v1_opencode": None, "import_body_limit_bytes": 120000})
+        self.assertIsNone(sb.load_config()["v1_opencode"])
+
+    def test_v1_must_be_an_absolute_path_and_not_the_v2_binary(self):
+        for raw, word in (({"v1_opencode": "opencode"}, "absolute"), ({"v1_opencode": 3}, "absolute"),
+                          ({"v1_opencode": "/a/b", "opencode": "/a/b"}, "same binary"),
+                          ({"import_body_limit_bytes": 10}, "at least"), ({"import_body_limit_bytes": True}, "at least"),
+                          ({"import_body_limit_bytes": "9"}, "at least")):
+            with self.subTest(raw=raw):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config(raw)
+                self.assertIn(word, str(caught.exception))
+        self.assertEqual(sb.validate_config({"v1_opencode": FAKE_V1, "opencode": FAKE_OPENCODE})["v1_opencode"], FAKE_V1)
+
+
+# ---- the command
+
+class ImportCase(Base):
+    """The CLI over the three fakes: v2, herdr and the v1 binary."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v1_opencode": FAKE_V1,
+                           "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.world = World(self, agents=())
+        self.v1 = FakeV1({V1_MAIN_ID: v1_export(), V1_CHILD_ID: v1_export(V1_CHILD)})
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_V1:
+            return self.v1(argv, **kwargs)
+        return self.world.route(argv, **kwargs)
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.route, now=self.world.clock.now, wait=lambda sock, s: False)
+        return code, out.getvalue(), err.getvalue()
+
+    def import_main(self):
+        return self.main("import-v1", "--session", V1_MAIN_ID, "--name", "chief", "--role", "chief-of-staff")
+
+    def imports(self):
+        return getattr(self.world.v2, "import_writes", [])
+
+    def imported(self):
+        return [s for s in self.world.v2.sessions.values() if "imported_from" in (s["metadata"].get("fleet") or {})]
+
+
+class TestImportV1Command(ImportCase):
+    def test_a_session_read_through_v1_lands_in_v2_with_every_message(self):
+        code, out, err = self.import_main()
+        self.assertEqual((code, err), (0, ""), out)
+        (session,) = self.imported()
+        self.assertEqual(len(session["messages"]), len(v1_export()["messages"]))
+        self.assertEqual(session["metadata"]["fleet"], {"name": "chief", "role": "chief-of-staff",
+                                                         "imported_from": "v1:" + V1_MAIN_ID})
+        self.assertIn("imported: v1 %s -> v2 %s, 7 message(s)" % (V1_MAIN_ID, session["id"]), out)
+        self.assertEqual(self.v1.calls, [[FAKE_V1, "export", V1_MAIN_ID]], "v1 was only asked to export")
+
+    def test_the_body_names_the_location_beside_the_info(self):
+        self.import_main()
+        body = self.imports()[0]["body"]
+        self.assertEqual(body["location"], {"directory": "/work/example-repo"})
+        self.assertEqual(body["location"], body["info"]["location"])
+        self.assertEqual(sorted(body), ["info", "location", "messages"])
+
+    def test_the_dropped_items_are_printed_and_audited_never_silent(self):
+        code, out, _ = self.import_main()
+        self.assertIn("dropped 10 item(s):", out)
+        self.assertRegex(out, r"4\s+step-marker")
+        self.assertRegex(out, r"1\s+synthetic-text")
+        self.assertIn("filled in 1 value(s)", out)
+        intent = [e for e in self.world.audit() if e["event"] == "v2.session.import" and e["phase"] == "intent"]
+        self.assertEqual(len(intent), 1)
+        detail = intent[0]["detail"]
+        self.assertEqual((detail["dropped_total"], detail["messages"]), (10, 7))
+        self.assertEqual(len(detail["dropped_examples"]), 10)
+        self.assertEqual({r["kind"] for r in detail["dropped_by_kind"]}, {d["kind"] for d in detail["dropped_examples"]})
+
+    def test_the_audit_is_written_before_and_after_the_write(self):
+        self.import_main()
+        entries = [e for e in self.world.audit() if e["event"] == "v2.session.import"]
+        self.assertEqual([e["phase"] for e in entries], ["intent", "result"])
+        self.assertTrue(entries[1]["ok"])
+        self.assertEqual(self.imports()[0]["audit_lines"], 1, "the intent line was already on disk")
+
+    def test_the_audit_names_no_message_text(self):
+        export = v1_export()
+        export["messages"][0]["parts"][0]["text"] = "SENTINEL-PRIVATE-TEXT"
+        export["messages"][1]["parts"][3]["state"]["output"] = "SENTINEL-OUTPUT"
+        self.v1.exports[V1_MAIN_ID] = json.dumps(export)
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-test-0123456789abcdef"
+        code, out, err = self.import_main()
+        self.assertEqual(code, 0)
+        for text in (self.world.audit_path.read_text(), out, err):
+            self.assertNotIn("SENTINEL", text)
+            self.assertNotIn("sk-or-test", text)
+
+    def test_the_same_session_twice_imports_once(self):
+        self.import_main()
+        code, out, _ = self.import_main()
+        self.assertEqual(code, 0)
+        self.assertIn("already imported (nothing done)", out)
+        self.assertEqual(len(self.imports()), 1)
+        self.assertEqual(len(self.imported()), 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "v2.session.import"]), 2, "one write only")
+
+    def test_found_by_listing_across_pages(self):
+        for n in range(5):
+            self.world.v2.create_session({"fleet": {"name": "other%d" % n}}, directory="/work/example-repo")
+        self.import_main()
+        for n in range(5):  # newer sessions push the import down the listing
+            self.world.v2.create_session({"fleet": {"name": "later%d" % n}}, directory="/work/example-repo")
+        self.world.v2.list_page_cap = 3
+        code, out, _ = self.import_main()
+        self.assertIn("already imported", out)
+        self.assertEqual(len(self.imports()), 1)
+
+    def test_a_listing_too_long_to_read_is_refused_not_assumed_empty(self):
+        for n in range(4):
+            self.world.v2.create_session({}, directory="/work/example-repo")
+        self.world.v2.list_page_cap = 1
+        with mock.patch.object(sb, "V1_LIST_MAX_PAGES", 2):
+            code, _, err = self.import_main()
+        self.assertEqual(code, 1)
+        self.assertIn("cannot prove", err)
+        self.assertEqual(self.imports(), [])
+
+    def test_a_dry_run_writes_nothing_anywhere(self):
+        code, out, _ = self.main("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("would import", out)
+        self.assertIn("7 message(s)", out)
+        self.assertEqual(self.imports(), [])
+        self.assertEqual(self.world.v2.sessions, {})
+        self.assertFalse(self.world.audit_path.exists(), "not even an audit line")
+        self.assertEqual(self.v1.calls, [])
+
+    def test_json_output_carries_the_dropped_list(self):
+        code, out, _ = self.main("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--dry-run", "--json")
+        report = json.loads(out)
+        self.assertEqual((report["status"], report["messages"], len(report["dropped"])), ("dry-run", 7, 10))
+
+    def test_v1_is_never_touched_beyond_one_export(self):
+        self.import_main()
+        self.import_main()
+        self.assertEqual(self.v1.calls, [[FAKE_V1, "export", V1_MAIN_ID]] * 2)
+
+    def test_the_agent_is_found_by_its_metadata_once_a_pane_shows_it(self):
+        self.import_main()
+        (session,) = self.imported()
+        self.world.herdr.add(self.world.herdr.new_pane_id(), session["id"])
+        engine = self.world.new_engine("cli", writable=False)
+        agent = engine.discover(self.world.clock.now()).agents["chief"]
+        self.assertEqual((agent.session_id, agent.fleet["role"], agent.fleet["imported_from"]),
+                         (session["id"], "chief-of-staff", "v1:" + V1_MAIN_ID))
+
+    def test_an_imported_session_does_not_look_like_a_worker_that_just_finished(self):
+        code, _, _ = self.main("import-v1", "--session", V1_MAIN_ID, "--name", "orch", "--role", "orchestrator",
+                               "--reports-to", "chief")
+        self.assertEqual(code, 0)
+        (session,) = self.imported()
+        self.world.herdr.add(self.world.herdr.new_pane_id(), session["id"])
+        engine = self.world.new_engine("cli", writable=False)
+        engine.discover(self.world.clock.now())
+        source = sb.WorkerFacts()
+        source.bind(engine)
+        self.assertEqual(source(), [], "no time.idle on the import, so nobody is told it 'finished'")
+
+
+class TestImportV1AsAProcess(Base):
+    def test_a_dry_run_through_the_real_entry_point_and_a_script_standing_in_for_v2(self):
+        v2 = self.fake_bin("opencode-v2", 'echo \'{"data": [], "cursor": {"previous": null, "next": null}}\'\n')
+        self.write_config({"opencode": str(v2)})
+        proc = self.run_cli(SWITCHBOARD, "import-v1", "--file", str(V1_MAIN), "--name", "chief", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("would import: v1 %s" % V1_MAIN_ID, proc.stdout)
+        self.assertFalse(self.state_dir.exists(), "a dry run does not even make the state directory")
+
+    def test_the_command_is_listed_in_help(self):
+        self.assertIn("import-v1", self.run_cli(SWITCHBOARD, "--help").stdout)
+
+
+class TestImportV1Refusals(ImportCase):
+    def assertRefused(self, argv, word, writes=0):
+        code, out, err = self.main(*argv)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(word, err)
+        self.assertEqual(len(self.imports()), writes)
+        self.assertNotIn("Traceback", err)
+        return err
+
+    def test_no_v1_binary_configured_means_no_session_import(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertRefused(("import-v1", "--session", V1_MAIN_ID, "--name", "chief"), "v1_opencode")
+        self.assertEqual(self.v1.calls, [])
+
+    def test_a_file_needs_no_v1_binary(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertEqual(self.main("import-v1", "--file", str(V1_MAIN), "--name", "chief")[0], 0)
+
+    def test_no_v2_binary_configured(self):
+        self.write_config({"v1_opencode": FAKE_V1})
+        self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "chief"), "'opencode' is not configured")
+
+    def test_a_session_id_that_is_not_one(self):
+        for bad in ("-x", "ses", "ses_a b", "../ses_1", "ses_1;rm"):
+            with self.subTest(bad=bad):
+                self.assertRefused(("import-v1", "--session=" + bad, "--name", "chief"), "--session")
+        self.assertEqual(self.v1.calls, [])
+
+    def test_a_session_v1_does_not_have(self):
+        self.assertRefused(("import-v1", "--session", "ses_nothere", "--name", "chief"), "Session not found")
+
+    def test_v1_that_cannot_run_or_hangs(self):
+        for failure, word in ((FileNotFoundError(2, "No such file or directory"), "cannot run"),
+                              (subprocess.TimeoutExpired([FAKE_V1], 1), "did not finish")):
+            with self.subTest(word=word):
+                self.route = lambda argv, f=failure, **kw: (_ for _ in ()).throw(f) if argv[0] == FAKE_V1 \
+                    else self.world.route(argv, **kw)
+                self.assertRefused(("import-v1", "--session", V1_MAIN_ID, "--name", "chief"), word)
+
+    def test_bad_json_from_v1_or_a_file(self):
+        self.v1.exports[V1_MAIN_ID] = "Exporting session...\n{"
+        self.assertRefused(("import-v1", "--session", V1_MAIN_ID, "--name", "chief"), "not valid JSON")
+        bad = self.home / "bad.json"
+        bad.write_text("not json")
+        self.assertRefused(("import-v1", "--file", str(bad), "--name", "chief"), "not valid JSON")
+        self.assertRefused(("import-v1", "--file", str(self.home / "missing.json"), "--name", "chief"), "cannot read")
+
+    def test_json_that_is_not_an_export(self):
+        wrong = self.home / "wrong.json"
+        wrong.write_text('{"info": {}, "messages": []}')
+        self.assertRefused(("import-v1", "--file", str(wrong), "--name", "chief"), "not a usable v1 export")
+
+    def test_a_conversion_that_breaks_the_schema_sends_nothing(self):
+        real = sb.convert_v1_export
+
+        def broken(export, fleet=None, tool_output_limit=None, directory=None):
+            out = real(export, fleet, tool_output_limit, directory)
+            out["messages"][1]["content"][0]["type"] = "thought"
+            return out
+        with mock.patch.object(sb, "convert_v1_export", broken):
+            err = self.assertRefused(("import-v1", "--session", V1_MAIN_ID, "--name", "chief"), "breaks v2's schema")
+        self.assertIn("messages[1].content[0]", err)
+        self.assertEqual([c for c in self.world.v2.calls if "experimental.session.import" in c], [])
+        self.assertEqual([c for c in self.world.v2.calls if "session.list" in c], [], "not even a read")
+        self.assertFalse(self.world.audit_path.exists())
+
+    def test_a_body_too_long_for_one_argument_is_refused_with_the_way_out(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v1_opencode": FAKE_V1,
+                           "import_body_limit_bytes": 4000})
+        err = self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "chief"), "bytes")
+        self.assertIn("--tool-output-limit", err)
+
+    def test_a_tool_output_limit_gets_it_under_the_limit(self):
+        export = v1_export()
+        export["messages"][1]["parts"][3]["state"]["output"] = "x" * 8000
+        big = self.home / "big.json"
+        big.write_text(json.dumps(export))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "import_body_limit_bytes": 9000})
+        self.assertRefused(("import-v1", "--file", str(big), "--name", "chief"), "bytes")
+        code, out, _ = self.main("import-v1", "--file", str(big), "--name", "chief", "--tool-output-limit", "100")
+        self.assertEqual(code, 0)
+        self.assertIn("tool output cut from 8000 to 100", out)
+
+    def test_a_child_before_its_parent_is_refused_and_after_it_goes_in(self):
+        args = ("import-v1", "--session", V1_CHILD_ID, "--name", "explorer")
+        err = self.assertRefused(args, "import the parent first")
+        self.assertIn(sb.v1_target_id("ses", V1_MAIN_ID), err)
+        self.assertEqual(self.main("import-v1", "--session", V1_MAIN_ID, "--name", "chief")[0], 0)
+        self.assertEqual(self.main(*args)[0], 0)
+        parent, child = (s for s in self.world.v2.sessions.values() if s["metadata"])
+        self.assertEqual(child["parentID"], parent["id"])
+        self.assertEqual([i["session"] for i in self.imports()], [parent["id"], child["id"]])
+
+    def test_a_409_is_already_imported_not_an_error_and_not_a_second_copy(self):
+        self.import_main()
+        (session,) = self.imported()
+        session["metadata"] = {}  # the listing no longer shows where it came from; the id still collides
+        code, out, err = self.import_main()
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("already imported", out)
+        self.assertEqual(len(self.imports()), 1)
+
+    def test_a_name_and_numbers_are_checked(self):
+        self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "Chief Of Staff"), "--name")
+        self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--issue", "0"), "--issue")
+        self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--charter", "-2"), "--charter")
+        self.assertRefused(("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--tool-output-limit", "0"),
+                           "--tool-output-limit")
+
+    def test_one_source_and_a_name_are_required(self):
+        self.assertEqual(self.main("import-v1", "--name", "chief")[0], 2)
+        self.assertEqual(self.main("import-v1", "--file", "a", "--session", "ses_1", "--name", "chief")[0], 2)
+        self.assertEqual(self.main("import-v1", "--file", "a")[0], 2)
+
+    def test_v2_unreachable_is_an_error_and_nothing_is_claimed(self):
+        self.world.v2.down = True
+        code, _, err = self.import_main()
+        self.assertEqual(code, 1)
+        self.assertIn("cannot reach", err)
+        self.assertEqual(self.imports(), [])
+
+    def test_a_failed_import_is_audited_as_failed(self):
+        real = sb.V2Client.session_import
+
+        def fail(self, *a, **k):
+            raise sb.V2Error("http", 400, "bad body")
+        with mock.patch.object(sb.V2Client, "session_import", fail):
+            code, _, err = self.import_main()
+        self.assertEqual(code, 1)
+        results = [e for e in self.world.audit() if e["event"] == "v2.session.import" and e["phase"] == "result"]
+        self.assertEqual([r["ok"] for r in results], [False])
+        self.assertIs(sb.V2Client.session_import, real)
+
+
+# ---- measured v2 import rules (Lab import spike), each a rule of the converter
+
+V2_SHAPE = V1_FIXTURES / "v2-export-shape.json"
+
+
+class TestImportMeasuredRules(ImportCase):
+    def test_ids_start_with_ses_and_msg_and_never_repeat_across_sessions(self):
+        parent, child = convert(), convert(v1_export(V1_CHILD), fleet=None)
+        ids = [m["id"] for c in (parent, child) for m in c["messages"]]
+        self.assertEqual(len(ids), len(set(ids)), "v2 answers 500 to a message id it already holds")
+        self.assertTrue(all(i.startswith("msg") for i in ids))
+        self.assertTrue(parent["info"]["id"].startswith("ses") and child["info"]["id"].startswith("ses"))
+        self.assertNotEqual(parent["info"]["id"], child["info"]["id"])
+        self.assertEqual({i for i in ids}, {m["id"] for c in (convert(), convert(v1_export(V1_CHILD), fleet=None))
+                                            for m in c["messages"]}, "a re-run mints the same ids")
+
+    def test_the_same_v1_message_ids_in_two_sessions_still_get_different_ids(self):
+        other = v1_export()
+        other["info"]["id"] = "ses_fixture00000000000009"
+        a, b = convert(), convert(other)
+        self.assertEqual(set(m["id"] for m in a["messages"]) & set(m["id"] for m in b["messages"]), set())
+
+    def test_v1_bash_is_v2_shell(self):
+        export = v1_export()
+        export["messages"][1]["parts"][4]["tool"] = "bash"
+        names = [c["name"] for c in convert(export)["messages"][1]["content"] if c["type"] == "tool"]
+        self.assertEqual(names, ["read", "shell"])
+        self.assertEqual(convert()["messages"][1]["content"][3]["name"], "bash".replace("bash", "shell"))
+
+    def test_only_text_reasoning_and_tool_reach_assistant_content_and_the_rest_is_dropped_loudly(self):
+        out = convert()
+        kinds = {c["type"] for m in out["messages"] if m["type"] == "assistant" for c in m["content"]}
+        self.assertEqual(kinds, {"text", "reasoning", "tool"})
+        self.assertEqual({m["type"] for m in out["messages"]}, {"user", "assistant"}, "no idle, no fabricated markers")
+        self.assertIn("unknown:future-kind", {d["kind"] for d in out["dropped"]})
+
+    def test_the_directory_flag_overrides_what_v1_recorded(self):
+        out = convert(directory="/work/elsewhere")
+        self.assertEqual(out["info"]["location"], {"directory": "/work/elsewhere"})
+        bare = v1_export()
+        bare["info"].pop("directory")
+        self.assertEqual(convert(bare, directory="/work/x")["info"]["location"], {"directory": "/work/x"})
+        with self.assertRaises(sb.ImportV1Error):
+            convert(bare)
+        code, _, err = self.main("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--dir", "rel")
+        self.assertEqual(code, 1)
+        self.assertIn("--dir", err)
+        self.assertEqual(self.main("import-v1", "--file", str(V1_MAIN), "--name", "chief", "--dir", "/work/x")[0], 0)
+        self.assertEqual(self.imported()[0]["directory"], "/work/x")
+
+    def test_what_v2_really_exports_passes_our_schema_and_ours_has_the_same_shape(self):
+        sample = json.loads(V2_SHAPE.read_text())
+        real = [m for m in sample["messages"] if m["type"] in ("user", "assistant")]
+        self.assertEqual({m["type"] for m in sample["messages"]}, {"user", "assistant", "idle"})
+        self.assertEqual(sb.v2_import_problems(
+            {k: v for k, v in sample["info"].items() if k not in ("outcome",)}, real, sample["info"]["location"]), [])
+        ours = convert()["messages"]
+        for kind in ("user", "assistant"):
+            theirs_keys = set().union(*[set(m) for m in real if m["type"] == kind])
+            our_keys = set().union(*[set(m) for m in ours if m["type"] == kind])
+            self.assertLessEqual(our_keys - {"files", "agents", "error", "retry", "rawFinish"}, theirs_keys | {"id"}, kind)
+        tool = next(c for m in real if m["type"] == "assistant" for c in m["content"] if c["type"] == "tool")
+        mine = next(c for m in ours for c in m.get("content", []) if c["type"] == "tool" and c["state"]["status"] == "completed")
+        self.assertLessEqual(set(mine) - {"executed"}, set(tool))
+        self.assertLessEqual(set(mine["state"]), set(tool["state"]))
+        self.assertEqual(tool["name"], "shell")
+
+    def test_the_shape_fixture_is_synthetic(self):
+        text = V2_SHAPE.read_text()
+        for fragment in ("/us" + "ers/", "/ho" + "me/", "fleet-switchboard", "lab-"):
+            self.assertNotIn(fragment, text)
+
+
+# ---- B: an imported agent is a fleet agent like any other (M1's offline half)
+
+class TestImportedAgentIsSeen(ImportCase):
+    ISSUES = {"1": {"intent": None},
+              "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1},
+              "3": {"intent": "Write the rollout note", "done_when": "the note is merged", "parent": 1}}
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGH(self.ISSUES, {1}, self.world.clock)
+        self.world.intents = sb.IntentReader(FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5)
+        self.world.config = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+                                                "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.world.engine = self.world.new_engine()
+        self.world.add_agent("platform", fleet={"role": "orchestrator", "charter": 1})
+
+    def route(self, argv, **kwargs):
+        return self.gh(argv) if argv[0] == FAKE_GH else super().route(argv, **kwargs)
+
+    def test_intents_lists_the_open_asks_of_an_imported_chief_of_staff(self):
+        self.assertEqual(self.import_main()[0], 0)
+        (session,) = self.imported()
+        pane = self.world.herdr.new_pane_id()
+        self.world.herdr.add(pane, session["id"])
+        os.environ["HERDR_PANE_ID"] = pane
+        code, out, err = self.main("intents")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines(), [
+            "#2  [platform]  Add a health check  | Done when: GET /health returns 200",
+            "#3  [platform]  Write the rollout note  | Done when: the note is merged"])
+
+    def test_without_the_import_metadata_the_agent_is_a_stranger(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "no-import-metadata"
+        self.assertEqual(self.import_main()[0], 0)
+        (session,) = [s for s in self.world.v2.sessions.values() if s["messages"]]
+        pane = self.world.herdr.new_pane_id()
+        self.world.herdr.add(pane, session["id"])
+        os.environ["HERDR_PANE_ID"] = pane
+        code, _, err = self.main("intents")
+        self.assertEqual(code, 1)
+        self.assertIn("not a fleet agent", err)
+
+    def test_status_shows_the_imported_agent_by_name(self):
+        self.import_main()
+        (session,) = self.imported()
+        self.world.herdr.add(self.world.herdr.new_pane_id(), session["id"])
+        report = json.loads(self.main("status", "--json")[1])
+        names = [a["name"] for a in report["agents"]["list"]]
+        self.assertIn("chief", names)
+
+
+# ---- M1, the oracles, and the control
+
+class TestM1(Base):
+    PATH = sc.DEFAULT_DIR / "m1-v1-session-imported.json"
+
+    def test_the_scenario_is_valid_and_in_the_catalog_shape(self):
+        scenario = sc.load(self.PATH)
+        self.assertEqual((scenario["id"], scenario["since_pr"], scenario["problem"]), ("M1", 10, None))
+        self.assertEqual(scenario["tiers"], ["offline", "lab-model"])
+        self.assertEqual(scenario["control"]["fault"], "no-import-metadata")
+        self.assertEqual(sc.validate(scenario), [])
+
+    def test_offline_it_passes_and_its_control_fails_what_it_names(self):
+        report = run_scenario(self, sc.load(self.PATH))
+        self.assertEqual(report["failures"], [], format_scenario_report(report))
+        self.assertEqual(report["implicit"], [])
+        self.assertEqual(report["proves_nothing"], [])
+        self.assertEqual(sorted(r["label"] for r in report["control"] if not r["ok"]),
+                         ["ask-2-listed", "ask-3-listed", "fleet-metadata"])
+        self.assertTrue(next(r for r in report["control"] if r["label"] == "same-messages")["ok"],
+                        "the messages are copied with or without metadata")
+
+    def test_the_lab_model_tier_is_validated_only(self):
+        lab = _load("t_proof_m1", BIN / "proof-switchboard")
+        scenario = sc.load(self.PATH)
+        self.assertNotIn("lab-scripted", scenario["tiers"])
+        self.assertNotIn("import-v1", lab.RUN_ACTIONS)
+
+    def test_a_variant_that_drops_a_message_fails_the_message_oracle(self):
+        scenario = sc.load(self.PATH)
+        run = OfflineRun(self, scenario, "dropped").run()
+        self.assertTrue(run.oracle_imported_messages({"that": "imported_messages", "agent": "chief-of-staff"})[0])
+        session = run.world.v2.sessions[run.world.sessions["chief-of-staff"]]
+        session["messages"].pop(3)
+        self.assertFalse(run.oracle_imported_messages({"that": "imported_messages", "agent": "chief-of-staff"})[0])
+
+    def test_reordered_or_retimed_messages_fail_it_too(self):
+        run = OfflineRun(self, sc.load(self.PATH), "reordered").run()
+        e = {"that": "imported_messages", "agent": "chief-of-staff"}
+        messages = run.world.v2.sessions[run.world.sessions["chief-of-staff"]]["messages"]
+        messages[0], messages[1] = messages[1], messages[0]
+        self.assertFalse(run.oracle_imported_messages(e)[0])
+        messages[0], messages[1] = messages[1], messages[0]
+        messages[2]["time"]["created"] += 1
+        self.assertFalse(run.oracle_imported_messages(e)[0])
+        messages[2]["time"]["created"] -= 1
+        messages[0]["text"] = "something else"
+        self.assertFalse(run.oracle_imported_messages(e)[0])
+
+    def test_the_count_field_must_match(self):
+        run = OfflineRun(self, sc.load(self.PATH), "count").run()
+        e = {"that": "imported_messages", "agent": "chief-of-staff"}
+        self.assertTrue(run.oracle_imported_messages(dict(e, count=7))[0])
+        self.assertFalse(run.oracle_imported_messages(dict(e, count=6))[0])
+
+    def test_the_oracles_say_so_when_there_was_no_import(self):
+        scenario = sc.load(self.PATH)
+        scenario["steps"] = [s for s in scenario["steps"] if s["do"] != "import-v1"]
+        run = OfflineRun(self, scenario, "none").run()
+        ok, seen = run.oracle_imported_messages({"that": "imported_messages", "agent": "chief-of-staff"})
+        self.assertFalse(ok)
+        self.assertIn("no import-v1 step", seen)
+
+    def test_a_fixture_outside_the_repo_is_refused(self):
+        with self.assertRaises(ValueError):
+            _fixture_path("../../../etc/passwd")
+
+    def test_the_vocabulary_is_in_the_readme_and_the_tables(self):
+        readme = (REPO / "scenarios" / "switchboard" / "README.md").read_text()
+        for word in ("`import-v1`", "`imported_messages`", "`lists_asks`", "v1-fixtures"):
+            self.assertTrue(word in readme, word)
+        self.assertEqual(set(sc.STEP_FIELDS["import-v1"]), {"agent", "fixture"})
+        self.assertEqual(sc.STEP_ACTORS["import-v1"], ("world",))
+        self.assertEqual(set(sc.EXPECT_FIELDS["imported_messages"]), {"agent", "count"})
+        self.assertEqual(set(sc.EXPECT_FIELDS["lists_asks"]), {"agent", "issue"})
+
+
+# ---- the runbook and the section's hygiene
+
+FORBIDDEN_IN_PUBLIC_TEXT = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/",
+                                                "/ho" + "me/", "direc" + "tor(?!y|ies)"]), re.IGNORECASE)
+
+
+class TestCutoverRunbook(unittest.TestCase):
+    def setUp(self):
+        self.text = CUTOVER_DOC.read_text()
+
+    def test_it_is_clean_of_names_and_home_paths(self):
+        for number, line in enumerate(self.text.splitlines(), 1):
+            self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (CUTOVER_DOC.name, number, line))
+
+    def test_it_has_the_sections_the_cutover_needs(self):
+        for heading in ("Preconditions", "The shared-directory hazard", "Backups", "Import, one agent at a time",
+                        "Start the switchboard", "Keep `fleet-heartbeat`", "Rollback", "What not to do", "Go / no-go"):
+            self.assertIsNotNone(re.search(r"(?m)^#{2,3} .*%s" % re.escape(heading), self.text), heading)
+
+    def test_it_names_the_hazards_and_the_commands(self):
+        for needle in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "TMPDIR", "HOME",
+                       "absolute path", "herdr plugin link", "fleet-switchboard import-v1", "--dry-run",
+                       "fleet-switchboard ensure", "fleet-heartbeat", "v1_opencode", "message count",
+                       "fleet-switchboard intents", "never type"):
+            self.assertTrue(needle.lower() in self.text.lower(), needle)
+
+    def test_it_has_no_keys_or_secrets(self):
+        for fragment in ("sk-", "bearer ", "password=", "token="):
+            self.assertNotIn(fragment, self.text.lower())
+
+    def test_every_command_it_shows_exists(self):
+        for command in re.findall(r"fleet-switchboard ([a-z0-9-]+)", self.text):
+            self.assertIn(command, ("import-v1", "ensure", "status", "intents", "run", "pending", "send", "launch",
+                                    "version", "poke", "intent", "remind"), command)
+
+    def test_the_readme_links_it_in_one_line(self):
+        readme = (REPO / "README.md").read_text()
+        self.assertEqual(len([line for line in readme.splitlines() if "switchboard-cutover.md" in line]), 1)
+
+
+PRE_EXISTING_REDEFINITIONS = {}  # names a bin file already defined twice before PR 10 (none)
+
+
+class TestPR10Source(unittest.TestCase):
+    SECTION = "\n# PR 10: move a v1 session into v2"
+
+    def test_the_section_is_one_clearly_marked_block(self):
+        self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
+
+    def test_the_engine_still_never_types(self):
+        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+
+    def test_the_import_command_runs_only_the_clients_it_is_given(self):
+        source = SWITCHBOARD.read_text()
+        start = source.index(self.SECTION)
+        section = source[start:source.index("\ndef build_parser")]
+        self.assertNotIn("subprocess.run", section, "the runner is injected")
+        self.assertNotIn("herdr", section.replace("herdr's", "").lower().replace("herdr_", ""))
+
+    def test_no_top_level_name_is_defined_twice_in_any_bin_file(self):
+        for name in ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard"):
+            tree = ast.parse((BIN / name).read_text())
+            seen = {}
+            for node in tree.body:
+                names = []
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    names = [node.name]
+                elif isinstance(node, ast.Assign):
+                    names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                for defined in names:
+                    seen.setdefault(defined, []).append(node.lineno)
+            repeated = {n: lines for n, lines in seen.items()
+                        if len(lines) > 1 and n not in PRE_EXISTING_REDEFINITIONS.get(name, ())}
+            self.assertEqual(repeated, {}, name)
+
+    def test_the_v1_binary_is_asked_for_nothing_but_export(self):
+        source = SWITCHBOARD.read_text()
+        calls = re.findall(r'runner\(\[binary, "([a-z-]+)"', source)
+        self.assertEqual(calls, ["export"])
 
 
 # ---------------------------------------------------------------------- runner

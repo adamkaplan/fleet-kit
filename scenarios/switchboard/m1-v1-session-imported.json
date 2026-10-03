@@ -1,0 +1,33 @@
+{
+  "id": "M1",
+  "title": "A v1 Chief of Staff session is imported",
+  "problem": null,
+  "since_pr": 10,
+  "tiers": ["offline", "lab-model"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1},
+    "3": {"intent": "Write the rollout note", "done_when": "the note is merged", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "import-v1", "agent": "chief-of-staff",
+     "fixture": "v1-fixtures/chief-of-staff-export.json",
+     "why": "fleet-switchboard import-v1: v1's export converted, checked against v2's schema, then imported; a person then opens the TUI on the new session (the runbook's step)"},
+    {"at": "10s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "same-messages", "that": "imported_messages", "agent": "chief-of-staff",
+     "why": "v2 holds one message per v1 message, in the same order, with the same timestamps and typed text"},
+    {"name": "fleet-metadata", "that": "metadata_roundtrip", "agent": "chief-of-staff", "of": "session",
+     "fleet": {"name": "chief-of-staff", "role": "chief-of-staff", "imported_from": "v1:ses_fixture00000000000001"},
+     "why": "session.get returns the stamped metadata.fleet, including where it came from"},
+    {"name": "ask-2-listed", "that": "lists_asks", "agent": "chief-of-staff", "issue": 2,
+     "why": "`intents`, run in the imported agent's pane, lists the open asks under every orchestrator's charter"},
+    {"name": "ask-3-listed", "that": "lists_asks", "agent": "chief-of-staff", "issue": 3}
+  ],
+  "control": {"fault": "no-import-metadata", "fails": ["fleet-metadata", "ask-2-listed", "ask-3-listed"]}
+}
