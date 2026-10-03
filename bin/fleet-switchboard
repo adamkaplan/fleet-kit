@@ -167,6 +167,7 @@ def validate_config(raw, source="config"):
     _validate_github(config, source)
     config.update(envs)
     validate_jev_config(config, raw, source)
+    validate_foreground_config(config, source)  # PR 8
     return config
 
 
@@ -372,6 +373,10 @@ def _one_line(text, limit=300):
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
+CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
+MAX_READ_PAGES = 5   # pages of READ_LIMIT messages `delivered_keys` reads before it holds
+
+
 class V2Client:
     """The one client for OpenCode v2. Every call is `<binary> api <operation>`."""
 
@@ -384,7 +389,7 @@ class V2Client:
         self.runner = runner
         self.timeout = timeout
 
-    def _call(self, operation, params=None, data=None):
+    def _call(self, operation, params=None, data=None, envelope=False):
         argv = [self.binary, "api", operation]
         for name, value in (params or {}).items():
             if value is not None:
@@ -415,7 +420,7 @@ class V2Client:
         except ValueError:
             raise V2Error("bad_json", None, "%s returned non-JSON: %s" % (operation, _one_line(stdout, 120))) from None
         if isinstance(body, dict) and "data" in body:
-            return body["data"]
+            return body if envelope else body["data"]  # PR 8: paging needs the cursor beside the data
         return body
 
     def server_info(self):
@@ -441,6 +446,48 @@ class V2Client:
             raise ValueError("order must be one of %s" % ", ".join(self.ORDERS))
         return self._call("session.message.list", {
             "sessionID": session_id, "limit": limit, "order": order, "type": type, "cursor": cursor})
+
+    def message_page(self, session_id, limit=None, type=None, cursor=None):
+        """PR 8: one page of `session.message.list` with its cursor: (messages, cursor).
+
+        `cursor` is v2's `{"previous": .., "next": ..}` object, or None when the
+        answer carries none. A cursor argument is v2's opaque token and fixes the
+        order, so no `order` is taken here (v2: do not combine them).
+        """
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_LIMIT):
+            raise ValueError("cursor must be v2's opaque token (a non-empty string), got %r" % (cursor,))
+        body = self._call("session.message.list", {
+            "sessionID": session_id, "limit": limit, "type": type, "cursor": cursor}, envelope=True)
+        if isinstance(body, dict):
+            found = body.get("cursor")
+            return (body["data"] if isinstance(body.get("data"), list) else []), \
+                (found if isinstance(found, dict) else None)
+        return (body if isinstance(body, list) else []), None
+
+    def message_pages(self, session_id, limit, type=None, max_pages=1):
+        """PR 8: the pages of one listing, newest first, following `cursor.next`.
+
+        UNVERIFIED: that `next` moves to older messages in a newest-first
+        listing; the Lab's paging spike must show it. Yields (messages, more):
+        `more` is True while v2 names a next cursor, False when it says there is
+        none, None when the answer carries no cursor at all. The walk ends after
+        a False or None, or after `max_pages`. A continuation that is empty or
+        repeats a message already seen means the cursor does not walk the
+        listing as assumed: that raises, and the caller holds.
+        """
+        cursor, seen = None, set()
+        for number in range(max_pages):
+            page, found = self.message_page(session_id, limit, type, cursor)
+            ids = [m.get("id") for m in page if isinstance(m, dict)]
+            if number and (not page or any(i in seen for i in ids)):
+                raise V2Error("bad_json", None, "session.message.list: the next page was empty or repeated "
+                                                "a message; the cursor does not walk older as assumed")
+            seen.update(ids)
+            cursor = found.get("next") if found else None
+            more = None if found is None else bool(cursor)
+            yield page, more
+            if not more:
+                return
 
     def synthetic(self, session_id, text, metadata, resume, delivery, message_id):
         if not isinstance(resume, bool):
@@ -743,7 +790,7 @@ def fact_sources(state_dir):
     reminders join this list. `send` is not a source: it delivers directly, by
     the same rule, and stores nothing.
     """
-    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir)]
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ForegroundFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -1024,9 +1071,14 @@ class Switchboard:
         page = self.v2.message_list(session_id, limit=READ_LIMIT)  # newest first (S5)
         return page if isinstance(page, list) else []
 
-    def last_human_prompt(self, session_id, now):
-        """Your newest prompt in the engagement window: type `user` without `metadata.fleet`."""
+    def last_human_prompt(self, session_id, now, inbox=False):
+        """Your newest prompt in the engagement window: type `user` without `metadata.fleet`.
+        `inbox` (a Chief of Staff, PR 8) also counts one still waiting in v2's inbox."""
         start = now - self.engaged_seconds
+        if inbox:
+            waiting = inbox_human_prompts(self, session_id)
+            if waiting and (_created(waiting[0]) or 0) >= start:
+                return _created(waiting[0])
         for message in self._messages(session_id):
             created = _created(message)
             if created is not None and created < start:
@@ -1052,7 +1104,8 @@ class Switchboard:
         if observation.problem:
             return observation
         try:
-            observation.last_human_prompt = self.last_human_prompt(session_id, now)
+            observation.last_human_prompt = self.last_human_prompt(
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff")
         except V2Error as err:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
@@ -1151,18 +1204,22 @@ class Switchboard:
         """Keys already in the session: its messages since `since`, read newest
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
-        keys = set()
+        keys, complete = set(), False
         # Only synthetic messages carry keys; asking for just those keeps the read
         # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
-        page = self.v2.message_list(session_id, limit=READ_LIMIT, type="synthetic")
-        page = page if isinstance(page, list) else []
-        complete = len(page) < READ_LIMIT
-        for message in page:
-            created = _created(message)
-            if created is not None and created < since:
+        # PR 8: more than READ_LIMIT of them are read page by page, up to MAX_READ_PAGES.
+        for page, more in self.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+            reached = False
+            for message in page:
+                created = _created(message)
+                if created is not None and created < since:
+                    reached = True
+                    break
+                keys.update(_fleet_keys(message))
+            if reached or len(page) < READ_LIMIT or more is False:
                 complete = True
+            if complete:
                 break
-            keys.update(_fleet_keys(message))
         inbox = self.v2.inbox_list(session_id)
         for item in inbox if isinstance(inbox, list) else []:
             keys.update(_fleet_keys(item))
@@ -1952,10 +2009,10 @@ def open_asks_of(discovery, cos_name):
     return asks
 
 
-def _classify_audit(engine, observation, message, previous, request, answer):
+def _classify_audit(engine, observation, message, previous, request, answer, shadow=True):
     state, questions = request
     detail = {"agent": observation.name, "session": observation.session_id, "message_id": message.get("id"),
-              "status": observation.status, "shadow": True,
+              "status": observation.status, "shadow": shadow,
               "question": {"state": state, "options": list(questions[CLASSIFY_ID]["criteria"])},
               "answer": {"choice": answer["choice"], "confident": answer["confident"],
                          "reason": answer["reason"], "jev_choice": answer["jev_choice"],
@@ -1966,7 +2023,7 @@ def _classify_audit(engine, observation, message, previous, request, answer):
 
 def shadow_classify(engine, observation, discovery, now):
     """Classify your newest prompt to a Chief of Staff once, and write what Jev said. Acts on nothing."""
-    prompts = human_prompts(engine._messages(observation.session_id))
+    prompts = newest_prompts(engine, observation.session_id)
     if not prompts:
         return False
     message = prompts[0]
@@ -1977,21 +2034,23 @@ def shadow_classify(engine, observation, discovery, now):
     if created is None or now - created > engine.engaged_seconds:
         return False
     engine._classified.add(key)  # one attempt per message, whatever the answer
-    asks = open_asks_of(discovery, observation.name)
+    asks = ask_intents(engine, open_asks_of(discovery, observation.name))  # PR 8: with their Intent
     if observation.status != "working" and not asks:
         return False  # nothing to choose between: it simply becomes the foreground work
     previous = _message_text(prompts[1]) if len(prompts) > 1 else None
-    current = _ask_of(observation.fleet, observation.name)
+    current = ask_intent(engine, _ask_of(observation.fleet, observation.name))
     request = classify_request(_message_text(message), previous, current, asks)
     answer = classify(engine.jev, _message_text(message), previous, current, asks,
                       engine.config["jev"]["min_confidence"])
-    _classify_audit(engine, observation, message, previous, request, answer)
+    _classify_audit(engine, observation, message, previous, request, answer, shadow=not acting(engine))
+    if acting(engine):  # PR 8
+        note_decision(engine, observation, message, current, asks, answer)
     return True
 
 
 def run_shadow_classifier(engine, discovery, now):
     """Each Chief of Staff, once per new prompt. A failure is audited and never stops the pass."""
-    if engine.jev is None or engine.audit is None or not engine.config.get("shadow_judges"):
+    if engine.jev is None or engine.audit is None or not (engine.config.get("shadow_judges") or acting(engine)):
         return
     if fault("no-classify"):
         return
@@ -2109,7 +2168,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None):
                 done += 1
                 if passes is not None and done >= passes:
                     return done
-                wait(sock, poll)
+                wait(sock, next_poll(engine, poll))
         finally:
             if sock is not None:
                 sock.close()
@@ -2304,6 +2363,391 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
             else "no pane was opened"
         raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
+# ======================================================================
+# PR 8: foreground and background
+#
+# One section, so the stack rebases cleanly. docs/switchboard.md,
+# "Foreground and background". Registered in these places, one line each:
+#   DEFAULTS            `classifier_mode` (below), checked by validate_foreground_config
+#   validate_config     calls validate_foreground_config
+#   fact_sources        adds ForegroundFacts
+#   shadow_classify     enriches asks with their Intent (ask_intent) and hands
+#                       an acting classification to note_decision
+#   run_shadow_classifier  also runs when classifier_mode is "act"
+#   build_parser, main  the `handoff` command
+# The decoration is a fact like any other: it is delivered by the one delivery
+# path, as a note, and the key in the transcript is what stops a repeat.
+# ======================================================================
+
+FOREGROUND_DEFAULTS = {
+    # "shadow": the classifier only logs (PR 7). "act": it also decorates the
+    # Chief of Staff's message, and tells it to hand off. SF1/SF2 decide when.
+    "classifier_mode": "shadow",
+    # Seconds between passes while a Chief of Staff is busy: your message is
+    # consumed at its next step boundary (SF1), so the decoration must beat it.
+    "busy_poll_seconds": 1,
+}
+DEFAULTS.update(FOREGROUND_DEFAULTS)
+CLASSIFIER_MODES = ("shadow", "act")
+DECORATION = "foreground.decoration"
+COS_SUBAGENT = "cos-subagent"
+SUBAGENT_AGENT = "cos-subagent"  # the OpenCode agent definition a background subagent runs
+DECORATION_INTENT_LIMIT = 160    # characters of an Intent inside a decoration
+
+
+def validate_foreground_config(config, source):
+    mode = config["classifier_mode"]
+    if mode not in CLASSIFIER_MODES:
+        raise ConfigError("%s: 'classifier_mode' must be one of %s, got %r" % (source, ", ".join(CLASSIFIER_MODES), mode))
+    busy = config["busy_poll_seconds"]
+    if not _is_number(busy) or busy <= 0:
+        raise ConfigError("%s: 'busy_poll_seconds' must be a positive number, got %r" % (source, busy))
+    if mode == "act" and not config.get("jev"):
+        raise ConfigError("%s: 'classifier_mode' \"act\" needs a 'jev' object: there is no decision model to ask" % source)
+
+
+def chief_busy(engine):
+    """True when the newest look found a chief-of-staff-role agent working: the daemon then polls fast."""
+    found = getattr(engine, "discovery", None)
+    return bool(found) and any(o.fleet.get("role") == "chief-of-staff" and o.status == "working"
+                               for o in found.agents.values())
+
+
+def next_poll(engine, poll):
+    """Seconds to wait before the next pass: `busy_poll_seconds` while a Chief of Staff works (only
+    when acting: shadow mode has no deadline), else `poll`."""
+    if acting(engine) and chief_busy(engine):
+        return min(poll, engine.config["busy_poll_seconds"])
+    return poll
+
+
+def inbox_human_prompts(engine, session_id):
+    """Your steered prompts still waiting in v2's inbox (SF1: there within ~0.1 s, consumed at the
+    next step boundary), as message-like records, newest first. Not yet seen by the model."""
+    inbox = engine.v2.inbox_list(session_id)
+    found = []
+    for item in inbox if isinstance(inbox, list) else []:
+        payload = item.get("payload") if isinstance(item, dict) and isinstance(item.get("payload"), dict) else {}
+        if isinstance(item, dict) and item.get("type") == "user" and _fleet_meta(item) is None \
+                and isinstance(payload.get("text"), str):
+            found.append({"id": item.get("id"), "type": "user", "text": payload["text"], "time": item.get("time"),
+                          "pending": True})
+    return sorted(found, key=lambda m: _created(m) or 0, reverse=True)
+
+
+def newest_prompts(engine, session_id):
+    """Your prompts to a Chief of Staff, newest first: the inbox's (not yet consumed), then the transcript's."""
+    return inbox_human_prompts(engine, session_id) + human_prompts(engine._messages(session_id))
+
+
+def acting(engine):
+    """True when the classifier's answers are acted on, not only logged."""
+    return engine.config.get("classifier_mode") == "act" and engine.jev is not None
+
+
+# ---- the asks, with their Intent
+
+def ask_intent(engine, ask):
+    """`ask` with its Intent and Done-when read from GitHub (IntentReader, cached).
+
+    Unchanged when no reader is configured or GitHub cannot answer: a
+    classification must not wait on, or fail for, an unreachable GitHub.
+    """
+    if not ask or engine.intents is None:
+        return ask
+    try:
+        issue = engine.intents.issue(ask["issue"])
+    except IntentError:
+        return ask
+    return dict(ask, intent=issue.intent or ask.get("intent") or "", done_when=issue.done_when)
+
+
+def ask_intents(engine, asks):
+    return [ask_intent(engine, ask) for ask in asks]
+
+
+# ---- the decoration's words (docs/switchboard.md, "Decorate" and "Hand off")
+
+def owned_ask_text(ask):
+    """The decoration for a message about an ask somebody else owns. The doc's own wording."""
+    where = ""
+    if ask.get("intent"):
+        where = " (Intent: %s)" % _one_line(ask["intent"], DECORATION_INTENT_LIMIT)
+    owner = ask.get("owner") or "its owner"
+    return ("This is about ask %s%s. %s is working on it in the background. Send it anything relevant "
+            "with: fleet-switchboard send %s --issue %s \"...\". Then continue with what you were doing."
+            % (ask["issue"], where, owner, owner, ask["issue"]))
+
+
+def handoff_text(current):
+    """The decoration for something new while the Chief of Staff is busy."""
+    ask = current or {}
+    number = ask.get("issue") or "<the ask of your current work>"
+    doing = ""
+    if ask.get("intent"):
+        doing = " (ask %s: %s)" % (ask["issue"], _one_line(ask["intent"], DECORATION_INTENT_LIMIT))
+    return ("This is not about what you are working on%s, and you are busy with it. Hand it off first: write a short "
+            "brief with Done so far, Next steps and Watch out for, and run: fleet-switchboard handoff --issue %s "
+            "--brief-file -. A background subagent takes it over; then turn to this message."
+            % (doing, number))
+
+
+def decoration_for(choice, observation, current, asks):
+    """(kind, ask, text) for the classification's answer, or None when nothing is added.
+
+    current: nothing. An ask somebody owns: name it and its owner. Something
+    new: hand off first when the Chief of Staff is busy, nothing when idle.
+    """
+    if choice == "current":
+        return None
+    if choice == "new":
+        if observation.status != "working":
+            return None
+        return "handoff", current, handoff_text(current)
+    ask = next((a for a in asks if str(a["issue"]) == choice), None)
+    return ("owned", ask, owned_ask_text(ask)) if ask else None
+
+
+# ---- the decoration as a fact
+
+class ForegroundFacts:
+    """`foreground.decoration:` facts for a Chief of Staff, derived on every call.
+
+    The only memory is the classifier's answers, by message id, in this
+    process; a restart classifies the newest message once more, and the key
+    already in the transcript stops a second delivery (invariant 2). Nothing is
+    stored on disk. A decoration holds only while it is true: the message is
+    still your newest, still inside the engagement window, and (to hand off)
+    the Chief of Staff is still busy.
+    """
+
+    __name__ = "foreground_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.decisions = {}  # session id -> the newest decision for it
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def record(self, observation, message, kind, ask, text):
+        self.decisions[observation.session_id] = {
+            "cos": observation.name, "session": observation.session_id, "message": message["id"],
+            "created": _created(message), "kind": kind, "ask": ask, "text": text}
+
+    def __call__(self):
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None)
+        if engine is None or discovery is None or not self.decisions:
+            return []
+        now, facts = engine.now(), []
+        for session, decision in sorted(self.decisions.items()):
+            if decision["created"] is None or now - decision["created"] > engine.engaged_seconds:
+                del self.decisions[session]  # old news; a decoration is only for your newest message
+                continue
+            fact = self.fact(decision, discovery)
+            if fact is not None:
+                facts.append(fact)
+        return facts
+
+    def fact(self, decision, discovery):
+        observation = discovery.agents.get(decision["cos"])
+        if observation is None or observation.problem or observation.conflict \
+                or observation.session_id != decision["session"]:
+            return None
+        if decision["kind"] == "handoff" and observation.status != "working":
+            return None  # it has finished what it was doing: nothing left to hand off
+        if not self.is_newest(decision):
+            return None
+        ask = decision["ask"] or {}
+        issue = ask.get("issue") if decision["kind"] == "owned" else None
+        return Fact("decoration:%s:%s" % (decision["session"], decision["message"]), decision["cos"], DECORATION,
+                    decision["text"], decision["created"], issue=issue if _is_issue_number(issue) else None,
+                    batch=False)
+
+    def is_newest(self, decision):
+        prompts = newest_prompts(self.engine, decision["session"])
+        return bool(prompts) and prompts[0].get("id") == decision["message"]
+
+
+def foreground_source(engine):
+    return next((s for s in engine.sources if isinstance(s, ForegroundFacts)), None)
+
+
+def note_decision(engine, observation, message, current, asks, answer):
+    """An acting classification becomes a decoration, kept for the fact source. Audited either way."""
+    found = decoration_for(answer["choice"], observation, current, asks)
+    source = foreground_source(engine)
+    detail = {"agent": observation.name, "message_id": message.get("id"), "choice": answer["choice"],
+              "decoration": found[0] if found else None, "owner": (found[1] or {}).get("owner") if found else None}
+    if found and source is None:
+        detail["problem"] = "no foreground fact source is registered, so nothing can be delivered"
+        found = None
+    engine.audit.append(engine.actor, "foreground.decision", "decision:%s:%s" % (observation.session_id, message.get("id")),
+                        detail)
+    if found:
+        source.record(observation, message, *found)
+        if not message.get("pending"):  # the model already took your message: the decoration cannot ride with it
+            engine.audit.append(engine.actor, "foreground.late", "decision:%s:%s" % (observation.session_id, message.get("id")),
+                                {"agent": observation.name, "message_id": message.get("id"),
+                                 "decoration": found[0], "age_seconds": round(engine.now() - (_created(message) or 0), 2)})
+
+
+# ---- handoff: a brief, not a fork
+
+class HandoffRefused(Exception):
+    """A handoff that was refused before anything was written."""
+
+
+BRIEF_LIMIT = 20000  # characters; a GitHub comment holds 65536
+BRIEF_LABELS = ("goal", "done so far", "next steps", "watch out for")
+_BRIEF_INLINE = re.compile(r"^\s{0,3}(?:#{1,6}\s+)?(?:[-*]\s+)?\**(%s)\**\s*:\**\s*(.*?)\s*$"
+                           % "|".join(BRIEF_LABELS), re.IGNORECASE)
+_BRIEF_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(%s)\s*#*\s*$" % "|".join(BRIEF_LABELS), re.IGNORECASE)
+_BRIEF_TITLE = re.compile(r"^\s{0,3}#{1,6}\s+handoff\b", re.IGNORECASE)
+
+
+def parse_brief(text):
+    """{label: text} from a Chief of Staff's brief: sections named `Done so far:`, `Next steps:`,
+    `Watch out for:` (and a `Goal:`, which the switchboard replaces). Anything else is refused,
+    so no written word is silently dropped. Raises HandoffRefused."""
+    if len(text) > BRIEF_LIMIT:
+        raise HandoffRefused("the brief is %d characters; the limit is %d: say less, link more" % (len(text), BRIEF_LIMIT))
+    sections, label, stray = {}, None, []
+    for line in text.splitlines():
+        found = _BRIEF_INLINE.match(line) or _BRIEF_HEADING.match(line)
+        if found:
+            label = found.group(1).lower()
+            sections[label] = [found.group(2)] if found.lastindex == 2 and found.group(2) else []
+        elif label is not None:
+            sections[label].append(line)
+        elif line.strip() and not _BRIEF_TITLE.match(line):
+            stray.append(line.strip())
+    if stray:
+        raise HandoffRefused("the brief has text outside its sections (%s): put it under Done so far, Next steps "
+                             "or Watch out for" % _one_line(stray[0], 80))
+    parsed = {name: "\n".join(lines).strip() for name, lines in sections.items()}
+    missing = [name.capitalize() for name in ("done so far", "next steps") if not parsed.get(name)]
+    if missing:
+        raise HandoffRefused("the brief has no %s: a subagent cannot continue from a brief without them"
+                             % " and no ".join(missing))
+    return parsed
+
+
+def goal_line(issue):
+    """Goal, from the ask's own Intent and Done-when: never retyped by the Chief of Staff."""
+    line = issue.intent or NO_INTENT
+    return "%s (Done when: %s)" % (line, issue.done_when) if issue.done_when else line
+
+
+def handoff_markdown(issue, parsed):
+    """The doc's handoff markdown for ask `issue` (an IssueIntent) and a parsed brief."""
+    lines = ["## Handoff: ask %d" % issue.number, "Goal: %s" % goal_line(issue),
+             "Done so far: %s" % parsed["done so far"], "Next steps: %s" % parsed["next steps"],
+             "Watch out for: %s" % (parsed.get("watch out for") or "nothing noted")]
+    return "\n".join(lines)
+
+
+def post_ask_comment(engine, issue, body):
+    """Comment on the ask through the configured `gh`. The one GitHub write the switchboard makes:
+    the handoff brief, so the record survives (docs: Hand off). Audited before and after."""
+    reader = engine.intents
+    path = "repos/%s/issues/%d/comments" % (reader.repo, issue)
+    with engine._external("github.comment", "issue:%d" % issue, {"repo": reader.repo, "issue": issue,
+                                                                   "chars": len(body)}) as result:
+        try:
+            done = reader.runner([reader.gh, "api", path, "--method", "POST", "--input", "-"],
+                                 input=json.dumps({"body": body}), capture_output=True, text=True,
+                                 timeout=reader.timeout)
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % reader.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (reader.gh, err.strerror or err)) from None
+        if done.returncode != 0:
+            raise IntentError("gh", _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode)
+        try:
+            posted = json.loads(done.stdout)
+        except ValueError:
+            posted = {}
+        url = posted.get("html_url") if isinstance(posted, dict) else None
+        result["url"] = url if isinstance(url, str) else None
+    return result["url"]
+
+
+def handoff_refusals(engine, issue, name, directory, workspace, agent):
+    """Why nothing may be written, found before anything is: the ask, the agent's name and place.
+    Returns the ask (an IssueIntent)."""
+    if engine.intents is None:
+        raise HandoffRefused("'intent_repo' is not configured: a handoff fills Goal from the ask and posts "
+                             "the brief on it")
+    ask = engine.intents.issue(issue)
+    if ask.charter:
+        raise HandoffRefused("#%d is a charter, not an ask: hand off an ask under it" % issue)
+    if ask.state != "open":
+        raise HandoffRefused("ask #%d is %s: there is nothing to hand off" % (issue, ask.state or "not open"))
+    problems = launch_problems(name, agent, directory, workspace, issue)
+    if problems:
+        raise HandoffRefused("; ".join(problems))
+    taken = engine.discover(engine.now()).agents.get(name)
+    if taken is not None:
+        raise HandoffRefused("a fleet agent named %s already runs in pane %s: send it what is new with "
+                             "fleet-switchboard send %s --issue %d" % (name, taken.pane, name, issue))
+    return ask
+
+
+def subagent_prompt(caller, issue, markdown):
+    return ("%s\n\nYou are a background subagent for %s. Report with: fleet-switchboard send %s --issue %d \"...\" "
+            "when you reach the ask's Done when, or when you are stuck." % (markdown, caller, caller, issue))
+
+
+def handoff_ask(engine, caller, issue, brief, name=None, directory=None, workspace=None, agent=SUBAGENT_AGENT,
+                patience=LAUNCH_PATIENCE, sleep=time.sleep):
+    """The Chief of Staff's handoff: check, post the brief on the ask, launch the subagent. Returns a dict.
+
+    Everything that can be refused is refused before the comment is posted.
+    A launch that fails after the comment says so: the record stands.
+    """
+    name = name or "cos-%d" % issue
+    parsed = parse_brief(brief)
+    ask = handoff_refusals(engine, issue, name, directory, workspace, agent)
+    markdown = handoff_markdown(ask, parsed)
+    url = post_ask_comment(engine, issue, markdown)
+    try:
+        done = launch_agent(engine, name, agent, directory, workspace, COS_SUBAGENT, caller, issue,
+                            subagent_prompt(caller, issue, markdown), patience, sleep)
+    except LaunchError as err:
+        raise LaunchError("the brief was posted on ask #%d, but the subagent did not start: %s" % (issue, err)) from err
+    return dict(done, issue=issue, reports_to=caller, role=COS_SUBAGENT, comment=url,
+                replaced_goal="goal" in parsed)
+
+
+def cmd_handoff(args, runner, now, socket_call=None):
+    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
+    brief = read_brief(args.brief_file, sys.stdin)
+    engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    try:
+        done = handoff_ask(engine, caller, args.issue, brief, args.name, args.dir or os.getcwd(), workspace)
+    except HandoffRefused as err:
+        sys.stderr.write("%s: handoff refused: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if done.pop("replaced_goal"):
+        sys.stderr.write("%s: the Goal line in your brief was replaced by the ask's own Intent and Done when\n" % PROG)
+    print(json.dumps(done, sort_keys=True))
+    return EXIT_OK
+
+
+def add_foreground_parsers(sub):
+    handoff = sub.add_parser("handoff", help="Hand your current work to a background subagent: post the brief on "
+                                             "the ask and launch it, without typing")
+    handoff.add_argument("--issue", type=int, required=True, help="The ask being handed off")
+    handoff.add_argument("--brief-file", dest="brief_file", required=True,
+                         help="The brief (Done so far, Next steps, Watch out for): a file, or - for stdin")
+    handoff.add_argument("--name", help="The subagent's fleet name (default: cos-<issue>)")
+    handoff.add_argument("--dir", help="The subagent's working directory (default: here)")
+    handoff.add_argument("--workspace", help="The herdr workspace for its tab (default: $HERDR_WORKSPACE_ID)")
 
 
 # ======================================================================
@@ -4420,6 +4864,7 @@ def build_parser():
     remind.add_argument("--issue", type=int, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     add_intent_parsers(sub)
+    add_foreground_parsers(sub)  # PR 8
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -4442,6 +4887,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_ensure(args, spawn)
         if args.action == "launch":
             return cmd_launch(args, runner, now, socket_call)
+        if args.action == "handoff":  # PR 8
+            return cmd_handoff(args, runner, now, socket_call)
         if args.action == "run":
             return cmd_run(args, runner, now, wait)
         if args.action == "send":

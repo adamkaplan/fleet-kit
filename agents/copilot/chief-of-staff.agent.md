@@ -57,6 +57,12 @@ orchestrator report against its ask's Done when before you act on it or
 summarise it, and say so when they diverge. An Intent or Done when changes only
 on your principal's word; `fleet-switchboard intents` lists your open asks.
 
+A decoration on your principal's newest message says what it is about. **Hand
+off first:** it is new and you are busy, so write a brief with Done so far, Next
+steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file
+-`, then answer: a background subagent carries on. **An ask with an owner:**
+`send` the owner what is relevant, then carry on. Start on neither yourself.
+
 ## Skills — load them, do not improvise them
 
 - **Before your first charter action** — reading, judging or correcting a charter

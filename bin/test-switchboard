@@ -160,7 +160,8 @@ class TestConfig(Base):
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
-            "intent_repo": None, "intent_required": True})
+            "intent_repo": None, "intent_required": True,
+            "classifier_mode": "shadow", "busy_poll_seconds": 1})  # PR 8
 
     def test_path_follows_xdg_config_home(self):
         self.assertEqual(sb.config_path(), self.config_file)
@@ -996,6 +997,7 @@ STEP_EXAMPLES = {
              "from": "coder", "batch": False},
     "pass": {"faults": ["no-dedupe", "crash-after-send"]},
     "launch": {"agent": "coder", "brief": "Add a health check"},
+    "handoff": {"issue": 2, "brief": "Done so far: a\nNext steps: b"},  # PR 8
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1342,6 +1344,12 @@ class FakeHTTP(Exception):
         self.status, self.name, self.message = status, name, message
 
 
+class Enveloped(list):
+    """A list a fake operation returns with the rest of v2's answer beside `data`."""
+
+    envelope = None
+
+
 def _record_keys(record):
     """Keys of a transcript message (`metadata`) or an inbox item (`payload.metadata`)."""
     meta = record.get("metadata") or (record.get("payload") or {}).get("metadata") or {}
@@ -1370,7 +1378,8 @@ class FakeV2:
       Ids are global, so a repeat aimed at another session is not admitted
       there either (the assumption the derived id is built around).
 
-    Not modelled, and refused loudly: a prompt to a busy session. A turn
+    Not modelled, and refused loudly: a fleet prompt to a busy session. (Yours is
+    modelled in the transcript only: see human_prompt_while_busy.) A turn
     started by a wake lasts `wake_lasts` seconds (0 by default).
     """
 
@@ -1417,7 +1426,9 @@ class FakeV2:
             return subprocess.CompletedProcess(
                 argv, 1, json.dumps({"name": err.name, "message": err.message}),
                 "HTTP %d %s\n" % (err.status, err.name))
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"data": data}), "")
+        payload = {"data": data}
+        payload.update(getattr(data, "envelope", None) or {})  # PR 8: a listing's cursor
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
 
     # -- state helpers
     def create_session(self, metadata, title="fake", agent=None, directory=None):
@@ -1456,8 +1467,9 @@ class FakeV2:
         delivered = []
         for item in items:
             s["inbox"].remove(item)
-            delivered.append(self._message(s, "synthetic", item["text"], item.get("metadata"), at, item["id"]))
-            self.admitted[item["id"]]["delivered_at"] = at
+            delivered.append(self._message(s, item.get("type", "synthetic"), item["text"], item.get("metadata"), at, item["id"]))
+            if item["id"] in self.admitted:  # your own prompt is not a switchboard admission
+                self.admitted[item["id"]]["delivered_at"] = at
         return delivered
 
     def _model_call(self, s, phase, inputs, at):
@@ -1509,6 +1521,8 @@ class FakeV2:
         """A prompt: yours (no fleet metadata) or the fleet's, starting a turn of `steps` model calls."""
         s = self.sessions[sid]
         if s["turn"] is not None:
+            if metadata is None and not fleet:  # PR 8: you type while it works
+                return self.human_prompt_while_busy(sid, text)
             raise AssertionError("fake opencode: a prompt to a busy session is not modelled")
         if metadata is None and fleet:
             metadata = {"fleet": {"from": "fleet-task"}}
@@ -1516,6 +1530,16 @@ class FakeV2:
 
     def admissions(self, sid):
         return [a for a in self.admitted.values() if a["session"] == sid]
+
+    def human_prompt_while_busy(self, sid, text):
+        """PR 8: you send a message while the session works. It is in the transcript at once,
+        as the TUI shows it, and the running turn goes on undisturbed. When the model first
+        sees it, and how the TUI admits it, is spike SF1's question: nothing here says."""
+        s = self.sessions[sid]
+        at, mid = self.clock.now(), self._id("msg")
+        item = {"id": mid, "sessionID": sid, "type": "user", "text": text, "metadata": None, "resume": False,
+                "delivery": "steer", "time": {"created": self.clock.ms(at)}}
+        s["inbox"].append(item)  # SF1: in the inbox at once, consumed at the next step boundary
 
     # -- operations
     def op_server_info(self, params, body):
@@ -1544,8 +1568,28 @@ class FakeV2:
         if "type" in params:
             messages = [m for m in messages if m["type"] == params["type"]]
         if "limit" in params:
-            messages = messages[:int(params["limit"])]
+            return self.page_of(messages, params)
         return copy.deepcopy(messages)
+
+    CURSOR_PREFIX = "cur_at_"
+
+    def page_of(self, messages, params):
+        """PR 8: a page and the cursor v2 returns beside it. A cursor token names the
+        offset of the next page, in the listing's own order (newest first by default);
+        `order` and `cursor` together are refused, as v2 says. `previous` points back."""
+        start = 0
+        if "cursor" in params:
+            if "order" in params:
+                raise FakeHTTP(400, "InvalidRequestError", "do not combine cursor with order")
+            if not params["cursor"].startswith(self.CURSOR_PREFIX):
+                raise FakeHTTP(400, "InvalidCursorError", "bad cursor")
+            start = int(params["cursor"][len(self.CURSOR_PREFIX):])
+        size = int(params["limit"])
+        page = Enveloped(copy.deepcopy(messages[start:start + size]))
+        more = start + size < len(messages)
+        page.envelope = {"cursor": {"next": self.CURSOR_PREFIX + str(start + size) if more else None,
+                                    "previous": self.CURSOR_PREFIX + str(max(0, start - size)) if start else None}}
+        return page
 
     def op_session_synthetic(self, params, body):
         s = self._session(params)
@@ -1577,7 +1621,7 @@ class FakeV2:
         """An inbox item as v2 2.0.22 returns it: text and metadata under
         `payload`, and no `resume` (S3, S5)."""
         return {"id": item["id"], "sessionID": item["sessionID"], "time": copy.deepcopy(item["time"]),
-                "type": "synthetic", "payload": {"text": item["text"], "metadata": copy.deepcopy(item.get("metadata"))},
+                "type": item.get("type", "synthetic"), "payload": {"text": item["text"], "metadata": copy.deepcopy(item.get("metadata"))},
                 "delivery": item["delivery"]}
 
     def op_session_inbox_list(self, params, body):
@@ -2047,7 +2091,7 @@ class TestFacts(Base):
         self.assertIn(":2:", str(caught.exception))
 
     def test_the_registration_point_lists_the_lab_source(self):
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts"])
+        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts", "foreground_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -2192,7 +2236,9 @@ class TestDerive(Base):
         for n in range(3):
             self.send(["k%d" % n], True)
             self.world.tick(100)
-        with mock.patch.object(sb, "READ_LIMIT", 2):
+        # PR 8 reads further pages, so the read is bounded to one page here: this test is about
+        # the bound (more pages than MAX_READ_PAGES also holds: see TestMessagePaging).
+        with mock.patch.object(sb, "READ_LIMIT", 2), mock.patch.object(sb, "MAX_READ_PAGES", 1):
             _, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
             self.assertFalse(complete)
             plan = self.plan([fact("new")])
@@ -3581,6 +3627,8 @@ class OfflineRun:
             apply_worker_step(self, step)
         elif do == "edit-intent":
             apply_edit_intent(self, step)
+        elif do == "handoff":  # PR 8
+            apply_handoff_step(self, step)
         elif do != "wait":
             raise NotImplementedError("the offline runner does not implement step %r" % do)
 
@@ -6351,6 +6399,8 @@ class FakeGH:
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append(argv)
+        if "--method" in argv:  # PR 8: the handoff comment, the one write
+            return self.post_comment(argv, kwargs)
         if len(argv) != 3 or argv[:2] != [FAKE_GH, "api"]:
             raise AssertionError("fake gh serves `gh api <path>` only, a GET; got %r" % argv)
         if self.down:
@@ -6369,6 +6419,28 @@ class FakeGH:
         if body is None:
             return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
         return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+
+@adds_to(FakeGH)
+def post_comment(self, argv, kwargs):
+    """PR 8: `gh api repos/R/issues/N/comments --method POST --input -` with {"body": ...} on stdin,
+    and nothing else. Any other write raises, so a stray write cannot pass for the handoff."""
+    path = argv[2] if len(argv) > 2 else ""
+    found = re.match(r"^%s(\d+)/comments$" % re.escape(ISSUES_API), path)
+    if argv[:2] != [FAKE_GH, "api"] or argv[3:] != ["--method", "POST", "--input", "-"] or not found:
+        raise AssertionError("fake gh writes only a comment: gh api <issues>/N/comments --method POST --input -; got %r"
+                             % (argv,))
+    if "stdin" in kwargs:
+        raise AssertionError("a write passes its body as input, not stdin")
+    if self.down:
+        return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
+    number = int(found.group(1))
+    if number not in self.issues:
+        return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+    comments = self.__dict__.setdefault("comments", [])
+    comments.append({"issue": number, "body": json.loads(kwargs["input"])["body"]})
+    return subprocess.CompletedProcess(argv, 0, json.dumps({
+        "id": 9000 + len(comments), "html_url": "https://example.test/%s/issues/%d#c%d" % (FAKE_REPO, number, len(comments))}), "")
 
 
 def attach_intent_lab(run):
@@ -6400,6 +6472,28 @@ def apply_edit_intent(run, step):
     if toast is not None:
         with world.engine.audit.external("daemon", "herdr.notification", "you", toast):
             world.engine.herdr.notification_show(toast["title"], toast["body"])
+
+
+def apply_handoff_step(run, step):
+    """PR 8, `handoff`: the cast member runs `fleet-switchboard handoff` for an ask, as the
+    Chief of Staff's model would. The brief is posted on the fake GitHub, and the subagent is
+    launched (into the fakes) with the cast member as the one it reports to."""
+    world = run.world
+    sb.handoff_ask(world.new_engine("cli"), step["actor"], step["issue"], step["brief"],
+                   directory=str(run.work), workspace="w1", patience=5,
+                   sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+
+
+@adds_to(OfflineRun)
+def oracle_handed_off(self, e):
+    """PR 8: a brief on the ask (the fake GitHub's comments) and a `cos-subagent` session for it (the fake v2)."""
+    comments = [c for c in getattr(self.ask_gh, "comments", []) if c["issue"] == e["issue"]
+                and c["body"].startswith("## Handoff: ask %d\n" % e["issue"])]
+    subagents = [s for s in self.world.v2.sessions.values()
+                 if (s["metadata"].get("fleet") or {}).get("role") == sb.COS_SUBAGENT
+                 and (s["metadata"].get("fleet") or {}).get("issue") == e["issue"]]
+    return bool(comments) and bool(subagents), "%d brief comment(s) on #%d; %d cos-subagent session(s) for it" % (
+        len(comments), e["issue"], len(subagents))
 
 
 def _delivered_texts(run, name):
@@ -6812,8 +6906,9 @@ COS_ONLY_MAXIMS = ("The last message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 120, "orchestrator": 178, "chief-of-staff": 162}  # lines; they must not grow
-ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8300}
+ROLE_LINE_LIMITS = {"coder": 120, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8300, "cos-subagent": 3500}
+WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
 def role_of(path):
@@ -6826,9 +6921,9 @@ def maxims_block(text):
 
 
 class TestAgentDefinitions(unittest.TestCase):
-    def test_there_are_six_role_files(self):
+    def test_there_are_eight_role_files(self):
         self.assertEqual(sorted(role_of(p) for p in AGENT_FILES),
-                         sorted(["coder", "orchestrator", "chief-of-staff"] * 2))
+                         sorted(["coder", "orchestrator", "chief-of-staff", "cos-subagent"] * 2))
 
     def test_each_has_a_short_maxims_block_with_its_roles_phrases(self):
         for path in AGENT_FILES:
@@ -6839,7 +6934,7 @@ class TestAgentDefinitions(unittest.TestCase):
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
                     self.assertIn(phrase, block)
-                self.assertEqual("Trust, but verify" in block, role != "coder")
+                self.assertEqual("Trust, but verify" in block, role not in WORKER_ROLES)
                 for phrase in COS_ONLY_MAXIMS:
                     self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
 
@@ -6854,7 +6949,7 @@ class TestAgentDefinitions(unittest.TestCase):
             text = path.read_text()
             with self.subTest(file=path.name):
                 for phrase in RUBRIC:
-                    self.assertEqual(phrase in text, role_of(path) != "coder", phrase)
+                    self.assertEqual(phrase in text, role_of(path) not in WORKER_ROLES, phrase)
 
     def test_each_explains_a_switchboard_message_and_forbids_typing_into_a_pane(self):
         for path in AGENT_FILES:
@@ -7627,6 +7722,821 @@ class TestPR7Source(unittest.TestCase):
         for fragment in ("sk-", "bearer", "http"):
             self.assertNotIn(fragment, text)
 
+
+# ======================================================================
+# PR 8: foreground and background
+#
+# One section, so the stack rebases cleanly: cursor paging, the acting
+# classifier and its decoration, the handoff command, the cos-subagent
+# role, and the scenarios F1 to F4.
+# ======================================================================
+
+class TestMessagePaging(Base):
+    """V2Client reads past one page by following v2's cursor (PR 4's known gap)."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("cos",))
+        self.sid = self.world.sessions["cos"]
+        self.client = sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5)
+
+    def fill(self, count, step=1):
+        for number in range(count):
+            self.world.v2.sessions[self.sid]["messages"].append(
+                {"id": "msg_p%05d" % number, "sessionID": self.sid, "type": "synthetic", "text": "x",
+                 "metadata": {"fleet": {"keys": ["k%d" % number], "from": "switchboard"}},
+                 "time": {"created": self.world.clock.ms(EPOCH + number * step)}})
+
+    def test_the_cursor_argv_is_strict(self):
+        runner = FakeRunner(default=(0, '{"data": [], "cursor": {"next": null, "previous": null}}', ""))
+        client = sb.V2Client("/opt/lab/bin/opencode", {}, runner, 7)
+        self.assertEqual(client.message_page(SES, 200, "synthetic", "cur_9"), ([], {"next": None, "previous": None}))
+        self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api", "session.message.list", "--param", "sessionID=" + SES,
+                                       "--param", "limit=200", "--param", "type=synthetic", "--param", "cursor=cur_9"])
+        self.assertNotIn("order=desc", runner.argv)  # v2: a cursor is not combined with order
+        for bad in ("", 7, "x" * (sb.CURSOR_LIMIT + 1)):
+            with self.subTest(cursor=bad), self.assertRaises(ValueError):
+                client.message_page(SES, 200, "synthetic", bad)
+
+    def test_a_listing_without_a_cursor_object_gives_none(self):
+        client = sb.V2Client(FAKE_OPENCODE, {}, FakeRunner(default=(0, '{"data": [{"id": "m"}]}', "")), 5)
+        self.assertEqual(client.message_page(SES, 5), ([{"id": "m"}], None))
+
+    def test_450_messages_are_read_in_three_pages_and_none_is_missed(self):
+        self.fill(450)
+        keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
+        self.assertTrue(complete)
+        self.assertEqual(keys, {"k%d" % n for n in range(450)})
+        reads = [c for c in self.world.v2.calls if c[2] == "session.message.list" and "type=synthetic" in c]
+        self.assertEqual(len(reads), 3)
+        self.assertTrue(all("limit=%d" % sb.READ_LIMIT in c for c in reads))
+        self.assertEqual([c for c in reads[1:] if "order=desc" in c or "order=asc" in c], [])
+
+    def test_a_recipient_with_450_synthetic_messages_is_not_held(self):
+        self.fill(450)
+        engine = self.world.engine
+        plan = engine.plan("cos", [fact("brand-new", EPOCH, recipient="cos")], engine.discover(EPOCH + 1000), EPOCH + 1000)
+        self.assertEqual(plan.action, "wake", plan.reason)
+
+    def test_the_read_stops_at_the_oldest_fact_without_reading_every_page(self):
+        self.fill(450)
+        # the newest 200 are k250..k449, made at EPOCH+250 and later: a horizon of EPOCH+300 lies in the first page
+        keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH + 300)
+        self.assertTrue(complete)
+        self.assertEqual(len([c for c in self.world.v2.calls if c[2] == "session.message.list"]), 1,
+                         "the first page reaches the horizon, so no cursor is followed")
+
+    def test_more_pages_than_the_bound_hold_rather_than_guess(self):
+        self.fill(450)
+        with mock.patch.object(sb, "MAX_READ_PAGES", 2):
+            _, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
+        self.assertFalse(complete)
+
+    def test_a_cursor_that_does_not_walk_older_holds_and_says_so(self):
+        self.fill(450)
+        original = self.world.v2.page_of
+
+        def stuck(messages, params):
+            page = original(messages, params)
+            page.envelope["cursor"]["next"] = self.world.v2.CURSOR_PREFIX + "0"  # always the first page again
+            return page
+        self.world.v2.page_of = stuck
+        engine = self.world.engine
+        plan = engine.plan("cos", [fact("brand-new", EPOCH, recipient="cos")], engine.discover(EPOCH + 1000), EPOCH + 1000)
+        self.assertEqual(plan.action, "hold")
+        self.assertIn("cannot read what cos already has", plan.reason)
+
+    def test_a_full_page_with_no_next_cursor_is_the_end_not_a_hold(self):
+        self.fill(sb.READ_LIMIT)
+        keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
+        self.assertTrue(complete)
+        self.assertEqual(len(keys), sb.READ_LIMIT)
+        self.assertEqual(len([c for c in self.world.v2.calls if c[2] == "session.message.list"]), 1)
+
+    def test_an_answer_with_no_cursor_and_a_full_page_still_holds(self):
+        self.fill(sb.READ_LIMIT)
+        self.world.v2.page_of = lambda messages, params: copy.deepcopy(messages[:int(params["limit"])])
+        _, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
+        self.assertFalse(complete)
+
+
+class TestClassifierModeConfig(Base):
+    JEV = {"jev": {"replay": "/fake/replay.json"}}
+
+    def test_shadow_is_the_default_and_act_is_the_only_other_mode(self):
+        self.assertEqual(sb.validate_config({})["classifier_mode"], "shadow")
+        self.assertEqual(sb.validate_config(dict(self.JEV, classifier_mode="act"))["classifier_mode"], "act")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config(dict(self.JEV, classifier_mode="enforce"))
+        self.assertIn("shadow, act", str(caught.exception))
+
+    def test_acting_without_a_decision_model_is_refused(self):
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"classifier_mode": "act"})
+        self.assertIn("jev", str(caught.exception))
+
+    def test_acting_is_off_in_the_engine_unless_both_are_set(self):
+        world = World(self, agents=("cos",), config=dict(self.JEV, classifier_mode="act"))
+        self.assertTrue(sb.acting(world.engine))
+        world.engine.jev = None
+        self.assertFalse(sb.acting(world.engine))
+        self.assertFalse(sb.acting(World(self, agents=("cos",), state=self.home / "s2", config=self.JEV).engine))
+
+
+class ActingCase(IntentCase):
+    """A Chief of Staff on ask 5 with a background subagent on ask 2, a fake GitHub, and a fake Jev."""
+
+    MODE = "act"
+
+    def setUp(self):
+        super().setUp()
+        self.config = {"gh": FAKE_GH, "intent_repo": FAKE_REPO, "jev": {"replay": "/fake/replay.json"},
+                       "classifier_mode": self.MODE}
+        self.world = World(self, agents=(), config=self.config, state=self.home / "acting")
+        self.gh = FakeGH(self.ISSUES, {1}, self.world.clock)
+        self.reader = sb.IntentReader(FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5)
+        self.world.intents = self.reader
+        self.cos = self.world.add_agent("cos", fleet={"role": "chief-of-staff", "issue": 5})
+        self.world.add_agent("cos-2", fleet={"role": "cos-subagent", "reports_to": "cos", "issue": 2})
+        self.answer = "new"
+        self.world.engine = self.world.new_engine()
+        self.use_jev(self.world.engine)
+
+    def use_jev(self, engine):
+        self.jev = engine.jev = FakeJev(lambda state, questions: confident(
+            self.answer, 0.95, tuple(questions[sb.CLASSIFY_ID]["criteria"])))
+
+    def restart(self):
+        self.world.engine = self.world.new_engine()
+        self.use_jev(self.world.engine)
+
+    def work(self, lasts=60, steps=6):
+        self.world.v2.start_turn(self.cos, "fleet task", fleet=True, lasts=lasts, steps=steps)
+
+    def say(self, text):
+        self.world.v2.start_turn(self.cos, text, fleet=False)
+
+    def passes(self, count=1):
+        for _ in range(count):
+            self.world.engine.run_pass()
+            self.world.tick(5)
+
+    def decorations(self):
+        return [a for a in self.world.admissions("cos") if any(k.startswith("decoration:") for k in a["keys"])]
+
+    def decision_entries(self):
+        return [e for e in self.world.audit() if e["event"] == "foreground.decision"]
+
+
+class TestActingClassifier(ActingCase):
+    def test_new_while_busy_hands_off_first_as_a_note(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        (note,) = self.decorations()
+        self.assertEqual((note["resume"], note["delivery"]), (False, "steer"))
+        yours = [m for m in self.world.v2.sessions[self.cos]["messages"]
+                 if m["type"] == "user" and m["text"] == "Also, the billing export?"]
+        self.assertEqual(note["keys"], ["decoration:%s:%s" % (self.cos, yours[0]["id"])])
+        self.assertIn("fleet-switchboard handoff --issue 5 --brief-file -", note["text"])
+        self.assertIn("Another ask", note["text"])
+        self.assertIsNotNone(note["delivered_at"], "a note rides into the running turn at its next step")
+
+    def test_it_is_delivered_once_however_many_passes_follow(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(8)
+        self.assertEqual(len(self.decorations()), 1)
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_new_while_idle_adds_nothing(self):
+        self.world.v2.sessions[self.world.sessions["cos-2"]]["metadata"]["fleet"].pop("issue")
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual(self.jev.calls, [], "idle and no other ask: nothing to choose between")
+        self.world.v2.sessions[self.world.sessions["cos-2"]]["metadata"]["fleet"]["issue"] = 2
+        self.world.tick(30)
+        self.say("And the billing export again?")
+        self.passes(3)
+        self.assertEqual(len(self.jev.calls), 1)
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(self.decision_entries()[-1]["detail"]["decoration"], None)
+
+    def test_current_adds_nothing(self):
+        self.answer = "current"
+        self.work()
+        self.say("How is it going?")
+        self.passes(3)
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(self.decision_entries()[0]["detail"]["decoration"], None)
+
+    def test_unsure_and_unreachable_add_nothing(self):
+        self.jev.rule = lambda state, questions: {sb.CLASSIFY_ID: choice_answer("new", {"current": 0.3, "2": 0.3, "new": 0.4})}
+        self.work()
+        self.say("Something vague")
+        self.passes(2)
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(self.decision_entries()[0]["detail"]["choice"], "current")
+        self.jev.rule = "unreachable"
+        self.world.tick(5)
+        self.say("Another vague thing")
+        self.passes(2)
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(len(self.decision_entries()), 2)
+
+    def test_an_ask_with_an_owner_names_the_ask_the_owner_and_the_command(self):
+        self.answer = "2"
+        self.work()
+        self.say("The agents still fail on staging")
+        self.passes(3)
+        (note,) = self.decorations()
+        self.assertIn("This is about ask 2 (Intent: Fix the agents).", note["text"])
+        self.assertIn("cos-2 is working on it in the background.", note["text"])
+        self.assertIn('fleet-switchboard send cos-2 --issue 2 "..."', note["text"])
+        self.assertIn("Then continue with what you were doing.", note["text"])
+        self.assertIn("Ask #2 Intent: Fix the agents", note["text"], "grouped under the ask's own Intent lines")
+        self.assertIn("Done when: both answer", note["text"])
+
+    def test_an_owned_ask_is_decorated_when_idle_too(self):
+        self.answer = "2"
+        self.say("The agents still fail on staging")
+        self.passes(3)
+        self.assertEqual(len(self.decorations()), 1)
+
+    def test_the_doc_s_decoration_wording_is_what_is_sent(self):
+        doc = (REPO / "docs" / "switchboard.md").read_text()
+        block = doc.split("#### Decorate: work that already has an owner", 1)[1].split("```text\n", 1)[1].split("```", 1)[0]
+        wanted = " ".join(block.split())
+        ask = {"issue": 615, "owner": "cos-615", "intent": 'fix the project agents that show "Agent unavailable"'}
+        self.assertEqual("[switchboard] " + " ".join(sb.owned_ask_text(ask).split()), wanted)
+
+    def test_without_github_the_decoration_still_names_the_owner(self):
+        self.answer = "2"
+        self.gh.down = True
+        self.reader.invalidate(2)
+        self.reader.invalidate(5)
+        self.say("The agents still fail on staging")
+        self.passes(3)
+        (note,) = self.decorations()
+        self.assertIn("cos-2 is working on it", note["text"])
+        self.assertNotIn("(Intent:", note["text"])
+
+    def test_a_decoration_is_never_a_wake_and_nothing_is_typed(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual([c for c in self.world.model_calls("cos") if c["phase"] in ("turn_start", "after_reply")
+                          and any(i["keys"] and i["keys"][0].startswith("decoration:") for i in c["inputs"])], [])
+        self.assertEqual(self.world.herdr.typing_attempts, [])
+
+    def test_only_a_chief_of_staff_is_decorated(self):
+        self.world.v2.sessions[self.cos]["metadata"]["fleet"]["role"] = "orchestrator"
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual((self.jev.calls, self.world.admissions("cos")), ([], []))
+
+    def test_the_decision_is_audited_and_the_classification_is_no_longer_marked_shadow(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(2)
+        (decision,) = self.decision_entries()
+        self.assertEqual((decision["detail"]["choice"], decision["detail"]["decoration"]), ("new", "handoff"))
+        classify = [e for e in self.world.audit() if e["event"] == "classify"]
+        self.assertFalse(classify[0]["detail"]["shadow"])
+        options = classify[0]["detail"]["question"]["state"]["open_asks"]
+        self.assertEqual([a["intent"] for a in options], ["Fix the agents"], "asks arrive with their Intent")
+
+    def test_acting_does_not_need_shadow_judges(self):
+        self.world.engine.config = dict(self.world.engine.config, shadow_judges=False)
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual(len(self.decorations()), 1)
+
+    def test_the_no_classify_fault_switches_it_off_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "no-classify"
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual((self.jev.calls, self.world.admissions("cos")), ([], []))
+
+
+class TestShadowModeStillActsOnNothing(ActingCase):
+    MODE = "shadow"
+
+    def test_the_same_new_message_adds_nothing_and_is_marked_shadow(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(4)
+        self.assertEqual(len(self.jev.calls), 1)
+        self.assertEqual(self.world.admissions("cos"), [])
+        self.assertEqual(self.world.v2.writes, [])
+        self.assertEqual(self.decision_entries(), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "classify"][0]["detail"]["shadow"])
+
+    def test_an_owned_ask_adds_nothing_in_shadow_mode_either(self):
+        self.answer = "2"
+        self.say("The agents still fail on staging")
+        self.passes(3)
+        self.assertEqual(self.world.admissions("cos"), [])
+
+
+class TestDecorationIsAFact(ActingCase):
+    def test_a_restart_classifies_once_more_and_the_transcript_stops_a_second_delivery(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(3)
+        self.assertEqual(len(self.decorations()), 1)
+        self.restart()
+        self.passes(3)
+        self.assertEqual(len(self.jev.calls), 1, "the new process classified the newest message once")
+        self.assertEqual(len(self.decorations()), 1, "the key is in the transcript: never delivered again")
+        self.assertEqual(len(self.world.v2.writes), 1)
+
+    def test_the_same_state_gives_the_same_key_after_a_restart(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.passes(1)
+        first = [f.key for f in self.world.engine.collect_facts()[0]]
+        self.restart()
+        self.world.engine.discover(self.world.clock.now())
+        self.world.engine.run_pass()
+        second = [f.key for f in self.world.engine.collect_facts()[0]]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 1)
+
+    def test_the_crash_after_send_fault_does_not_double_deliver(self):
+        self.work()
+        self.say("Also, the billing export?")
+        os.environ[sb.FAULT_ENV] = "crash-after-send"
+        with self.assertRaises(sb.SimulatedCrash):
+            self.world.engine.run_pass()
+        os.environ[sb.FAULT_ENV] = ""
+        self.restart()
+        self.passes(3)
+        self.assertEqual(len(self.decorations()), 1)
+
+    def test_a_newer_message_replaces_a_decoration_nobody_has_received(self):
+        self.work()
+        self.say("Also, the billing export?")
+        engine = self.world.engine
+        engine.run_pass()
+        source = sb.foreground_source(engine)
+        first = [f.key for f in source()]
+        self.world.tick(5)
+        self.answer = "current"
+        self.say("Never mind, how is it going?")
+        self.assertEqual(source(), [], "the first message is no longer your newest")
+        self.assertEqual(len(first), 1)
+
+    def test_a_handoff_decoration_lapses_when_the_chief_of_staff_has_stopped_working(self):
+        self.work(lasts=20, steps=2)
+        self.say("Also, the billing export?")
+        engine = self.world.engine
+        engine.run_pass()
+        self.assertEqual(len(sb.foreground_source(engine)()), 1)
+        self.world.tick(30)
+        engine.discover(self.world.clock.now())
+        self.assertEqual(sb.foreground_source(engine)(), [], "idle: nothing is left to hand off")
+
+    def test_a_decoration_lapses_with_the_engagement_window(self):
+        self.work(lasts=2000, steps=2)
+        self.say("Also, the billing export?")
+        engine = self.world.engine
+        engine.run_pass()
+        self.assertEqual(len(sb.foreground_source(engine)()), 1)
+        self.world.tick(11 * 60)
+        engine.discover(self.world.clock.now())
+        self.assertEqual(sb.foreground_source(engine)(), [])
+        self.assertEqual(sb.foreground_source(engine).decisions, {})
+
+    def test_it_is_a_batch_free_fact_for_the_chief_of_staff(self):
+        self.work()
+        self.say("Also, the billing export?")
+        self.world.engine.run_pass()
+        (found,) = sb.foreground_source(self.world.engine)()
+        self.assertEqual((found.kind, found.recipient, found.batch), (sb.DECORATION, "cos", False))
+        self.assertTrue(found.key.startswith("decoration:%s:msg_" % self.cos))
+
+    def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
+        self.assertIsNotNone(sb.foreground_source(self.world.engine))
+        source = SWITCHBOARD.read_text()
+        section = source.split("# PR 8: foreground and background", 1)[1].split("# Worker events, reminders", 1)[0]
+        for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
+            self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
+        self.assertNotIn(".synthetic(", section)
+
+
+class HandoffCase(IntentCase):
+    BRIEF = ("Done so far: found that the staging config drops the project binding\n"
+             "Next steps:\n1. patch the binding\n2. redeploy staging\nWatch out for: production is untouched\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.cos = self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.work = self.home / "work"
+        self.work.mkdir()
+        self.order = []
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH:
+            self.order.append("gh")
+            return self.gh(argv, **kwargs)
+        if argv[0] == FAKE_OPENCODE and argv[2:3] == ["session.create"]:
+            self.order.append("session.create")
+        return self.world.route(argv, **kwargs)
+
+    def main(self, brief=None, *extra, issue="2"):
+        path = self.home / "brief.md"
+        path.write_text(self.BRIEF if brief is None else brief)
+        with captured() as (out, err):
+            code = sb.main(["handoff", "--issue", issue, "--brief-file", str(path), "--dir", str(self.work),
+                            "--workspace", "w1"] + list(extra), runner=self.route, now=self.world.clock.now,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def comments(self):
+        return self.gh.__dict__.get("comments", [])
+
+    def subagents(self):
+        return [s for s in self.world.v2.sessions.values()
+                if (s["metadata"].get("fleet") or {}).get("role") == "cos-subagent"]
+
+    def assertNothingWritten(self):
+        self.assertEqual(self.comments(), [])
+        self.assertEqual(self.subagents(), [])
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+
+
+class TestBriefParsing(unittest.TestCase):
+    def test_the_sections_are_read_with_or_without_markup(self):
+        parsed = sb.parse_brief("## Handoff: ask 2\nGoal: retyped, ignored\n**Done so far:** a\nb\n"
+                                "## Next steps\n1. c\n- Watch out for: d\n")
+        self.assertEqual(parsed, {"goal": "retyped, ignored", "done so far": "a\nb", "next steps": "1. c",
+                                  "watch out for": "d"})
+
+    def test_a_brief_without_done_so_far_or_next_steps_is_refused(self):
+        for text, missing in (("Next steps: x\n", "Done so far"), ("Done so far: x\n", "Next steps"),
+                              ("Watch out for: x\n", "Done so far and no Next steps"),
+                              ("Done so far:\nNext steps: x\n", "Done so far")):
+            with self.subTest(brief=text), self.assertRaises(sb.HandoffRefused) as caught:
+                sb.parse_brief(text)
+            self.assertIn(missing, str(caught.exception))
+
+    def test_words_outside_the_sections_are_refused_not_dropped(self):
+        with self.assertRaises(sb.HandoffRefused) as caught:
+            sb.parse_brief("Please take over.\nDone so far: a\nNext steps: b\n")
+        self.assertIn("outside its sections", str(caught.exception))
+
+    def test_an_oversized_brief_is_refused(self):
+        with self.assertRaises(sb.HandoffRefused):
+            sb.parse_brief("Done so far: " + "x" * sb.BRIEF_LIMIT + "\nNext steps: b")
+
+    def test_the_markdown_is_the_docs_with_goal_from_the_ask(self):
+        issue = sb.IssueIntent(615, "open", "t", "Fix the agents", "both answer", None, False)
+        text = sb.handoff_markdown(issue, {"goal": "mine", "done so far": "a", "next steps": "b"})
+        self.assertEqual(text, "## Handoff: ask 615\nGoal: Fix the agents (Done when: both answer)\n"
+                               "Done so far: a\nNext steps: b\nWatch out for: nothing noted")
+        bare = sb.IssueIntent(7, "open", "t", None, None, None, False)
+        self.assertIn("Goal: no intent recorded\n", sb.handoff_markdown(bare, {"done so far": "a", "next steps": "b"}))
+
+
+class TestHandoff(HandoffCase):
+    def test_it_posts_the_brief_once_launches_the_subagent_and_prints_one_json_line(self):
+        code, out, err = self.main()
+        self.assertEqual(code, 0, err)
+        (comment,) = self.comments()
+        self.assertEqual(comment["issue"], 2)
+        self.assertEqual(comment["body"], "## Handoff: ask 2\nGoal: Fix the agents (Done when: both answer)\n"
+                         "Done so far: found that the staging config drops the project binding\n"
+                         "Next steps: 1. patch the binding\n2. redeploy staging\nWatch out for: production is untouched")
+        (posted,) = [c for c in self.gh.calls if "--method" in c]
+        self.assertEqual(posted, [FAKE_GH, "api", "repos/%s/issues/2/comments" % FAKE_REPO,
+                                  "--method", "POST", "--input", "-"])
+        (line,) = out.splitlines()
+        done = json.loads(line)
+        self.assertEqual((done["name"], done["role"], done["reports_to"], done["issue"]), ("cos-2", "cos-subagent", "cos", 2))
+        self.assertTrue(done["comment"].startswith("https://"))
+        self.assertTrue({"session", "pane", "tab"} <= set(done))
+
+    def test_the_subagent_is_a_fleet_agent_for_the_ask_reporting_to_the_caller_in_its_own_tab(self):
+        _, out, _ = self.main()
+        done = json.loads(out)
+        session = self.world.v2.sessions[done["session"]]
+        self.assertEqual(session["metadata"], {"fleet": {"name": "cos-2", "role": "cos-subagent",
+                                                         "reports_to": "cos", "issue": 2}})
+        self.assertEqual((session["agent"], session["directory"]), ("cos-subagent", str(self.work)))
+        method, params = self.world.herdr.socket_calls[0]
+        self.assertEqual((method, params["workspace_id"]), ("layout.apply", "w1"))
+        self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
+        self.assertNotIn("focus", json.dumps(self.world.herdr.socket_calls).lower())
+
+    def test_the_subagent_is_briefed_with_the_brief_and_told_how_to_report(self):
+        _, out, _ = self.main()
+        session = self.world.v2.sessions[json.loads(out)["session"]]
+        (prompt,) = [m for m in session["messages"] if m["type"] == "user"]
+        self.assertEqual(prompt["metadata"], {"fleet": {"from": "switchboard", "brief": True}})
+        self.assertIn("## Handoff: ask 2\nGoal: Fix the agents (Done when: both answer)", prompt["text"])
+        self.assertIn('fleet-switchboard send cos --issue 2 "..."', prompt["text"])
+
+    def test_the_record_comes_before_the_launch_and_every_write_is_audited(self):
+        self.main()
+        self.assertLess(self.order.index("gh"), self.order.index("session.create"))
+        events = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"].startswith(("github.", "v2.session"))]
+        self.assertEqual(events[:2], [("github.comment", "intent"), ("github.comment", "result")])
+        comment = [e for e in self.world.audit() if e["event"] == "github.comment"]
+        self.assertEqual(comment[0]["detail"]["issue"], 2)
+        self.assertNotIn("Next steps", json.dumps(comment), "the audit holds the size, not the brief")
+
+    def test_nothing_is_typed(self):
+        self.main()
+        self.assertEqual(self.world.herdr.typing_attempts, [])
+        for argv in self.world.herdr.calls:
+            self.assertIn(argv[1:3], HERDR_ALLOWED)
+
+    def test_the_goal_the_chief_of_staff_wrote_is_replaced_and_it_is_told(self):
+        code, out, err = self.main("Goal: something else entirely\n" + self.BRIEF)
+        self.assertEqual(code, 0)
+        self.assertNotIn("something else entirely", self.comments()[0]["body"])
+        self.assertIn("Goal line in your brief was replaced", err)
+        self.assertNotIn("replaced_goal", out)
+
+    def test_each_refusal_writes_nothing_at_all(self):
+        refusals = [
+            ("Next steps: x\n", {}, 2, "Done so far"),
+            ("Done so far: x\n", {}, 2, "Next steps"),
+            ("hello\n" + HandoffCase.BRIEF, {}, 2, "outside its sections"),
+            (None, {"issue": "1"}, 2, "charter"),
+            (None, {"issue": "99"}, 1, "not_found"),
+            (None, {"extra": ("--name", "Not A Name")}, 2, "name must match"),
+        ]
+        for brief, kwargs, code, words in refusals:
+            with self.subTest(words=words):
+                extra = kwargs.get("extra", ())
+                got, _, err = self.main(brief, *extra, issue=kwargs.get("issue", "2"))
+                self.assertEqual((got, words in err), (code, True), err)
+                self.assertNothingWritten()
+
+    def test_a_closed_ask_and_a_name_in_use_are_refused_before_anything_is_written(self):
+        self.gh.issues[2]["state"] = "closed"
+        self.reader.invalidate(2)
+        code, _, err = self.main()
+        self.assertEqual((code, "closed" in err), (2, True))
+        self.assertNothingWritten()
+        self.gh.issues[2]["state"] = "open"
+        self.reader.invalidate(2)
+        self.world.add_agent("cos-2", fleet={"role": "cos-subagent", "issue": 2})
+        before = len(self.world.v2.sessions)
+        code, _, err = self.main()
+        self.assertEqual((code, "already runs" in err), (2, True))
+        self.assertEqual((self.comments(), len(self.world.v2.sessions)), ([], before))
+
+    def test_without_an_ask_repo_it_says_what_to_set(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        code, _, err = self.main()
+        self.assertEqual((code, "intent_repo" in err), (2, True))
+        self.assertNothingWritten()
+
+    def test_a_github_that_cannot_post_stops_before_any_subagent_exists(self):
+        original = self.gh.post_comment
+        self.gh.post_comment = lambda argv, kwargs: subprocess.CompletedProcess(argv, 1, "", "gh: boom\n")
+        before = len(self.world.v2.sessions)
+        code, _, err = self.main()
+        self.gh.post_comment = original
+        self.assertEqual(code, 1)
+        self.assertIn("boom", err)
+        self.assertEqual(len(self.world.v2.sessions), before)
+
+    def test_a_launch_that_fails_after_the_comment_says_the_brief_was_posted(self):
+        self.world.herdr.launch_mode = "shell"
+        engine = self.world.new_engine("cli")
+        with self.assertRaises(sb.LaunchError) as caught:
+            sb.handoff_ask(engine, "cos", 2, self.BRIEF, directory=str(self.work), workspace="w1", patience=3,
+                           sleep=lambda seconds: self.world.tick(seconds))
+        self.assertIn("the brief was posted on ask #2", str(caught.exception))
+        self.assertEqual(len(self.comments()), 1)
+        self.assertEqual(len(self.world.herdr.closed), 1, "the pane it opened is closed again")
+
+    def test_it_needs_a_caller_it_can_identify(self):
+        os.environ.pop("HERDR_PANE_ID")
+        code, _, err = self.main()
+        self.assertEqual((code, "HERDR_PANE_ID" in err), (1, True))
+        self.assertNothingWritten()
+
+    def test_the_brief_can_come_from_standard_input(self):
+        with mock.patch.object(sys, "stdin", io.StringIO(self.BRIEF)):
+            with captured() as (out, err):
+                code = sb.main(["handoff", "--issue", "2", "--brief-file", "-", "--dir", str(self.work),
+                                "--workspace", "w1"], runner=self.route, now=self.world.clock.now,
+                               socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(len(self.comments()), 1)
+
+    def test_an_empty_brief_is_refused(self):
+        code, _, err = self.main("   \n")
+        self.assertEqual((code, "empty" in err), (1, True))
+        self.assertNothingWritten()
+
+    def test_the_handoff_is_the_only_github_write_and_the_reader_stays_read_only(self):
+        self.main()
+        writes = [c for c in self.gh.calls if len(c) != 3]
+        self.assertEqual(len(writes), 1)
+        self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
+        source = SWITCHBOARD.read_text()
+        self.assertEqual(source.count('"--method"'), 1)
+
+
+class TestForegroundScenarios(Base):
+    def test_the_pr8_catalog_is_present_with_its_tiers_and_controls(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, tiers in (("F1", {"offline", "lab-model"}), ("F2", {"offline", "lab-model"}),
+                           ("F3", {"offline", "lab-model"}), ("F4", {"offline", "lab-scripted"})):
+            with self.subTest(scenario=sid):
+                self.assertEqual((set(found[sid]["tiers"]), found[sid]["since_pr"], found[sid]["problem"]), (tiers, 8, 2))
+        for sid in ("F1", "F2", "F3"):
+            self.assertEqual(found[sid]["config"], {"classifier_mode": "act"})
+        self.assertEqual(found["F2"]["control"]["variant"], {"steps": {"1": {"text": "Also, can you look at the billing export?"}}})
+        self.assertEqual({sid: found[sid]["control"].get("fault") for sid in ("F1", "F3", "F4")},
+                         {"F1": "no-classify", "F3": "no-classify", "F4": "no-engagement-gate"})
+
+    def test_the_scenarios_run_and_their_controls_fail_what_they_name(self):
+        for sid, name in (("F1", "f1-unrelated-while-busy"), ("F2", "f2-current-work"),
+                          ("F3", "f3-ask-with-an-owner"), ("F4", "f4-subagent-finishes")):
+            with self.subTest(scenario=sid):
+                report = run_scenario(self, sc.load(sc.DEFAULT_DIR / (name + ".json")))
+                self.assertEqual(report["failures"], [])
+                self.assertEqual(report["implicit"], [])
+                self.assertEqual(report["proves_nothing"], [])
+                self.assertEqual(sorted(r["label"] for r in report["control"] if not r["ok"]) != [], True)
+
+    def test_f1_decorates_with_the_handoff_and_f3_names_the_owner(self):
+        f1 = OfflineRun(self, sc.load(sc.DEFAULT_DIR / "f1-unrelated-while-busy.json"), "run").run()
+        self.assertTrue(all(r["ok"] for r in f1.evaluate()))
+        texts = _delivered_texts(f1, "cos")
+        self.assertTrue(any("fleet-switchboard handoff --issue 610" in t for t in texts))
+        f3 = OfflineRun(self, sc.load(sc.DEFAULT_DIR / "f3-ask-with-an-owner.json"), "run").run()
+        self.assertTrue(all(r["ok"] for r in f3.evaluate()))
+        self.assertTrue(any("fleet-switchboard send cos-615 --issue 615" in t for t in _delivered_texts(f3, "cos")))
+
+    def test_f2_the_control_decorates_the_same_message_once_it_is_unrelated(self):
+        f2 = sc.load(sc.DEFAULT_DIR / "f2-current-work.json")
+        control, _ = control_play(self, f2)
+        self.assertEqual(len(_delivered_texts(control, "cos")), 1)
+
+    def test_f4_carries_the_asks_intent_lines_offline(self):
+        f4 = sc.load(sc.DEFAULT_DIR / "f4-subagent-finishes.json")
+        f4["expect"].append({"name": "intent-lines", "that": "message_has_intent", "to": "cos", "issue": 615})
+        run = OfflineRun(self, f4, "run").run()
+        results = {r["label"]: r for r in run.evaluate()}
+        self.assertTrue(results["intent-lines"]["ok"], results["intent-lines"]["seen"])
+        self.assertTrue(results["noted"]["ok"])
+
+    def test_the_handoff_step_leaves_a_brief_and_a_subagent_and_without_it_nothing(self):
+        f1 = sc.load(sc.DEFAULT_DIR / "f1-unrelated-while-busy.json")
+        run = OfflineRun(self, f1, "run").run()
+        self.assertTrue({r["label"]: r["ok"] for r in run.evaluate()}["handed-off"])
+        without = copy.deepcopy(f1)
+        without["steps"] = [s for s in without["steps"] if s["do"] != "handoff"]
+        run = OfflineRun(self, without, "run").run()
+        self.assertFalse({r["label"]: r["ok"] for r in run.evaluate()}["handed-off"])
+
+    def test_the_vocabulary_knows_the_new_config_and_step(self):
+        self.assertIn("handoff", sc.STEP_FIELDS)
+        self.assertEqual(sc.STEP_ACTORS["handoff"], ("cast",))
+        scenario = sc.load(sc.DEFAULT_DIR / "f2-current-work.json")
+        scenario["config"] = {"classifier_mode": "enforce"}
+        self.assertTrue([e for e in sc.validate(scenario) if "classifier_mode" in e])
+        scenario["config"] = {"classifier_mode": "act", "batch_seconds": 5}
+        self.assertEqual(sc.validate(scenario), [])
+        scenario["config"] = {"colour": "red"}
+        self.assertTrue([e for e in sc.validate(scenario) if "colour" in e])
+
+    def test_j1_and_f5_still_run_in_shadow_mode(self):
+        for name in ("j1-shadow-classifier.json", "f5-jev-unsure.json"):
+            with self.subTest(scenario=name):
+                scenario = sc.load(sc.DEFAULT_DIR / name)
+                self.assertNotIn("classifier_mode", scenario.get("config", {}))
+                report = run_scenario(self, scenario)
+                self.assertEqual(report["failures"] + report["proves_nothing"], [])
+
+
+class TestPR8Source(unittest.TestCase):
+    def test_the_foreground_section_is_one_clearly_marked_block(self):
+        source = SWITCHBOARD.read_text()
+        self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
+
+    def test_the_engine_still_never_types(self):
+        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+
+    def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
+        for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
+            seen = {}
+            for node in ast.parse((BIN / name).read_text()).body:
+                names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
+                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+                for each in names:
+                    self.assertNotIn(each, seen, "%s defines %s twice (lines %s and %s)" % (name, each, seen.get(each), node.lineno))
+                    seen[each] = node.lineno
+
+
+class TestNoticeRace(ActingCase):
+    """SF1: your message is consumed at the next step boundary T; the decoration must be in v2's inbox before it."""
+
+    def start(self):
+        self.work(lasts=10, steps=2)      # one step boundary, at EPOCH + 5
+        self.world.tick(1)
+        self.say("Also, the billing export?")
+        self.yours = self.world.v2.sessions[self.cos]["inbox"][-1]["id"]
+
+    def calls_with(self, message_id):
+        return [c for c in self.world.model_calls("cos") if message_id in [i["id"] for i in c["inputs"]]]
+
+    def test_your_message_is_seen_in_the_inbox_before_any_boundary(self):
+        self.start()
+        self.assertEqual([m for m in self.world.v2.sessions[self.cos]["messages"] if m["type"] == "user"][-1:][0]["text"],
+                         "fleet task", "not yet in the transcript")
+        self.world.clock.t = EPOCH + 1.2
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.jev.calls), 1)
+        self.assertEqual(len(self.decorations()), 1)
+
+    def test_a_decoration_sent_0_2_s_before_the_boundary_arrives_with_your_message(self):
+        self.start()
+        self.world.clock.t = EPOCH + 4.8
+        self.world.engine.run_pass()
+        self.world.clock.t = EPOCH + 5
+        self.world.v2.advance()
+        (call,) = self.calls_with(self.yours)
+        self.assertEqual(call["phase"], "between_steps")
+        self.assertTrue(any(k.startswith("decoration:") for i in call["inputs"] for k in i["keys"]))
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "foreground.late"], [])
+
+    def test_a_decoration_sent_after_the_boundary_is_late_and_audited(self):
+        self.start()
+        self.world.clock.t = EPOCH + 5
+        self.world.v2.advance()
+        self.world.clock.t = EPOCH + 5.2
+        self.world.engine.run_pass()
+        (call,) = self.calls_with(self.yours)
+        self.assertFalse(any(i["keys"] for i in call["inputs"]), "the model saw the bare message first")
+        (late,) = [e for e in self.world.audit() if e["event"] == "foreground.late"]
+        self.assertEqual((late["detail"]["decoration"], late["detail"]["agent"]), ("handoff", "cos"))
+        self.assertEqual(late["detail"]["message_id"], self.yours)
+
+    def test_a_decoration_is_a_note_not_a_wake_even_while_your_message_waits_in_the_inbox(self):
+        self.start()
+        self.world.engine.run_pass()
+        (note,) = self.decorations()
+        self.assertEqual((note["resume"], note["delivery"]), (False, "steer"))
+
+    def test_late_is_not_logged_when_nothing_is_decorated(self):
+        self.answer = "current"
+        self.start()
+        self.world.tick(6)
+        self.world.engine.run_pass()
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "foreground.late"], [])
+
+
+class TestBusyPoll(ActingCase):
+    def waits(self, passes=2):
+        waits = []
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: waits.append(t), passes=passes)
+        return waits
+
+    def test_the_default_is_one_second_and_must_be_positive(self):
+        self.assertEqual(sb.validate_config({})["busy_poll_seconds"], 1)
+        for bad in (0, -1, "1", True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"busy_poll_seconds": bad})
+
+    def test_the_daemon_polls_fast_only_while_a_chief_of_staff_works(self):
+        self.assertEqual(self.waits(2), [5])  # the pass sees an idle fleet
+        self.work()
+        self.assertEqual(self.waits(2), [1])  # ... and a working Chief of Staff
+        self.world.tick(120)
+        self.assertEqual(self.waits(3), [5, 5])
+
+    def test_a_busy_worker_or_orchestrator_does_not_speed_it_up(self):
+        self.world.v2.start_turn(self.world.sessions["cos-2"], "fleet task", fleet=True, lasts=60, steps=6)
+        self.assertEqual(self.waits(3), [5, 5])
+
+    def test_shadow_mode_never_polls_fast(self):
+        self.world.engine.config = dict(self.world.engine.config, classifier_mode="shadow")
+        self.work()
+        self.assertEqual(self.waits(3), [5, 5])
+
+
+class TestNativeChildSession(Base):
+    def test_a_pane_less_child_with_the_parents_fleet_metadata_is_not_a_second_agent(self):
+        world = World(self, agents=("cos",))
+        child = world.v2.create_session({"fleet": {"name": "cos", "role": "chief-of-staff"}})
+        world.v2.sessions[child]["parentID"] = world.sessions["cos"]  # herdr shows no pane for it
+        found = world.engine.discover(world.clock.now())
+        self.assertEqual(list(found.agents), ["cos"])
+        self.assertEqual((found.agents["cos"].session_id, found.agents["cos"].conflict), (world.sessions["cos"], []))
 
 # ---------------------------------------------------------------------- runner
 
