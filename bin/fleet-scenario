@@ -57,6 +57,9 @@ OUTCOMES = ("completed", "error")
 # is today's: it types a wake into the agent's input box, with `agent prompt`.
 BASELINES = ("fleet-heartbeat", "timer-heartbeat")
 WATCH_STATES = tuple(_load_switchboard().WATCH_STATES)
+# PR 9: the tool-call policy judge's vocabulary has one home too, in the engine.
+POLICY_TOOL_NAMES = tuple(_load_switchboard().POLICY_TOOLS)
+POLICY_RESULTS = tuple(_load_switchboard().POLICY_REQUEST_OUTCOMES)  # allow, ask, deny
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -98,6 +101,9 @@ STEP_FIELDS = {
     "occupy-hook": {},
     # PR 8: the Chief of Staff's `fleet-switchboard handoff`, played by the offline runner for it
     "handoff": {"issue": (True, "issue"), "brief": (True, "text")},
+    # PR 9: a cast member's tool call, judged by `judge-tool`; `configured` is the outcome the rules chose
+    "tool-call": {"tool": (True, "policy_tool"), "arguments": (True, "text"),
+                  "configured": (False, "policy_result")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -109,6 +115,7 @@ STEP_ACTORS = {
     "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
     "kill-forwarder": ("world",), "occupy-hook": ("world",),
     "handoff": ("cast",),
+    "tool-call": ("cast",),  # PR 9
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -135,6 +142,10 @@ EXPECT_FIELDS = {
     # PR 6
     "message_shows": {"to": (True, _CAST), "text": (True, "name")},
     "intent_gap": {"issue": (True, "issue")},
+    # PR 9: what `judge-tool` answered for the tool-call step with that index
+    "policy_outcome": {"agent": (True, _CAST), "step": (True, _STEP), "outcome": (True, "policy_result"),
+                       "reason": (False, "text"), "judged": (False, "bool"), "cached": (False, "bool"),
+                       "jev_calls": (False, "count0")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
@@ -148,7 +159,7 @@ VARIANT_KEYS = ("steps", "expect", "issues")
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
 OPTIONAL = ("tags", "issues", "config")
 CAST_KEYS = ("role", "reports_to", "issue", "charter")
-ISSUE_KEYS = ("intent", "done_when", "parent")
+ISSUE_KEYS = ("intent", "done_when", "parent", "authority")  # authority (PR 9): a charter's Standing authority line
 CONTROL_KINDS = ("fault", "baseline", "variant")
 
 ID_RE = re.compile(r"^[A-Z]{1,2}[0-9]+$")
@@ -219,6 +230,10 @@ def _field_ok(check, value, cast, steps=0):
         return value is None or isinstance(value, dict)
     if check == "faults":
         return isinstance(value, list) and bool(value) and all(v in KNOWN_FAULTS for v in value)
+    if check == "policy_tool":  # PR 9
+        return value in POLICY_TOOL_NAMES
+    if check == "policy_result":  # PR 9
+        return value in POLICY_RESULTS
     raise AssertionError("no such check: %s" % check)
 
 
@@ -234,6 +249,8 @@ _CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenari
                "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES),
                "watch_state": "one of " + ", ".join(WATCH_STATES), "fleet": "an object or null",
                "faults": "a non-empty list of known fault names"}
+_CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # PR 9
+                    "policy_result": "one of " + ", ".join(POLICY_RESULTS)})
 
 
 def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):
@@ -297,6 +314,8 @@ def _validate_issues(issues, errors):
                 errors.append("%s.%s: must be a string or null" % (where, key))
         if "parent" in issue and not (_int(issue["parent"]) and issue["parent"] >= 1):
             errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
+        if "authority" in issue and not (issue["authority"] is None or isinstance(issue["authority"], str)):
+            errors.append("%s.authority: must be a string or null" % where)  # PR 9
 
 
 # ---- scenario-level config (PR 4)

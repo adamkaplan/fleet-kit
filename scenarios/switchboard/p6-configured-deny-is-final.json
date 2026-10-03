@@ -1,0 +1,27 @@
+{
+  "id": "P6",
+  "title": "A command the configured rules deny",
+  "problem": null,
+  "since_pr": 9,
+  "tiers": ["offline"],
+  "tags": ["lab-scripted-owed-sp1"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1, "issue": 2}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "platform", "do": "tool-call", "tool": "shell", "configured": "deny",
+     "arguments": "rm -rf build",
+     "why": "The rules deny it. Jev would answer low (the catch-all rule): the judge must not even be asked"},
+    {"at": "30s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "stays-denied", "that": "policy_outcome", "agent": "platform", "step": 0, "outcome": "deny",
+     "judged": false, "jev_calls": 0, "reason": "final"}
+  ],
+  "control": {"variant": {"steps": {"0": {"configured": "allow"}}}, "fails": ["stays-denied"]}
+}

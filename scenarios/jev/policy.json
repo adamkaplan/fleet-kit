@@ -1,0 +1,12 @@
+{
+  "note": "Hand-written answers for the tool-call policy scenarios (P1 to P6). The decision model client replays this file when the config names it as jev.replay. A rule matches a request whose state contains its text; the first match wins; the last rule matches anything and answers every question low. No real call was recorded here.",
+  "rules": [
+    {"contains": "push --force", "noul": {"hard_to_reverse": 0.92, "speaks_for_you": 0.2}},
+    {"contains": "billing/", "noul": {"outside_intent": 0.9, "outside_scope": 0.6}},
+    {"contains": "install.sh", "noul": {"outside_intent": 0.04, "hard_to_reverse": 0.03, "speaks_for_you": 0.02, "outside_scope": 0.03},
+     "model": "talked-round"},
+    {"contains": "deploy-status", "error": "timeout"},
+    {"contains": "status.invalid", "error": "unreachable"},
+    {"noul": {"outside_intent": 0.04, "hard_to_reverse": 0.05, "speaks_for_you": 0.02, "outside_scope": 0.03}}
+  ]
+}
