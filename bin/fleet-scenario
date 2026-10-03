@@ -96,6 +96,8 @@ STEP_FIELDS = {
     # GitHub (PR 5)
     "kill-forwarder": {},
     "occupy-hook": {},
+    # PR 8: the Chief of Staff's `fleet-switchboard handoff`, played by the offline runner for it
+    "handoff": {"issue": (True, "issue"), "brief": (True, "text")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -106,6 +108,7 @@ STEP_ACTORS = {
     "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
     "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
     "kill-forwarder": ("world",), "occupy-hook": ("world",),
+    "handoff": ("cast",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -302,14 +305,19 @@ def _validate_issues(issues, errors):
 # real minutes; both runners apply it. Each is a positive number, as in the
 # engine's own config.
 CONFIG_KEYS = ("batch_seconds", "engaged_minutes")
+# PR 8: settings that name a mode, not a duration: key -> its allowed values.
+CONFIG_CHOICES = {"classifier_mode": ("shadow", "act")}
 
 
 def _validate_config(config, errors):
     if not isinstance(config, dict) or not config:
-        errors.append("config: must be a non-empty object (known keys: %s)" % ", ".join(CONFIG_KEYS))
+        errors.append("config: must be a non-empty object (known keys: %s)" % ", ".join(CONFIG_KEYS + tuple(CONFIG_CHOICES)))
         return
-    for key in sorted(set(config) - set(CONFIG_KEYS)):
-        errors.append("config: unknown key %r (known: %s)" % (key, ", ".join(CONFIG_KEYS)))
+    for key in sorted(set(config) - set(CONFIG_KEYS) - set(CONFIG_CHOICES)):
+        errors.append("config: unknown key %r (known: %s)" % (key, ", ".join(CONFIG_KEYS + tuple(CONFIG_CHOICES))))
+    for key, allowed in CONFIG_CHOICES.items():
+        if key in config and config[key] not in allowed:
+            errors.append("config.%s: must be one of %s, got %r" % (key, ", ".join(allowed), config[key]))
     for key in CONFIG_KEYS:
         value = config.get(key)
         if key in config and not (isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0):
