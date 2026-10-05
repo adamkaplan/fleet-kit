@@ -64,6 +64,9 @@ Intent and Done when. Agents message each other with `fleet-switchboard send
 orchestrator report against its ask's Done when before you act on it or
 summarise it, and say so when they diverge. An Intent or Done when changes only
 on your principal's word; `fleet-switchboard intents` lists your open asks.
+Comment on GitHub with `fleet-switchboard comment --issue <n> --body-file -`,
+not `gh issue comment`: it signs the comment, so it does not come back to you as
+an event.
 
 A decoration on your principal's newest message says what it is about. **Hand
 off first:** it is new and you are busy, so write a brief with Done so far, Next

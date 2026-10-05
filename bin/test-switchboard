@@ -157,7 +157,7 @@ class TestConfig(Base):
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
             "worker_lookback_hours": 24,
-            "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None,
+            "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "intent_repo": None, "intent_required": True,
@@ -7069,7 +7069,7 @@ COS_ONLY_MAXIMS = ("The last message stands alone", "No change, no message",
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
 ROLE_LINE_LIMITS = {"coder": 120, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
-ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8300, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8450, "cos-subagent": 3500}  # chief-of-staff +150: the signed-comment sentence
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -7123,6 +7123,15 @@ class TestAgentDefinitions(unittest.TestCase):
         for path in AGENT_FILES:
             if role_of(path) == "chief-of-staff":
                 self.assertIn("Done when", path.read_text())
+
+    def test_every_role_is_told_to_comment_through_the_switchboard_so_it_is_signed(self):
+        """Agents share the user's GitHub account; an unsigned comment comes back to its author as a wake."""
+        for path in AGENT_FILES:
+            with self.subTest(file=path.name):
+                text = " ".join(path.read_text().split())
+                self.assertIn("`fleet-switchboard comment --issue <n> --body-file -`, not `gh issue comment`", text)
+        skill = " ".join((REPO / "skills" / "fleet-charter" / "SKILL.md").read_text().split())
+        self.assertIn("`fleet-switchboard comment --issue <n> --body-file -`", skill)
 
     def test_a_switchboard_wake_is_never_told_to_run_heartbeat_ack(self):
         """The trial found the Chief of Staff running `heartbeat-ack` after a [switchboard] wake, against a
@@ -8348,6 +8357,110 @@ class HandoffCase(IntentCase):
         self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
 
 
+class TestSignedComments(HandoffCase):
+    """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
+    A comment the switchboard posts is signed, and a signed comment is never an event."""
+
+    def comment(self, body="Status: done", issue="2", *extra):
+        path = self.home / "comment.md"
+        path.write_text(body)
+        with captured() as (out, err):
+            code = sb.main(["comment", "--issue", issue, "--body-file", str(path)] + list(extra), runner=self.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_comment_command_posts_as_the_caller_with_its_signature(self):
+        code, out, err = self.comment("Status: complete.\nEvidence: curl returned 200.")
+        self.assertEqual(code, 0, err)
+        (posted,) = self.comments()
+        self.assertEqual(posted["body"], "Status: complete.\nEvidence: curl returned 200.\n\n<!-- fleet-switchboard:from=cos -->")
+        done = json.loads(out)
+        self.assertEqual((done["issue"], done["author"]), (2, "cos"))
+        self.assertTrue(done["comment"].startswith("https://"))
+
+    def test_the_signature_is_invisible_html_and_names_the_agent_only(self):
+        self.assertEqual(sb.fleet_mark("platform"), "<!-- fleet-switchboard:from=platform -->")
+        self.assertEqual(sb.signed_by_fleet("text\n\n<!--fleet-switchboard:from=cos-2 -->"), "cos-2")
+        for body in (None, 5, "", "a plain comment", "<!-- fleet-switchboard:from= -->", "<!-- other:from=cos -->",
+                     "fleet-switchboard:from=cos"):
+            self.assertIsNone(sb.signed_by_fleet(body), body)
+
+    def test_it_needs_the_ask_repo_a_body_and_a_caller_who_is_a_fleet_agent(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH})
+        code, _, err = self.comment()
+        self.assertNotEqual(code, 0)
+        self.assertIn("intent_repo", err)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.assertEqual(self.comments(), [])
+        code, _, err = self.comment(body="   \n")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.comments(), [])
+
+    def test_a_comment_without_an_author_is_posted_as_it_is(self):
+        engine = sb.build_engine(self.route, self.world.clock.now, "cli")[0]
+        sb.post_ask_comment(engine, 2, "from a human tool")
+        self.assertEqual(self.comments()[-1]["body"], "from a human tool")
+
+
+class TestSignedCommentsAreNotEvents(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}})
+        self.gh, self.hub = self.rig.gh, self.rig.hub
+        self.gh.issue(1)
+        self.gh.issue(12, parent=1)
+        self.hub.tick()
+
+    def test_a_signed_comment_is_dropped_from_the_webhook_and_an_unsigned_one_is_kept(self):
+        self.gh.comment(12, "I finished.\n\n<!-- fleet-switchboard:from=platform -->", 5001)
+        self.gh.comment(12, "A human note", 5002)
+        self.assertEqual(sorted(f.key for f in self.hub.facts()), ["github.comment:5002"])
+
+    def test_the_catch_up_read_drops_it_too_so_a_restart_does_not_bring_it_back(self):
+        self.gh.comment(12, "I finished.\n\n<!-- fleet-switchboard:from=platform -->", 5001, forward=False)
+        self.gh.comment(12, "A human note", 5002, forward=False)
+        items, errors = self.hub.catch_up_items(GH_REPO, self.rig.world.clock.now())
+        self.assertEqual(([i.key for i in items if i.kind == "github.comment"], errors), (["github.comment:5002"], []))
+
+    def test_a_signed_review_is_dropped_as_well(self):
+        review = {"id": 77, "state": "commented", "body": "ok\n\n<!-- fleet-switchboard:from=cos -->", "user": {"login": "x"}}
+        self.assertIsNone(sb._review_item(GH_REPO, review, {"number": 5}, 0))
+        self.assertIsNotNone(sb._review_item(GH_REPO, dict(review, body="ok"), {"number": 5}, 0))
+
+
+class TestIgnoredAuthors(Base):
+    """When the agents run as a bot account rather than as you, the author does say who wrote it."""
+
+    def rig(self, ignore):
+        rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}},
+                        config={"github_ignore_authors": ignore})
+        rig.gh.issue(1)
+        rig.gh.issue(12, parent=1)
+        rig.hub.tick()
+        return rig
+
+    def test_events_by_an_ignored_author_are_not_delivered_and_the_audit_says_so(self):
+        rig = self.rig(["Fleet-Bot"])
+        rig.gh.comment(12, "from an agent", 5001, login="fleet-bot")
+        rig.gh.comment(12, "from the human", 5002, login="you")
+        self.assertEqual(sorted(f.key for f in rig.hub.facts()), ["github.comment:5002"])
+        ignored = [e for e in rig.world.audit() if e["event"] == "github.ignored"]
+        self.assertEqual(ignored[0]["detail"], {"keys": ["github.comment:5001"], "authors": ["fleet-bot"]})
+
+    def test_with_nobody_ignored_every_author_is_delivered(self):
+        rig = self.rig([])
+        rig.gh.comment(12, "a", 5001, login="fleet-bot")
+        self.assertEqual([f.key for f in rig.hub.facts()], ["github.comment:5001"])
+
+    def test_the_setting_is_a_list_of_logins(self):
+        base = {"opencode": None, "gh": "gh"}
+        self.assertEqual(sb.validate_config(dict(base, github_ignore_authors=["a-b", "bot[bot]"]))["github_ignore_authors"],
+                         ["a-b", "bot[bot]"])
+        for bad in ("fleet-bot", [1], ["has space"], ["-x"], [""]):
+            with self.subTest(value=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, github_ignore_authors=bad))
+
+
 class TestBriefParsing(unittest.TestCase):
     def test_the_sections_are_read_with_or_without_markup(self):
         parsed = sb.parse_brief("## Handoff: ask 2\nGoal: retyped, ignored\n**Done so far:** a\nb\n"
@@ -8389,7 +8502,8 @@ class TestHandoff(HandoffCase):
         self.assertEqual(comment["issue"], 2)
         self.assertEqual(comment["body"], "## Handoff: ask 2\nGoal: Fix the agents (Done when: both answer)\n"
                          "Done so far: found that the staging config drops the project binding\n"
-                         "Next steps: 1. patch the binding\n2. redeploy staging\nWatch out for: production is untouched")
+                         "Next steps: 1. patch the binding\n2. redeploy staging\nWatch out for: production is untouched"
+                         "\n\n<!-- fleet-switchboard:from=cos -->")
         (posted,) = [c for c in self.gh.calls if "--method" in c]
         self.assertEqual(posted, [FAKE_GH, "api", "repos/%s/issues/2/comments" % FAKE_REPO,
                                   "--method", "POST", "--input", "-"])

@@ -1710,4 +1710,16 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     `gh webhook forward` prints its error and then its whole usage text, and the
     audit kept the last line: `-U, --url string Address of the local server...`.
     The reason is now the first error-looking line that is not usage.
+  - **Agents reacted to their own comments (scenario run, live).** The agents
+    share the user's GitHub account, so an event's author cannot say who wrote
+    it, and every comment an agent posted came back to it as a wake (`platform`:
+    "that message is just my own comment coming back"): a wasted model turn each
+    time, and a possible loop. Two fixes. `fleet-switchboard comment` (and
+    `handoff`) sign what they post with an HTML comment naming the agent,
+    invisible when rendered; a signed comment or review is dropped from the
+    webhook and the catch-up read alike. And `github_ignore_authors` drops every
+    event by the listed logins, for agents that run as a separate bot account,
+    which is the robust answer where you can have one. What is still open: an
+    agent that posts with plain `gh` is not signed, so the role files and the
+    charter skill now tell them to use `comment`; nothing enforces it.
 

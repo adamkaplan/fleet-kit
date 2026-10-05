@@ -95,6 +95,7 @@ DEFAULTS = {
     "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                       "check_suite", "workflow_run"],
     "github_port": None,
+    "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -2708,10 +2709,13 @@ def handoff_markdown(issue, parsed):
     return "\n".join(lines)
 
 
-def post_ask_comment(engine, issue, body):
-    """Comment on the ask through the configured `gh`. The one GitHub write the switchboard makes:
-    the handoff brief, so the record survives (docs: Hand off). Audited before and after."""
+def post_ask_comment(engine, issue, body, author=None):
+    """Comment on the ask through the configured `gh`. The GitHub writes the switchboard makes: the handoff
+    brief, so the record survives (docs: Hand off), and an agent's own comment (`comment`). Signed with
+    the author's name when there is one, so it is never delivered back as an event. Audited before and after."""
     reader = engine.intents
+    if author:
+        body = body.rstrip("\n") + "\n\n" + fleet_mark(author)
     path = "repos/%s/issues/%d/comments" % (reader.repo, issue)
     with engine._external("github.comment", "issue:%d" % issue, {"repo": reader.repo, "issue": issue,
                                                                    "chars": len(body)}) as result:
@@ -2771,7 +2775,7 @@ def handoff_ask(engine, caller, issue, brief, name=None, directory=None, workspa
     parsed = parse_brief(brief)
     ask = handoff_refusals(engine, issue, name, directory, workspace, agent)
     markdown = handoff_markdown(ask, parsed)
-    url = post_ask_comment(engine, issue, markdown)
+    url = post_ask_comment(engine, issue, markdown, author=caller)
     try:
         done = launch_agent(engine, name, agent, directory, workspace, COS_SUBAGENT, caller, issue,
                             subagent_prompt(caller, issue, markdown), patience, sleep)
@@ -2797,7 +2801,25 @@ def cmd_handoff(args, runner, now, socket_call=None):
     return EXIT_OK
 
 
+def cmd_comment(args, runner, now):
+    """Post a comment as the calling agent, signed so the switchboard does not deliver it back."""
+    engine, _, config = build_engine(runner, now, "cli")
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    body = read_brief(args.body_file, sys.stdin)
+    if body is None:
+        raise IntentError("usage", "--body-file is required (a file, or - for stdin)")
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    url = post_ask_comment(engine, args.issue, body, author=caller)
+    print(json.dumps({"issue": args.issue, "author": caller, "comment": url}, sort_keys=True))
+    return EXIT_OK
+
+
 def add_foreground_parsers(sub):
+    comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
+                                             "you as an event")
+    comment.add_argument("--issue", type=int, required=True, help="The issue to comment on")
+    comment.add_argument("--body-file", dest="body_file", required=True, help="The comment: a file, or - for stdin")
     handoff = sub.add_parser("handoff", help="Hand your current work to a background subagent: post the brief on "
                                              "the ask and launch it, without typing")
     handoff.add_argument("--issue", type=int, required=True, help="The ask being handed off")
@@ -3206,6 +3228,9 @@ WATCH_FILE = "github-watch.json"
 WATCH_STATES = ("starting", "running", "backoff", "conflict")
 
 
+GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,34}\[bot\])$")
+
+
 def _validate_github(config, source):
     """Check the github_* keys and `gh`; give `config` its own copies of the lists."""
     repos = config["github_repos"]
@@ -3227,7 +3252,11 @@ def _validate_github(config, source):
     port = config["github_port"]
     if port is not None and not (isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535):
         raise ConfigError("%s: 'github_port' must be null (any free port) or a port number, got %r" % (source, port))
+    ignore = config["github_ignore_authors"]
+    if not isinstance(ignore, list) or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in ignore):
+        raise ConfigError("%s: 'github_ignore_authors' must be a list of GitHub logins, got %r" % (source, ignore))
     config["github_repos"], config["github_events"] = list(repos), list(events)
+    config["github_ignore_authors"] = list(ignore)
 
 
 # ------------------------------------------------------------- verification
@@ -3301,6 +3330,23 @@ def _login(obj):
     return login if isinstance(login, str) and login else None
 
 
+# An agent's own words on GitHub. The agents share the user's GitHub account, so the author cannot say
+# who wrote a comment, and each agent comment came back to its author as a wake (the trial's orchestrator:
+# "that message is just my own comment coming back"). `fleet-switchboard comment` and `handoff` sign what
+# they post with an HTML comment, invisible when GitHub renders it; a signed comment is never an event.
+FLEET_MARK = re.compile(r"<!--\s*fleet-switchboard:from=([A-Za-z0-9_-]{1,64})\s*-->")
+
+
+def fleet_mark(name):
+    return "<!-- fleet-switchboard:from=%s -->" % name
+
+
+def signed_by_fleet(body):
+    """The agent a body was signed by, or None."""
+    match = FLEET_MARK.search(body) if isinstance(body, str) else None
+    return match.group(1) if match else None
+
+
 def _url_number(url):
     match = re.search(r"/(?:issues|pulls)/([0-9]+)$", url) if isinstance(url, str) else None
     return int(match.group(1)) if match else None
@@ -3351,7 +3397,7 @@ def _pr_numbers(obj):
 def _comment_item(repo, comment, issue, now):
     cid = _id(comment)
     number = _number(issue) or _url_number(comment.get("issue_url"))
-    if cid is None or number is None:
+    if cid is None or number is None or signed_by_fleet(comment.get("body")):
         return None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
@@ -3384,7 +3430,7 @@ def _pr_item(repo, pr, now):
 
 def _review_item(repo, review, pr, now):
     rid, number = _id(review), _number(pr)
-    if rid is None or number is None:
+    if rid is None or number is None or signed_by_fleet(review.get("body")):
         return None
     known, lookups = _pr_refs(pr, number)
     state = str(review.get("state") or "reviewed").lower()
@@ -3763,6 +3809,13 @@ class GitHubHub:
         return 202, "accepted"
 
     def enqueue(self, items):
+        ignore = {a.lower() for a in self.config.get("github_ignore_authors") or []}
+        if ignore:
+            dropped = [item for item in items if (item.sender or "").lower() in ignore]
+            if dropped:
+                self._audit("github.ignored", dropped[0].repo, {"keys": [item.key for item in dropped],
+                                                                "authors": sorted({item.sender for item in dropped})})
+                items = [item for item in items if item not in dropped]
         with self.lock:
             for item in items:
                 self.queue.setdefault(item.key, item)  # the same object seen twice is one item
@@ -6740,6 +6793,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_run(args, runner, now, wait)
         if args.action == "send":
             return cmd_send(args, runner, now)
+        if args.action == "comment":
+            return cmd_comment(args, runner, now)
         if args.action == "pending":
             return cmd_pending(args, runner, now)
         if args.action == "remind":

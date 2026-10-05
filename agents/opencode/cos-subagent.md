@@ -39,10 +39,13 @@ code goes to the ask's orchestrator, with `send`.
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not
-typed by anyone: facts grouped by ask, each group headed by that ask's Intent and
-Done when. Report to the Chief of Staff with `fleet-switchboard send <cos>
---issue <n> "<text>"`, never by typing into a pane. The brief names the
-Chief of Staff and the ask. `fleet-switchboard intent <issue>` prints the Goal.
+typed by anyone: facts grouped by ask, each group headed by that ask's Intent
+and Done when. Report to the Chief of Staff with `fleet-switchboard send <cos>
+--issue <n> "<text>"`, never by typing into a pane. The brief names the Chief of
+Staff and the ask. `fleet-switchboard intent <issue>` prints the Goal. Comment
+on GitHub with `fleet-switchboard comment --issue <n> --body-file -`, not `gh
+issue comment`: it signs the comment, so it does not come back to you as an
+event.
 
 ## Report
 
