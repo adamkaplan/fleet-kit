@@ -3575,6 +3575,21 @@ def _terminate(proc):
         pass
 
 
+_USAGE_LINE = re.compile(r"^\s*(-{1,2}[A-Za-z]|usage:|flags:|examples?:|global flags:|\$ |#|use \")", re.I)
+_ERROR_LINE = re.compile(r"\b(error|failed|failure|unauthorized|forbidden|denied|not found|refused|timed? ?out|invalid)\b", re.I)
+
+
+def forwarder_reason_line(lines):
+    """The line of a dead forwarder's output that says why. cobra prints the error and then the whole usage
+    text, so the LAST line is a flag description (the trial's audit said `-U, --url string Address of the
+    local server...`). First an error-looking line that is not usage, then any line that is not usage."""
+    plain = [line for line in lines if not _USAGE_LINE.match(line)]
+    for line in plain:
+        if _ERROR_LINE.search(line):
+            return line
+    return (plain or lines)[0]
+
+
 class GitHubHub:
     """The listener, the forwarder supervisor, the queue and the catch-up read.
 
@@ -4059,7 +4074,7 @@ class GitHubHub:
             self._audit("github.watch", watch.repo, {"state": "conflict", "retry_in": self.conflict_retry})
             return
         lines = [line for line in tail.splitlines() if line.strip()]
-        reason = "exited with code %s%s" % (code, ": " + _one_line(lines[-1], 200) if lines else "")
+        reason = "exited with code %s%s" % (code, ": " + _one_line(forwarder_reason_line(lines), 200) if lines else "")
         if now - (watch.started or now) >= GITHUB_STABLE:
             watch.failures = 0
         self._failed(watch, now, reason)

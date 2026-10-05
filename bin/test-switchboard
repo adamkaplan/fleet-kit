@@ -9331,6 +9331,37 @@ class TestNotFleetSessionsAreNotAskedAboutEveryPass(Base):
         self.assertEqual(self.gets(self.world.sessions["platform"]), 3, "a fleet agent is read every pass")
 
 
+class TestForwarderReasonLine(Base):
+    USAGE = ["Receive test events locally", "", "Usage:", "  forward --events=<types> [--url=<url>] [flags]",
+             "Examples:", "$ gh webhook forward --events=issues --repo=monalisa/smile", "Flags:",
+             "  -U, --url string   Address of the local server to receive events. If omitted, events will be printed."]
+
+    def lines(self, *head):
+        return [line for line in list(head) + self.USAGE if line.strip()]
+
+    def test_the_error_line_wins_over_the_usage_text_that_follows_it(self):
+        lines = self.lines("Error: error connecting to GitHub: websocket: bad handshake")
+        self.assertEqual(sb.forwarder_reason_line(lines), "Error: error connecting to GitHub: websocket: bad handshake")
+        self.assertNotEqual(lines[-1], sb.forwarder_reason_line(lines), "the old choice was the last line")
+
+    def test_with_no_error_word_the_first_line_that_is_not_usage_is_used(self):
+        self.assertEqual(sb.forwarder_reason_line(self.lines("the connection went away")), "the connection went away")
+
+    def test_output_that_is_all_usage_still_gives_a_line(self):
+        self.assertTrue(sb.forwarder_reason_line(self.USAGE))
+
+    def test_a_dead_forwarders_reason_in_the_audit_is_that_line(self):
+        rig = GithubRig(self)
+        rig.hub.tick()
+        proc = rig.gh.procs[-1]
+        with open(str(rig.hub.log_path(rig.watch())), "w") as log:
+            log.write("\n".join(self.lines("Error: HTTP 422: Validation Failed")) + "\n")
+        proc.exit(1)
+        rig.hub.tick()
+        self.assertIn("Validation Failed", rig.watch().last_error)
+        self.assertNotIn("--url string", rig.watch().last_error)
+
+
 class TestScheduleJudgeWarm(Base):
     def rig(self, ttl=300, warmer=True):
         world = World(self, agents=("a", "b"))

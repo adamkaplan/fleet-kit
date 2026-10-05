@@ -1706,4 +1706,8 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     :58, after the Chief of Staff had consumed the message and gone idle. A session
     that is no fleet agent (no fleet metadata, or one v2 does not have) is now
     remembered for 120 s; a fleet agent and a transient error never are.
+  - **A dead forwarder's reason was a flag description (scenario run, live).**
+    `gh webhook forward` prints its error and then its whole usage text, and the
+    audit kept the last line: `-U, --url string Address of the local server...`.
+    The reason is now the first error-looking line that is not usage.
 
