@@ -1624,3 +1624,21 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   no `--charter`, so a Chief of Staff could not find an orchestrator's asks.
   Fixed, with a test watched failing without the fix. The v1 import is left
   built but is not part of the trial.
+- 2026-10-05: three things the first real trial session found, all fixed in PR 11.
+  - **`gh` had no login for the agents or the daemon.** The token was given to
+    the v2 service only, but an agent's shell runs in the pane's own process, and
+    the trial's `XDG_CONFIG_HOME` hid `gh`'s account from the daemon. The wrapper
+    now asks `gh` for the token on every start (before it replaces `HOME`, since
+    on macOS `gh` finds it through the login keychain), and the daemon gets
+    `GH_CONFIG_DIR`. Nothing is stored in a file.
+  - **The role files still told the Chief of Staff and orchestrators they run
+    under the heartbeat service.** The doc said switchboard agents do not use
+    `heartbeat-ack`; PR 6 never changed the files. A `[switchboard]` wake sent the
+    Chief of Staff to a heartbeat state directory that does not exist. Only a
+    message starting `Heartbeat` may now send an agent there.
+  - **The judge asked the Chief of Staff about routine `gh` and `ls` calls.** With
+    no ask there is nothing to be outside of, so `outside_scope` now cannot fire
+    either (as `outside_intent` already could not); `hard_to_reverse` and
+    `speaks_for_you` still do. A wildcard allow was tried and rejected: it
+    overrides an agent's `edit: deny`.
+

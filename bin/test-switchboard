@@ -6978,6 +6978,21 @@ class TestAgentDefinitions(unittest.TestCase):
             if role_of(path) == "chief-of-staff":
                 self.assertIn("Done when", path.read_text())
 
+    def test_a_switchboard_wake_is_never_told_to_run_heartbeat_ack(self):
+        """The trial found the Chief of Staff running `heartbeat-ack` after a [switchboard] wake, against a
+        state directory that does not exist there. Only a `Heartbeat` message may send an agent to it."""
+        for path in AGENT_FILES:
+            if role_of(path) not in ("chief-of-staff", "orchestrator"):
+                continue
+            text = path.read_text()
+            section = " ".join(text.split("## Wake protocol", 1)[1].split("\n## ", 1)[0].split())
+            with self.subTest(file=path.name):
+                self.assertIn("[switchboard]", section)
+                self.assertIn("does not apply to you", section)
+                self.assertIn("starting `Heartbeat`", section)
+                self.assertNotIn("heartbeat-ack --pane", text, "no unconditional ack command in the role file")
+                self.assertNotIn("You run under the heartbeat service", text)
+
     def test_the_role_files_keep_their_frontmatter_and_placeholders(self):
         for path in AGENT_FILES:
             text = path.read_text()
@@ -8986,6 +9001,15 @@ class TestJudgeTool(PolicyCase):
         reply = self.judge_tool(no_ask, "edit", "anything.py", "allow")
         self.assertEqual((reply["outcome"], reply["judged"]), ("allow", True))
         self.assertIsNone(self.audit_events()[-1]["detail"]["ask"])
+
+    def test_with_no_ask_the_scope_question_cannot_fire_but_the_consequential_ones_still_do(self):
+        no_ask = self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})
+        self.configure([{"noul": dict(LOW, outside_scope=1.0)}])
+        self.assertEqual(self.judge_tool(no_ask, "shell", "gh issue list", "allow")["outcome"], "allow")
+        for question in ("hard_to_reverse", "speaks_for_you"):
+            with self.subTest(question=question):
+                self.configure([{"noul": dict(LOW, **{question: 0.9})}])
+                self.assertEqual(self.judge_tool(no_ask, "shell", "x %s" % question, "allow")["outcome"], "ask")
 
     def test_thresholds_come_from_the_config(self):
         self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], thresholds={"hard_to_reverse": 0.9})
@@ -11101,23 +11125,55 @@ class TestTrialDriver(Base):
                      "~/.config/herdr", "~/.local/state/herdr"):
             self.assertFalse(root.startswith(os.path.expanduser(live)), live)
 
+    def fake_gh(self, token="canary-gh"):
+        """A gh that answers `auth token` and records the GH_CONFIG_DIR it was asked under."""
+        path = self.home / "fake-gh"
+        path.write_text('#!/bin/sh\necho "$GH_CONFIG_DIR" > "%s"\necho "$HOME" > "%s"\n[ -n "%s" ] && echo "%s"\n[ -n "%s" ]\n'
+                        % (self.home / "gh-config-seen", self.home / "gh-home-seen", token, token, token))
+        path.chmod(0o755)
+        return str(path)
+
+    def wrapper_env(self, gh_token="canary-gh", **extra):
+        trial = self.trial()
+        trial.gh_bin, trial.gh_config_dir = self.fake_gh(gh_token), "/real/gh"
+        probe = trial.wrapper_text().rsplit("exec ", 1)[0] + 'env\n'
+        env = dict({"PATH": SAFE_PATH}, **extra)
+        return subprocess.run([shutil.which("sh"), "-c", probe], env=env, capture_output=True, text=True).stdout
+
     def test_the_wrapper_takes_every_credential_out_before_it_gives_agents_the_gh_token(self):
         text = self.trial().wrapper_text()
-        unset = text.index('unset "$name"')
-        self.assertLess(unset, text.index('export GH_TOKEN="$GH_FOR_AGENTS"'), "the token is added after the strip")
+        self.assertLess(text.index('unset "$name"'), text.index('export GH_TOKEN="$GH_FOR_AGENTS"'),
+                        "the token is added after the strip")
         self.assertIn("_API_KEY", text)  # the OpenRouter key is of this shape
         self.assertIn("COPILOT", text)
         self.assertNotIn("OPENROUTER", text, "the wrapper never names the key, it strips by shape")
-        sh = shutil.which("sh")
-        env = {"PATH": SAFE_PATH, "OPENROUTER_API_KEY": "canary-key", "FLEET_TRIAL_GH_TOKEN": "canary-gh",
-               "SOME_SECRET": "canary-secret", "KEEP_ME": "yes"}
-        probe = text.rsplit("exec ", 1)[0] + 'env\n'
-        out = subprocess.run([sh, "-c", probe], env=env, capture_output=True, text=True).stdout
+        out = self.wrapper_env(OPENROUTER_API_KEY="canary-key", SOME_SECRET="canary-secret", KEEP_ME="yes",
+                               GH_TOKEN="ambient-gh", GITHUB_TOKEN="ambient-github")
         self.assertIn("GH_TOKEN=canary-gh", out)
         self.assertIn("KEEP_ME=yes", out)
-        for canary in ("canary-key", "canary-secret"):
+        for canary in ("canary-key", "canary-secret", "ambient-gh", "ambient-github"):
             self.assertNotIn(canary, out)
-        self.assertNotIn("FLEET_TRIAL_GH_TOKEN", out)
+
+    def test_the_token_comes_from_the_users_real_gh_config_not_the_trials_home(self):
+        """The trial found agents with no GH_TOKEN: the token was handed to the service only, but the
+        agents' shell runs in the pane's process. The wrapper asks gh on every start."""
+        self.wrapper_env()
+        self.assertEqual((self.home / "gh-config-seen").read_text().strip(), "/real/gh")
+        self.assertNotIn("GH_CONFIG_DIR", self.wrapper_env(), "agents do not inherit the real gh config dir")
+
+    def test_gh_runs_under_the_users_real_home_because_macos_keeps_its_token_in_the_login_keychain(self):
+        trial = self.trial()
+        trial.gh_bin, trial.gh_config_dir = self.fake_gh(), "/real/gh"
+        probe = trial.wrapper_text().rsplit("exec ", 1)[0] + 'env\n'
+        subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH, "HOME": "/users-real-home"},
+                       capture_output=True, text=True)
+        self.assertEqual((self.home / "gh-home-seen").read_text().strip(), "/users-real-home")
+
+    def test_the_gh_token_is_never_written_to_the_trials_files(self):
+        trial = self.trial()
+        trial.gh_bin, trial.gh_config_dir = self.fake_gh(), "/real/gh"
+        self.assertNotIn("canary-gh", trial.wrapper_text())
+        self.assertNotIn("FLEET_TRIAL_GH_TOKEN", inspect.getsource(TRIAL))
 
     def test_agents_find_fleet_switchboard_on_their_path(self):
         probe = self.trial().wrapper_text().rsplit("exec ", 1)[0] + 'command -v fleet-switchboard\n'
@@ -11133,11 +11189,8 @@ class TestTrialDriver(Base):
         self.assertIn("github-copilot/a, github-copilot/b", problem)
         self.assertNotIn("other/c", problem)
 
-    def test_the_wrapper_without_a_token_gives_agents_none(self):
-        probe = self.trial().wrapper_text().rsplit("exec ", 1)[0] + 'env\n'
-        out = subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH, "GH_TOKEN": "ambient"},
-                             capture_output=True, text=True).stdout
-        self.assertNotIn("GH_TOKEN", out)
+    def test_the_wrapper_without_a_gh_login_gives_agents_none(self):
+        self.assertNotIn("GH_TOKEN", self.wrapper_env(gh_token="", GH_TOKEN="ambient"))
 
     def test_the_switchboard_env_points_at_the_trials_dirs_and_the_real_herdr(self):
         trial = self.trial()
@@ -11147,6 +11200,9 @@ class TestTrialDriver(Base):
         self.assertEqual(env["XDG_STATE_HOME"], str(trial.state_home))
         self.assertEqual(env["HERDR_SOCKET_PATH"], "/run/herdr.sock")
         self.assertNotIn("HERDR_PANE_ID", env, "the daemon is not a pane")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/u/.config"}):
+            self.assertEqual(TRIAL.Trial(self.home / "trial").switchboard_env()["GH_CONFIG_DIR"], "/home/u/.config/gh",
+                             "the daemon's gh keeps the account the user logged in, not an empty one under the trial's dir")
 
     def test_an_uninitialised_trial_says_what_to_run(self):
         with self.assertRaises(TRIAL.TrialError) as caught:
@@ -11201,18 +11257,17 @@ class TestTrialDriver(Base):
             self.assertEqual(trial.ensure_service(), "already running")
         self.assertEqual(calls, [("service", "status")], "nothing but a status read")
 
-    def test_a_stopped_service_is_started_with_the_gh_token_in_its_environment(self):
+    def test_a_stopped_service_is_started_through_the_wrapper(self):
         trial = self.trial()
-        seen = {}
+        calls = []
 
-        def wrapper_run(*args, env=None, **kwargs):
-            seen[args] = env
+        def wrapper_run(*args, **kwargs):
+            calls.append((args, kwargs))
             return subprocess.CompletedProcess([], 0, "stopped\n" if args == ("service", "status") else "", "")
 
-        with mock.patch.object(TRIAL.Trial, "wrapper_run", side_effect=wrapper_run), \
-                mock.patch.object(TRIAL.Trial, "service_env", return_value={"FLEET_TRIAL_GH_TOKEN": "t"}):
+        with mock.patch.object(TRIAL.Trial, "wrapper_run", side_effect=wrapper_run):
             self.assertIn("started", trial.ensure_service())
-        self.assertEqual(seen[("service", "start")], {"FLEET_TRIAL_GH_TOKEN": "t"})
+        self.assertEqual(calls[-1], (("service", "start"), {}), "no environment is passed: the wrapper builds it")
 
     def test_the_parser_knows_its_five_commands(self):
         parser = TRIAL.build_parser()

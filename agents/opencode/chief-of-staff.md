@@ -122,18 +122,13 @@ your principal cannot see. If GitHub is unreachable, say so and report live stat
 
 ## Wake protocol
 
-You run under the heartbeat service. Exactly one ack per wake, before your turn
-ends:
-
-```
-heartbeat-ack --pane <wN:pN> --active --wake-again-in 5m    # work in flight
-heartbeat-ack --pane <wN:pN> --idle   --wake-again-in 45m   # nothing to do
-```
-
-Cadence is clamped to 5 ≤ X < 60 minutes; confirm flags with `heartbeat-ack
---help` rather than trusting any document, including this one. Never ack twice
-and never skip — a skipped ack leaves your cadence at its floor and wakes you
-forever. Read the heartbeat service's state; never modify it.
+Two things wake you. A `[switchboard]` message carries facts grouped by ask: act
+on it, and when there is nothing more to do, stop. It has no acknowledgement and
+no cadence, and `heartbeat-ack` does not apply to you (its state directory does
+not exist under the switchboard). A message starting `Heartbeat` comes from the
+older heartbeat service and states the exact `heartbeat-ack` to run before your
+turn ends; run that, once, only then. Read the heartbeat service's state; never
+modify it.
 
 ## Your instructions are a snapshot, not a source of truth
 

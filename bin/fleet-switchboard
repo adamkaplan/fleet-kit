@@ -5243,7 +5243,10 @@ class PolicyJudge:
         key = policy_verdict_key(request, fleet["name"], context, fleet.get("role"))
         thresholds = dict(self.settings["thresholds"])
         if context["issue"] is None:
-            thresholds["outside_intent"] = 2.0  # with no ask there is nothing to be outside of: that question cannot fire
+            # With no ask there is nothing to be outside of: neither intent nor scope can fire. The
+            # trial found the Chief of Staff, which has no ask by design, asked about every routine
+            # `gh` and `ls`. The two consequential questions (hard to reverse, speaks for you) still do.
+            thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0
         cached = _valid_answers(self.verdicts.get(key))
         if cached is not None:
             combined = combine_policy(cached, thresholds, request["configured"])

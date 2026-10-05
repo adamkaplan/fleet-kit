@@ -75,6 +75,8 @@ class Trial:
         self.daemon_log = self.root / "daemon.log"
         self.fleet_bin = REPO_ROOT / "bin" / "fleet-switchboard"
         self.herdr_socket = self.live_herdr_socket()
+        self.gh_config_dir = self.live_gh_config_dir()
+        self.gh_bin = shutil.which("gh") or "gh"
 
     @staticmethod
     def live_herdr_socket():
@@ -83,6 +85,15 @@ class Trial:
             return os.environ["HERDR_SOCKET_PATH"]
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         return os.path.join(base, "herdr", "herdr.sock")
+
+    @staticmethod
+    def live_gh_config_dir():
+        """Where gh keeps its account list, read before the trial's XDG_CONFIG_HOME can hide it. The
+        token itself stays in gh's own store; nothing is copied."""
+        if os.environ.get("GH_CONFIG_DIR"):
+            return os.environ["GH_CONFIG_DIR"]
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "gh")
 
     # -- settings
 
@@ -117,6 +128,7 @@ class Trial:
         env["XDG_CONFIG_HOME"] = str(self.config_home)
         env["XDG_STATE_HOME"] = str(self.state_home)
         env["HERDR_SOCKET_PATH"] = self.herdr_socket  # herdr finds its socket under XDG_CONFIG_HOME otherwise
+        env["GH_CONFIG_DIR"] = self.gh_config_dir     # so does gh: under the trial's dir it is logged out
         env.pop("FLEET_SWITCHBOARD_LAB", None)
         return env
 
@@ -134,7 +146,8 @@ class Trial:
     # -- init
 
     def wrapper_text(self):
-        return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, key_pattern=KEY_NAME_PATTERN)
+        return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, key_pattern=KEY_NAME_PATTERN,
+                              gh=self.gh_bin, gh_config=self.gh_config_dir)
 
     def init(self, repo, charter, model):
         proof = self.proof
@@ -206,17 +219,6 @@ class Trial:
 
     # -- service and daemon
 
-    def service_env(self):
-        """What the v2 service (and so every agent's shell) is started with: the trial's
-        wrapper takes the credentials out, then `gh` access is given back as GH_TOKEN,
-        because the agents work on GitHub. The OpenRouter key is never in it."""
-        env = self.clean_env()
-        token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True).stdout.strip()
-        if not token:
-            raise TrialError("`gh auth token` gave nothing: log in with gh first")
-        env["FLEET_TRIAL_GH_TOKEN"] = token
-        return env
-
     def service_running(self):
         return self.wrapper_run("service", "status").stdout.strip().startswith("http")
 
@@ -225,7 +227,7 @@ class Trial:
         TUIs are connected to it, and stopping it would cut them off mid-turn."""
         if self.service_running():
             return "already running"
-        done = self.wrapper_run("service", "start", env=self.service_env())
+        done = self.wrapper_run("service", "start")
         if done.returncode:
             raise TrialError("could not start the v2 service: %s" % (done.stderr or done.stdout).strip())
         return "started with the trial profile"
@@ -318,12 +320,16 @@ class Trial:
 
 
 # The trial's wrapper: v2 confined to the trial profile. It differs from the Lab's in two
-# ways: no model is scripted, and the service may be given the `gh` token (as
-# FLEET_TRIAL_GH_TOKEN, which becomes GH_TOKEN here) because the agents work on GitHub.
-# The OpenRouter key and every other credential-shaped variable is removed.
+# ways: no model is scripted, and the agents are given the `gh` token (as GH_TOKEN) because
+# they work on GitHub. The OpenRouter key and every other credential-shaped variable is removed.
 WRAPPER = """#!/bin/sh
 # Switchboard trial: OpenCode v2 confined to the trial profile.
 # Written by `switchboard-trial init`. Never put this on the live PATH.
+# The agents work on GitHub, and their shell runs in the pane's process (not the service), so
+# every start of v2 asks gh for the token itself, from the user's real gh config, and
+# before HOME is replaced below: on macOS gh finds its token in the login keychain via HOME. Nothing is
+# stored: not in a file, not in launch_env, which lands in config.json.
+GH_FOR_AGENTS=$(GH_CONFIG_DIR="{gh_config}" "{gh}" auth token 2>/dev/null)
 LAB="{root}"
 export FLEET_SWITCHBOARD_TRIAL=1
 export XDG_CONFIG_HOME="$LAB/profile/config" XDG_DATA_HOME="$LAB/profile/data"
@@ -334,9 +340,8 @@ export HOME="$LAB/profile/home"
 export FLEET_SWITCHBOARD_BIN="{fleet_bin}"
 # Agents run `fleet-switchboard send`; their shell finds it here.
 export PATH="{kit_bin}:$PATH"
-GH_FOR_AGENTS="$FLEET_TRIAL_GH_TOKEN"
 for name in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p' \\
-    | grep -E '{key_pattern}|^(GH|GITHUB|COPILOT)_|^FLEET_TRIAL_GH_TOKEN$'); do
+    | grep -E '{key_pattern}|^(GH|GITHUB|COPILOT)_'); do
   unset "$name"
 done
 [ -n "$GH_FOR_AGENTS" ] && export GH_TOKEN="$GH_FOR_AGENTS"

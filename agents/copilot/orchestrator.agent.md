@@ -120,19 +120,14 @@ or supply commands to run.
 
 ## Wake protocol
 
-You run under the heartbeat service. Never sit in a polling loop — react to wakes
-and to real events. Exactly one ack per wake, before your turn ends:
-
-```
-heartbeat-ack --pane <wN:pN> --active --wake-again-in 5m    # work in flight
-heartbeat-ack --pane <wN:pN> --idle   --wake-again-in 45m   # nothing to do
-```
-
-Cadence is clamped to 5 ≤ X < 60 minutes; confirm flags with `heartbeat-ack
---help` rather than trusting any document, including this one. "No change" is a
-valid outcome and still needs an idle ack. Acking idle while your charter has
-open sub-issues is how you idle yourself out of existence. Read the heartbeat
-service's state; never modify it.
+Never sit in a polling loop: react to wakes and to real events. A `[switchboard]`
+message carries facts grouped by ask: act on it, and when there is nothing more
+to do, stop. It has no acknowledgement and no cadence, and `heartbeat-ack` does
+not apply to you (its state directory does not exist under the switchboard). A
+message starting `Heartbeat` comes from the older heartbeat service and states
+the exact `heartbeat-ack` to run before your turn ends; run that, once, only
+then. Stopping while your charter has open sub-issues is how you idle yourself
+out of existence. Read the heartbeat service's state; never modify it.
 
 ## Review, CI and merge
 
