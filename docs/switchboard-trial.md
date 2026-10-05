@@ -57,7 +57,7 @@ leaves the workspace for you to close.
 
 ## What you do each time
 
-Once ever: `init`, then `login`. After that, one command per session:
+Once ever: `init` (it also creates the charter labels in the repo and labels the charter, and pins the `gh` account the agents run as: `--gh-user NAME`, default the one active then), then `login`. After that, one command per session:
 
 | When | You run | It does |
 |---|---|---|

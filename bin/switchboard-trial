@@ -15,10 +15,12 @@ here reads or writes the live OpenCode, herdr or switchboard directories.
 docs/switchboard-trial.md walks through what to try.
 """
 import argparse
+import getpass
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -77,6 +79,7 @@ class Trial:
         self.herdr_socket = self.live_herdr_socket()
         self.gh_config_dir = self.live_gh_config_dir()
         self.gh_bin = shutil.which("gh") or "gh"
+        self.gh_user = self.settings().get("gh_user")  # the account the trial runs as, pinned at init
 
     @staticmethod
     def live_herdr_socket():
@@ -94,6 +97,41 @@ class Trial:
             return os.environ["GH_CONFIG_DIR"]
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         return os.path.join(base, "gh")
+
+    def gh_token(self):
+        """The pinned account's token, or None when no account is pinned or gh will not give one.
+        `gh` serves whichever account is *active*, which can change under the trial between runs."""
+        if not self.gh_user:
+            return None
+        done = subprocess.run([self.gh_bin, "auth", "token", "--user", self.gh_user], capture_output=True,
+                              text=True, env=dict(os.environ, GH_CONFIG_DIR=self.gh_config_dir))
+        return done.stdout.strip() or None
+
+    def label_prefix(self):
+        """The skill says the label prefix is what `whoami` answers: the OS user, not the GitHub handle."""
+        return getpass.getuser()
+
+    def ensure_repo_labels(self, repo, charter):
+        """Create the labels the charter convention needs and put the orchestrator label on the charter.
+        Idempotent (`--force` updates an existing label). Without them an orchestrator, correctly, will
+        not make repo changes it was not asked for, and cannot mark its own charter."""
+        prefix = self.label_prefix()
+        env = dict(os.environ, GH_CONFIG_DIR=self.gh_config_dir, GH_TOKEN=self.gh_token() or "")
+        wanted = ((prefix + ":orchestrator", "5319e7", "A charter: an orchestrator's standing job"),
+                  (prefix + ":awaiting-user", "d93f0b", "Blocked on the user: the fleet's only blocking channel"))
+        steps = [["label", "create", name, "--repo", repo, "--color", color, "--description", text, "--force"]
+                 for name, color, text in wanted]
+        steps.append(["issue", "edit", str(charter), "--repo", repo, "--add-label", prefix + ":orchestrator"])
+        for args in steps:
+            done = subprocess.run([self.gh_bin] + args, capture_output=True, text=True, env=env)
+            if done.returncode:
+                raise TrialError("`gh %s` failed: %s" % (" ".join(args[:2]), (done.stderr or done.stdout).strip()))
+        return [name for name, _, _ in wanted]
+
+    def detect_gh_user(self):
+        done = subprocess.run([self.gh_bin, "api", "user", "--jq", ".login"], capture_output=True, text=True,
+                              env=dict(os.environ, GH_CONFIG_DIR=self.gh_config_dir))
+        return done.stdout.strip() or None
 
     # -- settings
 
@@ -129,6 +167,9 @@ class Trial:
         env["XDG_STATE_HOME"] = str(self.state_home)
         env["HERDR_SOCKET_PATH"] = self.herdr_socket  # herdr finds its socket under XDG_CONFIG_HOME otherwise
         env["GH_CONFIG_DIR"] = self.gh_config_dir     # so does gh: under the trial's dir it is logged out
+        token = self.gh_token()
+        if token:  # the pinned account, in this process's environment only: never written anywhere
+            env["GH_TOKEN"] = token
         env.pop("FLEET_SWITCHBOARD_LAB", None)
         return env
 
@@ -147,10 +188,15 @@ class Trial:
 
     def wrapper_text(self):
         return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, key_pattern=KEY_NAME_PATTERN,
-                              gh=self.gh_bin, gh_config=self.gh_config_dir)
+                              gh=self.gh_bin, gh_config=self.gh_config_dir,
+                              gh_user_flag="--user %s" % shlex.quote(self.gh_user) if self.gh_user else "")
 
-    def init(self, repo, charter, model):
+    def init(self, repo, charter, model, gh_user=None):
         proof = self.proof
+        self.gh_user = gh_user or self.detect_gh_user()
+        if not self.gh_user or not self.gh_token():
+            raise TrialError("cannot get a gh token for %r: log in with `gh auth login` or pass --gh-user"
+                             % (self.gh_user,))
         for directory in (self.lab.v2_dir, self.lab.bin_dir, self.lab.opencode_config,
                           os.path.join(self.lab.opencode_config, "agents"),
                           os.path.join(self.lab.opencode_config, "plugins"), str(self.work),
@@ -192,7 +238,9 @@ class Trial:
             "policy": {"enabled": True}, "poll_seconds": 5,
         }
         self.switchboard_config.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
-        self.save(dict(self.settings(), repo=repo, charter=charter, model=model))
+        self.save(dict(self.settings(), repo=repo, charter=charter, model=model, gh_user=self.gh_user))
+        report["gh account"] = self.gh_user
+        report["repo labels"] = ", ".join(self.ensure_repo_labels(repo, charter))
         report["switchboard config"] = str(self.switchboard_config)
         return report
 
@@ -394,7 +442,7 @@ WRAPPER = """#!/bin/sh
 # every start of v2 asks gh for the token itself, from the user's real gh config, and
 # before HOME is replaced below: on macOS gh finds its token in the login keychain via HOME. Nothing is
 # stored: not in a file, not in launch_env, which lands in config.json.
-GH_FOR_AGENTS=$(GH_CONFIG_DIR="{gh_config}" "{gh}" auth token 2>/dev/null)
+GH_FOR_AGENTS=$(GH_CONFIG_DIR="{gh_config}" "{gh}" auth token {gh_user_flag} 2>/dev/null)
 LAB="{root}"
 export FLEET_SWITCHBOARD_TRIAL=1
 export XDG_CONFIG_HOME="$LAB/profile/config" XDG_DATA_HOME="$LAB/profile/data"
@@ -444,7 +492,7 @@ def cmd_init(trial, args):
     for name, value in (("--charter", args.charter),):
         if value < 1:
             raise TrialError("%s must be an issue number" % name)
-    report = trial.init(args.repo, args.charter, args.model)
+    report = trial.init(args.repo, args.charter, args.model, args.gh_user)
     for key, value in report.items():
         print("%-22s %s" % (key, value))
     print("\nNext: switchboard-trial login")
@@ -540,6 +588,8 @@ def build_parser():
     init = sub.add_parser("init", help="Create the trial profile (once)")
     init.add_argument("--repo", required=True, help="OWNER/REPO holding the charter and asks")
     init.add_argument("--charter", type=int, required=True, help="The orchestrator's charter issue number")
+    init.add_argument("--gh-user", dest="gh_user",
+                      help="The gh account the agents and the daemon run as (default: the active one now)")
     init.add_argument("--model", default=DEFAULT_MODEL, help="provider/model for every agent (default %(default)s)")
     sub.add_parser("login", help="Log the trial's OpenCode into GitHub Copilot (interactive)")
     up = sub.add_parser("up", help="Start the service and daemon; launch or resume the Chief of Staff and the orchestrator")

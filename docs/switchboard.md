@@ -1656,4 +1656,12 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     skills into its own `skills/` directory and lists it under `skills.paths`,
     which is read last and wins. The live skills are still visible to the
     trial's agents; only same-named ones are overridden.
+  - **Two first-run gaps in the trial.** The charter convention needs the
+    `<user>:orchestrator` label (the prefix is `whoami`, the OS user) and the
+    seeded repo had none, so `platform` could not mark its own charter and, rightly,
+    would not create labels unasked. `init` now creates the two labels
+    idempotently and labels the charter. And the trial served whichever `gh`
+    account was *active*, which changed to one that cannot see the repo: `init`
+    now pins the account (`--gh-user`), the wrapper asks for that account's token,
+    and the daemon gets it in its own environment only.
 

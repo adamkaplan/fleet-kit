@@ -11194,8 +11194,10 @@ class TestTrialDriver(Base):
     def fake_gh(self, token="canary-gh"):
         """A gh that answers `auth token` and records the GH_CONFIG_DIR it was asked under."""
         path = self.home / "fake-gh"
-        path.write_text('#!/bin/sh\necho "$GH_CONFIG_DIR" > "%s"\necho "$HOME" > "%s"\n[ -n "%s" ] && echo "%s"\n[ -n "%s" ]\n'
-                        % (self.home / "gh-config-seen", self.home / "gh-home-seen", token, token, token))
+        path.write_text('#!/bin/sh\necho "$GH_CONFIG_DIR" > "%s"\necho "$HOME" > "%s"\necho "$@" > "%s"\n'
+                        '[ -n "%s" ] && echo "%s"\n[ -n "%s" ]\n'
+                        % (self.home / "gh-config-seen", self.home / "gh-home-seen", self.home / "gh-args-seen",
+                           token, token, token))
         path.chmod(0o755)
         return str(path)
 
@@ -11234,6 +11236,70 @@ class TestTrialDriver(Base):
         subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH, "HOME": "/users-real-home"},
                        capture_output=True, text=True)
         self.assertEqual((self.home / "gh-home-seen").read_text().strip(), "/users-real-home")
+
+    def recording_gh(self, fail_on=None):
+        """A gh that appends each call to a log, and fails the call whose first words are `fail_on`."""
+        path = self.home / "rec-gh"
+        log = self.home / "rec-gh.log"
+        path.write_text('#!/bin/sh\necho "$GH_TOKEN|$@" >> "%s"\n[ "$1 $2" = "%s" ] && { echo "HTTP 404" >&2; exit 1; }\n'
+                        '[ "$1" = auth ] && echo tok\nexit 0\n' % (log, fail_on or "no such"))
+        path.chmod(0o755)
+        return str(path), log
+
+    def test_init_creates_the_charter_labels_with_the_os_users_prefix_and_labels_the_charter(self):
+        trial = self.trial()
+        trial.gh_bin, log = self.recording_gh()
+        trial.gh_user = "the-pinned-one"
+        with mock.patch.object(TRIAL.getpass, "getuser", return_value="osuser"):
+            names = trial.ensure_repo_labels("o/r", 7)
+        self.assertEqual(names, ["osuser:orchestrator", "osuser:awaiting-user"])
+        calls = [line.split("|", 1)[1].split() for line in log.read_text().splitlines() if "auth token" not in line]
+        self.assertEqual([c[:3] for c in calls], [["label", "create", "osuser:orchestrator"],
+                                                   ["label", "create", "osuser:awaiting-user"],
+                                                   ["issue", "edit", "7"]])
+        for call in calls[:2]:
+            self.assertIn("--force", call, "idempotent: an existing label is updated, not an error")
+        self.assertIn("osuser:orchestrator", calls[2])
+
+    def test_a_label_failure_stops_init_and_says_which_call_failed(self):
+        trial = self.trial()
+        trial.gh_bin, _ = self.recording_gh(fail_on="label create")
+        trial.gh_user = "u"
+        with self.assertRaises(TRIAL.TrialError) as caught:
+            trial.ensure_repo_labels("o/r", 1)
+        self.assertIn("gh label create", str(caught.exception))
+
+    def test_the_wrapper_asks_for_the_pinned_account_not_whichever_gh_has_active(self):
+        """The active gh account changed under the trial (to one that cannot see the repo). The agents
+        and the daemon must keep running as the account chosen at init."""
+        trial = self.trial()
+        trial.gh_bin, trial.gh_config_dir, trial.gh_user = self.fake_gh(), "/real/gh", "the-pinned-one"
+        probe = trial.wrapper_text().rsplit("exec ", 1)[0] + 'env\n'
+        subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH}, capture_output=True, text=True)
+        self.assertEqual((self.home / "gh-args-seen").read_text().split(), ["auth", "token", "--user", "the-pinned-one"])
+
+    def test_the_daemons_token_is_the_pinned_accounts_and_only_in_its_environment(self):
+        trial = self.trial()
+        trial.gh_bin, trial.gh_config_dir, trial.gh_user = self.fake_gh("pinned-token"), "/real/gh", "the-pinned-one"
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "ambient"}):
+            self.assertEqual(trial.switchboard_env()["GH_TOKEN"], "pinned-token")
+        self.assertEqual((self.home / "gh-args-seen").read_text().split(), ["auth", "token", "--user", "the-pinned-one"])
+        trial.root.mkdir(parents=True, exist_ok=True)
+        trial.save({"repo": "o/r"})
+        self.assertNotIn("pinned-token", trial.settings_file.read_text())
+
+    def test_without_a_pinned_account_no_token_is_asked_for(self):
+        trial = self.trial()
+        trial.gh_bin, trial.gh_user = self.fake_gh(), None
+        self.assertIsNone(trial.gh_token())
+        self.assertNotIn("--user", trial.wrapper_text().split("GH_FOR_AGENTS=")[1].split("\n")[0])
+
+    def test_init_refuses_when_gh_cannot_give_a_token_for_the_account(self):
+        trial = self.trial()
+        trial.gh_bin = self.fake_gh(token="")
+        with self.assertRaises(TRIAL.TrialError) as caught:
+            trial.init("o/r", 1, "p/m", gh_user="someone")
+        self.assertIn("--gh-user", str(caught.exception))
 
     def test_the_gh_token_is_never_written_to_the_trials_files(self):
         trial = self.trial()
