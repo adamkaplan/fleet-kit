@@ -1664,4 +1664,12 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     account was *active*, which changed to one that cannot see the repo: `init`
     now pins the account (`--gh-user`), the wrapper asks for that account's token,
     and the daemon gets it in its own environment only.
+  - **The orchestrator started its coder as a v1 agent.** Following the
+    `fleet-coordination` skill, `platform` ran `herdr tab create`, `herdr agent
+    start --kind opencode` and `herdr agent prompt`: a typed bare `opencode`, which
+    is the v1 install on this machine, outside the switchboard and the trial's
+    isolation, with no `fleet-switchboard` on its PATH. PR 3 built `launch` to
+    replace exactly this, but the skill still taught the old route. It now opens
+    with `fleet-switchboard launch` and marks the typed routes as the legacy
+    fleet's.
 

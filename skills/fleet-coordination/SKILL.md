@@ -57,10 +57,29 @@ misunderstanding that would otherwise cost you an afternoon and a wasted branch.
 
 ## Starting a named agent in a pane
 
-The brief is worthless if it lands in the wrong agent. How you start a named agent
-depends on which CLI is installed and, for opencode, which generation. A launch
-that works on one silently falls back to the default agent on another. Detect
-first, then use the matching route:
+**Under the switchboard, use one command and stop reading this section.** If
+`fleet-switchboard` is on your PATH (a message from the switchboard reached you),
+start a worker with
+
+```text
+fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
+  --reports-to <you> --issue <ask> --brief-file -     # the brief on stdin
+```
+
+It creates the v2 session, opens the tab by argv in your workspace
+(`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
+brief. It never types into a pane, and it runs the configured OpenCode, not whichever
+`opencode` is first on PATH. A worker started this way reports with
+`fleet-switchboard send`, and its finishing reaches you as a fact. Do **not** use the
+`herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:
+they type into a shell, and a bare `opencode` there is the old v1 install, outside the
+switchboard, with no `fleet-switchboard` on its PATH. The rest of this section is the
+legacy fleet's route, for a fleet with no switchboard.
+
+How you start a named agent without the switchboard depends on which CLI is
+installed and, for opencode, which generation. A launch that works on one silently
+falls back to the default agent on another. Detect first, then use the matching
+route:
 
 ```text
 ./bin/fleet-doctor | grep dispatch     # names the route for this machine

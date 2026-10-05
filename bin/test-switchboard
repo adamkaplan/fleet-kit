@@ -11489,6 +11489,17 @@ class TestTrialDriver(Base):
         self.assertEqual(trial.opencode_config("p/m")["skills"], {"paths": [str(trial.skills_dir())]})
         self.assertFalse(str(trial.skills_dir()).startswith(os.path.expanduser("~/.agents")))
 
+    def test_the_coordination_skill_sends_switchboard_agents_to_launch_not_to_type_a_bare_opencode(self):
+        """The trial's orchestrator followed this skill, typed `opencode` into a new tab and got the old v1
+        install, outside the switchboard, typing its brief with `herdr agent prompt`."""
+        text = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
+        head = text.split("How you start a named agent without the switchboard", 1)[0]
+        self.assertIn("fleet-switchboard launch <name>", head)
+        self.assertIn("--brief-file -", head)
+        self.assertIn("Do **not** use the `herdr tab create` / `herdr agent start` / `herdr agent prompt` routes", head)
+        self.assertIn("legacy fleet's route", head)
+        self.assertLess(text.index("fleet-switchboard launch <name>"), text.index("herdr agent start <name> --kind"))
+
     def test_the_charter_skill_does_not_tell_a_switchboard_agent_to_ack_a_wake(self):
         text = " ".join((REPO / "skills" / "fleet-charter" / "SKILL.md").read_text().split())
         self.assertIn("A `[switchboard]` message has no acknowledgement", text)
