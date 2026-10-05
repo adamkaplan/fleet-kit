@@ -1672,4 +1672,13 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     replace exactly this, but the skill still taught the old route. It now opens
     with `fleet-switchboard launch` and marks the typed routes as the legacy
     fleet's.
+  - **An Intent edit reached nobody (scenario run, live).** PR 6 built the
+    change item and the toast, and said PR 5's webhook would call them; nothing
+    did. The edit went to the owner as a generic issue note, with a header built
+    from the cached, old Done when, and the Chief of Staff and your screen heard
+    nothing. The hub now invalidates the issue's cached Intent on every edit,
+    holds an edit that changed the Intent section, and gives each Chief of Staff
+    the old-to-new item and, through the render step's one toast path, a toast.
+    Checked live: the next message carried the new Done when, the item showed
+    old to new, herdr reported the toast shown.
 

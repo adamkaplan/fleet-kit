@@ -3585,11 +3585,14 @@ class GitHubHub:
         self.port, self.server, self.threads, self.stopping = config["github_port"] or 0, None, [], threading.Event()
         self._cache, self._retry, self._rejects, self._suppressed = {}, {}, [], 0
         self._unrouted, self._snapshot = set(), None
+        self.engine = None
+        self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
 
     # -- wiring
 
     def attach(self, engine):
         """Make this hub one of `engine`'s fact sources, reading the fleet through it."""
+        self.engine = engine
         self.discover = lambda: engine.discover(engine.now())
         engine.sources.append(self.fact_source())
         return engine
@@ -3725,6 +3728,7 @@ class GitHubHub:
             self._audit("github.rejected", repo, {"reason": "unreadable %s: %s" % (event, _one_line(str(err)))})
             return 400, "bad payload"
         self.enqueue(items)
+        self.note_issue_edit(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [item.key for item in items]})
         return 202, "accepted"
@@ -3743,6 +3747,60 @@ class GitHubHub:
         with self.lock:
             for key in keys:
                 self.queue.pop(key, None)
+                self.intent_edits.pop(key, None)
+
+    # -- an edit to an ask's Intent (PR 6's item and toast, which nothing called until now)
+
+    def note_issue_edit(self, event, repo, payload):
+        """On an edited issue: drop its cached Intent, so the next message carries the new lines (a
+        message built from the old cache said the old Done when), and hold the edit for the Chief of
+        Staff when the Intent section itself changed. Never raises: a bad payload is only not surfaced."""
+        if event != "issues" or payload.get("action") != "edited":
+            return
+        try:
+            number = (payload.get("issue") or {}).get("number")
+            reader = getattr(self.engine, "intents", None)
+            if reader is not None and isinstance(number, int):
+                reader.invalidate(number, repo)
+            fact = intent_change_fact(dict(payload, repository={"full_name": repo}), "chief-of-staff")
+            if fact is not None:
+                with self.lock:
+                    self.intent_edits[fact.key] = dict(payload, repository={"full_name": repo})
+                    while len(self.intent_edits) > GITHUB_QUEUE_LIMIT:
+                        self.intent_edits.pop(next(iter(self.intent_edits)))
+        except Exception as err:
+            self._audit("github.rejected", repo, {"reason": "intent edit not surfaced: %s" % _one_line(str(err))})
+
+    def _chiefs_of_staff(self):
+        discovery = self.discover()
+        agents = discovery.agents if discovery is not None and not discovery.problems else {}
+        return sorted(name for name, seen in agents.items() if (seen.fleet or {}).get("role") == "chief-of-staff")
+
+    def intent_edit_facts(self):
+        with self.lock:
+            edits = list(self.intent_edits.values())
+        found = []
+        if edits:
+            for name in self._chiefs_of_staff():
+                for payload in edits:
+                    fact = intent_change_fact(payload, name)
+                    if fact is not None and fact.created >= self.now() - self.lookback:
+                        found.append(fact)
+        return found
+
+    def toasts(self):
+        """One toast per pending Intent edit, through the engine's render step (the one toast path)."""
+        found = []
+        with self.lock:
+            edits = list(self.intent_edits.values())
+        if edits:
+            for name in self._chiefs_of_staff():
+                for payload in edits:
+                    toast = intent_change_toast(payload)
+                    if toast is not None:
+                        number, updated, _ = _payload_issue(payload)
+                        found.append((name, "intent edit #%d %s" % (number, updated), toast["title"], toast["body"]))
+        return found
 
     # -- the fact source
 
@@ -3752,6 +3810,7 @@ class GitHubHub:
                 self.start()  # inside the daemon's lock: the first pass starts it
             return self.facts()
         github_facts.acknowledge = self.acknowledge
+        github_facts.toasts = self.toasts
         return github_facts
 
     def facts(self):
@@ -3768,6 +3827,7 @@ class GitHubHub:
         with self.lock:
             found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender)
                      for i in self.queue.values() if i.recipient]
+        found.extend(self.intent_edit_facts())
         for fact in found:
             # An object seen again (a catch-up, a redelivery) was perhaps delivered long
             # ago: the engine's read of the transcript must reach back that far.

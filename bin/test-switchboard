@@ -4914,6 +4914,86 @@ class TestGithubKeys(Base):
         self.assertIn("since=%s" % sb.iso(self.world.clock.now() - 24 * 3600), "".join(self.gh.api_calls))
 
 
+def intent_body(intent, done):
+    return "## Intent\n%s\nDone when: %s\n" % (intent, done)
+
+
+class TestIntentEditWiring(Base):
+    """The trial edited an ask's Done-when on GitHub and the Chief of Staff heard nothing: PR 6's change item
+    and toast existed but no webhook called them, and the cached Intent kept the old lines in headers."""
+
+    OLD, NEW = intent_body("Add /health", "returns 200"), intent_body("Add /health", "returns 200 and JSON")
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1},
+                                           "cos": {"role": "chief-of-staff"}})
+        self.gh, self.hub = self.rig.gh, self.rig.hub
+        self.gh.issue(1)
+        self.gh.issue(12, parent=1)
+        self.hub.tick()
+        self.invalidated = []
+        self.rig.world.engine.intents = types.SimpleNamespace(invalidate=lambda n, repo=None: self.invalidated.append((n, repo)))
+
+    def edit(self, old=None, new=None, changes=None):
+        issue = dict(self.gh.issues[12], body=new or self.NEW, updated_at=sb.iso(self.rig.world.clock.now()))
+        payload = {"action": "edited", "issue": issue, "sender": {"login": "you"},
+                   "changes": changes if changes is not None else {"body": {"from": old or self.OLD}}}
+        return self.gh.send("issues", payload)
+
+    def intent_facts(self):
+        return [f for f in self.hub.facts() if f.kind == "intent.edit"]
+
+    def test_an_intent_edit_is_an_old_to_new_item_for_the_chief_of_staff(self):
+        self.assertEqual(self.edit()[0], 202)
+        (fact,) = self.intent_facts()
+        self.assertEqual((fact.recipient, fact.issue, fact.sender), ("cos", 12, "you"))
+        self.assertIn("Done when: returns 200 -> returns 200 and JSON", fact.summary)
+
+    def test_it_also_asks_for_a_toast_through_the_one_toast_path(self):
+        self.edit()
+        ((who, reason, title, body),) = self.hub.toasts()
+        self.assertEqual((who, title), ("cos", "Intent changed on #12"))
+        self.assertIn("returns 200 and JSON", body)
+        self.assertIn("intent edit #12", reason)
+
+    def test_an_edit_that_leaves_the_intent_alone_is_not_surfaced(self):
+        self.edit(new=self.OLD, old=self.OLD)
+        self.edit(changes={"title": {"from": "old title"}})
+        self.assertEqual((self.intent_facts(), self.hub.toasts()), ([], []))
+
+    def test_every_edit_drops_the_cached_intent_so_the_next_header_is_fresh(self):
+        self.edit(changes={"title": {"from": "old title"}})
+        self.assertEqual(self.invalidated, [(12, GH_REPO)])
+
+    def test_delivering_it_forgets_it(self):
+        self.edit()
+        (fact,) = self.intent_facts()
+        self.hub.acknowledge([fact.key])
+        self.assertEqual((self.intent_facts(), self.hub.toasts()), ([], []))
+
+    def test_without_a_chief_of_staff_nothing_is_made_up(self):
+        rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}})
+        rig.gh.issue(1)
+        rig.gh.issue(12, parent=1)
+        rig.hub.tick()
+        rig.world.engine.intents = None
+        issue = dict(rig.gh.issues[12], body=self.NEW, updated_at=sb.iso(rig.world.clock.now()))
+        rig.gh.send("issues", {"action": "edited", "issue": issue, "changes": {"body": {"from": self.OLD}}})
+        self.assertEqual(([f for f in rig.hub.facts() if f.kind == "intent.edit"], rig.hub.toasts()), ([], []))
+
+    def test_through_a_pass_the_chief_of_staff_is_told_once_and_you_get_one_toast(self):
+        self.rig.world.engine.intents = None  # headers are PR 6's own tests; this is about delivery
+        self.edit()
+        self.rig.pump(200)
+        self.rig.pump(100)
+        told = [k for a in self.rig.world.admissions("cos") for k in a["keys"] if k.startswith("intent.edit:")]
+        self.assertEqual(len(told), 1)
+        shown = [a for a in self.rig.world.herdr.calls if a[1:3] == ["notification", "show"]]
+        self.assertEqual(len(shown), 1)
+        self.assertIn("Intent changed on #12", shown[0][3])
+
+
 class TestGithubRouting(Base):
     def setUp(self):
         super().setUp()
