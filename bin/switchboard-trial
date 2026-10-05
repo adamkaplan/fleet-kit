@@ -309,6 +309,50 @@ class Trial:
         except ValueError:
             return False
 
+    def observation(self, name):
+        """{"session", "pane", ...} for an agent a pane is running now, else None."""
+        done = self.run_fleet("pending", name, "--json", check=False)
+        try:
+            return json.loads(done.stdout).get("observation")
+        except ValueError:
+            return None
+
+    def latest_session(self, name):
+        """The newest v2 session whose fleet name is `name`, whether or not any pane runs it. This is
+        what lets a restart, or `up` after `down` or a reboot, keep the conversation."""
+        done = self.wrapper_run("api", "GET", "/api/session", "--param", "limit=200")
+        try:
+            body = json.loads(done.stdout)
+        except ValueError:
+            return None
+        sessions = body.get("data", body) if isinstance(body, dict) else body
+        mine = [s for s in sessions or []
+                if isinstance(s, dict) and ((s.get("metadata") or {}).get("fleet") or {}).get("name") == name]
+        mine.sort(key=lambda s: (s.get("time") or {}).get("created") or 0)
+        return mine[-1]["id"] if mine else None
+
+    def resume(self, workspace, name, session):
+        return json.loads(self.run_fleet("launch", name, "--resume", session, "--workspace", workspace).stdout)
+
+    def close_pane(self, pane, workspace):
+        """Close one agent pane, only if herdr says it is in the trial's workspace."""
+        info = self.proof.herdr("pane", "get", pane)
+        found = (info.get("pane") or info).get("workspace_id")
+        if found != workspace:
+            raise TrialError("refusing to close %s: it is in workspace %r, not the trial's %r" % (pane, found, workspace))
+        self.proof.herdr("pane", "close", pane)
+
+    def ensure_agent(self, name, workspace, directory, repo, charter, fresh=False):
+        """Make sure `name` has a pane. A running one is left alone; one with a session but no pane is
+        resumed on that session (unless `fresh`); only an agent that never existed is created."""
+        if self.observation(name):
+            return "already running"
+        session = None if fresh else self.latest_session(name)
+        if session:
+            return "resumed session %s, pane %s" % (session, self.resume(workspace, name, session)["pane"])
+        agent, role, extra, brief = agent_spec(name, repo, charter)
+        return "created, pane %s" % self.launch(workspace, name, agent, role, directory, extra, brief)["pane"]
+
     def launch(self, workspace, name, agent, role, directory, extra=(), brief=None):
         args = ["launch", name, "--agent", agent, "--dir", str(directory), "--workspace", workspace, "--role", role]
         args += list(extra)
@@ -355,12 +399,24 @@ exec "$LAB/v2/node_modules/@opencode/cli/bin/opencode.exe" "$@"
 # -- commands
 
 CHIEF_BRIEF = None  # you talk to the Chief of Staff; it needs no opening brief
+AGENT_ORDER = ("cos", "platform")
 
 ORCHESTRATOR_BRIEF = """You are the orchestrator `platform`. Your charter is issue #{charter} in {repo}.
 Read it with `gh issue view {charter} --repo {repo}`, then wait. The Chief of Staff (`cos`) will hand you asks
 as sub-issues of your charter; messages from the switchboard carry each ask's Intent and Done when.
 Report to `cos` with `fleet-switchboard send cos --issue <ask> "<text>"`. Do not type into panes.
 """
+
+
+def agent_spec(name, repo, charter):
+    """(opencode agent, role, extra launch args, opening brief) for a trial agent."""
+    if name == "cos":
+        return "chief-of-staff", "chief-of-staff", [], CHIEF_BRIEF
+    if name == "platform":
+        return ("orchestrator", "orchestrator",
+                ["--reports-to", "cos", "--issue", str(charter), "--charter", str(charter)],
+                ORCHESTRATOR_BRIEF.format(repo=repo, charter=charter))
+    raise TrialError("unknown trial agent %r (they are: %s)" % (name, ", ".join(AGENT_ORDER)))
 
 
 def cmd_init(trial, args):
@@ -404,16 +460,33 @@ def cmd_up(trial, args):
     workspace = trial.workspace_id(create=True)
     directory = trial.checkout(repo)
     print("%-22s %s (%s)" % ("workspace", WORKSPACE_LABEL, workspace))
-    if not trial.launched("cos"):
-        done = trial.launch(workspace, "cos", "chief-of-staff", "chief-of-staff", directory, brief=CHIEF_BRIEF)
-        print("%-22s pane %s" % ("cos", done["pane"]))
-    if not trial.launched("platform"):
-        done = trial.launch(workspace, "platform", "orchestrator", "orchestrator", directory,
-                            extra=["--reports-to", "cos", "--issue", str(charter), "--charter", str(charter)],
-                            brief=ORCHESTRATOR_BRIEF.format(repo=repo, charter=charter))
-        print("%-22s pane %s" % ("platform", done["pane"]))
+    for name in AGENT_ORDER:
+        print("%-22s %s" % (name, trial.ensure_agent(name, workspace, directory, repo, charter, fresh=args.fresh)))
     trial.close_spare_pane()
     print("\nReady. Open the %r workspace in herdr and talk to `cos`. See docs/switchboard-trial.md." % WORKSPACE_LABEL)
+    return EXIT_OK
+
+
+def cmd_restart(trial, args):
+    """Reopen agents on their EXISTING sessions: the conversation is kept, and the new process gets
+    the wrapper's current environment (a refreshed token, new role files)."""
+    trial.require_init()
+    names = args.names or list(AGENT_ORDER)
+    for name in names:
+        agent_spec(name, "", 0)  # refuses an unknown name before anything is touched
+    workspace = trial.workspace_id()
+    if not workspace:
+        raise TrialError("no %r workspace: run `switchboard-trial up`" % WORKSPACE_LABEL)
+    print("%-22s %s" % ("v2 service", trial.ensure_service()))
+    for name in names:
+        seen = trial.observation(name)
+        session = (seen or {}).get("session") or trial.latest_session(name)
+        if not session:
+            raise TrialError("%s has no session to restart: run `switchboard-trial up`" % name)
+        if seen:
+            trial.close_pane(seen["pane"], workspace)
+        done = trial.resume(workspace, name, session)
+        print("%-22s session %s, pane %s" % (name, session, done["pane"]))
     return EXIT_OK
 
 
@@ -448,13 +521,16 @@ def build_parser():
     init.add_argument("--charter", type=int, required=True, help="The orchestrator's charter issue number")
     init.add_argument("--model", default=DEFAULT_MODEL, help="provider/model for every agent (default %(default)s)")
     sub.add_parser("login", help="Log the trial's OpenCode into GitHub Copilot (interactive)")
-    sub.add_parser("up", help="Start the service and daemon; launch the Chief of Staff and the orchestrator")
+    up = sub.add_parser("up", help="Start the service and daemon; launch or resume the Chief of Staff and the orchestrator")
+    up.add_argument("--fresh", action="store_true", help="Create new sessions instead of resuming the existing ones")
+    restart = sub.add_parser("restart", help="Reopen agents on their existing sessions (default: all)")
+    restart.add_argument("names", nargs="*", help="Agent names: %s" % ", ".join(AGENT_ORDER))
     sub.add_parser("status", help="What is running")
     sub.add_parser("down", help="Stop the daemon and the v2 service")
     return parser
 
 
-COMMANDS = {"init": cmd_init, "login": cmd_login, "up": cmd_up, "status": cmd_status, "down": cmd_down}
+COMMANDS = {"init": cmd_init, "login": cmd_login, "up": cmd_up, "restart": cmd_restart, "status": cmd_status, "down": cmd_down}
 
 
 def main(argv=None):

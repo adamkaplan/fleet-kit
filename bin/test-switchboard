@@ -1557,7 +1557,7 @@ class FakeV2:
         return {"id": s["id"], "title": s["title"], "metadata": copy.deepcopy(s["metadata"]),
                 "time": {"created": self.clock.ms(s["created"]),
                          "idle": None if s["idle"] is None else self.clock.ms(s["idle"])},
-                "outcome": s["outcome"]}
+                "outcome": s["outcome"], "location": {"directory": s.get("directory")}}
 
     def op_session_get(self, params, body):
         return self._info(self._session(params))
@@ -3508,6 +3508,72 @@ class TestLaunch(Base):
                 calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
                          and isinstance(n.func, ast.Name) and n.func.id == "close_own_pane"]
                 self.assertEqual(len(calls), 1)  # guarded by `if pane`: only what it opened
+        for function in ast.walk(tree):
+            if isinstance(function, ast.FunctionDef) and function.name == "resume_agent":
+                calls = [n for n in ast.walk(function) if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name) and n.func.id == "close_own_pane"]
+                self.assertEqual(len(calls), 1)  # a restart closes only the pane it opened itself
+
+    def gone(self, name="platform"):
+        """The agent's pane is closed (its TUI quit); its session lives on in v2."""
+        session, pane = self.world.sessions[name], self.world.panes[name]
+        self.world.v2.sessions[session]["directory"] = str(self.work)  # a real session always has one
+        del self.world.herdr.panes[pane]
+        return session
+
+    def test_resume_opens_a_tab_on_the_same_session_and_creates_and_sends_nothing(self):
+        session = self.gone()
+        sessions, messages = set(self.world.v2.sessions), len(self.world.v2.sessions[session]["messages"])
+        done = sb.resume_agent(self.engine, "platform", session, "w1", patience=5, sleep=self.sleep)
+        self.assertEqual(done["session"], session)
+        self.assertEqual(set(self.world.v2.sessions), sessions, "no new session")
+        self.assertEqual(len(self.world.v2.sessions[session]["messages"]), messages, "no brief, no prompt")
+        method, params = self.world.herdr.socket_calls[-1]
+        self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
+                         ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
+        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        found = self.engine.discover(self.world.clock.now()).agents["platform"]
+        self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
+        self.assertEqual(self.world.herdr.typing_attempts, [])
+
+    def test_resume_refuses_a_session_that_belongs_to_someone_else(self):
+        other = self.world.add_agent("coder3", fleet={"role": "coder"})
+        self.gone("platform")
+        with self.assertRaises(sb.LaunchError) as caught:
+            sb.resume_agent(self.engine, "platform", self.world.sessions["coder3"], "w1", patience=2, sleep=self.sleep)
+        self.assertIn("belongs to", str(caught.exception))
+        self.assertEqual(self.world.herdr.socket_calls, [])
+
+    def test_resume_refuses_while_the_agent_still_has_a_pane(self):
+        self.world.v2.sessions[self.world.sessions["platform"]]["directory"] = str(self.work)
+        with self.assertRaises(sb.LaunchError) as caught:
+            sb.resume_agent(self.engine, "platform", self.world.sessions["platform"], "w1", patience=2, sleep=self.sleep)
+        self.assertIn("already runs", str(caught.exception))
+        self.assertEqual(self.world.herdr.socket_calls, [])
+
+    def test_a_resume_that_fails_verification_closes_only_its_own_pane(self):
+        session = self.gone()
+        self.world.herdr.launch_mode = "shell"
+        before = set(self.world.herdr.panes)
+        with self.assertRaises(sb.LaunchError) as caught:
+            sb.resume_agent(self.engine, "platform", session, "w1", patience=2, sleep=self.sleep)
+        self.assertIn("is untouched", str(caught.exception))
+        self.assertEqual(len(self.world.herdr.closed), 1)
+        self.assertNotIn(self.world.herdr.closed[0], before)
+
+    def test_the_cli_resumes_by_session_and_a_plain_launch_still_needs_agent_and_dir(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        session = self.gone()
+        with captured() as (out, err):
+            code = sb.main(["launch", "platform", "--resume", session], runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual((code, json.loads(out.getvalue())["session"]), (0, session), err.getvalue())
+        with captured() as (out, err):
+            code = sb.main(["launch", "coder9"], runner=self.world.route, now=self.world.clock.now,
+                           socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--agent and --dir", err.getvalue())
 
     def test_the_cli_takes_the_workspace_from_the_pane_it_runs_in(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -11269,9 +11335,88 @@ class TestTrialDriver(Base):
             self.assertIn("started", trial.ensure_service())
         self.assertEqual(calls[-1], (("service", "start"), {}), "no environment is passed: the wrapper builds it")
 
-    def test_the_parser_knows_its_five_commands(self):
+    def restart_rig(self, running=("cos", "platform"), sessions=None):
+        """A trial whose agents, sessions and herdr are stubs that record what the driver does."""
+        trial = self.trial()
+        trial.root.mkdir(parents=True, exist_ok=True)
+        trial.save({"repo": "o/r", "charter": 1})
+        sessions = sessions if sessions is not None else {"cos": "ses_cos", "platform": "ses_platform"}
+        panes = {"cos": "wT:p2", "platform": "wT:p3"}
+        log = []
+        trial.observation = lambda name: {"session": sessions[name], "pane": panes[name]} if name in running else None
+        trial.latest_session = lambda name: sessions.get(name)
+        trial.workspace_id = lambda create=False: "wT"
+        trial.ensure_service = lambda: "already running"
+        trial.close_pane = lambda pane, workspace: log.append(("close", pane, workspace))
+        trial.resume = lambda workspace, name, session: log.append(("resume", name, session)) or {"pane": "wT:p9"}
+        trial.launch = lambda *a, **k: log.append(("launch", a[1])) or {"pane": "wT:p8"}
+        return trial, log
+
+    def run_restart(self, trial, names):
+        with mock.patch.object(TRIAL, "Trial", return_value=trial), captured():
+            return TRIAL.cmd_restart(trial, types.SimpleNamespace(names=names))
+
+    def test_restart_closes_each_pane_then_reopens_the_same_session(self):
+        trial, log = self.restart_rig()
+        self.run_restart(trial, [])
+        self.assertEqual(log, [("close", "wT:p2", "wT"), ("resume", "cos", "ses_cos"),
+                               ("close", "wT:p3", "wT"), ("resume", "platform", "ses_platform")])
+
+    def test_restart_of_one_agent_touches_only_that_one(self):
+        trial, log = self.restart_rig()
+        self.run_restart(trial, ["platform"])
+        self.assertEqual(log, [("close", "wT:p3", "wT"), ("resume", "platform", "ses_platform")])
+
+    def test_restart_after_down_resumes_the_session_without_closing_anything(self):
+        trial, log = self.restart_rig(running=())
+        self.run_restart(trial, ["cos"])
+        self.assertEqual(log, [("resume", "cos", "ses_cos")])
+
+    def test_restart_refuses_an_agent_that_never_existed_and_an_unknown_name(self):
+        trial, log = self.restart_rig(running=(), sessions={})
+        with self.assertRaises(TRIAL.TrialError) as caught:
+            self.run_restart(trial, ["cos"])
+        self.assertIn("run `switchboard-trial up`", str(caught.exception))
+        with self.assertRaises(TRIAL.TrialError):
+            self.run_restart(trial, ["stranger"])
+        self.assertEqual(log, [])
+
+    def test_a_pane_outside_the_trials_workspace_is_never_closed(self):
+        trial = self.trial()
+        with mock.patch.object(trial.proof, "herdr", lambda *a, **k: {"pane": {"workspace_id": "wLIVE"}}
+                               if a[:2] == ("pane", "get") else self.fail("closed %r" % (a,))):
+            with self.assertRaises(TRIAL.TrialError) as caught:
+                trial.close_pane("wLIVE:p1", "wT")
+        self.assertIn("refusing to close", str(caught.exception))
+
+    def test_up_resumes_an_agent_that_has_a_session_and_no_pane_and_creates_one_that_never_existed(self):
+        trial, log = self.restart_rig(running=("platform",), sessions={"cos": "ses_cos", "platform": "ses_platform"})
+        self.assertIn("resumed session ses_cos", trial.ensure_agent("cos", "wT", "/d", "o/r", 1))
+        self.assertEqual(trial.ensure_agent("platform", "wT", "/d", "o/r", 1), "already running")
+        trial2, log2 = self.restart_rig(running=(), sessions={})
+        self.assertIn("created", trial2.ensure_agent("cos", "wT", "/d", "o/r", 1))
+        self.assertEqual(log2, [("launch", "cos")])
+
+    def test_up_fresh_creates_a_new_session_even_when_one_exists(self):
+        trial, log = self.restart_rig(running=(), sessions={"cos": "ses_cos"})
+        self.assertIn("created", trial.ensure_agent("cos", "wT", "/d", "o/r", 1, fresh=True))
+        self.assertEqual(log, [("launch", "cos")])
+
+    def test_the_newest_session_with_the_agents_name_is_the_one_resumed(self):
+        trial = self.trial()
+        body = {"data": [{"id": "ses_old", "time": {"created": 1}, "metadata": {"fleet": {"name": "cos"}}},
+                         {"id": "ses_new", "time": {"created": 9}, "metadata": {"fleet": {"name": "cos"}}},
+                         {"id": "ses_other", "time": {"created": 99}, "metadata": {"fleet": {"name": "platform"}}},
+                         {"id": "ses_plain", "time": {"created": 99}, "metadata": None}]}
+        done = subprocess.CompletedProcess([], 0, json.dumps(body), "")
+        with mock.patch.object(TRIAL.Trial, "wrapper_run", return_value=done):
+            self.assertEqual(trial.latest_session("cos"), "ses_new")
+            self.assertIsNone(trial.latest_session("coder"))
+
+    def test_the_parser_knows_its_commands(self):
         parser = TRIAL.build_parser()
-        for argv in (["init", "--repo", "o/r", "--charter", "1"], ["login"], ["up"], ["status"], ["down"]):
+        for argv in (["init", "--repo", "o/r", "--charter", "1"], ["login"], ["up"], ["up", "--fresh"], ["restart"],
+                     ["restart", "cos"], ["status"], ["down"]):
             self.assertIn(parser.parse_args(argv).action, TRIAL.COMMANDS)
 
     def test_the_service_port_is_not_the_labs(self):

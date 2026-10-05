@@ -63,6 +63,8 @@ Once ever: `init`, then `login`. After that, one command per session:
 |---|---|---|
 | Start, or after a reboot | `bin/switchboard-trial up` | Starts whatever is not running: the v2 service, the daemon, the workspace, `cos` and `platform`. |
 | Run it again while things are up | `up` | Nothing to the parts that are running. It never restarts the v2 service, which would cut the panes off mid-turn. |
+| After `down` or a reboot | `up` | Reopens `cos` and `platform` on their **existing sessions**, so the conversation is kept. `up --fresh` creates new sessions instead. |
+| An agent needs a fresh process | `bin/switchboard-trial restart [cos] [platform]` | Closes the agent's pane and reopens it on the **same session**. Use it after updating the kit or the token: a new process gets the wrapper's current environment and the current role files. No names means both. |
 | Stop | `bin/switchboard-trial down` | Stops the daemon and the service. Closing the workspace is yours. |
 
 Not needed each time: logging in again, setting up the repo, or exporting the

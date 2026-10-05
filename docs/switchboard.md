@@ -1641,4 +1641,10 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     either (as `outside_intent` already could not); `hard_to_reverse` and
     `speaks_for_you` still do. A wildcard allow was tried and rejected: it
     overrides an agent's `edit: deny`.
+  - **`restart`.** `launch --resume SESSION` opens a tab on an existing session
+    (it checks the session is the named agent's, creates nothing and sends no
+    brief), and `switchboard-trial restart` uses it to close an agent's pane and
+    reopen the same session. `up` now resumes an agent that has a session but no
+    pane, so `down` and reboots no longer discard a conversation (`up --fresh`
+    does). The driver only closes a pane herdr places in the trial's workspace.
 

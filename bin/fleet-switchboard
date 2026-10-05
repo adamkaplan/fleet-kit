@@ -2370,6 +2370,46 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
 
 
+def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep):
+    """Open a new tab on a fleet agent's EXISTING session: a restart that keeps its conversation.
+
+    The session must carry metadata.fleet.name == `name` (so a wrong id cannot start someone
+    else's session under this name), and no pane may already run `name`. Nothing is created in
+    v2 and no brief is sent; the pane is proved to run this session before this returns. A
+    failure after the pane opened closes that pane and no other.
+    """
+    if not NAME_RE.match(name or "") or not workspace:
+        raise LaunchError("resume needs a valid name and a target workspace (got name %r, workspace %r)"
+                          % (name, workspace))
+    session = engine.v2.session_get(session_id)
+    fleet = (session.get("metadata") or {}).get("fleet") or {}
+    directory = ((session.get("location") or {}).get("directory")) or session.get("directory")
+    if fleet.get("name") != name:
+        raise LaunchError("session %s belongs to %r, not %r: refusing to start it under this name"
+                          % (session_id, fleet.get("name"), name))
+    if not directory or not os.path.isabs(directory):
+        raise LaunchError("session %s has no working directory to open the tab in" % session_id)
+    taken = engine.discover(engine.now()).agents.get(name)
+    if taken is not None:
+        raise LaunchError("a fleet agent named %s already runs in pane %s: close it first" % (name, taken.pane))
+    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    argv = [engine.config["opencode"], "-s", session_id]
+    pane = None
+    try:
+        with engine._external("herdr.layout.apply", name, {
+                "workspace": workspace, "label": name, "cwd": directory, "argv": argv,
+                "env_names": sorted(env), "session": session_id, "resume": True}) as result:
+            opened = engine.herdr.open_tab_running(workspace, name, directory, argv, env)
+            pane = result["pane"] = opened["pane_id"]
+            result["tab"] = opened["tab_id"]
+        wait_until_verified(engine, pane, session_id, patience, sleep)
+    except Exception as err:
+        left = close_own_pane(engine, name, pane, "resume failed: %s" % _one_line(str(err), 120)) if pane \
+            else "no pane was opened"
+        raise LaunchError("%s (session %s is untouched; %s)" % (_one_line(str(err)), session_id, left)) from err
+    return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
 # ======================================================================
 # PR 8: foreground and background
 #
@@ -4299,8 +4339,14 @@ def read_brief(path, stdin):
 
 def cmd_launch(args, runner, now, socket_call=None):
     workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
-    brief = read_brief(args.brief_file, sys.stdin)
     engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    if args.resume:
+        done = resume_agent(engine, args.name, args.resume, workspace)
+        print(json.dumps(done, sort_keys=True))
+        return EXIT_OK
+    if not args.agent or not args.dir:
+        raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    brief = read_brief(args.brief_file, sys.stdin)
     done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                         args.issue, brief, charter=args.charter)
     print(json.dumps(done, sort_keys=True))
@@ -6463,8 +6509,10 @@ def build_parser():
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
     launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
-    launch.add_argument("--agent", required=True, help="The OpenCode agent definition, such as coder")
-    launch.add_argument("--dir", required=True, help="The agent's working directory (absolute)")
+    launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
+    launch.add_argument("--dir", help="The agent's working directory (absolute)")
+    launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
+                                                           "of creating one (a restart that keeps the conversation)")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
