@@ -163,14 +163,14 @@ class Trial:
         if proof.write_if_changed(str(self.wrapper), self.wrapper_text()):
             os.chmod(self.wrapper, 0o755)
             report["wrapper"] = "written"
-        opencode_json = {"$schema": "https://opencode.ai/config.json", "update": "disable", "share": "disabled",
-                         "model": model}
+        opencode_json = self.opencode_config(model)
         proof.write_if_changed(os.path.join(self.lab.opencode_config, "opencode.json"),
                                json.dumps(opencode_json, indent=2) + "\n")
         for name in AGENTS:
             text = (REPO_ROOT / "agents" / "opencode" / (name + ".md")).read_text()
             proof.write_if_changed(os.path.join(self.lab.opencode_config, "agents", name + ".md"),
                                    proof.agent_copy(text, model))
+        self.install_skills()
         plugin = (REPO_ROOT / "plugins" / "fleet-hooks" / "index.js").read_text()
         proof.write_if_changed(os.path.join(self.lab.opencode_config, "plugins", "fleet-hooks.js"), plugin)
         done = self.wrapper_run("service", "set", "port", str(SERVICE_PORT))
@@ -195,6 +195,27 @@ class Trial:
         self.save(dict(self.settings(), repo=repo, charter=charter, model=model))
         report["switchboard config"] = str(self.switchboard_config)
         return report
+
+    def skills_dir(self):
+        return self.root / "skills"
+
+    def opencode_config(self, model):
+        """The trial's opencode.json. `skills.paths` is how the kit's skills reach the agents: v2 scans
+        the real home for skills even under the trial's HOME, so the live fleet's (older) copy of a
+        skill of the same name would otherwise win. A configured path is read after those and wins."""
+        return {"$schema": "https://opencode.ai/config.json", "update": "disable", "share": "disabled",
+                "model": model, "skills": {"paths": [str(self.skills_dir())]}}
+
+    def install_skills(self):
+        """Copy the kit's skills into the trial's own skills directory."""
+        installed = []
+        for skill in sorted((REPO_ROOT / "skills").iterdir()):
+            if (skill / "SKILL.md").is_file():
+                target = self.skills_dir() / skill.name
+                os.makedirs(target, exist_ok=True)
+                self.proof.write_if_changed(str(target / "SKILL.md"), (skill / "SKILL.md").read_text())
+                installed.append(skill.name)
+        return installed
 
     def write_gitconfig(self):
         """git in an agent's shell (HOME is the trial's) pushes through gh's credential helper,

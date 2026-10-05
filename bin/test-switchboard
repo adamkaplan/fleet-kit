@@ -11413,6 +11413,22 @@ class TestTrialDriver(Base):
             self.assertEqual(trial.latest_session("cos"), "ses_new")
             self.assertIsNone(trial.latest_session("coder"))
 
+    def test_the_kits_skills_are_installed_in_the_trial_and_the_config_points_at_them(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        names = trial.install_skills()
+        self.assertIn("fleet-charter", names)
+        self.assertEqual((trial.skills_dir() / "fleet-charter" / "SKILL.md").read_text(),
+                         (REPO / "skills" / "fleet-charter" / "SKILL.md").read_text())
+        self.assertEqual(trial.opencode_config("p/m")["skills"], {"paths": [str(trial.skills_dir())]})
+        self.assertFalse(str(trial.skills_dir()).startswith(os.path.expanduser("~/.agents")))
+
+    def test_the_charter_skill_does_not_tell_a_switchboard_agent_to_ack_a_wake(self):
+        text = " ".join((REPO / "skills" / "fleet-charter" / "SKILL.md").read_text().split())
+        self.assertIn("A `[switchboard]` message has no acknowledgement", text)
+        self.assertIn("Only a message starting `Heartbeat` expects an acknowledgement", text)
+        self.assertNotIn("If your fleet runs a heartbeat that expects an acknowledgement, send exactly one", text)
+
     def test_the_parser_knows_its_commands(self):
         parser = TRIAL.build_parser()
         for argv in (["init", "--repo", "o/r", "--charter", "1"], ["login"], ["up"], ["up", "--fresh"], ["restart"],

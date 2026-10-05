@@ -1647,4 +1647,13 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     reopen the same session. `up` now resumes an agent that has a session but no
     pane, so `down` and reboots no longer discard a conversation (`up --fresh`
     does). The driver only closes a pane herdr places in the trial's workspace.
+  - **The agents were reading the live fleet's skills.** `platform` followed
+    `fleet-charter` section 4 and tried to ack a wake. Two causes: the kit's
+    skill still said to ack unconditionally in effect, and v2 scans the real
+    home for skills even with `HOME` replaced (issue #16 Q3, now confirmed), so
+    the live, older copy of a skill with the same name won. The skill now says
+    only a `Heartbeat` message expects an ack, and the trial installs the kit's
+    skills into its own `skills/` directory and lists it under `skills.paths`,
+    which is read last and wins. The live skills are still visible to the
+    trial's agents; only same-named ones are overridden.
 

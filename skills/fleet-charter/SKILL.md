@@ -173,11 +173,13 @@ Pane addresses are only unique within one herdr server. A `wN:pN` from another
 machine is a different agent wearing the same name, which is the other reason the
 label prefix is not optional.
 
-If your fleet runs a heartbeat that expects an acknowledgement, send exactly one
-per wake and let the cadence tell the truth: short when work is in flight, long
-when there is genuinely nothing to do. Acking idle while your charter still has
-open sub-issues is how you idle yourself out of existence — the failure mode that
-looks healthiest from the outside.
+Only a message starting `Heartbeat` expects an acknowledgement, and it states the
+exact `heartbeat-ack` command; send exactly one per such wake and let the cadence
+tell the truth: short when work is in flight, long when there is genuinely nothing
+to do. A `[switchboard]` message has no acknowledgement and no cadence, and
+`heartbeat-ack` does not apply to you under it. Either way, going quiet while your
+charter still has open sub-issues is how you idle yourself out of existence — the
+failure mode that looks healthiest from the outside.
 
 ## 5. Hand back at completion
 
