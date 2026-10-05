@@ -1048,6 +1048,7 @@ class Switchboard:
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
+        self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
         for source in self.sources:
             bind = getattr(source, "bind", None)
             if bind:
@@ -2991,6 +2992,7 @@ def finish_pass(engine, discovery, report):
         prune_delivered_reminders(engine, discovery)
     except Exception as err:
         engine._failed("reminders", "reminders", err, report)
+    schedule_judge_warm(engine, discovery)
 
 
 # ---- reminders
@@ -4351,6 +4353,8 @@ def cmd_run(args, runner, now, wait):
         return EXIT_OK if not report["errors"] else EXIT_ERROR
     hub = attach_github(engine, config, state, runner, now)
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
+    if judge_server is not None:
+        engine.judge_warm = make_judge_warmer(config, runner, now)
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait)
     except KeyboardInterrupt:
@@ -4973,7 +4977,7 @@ POLICY_PASS_THROUGH = ("read", "glob", "grep", "skill")  # never judged, never s
 POLICY_REQUEST_OUTCOMES = ("allow", "ask", "deny")       # what the plugin can configure and be told
 POLICY_DEFAULTS = {
     "enabled": False,       # off until the plugin is installed and a `jev` object is configured
-    "budget_ms": 900,       # the whole judgement, ask lookup included; no answer in time keeps the configured outcome
+    "budget_ms": 1500,      # the whole judgement; no answer in time keeps the configured outcome. Jev alone ran to ~1 s in the trial
     "thresholds": {},       # question id -> probability at which it fires (default POLICY_THRESHOLD)
     "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
     "cache_entries": 200,   # entries kept in each cache file
@@ -5369,8 +5373,8 @@ class PolicyJudge:
 
     # -- the pieces
 
-    def identify(self, session):
-        known = _valid_session_fleet(self.contexts.get("session:" + session))
+    def identify(self, session, refresh=False):
+        known = None if refresh else _valid_session_fleet(self.contexts.get("session:" + session))
         if known is not None:
             return known
         fleet = _fleet_meta(self.v2.session_get(session))
@@ -5380,11 +5384,20 @@ class PolicyJudge:
         self.contexts.put("session:" + session, {"fleet": kept})
         return kept
 
-    def context_of(self, fleet):
+    def warm(self, session):
+        """Refresh one agent's identity and ask context ahead of its next tool call. Each lookup is a
+        `gh` round trip (about half a second here), and an orchestrator needs several: cold, the first
+        calls ran out of budget and went through unjudged."""
+        fleet = self.identify(session, refresh=True)
+        if fleet is not None:
+            self.context_of(fleet, refresh=True)
+        return fleet
+
+    def context_of(self, fleet, refresh=False):
         if self.reader is None:
             return {"issue": None, "intent": None, "done_when": None, "authority": None}
         key = "ask:%s:%s:%s" % (fleet.get("repo") or self.reader.repo, fleet.get("issue"), fleet.get("charter"))
-        known = _valid_context(self.contexts.get(key))
+        known = None if refresh else _valid_context(self.contexts.get(key))
         if known is not None:
             return known
         context = resolve_policy_context(self.reader, fleet)
@@ -5446,6 +5459,39 @@ def build_policy_judge(config, runner, now):
     jev = build_jev(dict(config, jev=jev_settings))
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS))
     return PolicyJudge(config, v2, intent_reader_for(config, runner, now), jev, AuditLog(state / "audit.jsonl"), state, now)
+
+
+def make_judge_warmer(config, runner, now):
+    """warm(sessions): refresh each session's judge context, errors counted and audited once, never raised."""
+    def warm(sessions):
+        done = failed = 0
+        try:
+            judge = build_policy_judge(config, runner, now)
+            for session in sessions:
+                try:
+                    judge.warm(session)
+                    done += 1
+                except Exception:
+                    failed += 1
+            judge.audit.append(POLICY_ACTOR, "policy.warm", "judge", {"sessions": done, "failed": failed})
+        except Exception as err:
+            sys.stderr.write("%s: judge warm-up skipped: %s\n" % (PROG, _one_line(str(err), 120)))
+    return warm
+
+
+def schedule_judge_warm(engine, discovery):
+    """Between passes, now and then, warm the judge for every fleet agent with a session, off the pass's
+    thread. At half the cache lifetime, so a context is refreshed before it expires."""
+    warm = getattr(engine, "judge_warm", None)
+    if warm is None or discovery is None or engine.now() < engine._warm_due:
+        return
+    ttl = engine.config["policy"]["cache_seconds"] if engine.config.get("policy") else 0
+    if not ttl:
+        return
+    engine._warm_due = engine.now() + max(15, ttl / 2)
+    sessions = sorted({o.session_id for o in discovery.agents.values() if o.session_id})
+    if sessions:
+        threading.Thread(target=warm, args=(sessions,), daemon=True).start()
 
 
 # ------------------------------------------- the judge socket: the daemon holds the key

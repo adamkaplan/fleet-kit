@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 export const OUTCOMES = ["allow", "ask", "deny"]; // least to most strict
-export const DEFAULT_TIMEOUT_MS = 1500; // the CLI's own budget is 900 ms; this is that plus slack
+export const DEFAULT_TIMEOUT_MS = 2500; // the CLI's own budget is 1500 ms; this is that plus slack
 const REASON_LIMIT = 600;
 
 // The permission `action` names this plugin forwards, exactly as v2 reports

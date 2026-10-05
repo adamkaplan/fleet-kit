@@ -1681,4 +1681,14 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     the old-to-new item and, through the render step's one toast path, a toast.
     Checked live: the next message carried the new Done when, the item showed
     old to new, herdr reported the toast shown.
+  - **The judge failed open on a cold orchestrator (scenario run, live).**
+    `platform` ran `gh workflow run deploy.yml` and the judge allowed it,
+    unjudged: each of its calls spent the whole 900 ms resolving the ask (a `gh`
+    round trip is about half a second, and an orchestrator needs several) or
+    waiting for Jev, which ran to about a second. The daemon now warms every
+    fleet agent's identity and ask context in the background, at half the cache
+    lifetime, so a call finds them cached; the default budget is 1500 ms, and the
+    plugin's own timeout 2500 ms. Also seen live: both agents run with the
+    TUI's auto-accept on, which answers every `ask` itself, so the judge's asks
+    have no effect there; only a deny stops anything.
 

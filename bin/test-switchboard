@@ -8829,7 +8829,7 @@ EXPECT_EXAMPLES["policy_outcome"] = {"agent": "coder", "step": 0, "outcome": "as
 class TestPolicyConfig(Base):
     def test_off_by_default_with_documented_defaults(self):
         policy = sb.validate_config({})["policy"]
-        self.assertEqual(policy, {"enabled": False, "budget_ms": 900, "thresholds": {}, "cache_seconds": 300,
+        self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": {}, "cache_seconds": 300,
                                   "cache_entries": 200})
 
     def check_rejected(self, policy, fragment, **extra):
@@ -9213,6 +9213,87 @@ class TestJudgeTool(PolicyCase):
         self.assertEqual((reply["outcome"], reply["judged"]), ("allow", False))
 
 
+class TestJudgeWarmUp(PolicyCase):
+    """The trial's orchestrator ran `gh workflow run deploy.yml` unjudged: each call spent its whole budget
+    resolving the ask over `gh`, so the configured outcome (allow) stood. The daemon now warms the caches."""
+
+    def judge(self):
+        return sb.build_policy_judge(sb.load_config(), self.route, self.world.clock.now)
+
+    def test_a_warmed_agents_next_call_makes_no_gh_round_trips(self):
+        session = self.world.sessions["orch"]
+        self.judge().warm(session)
+        warmed = len(self.gh.calls)
+        self.assertGreater(warmed, 0, "the warm-up is what reads GitHub")
+        self.assertTrue(self.judge_tool(self.orch)["judged"])
+        self.assertEqual(len(self.gh.calls), warmed, "the call itself needed nothing from GitHub")
+
+    def test_without_the_warm_up_the_first_call_pays_for_the_lookups(self):
+        before = len(self.gh.calls)
+        self.judge_tool(self.orch)
+        self.assertGreater(len(self.gh.calls), before)
+
+    def test_a_warm_up_refreshes_a_cached_context_it_does_not_trust_it(self):
+        session = self.world.sessions["orch"]
+        judge = self.judge()
+        judge.warm(session)
+        first = len(self.gh.calls)
+        judge.warm(session)
+        self.assertGreater(len(self.gh.calls), first, "a warm context is re-read before it expires")
+
+    def test_an_agent_that_is_not_a_fleet_agent_warms_to_nothing(self):
+        self.assertIsNone(self.judge().warm(self.plain))
+
+
+class TestScheduleJudgeWarm(Base):
+    def rig(self, ttl=300, warmer=True):
+        world = World(self, agents=("a", "b"))
+        engine = world.engine
+        engine.config = dict(engine.config, policy={"cache_seconds": ttl})
+        calls, done = [], threading.Event()
+        if warmer:
+            def warm(sessions):
+                calls.append(list(sessions))
+                done.set()
+            engine.judge_warm = warm
+        return world, engine, calls, done
+
+    def schedule(self, world, engine, done):
+        done.clear()
+        sb.schedule_judge_warm(engine, engine.discover(world.clock.now()))
+        done.wait(1)
+
+    def test_it_warms_every_session_once_then_waits_half_the_cache_lifetime(self):
+        world, engine, calls, done = self.rig()
+        self.schedule(world, engine, done)
+        self.assertEqual(calls, [sorted(world.sessions.values())])
+        world.tick(60)
+        self.schedule(world, engine, done)
+        self.assertEqual(len(calls), 1, "not again within half of 300 s")
+        world.tick(100)
+        self.schedule(world, engine, done)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_daemon_pass_starts_the_warm_up(self):
+        world, engine, calls, done = self.rig()
+        engine.run_pass()
+        self.assertTrue(done.wait(2))
+        self.assertEqual(calls, [sorted(world.sessions.values())])
+
+    def test_it_does_nothing_without_a_warmer_or_with_the_cache_off(self):
+        for kwargs in ({"warmer": False}, {"ttl": 0}):
+            with self.subTest(kwargs=kwargs):
+                world, engine, calls, done = self.rig(**kwargs)
+                self.schedule(world, engine, done)
+                self.assertEqual(calls, [])
+
+    def test_a_failing_warmer_never_breaks_the_pass(self):
+        warm = sb.make_judge_warmer({"opencode": None, "policy": {"cache_seconds": 300}}, subprocess.run, time.time)
+        with captured() as (out, err):
+            warm(["ses_x"])  # no opencode configured: the judge cannot be built, and that is only reported
+        self.assertIn("skipped", err.getvalue())
+
+
 class TestJudgeToolNeverLoosens(PolicyCase):
     """Invariant 9, end to end through the CLI, with a decision model that does everything wrong."""
 
@@ -9387,7 +9468,7 @@ class TestJudgeToolBudget(PolicyCase):
         self.assertIn("resolving the ask", reply["reason"])
 
     def test_the_budget_is_the_config_value(self):
-        self.assertEqual(self.direct_judge(FakeJev(noul_answers(**LOW))).settings["budget_ms"], 900)
+        self.assertEqual(self.direct_judge(FakeJev(noul_answers(**LOW))).settings["budget_ms"], 1500)
 
 
 class TestJudgeToolCache(PolicyCase):
@@ -10029,7 +10110,7 @@ class TestFleetHooksPlugin(Base):
         self.assertIsNone(none["bin"])
         self.assertIsNone(empty["bin"])
         self.assertEqual((given["bin"], given["timeoutMs"]), ("/abs/x", 250))
-        self.assertEqual(bad_timeout["timeoutMs"], 1500)
+        self.assertEqual(bad_timeout["timeoutMs"], 2500)
 
     def test_registration_is_one_evaluate_hook_and_only_when_configured(self):
         registration = self.results["registration"]

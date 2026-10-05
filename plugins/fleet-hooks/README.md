@@ -23,7 +23,7 @@ may hold the OpenRouter key:
 
 So the requirement is: the daemon runs with the key variable set, v2 does not.
 With the daemon down, the socket missing, or no answer within
-`policy.budget_ms` (default 900), the configured outcome stands. The daemon
+`policy.budget_ms` (default 1500), the configured outcome stands. The daemon
 opens the socket only when the switchboard config has `jev` and
 `policy.enabled: true`.
 
@@ -45,7 +45,7 @@ Give v2's environment `FLEET_SWITCHBOARD_BIN`, the absolute path of
 | Variable | Meaning |
 |---|---|
 | `FLEET_SWITCHBOARD_BIN` | Absolute path of `bin/fleet-switchboard`. Unset or relative: the plugin does nothing, and tool calls follow the configured rules alone. It is never looked up on `PATH`. |
-| `FLEET_HOOKS_TIMEOUT_MS` | Hard limit on one call, default 1500. Keep it above `policy.budget_ms`. When it passes, the child is killed and the configured outcome stands. |
+| `FLEET_HOOKS_TIMEOUT_MS` | Hard limit on one call, default 2500. Keep it above `policy.budget_ms`. When it passes, the child is killed and the configured outcome stands. |
 
 ## Shape (measured in the Lab, v2 2.0.22)
 
