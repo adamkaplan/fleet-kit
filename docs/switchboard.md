@@ -1699,4 +1699,11 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     conservative and quote-aware, so any substitution, operator, redirect, glob or
     extra line sends the command back to normal judging, and `launch`, `handoff`
     and `import-v1`, which act, stay judged.
+  - **A pass took 2.7 s, and the notice lost its race by three (scenario run,
+    live).** herdr lists every pane of every workspace, so the trial's daemon asked
+    its v2 about all fifteen of the live fleet's sessions on every pass: eleven
+    `session.get` calls, two seconds. A decoration decided at :53 was written at
+    :58, after the Chief of Staff had consumed the message and gone idle. A session
+    that is no fleet agent (no fleet metadata, or one v2 does not have) is now
+    remembered for 120 s; a fleet agent and a transient error never are.
 

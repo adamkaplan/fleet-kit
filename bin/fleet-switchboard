@@ -1049,6 +1049,7 @@ class Switchboard:
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
+        self._not_fleet = {}  # session id -> until when it is believed to be no fleet agent (in memory only)
         for source in self.sources:
             bind = getattr(source, "bind", None)
             if bind:
@@ -1091,15 +1092,26 @@ class Switchboard:
                 return created
         return None
 
+    NOT_FLEET_SECONDS = 120  # how long "this session is no fleet agent" is believed
+
     def _observe_entry(self, entry, now):
         """An Observation for one herdr agent, or None when it is not a fleet agent."""
         session_id = agent_session(entry)
         if session_id is None:
             return None
-        info = self.v2.session_get(session_id) or {}
+        if self._not_fleet.get(session_id, 0) > now:
+            return None  # asked recently and it was not one: herdr lists every pane of every workspace
+        try:
+            info = self.v2.session_get(session_id) or {}
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS  # a pane of someone else's OpenCode
+            raise
         fleet = _fleet_meta(info)
         if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
+            self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS
             return None
+        self._not_fleet.pop(session_id, None)
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
                                   STATUS.get(entry.get("agent_status"), "unknown"), fleet,

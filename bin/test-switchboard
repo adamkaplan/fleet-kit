@@ -9288,6 +9288,49 @@ class TestJudgeWarmUp(PolicyCase):
         self.assertIsNone(self.judge().warm(self.plain))
 
 
+class TestNotFleetSessionsAreNotAskedAboutEveryPass(Base):
+    """The live herdr lists every pane of every workspace. The trial's daemon asked its v2 about all fifteen,
+    every pass: 2.7 s a pass, which is why a decoration landed after the step boundary."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.engine = self.world.engine
+        self.plain = self.world.v2.create_session({})  # no metadata.fleet
+        self.entry = {"pane_id": "wZ:p9", "agent": "opencode", "agent_status": "idle",
+                      "agent_session": {"kind": "id", "value": self.plain}}
+
+    def gets(self, session):
+        return len([c for c in self.world.v2.calls if "session.get" in c and "sessionID=" + session in c])
+
+    def test_a_session_that_is_no_fleet_agent_is_asked_about_once_in_a_while(self):
+        for _ in range(3):
+            self.engine.discover(self.world.clock.now(), entries=[self.entry])
+        self.assertEqual(self.gets(self.plain), 1)
+        self.world.tick(self.engine.NOT_FLEET_SECONDS + 1)
+        self.engine.discover(self.world.clock.now(), entries=[self.entry])
+        self.assertEqual(self.gets(self.plain), 2, "believed for a while, not for ever")
+
+    def test_a_session_v2_does_not_have_is_remembered_too_but_an_unreachable_v2_is_not(self):
+        ghost = dict(self.entry, agent_session={"kind": "id", "value": "ses_neverexisted"})
+        for _ in range(3):
+            self.engine.discover(self.world.clock.now(), entries=[ghost])
+        self.assertEqual(self.gets("ses_neverexisted"), 1)
+        real = self.engine.v2.session_get
+        self.engine.v2.session_get = lambda s: (_ for _ in ()).throw(sb.V2Error("timeout", None, "slow"))
+        found = self.engine.discover(self.world.clock.now(), entries=[dict(self.entry, agent_session={"kind": "id", "value": "ses_other"})])
+        self.assertTrue(found.problems)
+        self.assertNotIn("ses_other", self.engine._not_fleet, "a transient error says nothing about the session")
+        self.engine.v2.session_get = real
+
+    def test_a_fleet_agent_is_never_remembered_as_none(self):
+        for _ in range(3):
+            found = self.engine.discover(self.world.clock.now())
+        self.assertIn("platform", found.agents)
+        self.assertNotIn(self.world.sessions["platform"], self.engine._not_fleet)
+        self.assertEqual(self.gets(self.world.sessions["platform"]), 3, "a fleet agent is read every pass")
+
+
 class TestScheduleJudgeWarm(Base):
     def rig(self, ttl=300, warmer=True):
         world = World(self, agents=("a", "b"))
