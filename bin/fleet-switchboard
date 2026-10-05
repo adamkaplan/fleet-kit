@@ -2815,7 +2815,16 @@ def cmd_comment(args, runner, now):
     return EXIT_OK
 
 
+def cmd_whoami(args, runner, now):
+    """The calling agent's fleet name: what the `gh` shim signs a comment with. Exit 1, silent on stdout,
+    when the caller is not a fleet agent."""
+    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    print(identify_caller(engine.herdr, engine.v2, os.environ))
+    return EXIT_OK
+
+
 def add_foreground_parsers(sub):
+    sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
     comment.add_argument("--issue", type=int, required=True, help="The issue to comment on")
@@ -6795,6 +6804,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_send(args, runner, now)
         if args.action == "comment":
             return cmd_comment(args, runner, now)
+        if args.action == "whoami":
+            return cmd_whoami(args, runner, now)
         if args.action == "pending":
             return cmd_pending(args, runner, now)
         if args.action == "remind":

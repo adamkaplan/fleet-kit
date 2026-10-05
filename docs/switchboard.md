@@ -1722,4 +1722,20 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     which is the robust answer where you can have one. What is still open: an
     agent that posts with plain `gh` is not signed, so the role files and the
     charter skill now tell them to use `comment`; nothing enforces it.
+  - **Signing is transparent now.** Agents are vended just in time and have no
+    accounts of their own, and "use the special command" depends on each agent
+    remembering it. v2 triggers `shell.create.before` with a mutable spec
+    (`command`, `cwd`, `timeout`, `shell`, `env`) and spawns with its `env`
+    (measured in the Lab). The `fleet-hooks` plugin uses it to put the kit's
+    `shims/` directory first on PATH for every shell command; `shims/gh` signs the
+    body of `gh issue comment`, `pr comment`, `pr review`, `issue create` and
+    `pr create` (from `--body`, `-b`, a body file or stdin) with an HTML comment
+    naming the calling agent (`fleet-switchboard whoami`) and runs the real `gh`
+    otherwise, or on any doubt, unchanged. No command is parsed or rewritten, only
+    the environment it runs in. Checked live: `platform` ran a plain `gh issue
+    comment`, the posted body carried `from=platform`, and the webhook produced no
+    item. `fleet-switchboard comment` remains for a harness with no shim. The
+    marker is a name, not a proof: anyone who writes one into a comment suppresses
+    its delivery. An HMAC over the body with a per-install secret would make it
+    unforgeable; not done.
 

@@ -187,7 +187,7 @@ class Trial:
     # -- init
 
     def wrapper_text(self):
-        return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, key_pattern=KEY_NAME_PATTERN,
+        return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, kit_shims=REPO_ROOT / "shims", key_pattern=KEY_NAME_PATTERN,
                               gh=self.gh_bin, gh_config=self.gh_config_dir,
                               gh_user_flag="--user %s" % shlex.quote(self.gh_user) if self.gh_user else "")
 
@@ -451,6 +451,8 @@ export TMPDIR="$LAB/profile/tmp"
 # XDG alone leaves `home` live: v2 would load the live fleet's skills.
 export HOME="$LAB/profile/home"
 export FLEET_SWITCHBOARD_BIN="{fleet_bin}"
+# The fleet-hooks plugin puts this first on PATH of every agent shell: a gh that signs what agents say.
+export FLEET_SWITCHBOARD_SHIMS="{kit_shims}"
 # Agents run `fleet-switchboard send`; their shell finds it here.
 export PATH="{kit_bin}:$PATH"
 for name in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p' \\

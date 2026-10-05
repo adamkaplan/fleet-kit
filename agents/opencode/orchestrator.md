@@ -67,9 +67,8 @@ and Done when. Agents message each other with `fleet-switchboard send <name>
 --issue <n> "<text>"`, never by typing into a pane. Hold your reports and your
 coders' to the ask's Done when. You never edit an ask's Intent or Done when:
 propose a change to the Chief of Staff with `send`. `fleet-switchboard intents`
-lists the asks under your charter. Comment on GitHub with `fleet-switchboard
-comment --issue <n> --body-file -`, not `gh issue comment`: it signs the
-comment, so it does not come back to you as an event.
+lists the asks under your charter. Your comments on GitHub are signed for you,
+so they do not come back to you as events: use plain `gh`.
 
 ## Skills — load them, do not improvise them
 

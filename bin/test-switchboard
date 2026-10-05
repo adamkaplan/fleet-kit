@@ -7124,14 +7124,17 @@ class TestAgentDefinitions(unittest.TestCase):
             if role_of(path) == "chief-of-staff":
                 self.assertIn("Done when", path.read_text())
 
-    def test_every_role_is_told_to_comment_through_the_switchboard_so_it_is_signed(self):
-        """Agents share the user's GitHub account; an unsigned comment comes back to its author as a wake."""
+    def test_every_role_is_told_its_github_comments_are_signed_for_it_so_plain_gh_is_fine(self):
+        """Agents share the user's GitHub account; an unsigned comment comes back to its author as a wake. The
+        harness's gh shim signs, so nothing depends on an agent remembering a special command."""
         for path in AGENT_FILES:
             with self.subTest(file=path.name):
                 text = " ".join(path.read_text().split())
-                self.assertIn("`fleet-switchboard comment --issue <n> --body-file -`, not `gh issue comment`", text)
+                self.assertIn("Your comments on GitHub are signed for you", text)
+                self.assertIn("use plain `gh`", text)
+                self.assertNotIn("not `gh issue comment`", text)
         skill = " ".join((REPO / "skills" / "fleet-charter" / "SKILL.md").read_text().split())
-        self.assertIn("`fleet-switchboard comment --issue <n> --body-file -`", skill)
+        self.assertIn("Use plain `gh` for what you say on GitHub", skill)
 
     def test_a_switchboard_wake_is_never_told_to_run_heartbeat_ack(self):
         """The trial found the Chief of Staff running `heartbeat-ack` after a [switchboard] wake, against a
@@ -8357,6 +8360,131 @@ class HandoffCase(IntentCase):
         self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
 
 
+SHIM = REPO / "shims" / "gh"
+
+
+class TestShimHygiene(unittest.TestCase):
+    def test_it_is_executable_portable_stdlib_only_and_impersonal(self):
+        text = SHIM.read_text()
+        self.assertTrue(os.access(str(SHIM), os.X_OK))
+        self.assertEqual(text.splitlines()[0], "#!/usr/bin/env python3")
+        roots = _stdlib_roots()
+        for node in ast.walk(ast.parse(text)):
+            names = [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module.split(".")[0]] if isinstance(node, ast.ImportFrom) and node.level == 0 else []
+            for name in names:
+                origin = importlib.util.find_spec(name).origin or ""
+                self.assertTrue(origin in ("built-in", "frozen") or os.path.realpath(origin).startswith(roots), name)
+        self.assertIn("\nimport sys\n", text)
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]),
+                             re.IGNORECASE)
+        for number, line in enumerate(text.splitlines(), 1):
+            self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
+
+
+class TestGhShim(Base):
+    """The agent types plain `gh issue comment ...`; the shim signs it. A fake gh records what it was given."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        self.log = self.home / "gh-log.json"
+        fake = self.bin / "gh"
+        fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "files={a: open(a).read() for a in sys.argv[1:] if os.path.isfile(a)}\n"
+                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'files': files}, "
+                        "open(%r,'w'))\nprint('real gh out'); sys.stderr.write('real gh err\\n'); sys.exit(int(os.environ.get('FAKE_GH_EXIT','0')))\n"
+                        % str(self.log))
+        fake.chmod(0o755)
+        self.who = self.home / "whoami"
+        self.who.write_text("#!/bin/sh\n[ \"$1\" = whoami ] && echo \"${FAKE_WHO:-platform}\" && exit ${FAKE_WHO_EXIT:-0}\nexit 2\n")
+        self.who.chmod(0o755)
+
+    def run_shim(self, *args, stdin="", env=None, who=True):
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home)}
+        if who:
+            environ["FLEET_SWITCHBOARD_BIN"] = str(self.who)
+        environ.update(env or {})
+        if self.log.exists():
+            self.log.unlink()
+        done = subprocess.run([sys.executable, str(SHIM)] + list(args), input=stdin, capture_output=True, text=True,
+                              env=environ, timeout=60)
+        seen = json.loads(self.log.read_text()) if self.log.exists() else None
+        return done, seen
+
+    MARK = "<!-- fleet-switchboard:from=platform -->"
+
+    def test_each_way_of_giving_a_body_is_signed(self):
+        signed = "hello\n\n" + self.MARK + "\n"
+        for args, expected in (
+                (("issue", "comment", "2", "--body", "hello"), ["issue", "comment", "2", "--body", signed]),
+                (("issue", "comment", "2", "-b", "hello"), ["issue", "comment", "2", "-b", signed]),
+                (("pr", "comment", "7", "--body", "hello", "-R", "o/r"), ["pr", "comment", "7", "--body", signed, "-R", "o/r"]),
+                (("issue", "comment", "2", "--body=hello"), ["issue", "comment", "2", "--body=" + signed]),
+                (("issue", "comment", "2", "-bhello"), ["issue", "comment", "2", "-b" + signed]),
+                (("pr", "review", "7", "--approve", "--body", "hello"), ["pr", "review", "7", "--approve", "--body", signed]),
+                (("issue", "create", "--title", "t", "--body", "hello"), ["issue", "create", "--title", "t", "--body", signed]),
+                (("pr", "create", "--title", "t", "--body", "hello"), ["pr", "create", "--title", "t", "--body", signed])):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["argv"], expected)
+
+    def test_a_body_file_is_signed_through_a_copy_and_the_original_is_left_alone(self):
+        original = self.home / "body.md"
+        original.write_text("from a file")
+        done, seen = self.run_shim("issue", "comment", "2", "--body-file", str(original))
+        (sent_path,) = [a for a in seen["argv"] if a.endswith(".md") and a != str(original)]
+        self.assertEqual(seen["files"][sent_path], "from a file\n\n" + self.MARK + "\n")
+        self.assertEqual(original.read_text(), "from a file")
+        self.assertFalse(os.path.exists(sent_path), "the signed copy is removed afterwards")
+
+    def test_a_body_on_stdin_is_signed(self):
+        done, seen = self.run_shim("issue", "comment", "2", "-F", "-", stdin="from stdin\nline two")
+        self.assertEqual(seen["argv"], ["issue", "comment", "2", "-F", "-"])
+        self.assertEqual(seen["stdin"], "from stdin\nline two\n\n" + self.MARK + "\n")
+
+    def test_an_already_signed_body_is_not_signed_twice(self):
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "x\n\n<!-- fleet-switchboard:from=cos -->")
+        self.assertEqual(seen["argv"][4].count("fleet-switchboard:from"), 1)
+
+    def test_everything_else_runs_the_real_gh_with_exactly_the_same_arguments(self):
+        for args in (("issue", "view", "2", "--json", "body"), ("pr", "list"), ("api", "repos/o/r/issues/2/comments",
+                     "-f", "body=x"), ("issue", "comment", "2"), ("issue", "comment", "2", "--editor"),
+                     ("issue", "comment"), ("--version",), ()):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args)
+                self.assertEqual(seen["argv"], list(args))
+
+    def test_the_real_gh_output_and_exit_code_pass_through(self):
+        done, _ = self.run_shim("issue", "comment", "2", "--body", "x", env={"FAKE_GH_EXIT": "3"})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (3, "real gh out\n", "real gh err\n"))
+        done, _ = self.run_shim("issue", "view", "2", env={"FAKE_GH_EXIT": "4"})
+        self.assertEqual(done.returncode, 4)
+
+    def test_the_signature_names_the_agent_or_says_agent_when_it_cannot_be_found(self):
+        _, seen = self.run_shim("issue", "comment", "2", "--body", "x", env={"FAKE_WHO": "cos-2"})
+        self.assertIn("from=cos-2", seen["argv"][4])
+        for kwargs in ({"who": False}, {"env": {"FAKE_WHO_EXIT": "1"}}, {"env": {"FAKE_WHO": "Not A Name!"}},
+                       {"env": {"FLEET_SWITCHBOARD_BIN": "relative/fleet-switchboard"}},
+                       {"env": {"FLEET_SWITCHBOARD_BIN": "/does/not/exist"}}):
+            with self.subTest(kwargs=kwargs):
+                done, seen = self.run_shim("issue", "comment", "2", "--body", "x", **kwargs)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("from=agent", seen["argv"][4], "still signed: the signature is what stops the echo")
+
+    def test_it_never_calls_itself_and_says_so_when_there_is_no_real_gh_behind_it(self):
+        environ = {"PATH": str(SHIM.parent), "HOME": str(self.home)}
+        done = subprocess.run([sys.executable, str(SHIM), "issue", "view", "1"], capture_output=True, text=True, env=environ)
+        self.assertEqual(done.returncode, 127)
+        self.assertIn("no real gh", done.stderr)
+
+    def test_an_unreadable_body_file_runs_the_command_unchanged(self):
+        done, seen = self.run_shim("issue", "comment", "2", "--body-file", "/no/such/file.md")
+        self.assertEqual(seen["argv"], ["issue", "comment", "2", "--body-file", "/no/such/file.md"])
+
+
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""
@@ -8395,6 +8523,16 @@ class TestSignedComments(HandoffCase):
         code, _, err = self.comment(body="   \n")
         self.assertNotEqual(code, 0)
         self.assertEqual(self.comments(), [])
+
+    def test_whoami_prints_the_callers_fleet_name_and_fails_quietly_for_anyone_else(self):
+        with captured() as (out, err):
+            code = sb.main(["whoami"], runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual((code, out.getvalue().strip()), (0, "cos"))
+        os.environ.pop("HERDR_PANE_ID")
+        with captured() as (out, err):
+            code = sb.main(["whoami"], runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
 
     def test_a_comment_without_an_author_is_posted_as_it_is(self):
         engine = sb.build_engine(self.route, self.world.clock.now, "cli")[0]
@@ -10268,6 +10406,66 @@ results["registration"] = { registered, unregistered, id: plugin.id, setupIsFunc
 """
 
 
+SHELL_HOOK_CASES = r"""
+const sep = ":";
+const hook = hooks.makeShellHook("/kit/shims");
+const spec = (env) => ({ command: "gh issue comment 2 --body hi", cwd: "/w", timeout: 0, shell: "/bin/sh", env });
+let a = spec({ PATH: "/usr/bin:/bin", KEEP: "1" }); hook(a);
+results["prepended"] = { path: a.env.PATH, keep: a.env.KEEP, command: a.command };
+let b = spec({ PATH: "/usr/bin:/kit/shims:/bin" }); hook(b); hook(b);
+results["once-only"] = b.env.PATH;
+let c = spec({}); hook(c);
+results["no-path"] = c.env.PATH;
+let d = spec(undefined); hook(d);
+results["no-env"] = d.env.PATH;
+const before = { PATH: "/x" }; let e = spec(before); hook(e);
+results["input-env-untouched"] = before.PATH;
+let junk = [undefined, null, 5, "x"]; for (const j of junk) hook(j);
+results["junk-ok"] = true;
+let frozen = Object.freeze(spec({ PATH: "/x" })); hook(frozen);
+results["frozen-ok"] = frozen.env.PATH;
+results["shimsOf"] = [hooks.shimsOf({ FLEET_SWITCHBOARD_SHIMS: "/abs/shims" }), hooks.shimsOf({ FLEET_SWITCHBOARD_SHIMS: "rel/shims" }), hooks.shimsOf({})];
+const reg = []; const noReg = [];
+await plugin.setup({ shell: { hook: (n, f) => reg.push([n, typeof f]) }, permission: { hook: () => {} } }, { FLEET_SWITCHBOARD_SHIMS: "/abs/shims" });
+await plugin.setup({ shell: { hook: (n) => noReg.push(n) } }, {});
+await plugin.setup({ shell: { hook: (n) => noReg.push(n) } }, { FLEET_SWITCHBOARD_SHIMS: "relative" });
+await plugin.setup({ permission: { hook: () => {} } }, { FLEET_SWITCHBOARD_SHIMS: "/abs/shims", FLEET_SWITCHBOARD_BIN: "/abs/x" }); // an api without a shell service
+results["registration"] = { reg, noReg };
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the fleet-hooks plugin tests need it (skipped, not passed)")
+class TestFleetHooksShellHook(Base):
+    """The plugin puts the signing gh shim first on PATH for every shell command, without rewriting the command."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.home / "shell-harness.mjs"
+        script.write_text(HARNESS % {"url": (FLEET_HOOKS / "index.js").resolve().as_uri(), "body": SHELL_HOOK_CASES})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_shim_dir_goes_first_and_the_command_is_untouched(self):
+        self.assertEqual(self.r["prepended"], {"path": "/kit/shims:/usr/bin:/bin", "keep": "1",
+                                               "command": "gh issue comment 2 --body hi"})
+
+    def test_it_is_listed_once_however_often_the_hook_runs(self):
+        self.assertEqual(self.r["once-only"], "/kit/shims:/usr/bin:/bin")
+
+    def test_a_spec_with_no_path_or_no_env_still_gets_the_shims(self):
+        self.assertEqual((self.r["no-path"], self.r["no-env"]), ("/kit/shims", "/kit/shims"))
+
+    def test_the_specs_original_env_object_is_not_mutated_and_junk_or_a_frozen_spec_is_survived(self):  # noqa
+        self.assertEqual(self.r["input-env-untouched"], "/x")
+        self.assertTrue(self.r["junk-ok"])
+        self.assertEqual(self.r["frozen-ok"], "/x", "a spec that cannot be changed runs as it was")
+
+    def test_it_registers_only_for_an_absolute_shims_path_and_only_when_v2_has_a_shell_service(self):
+        self.assertEqual(self.r["shimsOf"], ["/abs/shims", None, None])
+        self.assertEqual(self.r["registration"], {"reg": [["create.before", "function"]], "noReg": []})
+
+
 @unittest.skipUnless(NODE, "node is not installed: the fleet-hooks plugin tests need it (skipped, not passed)")
 class TestFleetHooksPlugin(Base):
     def run_harness(self, body, index=None):
@@ -11660,6 +11858,10 @@ class TestTrialDriver(Base):
         with self.assertRaises(TRIAL.TrialError) as caught:
             trial.ensure_repo_labels("o/r", 1)
         self.assertIn("gh label create", str(caught.exception))
+
+    def test_the_wrapper_names_the_shims_the_plugin_puts_first_on_the_agents_path(self):
+        self.assertIn('export FLEET_SWITCHBOARD_SHIMS="%s"' % (REPO / "shims"), self.trial().wrapper_text())
+        self.assertTrue(os.access(str(REPO / "shims" / "gh"), os.X_OK))
 
     def test_the_wrapper_asks_for_the_pinned_account_not_whichever_gh_has_active(self):
         """The active gh account changed under the trial (to one that cannot see the repo). The agents

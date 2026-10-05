@@ -202,6 +202,7 @@ same courtesy: raise blockers and divergences, not status. Your charter and its
 sub-issues already carry your status. If someone has to ask you what you are
 doing, the convention has already failed.
 
-Post what you say on GitHub with `fleet-switchboard comment --issue <n> --body-file -`,
-not `gh issue comment`. The switchboard tells you about comments on your issues; it
-signs the ones you post, so they do not come back to you as events.
+Use plain `gh` for what you say on GitHub. The switchboard tells you about comments
+on your issues, and the harness signs the ones you post (an invisible HTML comment),
+so they do not come back to you as events. `fleet-switchboard comment` does the same
+by hand where the harness has no shim.

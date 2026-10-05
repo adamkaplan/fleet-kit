@@ -44,9 +44,9 @@ A message starting `[switchboard]` is delivered by the fleet's switchboard, not
 typed by anyone: facts grouped by ask, each group headed by that ask's Intent
 and Done when. Message your orchestrator with `fleet-switchboard send <name>
 --issue <n> "<text>"`, never by typing into a pane. What you build is held to
-the ask's Done when; `fleet-switchboard intent <issue>` prints it. Comment on
-GitHub with `fleet-switchboard comment --issue <n> --body-file -`, not `gh issue
-comment`: it signs the comment, so it does not come back to you as an event.
+the ask's Done when; `fleet-switchboard intent <issue>` prints it. Your comments
+on GitHub are signed for you, so they do not come back to you as events: use
+plain `gh`.
 
 ## Skills
 

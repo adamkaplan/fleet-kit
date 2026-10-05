@@ -135,10 +135,35 @@ export function settingsOf(env = process.env) {
   };
 }
 
+// Put the fleet's shims (a `gh` that signs what an agent says on GitHub) first on PATH of every shell
+// command v2 runs. v2 triggers `shell.create.before` with a mutable spec {command, cwd, timeout, shell, env}
+// and spawns with spec.env (measured in the Lab, v2 2.0.22). Nothing is parsed or rewritten: the command is
+// exactly what the agent wrote, and only the environment it runs in changes.
+export function shimsOf(env = process.env) {
+  const dir = env.FLEET_SWITCHBOARD_SHIMS;
+  return dir && path.isAbsolute(dir) ? dir : null; // an unset or relative path turns the shell hook off
+}
+
+export function makeShellHook(dir) {
+  return function createBefore(spec) {
+    try {
+      if (!spec || typeof spec !== "object") return;
+      const env = Object.assign({}, spec.env);
+      const rest = String(env.PATH || "").split(path.delimiter).filter((p) => p && p !== dir);
+      env.PATH = [dir, ...rest].join(path.delimiter);
+      spec.env = env;
+    } catch {
+      // Whatever goes wrong, the command runs as it was.
+    }
+  };
+}
+
 export default {
   id: "fleet.hooks",
   async setup(api, env = process.env) {
     const { bin, timeoutMs } = settingsOf(env);
+    const shims = shimsOf(env);
+    if (shims && api.shell && typeof api.shell.hook === "function") api.shell.hook("create.before", makeShellHook(shims));
     if (!bin) return; // not configured: tool calls follow the configured rules alone
     api.permission.hook("evaluate", makeHandler({ bin, timeoutMs }));
   },
