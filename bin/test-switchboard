@@ -11162,6 +11162,58 @@ class TestTrialDriver(Base):
             TRIAL.cmd_up(trial, None)
         self.assertIn("login", str(caught.exception))
 
+    def test_the_empty_pane_herdr_makes_with_the_workspace_is_closed_once_agents_exist(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        trial.save({"repo": "o/r", "spare_pane": "wX:p1"})
+        closed = []
+
+        def herdr(*args, **kwargs):
+            if args[:2] == ("pane", "list"):
+                return {"panes": [{"pane_id": "wX:p1"}, {"pane_id": "wX:p2"}]}
+            closed.append(args)
+            return {}
+
+        with mock.patch.object(trial.proof, "herdr", herdr):
+            self.assertTrue(trial.close_spare_pane())
+            self.assertEqual(closed, [("pane", "close", "wX:p1")])
+            self.assertNotIn("spare_pane", trial.settings())
+            self.assertFalse(trial.close_spare_pane(), "recorded once, closed once")
+
+    def test_the_spare_pane_is_kept_while_it_is_the_only_pane(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        trial.save({"spare_pane": "wX:p1"})
+        calls = []
+        with mock.patch.object(trial.proof, "herdr", lambda *a, **k: calls.append(a) or {"panes": [{"pane_id": "wX:p1"}]}):
+            self.assertFalse(trial.close_spare_pane())
+        self.assertNotIn(("pane", "close", "wX:p1"), calls)
+
+    def test_a_running_service_is_never_restarted_by_up(self):
+        trial = self.trial()
+        calls = []
+
+        def wrapper_run(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess([], 0, "http://127.0.0.1:49380\n" if args == ("service", "status") else "", "")
+
+        with mock.patch.object(TRIAL.Trial, "wrapper_run", side_effect=wrapper_run):
+            self.assertEqual(trial.ensure_service(), "already running")
+        self.assertEqual(calls, [("service", "status")], "nothing but a status read")
+
+    def test_a_stopped_service_is_started_with_the_gh_token_in_its_environment(self):
+        trial = self.trial()
+        seen = {}
+
+        def wrapper_run(*args, env=None, **kwargs):
+            seen[args] = env
+            return subprocess.CompletedProcess([], 0, "stopped\n" if args == ("service", "status") else "", "")
+
+        with mock.patch.object(TRIAL.Trial, "wrapper_run", side_effect=wrapper_run), \
+                mock.patch.object(TRIAL.Trial, "service_env", return_value={"FLEET_TRIAL_GH_TOKEN": "t"}):
+            self.assertIn("started", trial.ensure_service())
+        self.assertEqual(seen[("service", "start")], {"FLEET_TRIAL_GH_TOKEN": "t"})
+
     def test_the_parser_knows_its_five_commands(self):
         parser = TRIAL.build_parser()
         for argv in (["init", "--repo", "o/r", "--charter", "1"], ["login"], ["up"], ["status"], ["down"]):

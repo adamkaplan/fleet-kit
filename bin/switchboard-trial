@@ -217,12 +217,18 @@ class Trial:
         env["FLEET_TRIAL_GH_TOKEN"] = token
         return env
 
-    def restart_service(self):
-        self.wrapper_run("service", "stop")
-        time.sleep(1)
+    def service_running(self):
+        return self.wrapper_run("service", "status").stdout.strip().startswith("http")
+
+    def ensure_service(self):
+        """Start the v2 service if it is not running. A running one is left alone: the panes'
+        TUIs are connected to it, and stopping it would cut them off mid-turn."""
+        if self.service_running():
+            return "already running"
         done = self.wrapper_run("service", "start", env=self.service_env())
         if done.returncode:
             raise TrialError("could not start the v2 service: %s" % (done.stderr or done.stdout).strip())
+        return "started with the trial profile"
 
     def daemon_pid(self):
         try:
@@ -264,7 +270,27 @@ class Trial:
         wid = ws.get("workspace_id")
         if not wid:
             raise TrialError("herdr did not create a workspace: %s" % json.dumps(made)[:200])
+        # herdr gives a new workspace one empty shell pane. It is ours and is not an agent:
+        # remember it, and `close_spare_pane` removes it once the agents have their own tabs.
+        root = (made.get("root_pane") or {}).get("pane_id")
+        if root:
+            self.save(dict(self.settings(), spare_pane=root))
         return wid
+
+    def close_spare_pane(self):
+        """Close the empty shell pane herdr made with the workspace, if it is still there and
+        the workspace has other panes. Only the pane recorded at creation is ever closed."""
+        spare = self.settings().get("spare_pane")
+        if not spare:
+            return False
+        panes = [p.get("pane_id") for p in
+                 (self.proof.herdr("pane", "list", "--workspace", spare.split(":")[0]).get("panes") or [])]
+        if spare in panes and len(panes) > 1:
+            self.proof.herdr("pane", "close", spare)
+        settings = self.settings()
+        settings.pop("spare_pane", None)
+        self.save(settings)
+        return spare in panes and len(panes) > 1
 
     def checkout(self, repo):
         target = self.work / repo.split("/")[-1]
@@ -368,8 +394,7 @@ def cmd_up(trial, args):
     problem = trial.model_problem(settings["model"])
     if problem:
         raise TrialError(problem + " (change it with `init --model ...`)")
-    trial.restart_service()
-    print("%-22s %s" % ("v2 service", "started with the trial profile"))
+    print("%-22s %s" % ("v2 service", trial.ensure_service()))
     print("%-22s %s" % ("daemon", trial.start_daemon()))
     workspace = trial.workspace_id(create=True)
     directory = trial.checkout(repo)
@@ -382,6 +407,7 @@ def cmd_up(trial, args):
                             extra=["--reports-to", "cos", "--issue", str(charter), "--charter", str(charter)],
                             brief=ORCHESTRATOR_BRIEF.format(repo=repo, charter=charter))
         print("%-22s pane %s" % ("platform", done["pane"]))
+    trial.close_spare_pane()
     print("\nReady. Open the %r workspace in herdr and talk to `cos`. See docs/switchboard-trial.md." % WORKSPACE_LABEL)
     return EXIT_OK
 

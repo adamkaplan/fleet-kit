@@ -55,6 +55,22 @@ herdr and talk to `cos`.
 `status` shows what is running; `down` stops the daemon and the service and
 leaves the workspace for you to close.
 
+## What you do each time
+
+Once ever: `init`, then `login`. After that, one command per session:
+
+| When | You run | It does |
+|---|---|---|
+| Start, or after a reboot | `bin/switchboard-trial up` | Starts whatever is not running: the v2 service, the daemon, the workspace, `cos` and `platform`. |
+| Run it again while things are up | `up` | Nothing to the parts that are running. It never restarts the v2 service, which would cut the panes off mid-turn. |
+| Stop | `bin/switchboard-trial down` | Stops the daemon and the service. Closing the workspace is yours. |
+
+Not needed each time: logging in again, setting up the repo, or exporting the
+OpenRouter key by hand if your shell startup already does. herdr itself must be
+running. Nothing starts at login: after a reboot the daemon, service and agent
+tabs are gone until you run `up`. (Starting the daemon from herdr automatically
+is the plugin hook, which is not linked; see issue #16 Q5.)
+
 ## What to try
 
 Each of these is something the stack claims; watch whether it holds.
