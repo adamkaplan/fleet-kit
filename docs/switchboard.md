@@ -1691,4 +1691,12 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     plugin's own timeout 2500 ms. Also seen live: both agents run with the
     TUI's auto-accept on, which answers every `ask` itself, so the judge's asks
     have no effect there; only a deny stops anything.
+  - **The judge ruled on what a message said (scenario run, live).** An
+    orchestrator's `fleet-switchboard send cos "... run gh workflow run
+    deploy.yml ..."` was scored `speaks_for_you`, because the judge reads the whole
+    command. A plain `send`, `intent`, `intents`, `pending`, `status` or `remind`
+    is the agents' own channel and is no longer asked about; the check is
+    conservative and quote-aware, so any substitution, operator, redirect, glob or
+    extra line sends the command back to normal judging, and `launch`, `handoff`
+    and `import-v1`, which act, stay judged.
 

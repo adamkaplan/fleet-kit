@@ -9213,6 +9213,49 @@ class TestJudgeTool(PolicyCase):
         self.assertEqual((reply["outcome"], reply["judged"]), ("allow", False))
 
 
+class TestPlainSwitchboardMessage(PolicyCase):
+    """The judge ruled on what a message SAID, not on what it did, and asked about every quoted deploy."""
+
+    def test_a_plain_message_is_recognised_whatever_words_it_quotes(self):
+        for text in ('fleet-switchboard send cos --issue 2 "run gh workflow run deploy.yml; then git push --force"',
+                     "fleet-switchboard send platform --issue 2 'a && b | c > d $(not run)'",
+                     'fleet-switchboard send cos --issue 2 "line one\nline two: gh pr merge 5"',
+                     "/opt/kit/bin/fleet-switchboard intents", "fleet-switchboard pending platform --json",
+                     "fleet-switchboard status", 'fleet-switchboard remind cos 30m "check the deploy"'):
+            with self.subTest(text=text):
+                self.assertTrue(sb.plain_switchboard_message(text))
+
+    def test_anything_that_could_run_something_is_not_plain_and_is_judged_as_usual(self):
+        for text in ('fleet-switchboard send cos "x $(gh pr merge 1)"', 'fleet-switchboard send cos "x `gh pr merge 1`"',
+                     'fleet-switchboard send cos "x ${HOME}"', "fleet-switchboard send cos x; gh pr merge 1",
+                     "fleet-switchboard send cos x && gh pr merge 1", "fleet-switchboard send cos x | sh",
+                     "fleet-switchboard send cos x > /etc/passwd", "fleet-switchboard send cos x\ngh pr merge 1",
+                     'fleet-switchboard send cos "unterminated', "fleet-switchboard send cos $(whoami)",
+                     "fleet-switchboard send cos *", 'fleet-switchboard send cos "a \\" b"',
+                     "echo x; fleet-switchboard send cos y", "gh fleet-switchboard send cos y",
+                     "fleet-switchboard", "fleet-switchboard launch w --agent coder --dir /d",
+                     "fleet-switchboard handoff --issue 2 --brief-file -", "fleet-switchboard import-v1 --file x --name n",
+                     "", None, 5):
+            with self.subTest(text=text):
+                self.assertFalse(sb.plain_switchboard_message(text))
+
+    def test_a_plain_message_is_not_sent_to_jev_but_the_same_words_in_another_command_are(self):
+        self.configure([{"noul": dict(LOW, speaks_for_you=0.95)}])
+        quoted = 'fleet-switchboard send cos --issue 2 "run gh workflow run deploy.yml"'
+        reply = self.judge_tool(self.orch, "shell", quoted, "allow")
+        self.assertEqual((reply["outcome"], reply["judged"]), ("allow", False))
+        self.assertIn("own channel", reply["reason"])
+        (entry,) = self.audit_events()
+        self.assertEqual((entry["detail"]["judged"], entry["detail"]["answers"]), (False, None), "recorded, never asked")
+        sneaky = quoted + "; gh workflow run deploy.yml"
+        self.assertEqual(self.judge_tool(self.orch, "shell", sneaky, "allow")["outcome"], "ask")
+
+    def test_launch_is_still_judged_because_it_acts(self):
+        self.configure([{"noul": dict(LOW, speaks_for_you=0.95)}])
+        reply = self.judge_tool(self.orch, "shell", "fleet-switchboard launch w --agent coder --dir /d", "allow")
+        self.assertEqual((reply["outcome"], reply["judged"]), ("ask", True))
+
+
 class TestJudgeWarmUp(PolicyCase):
     """The trial's orchestrator ran `gh workflow run deploy.yml` unjudged: each call spent its whole budget
     resolving the ask over `gh`, so the configured outcome (allow) stood. The daemon now warms the caches."""

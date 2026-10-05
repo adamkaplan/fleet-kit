@@ -5088,6 +5088,49 @@ _SECRET_PATTERNS = (
 )
 
 
+# The sanctioned channel between agents. What a message *says* is not an action: the trial judged
+# `fleet-switchboard send cos "... run gh workflow run deploy.yml ..."` as a deploy. The receiving agent
+# judges what it then does. Only these read or message; `launch`, `handoff` and `import-v1` act, and stay judged.
+POLICY_MESSAGE_COMMANDS = ("send", "intent", "intents", "pending", "status", "remind")
+
+
+def plain_switchboard_message(text):
+    """True only for ONE simple `fleet-switchboard <send|intent|...> ...` command whose arguments cannot run
+    anything: no substitution, no operator, no redirect outside quotes, no unbalanced quote. Anything this
+    is unsure about is judged like any other shell command."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    quote, words, word, any_word = None, [], [], False
+    for ch in text.strip():
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                word.append(ch)
+        elif quote == '"':
+            if ch in "`$\\":
+                return False  # substitution or an escape inside double quotes
+            if ch == '"':
+                quote = None
+            else:
+                word.append(ch)
+        elif ch in "'\"":
+            quote, any_word = ch, True
+        elif ch in "`$\\;&|<>(){}*?[]~#!\n\r":
+            return False  # an operator, expansion, glob, comment or a second line outside any quote
+        elif ch in " \t":
+            if word or any_word:
+                words.append("".join(word))
+                word, any_word = [], False
+        else:
+            word.append(ch)
+    if quote is not None:
+        return False
+    if word or any_word:
+        words.append("".join(word))
+    return (len(words) >= 2 and os.path.basename(words[0]) == PROG and words[1] in POLICY_MESSAGE_COMMANDS)
+
+
 def redact_command_text(text, extra=()):
     """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed.
 
@@ -5346,6 +5389,8 @@ class PolicyJudge:
         fleet = self.identify(request["session"])
         if fleet is None:
             return policy_reply(request["configured"], "not a fleet agent (no metadata.fleet): not judged")
+        if request["tool"] == "shell" and plain_switchboard_message(request["arguments"]):
+            return policy_reply(request["configured"], "a plain %s message is the agents' own channel: not judged" % PROG)
         box["stage"] = "resolving the ask"
         context = self.context_of(fleet)
         box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
