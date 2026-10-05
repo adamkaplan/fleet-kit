@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""A trial of the fleet switchboard you can sit in front of.
+
+The Lab (bin/proof-switchboard) proves the system with a scripted model. The
+trial is the same isolation with a real model: its own OpenCode v2 data, its own
+config, its own switchboard state, and a herdr workspace of its own. Nothing
+here reads or writes the live OpenCode, herdr or switchboard directories.
+
+    switchboard-trial init  --repo OWNER/REPO --charter N   # once
+    switchboard-trial login                                 # once: device login
+    switchboard-trial up                                    # daemon, Chief of Staff, orchestrator
+    switchboard-trial status
+    switchboard-trial down
+
+docs/switchboard-trial.md walks through what to try.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent
+DEFAULT_MODEL = "github-copilot/claude-sonnet-5.5"
+SERVICE_PORT = 49380  # v2 manages one service per profile on a fixed port; the Lab holds 49374
+WORKSPACE_LABEL = "Switchboard Trial"
+AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+KEY_NAME_PATTERN = "(_API_KEY|_SECRET|_PASSWORD|_ACCESS_KEY|_ACCESS_KEY_ID)$"
+EXIT_OK, EXIT_ERROR = 0, 1
+
+
+class TrialError(RuntimeError):
+    pass
+
+
+def load_proof():
+    """bin/proof-switchboard, for the Lab machinery the trial reuses (install, herdr integration)."""
+    loader = importlib.machinery.SourceFileLoader("proof_switchboard", str(HERE / "proof-switchboard"))
+    spec = importlib.util.spec_from_loader("proof_switchboard", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["proof_switchboard"] = module
+    loader.exec_module(module)
+    return module
+
+
+def trial_root():
+    override = os.environ.get("FLEET_SWITCHBOARD_TRIAL_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / "fleet-switchboard-trial"
+
+
+class Trial:
+    def __init__(self, root=None):
+        proof = load_proof()
+        self.proof = proof
+        self.root = Path(root or trial_root())
+        self.lab = proof.Lab(str(self.root))  # the same layout as the Lab, a different root
+        self.profile = Path(self.lab.profile)
+        self.wrapper = Path(self.lab.wrapper)
+        self.config_home = self.profile / "config"
+        self.state_home = self.profile / "state"
+        self.switchboard_config = self.config_home / "fleet-switchboard" / "config.json"
+        self.switchboard_state = self.state_home / "fleet-switchboard"
+        self.settings_file = self.root / "trial.json"
+        self.work = self.root / "work"
+        self.daemon_log = self.root / "daemon.log"
+        self.fleet_bin = REPO_ROOT / "bin" / "fleet-switchboard"
+        self.herdr_socket = self.live_herdr_socket()
+
+    @staticmethod
+    def live_herdr_socket():
+        """The running herdr's socket, read before the trial's XDG_CONFIG_HOME can hide it."""
+        if os.environ.get("HERDR_SOCKET_PATH"):
+            return os.environ["HERDR_SOCKET_PATH"]
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "herdr", "herdr.sock")
+
+    # -- settings
+
+    def settings(self):
+        try:
+            return json.loads(self.settings_file.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, data):
+        self.settings_file.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    def require_init(self):
+        if not self.settings().get("repo"):
+            raise TrialError("not set up: run `switchboard-trial init --repo OWNER/REPO --charter N` first")
+        return self.settings()
+
+    # -- environments
+
+    def clean_env(self):
+        """This process's environment minus any herdr pane identity: the daemon and the CLI
+        are not running in a pane, and must never report as one."""
+        env = dict(os.environ)
+        for name in list(env):
+            if name.startswith("HERDR_"):
+                del env[name]
+        return env
+
+    def switchboard_env(self):
+        """For fleet-switchboard: the trial's config and state, never the user's."""
+        env = self.clean_env()
+        env["XDG_CONFIG_HOME"] = str(self.config_home)
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["HERDR_SOCKET_PATH"] = self.herdr_socket  # herdr finds its socket under XDG_CONFIG_HOME otherwise
+        env.pop("FLEET_SWITCHBOARD_LAB", None)
+        return env
+
+    def run_fleet(self, *args, check=True):
+        done = subprocess.run([sys.executable, str(self.fleet_bin)] + list(args), env=self.switchboard_env(),
+                              capture_output=True, text=True)
+        if check and done.returncode:
+            raise TrialError("fleet-switchboard %s failed: %s" % (" ".join(args), (done.stderr or done.stdout).strip()))
+        return done
+
+    def wrapper_run(self, *args, env=None, tty=False):
+        kwargs = {} if tty else {"capture_output": True, "text": True}
+        return subprocess.run([str(self.wrapper)] + list(args), env=env or self.clean_env(), **kwargs)
+
+    # -- init
+
+    def wrapper_text(self):
+        return WRAPPER.format(root=self.root, fleet_bin=self.fleet_bin, kit_bin=HERE, key_pattern=KEY_NAME_PATTERN)
+
+    def init(self, repo, charter, model):
+        proof = self.proof
+        for directory in (self.lab.v2_dir, self.lab.bin_dir, self.lab.opencode_config,
+                          os.path.join(self.lab.opencode_config, "agents"),
+                          os.path.join(self.lab.opencode_config, "plugins"), str(self.work),
+                          str(self.switchboard_state.parent), str(self.config_home / "fleet-switchboard")):
+            os.makedirs(directory, exist_ok=True)
+        for name in ("config", "data", "state", "cache", "tmp", "home"):
+            os.makedirs(self.profile / name, exist_ok=True)
+        os.chmod(self.state_home, 0o700)
+        report = {"v2": proof.ensure_v2(self.lab)}
+        if proof.write_if_changed(str(self.wrapper), self.wrapper_text()):
+            os.chmod(self.wrapper, 0o755)
+            report["wrapper"] = "written"
+        opencode_json = {"$schema": "https://opencode.ai/config.json", "update": "disable", "share": "disabled",
+                         "model": model}
+        proof.write_if_changed(os.path.join(self.lab.opencode_config, "opencode.json"),
+                               json.dumps(opencode_json, indent=2) + "\n")
+        for name in AGENTS:
+            text = (REPO_ROOT / "agents" / "opencode" / (name + ".md")).read_text()
+            proof.write_if_changed(os.path.join(self.lab.opencode_config, "agents", name + ".md"),
+                                   proof.agent_copy(text, model))
+        plugin = (REPO_ROOT / "plugins" / "fleet-hooks" / "index.js").read_text()
+        proof.write_if_changed(os.path.join(self.lab.opencode_config, "plugins", "fleet-hooks.js"), plugin)
+        done = self.wrapper_run("service", "set", "port", str(SERVICE_PORT))
+        if done.returncode:
+            raise TrialError("cannot set the service port: %s" % (done.stderr or done.stdout).strip())
+        report["service port"] = SERVICE_PORT
+        report["herdr home link"] = proof.ensure_home_link(self.lab)
+        report["herdr integration"] = proof.ensure_herdr_integration(self.lab)
+        self.write_gitconfig()
+        herdr = shutil.which("herdr")
+        gh = shutil.which("gh")
+        if not herdr or not gh:
+            raise TrialError("herdr and gh must be on PATH (herdr: %s, gh: %s)" % (herdr, gh))
+        config = {
+            "opencode": str(self.wrapper), "opencode_executable": self.lab.v2_bin,
+            "launch_env": {"FLEET_SWITCHBOARD_LAB_PANE": "1"},
+            "herdr": herdr, "gh": gh, "github_repos": [repo], "intent_repo": repo,
+            "jev": {}, "shadow_judges": True, "classifier_mode": "act",
+            "policy": {"enabled": True}, "poll_seconds": 5,
+        }
+        self.switchboard_config.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+        self.save(dict(self.settings(), repo=repo, charter=charter, model=model))
+        report["switchboard config"] = str(self.switchboard_config)
+        return report
+
+    def write_gitconfig(self):
+        """git in an agent's shell (HOME is the trial's) pushes through gh's credential helper,
+        which reads GH_TOKEN from the service's environment. No token is written anywhere."""
+        text = ("[user]\n\tname = Fleet Trial\n\temail = fleet-trial@users.noreply.github.com\n"
+                "[credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n")
+        self.proof.write_if_changed(str(self.profile / "home" / ".gitconfig"), text)
+
+    # -- login
+
+    def logged_in(self):
+        done = self.wrapper_run("auth", "list")
+        return "copilot" in (done.stdout + done.stderr).lower()
+
+    def model_problem(self, model):
+        """None when v2 lists `model`, else a sentence naming the Copilot models it does list."""
+        listed = self.wrapper_run("models").stdout.split()
+        if model in listed:
+            return None
+        copilot = [m for m in listed if m.startswith("github-copilot/")]
+        return "model %s is not available; v2 lists: %s" % (model, ", ".join(copilot) or "no Copilot models")
+
+    # -- service and daemon
+
+    def service_env(self):
+        """What the v2 service (and so every agent's shell) is started with: the trial's
+        wrapper takes the credentials out, then `gh` access is given back as GH_TOKEN,
+        because the agents work on GitHub. The OpenRouter key is never in it."""
+        env = self.clean_env()
+        token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True).stdout.strip()
+        if not token:
+            raise TrialError("`gh auth token` gave nothing: log in with gh first")
+        env["FLEET_TRIAL_GH_TOKEN"] = token
+        return env
+
+    def restart_service(self):
+        self.wrapper_run("service", "stop")
+        time.sleep(1)
+        done = self.wrapper_run("service", "start", env=self.service_env())
+        if done.returncode:
+            raise TrialError("could not start the v2 service: %s" % (done.stderr or done.stdout).strip())
+
+    def daemon_pid(self):
+        try:
+            pid = int((self.root / "daemon.pid").read_text())
+            os.kill(pid, 0)
+            return pid
+        except (OSError, ValueError):
+            return None
+
+    def start_daemon(self):
+        if self.daemon_pid():
+            return "already running"
+        with open(self.daemon_log, "ab") as log:
+            proc = subprocess.Popen([sys.executable, str(self.fleet_bin), "run"], env=self.switchboard_env(),
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        (self.root / "daemon.pid").write_text(str(proc.pid))
+        time.sleep(2)
+        if proc.poll() is not None:
+            raise TrialError("the daemon exited at once; see %s" % self.daemon_log)
+        return "started (pid %d)" % proc.pid
+
+    def stop_daemon(self):
+        pid = self.daemon_pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+        return pid
+
+    # -- workspace and agents
+
+    def workspace_id(self, create=False):
+        proof = self.proof
+        for ws in proof.herdr("workspace", "list").get("workspaces") or []:
+            if ws.get("label") == WORKSPACE_LABEL:
+                return ws["workspace_id"]
+        if not create:
+            return None
+        made = proof.herdr("workspace", "create", "--label", WORKSPACE_LABEL, "--cwd", str(self.work))
+        ws = made.get("workspace") or made
+        wid = ws.get("workspace_id")
+        if not wid:
+            raise TrialError("herdr did not create a workspace: %s" % json.dumps(made)[:200])
+        return wid
+
+    def checkout(self, repo):
+        target = self.work / repo.split("/")[-1]
+        if not (target / ".git").is_dir():
+            done = subprocess.run(["gh", "repo", "clone", repo, str(target)], capture_output=True, text=True)
+            if done.returncode:
+                raise TrialError("cannot clone %s: %s" % (repo, done.stderr.strip()))
+        return target
+
+    def launched(self, name):
+        done = self.run_fleet("pending", name, "--json", check=False)
+        try:
+            return bool(json.loads(done.stdout).get("observation"))
+        except ValueError:
+            return False
+
+    def launch(self, workspace, name, agent, role, directory, extra=(), brief=None):
+        args = ["launch", name, "--agent", agent, "--dir", str(directory), "--workspace", workspace, "--role", role]
+        args += list(extra)
+        if brief:
+            path = self.root / ("brief-%s.md" % name)
+            path.write_text(brief)
+            args += ["--brief-file", str(path)]
+        return json.loads(self.run_fleet(*args).stdout)
+
+
+# The trial's wrapper: v2 confined to the trial profile. It differs from the Lab's in two
+# ways: no model is scripted, and the service may be given the `gh` token (as
+# FLEET_TRIAL_GH_TOKEN, which becomes GH_TOKEN here) because the agents work on GitHub.
+# The OpenRouter key and every other credential-shaped variable is removed.
+WRAPPER = """#!/bin/sh
+# Switchboard trial: OpenCode v2 confined to the trial profile.
+# Written by `switchboard-trial init`. Never put this on the live PATH.
+LAB="{root}"
+export FLEET_SWITCHBOARD_TRIAL=1
+export XDG_CONFIG_HOME="$LAB/profile/config" XDG_DATA_HOME="$LAB/profile/data"
+export XDG_STATE_HOME="$LAB/profile/state" XDG_CACHE_HOME="$LAB/profile/cache"
+export TMPDIR="$LAB/profile/tmp"
+# XDG alone leaves `home` live: v2 would load the live fleet's skills.
+export HOME="$LAB/profile/home"
+export FLEET_SWITCHBOARD_BIN="{fleet_bin}"
+# Agents run `fleet-switchboard send`; their shell finds it here.
+export PATH="{kit_bin}:$PATH"
+GH_FOR_AGENTS="$FLEET_TRIAL_GH_TOKEN"
+for name in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p' \\
+    | grep -E '{key_pattern}|^(GH|GITHUB|COPILOT)_|^FLEET_TRIAL_GH_TOKEN$'); do
+  unset "$name"
+done
+[ -n "$GH_FOR_AGENTS" ] && export GH_TOKEN="$GH_FOR_AGENTS"
+if [ "$FLEET_SWITCHBOARD_LAB_PANE" != "1" ]; then
+  unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_TAB_ID HERDR_WORKSPACE_ID
+fi
+exec "$LAB/v2/node_modules/@opencode/cli/bin/opencode.exe" "$@"
+"""
+
+
+# -- commands
+
+CHIEF_BRIEF = None  # you talk to the Chief of Staff; it needs no opening brief
+
+ORCHESTRATOR_BRIEF = """You are the orchestrator `platform`. Your charter is issue #{charter} in {repo}.
+Read it with `gh issue view {charter} --repo {repo}`, then wait. The Chief of Staff (`cos`) will hand you asks
+as sub-issues of your charter; messages from the switchboard carry each ask's Intent and Done when.
+Report to `cos` with `fleet-switchboard send cos --issue <ask> "<text>"`. Do not type into panes.
+"""
+
+
+def cmd_init(trial, args):
+    for name, value in (("--charter", args.charter),):
+        if value < 1:
+            raise TrialError("%s must be an issue number" % name)
+    report = trial.init(args.repo, args.charter, args.model)
+    for key, value in report.items():
+        print("%-22s %s" % (key, value))
+    print("\nNext: switchboard-trial login")
+    return EXIT_OK
+
+
+def cmd_login(trial, args):
+    trial.require_init()
+    print("Starting the trial's own OpenCode login. Choose GitHub Copilot and follow the device-code steps.\n"
+          "This stores the credential under %s only.\n" % trial.profile)
+    subprocess.run([str(trial.wrapper), "service", "start"], env=trial.clean_env(), capture_output=True)
+    code = trial.wrapper_run("auth", "login", "github-copilot", tty=True).returncode
+    if code:
+        print("\nIf that did not offer GitHub Copilot, run `%s auth login` and pick it by hand." % trial.wrapper)
+        return code
+    print("\nLogged in." if trial.logged_in() else "\nLogin finished, but Copilot is not listed; run `%s auth list`." % trial.wrapper)
+    return EXIT_OK
+
+
+def cmd_up(trial, args):
+    settings = trial.require_init()
+    if not trial.logged_in():
+        raise TrialError("no GitHub Copilot login yet: run `switchboard-trial login`")
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        print("warning: OPENROUTER_API_KEY is not set here, so the classifier and the judge will answer "
+              "'unreachable' and change nothing. Export it in this shell and run `up` again to turn them on.")
+    repo = settings["repo"]
+    charter = settings["charter"]
+    problem = trial.model_problem(settings["model"])
+    if problem:
+        raise TrialError(problem + " (change it with `init --model ...`)")
+    trial.restart_service()
+    print("%-22s %s" % ("v2 service", "started with the trial profile"))
+    print("%-22s %s" % ("daemon", trial.start_daemon()))
+    workspace = trial.workspace_id(create=True)
+    directory = trial.checkout(repo)
+    print("%-22s %s (%s)" % ("workspace", WORKSPACE_LABEL, workspace))
+    if not trial.launched("cos"):
+        done = trial.launch(workspace, "cos", "chief-of-staff", "chief-of-staff", directory, brief=CHIEF_BRIEF)
+        print("%-22s pane %s" % ("cos", done["pane"]))
+    if not trial.launched("platform"):
+        done = trial.launch(workspace, "platform", "orchestrator", "orchestrator", directory,
+                            extra=["--reports-to", "cos", "--issue", str(charter), "--charter", str(charter)],
+                            brief=ORCHESTRATOR_BRIEF.format(repo=repo, charter=charter))
+        print("%-22s pane %s" % ("platform", done["pane"]))
+    print("\nReady. Open the %r workspace in herdr and talk to `cos`. See docs/switchboard-trial.md." % WORKSPACE_LABEL)
+    return EXIT_OK
+
+
+def cmd_status(trial, args):
+    settings = trial.settings()
+    print("%-22s %s" % ("trial dir", trial.root))
+    print("%-22s %s" % ("repo / charter", "%s #%s" % (settings.get("repo"), settings.get("charter"))))
+    if trial.wrapper.exists():
+        print("%-22s %s" % ("copilot login", "yes" if trial.logged_in() else "no"))
+    print("%-22s %s" % ("daemon", "pid %s" % trial.daemon_pid() if trial.daemon_pid() else "not running"))
+    print("%-22s %s" % ("workspace", trial.workspace_id() or "none"))
+    done = trial.run_fleet("status", check=False)
+    print(done.stdout.rstrip() or done.stderr.rstrip())
+    return EXIT_OK
+
+
+def cmd_down(trial, args):
+    pid = trial.stop_daemon()
+    print("daemon: %s" % ("stopped" if pid else "was not running"))
+    if trial.wrapper.exists():
+        trial.wrapper_run("service", "stop")
+        print("v2 service: stopped")
+    print("The herdr workspace %r is left for you to close." % WORKSPACE_LABEL)
+    return EXIT_OK
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="switchboard-trial", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="action", required=True)
+    init = sub.add_parser("init", help="Create the trial profile (once)")
+    init.add_argument("--repo", required=True, help="OWNER/REPO holding the charter and asks")
+    init.add_argument("--charter", type=int, required=True, help="The orchestrator's charter issue number")
+    init.add_argument("--model", default=DEFAULT_MODEL, help="provider/model for every agent (default %(default)s)")
+    sub.add_parser("login", help="Log the trial's OpenCode into GitHub Copilot (interactive)")
+    sub.add_parser("up", help="Start the service and daemon; launch the Chief of Staff and the orchestrator")
+    sub.add_parser("status", help="What is running")
+    sub.add_parser("down", help="Stop the daemon and the v2 service")
+    return parser
+
+
+COMMANDS = {"init": cmd_init, "login": cmd_login, "up": cmd_up, "status": cmd_status, "down": cmd_down}
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return COMMANDS[args.action](Trial(), args)
+    except TrialError as err:
+        sys.stderr.write("switchboard-trial: %s\n" % err)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

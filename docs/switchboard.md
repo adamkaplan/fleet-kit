@@ -20,6 +20,7 @@
 | 8 | `switchboard/foreground` | Classify your messages; hand unrelated work to a background subagent; decorate messages about owned asks; spikes SF1–SF4 | ready for review [#24](https://github.com/adamkaplan/fleet-kit/pull/24); F1–F4 pass offline; SF1, SF2 (first cut) and SF4 measured in the Lab |
 | 9 | `switchboard/policy` | Tool-call policy judge through the thin `fleet-hooks` plugin; spikes SP1–SP2 | ready for review [#25](https://github.com/adamkaplan/fleet-kit/pull/25); P1–P6 pass offline; SP1 measured in the Lab, then the real plugin end to end |
 | 10 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | ready for review [#26](https://github.com/adamkaplan/fleet-kit/pull/26); M1 passes offline; the import round trip is half-measured in the Lab |
+| 11 | `switchboard/trial` | `bin/switchboard-trial`: a Lab-isolated profile with GitHub Copilot, to try the system by hand; `launch --charter` | ready for review; see [switchboard-trial.md](switchboard-trial.md) |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -1612,3 +1613,14 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     R2, R3, S2 to S7, W1, W2, W3). The other scenarios are offline or lab-model by
     design, or owed (listed above). The real `fleet-hooks` plugin was then run
     end to end against real Jev, as described under SP1.
+- 2026-10-03: PR 11, a trial you can sit in front of. `bin/switchboard-trial`
+  (`init`, `login`, `up`, `status`, `down`) builds a second Lab-shaped profile
+  with a real model: its own v2 install and data, its own switchboard config and
+  state, its own herdr workspace, and a scratch repo. v2's managed service
+  uses a fixed port per profile, so the trial's is 49380 beside the Lab's
+  49374. The trial wrapper strips every credential-shaped variable and then
+  gives the agents the `gh` token as `GH_TOKEN` (they work on GitHub); the
+  OpenRouter key stays in the daemon only. A bug the trial found: `launch` had
+  no `--charter`, so a Chief of Staff could not find an orchestrator's asks.
+  Fixed, with a test watched failing without the fix. The v1 import is left
+  built but is not part of the trial.

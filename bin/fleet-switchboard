@@ -2262,7 +2262,7 @@ class LaunchError(Exception):
     """A launch that did not finish, and what it left behind."""
 
 
-def launch_problems(name, agent, directory, workspace, issue):
+def launch_problems(name, agent, directory, workspace, issue, charter=None):
     """Why these launch arguments cannot be used (empty when they can)."""
     problems = []
     if not NAME_RE.match(name or ""):
@@ -2275,11 +2275,13 @@ def launch_problems(name, agent, directory, workspace, issue):
         problems.append("no target workspace: pass --workspace or run from a herdr pane")
     if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
         problems.append("--issue must be an issue number, got %r" % (issue,))
+    if charter is not None and not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
+        problems.append("--charter must be an issue number, got %r" % (charter,))
     return problems
 
 
-def fleet_record(name, role, reports_to, issue):
-    fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": issue}
+def fleet_record(name, role, reports_to, issue, charter=None):
+    fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": issue, "charter": charter}
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -2327,7 +2329,7 @@ def close_own_pane(engine, name, pane, why):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -2336,13 +2338,13 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     session. A failure after the pane opened closes that pane, and no other.
     Returns {"name", "session", "pane", "tab"}.
     """
-    problems = launch_problems(name, agent, directory, workspace, issue)
+    problems = launch_problems(name, agent, directory, workspace, issue, charter)
     if problems:
         raise LaunchError("; ".join(problems))
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue)
+    fleet = fleet_record(name, role, reports_to, issue, charter)
     with engine._external("v2.session.create", name, {"agent": agent, "directory": directory,
                                                       "fleet": fleet}) as result:
         session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
@@ -4300,7 +4302,7 @@ def cmd_launch(args, runner, now, socket_call=None):
     brief = read_brief(args.brief_file, sys.stdin)
     engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                        args.issue, brief)
+                        args.issue, brief, charter=args.charter)
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK
 
@@ -6464,6 +6466,7 @@ def build_parser():
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
     launch.add_argument("--issue", type=int, help="metadata.fleet.issue")
+    launch.add_argument("--charter", type=int, help="metadata.fleet.charter: an orchestrator's charter issue")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")

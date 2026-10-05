@@ -3387,6 +3387,16 @@ class TestLaunch(Base):
         self.assertIn(("herdr", ["agent", "get", done["pane"]]), between)
         self.assertIn(("herdr", ["pane", "process-info", "--pane"]), between)
 
+    def test_an_orchestrators_charter_is_recorded_so_the_chief_of_staff_can_find_its_asks(self):
+        done = self.launch(name="platform2", role="orchestrator", issue=1, charter=1)
+        self.assertEqual(self.new_session(done)["metadata"]["fleet"]["charter"], 1)
+        self.assertNotIn("charter", self.new_session(self.launch(name="coder2"))["metadata"]["fleet"])
+
+    def test_a_charter_must_be_an_issue_number(self):
+        for bad in (0, -3, "1", True):
+            with self.subTest(charter=bad), self.assertRaises(sb.LaunchError):
+                self.launch(name="orch", role="orchestrator", charter=bad)
+
     def test_nothing_is_typed_and_focus_is_never_asked_for(self):
         self.launch()
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -5290,7 +5300,7 @@ def _stdlib_roots():
 
 
 class TestHygiene(unittest.TestCase):
-    FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard")
+    FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
     def test_every_file_is_executable_with_the_portable_shebang(self):
         for name in self.FILES:
@@ -11072,6 +11082,95 @@ class TestPR10Source(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------- runner
+
+# ======================================================================
+# The trial driver (bin/switchboard-trial): the same isolation as the Lab, with a
+# real model. Nothing here starts a real binary.
+# ======================================================================
+
+TRIAL = _load("t_switchboard_trial", BIN / "switchboard-trial")
+
+
+class TestTrialDriver(Base):
+    def trial(self):
+        return TRIAL.Trial(self.home / "trial")
+
+    def test_its_root_is_never_a_live_directory(self):
+        root = str(self.trial().root)
+        for live in ("~/.config/opencode", "~/.local/share/opencode", "~/.local/state/opencode",
+                     "~/.config/herdr", "~/.local/state/herdr"):
+            self.assertFalse(root.startswith(os.path.expanduser(live)), live)
+
+    def test_the_wrapper_takes_every_credential_out_before_it_gives_agents_the_gh_token(self):
+        text = self.trial().wrapper_text()
+        unset = text.index('unset "$name"')
+        self.assertLess(unset, text.index('export GH_TOKEN="$GH_FOR_AGENTS"'), "the token is added after the strip")
+        self.assertIn("_API_KEY", text)  # the OpenRouter key is of this shape
+        self.assertIn("COPILOT", text)
+        self.assertNotIn("OPENROUTER", text, "the wrapper never names the key, it strips by shape")
+        sh = shutil.which("sh")
+        env = {"PATH": SAFE_PATH, "OPENROUTER_API_KEY": "canary-key", "FLEET_TRIAL_GH_TOKEN": "canary-gh",
+               "SOME_SECRET": "canary-secret", "KEEP_ME": "yes"}
+        probe = text.rsplit("exec ", 1)[0] + 'env\n'
+        out = subprocess.run([sh, "-c", probe], env=env, capture_output=True, text=True).stdout
+        self.assertIn("GH_TOKEN=canary-gh", out)
+        self.assertIn("KEEP_ME=yes", out)
+        for canary in ("canary-key", "canary-secret"):
+            self.assertNotIn(canary, out)
+        self.assertNotIn("FLEET_TRIAL_GH_TOKEN", out)
+
+    def test_agents_find_fleet_switchboard_on_their_path(self):
+        probe = self.trial().wrapper_text().rsplit("exec ", 1)[0] + 'command -v fleet-switchboard\n'
+        out = subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH}, capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), str(BIN / "fleet-switchboard"))
+
+    def test_up_names_the_models_v2_does_list_when_the_configured_one_is_missing(self):
+        trial = self.trial()
+        listing = subprocess.CompletedProcess([], 0, "github-copilot/a github-copilot/b other/c\n", "")
+        with mock.patch.object(TRIAL.Trial, "wrapper_run", return_value=listing):
+            self.assertIsNone(trial.model_problem("github-copilot/a"))
+            problem = trial.model_problem("github-copilot/zzz")
+        self.assertIn("github-copilot/a, github-copilot/b", problem)
+        self.assertNotIn("other/c", problem)
+
+    def test_the_wrapper_without_a_token_gives_agents_none(self):
+        probe = self.trial().wrapper_text().rsplit("exec ", 1)[0] + 'env\n'
+        out = subprocess.run([shutil.which("sh"), "-c", probe], env={"PATH": SAFE_PATH, "GH_TOKEN": "ambient"},
+                             capture_output=True, text=True).stdout
+        self.assertNotIn("GH_TOKEN", out)
+
+    def test_the_switchboard_env_points_at_the_trials_dirs_and_the_real_herdr(self):
+        trial = self.trial()
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_SOCKET_PATH": "/run/herdr.sock"}):
+            env = TRIAL.Trial(self.home / "trial").switchboard_env()
+        self.assertEqual(env["XDG_CONFIG_HOME"], str(trial.config_home))
+        self.assertEqual(env["XDG_STATE_HOME"], str(trial.state_home))
+        self.assertEqual(env["HERDR_SOCKET_PATH"], "/run/herdr.sock")
+        self.assertNotIn("HERDR_PANE_ID", env, "the daemon is not a pane")
+
+    def test_an_uninitialised_trial_says_what_to_run(self):
+        with self.assertRaises(TRIAL.TrialError) as caught:
+            self.trial().require_init()
+        self.assertIn("init", str(caught.exception))
+
+    def test_up_refuses_without_a_copilot_login(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        trial.save({"repo": "o/r", "charter": 1})
+        with mock.patch.object(TRIAL.Trial, "logged_in", return_value=False), \
+                self.assertRaises(TRIAL.TrialError) as caught:
+            TRIAL.cmd_up(trial, None)
+        self.assertIn("login", str(caught.exception))
+
+    def test_the_parser_knows_its_five_commands(self):
+        parser = TRIAL.build_parser()
+        for argv in (["init", "--repo", "o/r", "--charter", "1"], ["login"], ["up"], ["status"], ["down"]):
+            self.assertIn(parser.parse_args(argv).action, TRIAL.COMMANDS)
+
+    def test_the_service_port_is_not_the_labs(self):
+        self.assertEqual(TRIAL.SERVICE_PORT, 49380)
+        self.assertNotEqual(TRIAL.SERVICE_PORT, 49374)
+
 
 def main(argv):
     loader = unittest.TestLoader()
