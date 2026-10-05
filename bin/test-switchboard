@@ -4914,7 +4914,7 @@ class TestGithubKeys(Base):
         self.assertIn("since=%s" % sb.iso(self.world.clock.now() - 24 * 3600), "".join(self.gh.api_calls))
 
 
-def intent_body(intent, done):
+def edited_body(intent, done):
     return "## Intent\n%s\nDone when: %s\n" % (intent, done)
 
 
@@ -4922,7 +4922,7 @@ class TestIntentEditWiring(Base):
     """The trial edited an ask's Done-when on GitHub and the Chief of Staff heard nothing: PR 6's change item
     and toast existed but no webhook called them, and the cached Intent kept the old lines in headers."""
 
-    OLD, NEW = intent_body("Add /health", "returns 200"), intent_body("Add /health", "returns 200 and JSON")
+    OLD, NEW = edited_body("Add /health", "returns 200"), edited_body("Add /health", "returns 200 and JSON")
 
     def setUp(self):
         super().setUp()
