@@ -1,0 +1,29 @@
+{
+  "id": "E2",
+  "title": "bootstrap opens the Chief of Staff once, refuses a second, and resumes it when its pane is gone",
+  "problem": null,
+  "since_pr": 16,
+  "tiers": ["offline"],
+  "cast": {
+    "cos": {"role": "chief-of-staff"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "bootstrap", "why": "No cos exists: a workspace is made and cos is launched in it"},
+    {"at": "10s", "actor": "world", "do": "bootstrap", "why": "cos has a pane: a second one is refused, naming it"},
+    {"at": "20s", "actor": "world", "do": "close-agent", "agent": "cos", "why": "You closed its pane"},
+    {"at": "30s", "actor": "world", "do": "bootstrap", "why": "cos has a session and no pane: it is resumed, not duplicated"},
+    {"at": "40s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "first-creates", "that": "bootstrap_says", "step": 0, "text": "created cos"},
+    {"name": "second-refused", "that": "bootstrap_says", "step": 1, "text": "already runs: cos"},
+    {"name": "then-resumed", "that": "bootstrap_says", "step": 3, "text": "resumed cos"},
+    {"name": "one-cos", "that": "fleet_sessions", "agent": "cos", "count": 1,
+     "why": "One Chief of Staff, one fleet: no step made a second session"},
+    {"name": "cos-runs-v2", "that": "pane_runs_v2", "agent": "cos"}
+  ],
+  "control": {
+    "variant": {"expect": {"one-cos": {"count": 2}, "second-refused": {"text": "created cos"}}},
+    "fails": ["one-cos", "second-refused"]
+  }
+}

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """A trial of the fleet switchboard you can sit in front of.
 
+This is a thin wrapper for an isolated experiment: the pieces it puts into its profile come from the
+same functions `fleet-switchboard install` uses (agents, skills, plugins, cli.json). A real user does not
+run this: they follow INSTALL.md, whose Fleet Switchboard step runs `fleet-switchboard install`.
+
 The Lab (bin/proof-switchboard) proves the system with a scripted model. The
 trial is the same isolation with a real model: its own OpenCode v2 data, its own
 config, its own switchboard state, and a herdr workspace of its own. Nothing
@@ -33,9 +37,6 @@ REPO_ROOT = HERE.parent
 DEFAULT_MODEL = "github-copilot/claude-sonnet-5.5"
 SERVICE_PORT = 49380  # v2 manages one service per profile on a fixed port; the Lab holds 49374
 WORKSPACE_LABEL = "Switchboard Trial"
-AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
-DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
-DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
 KEY_NAME_PATTERN = "(_API_KEY|_SECRET|_PASSWORD|_ACCESS_KEY|_ACCESS_KEY_ID)$"
 EXIT_OK, EXIT_ERROR = 0, 1
 
@@ -54,6 +55,17 @@ def load_proof():
     return module
 
 
+def load_switchboard():
+    """bin/fleet-switchboard, for the install functions the trial shares with `fleet-switchboard install`:
+    one path puts the kit's agents, skills and plugins into a profile, whoever asks."""
+    loader = importlib.machinery.SourceFileLoader("fleet_switchboard_install", str(HERE / "fleet-switchboard"))
+    spec = importlib.util.spec_from_loader("fleet_switchboard_install", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fleet_switchboard_install"] = module
+    loader.exec_module(module)
+    return module
+
+
 def trial_root():
     override = os.environ.get("FLEET_SWITCHBOARD_TRIAL_DIR")
     if override:
@@ -66,6 +78,7 @@ class Trial:
     def __init__(self, root=None):
         proof = load_proof()
         self.proof = proof
+        self.sb = load_switchboard()
         self.root = Path(root or trial_root())
         self.lab = proof.Lab(str(self.root))  # the same layout as the Lab, a different root
         self.profile = Path(self.lab.profile)
@@ -214,14 +227,10 @@ class Trial:
         opencode_json = self.opencode_config(model)
         proof.write_if_changed(os.path.join(self.lab.opencode_config, "opencode.json"),
                                json.dumps(opencode_json, indent=2) + "\n")
-        for name in AGENTS:
-            text = (REPO_ROOT / "agents" / "opencode" / (name + ".md")).read_text()
-            proof.write_if_changed(os.path.join(self.lab.opencode_config, "agents", name + ".md"),
-                                   proof.agent_copy(text, model))
-        self.install_skills()
+        self.guarded(self.sb.install_agents, self.lab.opencode_config, model, REPO_ROOT)  # the same functions
+        self.install_skills()                                                              # `fleet-switchboard install` calls
         report["decisions plugin"] = self.install_decisions_plugin()
-        plugin = (REPO_ROOT / "plugins" / "fleet-hooks" / "index.js").read_text()
-        proof.write_if_changed(os.path.join(self.lab.opencode_config, "plugins", "fleet-hooks.js"), plugin)
+        self.guarded(self.sb.install_hooks_plugin, self.lab.opencode_config, REPO_ROOT)
         done = self.wrapper_run("service", "set", "port", str(SERVICE_PORT))
         if done.returncode:
             raise TrialError("cannot set the service port: %s" % (done.stderr or done.stdout).strip())
@@ -247,6 +256,13 @@ class Trial:
         report["switchboard config"] = str(self.switchboard_config)
         return report
 
+    def guarded(self, function, *args):
+        """Call one of the shared install functions; its refusals are this driver's errors."""
+        try:
+            return function(*args)
+        except self.sb.InstallError as err:
+            raise TrialError(str(err)) from None
+
     def skills_dir(self):
         return self.root / "skills"
 
@@ -259,49 +275,14 @@ class Trial:
 
     def install_skills(self):
         """Copy the kit's skills into the trial's own skills directory."""
-        installed = []
-        for skill in sorted((REPO_ROOT / "skills").iterdir()):
-            if (skill / "SKILL.md").is_file():
-                target = self.skills_dir() / skill.name
-                os.makedirs(target, exist_ok=True)
-                self.proof.write_if_changed(str(target / "SKILL.md"), (skill / "SKILL.md").read_text())
-                installed.append(skill.name)
-        return installed
-
-    def decisions_plugin_dir(self):
-        return Path(self.lab.opencode_config) / DECISIONS_PLUGIN_NAME
-
-    def cli_json_path(self):
-        return Path(self.lab.opencode_config) / "cli.json"
-
-    def read_cli_json(self):
-        """The profile's cli.json as an object ({} when there is none). A file that is not a JSON object is
-        refused, never overwritten: it may hold plugins this driver knows nothing about."""
-        path = self.cli_json_path()
-        if not path.exists():
-            return {}
-        try:
-            body = json.loads(path.read_text())
-        except ValueError:
-            body = None
-        if not isinstance(body, dict) or not isinstance(body.get("plugins", []), list):
-            raise TrialError("%s is not a JSON object with a `plugins` list: fix it by hand, then run again" % path)
-        return body
+        self.guarded(self.sb.install_skills, self.skills_dir(), REPO_ROOT)
+        return self.sb.kit_skill_names(REPO_ROOT)
 
     def install_decisions_plugin(self):
         """Copy the Decisions TUI plugin into the trial profile and name its directory in cli.json, keeping
         every other plugin and key there. Idempotent. The wrapper (written by init) sets the environment
         variable the plugin reads. Nothing is restarted: a TUI loads plugins when it starts."""
-        source = REPO_ROOT / "plugins" / "fleet-decisions-tui"
-        changed = False
-        for name in DECISIONS_PLUGIN_FILES:
-            os.makedirs(self.decisions_plugin_dir(), exist_ok=True)
-            changed |= self.proof.write_if_changed(str(self.decisions_plugin_dir() / name), (source / name).read_text())
-        body = self.read_cli_json()
-        wanted = "./" + DECISIONS_PLUGIN_NAME
-        if wanted not in body.get("plugins", []):
-            body["plugins"] = list(body.get("plugins", [])) + [wanted]
-            changed |= self.proof.write_if_changed(str(self.cli_json_path()), json.dumps(body, indent=2) + "\n")
+        changed = self.guarded(self.sb.install_decisions_plugin, self.lab.opencode_config, REPO_ROOT)
         if self.wrapper.exists() and self.proof.write_if_changed(str(self.wrapper), self.wrapper_text()):
             os.chmod(self.wrapper, 0o755)  # an older trial's wrapper lacks FLEET_SWITCHBOARD_STATE, which the plugin reads
             changed = True
@@ -309,17 +290,8 @@ class Trial:
 
     def decisions_plugin_status(self):
         """`installed`, `not installed`, or `out of date` (a file differs from the kit's), for `status`."""
-        try:
-            named = ("./" + DECISIONS_PLUGIN_NAME) in self.read_cli_json().get("plugins", [])
-        except TrialError:
-            named = False
-        source = REPO_ROOT / "plugins" / "fleet-decisions-tui"
-        have = [(self.decisions_plugin_dir() / name).is_file() for name in DECISIONS_PLUGIN_FILES]
-        if not named or not all(have):
-            return "not installed"
-        same = all((self.decisions_plugin_dir() / name).read_text() == (source / name).read_text()
-                   for name in DECISIONS_PLUGIN_FILES)
-        return "installed" if same else "out of date: run `switchboard-trial up`"
+        status = self.sb.decisions_plugin_status(self.lab.opencode_config, REPO_ROOT)
+        return "out of date: run `switchboard-trial up`" if status == "out of date" else status
 
     def write_gitconfig(self):
         """git in an agent's shell (HOME is the trial's) pushes through gh's credential helper,

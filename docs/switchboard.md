@@ -25,6 +25,7 @@
 | 13 | `switchboard/reports` | Workers report with `fleet-switchboard report`; a bare idle is a rider and wakes nobody; a stop without a report is triaged; every message carries a one-line description for the TUI | ready for review |
 | 14 | `switchboard/decisions` | A read-only Decisions list for you: derived from labels, pending requests and unanswered reports, written to `decisions.json`, read by `fleet-switchboard decisions` and a TUI sidebar plugin | ready for review |
 | 15 | `switchboard/multi-repo` | One Chief of Staff, many independent projects: the watched repos are derived, `owner/repo#N` issue references, a `gh` account per repo, `launch --new-workspace`, repo creation is a decision and always hard to reverse, per-repo status | ready for review |
+| 16 | `switchboard/install` | `fleet-switchboard install`: config, the kit's pieces in OpenCode's profile, the herdr plugin and a service that keeps the daemon alive; the decision-model key as a private file; the daemon started on use; `bootstrap` opens the Chief of Staff | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -261,9 +262,10 @@ changes. It is never a delivery channel to an agent.
 | read | `agent list`, `agent get` | Pane, workspace, tab, `agent_status` (authoritative for v2 panes through the integration), `agent_session` (which v2 session the pane shows) |
 | read | Plugin `[[events]]` on `pane.agent_status_changed`, `pane.created`, `pane.closed`, `pane.exited` | Run `fleet-switchboard poke`, so a status change is acted on within seconds. A 60 s pass is the backstop |
 | write | `tab create --no-focus`, then `agent start --kind opencode --pane <p> -- -s <session>` | Open a pane for a launched agent without moving your focus |
+| write | `workspace create --cwd <dir> --label <text> --focus` (PR 16) | `bootstrap` opens the Chief of Staff in a workspace of its own, focused, because the person wants to see it. The one call that takes focus; only a person's own command makes it (`--no-focus` for scripts and trials) |
 | write | `pane report-metadata --token unread=<n>` | Unread count in the sidebar. Display-only; the switchboard never uses `report-agent`, which would take status authority away from the integration |
 | write | `notification show` | Toast for a held item, a blocked worker, an Intent change, or a switchboard fault |
-| never | `agent prompt`, `agent send-keys`, `pane send-text`, `pane send-keys`, `pane run`, any focus command | The switchboard never types and never moves your focus |
+| never | `agent prompt`, `agent send-keys`, `pane send-text`, `pane send-keys`, `pane run`, any focus command but the one above | The switchboard never types and never moves your focus on its own |
 
 herdr's v2 status comes from the TUI plugin, so it covers agents running the
 full TUI. v2's Mini and headless clients report nothing; fleet agents always
@@ -1189,6 +1191,187 @@ is unchanged.
 
 A decision's identity across repos is done: see "Ids and repos (PR 15)" under
 Decisions.
+### Install (PR 16)
+
+Until now a person needed `bin/switchboard-trial`, written for an isolated experiment, to try the
+system: it starts the daemon, writes the config, installs the pieces and opens the first panes. A real
+user should instead point an agent at [INSTALL.md](../INSTALL.md), answer two human steps (a Copilot
+login and a key), and have a Chief of Staff running in its own herdr workspace, with the daemon alive
+whenever it is needed. There is one Chief of Staff, one fleet and one daemon per user, and the Chief of
+Staff never does work.
+
+#### `fleet-switchboard install`
+
+```
+fleet-switchboard install [--opencode PATH] [--profile DIR] [--shared-profile] [--gh-user NAME]
+                          [--no-service] [--no-herdr-link] [--dry-run] [--uninstall]
+```
+
+Idempotent. Every step says `done`, `already done` or `skipped (why)`, and a second run changes nothing.
+`--dry-run` prints every step, the profile path it would use included, and writes nothing (a step that
+would change something says `would be done`); under a temporary `HOME` it creates nothing in
+`~/.config/opencode`, which a test checks. It prints no secret and writes none.
+
+| Step | What it does | Already done when |
+|---|---|---|
+| `opencode v2` | Finds the OpenCode v2 binary: `--opencode`, else the configured one, else `$XDG_DATA_HOME/fleet-switchboard/v2/...`, else `~/.local/share/fleet-v2/bin/opencode`, else `opencode` on `PATH`. It must be an absolute path and `--version` must say v2. A v1 binary is refused, with the `npm install --prefix` that gets v2 into a private directory (the same one the trial driver runs) | the config already names it |
+| `config` | Adds the keys that are missing to `config.json`: `opencode` (the wrapper below), `opencode_executable` (the real binary), `launch_env` (`FLEET_SWITCHBOARD_LAB_PANE=1`, so a pane's v2 keeps its herdr identity), `herdr` (an absolute path when `herdr` is on `PATH`), `github_repos: []`, `jev` with the standard model and `policy.enabled`. A key the user has is never rewritten or reordered; there is no `intent_repo` (the Chief of Staff and the next PR set repos up) | every key is there |
+| `profile` | Makes v2's **private profile**, `$XDG_DATA_HOME/fleet-switchboard/profile` (or `--profile DIR`): `config`, `data`, `state`, `cache`, `tmp` and `home`, the `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `TMPDIR` and `HOME` of v2's wrapper, exactly as the trial driver's profile is laid out. It is the one directory the rest of the table writes into, and nothing in it is read by any other program | the directories exist |
+| `wrapper` | `$XDG_DATA_HOME/fleet-switchboard/bin/fleet-opencode`, beside the profile: a shell script that runs the configured v2 binary with the profile's XDG variables and `HOME`, exports `FLEET_SWITCHBOARD_BIN`, `_SHIMS` and `_STATE` (the variables the two plugins read), puts the kit's `bin` first on `PATH`, strips every credential-shaped variable by shape (`_API_KEY`, `_SECRET`, `_PASSWORD`, `_ACCESS_KEY`, `_ACCESS_KEY_ID`, and the `GH_`, `GITHUB_` and `COPILOT_` prefixes), then gives the agents the `gh` token as `GH_TOKEN`, asked from your real gh config at every start before `HOME` is replaced (`--gh-user` pins the account; no token is written anywhere), and drops herdr's pane identity unless `FLEET_SWITCHBOARD_LAB_PANE=1` (the config's `launch_env` sets it for panes). These are the trial wrapper's rules, and a test runs both for the same canaries. The config's `opencode` is this file and `opencode_executable` the real binary. v2 run by its own name gets none of it | the file is current |
+| `agents`, `skills`, `skills path`, `fleet-hooks plugin`, `decisions plugin` | The kit's four agent definitions (the model placeholder filled with `github-copilot/claude-sonnet-5.5`), its skills, the `fleet-hooks` plugin, and the Decisions TUI plugin with its `cli.json` entry, into the private profile's `config/opencode`. The skills go to `$XDG_DATA_HOME/fleet-switchboard/skills`, named in `opencode.json` under `skills.paths`, because v2 also reads skills from the home directory and a configured path is read after those and wins. These are the functions `bin/switchboard-trial` calls: there is one path, and the trial passes its own profile | each file is identical |
+| `herdr integration` | herdr's OpenCode integration (the plugin that reports an agent's status), into the private profile: `herdr integration install opencode` run with the profile's `HOME`, whose `.config/opencode` is a link to the profile's `config/opencode`. herdr writes to `$HOME/.config/opencode` and ignores `XDG_CONFIG_HOME`, so the private `HOME` and the link are what send it there. `install` reads `herdr integration status` first and refuses (installing nothing) when the path it names is not under the private `HOME`. This is how `proof.ensure_herdr_integration` works for the trial's profile. Skipped with `--no-herdr-link` and with `--shared-profile` | herdr says `current` |
+| `herdr plugin` | `herdr plugin link <repo>/herdr` unless `--no-herdr-link`. It prints what it will do first (below) | `herdr plugin list` shows `fleet-switchboard` |
+| `service` | Writes the LaunchAgent or the systemd user unit and loads it unless `--no-service` (below) | the file is current and loaded |
+| `daemon` | Runs `ensure`, then prints `status`, whose first line says so when there is no key | the daemon already held its lock |
+
+**The profile is private, and `~/.config/opencode` is never written.** The directory OpenCode reads by
+default (`$XDG_CONFIG_HOME/opencode`, `~/.config/opencode` without the variable) is read by the person's
+ordinary OpenCode too, and the owner's own fleet may still run on OpenCode v1 on the same machine. A
+v2-shaped plugin (`fleet-hooks.js`), a `fleet-decisions` directory, `skills.paths` and a `cli.json` in
+that directory can stop every v1 agent at start. So `install` writes only into the private profile above
+and runs v2 only through `fleet-opencode`, which points v2 at it; the daemon reads the user's real
+switchboard config and reaches v2 only through that wrapper, so it, `bootstrap` (which launches the Chief
+of Staff through the configured `opencode`) and the LaunchAgent or unit all use the wrapper and the private
+profile without a line of their own. `--shared-profile` puts the pieces in the shared directory anyway; it
+says in plain words, before anything is written, that the ordinary OpenCode will read the files, and it
+installs no herdr integration and keeps the real `HOME`. A Copilot login made through `fleet-opencode
+auth login` lives in the private profile too (INSTALL.md, STEP 17). The fault `shared-profile-default`
+makes the default shared again; the test that the shared directory is untouched fails under it.
+
+`--uninstall` reverses the service, the herdr link, the herdr integration (`herdr integration uninstall
+opencode` with the private `HOME`, only when its status names a path there), the home link (only when it is
+the link `install` made) and the profile pieces, and leaves the config, the state and every session
+(the profile's `data`) alone. It never reads or removes anything in the shared directory unless
+`--uninstall --shared-profile` is given. A file the user edited, or a plugin they added to `cli.json`, is
+kept. A daemon that is running keeps running until it exits.
+
+**The herdr link, and what it will do.** herdr has one server, so a linked plugin's hooks run for every
+pane in it, including panes that run another agent. The plugin's startup hook runs
+`fleet-switchboard ensure`; its event hooks (pane created, closed, exited, agent detected, agent status
+changed) run `fleet-switchboard poke`, which is silent, returns at once, and only asks the daemon for a
+pass. Nothing is typed into any pane and nothing is sent anywhere. `install` prints this before it runs
+`herdr plugin link`, and INSTALL.md makes the person say yes first. This is the reason the manifest was
+left unlinked in PRs 3 to 14 ([the cutover runbook](switchboard-cutover.md) still says to read the question
+before linking by hand).
+
+#### The service
+
+| | macOS | Linux |
+|---|---|---|
+| Template | `templates/com.fleet-kit.switchboard.plist` | `templates/fleet-kit-switchboard.service` |
+| Written to | `~/Library/LaunchAgents/com.fleet-kit.switchboard.plist` | `$XDG_CONFIG_HOME/systemd/user/fleet-kit-switchboard.service` |
+| Loaded by | `launchctl bootstrap gui/$(id -u) <plist>` | `systemctl --user daemon-reload`, then `systemctl --user enable --now fleet-kit-switchboard.service` |
+| Checked by | `launchctl print gui/$(id -u)/com.fleet-kit.switchboard` | `systemctl --user is-enabled fleet-kit-switchboard.service` |
+| Removed by | `launchctl bootout gui/$(id -u)/com.fleet-kit.switchboard`, then the file | `systemctl --user disable --now ...`, the file, `daemon-reload` |
+| Logs | `launchd-stderr.log` and `launchd-stdout.log` in the state directory | the journal |
+
+The service runs `fleet-switchboard run --standby`: `RunAtLoad` and `KeepAlive` (`Restart=always`) keep it
+up, and a start every 30 s at most. `--standby` is the only addition to `run`: if another daemon already
+holds the single-instance lock (herdr's startup hook or a command's ensure-on-use may have started one
+first) it waits for the lock instead of exiting, so launchd or systemd does not restart it in a loop, and
+it takes over when that daemon goes. `ensure` keeps working beside it: if the service holds the lock,
+`ensure` says `running`. The templates hold no secret: the key comes from its file. `PATH` is the kit's
+`bin`, the directories of `gh`, `herdr` and the python, then the usual places, because a service has
+almost no `PATH` of its own; `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are passed so the service reads the
+config the installer wrote. A test lints the plist with `plutil -lint` where `plutil` exists, parses the
+unit, and fails on a secret, an unfilled placeholder or a personal name in either.
+
+#### The decision-model key
+
+Without a key the classifier and the tool-call judge fail open, so an install can look healthy and judge
+nothing. Two things follow: the key is never text, and its absence is loud.
+
+- **Where it comes from.** The variable named by `jev.key_env` if it is set, else the file `jev.key_file`
+  (default `$XDG_CONFIG_HOME/fleet-switchboard/jev.key`). The file must be a regular file (not a link)
+  owned by you with no group or other permissions; anything else is refused with the reason, and treated
+  as no key. Only the daemon reads it: `judge-tool` still asks the daemon over its socket.
+- **`fleet-switchboard key set`** reads the key from standard input (no echo at a terminal; a pipe
+  works), writes the file atomically with mode 0600 (a temporary file in the same directory, then a
+  rename), and prints only `key saved`. A key with spaces is refused without being shown. **`key status`**
+  prints `file`, `environment` or `none`. There is no `key show`, and the key is never an argument.
+- **Never text.** The key appears in no argument list, log, audit line, error, fact, prompt or status. One
+  test runs a judgement, `status` (text and JSON), `key status`, `decisions` and a failing call with a
+  made-up key in its file, and scans every output and every file the run wrote for it.
+- **Saying so.** When `jev` is configured with no `replay` and no key is found, `status` begins with
+  `No decision-model key: messages are not classified and tool calls are not judged.` before any line that
+  looks healthy; `status --json` carries `key: {source, notice, problem}`. It is a warning, not a failure:
+  the exit code is unchanged. Fault `key-missing-silent` leaves the line out (scenario E3).
+
+`status` also gains four lines: `daemon` (running with its pid, or not running), `key` (where it comes
+from), `plugin` (whether `herdr plugin list` names `fleet-switchboard`) and `service` (whether the file
+is installed; it never runs `launchctl` or `systemctl`).
+
+#### The daemon is alive when it is needed
+
+`send`, `report`, `launch`, `handoff`, `comment`, `remind`, `decisions`, `intent` and `bootstrap` call
+`ensure_daemon` first: quiet, and bounded to two seconds. If the daemon cannot be started, the command
+still does its work and prints one warning to stderr that names `daemon.log`. A config the daemon could not
+read is the command's own error, said once. `judge-tool`, which runs inside v2 on every tool call, never
+does this, and `status`, `poke`, `whoami`, `pending` and `intents` do not either (a test asserts both).
+Fault `no-ensure-on-use` skips it (scenario E1).
+
+#### `fleet-switchboard bootstrap [--workspace LABEL] [--dir DIR] [--no-focus]`
+
+Opens the Chief of Staff for the first time, or again. Everything is derived from facts; no id is stored.
+
+1. A fleet agent named `cos` that has a herdr pane: refused, naming its pane and session. There is one.
+2. Else a v2 session whose fleet name is `cos` (the newest, from `session.list`): it is resumed with the
+   existing `resume_agent` in the workspace labelled `LABEL` (default `Chief of Staff`), or in a new one
+   when that workspace is gone.
+3. Else a herdr workspace is made (`herdr workspace create --cwd DIR --label LABEL --focus`: the person
+   wants to see it; `--no-focus` for scripts) and `cos` (agent `chief-of-staff`, no `reports_to`) is
+   launched in it with the existing `launch_agent`. A first run always makes a new workspace and never
+   takes an old one that happens to share the label. The empty shell pane a new workspace opens with is
+   closed once the launch is verified, and only that pane.
+
+The brief tells it to introduce itself, run `fleet-switchboard status`, say plainly what is missing (the
+key, the GitHub repos to watch, the daemon, the plugin, the service), and ask what the person wants to
+work on. `DIR` defaults to the current directory. The launch and the resume are not rewritten.
+
+#### CLI reference (PR 16)
+
+| Command | Effect |
+|---|---|
+| `install [--opencode PATH] [--profile DIR] [--shared-profile] [--gh-user NAME] [--no-service] [--no-herdr-link] [--dry-run] [--uninstall]` | Above. Exit 0, or 1 with one line saying why it stopped |
+| `key set` / `key status` | Above. `set` exits 2 for an empty or spaced key and 1 if it cannot write the file; `status` exits 1 only when a key file is refused |
+| `bootstrap [--workspace LABEL] [--dir DIR] [--no-focus]` | Above. Prints one JSON line: `action` (`created` or `resumed`), `workspace`, `pane`, `session`, `tab`. Exits 1 when a Chief of Staff already runs |
+| `run [--once] [--poll S] [--standby]` | `--standby` is new: wait for the lock instead of exiting |
+| `status [--json]` | Gains the key notice and the `daemon`, `key`, `plugin` and `service` lines |
+
+**Scenarios and faults.** The ids I1 to I4 are PR 6's, so the three new scenarios are `E1`, `E2` and `E3`
+(catalog above). Faults `key-missing-silent`, `no-ensure-on-use` and `shared-profile-default`
+each have a control that fails (the last one's is a unit test of `install`: it must leave `~/.config/opencode`
+untouched, and does not under the fault); E2 has none to switch off, so its control is a variant that expects a
+second Chief of Staff and fails. The offline runner gained the steps `use`, `bootstrap` and `close-agent`
+and the oracles `status_first_line` (PR 15's `status_says` reads the GitHub lines), `bootstrap_says` and `fleet_sessions`. Install steps are unit-tested with
+a fake runner and a temporary `HOME` (a fake OpenCode, herdr, `launchctl` and `systemctl`), not scenarios.
+
+**Lab proof (2026-10-06).** In the Lab only, with a Lab v2 wrapper on a fresh data directory (so the
+Lab's own sessions were untouched), the Lab's scripted model, the real herdr, and a throwaway workspace
+labelled `Switchboard Lab PR16 throwaway`:
+
+1. `bootstrap --workspace <label> --dir <Lab repo> --no-focus` printed `action: created`, made workspace
+   `wV` with one pane, a `cos` session with `metadata.fleet {name: cos, role: chief-of-staff}`, and
+   the brief as a fleet prompt, which the scripted model answered. `status` listed `cos idle` in that pane;
+   herdr's pane count for the workspace was one (the empty shell pane was closed). Ensure-on-use had
+   started the daemon: `status` showed `daemon running`.
+2. A second `bootstrap` exited 1: `a Chief of Staff already runs: cos in pane wV:p2 (session ses_...)`.
+3. After closing that pane (the last pane, so herdr removed the workspace), a third `bootstrap` printed
+   `action: resumed`, the same session, in a new workspace `wW`; there was still exactly one `cos` session.
+4. An earlier run against the Lab's own data found ten old `cos` sessions there and resumed the newest,
+   which is the derive-from-facts rule working on a Lab that had been used before.
+
+Everything opened was removed: the throwaway workspace, the daemon (by the pid `ensure` started), the
+scripted model and the proof's v2 service and data; the Lab's own service stayed stopped and `lab status`
+read as before.
+
+**Not verified live.** Loading the LaunchAgent with `launchctl` and the systemd unit with `systemctl` (the
+installer's calls are tested with fakes; the plist passes `plutil -lint`, the unit parses); `herdr plugin
+link` and its hooks; a first-time `bootstrap` with `--focus` (the Lab runs used `--no-focus` so the
+owner's screen did not move); `install` against a real v2 binary and a real profile; a real `herdr
+integration install opencode` under the private `HOME` (the trial's profile does this, the installer's
+same steps are tested against a fake herdr); a v1 OpenCode reading the shared directory after an
+install (it is not written any more).
 
 ### Data
 
@@ -1634,6 +1817,9 @@ R1.
 | M4 | A repo whose account cannot create a webhook | — | Read on a poll; `status` and one toast say so | PR 15 | offline; control: the account may create it |
 | M5 | A worker runs `gh repo create` | — | Repo creation is always hard to reverse (deterministic rule) | PR 15 | offline; control `repo-create-allowed` |
 | M6 | `launch --new-workspace` with a label the charter does not name | — | Refused before anything is made | PR 15 | offline; control: the label matches |
+| E1 | A command that needs the daemon runs while it is dead | — | Ensure on use: the daemon is started first and the fact that waited is delivered | PR 16 | offline; control `no-ensure-on-use` |
+| E2 | `bootstrap` is run three times | — | One Chief of Staff: opened once, a second refused naming the one that runs, resumed in a workspace when its pane is gone | PR 16 | offline; the control is a variant that expects a second one |
+| E3 | The decision-model key is missing | — | `status` says so in its first line, in plain words | PR 16 | offline; control `key-missing-silent` |
 
 ## Repo and PR conventions
 
@@ -2128,3 +2314,33 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   poll window both kept) and `build_engine` (`state_dir` and `engine.accounts`
   both set). Scenario D6 (two repos, the same issue number, two decisions) with
   `bare-issue-number` as its control.
+- 2026-10-06: PR 16, Install. Found: trying the system needed `bin/switchboard-trial`, which we wrote;
+  a real user could not point an agent at INSTALL.md and end with a Chief of Staff. Added `fleet-switchboard
+  install` (idempotent, `--dry-run`, `--uninstall`), a LaunchAgent and a systemd user unit that run
+  `run --standby`, the decision-model key as a private file with `key set` and `key status`, `status` saying
+  in its first line when there is no key (without one the classifier and the judge fail open and an install
+  looks healthy), the daemon started by the commands that need it (never by `judge-tool`), and `bootstrap`.
+  The trial driver now calls the install functions for the agents, skills and plugins, so there is one path.
+  The scenario ids I1 to I4 were PR 6's, so E1 to E3 are the new ones. The herdr focus guard now allows
+  `--focus` in exactly one method (`workspace create`): the Chief of Staff's workspace is the one thing the
+  switchboard opens where the person is looking. The Lab
+  proof above found that a Lab used before holds old `cos` sessions, and that closing a workspace's last
+  pane removes the workspace, so a resume must be ready to make one.
+- 2026-10-06: PR 16, the profile is private. Found in review (not by a test or a run): `install` wrote the
+  v2 profile (`fleet-hooks.js`, `fleet-decisions/`, `skills.paths`, `cli.json`) into
+  `$XDG_CONFIG_HOME/opencode`, the directory the person's ordinary OpenCode reads, while the owner's live
+  fleet runs on v1 on the same machine: a v2-shaped plugin there can break every live agent at start. The
+  first report said a private directory would break herdr's OpenCode integration, because herdr writes to
+  `$HOME/.config/opencode` and ignores `XDG_CONFIG_HOME`. That was wrong, or at best incomplete:
+  `bin/switchboard-trial` already runs v2 on a private profile and installs the integration into it
+  (`proof.ensure_herdr_integration`), with a private `HOME` whose `.config/opencode` is a link to the
+  profile's config directory. Changed: `install` makes that profile (default
+  `$XDG_DATA_HOME/fleet-switchboard/profile`), installs everything and herdr's integration into it, runs v2
+  through a new `fleet-opencode` wrapper with the trial wrapper's rules (private XDG and `HOME`, credential
+  stripping by shape, the `gh` token handled as the trial does), puts `launch_env` in the config so a pane's
+  v2 keeps its herdr identity, and writes into the shared directory only with `--shared-profile`, saying
+  so. `--uninstall` removes only what was installed, in the private profile. Fault `shared-profile-default`
+  with a test that fails under it; a dry run under a temporary `HOME` is tested to touch nothing in
+  `~/.config/opencode`. Found while rebasing onto PR 15: both PRs defined an oracle `status_says`, so
+  PR 16's is now `status_first_line`; both fake herdrs defined `workspace create`, now one; and PR 15's
+  `launch --new-workspace` calls PR 16's `workspace_create` with `focus=False`.

@@ -1,0 +1,45 @@
+# fleet-kit-switchboard.service — systemd --user unit TEMPLATE for the Fleet Switchboard daemon.
+#
+# The Linux sibling of com.fleet-kit.switchboard.plist. This file is a template, not a unit you can
+# load. `fleet-switchboard install` fills the placeholders from the running environment, writes the
+# result to ~/.config/systemd/user/fleet-kit-switchboard.service and runs:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fleet-kit-switchboard.service
+#
+# `fleet-switchboard install` with its uninstall flag runs `systemctl --user disable --now` and removes the file.
+#
+# The placeholders are the same set as the plist's, written between double underscores: PYTHON, PREFIX,
+# HOME, PATH, CONFIG_HOME (XDG_CONFIG_HOME) and STATE_HOME (XDG_STATE_HOME).
+#
+# There is nothing private in this file: the decision-model key is read by the daemon from its own
+# private key file (`fleet-switchboard key set`).
+#
+# The `standby` flag of `run` waits when another daemon already holds the lock instead of exiting.
+#
+# A user unit only runs while you have a session unless lingering is on: `loginctl enable-linger $USER`
+# on a headless box. Read the log with: journalctl --user -u fleet-kit-switchboard.service
+#
+# There is exactly one copy of this file. Do not keep a second one for the installer.
+
+[Unit]
+Description=Fleet Switchboard (delivers messages between fleet agents)
+
+[Service]
+Type=simple
+ExecStart="__PYTHON__" -B "__PREFIX__/bin/fleet-switchboard" run --standby
+WorkingDirectory=__HOME__
+Environment="HOME=__HOME__"
+Environment="PATH=__PATH__"
+Environment="XDG_CONFIG_HOME=__CONFIG_HOME__"
+Environment="XDG_STATE_HOME=__STATE_HOME__"
+
+Restart=always
+RestartSec=30
+
+# Never /dev/null: with Restart=always a fatal start-up error sent nowhere is an invisible restart loop.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

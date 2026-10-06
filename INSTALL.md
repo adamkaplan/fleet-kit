@@ -385,10 +385,155 @@ in GitHub without showing the person first.**
 
 ---
 
+## The Fleet Switchboard (optional: STEPS 14 to 19)
+
+The Fleet Switchboard is the system around the fleet: it delivers messages
+between agents by OpenCode v2's own message queue (never by typing into a
+pane), keeps a Chief of Staff, and judges tool calls. Do this part only if the
+person asked for it. There is one Chief of Staff, one fleet and one daemon per
+user. The Chief of Staff never does work. Two steps need the person (the Copilot
+login and a key), and you stop at each. Read `docs/switchboard.md`, "Install
+(PR 16)", if anything here surprises you.
+
+---
+
+## STEP 14 — OpenCode v2
+
+```
+CHECK:   V2="$HOME/.local/share/fleet-switchboard/v2/node_modules/@opencode/cli/bin/opencode.exe"
+         "$V2" --version
+         Prints "opencode v2.<minor>.<patch>"?  -> skip to STEP 15.
+DO:      npm install --prefix "$HOME/.local/share/fleet-switchboard/v2" \
+           --no-audit --no-fund --ignore-scripts @opencode/cli@2.0.22
+         (cd "$HOME/.local/share/fleet-switchboard/v2/node_modules/@opencode/cli" && node ./postinstall.mjs)
+VERIFY:  "$V2" --version
+PROVES:  a version that starts with "opencode v2.". Run it by this absolute path.
+```
+
+Never trust the `opencode` on `PATH`: it may be OpenCode v1, which the person's
+other fleet runs on. Never use `npm -g` or the curl installer, which replace
+that v1 binary. If `node` or `npm` is missing, that is a `HUMAN` step: stop and
+say so.
+
+---
+
+## STEP 15 — herdr with plugins
+
+```
+CHECK:   herdr plugin list
+         Prints a list (even an empty one)?  -> skip to STEP 16.
+DO:      update herdr the way STEP 2 installed it. Plugins need 0.9.3 or later.
+VERIFY:  herdr --version; herdr plugin list
+PROVES:  the version is 0.9.3 or later and `plugin list` exits 0.
+```
+
+`install` (the next step) links the Fleet Switchboard's plugin. Do not run
+`herdr plugin link` yourself.
+
+---
+
+## STEP 16 — Install it
+
+```
+CHECK:   ./bin/fleet-switchboard install --dry-run
+         Every line says "already done"?  -> skip to STEP 17.
+DO:      show the person the dry run, and read them the herdr plugin notice in it.
+         HUMAN: the plugin's hooks run for every pane in herdr, including panes
+         that run other agents. They are silent and type nothing, but it is the
+         person's call. Wait for a yes, then:
+         ./bin/fleet-switchboard install --opencode "$V2"
+VERIFY:  ./bin/fleet-switchboard install --opencode "$V2"
+PROVES:  every step says "already done" on this second run (the first one says
+         "done" or "already done"), and no step says FAILED.
+```
+
+`install` is safe to repeat. It finds the v2 binary (it refuses OpenCode v1 and
+says how to get v2), writes only the config keys that are missing and never
+touches the ones the person edited, puts the kit's agents, skills and plugins
+and herdr's OpenCode integration into a **private v2 profile** (by default
+`~/.local/share/fleet-switchboard/profile`), links the herdr plugin, installs a
+service that keeps the daemon alive (a LaunchAgent on macOS, a systemd user unit
+on Linux), starts the daemon, and prints `status`. `install --uninstall` reverses
+all of it except the config, the state and the sessions. Add `--no-service` or
+`--no-herdr-link` to skip either one, and say so in your report.
+
+The profile is private on purpose. The person's ordinary OpenCode (possibly v1,
+which their other fleet may run on) reads `~/.config/opencode`, and `install`
+never writes there: v2-shaped files in it can stop every v1 agent at start. The
+dry run prints the profile path it would use; read it to the person. Never pass
+`--shared-profile` unless the person asks for it by name: it puts the files where
+their ordinary OpenCode reads them, and says so.
+
+If `status` begins with "No decision-model key", that is STEP 18, not a failure.
+
+---
+
+## STEP 17 — The Copilot login
+
+```
+CHECK:   "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth list
+         Lists GitHub Copilot?  -> skip to STEP 18.
+HUMAN:   yes. The login is an interactive device-code flow in a browser.
+DO:      tell the person to run
+         "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth login
+         and choose GitHub Copilot. Wait.
+VERIFY:  "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth list
+PROVES:  GitHub Copilot is listed.
+```
+
+Use the wrapper `install` wrote (`fleet-opencode`), not the bare binary: it
+points v2 at the private profile and sets the environment the plugins need. The
+login is stored in that profile, so the person's ordinary OpenCode is not
+affected and does not see it.
+
+---
+
+## STEP 18 — The decision-model key
+
+```
+CHECK:   ./bin/fleet-switchboard key status
+         Prints "file" or "environment"?  -> skip to STEP 19.
+HUMAN:   yes. Only the person has the key.
+DO:      tell the person to run ./bin/fleet-switchboard key set and paste the
+         key (nothing is echoed; it is saved to a private file, mode 0600).
+         Do not ask them to paste it to you. Do not put it in an argument, an
+         environment variable of yours, a file you write, or this transcript.
+VERIFY:  ./bin/fleet-switchboard key status
+PROVES:  "file" (or "environment").
+```
+
+Without a key the message classifier and the tool-call judge fail open: the
+system looks healthy and nothing is classified or judged. That is why `status`
+says so in its first line. Do not call the install done while it does.
+
+---
+
+## STEP 19 — Open the Chief of Staff, and prove it
+
+```
+CHECK:   ./bin/fleet-switchboard status
+         A "cos" agent listed?  -> it is open; skip bootstrap.
+DO:      ./bin/fleet-switchboard bootstrap
+VERIFY:  ./bin/fleet-switchboard status
+PROVES:  the first line is not "No decision-model key"; the lines `daemon`
+         (running), `key` (file or environment), `plugin` (linked) and `service`
+         (installed) are all present and say so; and `cos` is listed with a pane.
+```
+
+`bootstrap` opens the Chief of Staff in its own herdr workspace and focuses it.
+Run again, it resumes the same Chief of Staff if its pane is gone, and refuses
+to open a second one if it is still there. The Chief of Staff introduces
+itself, reads `status`, and tells the person plainly what is missing (a key,
+the GitHub repos to watch) and asks what they want to work on. It sets the
+repos up with them; you do not.
+
+---
+
 ## When you finish
 
 Report: which steps you ran, which you skipped and why, the full `fleet-doctor`
-output, and anything you could not verify.
+output (and, if you did STEPS 14 to 19, the full `status` output), and anything
+you could not verify.
 
 Then stop. **Do not create a charter or start an orchestrator** — installing the
 kit and using it are different things, and the person decides when to begin.

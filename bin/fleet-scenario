@@ -116,6 +116,11 @@ STEP_FIELDS = {
                  "repo": (False, "repo")},  # repo: PR 15, the repo of the issue
     "send": {"to": (True, _CAST), "text": (True, "line"), "issue": (False, "issue")},
     "delete-decisions": {},
+    # PR 16: you run a command that needs the daemon (it starts one if none runs); `bootstrap` opens the Chief of
+    # Staff; a pane is closed as a person would close it
+    "use": {"command": (True, "name")},
+    "bootstrap": {},
+    "close-agent": {"agent": (True, _CAST)},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -133,6 +138,9 @@ STEP_ACTORS = {
     "awaiting": ("you", "world", "cast"),  # PR 14
     "send": ("cast",),
     "delete-decisions": ("world",),
+    "use": ("you",),  # PR 16
+    "bootstrap": ("world",),
+    "close-agent": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -175,6 +183,11 @@ EXPECT_FIELDS = {
     # `text`, if given), and what the command says
     "decisions": {"at": (True, "duration"), "count": (True, "count0"), "text": (False, "text")},
     "decisions_say": {"at": (True, "duration"), "text": (True, "text")},
+    # PR 16: the first line `fleet-switchboard status` prints; what the bootstrap step printed; how many v2 sessions
+    # carry that cast member's fleet name
+    "status_first_line": {"text": (True, "text")},
+    "bootstrap_says": {"step": (True, _STEP), "text": (True, "text")},
+    "fleet_sessions": {"agent": (True, _CAST), "count": (True, "count0")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")

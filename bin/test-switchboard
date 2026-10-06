@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -440,13 +441,19 @@ def herdr_typing_violations(source):
     for token in tokens:
         if token in ("send-keys", "send-text"):
             found.append(token)
-        if "focus" in token.lower() and not token.startswith("--no-"):
+        if "focus" in token.lower() and not token.startswith("--no-") and token != "--focus":
             found.append(token)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == "HerdrClient":
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Constant) and inner.value in FORBIDDEN_HERDR:
                     found.append("HerdrClient uses %r" % inner.value)
+    # PR 16: the one `--focus` is `workspace create`, which only a person's own `bootstrap` runs
+    allowed = [inner for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "workspace_create"
+               for inner in ast.walk(node)]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "--focus" and not any(node is inner for inner in allowed):
+            found.append("--focus outside HerdrClient.workspace_create")
     for token in tokens:  # the socket: any herdr method but the one allowed is a way in
         if re.match(r"^(agent|pane|tab|workspace|terminal|layout|window|input)\.", token) \
                 and token not in SOCKET_ALLOWED:
@@ -551,7 +558,17 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_process_info",
-                                  "pane_report_metadata_token", "workspace_create"])
+                                  "pane_report_metadata_token", "workspace_create", "workspace_list"])  # PR 16
+
+    def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
+        body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
+               '"root_pane": {"pane_id": "w2:p1"}}}'
+        client, runner = self.client(body)
+        self.assertEqual(client.workspace_list(), [{"workspace_id": "w1", "label": "A"}])
+        self.assertEqual(client.workspace_create("/work", "Chief of Staff"), {"workspace_id": "w2", "root_pane": "w2:p1"})
+        self.assertEqual([argv for argv, _ in runner.calls],
+                         [["/opt/herdr", "workspace", "list"],
+                          ["/opt/herdr", "workspace", "create", "--cwd", "/work", "--label", "Chief of Staff", "--focus"]])
 
     def test_the_socket_admits_one_method_and_sends_no_focus_key(self):
         sent = []
@@ -638,10 +655,13 @@ class TestHerdrClient(Base):
         self.assertNotEqual(planted, SWITCHBOARD.read_text())
         self.assertTrue(herdr_typing_violations(planted))
         for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]',
-                        'x = "pane.send_text"', 'x = "agent.prompt"', 'y = {"focus": True}'):
+                        'x = "pane.send_text"', 'x = "agent.prompt"', 'y = {"focus": True}',
+                        'x = ["workspace", "focus", w]', 'x = ["tab", "create", "--focus"]'):
             with self.subTest(snippet=snippet):
                 self.assertTrue(herdr_typing_violations(snippet))
         self.assertEqual(herdr_typing_violations('x = ["tab", "create", "--no-focus"]'), [])
+        # PR 16: the one `--focus` lives in HerdrClient.workspace_create and nowhere else
+        self.assertEqual(herdr_typing_violations("def workspace_create(self):\n    return self._call('x', '--focus')\n"), [])
         self.assertEqual(herdr_typing_violations('x = "layout.apply"; y = "run.lock"'), [])
 
 
@@ -741,7 +761,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "no-import-metadata", "idle-wakes", "no-rider", "no-nudge-once", "no-fail-open",
               "ignore-reports", "no-description",
               "no-decisions-file", "stale-as-fresh", "decision-resolves-never",  # PR 14
-              "static-repos", "bare-issue-number", "one-account", "repo-create-allowed")  # PR 15
+              "static-repos", "bare-issue-number", "one-account", "repo-create-allowed",  # PR 15
+              "key-missing-silent", "no-ensure-on-use", "shared-profile-default")  # PR 16
 
 
 class TestFaults(Base):
@@ -1013,6 +1034,9 @@ STEP_EXAMPLES = {
     "awaiting": {"issue": 5, "on": True, "title": "Pick the database"},  # PR 14
     "send": {"to": "platform", "text": "use postgres", "issue": 2},
     "delete-decisions": {},
+    "use": {"command": "decisions"},  # PR 16
+    "bootstrap": {},
+    "close-agent": {"agent": "coder"},
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1039,6 +1063,9 @@ EXPECT_EXAMPLES = {
     "intent_gap": {"issue": 2},
     "decisions": {"at": "30s", "count": 1, "text": "Which database?"},  # PR 14
     "decisions_say": {"at": "30s", "text": "not updating"},
+    "status_first_line": {"text": "No decision-model key"},  # PR 16
+    "bootstrap_says": {"step": 1, "text": "already runs"},
+    "fleet_sessions": {"agent": "coder", "count": 1},
 }
 
 
@@ -1233,7 +1260,8 @@ class TestStatus(Base):
         self.assertIn("2 agent(s)", out)
         self.assertEqual(err, "")
         self.assertEqual([argv for argv, _ in runner.calls],
-                         [["/opt/lab/bin/opencode", "api", "server.info"], ["/opt/herdr", "agent", "list"]])
+                         [["/opt/lab/bin/opencode", "api", "server.info"], ["/opt/herdr", "agent", "list"],
+                          ["/opt/herdr", "plugin", "list"]])  # PR 16: whether herdr lists the plugin; read-only
         self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
 
     def test_unconfigured_v2_is_reported_and_never_run(self):
@@ -1242,7 +1270,8 @@ class TestStatus(Base):
         code, out, _ = self.status(runner)
         self.assertEqual(code, 1)
         self.assertRegex(out, r"(?m)^ERROR v2 +not configured: ")
-        self.assertEqual([argv[0] for argv, _ in runner.calls], ["herdr"])
+        self.assertEqual([argv for argv, _ in runner.calls], [["herdr", "agent", "list"], ["herdr", "plugin", "list"]])
+        self.assertNotIn("api", [argv[1] for argv, _ in runner.calls], "v2 is never run when it is not configured")
 
     def test_failures_are_one_line_each_and_exit_1(self):
         self.write_config({"opencode": "/opt/lab/bin/opencode"})
@@ -1666,7 +1695,8 @@ class FakeV2:
 
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
-                 ["pane", "process-info"], ["pane", "close"], ["workspace", "create"])
+                 ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
+                 ["plugin", "list"])  # PR 16: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -1732,6 +1762,8 @@ class FakeHerdr:
         self.socket_down = False
         self._pane_n = 0
         self._last_toast = None
+        self.workspaces = {"w1": {"workspace_id": "w1", "label": "Switchboard Lab", "number": 1}}  # PR 16
+        self.shell_panes = set()    # PR 16: the empty shell pane a new workspace opens with
 
     def new_pane_id(self, workspace="w1"):
         self._pane_n += 1
@@ -1777,7 +1809,7 @@ class FakeHerdr:
         handler = {("agent", "list"): self._agent_list, ("agent", "get"): self._agent_get,
                    ("agent", "prompt"): self._agent_prompt, ("pane", "report-metadata"): self._report_metadata,
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
-                   ("pane", "close"): self._pane_close,
+                   ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
                    ("workspace", "create"): self._workspace_create}.get(tuple(args[:2]))
         if handler is None:
             return _usage(argv, "fake herdr: refused %r" % args)
@@ -1859,30 +1891,40 @@ class FakeHerdr:
         return {"result": {"type": "pane_process_info", "process_info": {
             "pane_id": pane, "foreground_processes": processes, "shell_pid": 4242}}}
 
-    def _workspace_create(self, rest):
-        """`herdr workspace create [--cwd PATH] [--label TEXT] [--env K=V] [--focus|--no-focus]`, as 0.9.3
-        has it: nothing positional, no other flag, and the two focus flags never together."""
-        positional, flags = parse_flags(rest, ("--cwd", "--label", "--env"), ("--focus", "--no-focus"))
-        if positional:
-            raise ValueError("workspace create takes no positional argument")
-        if "--focus" in flags and "--no-focus" in flags:
-            raise ValueError("--focus and --no-focus conflict")
-        self.workspaces = getattr(self, "workspaces", [])
-        number = len(self.workspaces) + 2
-        entry = {"workspace_id": "w%d" % number, "label": (flags.get("--label") or [None])[0],
-                 "cwd": (flags.get("--cwd") or [None])[0], "focused": "--focus" in flags}
-        self.workspaces.append(entry)
-        return {"id": "cli:workspace:create", "result": {"type": "workspace_created", "workspace": dict(entry),
-                                                        "tab": {"tab_id": "w%d:t1" % number},
-                                                        "root_pane": {"pane_id": "w%d:p0" % number}}}
-
     def _pane_close(self, rest):
         positional, _ = parse_flags(rest, ())
         if len(positional) != 1:
             raise ValueError("pane close takes one pane id")
+        if positional[0] in self.shell_panes:
+            self.shell_panes.discard(positional[0])
+            self.closed.append(positional[0])
+            return {"result": {"type": "ok"}}
         self.closed.append(self._pane(positional[0]))
         del self.panes[positional[0]]
         return {"result": {"type": "ok"}}
+
+    def _workspace_list(self, rest):
+        parse_flags(rest, ())
+        return {"result": {"type": "workspace_list", "workspaces": [dict(w) for w in self.workspaces.values()]}}
+
+    def _workspace_create(self, rest):
+        """PR 16: `herdr workspace create [--cwd P] [--label T] [--focus|--no-focus]`: one workspace with one empty shell pane."""
+        positional, flags = parse_flags(rest, ("--cwd", "--label", "--env"), bare=("--focus", "--no-focus"))
+        if positional:
+            raise ValueError("workspace create takes no positional argument")
+        if "--focus" in flags and "--no-focus" in flags:
+            raise ValueError("--focus and --no-focus conflict")
+        self._workspace_n = getattr(self, "_workspace_n", len(self.workspaces)) + 1
+        number = self._workspace_n
+        wid = "w%d" % number
+        label = (flags.get("--label") or ["%d" % number])[0]
+        self.workspaces[wid] = {"workspace_id": wid, "label": label, "number": number}
+        self.created_workspaces = getattr(self, "created_workspaces", []) + [{"id": wid, "cwd": (flags.get("--cwd") or [None])[0],
+                                                                                "label": label, "argv": list(rest), "focus": "--focus" in flags and "--no-focus" not in flags}]
+        root = self.new_pane_id(wid)
+        self.shell_panes.add(root)
+        return {"result": {"type": "workspace_created", "workspace": dict(self.workspaces[wid]),
+                           "root_pane": {"pane_id": root, "workspace_id": wid}}}
 
     # -- the socket
     def socket(self, path, method, params, timeout):
@@ -2986,7 +3028,7 @@ class TestEnsure(Base):
         self.assertEqual(result.stdout.strip(), "daemon started")
         self.assertLess(time.time() - started, 5)
         pid = int((self.state / "run.lock").read_text())
-        self.addCleanup(lambda: os.kill(pid, signal.SIGTERM) if _alive(pid) else None)
+        self.addCleanup(self._stop_daemon, pid)
         self.assertNotEqual(os.getsid(pid), os.getsid(0), "the daemon must have a session of its own")
         self.assertEqual(sb.ensure_daemon(self.state), "running")
         self.assertTrue(self._wait_for(lambda: log.exists() and len(log.read_text().splitlines()) >= 1))
@@ -2995,6 +3037,15 @@ class TestEnsure(Base):
         self.assertEqual(self.run_cli(SWITCHBOARD, "poke").returncode, 0)
         self.assertTrue(self._wait_for(lambda: len(log.read_text().splitlines()) > before),
                         "the poke did not make the daemon pass (poll is an hour)")
+
+    def _stop_daemon(self, pid):
+        """Stop the daemon this test started and wait until it is gone: it writes into the temporary state
+        directory, and the directory is removed right after (a daemon still writing made that removal fail)."""
+        if _alive(pid):
+            os.kill(pid, signal.SIGTERM)
+        if not self._wait_for(lambda: not _alive(pid), seconds=10) and _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+            self._wait_for(lambda: not _alive(pid), seconds=5)
 
     @staticmethod
     def _wait_for(condition, seconds=10):
@@ -3690,12 +3741,18 @@ class OfflineRun:
         self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
                            config=dict(JEV_SCENARIO_CONFIG, **(scenario.get("config") or {})))
         launched = {step["agent"] for step in scenario["steps"] if step["do"] in ("launch", "import-v1")}
+        if any(step["do"] == "bootstrap" for step in scenario["steps"]):
+            launched.add(sb.COS_NAME)  # PR 16: `bootstrap` makes the Chief of Staff
         for name, member in sorted(scenario["cast"].items()):
             if name not in launched:  # a launched agent does not exist until `launch` makes it
                 self.world.add_agent(name, fleet=self.fleet_of(member))
         attach_intent_lab(self)  # PR 6: a fake GitHub when the scenario has issues
         self.world.engine = self.world.new_engine()
         self.daemon = True
+        self.lock = None
+        self.take_lock()        # PR 16: a live daemon holds run.lock, so ensure-on-use can tell
+        test.addCleanup(self.drop_lock)
+        self.said = {}          # PR 16: step index -> what a command step printed
         self.crashed_writes = set()
         self.launched = {}
         self.snapshots = {}  # PR 14: second -> what `fleet-switchboard decisions` showed then, for the decisions oracles
@@ -3760,9 +3817,15 @@ class OfflineRun:
             self.one_pass(step.get("faults", ()))
         elif do == "kill-daemon":
             self.daemon = False
+            self.drop_lock()
         elif do == "restart-daemon":
-            self.daemon = True
-            world.engine = world.new_engine()  # a new process: nothing in memory survives
+            self.start_daemon()
+        elif do == "use":  # PR 16
+            self.use(step)
+        elif do == "bootstrap":
+            self.bootstrap(step)
+        elif do == "close-agent":
+            world.herdr([FAKE_HERDR, "pane", "close", world.panes[step["agent"]]])
         elif do in WORKER_STEPS:
             apply_worker_step(self, step)
         elif do == "edit-intent":
@@ -3771,6 +3834,70 @@ class OfflineRun:
             apply_handoff_step(self, step)
         elif do != "wait":
             raise NotImplementedError("the offline runner does not implement step %r" % do)
+
+    # -- PR 16: the daemon's lock, the commands that start it, and `bootstrap`
+    def take_lock(self):
+        if self.lock is None:
+            fd = os.open(str(self.world.state / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:  # another run in this test already holds this state directory's lock
+                os.close(fd)
+                return
+            self.lock = fd
+
+    def drop_lock(self):
+        if self.lock is not None:
+            os.close(self.lock)
+            self.lock = None
+
+    def start_daemon(self):
+        self.daemon = True
+        self.world.engine = self.world.new_engine()  # a new process: nothing in memory survives
+        self.take_lock()
+
+    def use(self, step):
+        """A command that needs the daemon, as `main` runs it: ensure-on-use first, with a spawn that is this runner's daemon."""
+        if step["command"] not in sb.ENSURE_ON_USE_COMMANDS:
+            raise NotImplementedError("%r does not ensure the daemon" % step["command"])
+        with mock.patch.dict(os.environ, {sb.FAULT_ENV: ",".join(self.faults)}), mock.patch.object(sb, "ENSURE_ON_USE", True):
+            sb.ensure_on_use(lambda argv, **kwargs: self.start_daemon(), state_dir=self.world.state, sleep=lambda s: None)
+
+    def bootstrap(self, step):
+        world = self.world
+        index = [i for i, s in enumerate(self.scenario["steps"]) if s is step][0]
+        with mock.patch.dict(os.environ, {sb.FAULT_ENV: ",".join(self.faults)}):
+            try:
+                done = sb.bootstrap_cos(world.new_engine("cli"), directory=str(self.work), patience=5,
+                                        sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+            except sb.BootstrapRefused as err:
+                self.said[index] = "bootstrap refused: %s" % err
+                return
+        world.sessions[sb.COS_NAME], world.panes[sb.COS_NAME] = done["session"], done["pane"]
+        self.said[index] = "%s %s in workspace %s, pane %s" % (done["action"], sb.COS_NAME, done["workspace"], done["pane"])
+
+    def oracle_status_first_line(self, e):
+        """The first line of `fleet-switchboard status` for a machine whose config asks for the decision model, with no key."""
+        root = self.world.state.parent / ("status-" + self.world.state.name)
+        config = root / "config" / "fleet-switchboard" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {}}))
+        env = {"XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
+               sb.FAULT_ENV: ",".join(self.faults)}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            text = sb.format_status(sb.collect_status(self.world.route, self.world.clock.now))
+        first = text.splitlines()[0]
+        return e["text"] in first, "the first line is %r" % first
+
+    def oracle_bootstrap_says(self, e):
+        said = self.said.get(e["step"])
+        return said is not None and e["text"] in said, "step %d printed %r" % (e["step"], said)
+
+    def oracle_fleet_sessions(self, e):
+        found = [sid for sid, session in self.world.v2.sessions.items()
+                 if ((session.get("metadata") or {}).get("fleet") or {}).get("name") == e["agent"]]
+        return len(found) == e["count"], "%d v2 session(s) carry the fleet name %s" % (len(found), e["agent"])
 
     def type_wake(self, step):
         """The baseline: today's heartbeat types the wake with `herdr agent prompt`.
@@ -13645,8 +13772,8 @@ class TestTrialDecisionsPlugin(Base):
         self.assertRegex(out.getvalue(), r"decisions plugin\s+installed")
 
     def test_the_plugin_files_the_trial_installs_are_the_kits_own(self):
-        self.assertEqual(sorted(TRIAL.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "tui.tsx"])
-        for name in TRIAL.DECISIONS_PLUGIN_FILES:
+        self.assertEqual(sorted(sb.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "tui.tsx"])  # PR 16: the shared installer's
+        for name in sb.DECISIONS_PLUGIN_FILES:
             self.assertTrue((REPO / "plugins" / "fleet-decisions-tui" / name).is_file())
 
 
@@ -14060,7 +14187,7 @@ def _repos_extend_offline_run():
 
     def oracle_launch_refused(self, e):
         code, err = self.launch_results.get(e["agent"], (None, ""))
-        made = getattr(self.world.herdr, "workspaces", [])
+        made = getattr(self.world.herdr, "created_workspaces", [])
         ok = code not in (None, 0) and e.get("text", "") in err and not made and e["agent"] not in self.world.sessions
         return ok, "launch exit %s, stderr %r, workspaces created: %d" % (code, err.strip(), len(made))
 
@@ -14449,10 +14576,10 @@ class TestLaunchNewWorkspace(TwoRepoCase):
         create = [argv for argv in self.world.herdr.calls if argv[1:3] == ["workspace", "create"]]
         self.assertEqual(len(create), 1)
         self.assertEqual(create[0][3:], ["--cwd", str(self.home / "checkout"), "--label", "Acme Web", "--no-focus"])
-        (workspace,) = self.world.herdr.workspaces
-        self.assertFalse(workspace["focused"])
+        (workspace,) = self.world.herdr.created_workspaces
+        self.assertFalse(workspace["focus"])
         (params,) = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"]
-        self.assertEqual(params["workspace_id"], workspace["workspace_id"])
+        self.assertEqual(params["workspace_id"], workspace["id"])
         self.assertEqual(json.loads(out)["name"], "web-orch2")
 
     def test_a_charter_naming_another_workspace_is_refused_before_anything_is_made(self):
@@ -14461,7 +14588,7 @@ class TestLaunchNewWorkspace(TwoRepoCase):
         self.assertEqual(code, 1)
         self.assertIn("Acme Web", err)
         self.assertIn("Acme Website", err)
-        self.assertEqual((getattr(self.world.herdr, "workspaces", []), len(self.world.v2.sessions)), ([], before))
+        self.assertEqual((getattr(self.world.herdr, "created_workspaces", []), len(self.world.v2.sessions)), ([], before))
 
     def test_the_label_must_match_exactly(self):
         code, _, _ = self.launch(label="acme web", charter=1)
@@ -14985,6 +15112,1357 @@ class TestD6Scenario(Base):
 
     def test_the_awaiting_step_may_name_a_repo(self):
         self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "repo", "title"])
+# ======================================================================
+# PR 16: install, a service that keeps the daemon alive, the decision-model
+# key as a file, the daemon started on use, and `bootstrap`.
+# docs/switchboard.md, "Install (PR 16)".
+# ======================================================================
+sb.ENSURE_ON_USE = False  # the CLI starts a daemon on use; these suites must never start one by accident
+
+PR16_KEY = "pr16-canary-key-3c91d7a2e8f4"  # a made-up key: it only has to be findable
+PR16_NOTICE = "No decision-model key: messages are not classified and tool calls are not judged."
+
+
+class KeyCase(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        self.key_file = self.config_file.parent / "jev.key"
+
+    def put_key(self, text=PR16_KEY, mode=0o600):
+        self.key_file.parent.mkdir(parents=True, exist_ok=True)
+        if self.key_file.exists():
+            self.key_file.unlink()
+        self.key_file.write_text(text + "\n")
+        os.chmod(str(self.key_file), mode)
+        return self.key_file
+
+
+class TestKeyFile(KeyCase):
+    def test_the_default_key_file_sits_beside_the_config(self):
+        self.assertEqual(sb.jev_key_file(dict(sb.JEV_DEFAULTS)), self.key_file)
+        self.assertIsNone(sb.JEV_DEFAULTS["key_file"])
+
+    def test_the_variable_wins_over_the_file(self):
+        self.put_key()
+        os.environ["OPENROUTER_API_KEY"] = "from-the-environment"
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), ("from-the-environment", "environment"))
+
+    def test_the_file_is_read_when_the_variable_is_unset(self):
+        self.put_key()
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), (PR16_KEY, "file"))
+
+    def test_the_variable_named_by_key_env_is_the_one_read(self):
+        os.environ["MY_JEV_KEY"] = "named"
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS, key_env="MY_JEV_KEY")), ("named", "environment"))
+
+    def test_no_key_anywhere_is_none(self):
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), (None, "none"))
+
+    def test_a_file_anyone_else_could_read_is_refused_and_says_why(self):
+        for mode in (0o640, 0o604, 0o660, 0o644):
+            with self.subTest(mode=oct(mode)):
+                self.put_key(mode=mode)
+                with self.assertRaises(sb.KeyFileError) as caught:
+                    sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+                self.assertIn("0600", str(caught.exception))
+                self.assertIn(str(self.key_file), str(caught.exception))
+                self.assertNotIn(PR16_KEY, str(caught.exception))
+
+    def test_a_file_you_may_read_and_write_alone_is_taken(self):
+        for mode in (0o600, 0o400, 0o700):
+            with self.subTest(mode=oct(mode)):
+                self.put_key(mode=mode)
+                self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS))[1], "file")
+
+    def test_a_link_a_directory_a_stranger_s_file_and_an_empty_file_are_refused(self):
+        real = self.home / "elsewhere.key"
+        real.write_text(PR16_KEY)
+        os.chmod(str(real), 0o600)
+        self.key_file.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(real), str(self.key_file))
+        with self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("regular file", str(caught.exception))
+        self.key_file.unlink()
+        self.key_file.mkdir()
+        with self.assertRaises(sb.KeyFileError):
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.key_file.rmdir()
+        self.put_key()
+        with mock.patch.object(sb.os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("owned by you", str(caught.exception))
+        self.key_file.write_text("  \n")
+        os.chmod(str(self.key_file), 0o600)
+        with self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("empty", str(caught.exception))
+
+    def test_a_key_file_path_in_the_config_is_used_and_must_be_absolute(self):
+        other = self.home / "custom.key"
+        other.write_text(PR16_KEY)
+        os.chmod(str(other), 0o600)
+        config = sb.validate_config({"jev": {"key_file": str(other)}})
+        self.assertEqual(sb.locate_jev_key(config["jev"]), (PR16_KEY, "file"))
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"jev": {"key_file": "relative.key"}})
+        self.assertIn("key_file", str(caught.exception))
+
+    def test_the_client_sends_the_file_s_key_only_as_the_authorization_header(self):
+        self.put_key()
+        opener = FakeOpener(jev_reply(noul_answers(q=0.2)))
+        client = sb.JevClient(dict(JEV_SETTINGS), opener=opener)
+        out = client.decide({"x": 1}, {"q": {"type": "noul", "instructions": "x"}})
+        self.assertEqual(opener.calls[0]["headers"]["Authorization"], "Bearer " + PR16_KEY)
+        self.assertNotIn(PR16_KEY, json.dumps(opener.calls[0]["body"]))
+        self.assertNotIn(PR16_KEY, json.dumps(out))
+
+    def test_a_refused_file_makes_the_client_fail_open_without_the_key(self):
+        self.put_key(mode=0o644)
+        client = sb.JevClient(dict(JEV_SETTINGS), opener=FakeOpener(jev_reply(noul_answers(q=0.2))))
+        with self.assertRaises(sb.JevError) as caught:
+            client.decide({"x": 1}, {"q": {"type": "noul", "instructions": "x"}})
+        self.assertEqual(caught.exception.reason, "unauthorized")
+        self.assertNotIn(PR16_KEY, str(caught.exception) + caught.exception.detail)
+
+
+class TestKeyCommand(KeyCase):
+    def run_key(self, *args, stdin=PR16_KEY + "\n"):
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), captured() as (out, err):
+            code = sb.main(["key"] + list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_set_saves_the_key_as_a_private_file_and_prints_only_that(self):
+        code, out, err = self.run_key("set")
+        self.assertEqual((code, out, err), (0, "key saved\n", ""))
+        self.assertEqual(self.key_file.read_text(), PR16_KEY + "\n")
+        self.assertEqual(stat.S_IMODE(self.key_file.stat().st_mode), 0o600)
+        self.assertEqual(sorted(os.listdir(str(self.key_file.parent))), ["jev.key"])
+
+    def test_set_replaces_an_old_key_and_leaves_no_temporary_file(self):
+        self.run_key("set", stdin="old-key-value\n")
+        self.run_key("set")
+        self.assertEqual(self.key_file.read_text(), PR16_KEY + "\n")
+        self.assertEqual(sorted(os.listdir(str(self.key_file.parent))), ["jev.key"])
+
+    def test_set_is_atomic_a_failed_write_keeps_the_old_key(self):
+        self.run_key("set", stdin="old-key-value\n")
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("disk gone")):
+            code, out, err = self.run_key("set")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.key_file.read_text(), "old-key-value\n")
+        self.assertEqual(sorted(os.listdir(str(self.key_file.parent))), ["jev.key"])
+        self.assertNotIn(PR16_KEY, out + err)
+
+    def test_set_from_a_terminal_reads_without_echo(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        with mock.patch.object(sys, "stdin", Tty("")), \
+                mock.patch.object(sb.getpass, "getpass", return_value=PR16_KEY) as asked, captured() as (out, err):
+            code = sb.main(["key", "set"])
+        self.assertEqual((code, out.getvalue()), (0, "key saved\n"))
+        self.assertEqual(asked.call_count, 1)
+        self.assertEqual(self.key_file.read_text(), PR16_KEY + "\n")
+
+    def test_set_refuses_nothing_at_all_and_a_key_with_spaces_without_echoing_either(self):
+        for text in ("", "\n", "two words\n"):
+            with self.subTest(text=text):
+                code, out, err = self.run_key("set", stdin=text)
+                self.assertEqual(code, 2)
+                self.assertFalse(self.key_file.exists())
+                self.assertNotIn("two words", out + err)
+
+    def test_the_key_is_never_an_argument_and_there_is_no_show(self):
+        for argv in (["key", "set", PR16_KEY], ["key", "show"], ["key", "set", "--key", PR16_KEY]):
+            with self.subTest(argv=argv), captured():
+                self.assertEqual(sb.main(argv), 2)
+
+    def test_status_says_file_environment_or_none(self):
+        self.assertEqual(self.run_key("status")[1], "none\n")
+        self.put_key()
+        self.assertEqual(self.run_key("status")[1], "file\n")
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        self.assertEqual(self.run_key("status")[1], "environment\n")
+
+    def test_status_of_a_refused_file_says_none_and_why_on_stderr(self):
+        self.put_key(mode=0o644)
+        code, out, err = self.run_key("status")
+        self.assertEqual((code, out), (1, "none\n"))
+        self.assertIn("0600", err)
+        self.assertNotIn(PR16_KEY, out + err)
+
+    def test_set_writes_to_the_path_the_config_names(self):
+        other = self.home / "else" / "my.key"
+        self.write_config({"jev": {"key_file": str(other)}})
+        self.assertEqual(self.run_key("set")[0], 0)
+        self.assertEqual(other.read_text(), PR16_KEY + "\n")
+        self.assertEqual(stat.S_IMODE(other.stat().st_mode), 0o600)
+
+
+class StatusCase(KeyCase):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=())
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {}})
+
+    def status(self, *flags):
+        with captured() as (out, err):
+            code = sb.main(["status"] + list(flags), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue()
+
+
+class TestStatusSaysWhenThereIsNoKey(StatusCase):
+    def test_a_missing_key_is_the_first_line_in_plain_words(self):
+        code, text = self.status()
+        self.assertEqual(text.splitlines()[0], PR16_NOTICE)
+        self.assertEqual(code, 0, "a missing key is a warning, not a failure of the switchboard")
+
+    def test_a_key_in_the_variable_or_the_file_removes_the_line(self):
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        self.assertTrue(self.status()[1].startswith("fleet-switchboard "))
+        del os.environ["OPENROUTER_API_KEY"]
+        self.put_key()
+        text = self.status()[1]
+        self.assertTrue(text.startswith("fleet-switchboard "))
+        self.assertIn("key        file", text)
+
+    def test_a_refused_file_is_still_no_key_and_says_why(self):
+        self.put_key(mode=0o644)
+        text = self.status()[1]
+        self.assertEqual(text.splitlines()[0], PR16_NOTICE)
+        self.assertIn("0600", text)
+
+    def test_a_replayed_decision_model_needs_no_key(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {"replay": str(JEV_REPLAY)}})
+        self.assertTrue(self.status()[1].startswith("fleet-switchboard "))
+
+    def test_no_decision_model_configured_is_not_this_warning(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertTrue(self.status()[1].startswith("fleet-switchboard "))
+
+    def test_the_json_says_where_the_key_comes_from_and_never_what_it_is(self):
+        code, text = self.status("--json")
+        self.assertEqual(json.loads(text)["key"], {"source": "none", "notice": PR16_NOTICE, "problem": None})
+        self.put_key()
+        code, text = self.status("--json")
+        self.assertEqual(json.loads(text)["key"]["source"], "file")
+        self.assertNotIn(PR16_KEY, text)
+
+    def test_the_fault_key_missing_silent_hides_the_line_and_only_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "key-missing-silent"
+        os.environ.pop(sb.LAB_ENV, None)
+        self.assertEqual(self.status()[1].splitlines()[0], PR16_NOTICE, "outside the Lab a fault does nothing")
+        os.environ[sb.LAB_ENV] = "1"
+        text = self.status()[1]
+        self.assertTrue(text.startswith("fleet-switchboard "))
+        self.assertNotIn("No decision-model key", text)
+        self.assertIn("key-missing-silent", sb.KNOWN_FAULTS)
+
+    def test_status_names_the_daemon_the_key_the_plugin_and_the_service(self):
+        text = self.status()[1]
+        for label in ("daemon", "key", "plugin", "service"):
+            self.assertRegex(text, r"(?m)^      %s +\S" % label)
+        self.assertIn("daemon     not running", text)
+        self.assertIn("service    not installed", text)
+
+
+class FakeDaemons:
+    """Stands in for Popen in ensure-on-use tests: like a daemon, the spawned process takes the lock."""
+
+    def __init__(self, test, state):
+        self.state, self.spawned = state, []
+        test.addCleanup(self.close)
+        self.fds = []
+
+    def __call__(self, argv, **kwargs):
+        self.spawned.append((argv, kwargs))
+        fd = os.open(str(self.state / "run.lock"), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.fds.append(fd)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+
+USE_COMMANDS = {
+    "send": ["send", "other", "hello"], "report": ["report", "done", "finished"], "launch": ["launch", "a"],
+    "handoff": ["handoff", "--issue", "1", "--brief-file", "-"], "comment": ["comment", "--issue", "1", "--body-file", "-"],
+    "remind": ["remind", "other", "1h", "later"], "decisions": ["decisions"], "intent": ["intent", "1"],
+    "bootstrap": ["bootstrap"],
+}
+
+
+class TestEnsureOnUse(Base):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "ENSURE_ON_USE", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.world = World(self, agents=())
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.daemons = FakeDaemons(self, sb.ensure_state_dir())
+
+    def use(self, argv, spawn=None):
+        with mock.patch.object(sys, "stdin", io.StringIO("text\n")), captured() as (out, err):
+            code = sb.main(argv, runner=self.world.route, now=self.world.clock.now, spawn=spawn or self.daemons,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_every_command_that_needs_the_daemon_starts_it_first(self):
+        self.assertEqual(set(USE_COMMANDS), set(sb.ENSURE_ON_USE_COMMANDS))
+        for name, argv in sorted(USE_COMMANDS.items()):
+            with self.subTest(command=name):
+                self.daemons.close()
+                self.daemons.spawned.clear()
+                self.use(argv)
+                self.assertEqual(len(self.daemons.spawned), 1, "%s did not start the daemon" % name)
+
+    def test_a_running_daemon_is_not_started_again(self):
+        self.daemons.spawned.clear()
+        self.daemons(["x"])
+        self.daemons.spawned.clear()
+        self.use(["decisions"])
+        self.assertEqual(self.daemons.spawned, [])
+
+    def test_the_hot_path_and_the_cheap_commands_never_start_a_daemon(self):
+        for argv in (["judge-tool"], ["status"], ["poke"], ["version"], ["whoami"], ["pending", "x"], ["intents"]):
+            with self.subTest(argv=argv):
+                self.daemons.spawned.clear()
+                self.use(argv)
+                self.assertEqual(self.daemons.spawned, [])
+        self.assertNotIn("ensure", inspect.getsource(sb.cmd_judge_tool))
+
+    def test_a_daemon_that_cannot_start_is_one_warning_and_the_command_still_runs(self):
+        code, out, err = self.use(["decisions"], spawn=lambda argv, **kw: None)
+        warnings = [line for line in err.splitlines() if "daemon" in line]
+        self.assertEqual(len(warnings), 1, err)
+        self.assertIn("daemon.log", warnings[0])
+        self.assertIn(str(sb.state_dir_path()), warnings[0])
+        self.assertIn("Decisions unavailable", out + err, "the command did its work")
+
+    def test_the_wait_is_bounded_to_a_couple_of_seconds(self):
+        self.assertLessEqual(sb.USE_ENSURE_PATIENCE, 2)
+        waited = []
+        with mock.patch.object(sb.time, "sleep", side_effect=waited.append):
+            self.use(["decisions"], spawn=lambda argv, **kw: None)
+        self.assertLessEqual(sum(waited), sb.USE_ENSURE_PATIENCE + 0.5)
+
+    def test_the_fault_skips_it_and_only_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "no-ensure-on-use"
+        os.environ.pop(sb.LAB_ENV, None)
+        self.use(["decisions"])
+        self.assertEqual(len(self.daemons.spawned), 1, "outside the Lab a fault does nothing")
+        self.daemons.close()
+        self.daemons.spawned.clear()
+        os.environ[sb.LAB_ENV] = "1"
+        self.use(["decisions"])
+        self.assertEqual(self.daemons.spawned, [])
+        self.assertIn("no-ensure-on-use", sb.KNOWN_FAULTS)
+
+    def test_a_bad_config_is_the_command_s_error_not_a_second_warning(self):
+        self.write_config("{not json")
+        code, out, err = self.use(["remind", "other", "1h", "later"])
+        self.assertEqual(len([l for l in err.splitlines() if "not valid JSON" in l]), 1, err)
+
+
+class BootstrapCase(Base):
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=())
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.work = self.home / "chief-dir"
+        self.work.mkdir()
+
+    def bootstrap(self, *flags):
+        with captured() as (out, err):
+            code = sb.main(["bootstrap"] + list(flags), runner=self.world.route, now=self.world.clock.now,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def cos_sessions(self):
+        return [sid for sid, s in self.world.v2.sessions.items() if (s.get("metadata") or {}).get("fleet", {}).get("name") == "cos"]
+
+
+class TestBootstrap(BootstrapCase):
+    def test_the_first_run_opens_a_focused_workspace_and_launches_the_chief_of_staff(self):
+        code, out, err = self.bootstrap("--dir", str(self.work))
+        self.assertEqual(code, 0, err)
+        made = self.world.herdr.created_workspaces
+        self.assertEqual(len(made), 1)
+        self.assertEqual((made[0]["label"], made[0]["cwd"], made[0]["focus"]), ("Chief of Staff", str(self.work), True))
+        done = json.loads(out)
+        self.assertEqual(done["action"], "created")
+        [session] = self.cos_sessions()
+        info = self.world.v2.sessions[session]
+        self.assertEqual(info["metadata"]["fleet"], {"name": "cos", "role": "chief-of-staff"})
+        self.assertEqual(done["session"], session)
+        self.assertEqual(done["workspace"], made[0]["id"])
+
+    def test_the_brief_tells_it_to_look_and_to_say_plainly_what_is_missing(self):
+        self.bootstrap("--dir", str(self.work))
+        [session] = self.cos_sessions()
+        text = self.world.v2.sessions[session]["messages"][0]["text"]
+        for needle in ("fleet-switchboard status", "key", "repos", "Introduce yourself", "work on"):
+            self.assertIn(needle, text)
+        self.assertNotIn("reports_to", text)
+
+    def test_it_closes_only_the_empty_shell_pane_the_new_workspace_came_with(self):
+        self.bootstrap("--dir", str(self.work))
+        made = self.world.herdr.created_workspaces[0]
+        self.assertEqual(len(self.world.herdr.closed), 1)
+        self.assertTrue(self.world.herdr.closed[0].startswith(made["id"] + ":"))
+        self.assertEqual(len(self.world.herdr.panes), 1)
+
+    def test_a_second_chief_of_staff_is_refused_naming_the_one_that_runs(self):
+        self.bootstrap("--dir", str(self.work))
+        before = (len(self.world.herdr.created_workspaces), len(self.cos_sessions()))
+        [pane] = list(self.world.herdr.panes)
+        code, out, err = self.bootstrap("--dir", str(self.work))
+        self.assertEqual(code, 1)
+        self.assertIn("cos", err)
+        self.assertIn(pane, err)
+        self.assertEqual((len(self.world.herdr.created_workspaces), len(self.cos_sessions())), before)
+
+    def test_with_the_pane_gone_the_session_is_resumed_in_its_workspace(self):
+        first = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.world.herdr.panes.clear()
+        code, out, err = self.bootstrap("--dir", str(self.work))
+        self.assertEqual(code, 0, err)
+        again = json.loads(out)
+        self.assertEqual((again["action"], again["session"], again["workspace"]),
+                         ("resumed", first["session"], first["workspace"]))
+        self.assertEqual(self.cos_sessions(), [first["session"]], "no second session")
+        self.assertEqual(len(self.world.herdr.created_workspaces), 1, "no second workspace")
+
+    def test_a_session_whose_workspace_is_gone_gets_a_new_workspace_and_is_resumed(self):
+        first = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.world.herdr.panes.clear()
+        del self.world.herdr.workspaces[first["workspace"]]
+        again = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.assertEqual((again["action"], again["session"]), ("resumed", first["session"]))
+        self.assertNotEqual(again["workspace"], first["workspace"])
+
+    def test_a_workspace_that_shares_the_label_is_never_taken_for_the_first_run(self):
+        self.world.herdr.workspaces["wOLD"] = {"workspace_id": "wOLD", "label": "Chief of Staff", "number": 9}
+        done = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.assertNotEqual(done["workspace"], "wOLD")
+        self.assertEqual(len(self.world.herdr.created_workspaces), 1)
+
+    def test_no_focus_asks_herdr_not_to_take_it(self):
+        self.bootstrap("--dir", str(self.work), "--no-focus")
+        self.assertIs(self.world.herdr.created_workspaces[0]["focus"], False)
+        self.assertIn("--no-focus", self.world.herdr.created_workspaces[0]["argv"])
+
+    def test_the_label_is_a_choice(self):
+        self.bootstrap("--dir", str(self.work), "--workspace", "Fleet Office")
+        self.assertEqual(self.world.herdr.created_workspaces[0]["label"], "Fleet Office")
+
+    def test_a_directory_that_does_not_exist_is_refused_before_anything_opens(self):
+        code, out, err = self.bootstrap("--dir", str(self.home / "nope"))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.world.herdr.created_workspaces if hasattr(self.world.herdr, "created_workspaces") else [], [])
+
+    def test_it_reuses_the_launch_and_resume_code_and_adds_no_launch_of_its_own(self):
+        source = inspect.getsource(sb.bootstrap_cos)
+        self.assertIn("launch_agent(", source)
+        self.assertIn("resume_agent(", source)
+        self.assertNotIn("open_tab_running", source)
+        self.assertNotIn("session_create", source)
+
+
+# ---- install, the service and the templates
+
+class InstallFakes:
+    """A pretend machine for `install`: OpenCode answers --version, herdr lists and links plugins, and the
+    service managers load and unload. Records every call. Nothing real runs, and nothing real is touched."""
+
+    def __init__(self, home, version="opencode v2.0.22"):
+        self.calls, self.version = [], version
+        self.linked = False
+        self.loaded = False
+        self.fail = {}
+        self.integration_calls, self.integration_reports_at = [], None
+        self.binary = str(home / "v2dir" / "opencode.exe")
+        os.makedirs(os.path.dirname(self.binary))
+        Path(self.binary).write_text("#!/bin/sh\n")
+        os.chmod(self.binary, 0o755)
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+        for fragment, code in self.fail.items():
+            if fragment in " ".join(argv):
+                return subprocess.CompletedProcess(argv, code, "", "boom: %s" % fragment)
+        ok = lambda out="": subprocess.CompletedProcess(argv, 0, out, "")
+        if argv[0] == self.binary and argv[1:] == ["--version"]:
+            return ok(self.version + "\n")
+        if argv[0] == self.binary:
+            return subprocess.CompletedProcess(argv, 1, "", "not running")
+        if argv[:3] == ["herdr", "plugin", "list"]:
+            return ok("1 plugin installed:\n- board (Board) enabled\n" + ("- fleet-switchboard (Fleet Switchboard) enabled\n" if self.linked else ""))
+        if argv[:3] == ["herdr", "plugin", "link"]:
+            self.linked = True
+            return ok()
+        if argv[:3] == ["herdr", "plugin", "unlink"]:
+            self.linked = False
+            return ok()
+        if argv[:3] == ["herdr", "integration", "status"] or argv[:4] in (["herdr", "integration", "install", "opencode"],
+                                                                        ["herdr", "integration", "uninstall", "opencode"]):
+            # herdr writes its OpenCode integration to $HOME/.config/opencode and ignores XDG_CONFIG_HOME: where
+            # the file lands depends on the HOME the caller gave it, and a link there carries it elsewhere
+            home = (kwargs.get("env") or {}).get("HOME") or os.environ["HOME"]
+            target = os.path.join(home, ".config", "opencode", "plugins", "herdr-agent-state.js")
+            self.integration_calls.append((argv[2], dict(kwargs.get("env") or {})))
+            if argv[2] == "install":
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                Path(target).write_text("// herdr agent state\n")
+                return ok("installed opencode integration at %s\n" % target)
+            if argv[2] == "uninstall":
+                if os.path.exists(target):
+                    os.unlink(target)
+                return ok("uninstalled\n")
+            shown = self.integration_reports_at or target
+            state = "current (v13)" if os.path.exists(target) else "not installed"
+            return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
+        if argv[0] == "launchctl":
+            if argv[1] == "print":
+                return subprocess.CompletedProcess(argv, 0 if self.loaded else 113, "", "")
+            self.loaded = argv[1] == "bootstrap"
+            return ok()
+        if argv[0] == "systemctl":
+            if "is-enabled" in argv:
+                return subprocess.CompletedProcess(argv, 0 if self.loaded else 1, "", "")
+            if "enable" in argv:
+                self.loaded = True
+            if "disable" in argv:
+                self.loaded = False
+            return ok()
+        raise AssertionError("install reached for a real program: %r" % argv)
+
+    def commands(self, program):
+        return [c for c in self.calls if c[0] == program]
+
+
+def tree_of(root):
+    """Every file under root with its content: what a dry run must leave exactly as it was."""
+    found = {}
+    for base, dirs, files in os.walk(str(root)):
+        for name in files:
+            path = os.path.join(base, name)
+            found[path] = open(path, "rb").read()
+        for name in dirs:
+            found[os.path.join(base, name) + "/"] = None
+    return found
+
+
+class InstallCase(Base):
+    PLATFORM = "darwin"
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ["XDG_DATA_HOME"] = str(self.home / "xdg-data")
+        self.machine = InstallFakes(self.home)
+        self.daemons = FakeDaemons(self, sb.ensure_state_dir())
+        self.data = self.home / "xdg-data" / "fleet-switchboard"
+        self.private = self.data / "profile"            # v2's own profile: XDG_CONFIG_HOME, XDG_DATA_HOME and HOME of its wrapper
+        self.profile = self.private / "config" / "opencode"
+        self.wrapper = self.data / "bin" / "fleet-opencode"
+        self.shared = self.home / "xdg-config" / "opencode"  # what the person's ordinary OpenCode reads
+
+    def install(self, *flags, status="STATUS\n", platform=None):
+        out = io.StringIO()
+        args = sb.build_parser().parse_args(["install"] + [f for f in flags if f != "--dry-run"] + (
+            ["--dry-run"] if "--dry-run" in flags else []))
+        installer = sb.Installer(self.machine, self.daemons, time.time, platform or self.PLATFORM, REPO,
+                                 dry_run="--dry-run" in flags, out=out, shared_profile=args.shared_profile,
+                                 profile=args.profile, gh_user=args.gh_user)
+        try:
+            if args.uninstall:
+                installer.uninstall(not args.no_service, not args.no_herdr_link)
+            else:
+                installer.install(args.opencode, not args.no_service, not args.no_herdr_link,
+                                  status=lambda: status)
+        except sb.InstallError as err:
+            return out.getvalue(), str(err)
+        return out.getvalue(), None
+
+    def statuses(self, text):
+        """step -> its status word(s), from lines like `config   done /path`."""
+        found = {}
+        for line in text.splitlines():
+            match = re.match(r"^(\S+(?: \S+)*?) {2,}(done|already done|would be done|skipped \(.*?\)|will run|would run|FAILED)", line)
+            if match:
+                found.setdefault(match.group(1), []).append(match.group(2))
+        return found
+
+    def service_path(self):
+        if self.PLATFORM == "darwin":
+            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.switchboard.plist"
+        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-switchboard.service"
+
+
+class TestInstall(InstallCase):
+    def full(self, *flags, **kw):
+        return self.install("--opencode", self.machine.binary, *flags, **kw)
+
+    def test_a_full_install_does_every_step_and_says_so(self):
+        out, error = self.full()
+        self.assertIsNone(error)
+        steps = self.statuses(out)
+        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
+                     "decisions plugin", "herdr plugin", "service", "daemon"):
+            self.assertIn(name, steps, "%s: no line in\n%s" % (name, out))
+        self.assertEqual(steps["config"], ["done"])
+        self.assertIn("STATUS", out, "the last step prints status")
+
+    def test_it_writes_the_config_the_pieces_and_the_service(self):
+        self.full()
+        config = json.loads(self.config_file.read_text())
+        wrapper = self.wrapper
+        self.assertEqual((config["opencode"], config["opencode_executable"]), (str(wrapper), self.machine.binary))
+        self.assertEqual((config["github_repos"], config["jev"], config["policy"]),
+                         ([], {"model": sb.JEV_MODEL}, {"enabled": True}))
+        self.assertNotIn("intent_repo", config)
+        sb.validate_config(config)
+        self.assertTrue(os.access(str(wrapper), os.X_OK))
+        for name in sb.KIT_AGENTS:
+            text = (self.profile / "agents" / (name + ".md")).read_text()
+            self.assertIn(sb.STANDARD_MODEL, text)
+            self.assertNotIn("__PROVIDER__", text)
+        for skill in sb.kit_skill_names(REPO):
+            self.assertTrue((self.home / "xdg-data" / "fleet-switchboard" / "skills" / skill / "SKILL.md").is_file())
+        self.assertEqual((self.profile / "plugins" / "fleet-hooks.js").read_text(),
+                         (REPO / "plugins" / "fleet-hooks" / "index.js").read_text())
+        self.assertEqual(json.loads((self.profile / "cli.json").read_text())["plugins"], ["./fleet-decisions"])
+        self.assertTrue((self.profile / "fleet-decisions" / "tui.tsx").is_file())
+        self.assertIn(str(self.home / "xdg-data" / "fleet-switchboard" / "skills"),
+                      json.loads((self.profile / "opencode.json").read_text())["skills"]["paths"])
+        self.assertTrue(self.service_path().is_file())
+
+    def test_the_wrapper_sets_the_plugins_environment_and_holds_no_secret(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        self.full()
+        text = self.wrapper.read_text()
+        for needle in ("FLEET_SWITCHBOARD_BIN=", "FLEET_SWITCHBOARD_SHIMS=", "FLEET_SWITCHBOARD_STATE=", "exec "):
+            self.assertIn(needle, text)
+        self.assertIn(self.machine.binary, text)
+        self.assertNotIn(PR16_KEY, text)
+
+    def test_a_second_run_changes_nothing_and_every_step_says_already_done(self):
+        self.full()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        out, error = self.full()
+        self.assertIsNone(error)
+        steps = self.statuses(out)
+        for name, words in steps.items():
+            if name != "daemon":
+                self.assertEqual(words, ["already done"], "%s on the second run:\n%s" % (name, out))
+        self.assertEqual(tree_of(self.home), before)
+        mutating = [c for c in self.machine.calls[calls:] if c[:3] in (["herdr", "plugin", "link"],) or c[:2] == ["launchctl", "bootstrap"]]
+        self.assertEqual(mutating, [])
+
+    def test_dry_run_prints_every_step_and_writes_nothing(self):
+        before = tree_of(self.home)
+        out, error = self.full("--dry-run")
+        self.assertIsNone(error)
+        self.assertEqual(tree_of(self.home), before)
+        steps = self.statuses(out)
+        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
+                     "decisions plugin", "herdr plugin", "service"):
+            self.assertIn(name, steps, name)
+        self.assertEqual(steps["config"], ["would be done"])
+        run = [c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"] or c[0] in ("launchctl",) and c[1] != "print"]
+        self.assertEqual(run, [], "a dry run starts and loads nothing")
+        self.assertEqual(self.daemons.spawned, [])
+
+    def test_dry_run_on_an_installed_machine_says_already_done(self):
+        self.full()
+        out, _ = self.full("--dry-run")
+        for name, words in self.statuses(out).items():
+            if name != "daemon":
+                self.assertEqual(words, ["already done"], name)
+
+    def test_uninstall_reverses_the_pieces_the_link_and_the_service_and_leaves_the_rest(self):
+        self.full()
+        self.config_file.write_text(self.config_file.read_text())
+        (self.state_dir / "audit.jsonl").write_text("{}\n")
+        out, error = self.install("--uninstall")
+        self.assertIsNone(error)
+        self.assertFalse(self.service_path().exists())
+        self.assertFalse(self.machine.linked)
+        self.assertFalse(self.machine.loaded)
+        for name in sb.KIT_AGENTS:
+            self.assertFalse((self.profile / "agents" / (name + ".md")).exists())
+        self.assertFalse((self.profile / "plugins" / "fleet-hooks.js").exists())
+        self.assertFalse((self.profile / "fleet-decisions").exists())
+        self.assertFalse((self.profile / "cli.json").exists())
+        self.assertFalse((self.profile / "opencode.json").exists())
+        self.assertFalse((self.home / "xdg-data" / "fleet-switchboard" / "skills").exists())
+        self.assertFalse(self.wrapper.exists())
+        self.assertTrue(self.config_file.exists(), "config is left alone")
+        self.assertTrue((self.state_dir / "audit.jsonl").exists(), "state is left alone")
+        again, _ = self.install("--uninstall")
+        for name, words in self.statuses(again).items():
+            self.assertNotEqual(words, ["done"], "a second uninstall finds nothing to do: %s" % name)
+
+    def test_a_dry_run_of_uninstall_says_what_it_would_remove_and_removes_nothing(self):
+        self.full()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        out, error = self.install("--uninstall", "--dry-run")
+        self.assertIsNone(error)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertTrue(self.machine.linked and self.machine.loaded)
+        self.assertEqual([c for c in self.machine.calls[calls:] if c[:3] == ["herdr", "plugin", "unlink"]
+                          or c[:2] == ["launchctl", "bootout"]], [])
+        steps = self.statuses(out)
+        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "wrapper", "service"):
+            self.assertEqual(steps[name][-1], "would be done", name)
+
+    def test_uninstall_keeps_what_the_user_added_or_edited(self):
+        self.full()
+        (self.profile / "cli.json").write_text(json.dumps({"plugins": ["./fleet-decisions", "./mine"], "theme": "x"}))
+        (self.profile / "agents" / "coder.md").write_text("my own coder\n")
+        (self.profile / "opencode.json").write_text(json.dumps(
+            {"model": "m", "provider": {"p": 1}, "skills": {"paths": [str(self.home / "xdg-data" / "fleet-switchboard" / "skills"), "/mine"]}}))
+        self.install("--uninstall")
+        self.assertEqual(json.loads((self.profile / "cli.json").read_text()), {"plugins": ["./mine"], "theme": "x"})
+        self.assertEqual((self.profile / "agents" / "coder.md").read_text(), "my own coder\n")
+        self.assertEqual(json.loads((self.profile / "opencode.json").read_text()),
+                         {"model": "m", "provider": {"p": 1}, "skills": {"paths": ["/mine"]}})
+
+    def test_the_users_config_keys_keep_their_values_and_their_order(self):
+        mine = '{\n  "poll_seconds": 7,\n  "herdr": "herdr",\n  "jev": {"model": "mine/model"},\n  "github_repos": ["acme/api"]\n}\n'
+        self.write_config(mine)
+        self.full()
+        config = json.loads(self.config_file.read_text(), object_pairs_hook=list)
+        self.assertEqual([k for k, _ in config][:4], ["poll_seconds", "herdr", "jev", "github_repos"])
+        found = dict(config)
+        self.assertEqual((found["poll_seconds"], found["jev"], found["github_repos"]),
+                         (7, [("model", "mine/model")], ["acme/api"]))
+        self.assertIn("opencode", found)
+
+    def test_a_config_with_every_key_is_not_rewritten(self):
+        self.full()
+        mtime = self.config_file.stat().st_mtime_ns
+        text = self.config_file.read_text()
+        time.sleep(0.01)
+        self.full()
+        self.assertEqual((self.config_file.read_text(), self.config_file.stat().st_mtime_ns), (text, mtime))
+
+    def test_an_invalid_config_is_refused_and_not_overwritten(self):
+        self.write_config("{not json")
+        out, error = self.full()
+        self.assertIn("config", error)
+        self.assertEqual(self.config_file.read_text(), "{not json")
+
+    def test_a_v1_binary_is_refused_with_how_to_get_v2_and_nothing_is_written(self):
+        self.machine.version = "1.4.2"
+        before = tree_of(self.home)
+        out, error = self.full()
+        self.assertIn("v1", error)
+        self.assertIn("npm install --prefix", error)
+        self.assertIn("%s@%s" % (sb.V2_PACKAGE, sb.V2_VERSION), error)
+        self.assertEqual(tree_of(self.home), before)
+
+    def test_a_bare_name_and_a_missing_binary_are_refused(self):
+        out, error = self.install("--opencode", "opencode")
+        self.assertIn("absolute", error)
+        out, error = self.install("--opencode", str(self.home / "nowhere" / "opencode"))
+        self.assertIn("no OpenCode v2 found", error)
+
+    def test_the_binary_may_be_found_in_a_known_place(self):
+        known = self.home / "xdg-data" / "fleet-switchboard" / "v2" / "node_modules" / "@opencode" / "cli" / "bin" / "opencode.exe"
+        known.parent.mkdir(parents=True)
+        known.write_text("#!/bin/sh\n")
+        self.machine.binary = str(known)
+        out, error = self.install()
+        self.assertIsNone(error, error)
+        self.assertEqual(json.loads(self.config_file.read_text())["opencode_executable"], str(known))
+
+    def test_the_flags_skip_the_service_and_the_link_and_say_so(self):
+        out, error = self.full("--no-service", "--no-herdr-link")
+        steps = self.statuses(out)
+        self.assertEqual(steps["service"], ["skipped (--no-service)"])
+        self.assertEqual(steps["herdr plugin"], ["skipped (--no-herdr-link)"])
+        self.assertFalse(self.service_path().exists())
+        self.assertEqual([c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"]], [])
+        self.assertEqual(self.machine.commands("launchctl"), [])
+
+    def test_the_link_says_exactly_what_it_will_do_before_it_does_it(self):
+        out, error = self.full()
+        text = out[out.index("herdr plugin"):]
+        for needle in ("plugin link", str(REPO / "herdr"), "every pane", "ensure", "poke", "unlink"):
+            self.assertIn(needle, text)
+        self.assertLess(out.index("every pane"), out.index("done linked"), "the notice comes before the act")
+
+    def test_a_failed_link_stops_the_install_naming_why(self):
+        self.machine.fail = {"plugin link": 1}
+        out, error = self.full()
+        self.assertIn("plugin link", error)
+        self.assertEqual(self.machine.commands("launchctl"), [])
+
+    def test_no_secret_is_printed_or_written_anywhere_but_the_key_file(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        out, error = self.full()
+        self.assertNotIn(PR16_KEY, out + str(error))
+        for path, content in tree_of(self.home).items():
+            if content is not None:
+                self.assertNotIn(PR16_KEY.encode(), content, path)
+        for call in self.machine.calls:
+            self.assertNotIn(PR16_KEY, " ".join(call))
+
+    def test_the_last_step_runs_ensure_and_then_status(self):
+        out, error = self.full(status="THE STATUS\n")
+        self.assertEqual(len(self.daemons.spawned), 1)
+        self.assertTrue(out.rstrip().endswith("THE STATUS"))
+
+    def test_the_real_status_after_an_install_names_the_missing_key_first(self):
+        out = io.StringIO()
+        installer = sb.Installer(self.machine, self.daemons, time.time, "darwin", REPO, out=out)
+        installer.install(self.machine.binary)
+        self.assertIn(PR16_NOTICE, out.getvalue())
+        self.assertLess(out.getvalue().index(PR16_NOTICE), out.getvalue().index("fleet-switchboard 0.1.0"))
+        self.assertIn("service    installed", out.getvalue())
+
+    def test_the_cli_runs_install_and_returns_its_exit_code(self):
+        os.environ["XDG_DATA_HOME"] = str(self.home / "xdg-data")
+        with captured() as (out, err):
+            code = sb.main(["install", "--opencode", self.machine.binary, "--no-service", "--no-herdr-link", "--dry-run"],
+                           runner=self.machine, now=time.time, spawn=self.daemons)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("would be done", out.getvalue())
+        with captured() as (out, err):
+            code = sb.main(["install", "--opencode", "bare"], runner=self.machine, now=time.time, spawn=self.daemons)
+        self.assertEqual(code, 1)
+        self.assertIn("absolute", err.getvalue())
+
+
+class TestInstallPrivateProfile(InstallCase):
+    """The MUST-FIX of PR 16's review: the v2 profile is private. `install` used to write a v2-shaped plugin,
+    a `fleet-decisions` directory, `skills.paths` and `cli.json` into the directory the ordinary OpenCode (v1)
+    reads too, where they can break every v1 agent at start."""
+
+    def full(self, *flags, **kw):
+        return self.install("--opencode", self.machine.binary, *flags, **kw)
+
+    def snapshot_of_the_shared_places(self):
+        """Every place the ordinary OpenCode reads: the XDG one, and ~/.config/opencode when XDG_CONFIG_HOME is unset."""
+        return {str(path): tree_of(path) if path.exists() else None
+                for path in (self.shared, self.home / ".config" / "opencode", self.home / ".local" / "share" / "opencode")}
+
+    def shared_is_untouched(self):
+        before = self.snapshot_of_the_shared_places()
+        self.full()
+        return self.snapshot_of_the_shared_places() == before
+
+    def test_the_default_profile_is_private_and_the_shared_directory_is_never_written(self):
+        self.shared.mkdir(parents=True)
+        (self.shared / "opencode.json").write_text('{"model": "v1/model"}\n')
+        (self.shared / "agents").mkdir()
+        (self.shared / "agents" / "mine.md").write_text("mine\n")
+        self.assertTrue(self.shared_is_untouched())
+        for relative in ("agents/coder.md", "plugins/fleet-hooks.js", "fleet-decisions/tui.tsx", "cli.json", "opencode.json"):
+            self.assertTrue((self.profile / relative).is_file(), relative)
+        self.assertIn(str(self.data / "skills"), json.loads((self.profile / "opencode.json").read_text())["skills"]["paths"])
+
+    def test_the_fault_that_writes_to_the_shared_directory_by_default_is_caught_by_that_test(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "shared-profile-default"
+        self.assertIn("shared-profile-default", sb.KNOWN_FAULTS)
+        self.assertFalse(self.shared_is_untouched(), "the control: with the fault, the shared directory is written")
+        self.assertTrue((self.shared / "plugins" / "fleet-hooks.js").is_file())
+        self.assertTrue((self.shared / "cli.json").is_file())
+
+    def test_the_fault_is_off_outside_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "shared-profile-default"
+        os.environ.pop(sb.LAB_ENV, None)
+        self.assertTrue(self.shared_is_untouched())
+
+    def test_a_dry_run_against_a_temporary_home_touches_nothing_under_config_opencode(self):
+        """With XDG_CONFIG_HOME unset, the ordinary OpenCode reads ~/.config/opencode: nothing is created or changed there."""
+        os.environ.pop("XDG_CONFIG_HOME")
+        ordinary = self.home / ".config" / "opencode"
+        self.assertFalse(ordinary.exists())
+        before = tree_of(self.home)
+        out, error = self.full("--dry-run")
+        self.assertIsNone(error, error)
+        self.assertFalse(ordinary.exists(), "a dry run creates no ~/.config/opencode")
+        self.assertEqual(tree_of(self.home), before, "and writes nothing at all")
+        ordinary.mkdir(parents=True)
+        (ordinary / "agents").mkdir()
+        (ordinary / "agents" / "mine.md").write_text("mine\n")
+        before = tree_of(ordinary)
+        self.full("--dry-run")
+        self.assertEqual(tree_of(ordinary), before)
+        self.full()  # and the real thing leaves it alone too
+        self.assertEqual(tree_of(ordinary), before)
+
+    def test_a_dry_run_shows_the_profile_path_it_would_use(self):
+        out, error = self.full("--dry-run")
+        self.assertIsNone(error, error)
+        self.assertIn(str(self.private), out)
+        self.assertEqual(self.statuses(out)["profile"], ["would be done"])
+        self.assertFalse(self.private.exists())
+        custom = self.home / "elsewhere" / "profile"
+        out, _ = self.full("--dry-run", "--profile", str(custom))
+        self.assertIn(str(custom), out)
+
+    def test_the_profile_path_may_be_chosen_and_must_be_absolute(self):
+        custom = self.home / "elsewhere" / "profile"
+        out, error = self.full("--profile", str(custom))
+        self.assertIsNone(error, error)
+        self.assertTrue((custom / "config" / "opencode" / "agents" / "coder.md").is_file())
+        self.assertFalse(self.private.exists())
+        out, error = self.full("--profile", "relative/path")
+        self.assertIn("absolute", error)
+
+    def wrapper_probe(self, *, gh_token="canary-gh", flags=(), **extra):
+        """What the wrapper's environment looks like, by running it up to its exec with a stand-in `gh` that `install`
+        found on PATH."""
+        fakebin = self.home / "fakebin"
+        fakebin.mkdir(exist_ok=True)
+        gh = fakebin / "gh"
+        gh.write_text('#!/bin/sh\necho "$@" > "%s"\necho "$GH_CONFIG_DIR" > "%s"\n[ -n "%s" ] && echo "%s"\n[ -n "%s" ]\n'
+                      % (self.home / "gh-args", self.home / "gh-config", gh_token, gh_token, gh_token))
+        gh.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": "%s:%s" % (fakebin, SAFE_PATH)}):
+            shutil.rmtree(str(self.data), ignore_errors=True)
+            self.full(*flags)
+        probe = self.wrapper.read_text().rsplit("exec ", 1)[0] + "env\n"
+        env = dict({"PATH": SAFE_PATH, "HOME": str(self.home)}, **extra)
+        return subprocess.run([shutil.which("sh"), "-c", probe], env=env, capture_output=True, text=True).stdout
+
+    def test_the_wrapper_runs_v2_in_the_private_profile_as_the_trials_wrapper_does(self):
+        out = self.wrapper_probe(XDG_CONFIG_HOME=str(self.shared.parent), XDG_DATA_HOME="/real/data")
+        seen = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        self.assertEqual(seen["XDG_CONFIG_HOME"], str(self.private / "config"))
+        self.assertEqual(seen["XDG_DATA_HOME"], str(self.private / "data"))
+        self.assertEqual(seen["XDG_STATE_HOME"], str(self.private / "state"))
+        self.assertEqual(seen["XDG_CACHE_HOME"], str(self.private / "cache"))
+        self.assertEqual(seen["TMPDIR"], str(self.private / "tmp"))
+        self.assertEqual(seen["HOME"], str(self.private / "home"), "XDG alone leaves `home` live: v2 would read the real home's skills")
+        self.assertEqual(seen["FLEET_SWITCHBOARD_STATE"], str(sb.state_dir_path()))
+        self.assertEqual(seen["FLEET_SWITCHBOARD_BIN"], str(REPO / "bin" / "fleet-switchboard"))
+        self.assertEqual(seen["FLEET_SWITCHBOARD_SHIMS"], str(REPO / "shims"))
+        self.assertTrue(seen["PATH"].startswith(str(REPO / "bin") + ":"))
+
+    def test_the_wrapper_strips_credentials_by_shape_then_hands_agents_the_gh_token_as_the_trial_does(self):
+        out = self.wrapper_probe(OPENROUTER_API_KEY="canary-key", SOME_SECRET="canary-secret", KEEP_ME="yes",
+                                 GH_TOKEN="ambient-gh", GITHUB_TOKEN="ambient-github", COPILOT_TOKEN="ambient-copilot")
+        self.assertIn("GH_TOKEN=canary-gh", out)
+        self.assertIn("KEEP_ME=yes", out)
+        for canary in ("canary-key", "canary-secret", "ambient-gh", "ambient-github", "ambient-copilot"):
+            self.assertNotIn(canary, out)
+        text = self.wrapper.read_text()
+        self.assertLess(text.index('unset "$name"'), text.index('export GH_TOKEN="$GH_FOR_AGENTS"'))
+        self.assertIn(TRIAL.KEY_NAME_PATTERN, text, "the same shape as the trial's wrapper strips")
+        self.assertEqual(sb.KEY_NAME_PATTERN, TRIAL.KEY_NAME_PATTERN)
+        self.assertNotIn("canary-gh", text, "the token is asked for at every start and never written")
+        self.assertNotIn("OPENROUTER", text)
+
+    def test_the_wrapper_asks_gh_before_home_is_replaced_and_for_the_chosen_account_only(self):
+        self.wrapper_probe(flags=("--gh-user", "the-pinned-one"))
+        self.assertEqual((self.home / "gh-args").read_text().split(), ["auth", "token", "--user", "the-pinned-one"])
+        text = self.wrapper.read_text()
+        self.assertLess(text.index("GH_FOR_AGENTS="), text.index("export HOME="))
+        self.wrapper_probe()
+        self.assertEqual((self.home / "gh-args").read_text().split(), ["auth", "token"], "no account chosen: gh's active one")
+        self.assertEqual((self.home / "gh-config").read_text().strip(), str(self.home / "xdg-config" / "gh"),
+                         "gh's own config, read before the private XDG_CONFIG_HOME hides it")
+
+    def test_a_pane_keeps_its_herdr_identity_only_when_the_config_says_so_and_the_config_does(self):
+        self.full()
+        config = json.loads(self.config_file.read_text())
+        self.assertEqual(config["launch_env"], {"FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        self.assertEqual(config["opencode"], str(self.wrapper))
+        text = self.wrapper.read_text()
+        self.assertIn('unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_TAB_ID HERDR_WORKSPACE_ID', text)
+        quiet = self.wrapper_probe(HERDR_PANE_ID="p1")
+        self.assertNotIn("HERDR_PANE_ID", quiet)
+        kept = self.wrapper_probe(HERDR_PANE_ID="p1", FLEET_SWITCHBOARD_LAB_PANE="1")
+        self.assertIn("HERDR_PANE_ID=p1", kept)
+
+    def test_the_herdr_opencode_integration_is_installed_into_the_private_profile_through_a_private_home(self):
+        out, error = self.full()
+        self.assertIsNone(error, error)
+        home = self.private / "home"
+        link = home / ".config" / "opencode"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(str(link)), str(self.profile))
+        self.assertTrue((self.profile / "plugins" / "herdr-agent-state.js").is_file(), "it landed in the private profile")
+        self.assertFalse((self.shared / "plugins").exists())
+        self.assertFalse((self.home / ".config" / "opencode").exists())
+        installs = [env for what, env in self.machine.integration_calls if what == "install"]
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0]["HOME"], str(home), "herdr ignores XDG_CONFIG_HOME: HOME is what places it")
+        self.assertEqual(self.statuses(out)["herdr integration"], ["done"])
+        again, _ = self.full()
+        self.assertEqual(self.statuses(again)["herdr integration"], ["already done"])
+        self.assertEqual(len([1 for what, _ in self.machine.integration_calls if what == "install"]), 1)
+
+    def test_it_refuses_to_let_herdr_install_anywhere_but_the_private_profile(self):
+        self.machine.integration_reports_at = str(self.home / ".config" / "opencode" / "plugins" / "herdr-agent-state.js")
+        out, error = self.full()
+        self.assertIn("outside", error)
+        self.assertEqual([c for c in self.machine.integration_calls if c[0] == "install"], [])
+        self.assertEqual(self.machine.commands("launchctl"), [], "the install stopped there")
+
+    def test_the_integration_follows_the_herdr_flag_and_a_dry_run_only_looks(self):
+        out, _ = self.full("--no-herdr-link")
+        self.assertEqual(self.statuses(out)["herdr integration"], ["skipped (--no-herdr-link)"])
+        self.assertEqual(self.machine.integration_calls, [])
+        shutil.rmtree(str(self.data))
+        out, _ = self.full("--dry-run")
+        self.assertEqual(self.statuses(out)["herdr integration"], ["would be done"])
+        self.assertEqual([c for c in self.machine.integration_calls if c[0] != "status"], [])
+        self.assertFalse((self.private / "home").exists())
+
+    def test_the_shared_profile_is_used_only_when_asked_and_the_person_is_told_in_plain_words(self):
+        out, error = self.full("--shared-profile")
+        self.assertIsNone(error, error)
+        self.assertIn("ordinary OpenCode will read", out)
+        self.assertIn(str(self.shared), out)
+        self.assertLess(out.index("ordinary OpenCode will read"), out.index("agents"), "said before anything is written")
+        self.assertTrue((self.shared / "plugins" / "fleet-hooks.js").is_file())
+        self.assertTrue((self.shared / "cli.json").is_file())
+        self.assertFalse(self.private.exists(), "no private profile is made")
+        self.assertEqual(self.machine.integration_calls, [])
+        self.assertEqual(self.statuses(out)["herdr integration"], ["skipped (--shared-profile)"])
+        self.assertNotIn("export HOME=", self.wrapper.read_text(), "the shared wrapper keeps the real home")
+
+    def test_a_private_install_says_the_shared_directory_is_left_alone(self):
+        out, _ = self.full()
+        self.assertNotIn("ordinary OpenCode will read", out)
+        self.assertIn("not touched", out)
+
+    def test_uninstall_removes_only_what_it_installed_and_only_in_the_private_profile(self):
+        self.full()
+        (self.profile / "agents" / "mine.md").write_text("mine\n")
+        (self.profile / "cli.json").write_text(json.dumps({"plugins": ["./fleet-decisions", "./mine"]}))
+        self.shared.mkdir(parents=True)
+        (self.shared / "agents").mkdir()
+        (self.shared / "agents" / "coder.md").write_text((self.profile / "agents" / "coder.md").read_text())
+        (self.shared / "cli.json").write_text(json.dumps({"plugins": ["./fleet-decisions"]}))
+        shared_before = tree_of(self.shared)
+        out, error = self.install("--uninstall")
+        self.assertIsNone(error, error)
+        self.assertEqual(tree_of(self.shared), shared_before, "the shared directory is never read for removal")
+        self.assertEqual((self.profile / "agents" / "mine.md").read_text(), "mine\n")
+        self.assertEqual(json.loads((self.profile / "cli.json").read_text()), {"plugins": ["./mine"]})
+        self.assertFalse((self.profile / "agents" / "coder.md").exists())
+        self.assertFalse((self.profile / "plugins" / "fleet-hooks.js").exists())
+        self.assertFalse((self.profile / "plugins" / "herdr-agent-state.js").exists(), "herdr's integration is removed too")
+        self.assertFalse((self.private / "home" / ".config" / "opencode").exists(), "the link is ours: removed")
+        self.assertFalse(self.wrapper.exists())
+        self.assertTrue((self.private / "data").is_dir(), "the profile's data, its sessions, stay")
+        uninstalls = [env for what, env in self.machine.integration_calls if what == "uninstall"]
+        self.assertEqual([env["HOME"] for env in uninstalls], [str(self.private / "home")])
+        again, _ = self.install("--uninstall")
+        for name, words in self.statuses(again).items():
+            self.assertNotEqual(words, ["done"], name)
+
+    def test_uninstall_never_removes_a_home_link_that_is_not_ours(self):
+        self.full()
+        link = self.private / "home" / ".config" / "opencode"
+        link.unlink()
+        link.mkdir()
+        (link / "theirs.txt").write_text("x\n")
+        self.install("--uninstall")
+        self.assertTrue((link / "theirs.txt").exists())
+
+    def test_uninstall_of_the_shared_profile_is_asked_for_by_name(self):
+        self.full("--shared-profile")
+        out, error = self.install("--uninstall", "--shared-profile")
+        self.assertIsNone(error, error)
+        self.assertFalse((self.shared / "plugins" / "fleet-hooks.js").exists())
+        self.assertFalse((self.shared / "cli.json").exists())
+
+    def test_the_trial_keeps_its_own_isolated_profile_and_the_functions_it_shares(self):
+        trial = TRIAL.Trial(self.home / "trial")
+        self.assertNotEqual(Path(trial.lab.opencode_config), self.profile)
+        self.assertTrue(str(trial.lab.opencode_config).startswith(str(self.home / "trial")))
+        self.assertIn("sb.install_agents", (BIN / "switchboard-trial").read_text())
+        self.assertTrue(callable(sb.ensure_home_link) and callable(sb.herdr_integration_status))
+
+
+class TestInstallOnLinux(InstallCase):
+    PLATFORM = "linux"
+
+    def test_the_unit_is_written_and_enabled_and_removed_again(self):
+        out, error = self.install("--opencode", self.machine.binary)
+        self.assertIsNone(error, error)
+        self.assertTrue(self.service_path().is_file())
+        commands = self.machine.commands("systemctl")
+        self.assertIn(["systemctl", "--user", "daemon-reload"], commands)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "fleet-kit-switchboard.service"], commands)
+        second, _ = self.install("--opencode", self.machine.binary)
+        self.assertEqual(self.statuses(second)["service"], ["already done"])
+        self.install("--uninstall")
+        self.assertFalse(self.service_path().exists())
+        self.assertIn(["systemctl", "--user", "disable", "--now", "fleet-kit-switchboard.service"],
+                      self.machine.commands("systemctl"))
+
+
+class TestInstallOnAnUnknownPlatform(InstallCase):
+    PLATFORM = "plan9"
+
+    def test_the_service_is_skipped_with_the_reason(self):
+        out, error = self.install("--opencode", self.machine.binary)
+        self.assertIsNone(error, error)
+        self.assertIn("skipped (no service manager", self.statuses(out)["service"][0] + out)
+
+
+class TestServiceTemplates(Base):
+    TEMPLATES = ("com.fleet-kit.switchboard.plist", "fleet-kit-switchboard.service")
+
+    def values(self):
+        return sb.service_values(REPO, ["/opt/tools/bin", "/usr/bin"])
+
+    def test_the_plist_passes_plutil_and_plistlib(self):
+        import plistlib
+        text = sb.render_service("launchd", self.values(), REPO)
+        body = plistlib.loads(text.encode())
+        self.assertEqual(body["Label"], "com.fleet-kit.switchboard")
+        self.assertIs(body["RunAtLoad"], True)
+        self.assertIs(body["KeepAlive"], True)
+        self.assertEqual(body["ProgramArguments"][-2:], ["run", "--standby"])
+        self.assertTrue(body["ProgramArguments"][2].endswith("/bin/fleet-switchboard"))
+        self.assertTrue(body["StandardErrorPath"].startswith(str(sb.state_dir_path())))
+        self.assertTrue(body["StandardOutPath"].startswith(str(sb.state_dir_path())))
+        self.assertIn("/opt/tools/bin", body["EnvironmentVariables"]["PATH"].split(":"))
+        if not shutil.which("plutil"):
+            self.skipTest("plutil is macOS only")
+        done = subprocess.run(["plutil", "-lint", "-"], input=text.encode(), capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
+
+    def test_the_unit_parses_and_keeps_the_daemon_alive(self):
+        import configparser
+        text = sb.render_service("systemd", self.values(), REPO)
+        parser = configparser.ConfigParser(strict=False, interpolation=None)
+        parser.optionxform = str
+        parser.read_string(text)
+        service = parser["Service"]
+        self.assertIn("run --standby", service["ExecStart"])
+        self.assertEqual((service["Restart"], parser["Install"]["WantedBy"]), ("always", "default.target"))
+        self.assertIn("/opt/tools/bin", service["Environment"] + text)
+        self.assertNotIn("/dev/null", "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#")))
+
+    def test_neither_holds_a_secret_or_an_unfilled_placeholder_or_a_personal_name(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        for kind, name in (("launchd", self.TEMPLATES[0]), ("systemd", self.TEMPLATES[1])):
+            rendered = sb.render_service(kind, self.values(), REPO)
+            self.assertNotIn(PR16_KEY, rendered)
+            self.assertNotRegex(rendered, r"(?i)api_key|secret|token|password|bearer")
+            self.assertNotIn("__", re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S), "an unfilled placeholder in %s" % name)
+            template = (REPO / "templates" / name).read_text()
+            for number, line in enumerate(template.splitlines(), 1):
+                self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (name, number, line))
+
+    def test_the_templates_never_send_output_to_the_void(self):
+        plist = re.sub(r"<!--.*?-->", "", (REPO / "templates" / self.TEMPLATES[0]).read_text(), flags=re.S)
+        self.assertNotIn("/dev/null", plist)
+        self.assertIn("launchd-stderr.log", plist)
+        self.assertIn("__STATE_DIR__", plist)
+
+    def test_the_path_holds_the_tools_the_daemon_runs(self):
+        dirs = sb.service_path_dirs(REPO, ["/opt/gh/bin/gh", "/opt/herdr/bin/herdr", "herdr"])
+        for needed in (str(REPO / "bin"), "/opt/gh/bin", "/opt/herdr/bin", os.path.dirname(sys.executable), "/usr/bin"):
+            self.assertIn(needed, dirs)
+        self.assertEqual(len(dirs), len(set(dirs)))
+
+    def test_run_standby_waits_for_a_held_lock_instead_of_exiting(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        state = sb.ensure_state_dir()
+        holder = os.open(str(state / "run.lock"), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        slept, ran = [], []
+
+        def sleeper(seconds):
+            slept.append(seconds)
+            os.close(holder)  # the other daemon goes away
+        world = World(self, agents=())
+        with mock.patch.object(sb.time, "sleep", sleeper), mock.patch.object(sb, "run_daemon", lambda *a, **k: ran.append(1)), \
+                captured():
+            code = sb.main(["run", "--standby"], runner=world.route, now=world.clock.now)
+        self.assertEqual((code, slept, ran), (0, [sb.STANDBY_SECONDS], [1]))
+
+
+class TestTheTrialSharesTheInstaller(Base):
+    """One path: `fleet-switchboard install` and `switchboard-trial` put the same pieces into a profile by the same functions."""
+
+    def trial(self):
+        return TRIAL.Trial(root=self.home / "trial")
+
+    def test_the_trial_s_skills_agents_and_plugins_come_from_the_shared_functions(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        with mock.patch.object(trial.sb, "install_skills", return_value=True) as skills, \
+                mock.patch.object(trial.sb, "install_decisions_plugin", return_value=False) as plugin:
+            trial.install_skills()
+            self.assertEqual(trial.install_decisions_plugin(), "unchanged")
+        skills.assert_called_once_with(trial.skills_dir(), TRIAL.REPO_ROOT)
+        plugin.assert_called_once_with(trial.lab.opencode_config, TRIAL.REPO_ROOT)
+
+    def test_the_trial_has_no_installer_of_its_own(self):
+        source = (BIN / "switchboard-trial").read_text()
+        for gone in ("agent_copy(", "fleet-hooks.js", "def read_cli_json", "DECISIONS_PLUGIN_FILES", "fleet-decisions-tui"):
+            self.assertNotIn(gone, source)
+        for shared in ("sb.install_agents", "sb.install_skills", "sb.install_hooks_plugin", "sb.install_decisions_plugin",
+                       "sb.decisions_plugin_status"):
+            self.assertIn(shared, source)
+
+    def test_both_write_the_same_files_into_a_profile(self):
+        trial = self.trial()
+        trial.root.mkdir(parents=True)
+        os.makedirs(trial.lab.opencode_config)
+        trial.guarded(trial.sb.install_agents, trial.lab.opencode_config, TRIAL.DEFAULT_MODEL, TRIAL.REPO_ROOT)
+        trial.guarded(trial.sb.install_hooks_plugin, trial.lab.opencode_config, TRIAL.REPO_ROOT)
+        trial.install_skills()
+        self.assertEqual(trial.install_decisions_plugin(), "installed")
+        other = self.home / "other-profile"
+        sb.install_agents(other, sb.STANDARD_MODEL, REPO)
+        sb.install_hooks_plugin(other, REPO)
+        sb.install_decisions_plugin(other, REPO)
+        for relative in ("agents/coder.md", "plugins/fleet-hooks.js", "fleet-decisions/tui.tsx", "cli.json"):
+            self.assertEqual((Path(trial.lab.opencode_config) / relative).read_text(), (other / relative).read_text(), relative)
+
+    def test_the_trial_refuses_a_cli_json_it_does_not_understand_as_before(self):
+        trial = self.trial()
+        os.makedirs(trial.lab.opencode_config)
+        (Path(trial.lab.opencode_config) / "cli.json").write_text("[1, 2]")
+        with self.assertRaises(TRIAL.TrialError):
+            trial.install_decisions_plugin()
+        self.assertEqual((Path(trial.lab.opencode_config) / "cli.json").read_text(), "[1, 2]")
+
+    def test_the_constants_the_two_drivers_share_agree(self):
+        self.assertEqual(TRIAL.DEFAULT_MODEL, sb.STANDARD_MODEL)
+        proof = _load("t_proof_switchboard_pr16", BIN / "proof-switchboard")
+        self.assertEqual((proof.V2_PACKAGE, proof.V2_VERSION), (sb.V2_PACKAGE, sb.V2_VERSION))
+
+
+class TestTheFileKeyIsNeverText(PolicyCase):
+    """The key in its file reaches Jev's Authorization header and nowhere else: not argv, a log, the audit, an error,
+    a fact, a prompt, status, or any file the run writes."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        self.key_file = self.config_file.parent / "jev.key"
+        self.key_file.write_text(PR16_KEY + "\n")
+        os.chmod(str(self.key_file), 0o600)
+        self.opener = FakeOpener(jev_reply(noul_answers(**dict(LOW, hard_to_reverse=0.9))))
+        self.client = sb.JevClient(dict(JEV_SETTINGS), opener=self.opener)
+        self.judge = sb.PolicyJudge(policy_raw_config(), self.world.engine.v2, self.reader, self.client,
+                                    sb.AuditLog(self.world.audit_path), self.world.state, self.world.clock.now)
+
+    def everything_written(self):
+        text = ""
+        for base, _, files in os.walk(str(self.home)):
+            for name in files:
+                path = os.path.join(base, name)
+                if path != str(self.key_file) and os.path.isfile(path) and not stat.S_ISSOCK(os.stat(path).st_mode):
+                    text += open(path, "rb").read().decode("utf-8", "replace")
+        return text
+
+    def test_a_whole_run_with_the_key_in_its_file_leaves_it_in_no_output(self):
+        outputs = []
+        reply = self.judge.decide(sb.parse_policy_request(json.dumps(
+            {"sessionID": self.coder, "tool": "shell", "arguments": "git push --force -H 'X: %s'" % PR16_KEY,
+             "outcome": "allow"})))
+        outputs.append(json.dumps(reply))
+        self.assertEqual(self.opener.calls[0]["headers"]["Authorization"], "Bearer " + PR16_KEY, "the file's key was used")
+        for argv in (["status"], ["status", "--json"], ["key", "status"], ["decisions"]):
+            with captured() as (out, err):
+                sb.main(argv, runner=self.route, now=self.world.clock.now)
+            outputs += [out.getvalue(), err.getvalue()]
+        failing = sb.JevClient(dict(JEV_SETTINGS), opener=FakeOpener(http_error(401, ("bad key %s" % PR16_KEY).encode())))
+        try:
+            failing.decide({"x": 1}, {"q": {"type": "noul", "instructions": "x"}})
+        except sb.JevError as err:
+            outputs.append(str(err) + err.detail)
+        for text in outputs + [self.everything_written(), json.dumps(self.opener.calls[0]["body"])]:
+            self.assertNotIn(PR16_KEY, text)
+        for call in self.world.v2.calls:
+            self.assertNotIn(PR16_KEY, " ".join(call))
+
+
+class TestInstallDocs(unittest.TestCase):
+    def setUp(self):
+        self.install = (REPO / "INSTALL.md").read_text()
+        self.design = (REPO / "docs" / "switchboard.md").read_text()
+        self.trial = (REPO / "docs" / "switchboard-trial.md").read_text()
+        start = self.install.index("## The Fleet Switchboard")
+        self.section = self.install[start:self.install.index("## When you finish")]
+
+    def test_the_install_guide_has_the_switchboard_steps_in_its_own_style(self):
+        for number in range(14, 20):
+            self.assertRegex(self.section, r"(?m)^## STEP %d " % number)
+        for label in ("CHECK:", "DO:", "VERIFY:", "PROVES:", "HUMAN:"):
+            self.assertGreaterEqual(self.section.count(label), 6 if label != "HUMAN:" else 3, label)
+        for needle in ("auth login", "key set", "bootstrap", "install --dry-run", "herdr plugin list", "opencode v2"):
+            self.assertIn(needle, self.section)
+        last = self.section[self.section.index("## STEP 19"):]
+        for line in ("daemon", "key", "plugin", "service"):
+            self.assertIn("`%s`" % line, last)
+        self.assertIn("fleet-switchboard status", last)
+
+    def test_the_install_guide_says_the_profile_is_private_and_uses_the_wrapper(self):
+        for needle in ("private v2 profile", "--shared-profile", "fleet-opencode", "~/.config/opencode", "dry run prints the profile path"):
+            self.assertIn(needle, " ".join(self.section.split()))
+        self.assertNotIn("fleet-switchboard/bin/opencode", self.install)
+        for line in self.section.splitlines():
+            if "auth login" in line or "auth list" in line:
+                self.assertIn("fleet-opencode", line)
+
+    def test_the_existing_steps_stay(self):
+        for number in range(1, 14):
+            self.assertRegex(self.install, r"(?m)^## STEP %d " % number)
+
+    def test_the_new_part_is_clean_of_names_home_paths_secrets_and_emoji(self):
+        for number, line in enumerate(self.section.splitlines(), 1):
+            self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "INSTALL.md section:%d %s" % (number, line))
+            self.assertTrue(all(ord(ch) < 0x2600 for ch in line), "a symbol in: %s" % line)
+        for fragment in ("sk-", "bearer ", "password=", "token="):
+            self.assertNotIn(fragment, self.section.lower())
+
+    def test_every_command_the_install_guide_shows_exists(self):
+        parser = sb.build_parser()
+        commands = set(parser._subparsers._group_actions[0].choices)
+        for command in re.findall(r"fleet-switchboard ([a-z][a-z-]+)", self.section):
+            self.assertIn(command, commands | {"is", "are", "says", "begins", "key"}, command)
+        for flag in ("--opencode", "--no-service", "--no-herdr-link", "--dry-run", "--uninstall"):
+            self.assertIn(flag, parser._subparsers._group_actions[0].choices["install"].format_help())
+
+    def test_the_design_doc_has_the_status_row_the_catalog_and_the_log(self):
+        self.assertRegex(self.design, r"(?m)^\| 16 \| `switchboard/install` \| .+ \| ready for review \|$")
+        self.assertRegex(self.design, r"(?m)^- 2026-10-06: PR 16, Install\.")
+        for scenario in ("E1", "E2", "E3"):
+            self.assertRegex(self.design, r"(?m)^\| %s \|" % scenario)
+        for needle in ("### Install (PR 16)", "shared-profile-default", "--shared-profile", "fleet-opencode", "Found in review",
+                       "herdr integration", "private profile", "status_first_line", "key-missing-silent", "no-ensure-on-use", "bootstrap", "launchctl bootstrap gui/",
+                       "systemctl --user enable --now", "key set", "ensure_daemon", "Lab proof", "Not verified live",
+                       "--standby", "`jev.key_file`"):
+            self.assertIn(needle, self.design)
+        section = self.design[self.design.index("### Install (PR 16)"):self.design.index("### Data")]
+        for number, line in enumerate(section.splitlines(), 1):
+            self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "switchboard.md Install:%d %s" % (number, line))
+
+    def test_the_trial_doc_says_it_is_a_thin_wrapper_and_points_real_users_at_install(self):
+        text = " ".join(self.trial.split())
+        self.assertIn("thin wrapper for an isolated experiment", text)
+        self.assertIn("INSTALL.md", text)
+        self.assertIn("fleet-switchboard install", text)
+
+    def test_the_presentation_is_untouched_by_this_pr(self):
+        done = subprocess.run(["git", "diff", "--name-only", "HEAD", "--", "docs/presentation"], cwd=str(REPO),
+                              capture_output=True, text=True)
+        if done.returncode == 0:
+            self.assertEqual(done.stdout.strip(), "")
 
 
 def main(argv):

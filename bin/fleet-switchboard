@@ -54,10 +54,14 @@ from pathlib import Path
 import re
 import secrets
 import select
+import shlex
+import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import quote
@@ -255,6 +259,9 @@ KNOWN_FAULTS = (
     "bare-issue-number",    # PR 15: an `owner/repo#N` qualifier is ignored
     "one-account",          # PR 15: every repo uses the default token
     "repo-create-allowed",  # PR 15: the judge's deterministic rule on `gh repo create` is off
+    "key-missing-silent",   # PR 16: `status` does not say that no decision-model key is configured
+    "no-ensure-on-use",     # PR 16: a command that needs the daemon does not start it
+    "shared-profile-default",  # PR 16: `install` writes into the directory the ordinary OpenCode reads, by default
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -722,15 +729,21 @@ class HerdrClient:
     def pane_close(self, pane):
         return self._call("pane", "close", pane)
 
-    def workspace_create(self, cwd, label):
-        """A new herdr workspace for a project, never focused (PR 15): `herdr workspace create --cwd DIR --label
-        LABEL --no-focus`. Returns its id."""
-        body = self._call("workspace", "create", "--cwd", cwd, "--label", label, "--no-focus")
-        found = (body or {}).get("result", {}).get("workspace") if isinstance(body, dict) else None
-        ident = found.get("workspace_id") or found.get("id") if isinstance(found, dict) else found
-        if not isinstance(ident, str) or not ident:
+    def workspace_list(self):
+        """PR 16: every workspace, as herdr lists them: [{"workspace_id", "label", ...}]."""
+        return self._result(self._call("workspace", "list"), "workspaces", list)
+
+    def workspace_create(self, cwd, label, focus=True):
+        """PR 16: a new workspace, focused: `bootstrap` opens the Chief of Staff where the person is looking.
+        The only call here that can take focus, and only a person's own command makes it (`focus=False` asks
+        for `--no-focus`, for scripts and trials). Returns {"workspace_id", "root_pane"}: the empty shell pane
+        herdr opens with it (None when it names none)."""
+        body = self._call("workspace", "create", "--cwd", cwd, "--label", label, "--focus" if focus else "--no-focus")
+        workspace = self._result(body, "workspace", dict)
+        if not isinstance(workspace.get("workspace_id"), str):
             raise HerdrError("bad_shape", "expected result.workspace.workspace_id in herdr's reply")
-        return ident
+        root = (body["result"].get("root_pane") or {}).get("pane_id")
+        return {"workspace_id": workspace["workspace_id"], "root_pane": root if isinstance(root, str) else None}
 
     def open_tab_running(self, workspace, label, cwd, argv, env):
         """A new tab in `workspace` whose one pane execs `argv` directly. Never
@@ -1747,6 +1760,7 @@ JEV_DEFAULTS = {
     "model": JEV_MODEL,
     "url": JEV_URL,
     "key_env": JEV_KEY_ENV,       # the NAME of the variable that holds the key, never the key
+    "key_file": None,             # PR 16: a private file that holds the key; None means jev.key beside config.json
     "timeout_seconds": 20,
     "min_confidence": 0.7,        # the classifier's threshold; SF2 will choose the real one
     "record_file": None,          # append every real call here as a request/response pair
@@ -1798,7 +1812,7 @@ def _checked_jev_settings(jev, source):
     if not _is_number(settings["min_confidence"]) or not 0 < settings["min_confidence"] <= 1:
         raise ConfigError("%s: 'jev.min_confidence' must be a number above 0 and at most 1, got %r"
                           % (source, settings["min_confidence"]))
-    for name in ("record_file", "replay"):
+    for name in ("record_file", "replay", "key_file"):
         value = settings[name]
         if value is not None and (not isinstance(value, str) or not os.path.isabs(value)):
             raise ConfigError("%s: 'jev.%s' must be an absolute path, got %r" % (source, name, value))
@@ -1866,6 +1880,63 @@ def check_answers(questions, answers):
     return answers
 
 
+class KeyFileError(Exception):
+    """The key file exists and may not be used. Names the path and the rule, never the key."""
+
+
+def jev_key_file(settings):
+    """Where the decision-model key file is: `jev.key_file`, else jev.key beside config.json."""
+    given = (settings or {}).get("key_file")
+    return Path(given) if given else config_path().parent / "jev.key"
+
+
+def locate_jev_key(settings, environ=None):
+    """(key, source): the key and where it came from, `environment`, `file`, or (None, `none`).
+
+    The variable named by `key_env` wins. Otherwise the key file, which must be a regular file (not a
+    link) that you own and nobody else can read or write, and must not be empty: a file the group or
+    the world can read is refused with the reason, and the key is never part of that reason.
+    Raises KeyFileError.
+    """
+    environ = os.environ if environ is None else environ
+    name = (settings or {}).get("key_env") or JEV_KEY_ENV
+    value = environ.get(name)
+    if value:
+        return value, "environment"
+    path = jev_key_file(settings)
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return None, "none"
+    except OSError as err:
+        raise KeyFileError("cannot read the key file %s: %s" % (path, err.strerror or err)) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise KeyFileError("the key file %s must be a regular file, not a link or a directory" % path)
+    if info.st_uid != os.getuid():
+        raise KeyFileError("the key file %s must be owned by you" % path)
+    if info.st_mode & 0o077:
+        raise KeyFileError("the key file %s can be read by others: run `chmod 0600 %s`, or save the key again "
+                           "with `%s key set` (mode 0600, owned by you)" % (path, path, PROG))
+    try:
+        text = path.read_text().strip()
+    except OSError as err:
+        raise KeyFileError("cannot read the key file %s: %s" % (path, err.strerror or err)) from None
+    if not text:
+        raise KeyFileError("the key file %s is empty" % path)
+    return text, "file"
+
+
+def jev_secrets(config, environ=None):
+    """The decision-model key as a list (empty when there is none or the file is refused): what redaction hides."""
+    if not config.get("jev"):
+        return []
+    try:
+        key, _ = locate_jev_key(config["jev"], environ)
+    except KeyFileError:
+        return []
+    return [key] if key else []
+
+
 def _usage_of(usage):
     """The numbers of a usage block under names the audit does not redact."""
     usage = usage if isinstance(usage, dict) else {}
@@ -1890,11 +1961,14 @@ class JevClient:
 
     def decide(self, state, questions):
         """{"model", "answers", "usage", "latency_ms"}. Raises JevError, with the latency."""
-        key = self.environ.get(self.settings["key_env"])
         started = self.clock()
         try:
+            try:
+                key, _ = locate_jev_key(self.settings, self.environ)
+            except KeyFileError as err:
+                raise JevError("unauthorized", str(err)) from None
             if not key:
-                raise JevError("unauthorized", "no key in $%s" % self.settings["key_env"])
+                raise JevError("unauthorized", "no key in $%s or the key file" % self.settings["key_env"])
             body = {"model": self.settings["model"], "state": state, "questions": questions}
             out = self._post(body, key)
             answers = check_answers(questions, out.get("answers"))
@@ -5575,6 +5649,10 @@ def collect_status(runner=subprocess.run, now=time.time):
         report["github"] = github_status(config, state, fleets)
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+    report["key"] = key_report(config if config_ok else None)   # PR 16
+    report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None}
+    report["plugin"] = plugin_report(config, runner) if config_ok else {"state": "unknown", "detail": "config unusable"}
+    report["service"] = service_report()
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
     return report
 
@@ -5614,7 +5692,8 @@ def format_status(report):
         return "ok   " if part["ok"] else "ERROR"
 
     config = report["config"]
-    lines = ["%s %s" % (PROG, report["version"])]
+    lines = [report["key"]["notice"]] if report["key"]["notice"] else []  # PR 16: the danger comes first
+    lines.append("%s %s" % (PROG, report["version"]))
     if config["ok"]:
         lines.append("%s config     %s%s" % (mark(config), config["path"],
                                              "" if config["exists"] else " (not present; defaults)"))
@@ -5652,6 +5731,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
 
 
@@ -5711,6 +5791,9 @@ def cmd_run(args, runner, now, wait):
                 report["at"], len(report["sent"]), len(report["held"]), len(report["waiting"]),
                 len(report["converted"]), len(report["errors"])))
         return EXIT_OK if not report["errors"] else EXIT_ERROR
+    if args.standby:  # PR 16: the service waits for the lock instead of exiting and being restarted
+        while run_lock_held(state):
+            time.sleep(STANDBY_SECONDS)
     hub = attach_github(engine, config, state, runner, now)
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
     if judge_server is not None:
@@ -5725,6 +5808,9 @@ def cmd_run(args, runner, now, wait):
         if judge_server is not None:
             judge_server.stop()
     return EXIT_OK
+
+
+STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock
 
 
 def cmd_ensure(args, spawn=subprocess.Popen):
@@ -5785,7 +5871,9 @@ def cmd_launch(args, runner, now, socket_call=None):
         check_charter_workspace(engine, runner, now, args.charter, repo, args.new_workspace)
         with engine._external("herdr.workspace.create", args.name, {"label": args.new_workspace,
                                                                     "cwd": args.dir}) as result:
-            created = workspace = result["workspace"] = engine.herdr.workspace_create(args.dir, args.new_workspace)
+            # PR 15's launch never takes focus: only a person's own `bootstrap` does (PR 16)
+            created = workspace = result["workspace"] = engine.herdr.workspace_create(
+                args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
         done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                             None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
@@ -7222,8 +7310,7 @@ class PolicyJudge:
         return context
 
     def redacted(self, text):
-        secrets = [self.environ.get(self.config["jev"]["key_env"])] if self.config.get("jev") else []
-        return redact_command_text(text, secrets)
+        return redact_command_text(text, jev_secrets(self.config, self.environ))
 
     def state_of(self, request, fleet, context):
         return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
@@ -8423,6 +8510,8 @@ def build_parser():
     run.add_argument("--once", action="store_true", help="One pass, then exit")
     run.add_argument("--poll", type=float, help="Seconds between passes (default: config poll_seconds)")
     run.add_argument("--json", action="store_true", help="With --once: print the pass report as JSON")
+    run.add_argument("--standby", action="store_true", help="If another daemon holds the lock, wait for it to go "
+                                                           "instead of exiting (the service uses this)")
     send = sub.add_parser("send", help="Deliver a message to another fleet agent now, by the delivery rule")
     send.add_argument("name", help="The recipient's fleet name")
     send.add_argument("text", nargs="+", help="The message")
@@ -8482,6 +8571,7 @@ def build_parser():
     add_foreground_parsers(sub)  # PR 8
     add_policy_parsers(sub)  # PR 9
     add_v1_move_parsers(sub)  # PR 10
+    add_install_parsers(sub)  # PR 16
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -8502,8 +8592,16 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if args.action in POLICY_COMMANDS:  # PR 9: prints one JSON line and exits 0 whatever happens
         return POLICY_COMMANDS[args.action](args, runner, now)
     try:
+        if args.action in ENSURE_ON_USE_COMMANDS:  # PR 16: the daemon is alive when a command needs it
+            ensure_on_use(spawn)
         if args.action == "ensure":
             return cmd_ensure(args, spawn)
+        if args.action == "install":  # PR 16
+            return cmd_install(args, runner, now, spawn)
+        if args.action == "key":
+            return cmd_key(args)
+        if args.action == "bootstrap":
+            return cmd_bootstrap(args, runner, now, socket_call)
         if args.action == "launch":
             return cmd_launch(args, runner, now, socket_call)
         if args.action == "handoff":  # PR 8
@@ -8532,11 +8630,1178 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
     except (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError,
-            LaunchError, IntentError) as err:
+            LaunchError, IntentError, InstallError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
     sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))
     return EXIT_USAGE
+
+
+# ============================================================================
+# PR 16: install, a service that keeps the daemon alive, the decision-model
+# key as a file, the daemon started on use, and `bootstrap`
+#
+# One section, so the stack rebases cleanly. docs/switchboard.md, "Install
+# (PR 16)". Registered in these places:
+#   KNOWN_FAULTS         `key-missing-silent`, `no-ensure-on-use`, `shared-profile-default`
+#   JEV_DEFAULTS         `key_file` (above, with the key reader)
+#   collect_status       the key, daemon, plugin and service lines
+#   main                 ensure on use, then the commands: install, key, bootstrap
+#   HerdrClient          workspace_list, workspace_create (the one `--focus`)
+# The pieces `install` puts into OpenCode's profile are plain functions that
+# bin/switchboard-trial calls too: there is one path, not two installers.
+# ============================================================================
+from xml.sax.saxutils import escape as xml_escape
+
+KIT_ROOT = Path(__file__).resolve().parent.parent
+STANDARD_MODEL = "github-copilot/claude-sonnet-5.5"  # the model every kit agent file gets
+KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
+DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
+HOOKS_PLUGIN_FILE = "fleet-hooks.js"
+WRAPPER_NAME = "fleet-opencode"  # beside the profile, never named `opencode`: the person's own OpenCode keeps that name
+# Names a wrapper strips from a v2 process by shape, before it adds the one `gh` token agents are given. The same
+# pattern bin/switchboard-trial strips with: a test keeps the two equal.
+KEY_NAME_PATTERN = "(_API_KEY|_SECRET|_PASSWORD|_ACCESS_KEY|_ACCESS_KEY_ID)$"
+PANE_ENV = "FLEET_SWITCHBOARD_LAB_PANE"  # a pane's v2 keeps its herdr identity only when this is "1" (config `launch_env`)
+PROFILE_DIRS = ("config", "data", "state", "cache", "tmp", "home")
+V2_PACKAGE, V2_VERSION = "@opencode/cli", "2.0.22"  # what the Lab and the trial install; a test keeps them equal
+SERVICE_LABEL = "com.fleet-kit.switchboard"
+SERVICE_UNIT = "fleet-kit-switchboard.service"
+HERDR_PLUGIN_ID = "fleet-switchboard"
+COS_NAME = "cos"
+COS_AGENT = "chief-of-staff"
+COS_WORKSPACE_LABEL = "Chief of Staff"
+
+NO_KEY_NOTICE = "No decision-model key: messages are not classified and tool calls are not judged."
+
+ENSURE_ON_USE = True  # tests switch it off: a command run in a test must never start a real daemon
+ENSURE_ON_USE_COMMANDS = ("send", "report", "launch", "handoff", "comment", "remind", "decisions", "intent",
+                          "bootstrap")  # never `judge-tool`: it runs inside v2 on every tool call
+USE_ENSURE_PATIENCE = 2.0  # seconds a command waits for a daemon it started; then it goes on without
+
+
+# ------------------------------------------------------------ the daemon on use
+
+def ensure_on_use(spawn=subprocess.Popen, patience=None, sleep=time.sleep, state_dir=None):
+    """Make sure a daemon runs before a command that needs one does its work. Quiet and bounded.
+
+    A command that cannot start the daemon still does its work: this writes one warning naming the log
+    and returns. A config the daemon could not read is the command's own error, not a second one here.
+    """
+    if not ENSURE_ON_USE or fault("no-ensure-on-use"):
+        return None
+    try:
+        load_config()
+    except ConfigError:
+        return None
+    try:
+        state = ensure_state_dir(state_dir)
+        return ensure_daemon(state, spawn, USE_ENSURE_PATIENCE if patience is None else patience, sleep)
+    except (LockError, ConfigError, OSError) as err:
+        why = "" if isinstance(err, LockError) else " (%s)" % _one_line(str(err), 120)
+        sys.stderr.write("%s: the daemon is not running and could not be started%s; see %s\n"
+                         % (PROG, why, state_dir_path() / "daemon.log"))
+        return None
+
+
+# ------------------------------------------------------------------ the key
+
+def key_report(config):
+    """{"source", "notice", "problem"} for `status`: where the key comes from, never what it is."""
+    jev = (config or {}).get("jev")
+    if not jev:
+        return {"source": "not configured", "notice": None, "problem": None}
+    if jev.get("replay"):
+        return {"source": "replayed", "notice": None, "problem": None}
+    problem = None
+    try:
+        _, source = locate_jev_key(jev)
+    except KeyFileError as err:
+        source, problem = "none", str(err)
+    try:
+        silent = fault("key-missing-silent")
+    except FaultError:
+        silent = False  # a bad fault name is `status`'s own lab line to report
+    notice = NO_KEY_NOTICE if source == "none" and not silent else None
+    return {"source": source, "notice": notice, "problem": problem}
+
+
+def format_key_line(key):
+    detail = {"none": "none: the classifier and the judge answer nothing until `%s key set` saves one" % PROG,
+              "replayed": "not needed (answers are replayed)",
+              "not configured": "not needed (no `jev` in the config)"}.get(key["source"], key["source"])
+    return "      %-10s %s%s" % ("key", detail, " (%s)" % key["problem"] if key["problem"] else "")
+
+
+def daemon_report(state_dir):
+    if not run_lock_held(state_dir):
+        return {"running": False, "pid": None}
+    try:
+        pid = int((Path(state_dir) / "run.lock").read_text().strip())
+    except (OSError, ValueError):
+        pid = None
+    return {"running": True, "pid": pid}
+
+
+def plugin_report(config, runner):
+    """Whether herdr lists the switchboard's plugin: `linked`, `not linked`, or `unknown` with why."""
+    try:
+        done = runner([config["herdr"], "plugin", "list"], capture_output=True, text=True, timeout=HERDR_CALL_TIMEOUT,
+                      stdin=subprocess.DEVNULL)
+    except Exception as err:  # status must always answer; say what broke in one line
+        return {"state": "unknown", "detail": _one_line(str(err), 100)}
+    if done.returncode != 0:
+        return {"state": "unknown", "detail": "herdr plugin list exited %d" % done.returncode}
+    listed = re.search(r"(?m)^\W*%s\b" % re.escape(HERDR_PLUGIN_ID), done.stdout or "") is not None
+    return {"state": "linked" if listed else "not linked", "detail": None}
+
+
+def service_kind(platform=None):
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        return "launchd"
+    return "systemd" if platform.startswith("linux") else None
+
+
+def service_file_path(kind):
+    if kind == "launchd":
+        return Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
+    if kind == "systemd":
+        return _xdg("XDG_CONFIG_HOME", ".config") / "systemd" / "user" / SERVICE_UNIT
+    return None
+
+
+def service_report():
+    kind = service_kind()
+    path = service_file_path(kind)
+    return {"kind": kind, "path": str(path) if path else None, "installed": bool(path and path.is_file())}
+
+
+def format_install_lines(report):
+    lines = []
+    daemon = report["daemon"]
+    lines.append("      %-10s %s" % ("daemon", "running%s" % (" (pid %d)" % daemon["pid"] if daemon["pid"] else "")
+                                    if daemon["running"] else "not running (`%s ensure` starts it)" % PROG))
+    lines.append(format_key_line(report["key"]))
+    plugin = report["plugin"]
+    lines.append("      %-10s %s%s" % ("plugin", plugin["state"], " (%s)" % plugin["detail"] if plugin["detail"] else ""))
+    service = report["service"]
+    lines.append("      %-10s %s" % ("service", ("installed (%s)" % service["path"]) if service["installed"]
+                                    else "not installed (`%s install` adds it)" % PROG if service["kind"]
+                                    else "no service manager on this platform"))
+    return lines
+
+
+def _write_private(path, text):
+    """Write `text` to `path` atomically with mode 0600: a temporary file in the same directory, then rename."""
+    path = Path(path)
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, mode=0o700)
+    handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
+    try:
+        with os.fdopen(handle, "w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, str(path))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def cmd_key(args, runner=None, now=None):
+    config = load_config()
+    settings = config.get("jev") or dict(JEV_DEFAULTS)
+    if args.key_action == "status":
+        try:
+            _, source = locate_jev_key(settings)
+        except KeyFileError as err:
+            print("none")
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return EXIT_ERROR
+        print(source)
+        return EXIT_OK
+    if sys.stdin.isatty():
+        key = getpass.getpass("Decision-model key (not shown): ")
+    else:
+        key = sys.stdin.readline()
+    key = key.strip()
+    if not key:
+        sys.stderr.write("%s: no key given: pipe it in or type it at the prompt\n" % PROG)
+        return EXIT_USAGE
+    if re.search(r"\s", key) or any(ord(ch) < 32 for ch in key):
+        sys.stderr.write("%s: that is not a key: it has spaces or control characters (it is not shown)\n" % PROG)
+        return EXIT_USAGE
+    path = jev_key_file(settings)
+    try:
+        _write_private(path, key + "\n")
+    except OSError as err:
+        sys.stderr.write("%s: could not save the key to %s: %s\n" % (PROG, path, err.strerror or err))
+        return EXIT_ERROR
+    print("key saved")
+    return EXIT_OK
+
+
+# ----------------------------------------------------------------- bootstrap
+
+COS_BRIEF = """Introduce yourself to the person in one or two sentences: you are the Chief of Staff, the one place
+they talk to. You hold the plan and hand work out. You do not do work yourself.
+
+Then run `fleet-switchboard status` and read all of it. Tell the person plainly what you found, in your own
+words, and what is missing. Three things matter: whether a decision-model key is saved (without one, messages are
+not classified and tool calls are not judged: say so first, and tell them `fleet-switchboard key set` saves one),
+whether any GitHub repos are watched (`github_repos` in the switchboard config is empty until they choose), and
+whether the daemon, the herdr plugin and the service are all in place.
+
+End by asking what they want to work on. Do not start anything until they answer.
+"""
+
+
+class BootstrapRefused(Exception):
+    """`bootstrap` will not open a second Chief of Staff."""
+
+
+def find_cos_session(v2):
+    """The newest v2 session whose fleet name is `cos`, or None: derived from v2, never from a stored id."""
+    cursor, found = None, []
+    for _ in range(V1_LIST_MAX_PAGES):
+        sessions, cursor = v2.session_list_page(None, cursor)
+        found.extend(s for s in sessions if isinstance(s, dict) and (_fleet_meta(s) or {}).get("name") == COS_NAME)
+        if cursor is None:
+            break
+    if not found:
+        return None
+    return max(found, key=lambda s: (s.get("time") or {}).get("created") or 0)
+
+
+def bootstrap_cos(engine, label=COS_WORKSPACE_LABEL, directory=None, patience=LAUNCH_PATIENCE, sleep=time.sleep,
+                  focus=True):
+    """Open the Chief of Staff for the first time, or again. {"action", "workspace", "name", "session", "pane", "tab"}.
+
+    A `cos` that already has a pane is refused, naming it. A session without a pane is resumed in the
+    workspace labelled `label`, where it was; the first time there is no session, and a new workspace is
+    always made (and focused: the person wants to see it), never an old one that happens to share the label.
+    The launch and the resume are the ones `launch` uses.
+    """
+    directory = directory or os.getcwd()
+    if not os.path.isabs(directory) or not os.path.isdir(directory):
+        raise LaunchError("--dir must be an absolute path of an existing directory, got %r" % directory)
+    running = engine.discover(engine.now()).agents.get(COS_NAME)
+    if running is not None:
+        raise BootstrapRefused("a Chief of Staff already runs: %s in pane %s (session %s). There is one per fleet; "
+                               "open its workspace in herdr" % (COS_NAME, running.pane, running.session_id))
+    session = find_cos_session(engine.v2)
+    existing = None
+    if session is not None:
+        existing = next((w for w in engine.herdr.workspace_list() if w.get("label") == label), None)
+    created = None
+    if existing is not None:
+        workspace = existing["workspace_id"]
+    else:
+        with engine._external("herdr.workspace.create", COS_NAME, {"label": label, "cwd": directory}) as result:
+            created = engine.herdr.workspace_create(directory, label, focus)
+            workspace = result["workspace"] = created["workspace_id"]
+    try:
+        if session is not None:
+            done, action = resume_agent(engine, COS_NAME, session["id"], workspace, patience, sleep), "resumed"
+        else:
+            done, action = launch_agent(engine, COS_NAME, COS_AGENT, directory, workspace, COS_AGENT, None, None,
+                                        COS_BRIEF, patience, sleep), "created"
+    except LaunchError as err:
+        if created is not None:
+            raise LaunchError("%s (the workspace %r was opened and is still there)" % (err, label)) from err
+        raise
+    if created is not None and created.get("root_pane"):  # the empty shell pane herdr gives a new workspace
+        close_own_pane(engine, COS_NAME, created["root_pane"], "the empty pane of the workspace bootstrap opened")
+    return dict(done, action=action, workspace=workspace)
+
+
+def cmd_bootstrap(args, runner, now, socket_call=None):
+    engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    directory = os.path.abspath(args.dir) if args.dir else os.getcwd()
+    try:
+        done = bootstrap_cos(engine, args.workspace or COS_WORKSPACE_LABEL, directory, focus=not args.stay_put)
+    except BootstrapRefused as err:
+        sys.stderr.write("%s: bootstrap refused: %s\n" % (PROG, err))
+        return EXIT_ERROR
+    print(json.dumps(done, sort_keys=True))
+    return EXIT_OK
+
+
+# ------------------------------------------------- the profile pieces (shared)
+#
+# What `install` puts into OpenCode v2's profile. bin/switchboard-trial calls these same functions with
+# the trial's own profile, so there is one path. Each takes the directories it writes, and returns whether
+# anything changed. Nothing here reads the environment.
+
+class InstallError(Exception):
+    """A step of `install` cannot go on, and says why and what to do."""
+
+
+def write_if_changed(path, content):
+    """Write `content` unless the file already holds it. True when it wrote."""
+    path = Path(path)
+    try:
+        if path.read_text() == content:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return True
+
+
+def kit_agent_text(name, model, kit_root=KIT_ROOT):
+    """A kit agent file with the model placeholder filled in."""
+    return (Path(kit_root) / "agents" / "opencode" / (name + ".md")).read_text().replace("__PROVIDER__/__MODEL_ID__", model)
+
+
+def install_agents(config_dir, model=STANDARD_MODEL, kit_root=KIT_ROOT):
+    """The four agent definitions into <config_dir>/agents. True when any file changed."""
+    changed = False
+    for name in KIT_AGENTS:
+        changed |= write_if_changed(Path(config_dir) / "agents" / (name + ".md"), kit_agent_text(name, model, kit_root))
+    return changed
+
+
+def kit_skill_names(kit_root=KIT_ROOT):
+    root = Path(kit_root) / "skills"
+    return sorted(p.name for p in root.iterdir() if (p / "SKILL.md").is_file())
+
+
+def install_skills(skills_dir, kit_root=KIT_ROOT):
+    """The kit's skills into `skills_dir`, one directory each. True when any file changed."""
+    changed = False
+    for name in kit_skill_names(kit_root):
+        text = (Path(kit_root) / "skills" / name / "SKILL.md").read_text()
+        changed |= write_if_changed(Path(skills_dir) / name / "SKILL.md", text)
+    return changed
+
+
+def _read_json_object(path, what):
+    """The JSON object at `path` ({} when there is no file). Anything else is refused, never overwritten."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        body = json.loads(path.read_text())
+    except (OSError, ValueError):
+        body = None
+    if not isinstance(body, dict):
+        raise InstallError("%s is not a JSON object: fix it by hand (%s), then run again" % (path, what))
+    return body
+
+
+def ensure_skills_path(config_dir, skills_dir, model=None):
+    """Name `skills_dir` in the profile's opencode.json under skills.paths, keeping every other key.
+
+    v2 also scans the user's home for skills, and a skill of the same name there would win over one that is
+    only copied into the profile; a configured path is read after those and wins. True when it wrote.
+    """
+    path = Path(config_dir) / "opencode.json"
+    body = _read_json_object(path, "it holds the profile's settings")
+    skills = body.get("skills")
+    if skills is not None and not isinstance(skills, dict):
+        raise InstallError("%s: `skills` is not an object: fix it by hand, then run again" % path)
+    skills = dict(skills or {})
+    paths = skills.get("paths", [])
+    if not isinstance(paths, list):
+        raise InstallError("%s: `skills.paths` is not a list: fix it by hand, then run again" % path)
+    if str(skills_dir) in paths:
+        return False
+    skills["paths"] = list(paths) + [str(skills_dir)]
+    if not body:
+        body["$schema"] = "https://opencode.ai/config.json"
+        if model:
+            body["model"] = model
+    body["skills"] = skills
+    return write_if_changed(path, json.dumps(body, indent=2) + "\n")
+
+
+def install_hooks_plugin(config_dir, kit_root=KIT_ROOT):
+    return write_if_changed(Path(config_dir) / "plugins" / HOOKS_PLUGIN_FILE,
+                            (Path(kit_root) / "plugins" / "fleet-hooks" / "index.js").read_text())
+
+
+def read_cli_json(config_dir):
+    """The profile's cli.json as an object ({} when there is none). A file that is not a JSON object with a
+    `plugins` list is refused, never overwritten: it may hold plugins this code knows nothing about."""
+    path = Path(config_dir) / "cli.json"
+    body = _read_json_object(path, "it names the TUI plugins")
+    if not isinstance(body.get("plugins", []), list):
+        raise InstallError("%s is not a JSON object with a `plugins` list: fix it by hand, then run again" % path)
+    return body
+
+
+def install_decisions_plugin(config_dir, kit_root=KIT_ROOT):
+    """Copy the Decisions TUI plugin into the profile and name its directory in cli.json, keeping every other
+    plugin and key there. Idempotent; True when anything changed. Nothing is restarted."""
+    source = Path(kit_root) / "plugins" / "fleet-decisions-tui"
+    target = Path(config_dir) / DECISIONS_PLUGIN_NAME
+    changed = False
+    for name in DECISIONS_PLUGIN_FILES:
+        changed |= write_if_changed(target / name, (source / name).read_text())
+    body = read_cli_json(config_dir)
+    wanted = "./" + DECISIONS_PLUGIN_NAME
+    if wanted not in body.get("plugins", []):
+        body["plugins"] = list(body.get("plugins", [])) + [wanted]
+        changed |= write_if_changed(Path(config_dir) / "cli.json", json.dumps(body, indent=2) + "\n")
+    return changed
+
+
+def decisions_plugin_status(config_dir, kit_root=KIT_ROOT):
+    """`installed`, `not installed`, or `out of date` (a file differs from the kit's)."""
+    try:
+        named = ("./" + DECISIONS_PLUGIN_NAME) in read_cli_json(config_dir).get("plugins", [])
+    except InstallError:
+        named = False
+    source = Path(kit_root) / "plugins" / "fleet-decisions-tui"
+    target = Path(config_dir) / DECISIONS_PLUGIN_NAME
+    if not named or not all((target / name).is_file() for name in DECISIONS_PLUGIN_FILES):
+        return "not installed"
+    same = all((target / name).read_text() == (source / name).read_text() for name in DECISIONS_PLUGIN_FILES)
+    return "installed" if same else "out of date"
+
+
+def remove_if_same(path, content):
+    """Delete `path` when it still holds exactly `content` (what the kit wrote). False when absent or edited."""
+    path = Path(path)
+    try:
+        if path.read_text() != content:
+            return False
+    except OSError:
+        return False
+    path.unlink()
+    return True
+
+
+def uninstall_agents(config_dir, model=STANDARD_MODEL, kit_root=KIT_ROOT):
+    removed = False
+    for name in KIT_AGENTS:
+        removed |= remove_if_same(Path(config_dir) / "agents" / (name + ".md"), kit_agent_text(name, model, kit_root))
+    return removed
+
+
+def uninstall_skills(skills_dir, kit_root=KIT_ROOT):
+    removed = False
+    for name in kit_skill_names(kit_root):
+        target = Path(skills_dir) / name
+        if remove_if_same(target / "SKILL.md", (Path(kit_root) / "skills" / name / "SKILL.md").read_text()):
+            removed = True
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+    try:
+        Path(skills_dir).rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def uninstall_skills_path(config_dir, skills_dir):
+    """Take `skills_dir` out of skills.paths; drop what is then empty; remove the file if it held only that."""
+    path = Path(config_dir) / "opencode.json"
+    if not path.exists():
+        return False
+    body = _read_json_object(path, "it holds the profile's settings")
+    skills = body.get("skills")
+    if not isinstance(skills, dict) or str(skills_dir) not in (skills.get("paths") or []):
+        return False
+    skills["paths"] = [p for p in skills["paths"] if p != str(skills_dir)]
+    if not skills["paths"]:
+        del skills["paths"]
+    if not skills:
+        del body["skills"]
+    if set(body) <= {"$schema", "model"}:
+        path.unlink()
+    else:
+        path.write_text(json.dumps(body, indent=2) + "\n")
+    return True
+
+
+def uninstall_hooks_plugin(config_dir, kit_root=KIT_ROOT):
+    return remove_if_same(Path(config_dir) / "plugins" / HOOKS_PLUGIN_FILE,
+                          (Path(kit_root) / "plugins" / "fleet-hooks" / "index.js").read_text())
+
+
+def uninstall_decisions_plugin(config_dir, kit_root=KIT_ROOT):
+    source = Path(kit_root) / "plugins" / "fleet-decisions-tui"
+    target = Path(config_dir) / DECISIONS_PLUGIN_NAME
+    removed = False
+    for name in DECISIONS_PLUGIN_FILES:
+        removed |= remove_if_same(target / name, (source / name).read_text())
+    try:
+        target.rmdir()
+    except OSError:
+        pass
+    path = Path(config_dir) / "cli.json"
+    if path.exists():
+        body = read_cli_json(config_dir)
+        wanted = "./" + DECISIONS_PLUGIN_NAME
+        if wanted in body.get("plugins", []):
+            body["plugins"] = [p for p in body["plugins"] if p != wanted]
+            if not body["plugins"]:
+                del body["plugins"]
+            if body:
+                path.write_text(json.dumps(body, indent=2) + "\n")
+            else:
+                path.unlink()
+            removed = True
+    return removed
+
+
+# ----------------------------------------------------------------- the service
+
+def render_service(kind, values, kit_root=KIT_ROOT):
+    """The LaunchAgent or the systemd user unit, from its template in templates/, placeholders filled in."""
+    name = SERVICE_LABEL + ".plist" if kind == "launchd" else SERVICE_UNIT
+    text = (Path(kit_root) / "templates" / name).read_text()
+    for placeholder, value in values.items():
+        text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
+    return text
+
+
+def service_values(kit_root, path_dirs):
+    """The placeholders of both service templates. No secret is among them: the key comes from its file."""
+    return {"__PYTHON__": sys.executable, "__HOME__": str(Path.home()), "__PREFIX__": str(kit_root),
+            "__STATE_DIR__": str(state_dir_path()), "__CONFIG_HOME__": str(config_path().parent.parent),
+            "__STATE_HOME__": str(state_dir_path().parent), "__PATH__": os.pathsep.join(path_dirs)}
+
+
+def service_path_dirs(kit_root, tools):
+    """PATH for the service: the kit's bin, the directories of the tools it runs, then the usual places."""
+    dirs = [str(Path(kit_root) / "bin")]
+    dirs += [os.path.dirname(tool) for tool in tools if tool and os.path.isabs(tool)]
+    dirs += [os.path.dirname(sys.executable), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+             "/usr/sbin", "/sbin"]
+    seen = []
+    return [d for d in dirs if d and not (d in seen or seen.append(d))]
+
+
+SHARED_WRAPPER_TEXT = """#!/bin/sh
+# OpenCode v2 with the Fleet Switchboard's environment, in the profile your ordinary OpenCode reads too
+# (`fleet-switchboard install --shared-profile`). It holds no secret.
+# The plugins find the switchboard through these variables, and an agent's shell finds `fleet-switchboard`
+# and the signing `gh` shim first on its PATH. Anything that runs this file gets them; v2 run by its own
+# name does not, and then the plugins do nothing.
+export FLEET_SWITCHBOARD_BIN={fleet_bin}
+export FLEET_SWITCHBOARD_SHIMS={shims}
+export FLEET_SWITCHBOARD_STATE={state}
+{xdg}export PATH={kit_bin}:"$PATH"
+exec {v2} "$@"
+"""
+
+# v2 confined to the kit's private profile, as bin/switchboard-trial's wrapper confines it to the trial's: its XDG
+# directories and its HOME are the profile's, so nothing the kit installs is read by your ordinary OpenCode and
+# nothing of yours is read by v2; every credential-shaped variable is removed by shape; the agents are given the
+# `gh` token (as GH_TOKEN) because they work on GitHub, asked for at every start from your real gh config and
+# before HOME is replaced (on macOS gh finds its token in the login keychain via HOME), and never stored.
+PRIVATE_WRAPPER_TEXT = """#!/bin/sh
+# OpenCode v2 in the Fleet Switchboard's own profile. Written by `fleet-switchboard install`; it holds no secret.
+# Run v2 through this file, not by its own name: your ordinary OpenCode never sees this profile, and v2 sees none
+# of yours. The agents work on GitHub and their shell runs in the pane's process, so every start asks gh for
+# the token itself, before HOME is replaced below. Nothing is stored: not in a file, not in `launch_env`.
+GH_FOR_AGENTS=$(GH_CONFIG_DIR={gh_config} {gh} auth token {gh_user_flag} 2>/dev/null)
+PROFILE={profile}
+export XDG_CONFIG_HOME="$PROFILE/config" XDG_DATA_HOME="$PROFILE/data"
+export XDG_STATE_HOME="$PROFILE/state" XDG_CACHE_HOME="$PROFILE/cache"
+export TMPDIR="$PROFILE/tmp"
+# XDG alone leaves `home` live: v2 would load your skills. herdr's OpenCode integration is written under
+# $HOME/.config/opencode, which install links to this profile's opencode directory.
+export HOME="$PROFILE/home"
+export FLEET_SWITCHBOARD_BIN={fleet_bin}
+# The Decisions plugin reads decisions.json from the daemon's state directory.
+export FLEET_SWITCHBOARD_STATE={state}
+# The fleet-hooks plugin puts this first on PATH of every agent shell: a gh that signs what agents say.
+export FLEET_SWITCHBOARD_SHIMS={shims}
+# Agents run `fleet-switchboard send`; their shell finds it here.
+export PATH={kit_bin}:"$PATH"
+for name in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p' \\
+    | grep -E '{key_pattern}|^(GH|GITHUB|COPILOT)_'); do
+  unset "$name"
+done
+[ -n "$GH_FOR_AGENTS" ] && export GH_TOKEN="$GH_FOR_AGENTS"
+if [ "${pane_env}" != "1" ]; then
+  unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_TAB_ID HERDR_WORKSPACE_ID
+fi
+exec {v2} "$@"
+"""
+
+
+def private_env(profile_root, base=None):
+    """The environment of a process that must see the private profile and nothing else of yours: its XDG
+    directories and its HOME are the profile's (herdr writes its OpenCode integration under $HOME/.config/opencode
+    and ignores XDG_CONFIG_HOME)."""
+    root = Path(profile_root)
+    env = dict(os.environ if base is None else base)
+    env.update({"XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
+                "XDG_STATE_HOME": str(root / "state"), "XDG_CACHE_HOME": str(root / "cache"),
+                "TMPDIR": str(root / "tmp"), "HOME": str(root / "home")})
+    for name in [n for n in env if n.startswith("HERDR_") and n != "HERDR_SOCKET_PATH"]:
+        del env[name]  # this process is not in a pane and must not report as one
+    return env
+
+
+def home_link_path(profile_root):
+    return Path(profile_root) / "home" / ".config" / "opencode"
+
+
+def home_link_is_ours(profile_root, config_dir):
+    link = home_link_path(profile_root)
+    return link.is_symlink() and os.readlink(str(link)) == str(config_dir)
+
+
+def ensure_home_link(profile_root, config_dir):
+    """Make `$HOME/.config/opencode` under the private HOME a link to the profile's opencode directory, where herdr
+    writes its integration whatever XDG_CONFIG_HOME says. Returns whether it changed anything; refuses a path
+    that is there and is not that link."""
+    link = home_link_path(profile_root)
+    if home_link_is_ours(profile_root, config_dir):
+        return False
+    if os.path.lexists(str(link)):
+        raise InstallError("%s exists and is not the link to %s: not touching it" % (link, config_dir))
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(config_dir), str(link))
+    return True
+
+
+def herdr_integration_status(runner, herdr, env):
+    """The `opencode:` line of `herdr integration status`, read with `env` (so HOME says where it would install)."""
+    done = runner([herdr, "integration", "status"], capture_output=True, text=True, timeout=30, env=env,
+                  stdin=subprocess.DEVNULL)
+    return next((line.strip() for line in (done.stdout or "").splitlines() if line.startswith("opencode:")), "")
+
+
+# ----------------------------------------------------------------- the installer
+
+def v2_version_of(runner, exe):
+    """The version `binary --version` prints, as a tuple of ints, or None (it did not run or did not say)."""
+    try:
+        done = runner([exe, "--version"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", (done.stdout or "") + " " + (done.stderr or "")) if done.returncode == 0 else None
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+class Installer:
+    """`fleet-switchboard install`: idempotent steps, each reported `done`, `already done` or `skipped (why)`.
+
+    `runner` runs the other programs (OpenCode, herdr, launchctl, systemctl): tests give it a fake and a
+    temporary HOME, so nothing real is touched. `dry_run` reports what would change and writes nothing.
+    """
+
+    def __init__(self, runner=subprocess.run, spawn=subprocess.Popen, now=time.time, platform=None, kit_root=KIT_ROOT,
+                 dry_run=False, out=None, shared_profile=False, profile=None, gh_user=None):
+        self.runner, self.spawn, self.now = runner, spawn, now
+        self.kind = service_kind(platform)
+        self.kit_root = Path(kit_root)
+        self.dry = dry_run
+        self.out = out or sys.stdout
+        self.problems = []
+        self.asked_shared = bool(shared_profile)
+        # v2's profile is private unless the person asks for the shared one, by name. (The fault is the bug this
+        # fixed: a default that writes where the ordinary OpenCode reads.)
+        self.shared = self.asked_shared or fault("shared-profile-default")
+        self.profile_arg, self.gh_user = profile, gh_user
+
+    # -- reporting
+    def say(self, step, status, detail=""):
+        self.out.write("%-24s %s%s\n" % (step, status, " " + detail if detail else ""))
+
+    def result(self, step, changed, detail="", unchanged_detail=None):
+        status = ("would be done" if self.dry else "done") if changed else "already done"
+        self.say(step, status, detail if changed else (unchanged_detail if unchanged_detail is not None else detail))
+
+    # -- places
+    def profile_root(self):
+        """The private profile: v2's XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME and HOME (its wrapper sets them)."""
+        if self.profile_arg:
+            if not os.path.isabs(self.profile_arg):
+                raise InstallError("--profile must be an absolute path, got %r" % self.profile_arg)
+            return Path(self.profile_arg)
+        return self.data_dir() / "profile"
+
+    def config_dir(self, config):
+        """The OpenCode config directory the pieces go into: the private profile's, or with --shared-profile the one
+        the ordinary OpenCode reads."""
+        if not self.shared:
+            return self.profile_root() / "config" / "opencode"
+        env = config.get("opencode_env") or {}
+        if env.get("OPENCODE_CONFIG_DIR"):
+            return Path(env["OPENCODE_CONFIG_DIR"])
+        if env.get("XDG_CONFIG_HOME"):
+            return Path(env["XDG_CONFIG_HOME"]) / "opencode"
+        return _xdg("XDG_CONFIG_HOME", ".config") / "opencode"
+
+    def data_dir(self):
+        return _xdg("XDG_DATA_HOME", ".local/share") / PROG
+
+    def skills_dir(self):
+        return self.data_dir() / "skills"
+
+    def wrapper_path(self):
+        return self.data_dir() / "bin" / WRAPPER_NAME
+
+    # -- 1: the OpenCode v2 binary
+    def candidates(self, explicit, config):
+        if explicit:
+            return [explicit]
+        found = []
+        configured = config.get("opencode_executable") or config.get("opencode")
+        if configured and configured != str(self.wrapper_path()):
+            found.append(configured)
+        found.append(str(self.data_dir() / "v2" / "node_modules" / "@opencode" / "cli" / "bin" / "opencode.exe"))
+        found.append(str(Path.home() / ".local" / "share" / "fleet-v2" / "bin" / "opencode"))
+        on_path = shutil.which("opencode")
+        if on_path:
+            found.append(on_path)
+        return found
+
+    def find_v2(self, explicit, config):
+        """(binary, version) of an OpenCode v2 by absolute path. Refuses with how to get one."""
+        tried = []
+        for binary in self.candidates(explicit, config):
+            if not os.path.isabs(binary):
+                raise InstallError("--opencode must be an absolute path, got %r: a bare name is resolved through PATH, "
+                                   "and PATH can find OpenCode v1" % binary)
+            version = v2_version_of(self.runner, binary) if os.path.exists(binary) else None
+            if version is not None and version[0] == 2:
+                return binary, ".".join(str(part) for part in version)
+            tried.append("%s (%s)" % (binary, "not there" if not os.path.exists(binary)
+                                      else "version %s" % (".".join(map(str, version)) if version else "unreadable")))
+        prefix = self.data_dir() / "v2"
+        raise InstallError(
+            "no OpenCode v2 found (looked at: %s). Your ordinary `opencode` may be v1; this never assumes it is not.\n"
+            "  Get v2 into a private directory, never `npm -g` or the curl installer (they replace v1):\n"
+            "    npm install --prefix %s --no-audit --no-fund --ignore-scripts %s@%s\n"
+            "    (cd %s/node_modules/%s && node ./postinstall.mjs)\n"
+            "  then run `%s install --opencode %s/node_modules/@opencode/cli/bin/opencode.exe`."
+            % (", ".join(tried) or "nothing", prefix, V2_PACKAGE, V2_VERSION, prefix, V2_PACKAGE, PROG, prefix))
+
+    # -- 2: config.json
+    def wanted_config(self, binary):
+        keys = {"opencode": str(self.wrapper_path()), "opencode_executable": binary}
+        if not self.shared:  # a pane's v2 keeps its herdr identity (its plugin reports status); the wrapper drops it otherwise
+            keys["launch_env"] = {PANE_ENV: "1"}
+        herdr = shutil.which("herdr")
+        if herdr:
+            keys["herdr"] = herdr
+        keys["github_repos"] = []
+        keys["jev"] = {"model": JEV_MODEL}
+        keys["policy"] = {"enabled": True}
+        return keys
+
+    def step_config(self, binary):
+        path = config_path()
+        raw = _read_json_object(path, "it is the switchboard's config")
+        missing = {key: value for key, value in self.wanted_config(binary).items() if key not in raw}
+        if not missing:
+            return self.result("config", False, str(path))
+        merged = dict(raw, **missing)  # the user's keys keep their values and their order; ours follow
+        validate_config(merged, str(path))
+        if not self.dry:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(merged, indent=2) + "\n")
+        return self.result("config", True, "%s: added %s" % (path, ", ".join(missing)))
+
+    # -- 3: what goes into the profile
+    def gh_config_dir(self):
+        """Where gh keeps its accounts: read now, because the wrapper's private XDG_CONFIG_HOME would hide it."""
+        return os.environ.get("GH_CONFIG_DIR") or str(_xdg("XDG_CONFIG_HOME", ".config") / "gh")
+
+    def wrapper_text(self, binary, config):
+        common = dict(fleet_bin=shlex.quote(str(self.kit_root / "bin" / PROG)), shims=shlex.quote(str(self.kit_root / "shims")),
+                      state=shlex.quote(str(state_dir_path())), kit_bin=shlex.quote(str(self.kit_root / "bin")),
+                      v2=shlex.quote(binary))
+        if self.shared:
+            xdg = "".join("export %s=%s\n" % (name, shlex.quote(os.environ[name]))
+                          for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME") if os.environ.get(name))
+            return SHARED_WRAPPER_TEXT.format(xdg=xdg, **common)
+        return PRIVATE_WRAPPER_TEXT.format(
+            profile=shlex.quote(str(self.profile_root())), gh=shlex.quote(shutil.which("gh") or "gh"),
+            gh_config=shlex.quote(self.gh_config_dir()), key_pattern=KEY_NAME_PATTERN, pane_env=PANE_ENV,
+            gh_user_flag="--user %s" % shlex.quote(self.gh_user) if self.gh_user else "", **common)
+
+    # -- 3a: the profile itself
+    SHARED_NOTICE = ("--shared-profile: the ordinary OpenCode will read the files below too ({dir}). They are v2-shaped "
+                     "(a plugin, a decisions directory, skills.paths, cli.json) and can stop a v1 OpenCode that reads "
+                     "them from starting. Leave the flag off to keep v2's profile private.")
+
+    def step_profile(self, config):
+        if self.shared:
+            where = self.config_dir(config)
+            if self.asked_shared:
+                self.out.write("%s\n" % self.SHARED_NOTICE.format(dir=where))
+            return self.say("profile", "shared", str(where))
+        root = self.profile_root()
+        missing = [name for name in PROFILE_DIRS if not (root / name).is_dir()]
+        if missing and not self.dry:
+            for name in PROFILE_DIRS:
+                (root / name).mkdir(parents=True, exist_ok=True)
+            os.chmod(str(root / "state"), 0o700)
+        self.result("profile", bool(missing), "%s (private to v2; %s is not touched)" % (root, self.shared_dir()),
+                    "%s (private to v2; %s is not touched)" % (root, self.shared_dir()))
+
+    def shared_dir(self):
+        return _xdg("XDG_CONFIG_HOME", ".config") / "opencode"
+
+    def piece(self, step, action, detail):
+        """Run one profile piece (`action()` returns whether it changed anything). In a dry run, ask without writing."""
+        changed = action()
+        self.result(step, changed, detail)
+
+    def step_pieces(self, binary, config):
+        profile = self.config_dir(config)
+        wrapper = self.wrapper_path()
+        text = self.wrapper_text(binary, config)
+        current = wrapper.read_text() if wrapper.exists() else None
+        if not self.dry and current != text:
+            write_if_changed(wrapper, text)
+            os.chmod(str(wrapper), 0o755)
+        self.result("wrapper", current != text, str(wrapper))
+        steps = (("agents", lambda: install_agents(profile, STANDARD_MODEL, self.kit_root), "%s/agents" % profile),
+                 ("skills", lambda: install_skills(self.skills_dir(), self.kit_root), str(self.skills_dir())),
+                 ("skills path", lambda: ensure_skills_path(profile, self.skills_dir(), STANDARD_MODEL),
+                  "%s/opencode.json" % profile),
+                 ("fleet-hooks plugin", lambda: install_hooks_plugin(profile, self.kit_root),
+                  "%s/plugins/%s" % (profile, HOOKS_PLUGIN_FILE)),
+                 ("decisions plugin", lambda: install_decisions_plugin(profile, self.kit_root),
+                  "%s/%s and cli.json" % (profile, DECISIONS_PLUGIN_NAME)))
+        for step, action, detail in steps:
+            if self.dry:
+                self.dry_piece(step, profile)
+            else:
+                self.piece(step, action, detail)
+
+    def dry_piece(self, step, profile):
+        """What a piece would change, found by running it against a copy: nothing real is written."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shadow = Path(scratch) / "profile"
+            if profile.exists():
+                shutil.copytree(str(profile), str(shadow), symlinks=True)
+            skills = Path(scratch) / "skills"
+            if self.skills_dir().exists():
+                shutil.copytree(str(self.skills_dir()), str(skills))
+            actions = {"agents": lambda: install_agents(shadow, STANDARD_MODEL, self.kit_root),
+                       "skills": lambda: install_skills(skills, self.kit_root),
+                       "skills path": lambda: ensure_skills_path(shadow, self.skills_dir(), STANDARD_MODEL),
+                       "fleet-hooks plugin": lambda: install_hooks_plugin(shadow, self.kit_root),
+                       "decisions plugin": lambda: install_decisions_plugin(shadow, self.kit_root)}
+            self.result(step, actions[step](), "in %s" % profile)
+
+    # -- 3b: herdr's OpenCode integration, in the private profile
+    def integration_line(self, config):
+        """(the `opencode:` line of herdr's integration status read with the private HOME, the path it names)."""
+        root = self.profile_root()
+        line = herdr_integration_status(self.runner, self.herdr_bin(config), private_env(root))
+        named = re.search(r"\((/[^)]*)\)\s*$", line)
+        return line, named.group(1) if named else None
+
+    def inside_private_home(self, path):
+        return bool(path) and (str(path) + os.sep).startswith(str(self.profile_root() / "home") + os.sep)
+
+    def step_integration(self, config):
+        """herdr installs its OpenCode integration (the plugin that reports an agent's status) into
+        $HOME/.config/opencode and ignores XDG_CONFIG_HOME. Run with the private HOME, whose `.config/opencode` is a
+        link to the private profile, it lands there and never in the ordinary OpenCode's directory. Refused when
+        herdr says it would install anywhere else."""
+        if self.shared:
+            return self.say("herdr integration", "skipped (--shared-profile)")
+        try:
+            line, path = self.integration_line(config)
+        except (OSError, subprocess.SubprocessError) as err:
+            return self.say("herdr integration", "skipped (herdr cannot be asked: %s)" % _one_line(str(err), 100))
+        if not self.inside_private_home(path):
+            raise InstallError("herdr would install its OpenCode integration outside the private profile (%s): "
+                               "refusing; nothing was installed" % (line or "no `opencode:` line in `herdr integration status`"))
+        if "current" in line:
+            return self.result("herdr integration", False, path)
+        if self.dry:
+            return self.result("herdr integration", True, "`herdr integration install opencode` into %s" % path)
+        ensure_home_link(self.profile_root(), self.config_dir(config))
+        root = self.profile_root()
+        done = self.runner([self.herdr_bin(config), "integration", "install", "opencode"], capture_output=True, text=True,
+                           timeout=60, env=private_env(root), stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise InstallError("`herdr integration install opencode` failed: %s" % _one_line(done.stderr or done.stdout, 200))
+        self.result("herdr integration", True, "installed into %s" % path)
+
+    # -- 4: the herdr plugin
+    def herdr_bin(self, config):
+        return config.get("herdr") or "herdr"
+
+    def plugin_linked(self, config):
+        return plugin_report(config, self.runner)
+
+    def step_link(self, config):
+        herdr, source = self.herdr_bin(config), self.kit_root / "herdr"
+        state = self.plugin_linked(config)
+        if state["state"] == "linked":
+            return self.say("herdr plugin", "already done", "%s is linked" % HERDR_PLUGIN_ID)
+        if state["state"] == "unknown":
+            raise InstallError("cannot tell whether herdr's plugin is linked (%s): is herdr installed and running? "
+                               "Run again, or pass --no-herdr-link" % state["detail"])
+        self.say("herdr plugin", "would run" if self.dry else "will run", "`%s plugin link %s`" % (herdr, source))
+        for line in ("herdr has one server, so a linked plugin's hooks run for every pane in it, including panes that "
+                     "run something else:",
+                     "  startup: `%s ensure` starts the switchboard daemon unless it runs;" % (self.kit_root / "bin" / PROG),
+                     "  pane created, closed, exited, agent detected or its status changed: `%s poke`, which is "
+                     "silent, returns at once, and only asks the daemon for a pass;" % (self.kit_root / "bin" / PROG),
+                     "  nothing is typed into any pane, and nothing is sent anywhere. `install --uninstall` unlinks it "
+                     "(`%s plugin unlink %s`)." % (herdr, HERDR_PLUGIN_ID)):
+            self.out.write("    %s\n" % line)
+        if self.dry:
+            return self.say("herdr plugin", "would be done")
+        done = self.runner([herdr, "plugin", "link", str(source)], capture_output=True, text=True,
+                           timeout=HERDR_CALL_TIMEOUT * 2, stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise InstallError("`herdr plugin link` failed: %s" % _one_line(done.stderr or done.stdout, 200))
+        self.say("herdr plugin", "done", "linked %s" % source)
+
+    # -- 5: the service
+    def service_text(self, config):
+        tools = [shutil.which("gh"), self.herdr_bin(config) if os.path.isabs(self.herdr_bin(config)) else shutil.which("herdr")]
+        dirs = service_path_dirs(self.kit_root, tools)
+        return render_service(self.kind, service_values(self.kit_root, dirs), self.kit_root)
+
+    def loaded(self):
+        uid = os.getuid()
+        if self.kind == "launchd":
+            done = self.runner(["launchctl", "print", "gui/%d/%s" % (uid, SERVICE_LABEL)], capture_output=True, text=True,
+                               timeout=30, stdin=subprocess.DEVNULL)
+            return done.returncode == 0
+        done = self.runner(["systemctl", "--user", "is-enabled", SERVICE_UNIT], capture_output=True, text=True,
+                           timeout=30, stdin=subprocess.DEVNULL)
+        return done.returncode == 0
+
+    def run_checked(self, argv, what):
+        done = self.runner(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise InstallError("%s failed: %s" % (what, _one_line(done.stderr or done.stdout, 200)))
+        return done
+
+    def load_commands(self, path):
+        uid = os.getuid()
+        if self.kind == "launchd":
+            return [["launchctl", "bootstrap", "gui/%d" % uid, str(path)]]
+        return [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", SERVICE_UNIT]]
+
+    def unload_commands(self):
+        uid = os.getuid()
+        if self.kind == "launchd":
+            return [["launchctl", "bootout", "gui/%d/%s" % (uid, SERVICE_LABEL)]]
+        return [["systemctl", "--user", "disable", "--now", SERVICE_UNIT]]
+
+    def step_service(self, config):
+        path, text = service_file_path(self.kind), self.service_text(config)
+        on_disk = path.read_text() if path.exists() else None
+        loaded = self.loaded()
+        if on_disk == text and loaded:
+            return self.say("service", "already done", str(path))
+        what = "load" if on_disk == text else "write and load"
+        commands = " && ".join(" ".join(c) for c in self.load_commands(path))
+        self.say("service", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
+        if self.dry:
+            return self.say("service", "would be done", str(path))
+        ensure_state_dir()  # launchd opens its log files in the state directory, and will not make it
+        if on_disk != text:
+            if loaded:  # a changed definition is read only by a fresh load
+                for command in self.unload_commands():
+                    self.run_checked(command, " ".join(command))
+            write_if_changed(path, text)
+        for command in self.load_commands(path):
+            self.run_checked(command, " ".join(command))
+        self.say("service", "done", str(path))
+
+    # -- 6: the daemon, and what status says
+    def step_ensure(self, ensure, status):
+        if self.dry:
+            return self.say("daemon", "skipped (dry run)")
+        try:
+            self.say("daemon", "done" if ensure() == "started" else "already done")
+        except (LockError, ConfigError, OSError) as err:
+            self.say("daemon", "FAILED", _one_line(str(err), 200))
+        self.out.write("\n%s\n" % status())
+
+    def read_config(self):
+        """The config as it stands now (defaults when there is no file). A file that cannot be read stops the install."""
+        try:
+            return load_config() if config_path().exists() else validate_config({})
+        except ConfigError as err:
+            raise InstallError(str(err)) from None
+
+    def install(self, explicit_opencode=None, with_service=True, with_link=True, ensure=None, status=None):
+        config = self.read_config()
+        binary, version = self.find_v2(explicit_opencode, config)
+        self.result("opencode v2", binary != config.get("opencode_executable"), "%s (v%s)" % (binary, version),
+                    "%s (v%s)" % (binary, version))
+        self.step_config(binary)
+        config = self.read_config()
+        self.step_profile(config)
+        self.step_pieces(binary, config)
+        if with_link:
+            self.step_integration(config)
+        else:
+            self.say("herdr integration", "skipped (--no-herdr-link)")
+        if with_link:
+            self.step_link(config)
+        else:
+            self.say("herdr plugin", "skipped (--no-herdr-link)")
+        if not with_service:
+            self.say("service", "skipped (--no-service)")
+        elif self.kind is None:
+            self.say("service", "skipped (no service manager known for this platform)")
+        else:
+            self.step_service(config)
+        self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
+                         status or (lambda: format_status(collect_status(self.runner, self.now))))
+
+    # -- the reverse of 3 to 5
+    def uninstall(self, with_service=True, with_link=True):
+        config = self.read_config()
+        profile = self.config_dir(config)
+        if not with_service:
+            self.say("service", "skipped (--no-service)")
+        elif self.kind is None:
+            self.say("service", "skipped (no service manager known for this platform)")
+        else:
+            path = service_file_path(self.kind)
+            had = path.exists()
+            if self.loaded():
+                self.say("service", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.unload_commands()))
+                if not self.dry:
+                    for command in self.unload_commands():
+                        self.run_checked(command, " ".join(command))
+            if had and not self.dry:
+                path.unlink()
+                if self.kind == "systemd":
+                    self.run_checked(["systemctl", "--user", "daemon-reload"], "systemctl --user daemon-reload")
+            self.result("service", had, "removed %s" % path, "not installed")
+        if with_link:
+            state = self.plugin_linked(config)
+            if state["state"] == "linked":
+                self.say("herdr plugin", "will run" if not self.dry else "would run",
+                         "`%s plugin unlink %s`" % (self.herdr_bin(config), HERDR_PLUGIN_ID))
+                if not self.dry:
+                    self.run_checked([self.herdr_bin(config), "plugin", "unlink", HERDR_PLUGIN_ID], "`herdr plugin unlink`")
+                self.result("herdr plugin", True, "unlinked")
+            elif state["state"] == "unknown":
+                self.say("herdr plugin", "skipped (cannot tell whether it is linked: %s)" % state["detail"])
+            else:
+                self.result("herdr plugin", False, "not linked")
+        else:
+            self.say("herdr plugin", "skipped (--no-herdr-link)")
+        wrapper = self.wrapper_path()
+        self.uninstall_integration(config, profile, with_link)
+        for step, action in (("decisions plugin", lambda: uninstall_decisions_plugin(profile, self.kit_root)),
+                             ("fleet-hooks plugin", lambda: uninstall_hooks_plugin(profile, self.kit_root)),
+                             ("skills path", lambda: uninstall_skills_path(profile, self.skills_dir())),
+                             ("skills", lambda: uninstall_skills(self.skills_dir(), self.kit_root)),
+                             ("agents", lambda: uninstall_agents(profile, STANDARD_MODEL, self.kit_root))):
+            self.result(step, self.would_remove(step, profile) if self.dry else action(), "removed" , "nothing to remove")
+        had = wrapper.exists()
+        if had and not self.dry:
+            wrapper.unlink()
+        self.result("wrapper", had, "removed %s" % wrapper, "nothing to remove")
+        self.out.write("config, state and sessions are left alone; a running daemon keeps running until it exits\n")
+
+    def uninstall_integration(self, config, profile, with_link):
+        """Remove herdr's OpenCode integration from the private profile, and the home link install made. Only ever
+        the private HOME: a status that names any other path leaves it alone."""
+        if self.shared:
+            return self.say("herdr integration", "skipped (--shared-profile)")
+        if not with_link:
+            return self.say("herdr integration", "skipped (--no-herdr-link)")
+        try:
+            line, path = self.integration_line(config)
+        except (OSError, subprocess.SubprocessError) as err:
+            self.say("herdr integration", "skipped (herdr cannot be asked: %s)" % _one_line(str(err), 100))
+            path, line = None, ""
+        present = self.inside_private_home(path) and "not installed" not in line and bool(line)
+        if present and not self.dry:
+            done = self.runner([self.herdr_bin(config), "integration", "uninstall", "opencode"], capture_output=True,
+                               text=True, timeout=60, env=private_env(self.profile_root()), stdin=subprocess.DEVNULL)
+            if done.returncode != 0:
+                raise InstallError("`herdr integration uninstall opencode` failed: %s" % _one_line(done.stderr or done.stdout, 200))
+        if path or present:
+            self.result("herdr integration", present, "removed %s" % path, "nothing to remove")
+        ours = home_link_is_ours(self.profile_root(), profile)
+        if ours and not self.dry:
+            home_link_path(self.profile_root()).unlink()
+        self.result("home link", ours, "removed %s" % home_link_path(self.profile_root()), "nothing to remove")
+
+    def would_remove(self, step, profile):
+        """For a dry run of --uninstall: whether the piece is there to remove (a file the user edited is not)."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shadow, skills = Path(scratch) / "profile", Path(scratch) / "skills"
+            if profile.exists():
+                shutil.copytree(str(profile), str(shadow), symlinks=True)
+            if self.skills_dir().exists():
+                shutil.copytree(str(self.skills_dir()), str(skills))
+            actions = {"decisions plugin": lambda: uninstall_decisions_plugin(shadow, self.kit_root),
+                       "fleet-hooks plugin": lambda: uninstall_hooks_plugin(shadow, self.kit_root),
+                       "skills path": lambda: uninstall_skills_path(shadow, self.skills_dir()),
+                       "skills": lambda: uninstall_skills(skills, self.kit_root),
+                       "agents": lambda: uninstall_agents(shadow, STANDARD_MODEL, self.kit_root)}
+            return actions[step]()
+
+
+def cmd_install(args, runner, now, spawn=subprocess.Popen):
+    installer = Installer(runner, spawn, now, dry_run=args.dry_run, shared_profile=args.shared_profile,
+                          profile=args.profile, gh_user=args.gh_user)
+    try:
+        if args.uninstall:
+            installer.uninstall(not args.no_service, not args.no_herdr_link)
+        else:
+            installer.install(args.opencode, not args.no_service, not args.no_herdr_link)
+    except InstallError as err:
+        sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def add_install_parsers(sub):
+    install = sub.add_parser(
+        "install", help="Install the switchboard for this user: config, profile pieces, the herdr plugin, a service",
+        description="Idempotent. Each step says done, already done, or skipped (why). Finds an OpenCode v2 binary "
+                    "(never assumes `opencode` is v2), writes the config keys that are missing, puts the kit's agents, "
+                    "skills and plugins into a private v2 profile (never the directory your ordinary OpenCode reads, unless "
+                    "--shared-profile), links the herdr plugin, installs a service that keeps "
+                    "the daemon alive, then starts the daemon and prints `status`. No secret is written anywhere.")
+    install.add_argument("--opencode", help="The OpenCode v2 binary (absolute path); default: the configured one, "
+                                           "then the known places")
+    install.add_argument("--no-service", dest="no_service", action="store_true", help="Do not install the service")
+    install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
+                         help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
+    install.add_argument("--shared-profile", dest="shared_profile", action="store_true",
+                         help="Put v2's pieces in the directory your ordinary OpenCode reads too (%s), which can break "
+                              "a v1 OpenCode that reads them. Default: a private profile" % "~/.config/opencode")
+    install.add_argument("--profile", metavar="DIR", help="The private profile's directory (absolute); default: "
+                                                          "$XDG_DATA_HOME/%s/profile" % PROG)
+    install.add_argument("--gh-user", dest="gh_user", metavar="NAME",
+                         help="The gh account the agents' token comes from (default: gh's active one)")
+    install.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print every step; write nothing")
+    install.add_argument("--uninstall", action="store_true",
+                         help="Reverse the profile pieces, the herdr link and the service; config, state and sessions stay")
+    key = sub.add_parser("key", help="Save or check the decision-model key (it is a private file, never an argument)")
+    keys = key.add_subparsers(dest="key_action", required=True)
+    keys.add_parser("set", help="Read the key from standard input (hidden at a terminal) into a private file")
+    keys.add_parser("status", help="Say where the key comes from: file, environment or none")
+    boot = sub.add_parser("bootstrap", help="Open the Chief of Staff in its own herdr workspace, or resume it")
+    boot.add_argument("--workspace", metavar="LABEL", help="The workspace's label (default: %s)" % COS_WORKSPACE_LABEL)
+    boot.add_argument("--dir", help="The Chief of Staff's working directory (default: here)")
+    boot.add_argument("--no-focus", dest="stay_put", action="store_true",
+                      help="Open the workspace without taking focus (for scripts and trials)")
+
+
+INSTALL_COMMANDS = {"key": cmd_key}
 
 
 if __name__ == "__main__":

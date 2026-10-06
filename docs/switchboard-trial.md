@@ -9,6 +9,14 @@ OpenCode, herdr or switchboard directories.
 
 Everything is driven by `bin/switchboard-trial`.
 
+**This is a thin wrapper for an isolated experiment.** Since PR 16 it puts the kit's agents, skills and
+plugins into its own profile with the same functions `fleet-switchboard install` uses (there is one path,
+not two installers), and everything else it does (a pinned `gh` account, a scratch repo and charter, its own
+workspace and service port) is what makes it an experiment. A real user does not run it: they follow
+[INSTALL.md](../INSTALL.md), whose Fleet Switchboard steps run `fleet-switchboard install`, then
+`fleet-switchboard key set` and `fleet-switchboard bootstrap`. See
+[switchboard.md](switchboard.md#install-pr-16).
+
 ## What you need
 
 - herdr running (the trial adds one workspace to it), `gh` logged in, `node`

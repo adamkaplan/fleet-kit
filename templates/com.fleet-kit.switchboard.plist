@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.fleet-kit.switchboard — LaunchAgent TEMPLATE for the Fleet Switchboard daemon.
+
+  This file is a template, not a plist you can load. `fleet-switchboard install`
+  fills the placeholders from the running environment, writes the result to
+  ~/Library/LaunchAgents/com.fleet-kit.switchboard.plist and loads it:
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet-kit.switchboard.plist
+
+  `fleet-switchboard install` with its uninstall flag unloads it again:
+
+    launchctl bootout gui/$(id -u)/com.fleet-kit.switchboard
+
+  The placeholders are written between double underscores: PYTHON (the python3 that runs the
+  daemon), PREFIX (where the kit is checked out), HOME, PATH (the kit's bin, the directories of gh,
+  herdr and python, then the usual places: a service has almost no PATH of its own), STATE_DIR (the
+  switchboard's state directory, where the service logs), CONFIG_HOME and STATE_HOME (XDG_CONFIG_HOME
+  and XDG_STATE_HOME, so the daemon reads the config the installer wrote).
+
+  There is nothing private in this file. The decision-model key is read by the daemon from its own
+  private key file (`fleet-switchboard key set`), never from here.
+
+  The `standby` flag of `run` waits when another daemon already holds the lock (herdr's startup hook may
+  have started one first) instead of exiting, so launchd does not restart it in a loop; when that
+  daemon goes away this one takes over.
+
+  There is exactly one copy of this file. Do not keep a second one for the installer.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.fleet-kit.switchboard</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-B</string>
+		<string>__PREFIX__/bin/fleet-switchboard</string>
+		<string>run</string>
+		<string>--standby</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__PATH__</string>
+		<key>XDG_CONFIG_HOME</key>
+		<string>__CONFIG_HOME__</string>
+		<key>XDG_STATE_HOME</key>
+		<string>__STATE_HOME__</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- A daemon that cannot start (bad config) restarts slowly and visibly, not in a tight loop. -->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<!--
+	  Never /dev/null: with KeepAlive, a fatal start-up error sent nowhere is an invisible restart loop.
+	  The installer makes the state directory first, because launchd will not.
+	-->
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/launchd-stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/launchd-stdout.log</string>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>__HOME__</string>
+</dict>
+</plist>

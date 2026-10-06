@@ -66,6 +66,9 @@ is how many.
 | `send` | a cast member | `to`, `text` (one line), [`issue`] | `fleet-switchboard send` as that member (PR 14). Offline only |
 | `awaiting` | you, world, a cast member | `issue`, `on` (true puts your awaiting-user label on the issue, false takes it off), [`title`] | The label changes on the fake GitHub and its `issues` webhook event reaches the hub (PR 14). Offline only |
 | `delete-decisions` | world | none | `decisions.json` is deleted, as in D4; the next pass writes it again (PR 14). Offline only |
+| `use` | you | `command` (one that ensures the daemon, such as `decisions`) | You run a command that needs the daemon: ensure-on-use runs first, with a start that is this runner's daemon (PR 16). Offline only |
+| `bootstrap` | world | none | `fleet-switchboard bootstrap` on the fakes: opens the Chief of Staff (`cos`, which the cast names but the play does not create), or resumes it, or is refused (PR 16). Offline only |
+| `close-agent` | world | `agent` | The agent's pane is closed, as you would close it (PR 16). Offline only |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations
@@ -99,6 +102,9 @@ is how many.
 | `lists_asks` | `agent`, `issue` | `fleet-switchboard intents`, run in the pane that shows the agent's session, lists the ask `issue`: the agent is found by its `metadata.fleet` (PR 10) |
 | `decisions` | `at`, `count`, [`text`] | At the time `at`, the list `fleet-switchboard decisions` reads from `decisions.json` has `count` decisions (those whose title holds `text`, if given); a file the command calls stale lists none (PR 14). Offline only |
 | `decisions_say` | `at`, `text` | At the time `at`, the command's output contains `text` (PR 14). The Lab reads it only when the play ends, so `at` must be the time of the last step there |
+| `status_says` | `text` | The first line `fleet-switchboard status` prints, for a machine whose config asks for the decision model and which has no key, contains `text` (PR 16). Offline only |
+| `bootstrap_says` | `step`, `text` | What the `bootstrap` step with that index printed contains `text` (PR 16). Offline only |
+| `fleet_sessions` | `agent`, `count` | `count` v2 sessions carry that cast member's fleet name, so a second Chief of Staff was not made (PR 16). Offline only |
 
 **Mode.** Whether a message was a note or a wake is read from what it did,
 in both runners, not from the flags it was sent with. A message is a **wake**

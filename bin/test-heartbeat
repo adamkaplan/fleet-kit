@@ -1502,13 +1502,14 @@ class TestHygiene(unittest.TestCase):
             for number, line in enumerate((BIN / name).read_text().splitlines(), 1):
                 self.assertIsNone(pattern.search(line), "%s:%d %s" % (name, number, line))
 
-    def test_the_kit_ships_exactly_one_plist(self):
+    def test_the_kit_ships_exactly_one_plist_per_service(self):
         plists = sorted(p.name for p in (BIN.parent / "templates").glob("*.plist"))
-        self.assertEqual(plists, ["com.fleet-kit.heartbeat.plist"])
+        # PR 16 adds the Fleet Switchboard's own; test-switchboard checks it
+        self.assertEqual(plists, ["com.fleet-kit.heartbeat.plist", "com.fleet-kit.switchboard.plist"])
 
-    def test_the_kit_ships_exactly_one_unit(self):
+    def test_the_kit_ships_exactly_one_unit_per_service(self):
         units = sorted(p.name for p in (BIN.parent / "templates").glob("*.service"))
-        self.assertEqual(units, ["fleet-kit-heartbeat.service"])
+        self.assertEqual(units, ["fleet-kit-heartbeat.service", "fleet-kit-switchboard.service"])
 
     def test_the_unit_never_sends_output_to_the_void(self):
         template = (BIN.parent / "templates" / "fleet-kit-heartbeat.service").read_text()
