@@ -448,14 +448,26 @@ PROVES:  every step says "already done" on this second run (the first one says
 ```
 
 `install` is safe to repeat. It finds the v2 binary (it refuses OpenCode v1 and
-says how to get v2), writes only the config keys that are missing and never
-touches the ones the person edited, puts the kit's agents, skills and plugins
+says how to get v2), writes the config keys that are missing and never touches
+the ones the person edited, except the two that say what a pane runs
+(`opencode` and `opencode_executable`): when the binary it found differs from the
+config it replaces both and prints `updated ... (was <old>)`, so a config from
+an earlier install does not keep pointing at an old binary. It puts the kit's agents, skills and plugins
 and herdr's OpenCode integration into a **private v2 profile** (by default
 `~/.local/share/fleet-switchboard/profile`), links the herdr plugin, installs a
 service that keeps the daemon alive (a LaunchAgent on macOS, a systemd user unit
 on Linux), starts the daemon, and prints `status`. `install --uninstall` reverses
 all of it except the config, the state and the sessions. Add `--no-service` or
 `--no-herdr-link` to skip either one, and say so in your report.
+
+`install` also puts the CLI on PATH: a symlink `fleet-switchboard` in
+`~/.local/bin` (or another directory of the person's PATH under their home),
+pointing at this checkout's `bin/fleet-switchboard`. It says which, and prints
+the exact line to add to their shell startup file when none of those is on PATH.
+It never overwrites a different file there. The Chief of Staff's shell needs it:
+without it the Chief of Staff cannot run `fleet-switchboard status` and reports
+from GitHub alone. A moved or deleted checkout breaks the link; run `install`
+again from the new one to repair it.
 
 The profile is private on purpose. The person's ordinary OpenCode (possibly v1,
 which their other fleet may run on) reads `~/.config/opencode`, and `install`
@@ -464,7 +476,8 @@ dry run prints the profile path it would use; read it to the person. Never pass
 `--shared-profile` unless the person asks for it by name: it puts the files where
 their ordinary OpenCode reads them, and says so.
 
-If `status` begins with "No decision-model key", that is STEP 18, not a failure.
+If `status` begins with "No decision-model key", or says the key is only in an
+environment variable, that is STEP 18, not a failure.
 
 ---
 
@@ -506,6 +519,12 @@ Without a key the message classifier and the tool-call judge fail open: the
 system looks healthy and nothing is classified or judged. That is why `status`
 says so in its first line. Do not call the install done while it does.
 
+A key exported in a shell does not count for the service: launchd and systemd
+start the daemon without your shell's variables. The daemon records where its
+own key came from and `status` reports that, so if the key is only in the
+environment, `status` says so in its first line and `key status` prints
+`environment (only this shell)`. `key set` is the fix.
+
 ---
 
 ## STEP 19 — Open the Chief of Staff, and prove it
@@ -522,7 +541,9 @@ PROVES:  the first line is not "No decision-model key"; the lines `daemon`
 
 `bootstrap` opens the Chief of Staff in its own herdr workspace and focuses it.
 Run again, it resumes the same Chief of Staff if its pane is gone, and refuses
-to open a second one if it is still there. The Chief of Staff introduces
+to open a second one if it is still there. If an earlier run died after it made
+the session but before the brief was sent, the resume sends the brief once (it
+reads the transcript to know), and sends nothing if it is already there. The Chief of Staff introduces
 itself, reads `status`, and tells the person plainly what is missing (a key,
 the GitHub repos to watch) and asks what they want to work on. It sets the
 repos up with them; you do not.

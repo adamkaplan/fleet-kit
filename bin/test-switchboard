@@ -762,7 +762,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "ignore-reports", "no-description",
               "no-decisions-file", "stale-as-fresh", "decision-resolves-never",  # PR 14
               "static-repos", "bare-issue-number", "one-account", "repo-create-allowed",  # PR 15
-              "key-missing-silent", "no-ensure-on-use", "shared-profile-default")  # PR 16
+              "key-missing-silent", "no-ensure-on-use", "shared-profile-default",  # PR 16
+              "key-env-only-unseen")  # PR 16, the first real install
 
 
 class TestFaults(Base):
@@ -15285,7 +15286,9 @@ class TestKeyCommand(KeyCase):
         self.put_key()
         self.assertEqual(self.run_key("status")[1], "file\n")
         os.environ["OPENROUTER_API_KEY"] = "v"
-        self.assertEqual(self.run_key("status")[1], "environment\n")
+        self.assertEqual(self.run_key("status")[1], "environment\n", "a saved file too: not only this shell")
+        self.key_file.unlink()
+        self.assertEqual(self.run_key("status")[1], "environment (only this shell)\n")
 
     def test_status_of_a_refused_file_says_none_and_why_on_stderr(self):
         self.put_key(mode=0o644)
@@ -15345,7 +15348,8 @@ class TestStatusSaysWhenThereIsNoKey(StatusCase):
 
     def test_the_json_says_where_the_key_comes_from_and_never_what_it_is(self):
         code, text = self.status("--json")
-        self.assertEqual(json.loads(text)["key"], {"source": "none", "notice": PR16_NOTICE, "problem": None})
+        self.assertEqual(json.loads(text)["key"], {"source": "none", "cli": "none", "daemon": None, "file": False,
+                                                   "notice": PR16_NOTICE, "problem": None})
         self.put_key()
         code, text = self.status("--json")
         self.assertEqual(json.loads(text)["key"]["source"], "file")
@@ -16133,7 +16137,7 @@ class TestInstallPrivateProfile(InstallCase):
         self.assertFalse(self.private.exists(), "no private profile is made")
         self.assertEqual(self.machine.integration_calls, [])
         self.assertEqual(self.statuses(out)["herdr integration"], ["skipped (--shared-profile)"])
-        self.assertNotIn("export HOME=", self.wrapper.read_text(), "the shared wrapper keeps the real home")
+        self.assertFalse(self.wrapper.exists(), "nothing runs a wrapper in a shared profile, so none is written")
 
     def test_a_private_install_says_the_shared_directory_is_left_alone(self):
         out, _ = self.full()
@@ -16391,6 +16395,540 @@ class TestTheFileKeyIsNeverText(PolicyCase):
             self.assertNotIn(PR16_KEY, " ".join(call))
 
 
+# ---- the first real install found these (fixes to PR 16)
+
+class TestPaneProgramBySymlink(Base):
+    """A pane runs the resolved path of a binary the config names by its stable link: the same program."""
+
+    def setUp(self):
+        super().setUp()
+        self.real = self.home / "Cellar" / "opencode" / "2.0.22" / "bin" / "opencode"
+        self.real.parent.mkdir(parents=True)
+        self.real.write_text("#!/bin/sh\n")
+        self.link = self.home / "opt" / "bin" / "opencode"
+        self.link.parent.mkdir(parents=True)
+        os.symlink(str(self.real), str(self.link))
+
+    def test_runs_program_compares_by_realpath_on_both_sides(self):
+        spaced = self.home / "Application Support" / "bin" / "opencode"
+        spaced.parent.mkdir(parents=True)
+        spaced.write_text("#!/bin/sh\n")
+        spaced_link = self.home / "opt" / "bin" / "opencode-spaced"
+        os.symlink(str(spaced), str(spaced_link))
+        other = str(self.home / "other" / "opencode")
+        for cmdline, exe, expected in (
+                (str(self.real) + " -s ses_1", str(self.link), True),
+                (str(self.link) + " -s ses_1", str(self.real), True),
+                (str(self.real), str(self.link), True),
+                (str(self.link), str(self.link), True),
+                (str(spaced) + " -s ses_1", str(spaced_link), True),
+                (other + " -s ses_1", str(self.link), False),
+                (str(self.real) + "-v1 -s ses_1", str(self.link), False),
+                ("-zsh", str(self.link), False),
+                (None, str(self.link), False)):
+            with self.subTest(cmdline=cmdline, exe=exe):
+                self.assertEqual(sb.runs_program(cmdline, exe), expected)
+
+    def test_a_pane_on_the_resolved_path_is_not_wrong_for_discovery_or_for_launch_verification(self):
+        world = World(self, agents=("platform",))
+        engine, pane, session = world.engine, world.panes["platform"], world.sessions["platform"]
+        engine.executable = str(self.link)
+        world.herdr.panes[pane]["program"] = "%s -s %s" % (self.real, session)
+        self.assertIsNone(sb.pane_problem(engine, pane, session))
+        self.assertFalse(engine.discover(world.clock.now()).agents["platform"].wrong_program)
+        engine.executable = str(self.real)
+        world.herdr.panes[pane]["program"] = "%s -s %s" % (self.link, session)
+        self.assertIsNone(sb.pane_problem(engine, pane, session))
+        self.assertFalse(engine.discover(world.clock.now()).agents["platform"].wrong_program)
+
+    def test_another_binary_is_still_a_wrong_program(self):
+        world = World(self, agents=("platform",))
+        engine, pane, session = world.engine, world.panes["platform"], world.sessions["platform"]
+        engine.executable = str(self.link)
+        world.herdr.panes[pane]["program"] = "%s -s %s" % (self.home / "other" / "opencode", session)
+        self.assertIn("not the configured v2", sb.pane_problem(engine, pane, session))
+        self.assertTrue(engine.discover(world.clock.now()).agents["platform"].wrong_program)
+
+
+class TestInstallOwnsWhatAPaneRuns(InstallCase):
+    """`opencode` and `opencode_executable` are the two keys install owns: a config from an earlier install, or an
+    older binary, no longer survives it."""
+
+    def full(self, *flags, **kw):
+        return self.install("--opencode", self.machine.binary, *flags, **kw)
+
+    def config(self):
+        return json.loads(self.config_file.read_text())
+
+    def stale(self):
+        self.write_config({"opencode": "/old/place/fleet-opencode", "opencode_executable": "/old/place/opencode",
+                           "poll_seconds": 7, "github_repos": ["acme/api"], "jev": {"model": "mine/model"},
+                           "policy": {"enabled": False}})
+
+    def test_a_stale_pair_is_replaced_and_says_what_it_was(self):
+        self.stale()
+        out, error = self.full()
+        self.assertIsNone(error, error)
+        config = self.config()
+        self.assertEqual((config["opencode"], config["opencode_executable"]), (str(self.wrapper), self.machine.binary))
+        self.assertIn("updated", out)
+        self.assertIn("(was /old/place/fleet-opencode)", out)
+        self.assertIn("(was /old/place/opencode)", out)
+
+    def test_no_other_key_is_touched(self):
+        self.stale()
+        self.full()
+        config = self.config()
+        self.assertEqual((config["poll_seconds"], config["github_repos"], config["jev"], config["policy"]),
+                         (7, ["acme/api"], {"model": "mine/model"}, {"enabled": False}))
+        self.assertEqual([k for k in config][:6], ["opencode", "opencode_executable", "poll_seconds", "github_repos", "jev", "policy"])
+
+    def test_the_second_run_finds_nothing_to_update(self):
+        self.stale()
+        self.full()
+        text = self.config_file.read_text()
+        out, _ = self.full()
+        self.assertEqual(self.statuses(out)["config"], ["already done"])
+        self.assertNotIn("updated", out)
+        self.assertEqual(self.config_file.read_text(), text)
+
+    def test_a_dry_run_says_it_would_update_and_writes_nothing(self):
+        self.stale()
+        before = self.config_file.read_text()
+        out, _ = self.full("--dry-run")
+        self.assertEqual(self.config_file.read_text(), before)
+        self.assertEqual(self.statuses(out)["config"], ["would be done"])
+        self.assertIn("updated", out)
+
+    def test_a_shared_profile_has_no_wrapper_and_both_keys_are_the_binary_as_given_not_resolved(self):
+        real = self.home / "Cellar" / "opencode" / "bin" / "opencode"
+        real.parent.mkdir(parents=True)
+        real.write_text("#!/bin/sh\n")
+        link = self.home / "opt" / "bin" / "opencode"
+        link.parent.mkdir(parents=True)
+        os.symlink(str(real), str(link))
+        self.machine.binary = str(link)
+        self.stale()
+        out, error = self.full("--shared-profile")
+        self.assertIsNone(error, error)
+        config = self.config()
+        self.assertEqual((config["opencode"], config["opencode_executable"]), (str(link), str(link)))
+        self.assertNotIn("Cellar", config["opencode"] + config["opencode_executable"])
+        self.assertNotIn("launch_env", config)
+
+    def test_a_shared_profile_install_writes_no_wrapper_and_says_so(self):
+        out, error = self.full("--shared-profile")
+        self.assertIsNone(error, error)
+        self.assertFalse(self.wrapper.exists())
+        self.assertFalse(self.wrapper.parent.exists() and list(self.wrapper.parent.iterdir()))
+        self.assertTrue(self.statuses(out)["wrapper"][0].startswith("skipped"), out)
+        again, _ = self.full("--shared-profile")
+        self.assertFalse(self.wrapper.exists())
+
+    def test_a_private_install_keeps_the_wrapper_and_launch_env_which_the_wrapper_needs(self):
+        out, error = self.full()
+        self.assertTrue(self.wrapper.is_file())
+        self.assertEqual(self.config()["launch_env"], {sb.PANE_ENV: "1"})
+        self.assertIn("pane_env", inspect.getsource(sb.Installer.wrapper_text), "launch_env only matters to that wrapper")
+
+    def test_uninstall_still_removes_a_wrapper_an_earlier_install_made(self):
+        self.full()
+        self.assertTrue(self.wrapper.is_file())
+        out, error = self.install("--uninstall", "--shared-profile")
+        self.assertIsNone(error, error)
+        self.assertFalse(self.wrapper.exists())
+
+
+class TestInstallPutsTheCliOnPath(InstallCase):
+    """The Chief of Staff's shell must find `fleet-switchboard`."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = REPO / "bin" / "fleet-switchboard"
+        self.local = self.home / ".local" / "bin"
+        self.link = self.local / "fleet-switchboard"
+
+    def full(self, *flags, **kw):
+        return self.install("--opencode", self.machine.binary, *flags, **kw)
+
+    def on_path(self, *dirs):
+        return mock.patch.dict(os.environ, {"PATH": ":".join([str(d) for d in dirs] + [SAFE_PATH])})
+
+    def test_it_links_into_local_bin_says_where_and_prints_the_line_when_that_is_not_on_path(self):
+        out, error = self.full()
+        self.assertIsNone(error, error)
+        self.assertTrue(self.link.is_symlink())
+        self.assertEqual(os.readlink(str(self.link)), str(self.target))
+        self.assertEqual(self.statuses(out)["cli link"], ["done"])
+        self.assertIn(str(self.local), out)
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH"', out)
+
+    def test_it_says_a_moved_checkout_breaks_the_link_and_install_repairs_it(self):
+        out, _ = self.full()
+        text = " ".join(out.split())
+        self.assertIn("moved or deleted checkout", text)
+        self.assertIn("`fleet-switchboard install` again", text)
+
+    def test_local_bin_on_the_path_needs_no_line(self):
+        with self.on_path(self.local):
+            out, error = self.full()
+        self.assertTrue(self.link.is_symlink())
+        self.assertNotIn("export PATH", out)
+        self.assertIn("on your PATH", out)
+
+    def test_without_local_bin_on_the_path_the_first_directory_under_home_that_is(self):
+        mine = self.home / "bin"
+        mine.mkdir()
+        with self.on_path("/usr/local/bin", mine):
+            out, error = self.full()
+        self.assertTrue((mine / "fleet-switchboard").is_symlink())
+        self.assertFalse(self.link.exists())
+        self.assertIn(str(mine), out)
+        self.assertNotIn("export PATH", out)
+
+    def test_a_second_run_changes_nothing_and_says_already_done(self):
+        self.full()
+        before = tree_of(self.home)
+        out, _ = self.full()
+        self.assertEqual(self.statuses(out)["cli link"], ["already done"])
+        self.assertEqual(tree_of(self.home), before)
+
+    def test_a_correct_link_made_by_hand_reads_already_done(self):
+        self.local.mkdir(parents=True)
+        os.symlink(str(self.target), str(self.link))
+        out, _ = self.full()
+        self.assertEqual(self.statuses(out)["cli link"], ["already done"])
+        self.assertEqual(os.readlink(str(self.link)), str(self.target))
+
+    def test_a_different_file_is_never_overwritten_and_is_reported(self):
+        self.local.mkdir(parents=True)
+        self.link.write_text("mine\n")
+        out, error = self.full()
+        self.assertIsNone(error, error)
+        self.assertEqual(self.link.read_text(), "mine\n")
+        self.assertTrue(self.statuses(out)["cli link"][0].startswith("skipped"), out)
+        self.assertIn(str(self.link), out)
+        self.assertIn("left alone", out)
+
+    def test_a_link_to_a_different_existing_file_is_left_alone_too(self):
+        elsewhere = self.home / "elsewhere" / "fleet-switchboard"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("#!/bin/sh\n")
+        self.local.mkdir(parents=True)
+        os.symlink(str(elsewhere), str(self.link))
+        out, _ = self.full()
+        self.assertEqual(os.readlink(str(self.link)), str(elsewhere))
+        self.assertIn("left alone", out)
+
+    def test_a_link_to_a_checkout_that_is_gone_is_repaired(self):
+        self.local.mkdir(parents=True)
+        os.symlink(str(self.home / "old-checkout" / "bin" / "fleet-switchboard"), str(self.link))
+        out, _ = self.full()
+        self.assertEqual(os.readlink(str(self.link)), str(self.target))
+        self.assertEqual(self.statuses(out)["cli link"], ["done"])
+
+    def test_a_dry_run_writes_nothing(self):
+        before = tree_of(self.home)
+        out, _ = self.full("--dry-run")
+        self.assertEqual(tree_of(self.home), before)
+        self.assertFalse(self.local.exists())
+        self.assertEqual(self.statuses(out)["cli link"], ["would be done"])
+
+    def test_uninstall_removes_only_a_link_that_points_at_this_checkout(self):
+        self.full()
+        out, error = self.install("--uninstall")
+        self.assertIsNone(error, error)
+        self.assertFalse(self.link.is_symlink() or self.link.exists())
+        self.assertEqual(self.statuses(out)["cli link"], ["done"])
+        again, _ = self.install("--uninstall")
+        self.assertNotEqual(self.statuses(again)["cli link"], ["done"])
+
+    def test_uninstall_leaves_a_file_and_a_link_that_are_not_ours(self):
+        self.local.mkdir(parents=True)
+        self.link.write_text("mine\n")
+        self.install("--uninstall")
+        self.assertEqual(self.link.read_text(), "mine\n")
+        self.link.unlink()
+        elsewhere = self.home / "elsewhere" / "fleet-switchboard"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text("#!/bin/sh\n")
+        os.symlink(str(elsewhere), str(self.link))
+        self.install("--uninstall")
+        self.assertEqual(os.readlink(str(self.link)), str(elsewhere))
+
+    def test_uninstall_dry_run_removes_nothing(self):
+        self.full()
+        before = tree_of(self.home)
+        out, _ = self.install("--uninstall", "--dry-run")
+        self.assertEqual(tree_of(self.home), before)
+        self.assertEqual(self.statuses(out)["cli link"], ["would be done"])
+
+
+class RealStatusAfterInstall:
+    """The real `status` an install prints is about the platform install ran for, not the one the tests run on."""
+
+    def installed_status(self, installed_for, host):
+        out = io.StringIO()
+        installer = sb.Installer(self.machine, self.daemons, time.time, installed_for, REPO, out=out)
+        with mock.patch.object(sb.sys, "platform", host):
+            installer.install(self.machine.binary)
+        return out.getvalue()
+
+
+class TestRealStatusAfterInstallOnMacOS(RealStatusAfterInstall, InstallCase):
+    PLATFORM = "darwin"
+
+    def test_the_service_it_just_wrote_is_installed_whatever_the_host_is(self):
+        for host in ("darwin", "linux"):
+            with self.subTest(host=host):
+                self.assertIn("service    installed (%s)" % self.service_path(), self.installed_status("darwin", host))
+
+
+class TestRealStatusAfterInstallOnLinux(RealStatusAfterInstall, InstallCase):
+    PLATFORM = "linux"
+
+    def test_the_service_it_just_wrote_is_installed_whatever_the_host_is(self):
+        for host in ("linux", "darwin"):
+            with self.subTest(host=host):
+                self.assertIn("service    installed (%s)" % self.service_path(), self.installed_status("linux", host))
+
+
+class TestInstallStatusUsesTheInstalledPlatform(Base):
+    def test_service_report_takes_the_platform(self):
+        self.assertEqual(sb.service_report("darwin")["kind"], "launchd")
+        self.assertEqual(sb.service_report("linux")["kind"], "systemd")
+        self.assertIsNone(sb.service_report("plan9")["kind"])
+        self.assertEqual(sb.service_report()["kind"], sb.service_kind())
+
+    def test_collect_status_passes_it_on(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        world = World(self, agents=())
+        report = sb.collect_status(world.route, world.clock.now, platform="linux")
+        self.assertEqual(report["service"]["kind"], "systemd")
+
+
+class TestBootstrapSendsTheBriefOnce(BootstrapCase):
+    """The first attempt can die after the session is made and before its brief is: the resume must still send it."""
+
+    def half_made(self):
+        """A cos session with no pane and no brief: what a bootstrap that died after session.create leaves."""
+        session = self.world.v2.create_session({"fleet": {"name": "cos", "role": "chief-of-staff"}}, "cos",
+                                               "chief-of-staff", str(self.work))
+        return session
+
+    def briefs(self, session):
+        return [m for m in self.world.v2.sessions[session]["messages"]
+                if ((m.get("metadata") or {}).get("fleet") or {}).get("brief")]
+
+    def test_a_resume_of_a_session_with_no_brief_sends_it_once(self):
+        session = self.half_made()
+        code, out, err = self.bootstrap("--dir", str(self.work))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["action"], "resumed")
+        [brief] = self.briefs(session)
+        self.assertEqual(brief["text"], sb.COS_BRIEF)
+
+    def test_a_resume_of_a_session_that_holds_the_brief_sends_nothing(self):
+        first = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.assertEqual(len(self.briefs(first["session"])), 1)
+        self.world.herdr.panes.clear()
+        before = len(self.world.v2.sessions[first["session"]]["messages"])
+        again = json.loads(self.bootstrap("--dir", str(self.work))[1])
+        self.assertEqual(again["action"], "resumed")
+        self.assertEqual(len(self.world.v2.sessions[first["session"]]["messages"]), before)
+        self.assertEqual(len(self.briefs(first["session"])), 1)
+
+    def test_a_third_run_after_the_repair_sends_nothing_more(self):
+        session = self.half_made()
+        self.bootstrap("--dir", str(self.work))
+        self.world.herdr.panes.clear()
+        self.bootstrap("--dir", str(self.work))
+        self.world.herdr.panes.clear()
+        self.bootstrap("--dir", str(self.work))
+        self.assertEqual(len(self.briefs(session)), 1)
+
+    def test_a_message_that_is_not_the_brief_does_not_count_as_one(self):
+        session = self.half_made()
+        self.world.v2.start_turn(session, "hello", fleet=False)
+        self.bootstrap("--dir", str(self.work))
+        self.assertEqual(len(self.briefs(session)), 1)
+
+    def test_a_failed_send_closes_the_pane_it_opened_and_a_new_run_sends_it(self):
+        session = self.half_made()
+        self.world.v2.op_session_prompt = mock.Mock(side_effect=FakeHTTP(500, "Boom", "no"))
+        code, out, err = self.bootstrap("--dir", str(self.work))
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.briefs(session), [])
+        self.assertEqual(len(self.world.herdr.closed), 1)
+        del self.world.v2.op_session_prompt
+        self.assertEqual(self.bootstrap("--dir", str(self.work))[0], 0)
+        self.assertEqual(len(self.briefs(session)), 1)
+
+    def test_a_listing_too_long_to_read_to_the_end_is_taken_to_hold_the_brief(self):
+        class Endless:
+            def message_pages(self, session, limit, type=None, max_pages=1):
+                for number in range(max_pages):
+                    yield [{"id": "msg_%d" % number, "type": "user"}], True
+
+        class Engine:
+            v2 = Endless()
+        self.assertTrue(sb.brief_in_transcript(Engine(), "ses_x"))
+
+    def test_launch_and_bootstrap_send_it_by_the_one_function(self):
+        self.assertIn("send_brief(", inspect.getsource(sb.launch_agent))
+        self.assertIn("resume_brief(", inspect.getsource(sb.bootstrap_cos))
+        self.assertIn("send_brief(", inspect.getsource(sb.resume_brief))
+        self.assertNotIn("brief", inspect.getsource(sb.resume_agent).replace("no brief is sent", ""))
+
+
+class TestTheDaemonKnowsItsKey(StatusCase):
+    """`status` is run from a shell that may hold the key; the daemon, started by launchd or systemd, may not."""
+
+    def setUp(self):
+        super().setUp()
+        self.held = []
+        self.addCleanup(self.release)
+
+    def release(self):
+        for fd in self.held:
+            os.close(fd)
+
+    def daemon_started_with(self, source, pid=None):
+        state = sb.ensure_state_dir()
+        fd = os.open(str(state / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, ("%d\n" % os.getpid()).encode())
+        self.held.append(fd)
+        (state / "daemon.json").write_text(json.dumps({"pid": pid or os.getpid(), "key_source": source}))
+
+    def service_installed(self):
+        kind = sb.service_kind()
+        if kind is None:
+            self.skipTest("no service manager on this platform")
+        path = sb.service_file_path(kind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+
+    def first(self):
+        return self.status()[1].splitlines()[0]
+
+    def test_the_daemon_writes_where_its_key_came_from_beside_its_pid(self):
+        world = World(self, agents=())
+        sb.run_daemon(world.engine, world.state, 5, wait=lambda sock, timeout: None, passes=1,
+                      record={"key_source": "environment"})
+        record = json.loads((world.state / "daemon.json").read_text())
+        self.assertEqual((record["pid"], record["key_source"]), (os.getpid(), "environment"))
+
+    def test_the_source_is_one_of_file_environment_or_none(self):
+        settings = dict(sb.JEV_DEFAULTS)
+        config = {"jev": settings}
+        self.assertEqual(sb.key_source_of(config, {}), "none")
+        self.assertEqual(sb.key_source_of(config, {sb.JEV_KEY_ENV: "v"}), "environment")
+        self.put_key()
+        self.assertEqual(sb.key_source_of(config, {}), "file")
+        self.assertEqual(sb.daemon_record(config, {}), {"key_source": "file"})
+
+    def test_run_hands_the_record_to_the_daemon(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {}})
+        seen = []
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        world = World(self, agents=())
+        with mock.patch.object(sb, "run_daemon", lambda *a, **k: seen.append(k)), \
+                mock.patch.object(sb, "start_judge_server", lambda *a, **k: None), captured():
+            sb.main(["run"], runner=world.route, now=world.clock.now)
+        self.assertEqual(seen[0]["record"], {"key_source": "environment"})
+
+    def test_a_shell_with_the_key_and_a_daemon_without_it_is_the_first_line_in_plain_words(self):
+        self.daemon_started_with("none")
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        code, text = self.status()
+        line = text.splitlines()[0]
+        self.assertEqual(code, 0)
+        for needle in ("this shell", "daemon", "fleet-switchboard key set"):
+            self.assertIn(needle, line)
+        self.assertNotIn("v\n", text)
+
+    def test_status_reports_the_daemons_source_not_the_shells(self):
+        self.daemon_started_with("none")
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        report = json.loads(self.status("--json")[1])["key"]
+        self.assertEqual((report["source"], report["cli"], report["daemon"]), ("none", "environment", "none"))
+        self.assertIn("key        none", self.status()[1])
+
+    def test_a_service_and_a_key_only_in_the_shell_says_the_service_will_not_have_it(self):
+        self.service_installed()
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        line = self.first()
+        for needle in ("service", "shell", "fleet-switchboard key set"):
+            self.assertIn(needle, line)
+
+    def test_a_daemon_started_with_the_key_but_a_service_and_no_file_still_says_so(self):
+        self.service_installed()
+        self.daemon_started_with("environment")
+        line = self.first()
+        self.assertIn("fleet-switchboard key set", line)
+        self.assertIn("service", line)
+
+    def test_a_saved_key_file_removes_the_warning(self):
+        self.service_installed()
+        self.daemon_started_with("environment")
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        self.put_key()
+        text = self.status()[1]
+        self.assertTrue(text.startswith("fleet-switchboard "), text.splitlines()[0])
+        self.assertIn("key        environment", text)
+
+    def test_a_running_daemon_with_a_file_key_is_quiet(self):
+        self.put_key()
+        self.daemon_started_with("file")
+        text = self.status()[1]
+        self.assertTrue(text.startswith("fleet-switchboard "))
+        self.assertIn("key        file", text)
+
+    def test_the_variable_in_the_shell_and_nothing_else_names_where_it_lives(self):
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        text = self.status()[1]
+        self.assertIn("key        environment (", text)
+        self.assertIn("key set", text)
+
+    def test_no_key_anywhere_is_the_old_notice_even_with_a_daemon_that_says_none(self):
+        self.daemon_started_with("none")
+        self.assertEqual(self.first(), PR16_NOTICE)
+
+    def test_a_record_from_another_process_is_not_the_running_daemons(self):
+        self.daemon_started_with("environment", pid=os.getpid() + 7)
+        self.put_key()
+        report = json.loads(self.status("--json")[1])["key"]
+        self.assertEqual((report["source"], report["daemon"]), ("file", None))
+
+    def test_a_record_with_no_daemon_running_is_not_read(self):
+        (sb.ensure_state_dir() / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "key_source": "environment"}))
+        self.assertEqual(self.first(), PR16_NOTICE)
+
+    def test_the_fault_hides_the_unseen_key_warning_and_only_in_the_lab(self):
+        self.daemon_started_with("none")
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        os.environ[sb.FAULT_ENV] = "key-env-only-unseen"
+        os.environ.pop(sb.LAB_ENV, None)
+        self.assertIn("fleet-switchboard key set", self.first(), "outside the Lab a fault does nothing")
+        os.environ[sb.LAB_ENV] = "1"
+        text = self.status()[1]
+        self.assertTrue(text.startswith("fleet-switchboard "), "the control: the fault removes the warning")
+        self.assertNotIn("key set", text.split("key        ")[0])
+        self.assertIn("key-env-only-unseen", sb.KNOWN_FAULTS)
+
+    def test_key_status_says_when_the_variable_is_all_there_is(self):
+        os.environ["OPENROUTER_API_KEY"] = "v"
+        with captured() as (out, err):
+            sb.main(["key", "status"])
+        self.assertEqual(out.getvalue(), "environment (only this shell)\n")
+        self.put_key()
+        with captured() as (out, err):
+            sb.main(["key", "status"])
+        self.assertEqual(out.getvalue(), "environment\n")
+
+
 class TestInstallDocs(unittest.TestCase):
     def setUp(self):
         self.install = (REPO / "INSTALL.md").read_text()
@@ -16406,6 +16944,10 @@ class TestInstallDocs(unittest.TestCase):
             self.assertGreaterEqual(self.section.count(label), 6 if label != "HUMAN:" else 3, label)
         for needle in ("auth login", "key set", "bootstrap", "install --dry-run", "herdr plugin list", "opencode v2"):
             self.assertIn(needle, self.section)
+        flat = " ".join(self.section.split())
+        for needle in ("puts the CLI on PATH", "~/.local/bin", "moved or deleted checkout", "updated ... (was <old>)",
+                       "only in the environment", "environment (only this shell)", "sends the brief once"):
+            self.assertIn(needle, flat)
         last = self.section[self.section.index("## STEP 19"):]
         for line in ("daemon", "key", "plugin", "service"):
             self.assertIn("`%s`" % line, last)
@@ -16446,7 +16988,9 @@ class TestInstallDocs(unittest.TestCase):
         for needle in ("### Install (PR 16)", "shared-profile-default", "--shared-profile", "fleet-opencode", "Found in review",
                        "herdr integration", "private profile", "status_first_line", "key-missing-silent", "no-ensure-on-use", "bootstrap", "launchctl bootstrap gui/",
                        "systemctl --user enable --now", "key set", "ensure_daemon", "Lab proof", "Not verified live",
-                       "--standby", "`jev.key_file`"):
+                       "--standby", "`jev.key_file`", "what the first real install found", "`cli link`", "daemon.json",
+                       "key-env-only-unseen", "environment (only this shell)", "owns exactly two keys", "`send_brief`",
+                       "realpath"):
             self.assertIn(needle, self.design)
         section = self.design[self.design.index("### Install (PR 16)"):self.design.index("### Data")]
         for number, line in enumerate(section.splitlines(), 1):
