@@ -1,0 +1,25 @@
+{
+  "id": "D2",
+  "title": "A label on an issue puts it in your list; taking it off removes it",
+  "problem": null,
+  "since_pr": 14,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "20s", "actor": "platform", "do": "awaiting", "issue": 5, "on": true, "title": "Close #2? and a second deploy run?",
+     "why": "The orchestrator needs a decision only you can make, so it labels the issue first"},
+    {"at": "45s", "actor": "world", "do": "wait", "why": "Both the webhook and the catch-up read have run"},
+    {"at": "60s", "actor": "platform", "do": "awaiting", "issue": 5, "on": false,
+     "why": "You answered; the orchestrator acts and takes the label off"},
+    {"at": "90s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "listed", "that": "decisions", "at": "45s", "count": 1, "text": "Close #2?"},
+    {"name": "says-its-id", "that": "decisions_say", "at": "45s", "text": "#5  waiting"},
+    {"name": "gone", "that": "decisions", "at": "90s", "count": 0},
+    {"name": "says-none", "that": "decisions_say", "at": "90s", "text": "No decisions are waiting on you."}
+  ],
+  "control": {"fault": "no-decisions-file", "fails": ["listed", "says-its-id", "says-none"]}
+}

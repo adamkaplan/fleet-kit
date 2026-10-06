@@ -23,6 +23,7 @@
 | 11 | `switchboard/trial` | `bin/switchboard-trial`: a Lab-isolated profile with GitHub Copilot, to try the system by hand; `launch --charter` | ready for review; see [switchboard-trial.md](switchboard-trial.md) |
 | 12 | `switchboard/presentation` | A three-minute narrated deck and video explaining the system: `docs/presentation/` | ready for review [#28](https://github.com/adamkaplan/fleet-kit/pull/28); see [presentation/README.md](presentation/README.md) |
 | 13 | `switchboard/reports` | Workers report with `fleet-switchboard report`; a bare idle is a rider and wakes nobody; a stop without a report is triaged; every message carries a one-line description for the TUI | ready for review |
+| 14 | `switchboard/decisions` | A read-only Decisions list for you: derived from labels, pending requests and unanswered reports, written to `decisions.json`, read by `fleet-switchboard decisions` and a TUI sidebar plugin | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -446,6 +447,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6 |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working` and `paused` are riders: kept until a message carries them, never waking. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
+| `fleet-switchboard decisions [--json] [--fresh] [--watch]` | You, or any agent (PR 14) | The open decisions waiting on you, one line each: `#2a  waiting 12m  platform  Close #2? and a second deploy run?`. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `errors`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty list prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
 | `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
@@ -959,6 +961,106 @@ stop is nudged), `no-fail-open` (a failed model call stays quiet),
 `ignore-reports` (a report is not recognised), `no-description` (a message goes
 without its one line).
 
+### Decisions (PR 14)
+
+You had no place to see what is blocked on you, so agents repeated "I am still
+waiting on your two answers" in every reply. The Decisions list is that place:
+read-only, in the right sidebar of the TUI like the TODO list, and as a command.
+No click, no dialog, no text pushed into the prompt box: you read it and name a
+decision by its id in chat ("answer #2a: yes"). It is **derived, never the source
+of truth** (invariant 1): every row comes from a fact that already lives
+somewhere else, and deleting the file loses nothing.
+
+**What is a decision.** Each is `{id, title, ask, agent, kind, since}`, oldest
+first, from three sources, one function (`derive_decisions`) that reuses the
+readers the pass already has:
+
+| Source | `kind` | Row | Read from |
+|---|---|---|---|
+| An open issue with your label (`awaiting_label`, default `<OS user>:awaiting-user`, as in `skills/fleet-charter`) | `issue` | The issue title; agent is the orchestrator that owns the issue | The hub's picture: `issues` and `issue_comment` webhook events keep it, and the catch-up read (one `gh api` call per forwarder start, never per pass) makes it right |
+| A pending permission request or question of any fleet agent, a boss with no boss included | `permission`, `question` | `permission: shell echo hi`, the agent that asked | What `WorkerFacts` already reads for a blocked agent |
+| A `question` or `blocked` report delivered to a boss and not answered | `report` | The report's line, the worker that sent it | The boss's transcript (`decisions_lookback_hours`, default 72) |
+
+A report is **answered** when a newer `send` from the boss to that worker exists
+on the same ask (a `send` with no `--issue` counts for any ask: the worker has
+one), or the worker has since reported again on that ask. A worker that no
+longer runs is not waited on. A report is listed once it is in the boss's
+transcript, not before: a note still in the inbox is not yet delivered.
+
+**Ids** are short, quotable and derived from the decision alone, with no counter
+and no file. An issue's own label is `#<issue>` (`#5`). Any other decision on an
+issue is `#<issue>` and two letters (`#2ka`); one about no issue is
+`<agent>-` and three digits (`platform-481`). The letters and digits come from a
+hash of the decision's identity (the request id, the report's message), not from
+its rank among the open ones, because a rank would renumber `#2b` into `#2a`
+when `#2a` resolves, and an id must stay put while its decision is open. On a
+hash collision the decision that has waited longer keeps its id and the later one
+takes the next free one, so two open decisions never share an id. An id can be
+reused later for a different decision only by chance, after the first has
+resolved. The price of hashing is that ids are not `a`, `b`, `c`.
+
+**`decisions.json`.** The daemon recomputes the list at the end of every pass and
+writes `$STATE/decisions.json` (mode 0600; temp file and rename, so a reader
+never sees half of it) only when the list changed:
+`{"generation", "written_at", "daemon_pid", "decisions": [...], "errors": [...]}`.
+When nothing changed it only touches the file, so **the file's age says whether
+the daemon is alive**. It is disposable: deleting it loses nothing, and the next
+pass writes it again (scenario D4; R3 deletes the whole state directory). A source
+that cannot be read does not hide the others: it is an entry in `errors`
+(`{"source": "github" | "v2" | "reports", "error": "..."}`) and an audit event
+`decisions.error`, once per change. Until a repo's first catch-up read the list
+says that GitHub is not read yet, rather than passing for empty. A read-only look
+(`status`, `pending`) never writes it.
+
+**Staleness.** A file older than 120 s, missing or unreadable is never shown as
+current: the command says "the daemon is not updating this list" (and `status`
+shows it), and the plugin shows a row `daemon not updating` (scenario D5).
+
+**The TUI plugin** is `plugins/fleet-decisions-tui/`: `tui.tsx`, a thin layer over
+`decisions.mjs`, whose pure functions (read the file, staleness, rows) are tested
+with node. v2 loads it from the profile's `cli.json` (`{"plugins":
+["./fleet-decisions"]}`, a directory holding `tui.tsx`), into the `sidebar.content`
+slot, as a section titled **Decisions (N)** with a row `<id> <age> <title>` for
+each decision, cut to 34 characters so a row never wraps. The section never
+disappears (design law: no disappearing UI): an empty list is a row `none`, and a
+missing, unreadable or stale file, or an unset `FLEET_SWITCHBOARD_STATE`, is a row
+`daemon not updating`. It watches the **directory** of `decisions.json` with
+`fs.watch`, because the file is replaced by rename, with one slow re-read every 60
+s and one timer for the moment a list would turn stale. It spawns no process, holds
+no credential and makes no network call; it reads only the file named by
+`FLEET_SWITCHBOARD_STATE`, which the trial's wrapper exports. `switchboard-trial
+up` installs it and `status` says whether it is installed; a TUI picks it up when
+it is restarted (`switchboard-trial restart`), and `up` never restarts v2. The
+sidebar exists on the session screen only, and only in a terminal wide enough to
+show it (the Lab's 160 columns give a sidebar about 36 columns wide).
+
+**Proof that `fs.watch` fires inside the TUI plugin runtime, on macOS** (Lab
+tier, 2026-10-06). The plugin runtime is the Lab's pinned v2 binary (2.0.22), which
+runs plugins on bun 1.4.2, darwin. A throwaway profile (its own XDG directories,
+its own service port 49392, set with `service set port`) ran that binary's TUI in a
+pty, 160 by 45, read through a terminal emulator. First a probe plugin that only
+watched the state directory and logged each event: three renames of
+`decisions.json.tmp` over `decisions.json`, three seconds apart, logged six events
+(`rename decisions.json.tmp`, `rename decisions.json` each time) within 10 ms of
+each rename, and the sidebar row the probe drew went from `probe events: 0` to
+`probe events: 6`. Then the real plugin: with no file the section read `Decisions
+(?)` and `daemon not updating`; a renamed-in file with two decisions drew
+`Decisions (2)` and both rows within 3 s; and a list written with an mtime 100 s
+old turned to `daemon not updating` 25 s later with no file event, from the stale
+timer. (The same run showed that a row wrapped at the sidebar's width, which is why
+rows are cut to 34 characters.) The probe, the throwaway profile and its service
+(pid recorded, stopped with `service stop`, never by name) are gone, and a
+checksum of the Lab's config, wrapper and `lab.json` was identical before and
+after: the proof used the Lab's binary and none of its state, because a second v2
+on another XDG directory collides with the Lab's service on port 49374 unless its
+`service.json` names another port. Not measured: a terminal narrower than the
+sidebar's threshold, and a macOS machine where the directory is on a network volume.
+
+Faults (Lab only), one per behaviour: `no-decisions-file` (the file is never
+written), `stale-as-fresh` (an old file is shown as current), `decision-resolves-never`
+(an answered report stays listed). Scenarios D2 to D5 are new, and R3 now also expects
+the file back.
+
 ### Data
 
 The switchboard keeps almost nothing. Each fact lives in the system that owns
@@ -977,6 +1079,7 @@ it, and is read from there each time it is needed.
 | Intent and Done-when | GitHub issue body | `gh api`, cached in memory |
 | Charters, sub-issues, PRs, checks, reviews | GitHub | Webhooks, plus a catch-up read after gaps |
 | Reminders not yet due | Switchboard file `reminders.json` | |
+| What waits on you | Derived each pass; the projection is `decisions.json` | `fleet-switchboard decisions` |
 | What the switchboard did and why | Switchboard file `audit.jsonl` | |
 
 ```mermaid
@@ -1053,7 +1156,8 @@ Delivered means in the recipient's transcript. Its keys are never sent again.
    one is made for every forwarder start. The OpenRouter key (PR 7) is read
    from the switchboard's config and never passed to an agent.
 8. **Deleting the state directory is safe.** It loses the audit history and
-   reminders not yet due. Nothing else changes.
+   reminders not yet due. Nothing else changes (`decisions.json` is written again
+   by the next pass).
 9. **The policy judge only tightens** (PR 9). It can turn allow into ask or
    deny, and ask into deny, never the reverse; when it can't answer, the
    configured outcome stands.
@@ -1361,7 +1465,7 @@ R1.
 | Q1 | Two hours with no events | 3 | No timer wakes | PR 4 | offline (2 h simulated); the Lab tier is owed: its control is the old timer, which is not built there |
 | R1 | The daemon is killed while a worker finishes, then restarted | 4 | Derived pending, dedupe (invariants 1–2) | PR 4 | offline, lab-scripted |
 | H1 | A worker's pane is closed between deciding and delivering | — | Re-check before every write (invariant 4); hold and toast | PR 4 | offline, lab-scripted |
-| R3 | The state directory is deleted while items are pending | — | Nothing but the audit history and reminders is lost (invariant 8) | PR 4 | offline, lab-scripted |
+| R3 | The state directory is deleted while items are pending | — | Nothing but the audit history and reminders is lost (invariant 8); from PR 14 `decisions.json` is written again | PR 4 | offline, lab-scripted |
 | G1 | A comment lands on an ask | 4 | Routing, Intent header | PR 5 | offline; the Lab runner cannot yet post a signed webhook |
 | G2 | The forwarder dies while events are sent | 4 | Catch-up read, object-id keys | PR 5 | offline; Lab owed, as G1 |
 | G3 | Someone else is already forwarding the repo | — | Conflict reported, fallback | PR 5 | offline; Lab owed, as G1 |
@@ -1389,6 +1493,10 @@ R1.
 | R6 | A worker stops without reporting work it owes | 4 | Nudged once, then the boss is told | PR 13 | offline; control `no-nudge-once` |
 | R7 | The decision model is down when a worker stops without reporting | 4 | Fails open: one wake | PR 13 | offline; control `no-fail-open` |
 | R8 | Progress reports | 4 | Riders never wake, and ride in the next report | PR 13 | offline; control `no-rider` |
+| D2 | A label on an issue puts it in your list; taking it off removes it | — | Derived from the label, by webhook, with no `gh` call per pass | PR 14 | offline; control `no-decisions-file` |
+| D3 | A worker's `report question` is listed until its boss answers with `send` | — | Resolution is derived from both transcripts | PR 14 | offline; control `decision-resolves-never` |
+| D4 | The decisions file is deleted | — | A disposable projection: the next pass writes it again | PR 14 | offline; control `no-decisions-file` |
+| D5 | The daemon stops | — | A list older than 120 s is stale, never current | PR 14 | offline; control `stale-as-fresh` |
 
 ## Repo and PR conventions
 
@@ -1831,3 +1939,24 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   coordination skill tell agents to report. Scenarios R4 to R8 are new, and
   N1, N2, W1, F4, H1, R1 and R3 now go through the stop triage and wait for
   `worker.stopped` where they waited for `worker.idle`.
+- 2026-10-06: PR 14, Decisions. Found live: the human had no place to see what
+  waited on them, so every agent reply restated "I am still waiting on your two
+  answers"; the `awaiting-user` label answered the question only to someone who
+  ran `gh issue list`. Measured first (the spike, then this PR): v2's TUI loads
+  a plugin from `cli.json` naming a directory with `tui.tsx`, and draws a
+  `sidebar.content` slot as a section; `fs.watch` on the state directory fires
+  inside that runtime on macOS (bun 1.4.2, 2.0.22), six events for three
+  renames, and re-rendered the section; a row longer than the sidebar (about 36
+  columns at a width of 160) wraps, so rows are cut to 34 characters. Changed:
+  `derive_decisions` (labels, pending requests, unanswered reports; ids derived
+  from a hash, so they stay put while a decision is open), `decisions.json` kept
+  by the daemon (rewritten on change, touched otherwise, so its age is the
+  daemon's pulse), `fleet-switchboard decisions`, the `fleet-decisions-tui`
+  plugin, `switchboard-trial` installing it, role files and skills ("say it once
+  with its id; see Decisions"), and the hub keeping the awaiting-user issues from
+  webhook events and one extra read per catch-up, with no new `gh` call per pass.
+  Two things the first design got wrong and the tests found: a rank-based suffix
+  (`#2a`, `#2b`) renumbers when the first resolves, and a file written only on
+  change cannot say the daemon is alive. Scenarios D2 to D5 are new; R3 also expects
+  the file back; every offline scenario now also writes `decisions.json`, which
+  changed nothing else.

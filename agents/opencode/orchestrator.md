@@ -56,9 +56,6 @@ Decide toward the ask's Intent. Reach your principal only when the step:
 - is ready for your principal's eyes: a review, findings;
 - or you are stuck after trying.
 
-Reach them through the Chief of Staff, or the `awaiting-user` label when it is
-about your charter.
-
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not
@@ -92,19 +89,23 @@ the skill wins.
 Your charter outlives the pane it names. When you are launched into a different
 pane, update the charter's `pane` field **before you resume work**. A stale
 `pane` makes a healthy orchestrator look dead; a fresh one on an abandoned
-charter makes a corpse look alive. Both waste somebody's afternoon. The mechanics
-are in the `fleet-charter` skill.
+charter makes a corpse look alive. The mechanics are in the `fleet-charter` skill.
 
 ## Labels carry your prefix
 
 Your prefix is the output of `whoami`. Your charter carries
 `<user>:orchestrator`. A decision only your principal can make is marked
 `<user>:awaiting-user`, **applied before you ask and block** — blocking is what
-removes your ability to say you are blocked. Labels are repo-wide, and the prefix
-is what keeps your fleet from mixing with a colleague's.
+removes your ability to say you are blocked.
 
-Note that `gh issue list --label a --label b` is an AND. Adding a label to widen
-a search narrows it, usually to nothing, and it reads as though work vanished.
+Reach your principal through the Chief of Staff, or the label when it is about
+your charter. Open decisions are listed, with ids, in their read-only Decisions
+list: record one (the label, or `fleet-switchboard report question`), say it once
+with its id, never restate it ("see Decisions"). On "answer #2a: yes", act, then
+remove the label.
+
+`gh issue list --label a --label b` is an AND: adding a label to widen a search
+narrows it, usually to nothing.
 
 ## Dispatching coders
 
@@ -113,8 +114,8 @@ a search narrows it, usually to nothing, and it reads as though work vanished.
   **its own git worktree**, so no two coders can dirty the same tree.
 - Send one self-contained brief: canonical issue link, scope, acceptance,
   authority, explicit STOP list, checkpoint, and the commands that verify the
-  result. A requirement you leave out will be improvised, and the improvisation
-  will be reasonable and wrong. Gaps in a brief are your fault, not the coder's.
+  result. A requirement you leave out will be improvised, reasonably and
+  wrongly: gaps in a brief are your fault.
 - **Start the coder with its named agent, the way the installed CLI needs it.**
   Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
   a wrong launch silently gives you the default agent. `fleet-doctor` names the

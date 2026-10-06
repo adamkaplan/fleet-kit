@@ -1343,7 +1343,7 @@ RUN_ACTIONS = ("turn", "message", "draft", "away", "permission", "synthetic", "n
                "wait", "launch") + ENGINE_ACTIONS
 RUN_EXPECTATIONS = ("no_machine_turn", "within", "draft_intact", "tool_outcome", "delivered",
                     "message_count", "model_saw", "status_is", "metadata_roundtrip", "pane_runs_v2",
-                    "no_typing", "toast", "classified")
+                    "no_typing", "toast", "classified", "decisions_say")
 RUN_BASELINES = ("fleet-heartbeat",)
 SYNTHETIC_DEFAULTS = {"note": (False, "steer"), "wake": (True, "queue"),
                       "synthetic": (False, "steer")}
@@ -2290,6 +2290,16 @@ class ScenarioRun:
                 ids.append(m.get("id"))
         return len(ids) == item["count"], "%d switchboard message(s) (want %d): %s" % (
             len(ids), item["count"], ", ".join(ids) or "none")
+
+    def check_decisions_say(self, item):
+        """PR 14. What `fleet-switchboard decisions` prints for this play's engine state. A play can be read only
+        at its end, so `at` must be the time of its last step: the offline runner judges any second."""
+        end = max(self.seconds(step["at"]) for step in self.scenario["steps"])
+        if self.seconds(item["at"]) != end:
+            return False, "the Lab reads the list only when the play ends (%ds), not at %s" % (end, item["at"])
+        done = subprocess.run([sys.executable, ENGINE, "decisions"], env=self.engine.env(), capture_output=True,
+                              text=True, timeout=60)
+        return item["text"] in done.stdout, "`decisions` printed: %s" % short(done.stdout.replace("\n", " / "), 200)
 
     def check_classified(self, item):
         """PR 7. The engine's audit log owns this fact: Jev's classification of

@@ -110,6 +110,10 @@ STEP_FIELDS = {
     "import-v1": {"agent": (True, _CAST), "fixture": (True, "name")},
     # PR 13: a cast member's `fleet-switchboard report <state> [--issue N] "one line"`
     "report": {"state": (True, "report_state"), "text": (True, "line"), "issue": (False, "issue")},
+    # PR 14: Decisions. A label put on or taken off an issue; a boss's message to a worker; the projection deleted
+    "awaiting": {"issue": (True, "issue"), "on": (True, "bool"), "title": (False, "text")},
+    "send": {"to": (True, _CAST), "text": (True, "line"), "issue": (False, "issue")},
+    "delete-decisions": {},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -124,6 +128,9 @@ STEP_ACTORS = {
     "tool-call": ("cast",),  # PR 9
     "import-v1": ("world",),
     "report": ("cast",),  # PR 13
+    "awaiting": ("you", "world", "cast"),  # PR 14
+    "send": ("cast",),
+    "delete-decisions": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -157,6 +164,10 @@ EXPECT_FIELDS = {
     # PR 10
     "imported_messages": {"agent": (True, _CAST), "count": (False, "count0")},
     "lists_asks": {"agent": (True, _CAST), "issue": (True, "issue")},
+    # PR 14: the list `fleet-switchboard decisions` shows at a time: how many decisions (whose title holds
+    # `text`, if given), and what the command says
+    "decisions": {"at": (True, "duration"), "count": (True, "count0"), "text": (False, "text")},
+    "decisions_say": {"at": (True, "duration"), "text": (True, "text")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")

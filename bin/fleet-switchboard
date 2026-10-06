@@ -18,6 +18,7 @@ delivery rule, and delivers. See docs/switchboard.md, "Delivery rule".
     fleet-switchboard status                config, clients, fleet agents
     fleet-switchboard intent <issue>        the ask's Intent and Done-when (PR 6)
     fleet-switchboard intents               your open asks, one line each (PR 6)
+    fleet-switchboard decisions             what waits on you, one line each, read-only (PR 14)
 
 Rules this file keeps from the start:
 
@@ -43,6 +44,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import getpass
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,6 +60,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import quote
 import uuid
 
 VERSION = "0.1.0"
@@ -98,6 +101,8 @@ DEFAULTS = {
                       "check_suite", "workflow_run"],
     "github_port": None,
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
+    "awaiting_label": None,         # PR 14: the label that marks a decision for you; None means `<OS user>:awaiting-user`
+    "decisions_lookback_hours": 72,  # PR 14: how far back a boss's transcript is read for open report questions
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -174,6 +179,7 @@ def validate_config(raw, source="config"):
     validate_foreground_config(config, source)  # PR 8
     validate_policy_config(config, source)  # PR 9
     validate_report_triage_config(config, source)  # PR 13
+    validate_decisions_config(config, source)  # PR 14
     return config
 
 
@@ -239,6 +245,9 @@ KNOWN_FAULTS = (
     "no-fail-open",
     "ignore-reports",
     "no-description",
+    "no-decisions-file",
+    "stale-as-fresh",
+    "decision-resolves-never",
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -1134,8 +1143,14 @@ class Switchboard:
     and any write then raises instead of happening unaudited.
     """
 
-    def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon", intents=None):
+    def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon", intents=None,
+                 state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
+        self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
+        self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
+        self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
+        self.synthetic_cache = {}       # PR 14: session -> (newest synthetic id, since, lines), a cache for the decisions
         self.intents = intents  # an IntentReader (PR 6), or None when no ask repo is configured
         self.sources, self.now, self.actor = list(sources), now, actor
         self.batch_seconds = config["batch_seconds"]
@@ -3084,6 +3099,7 @@ class WorkerFacts:
     def __init__(self):
         self.engine = None
         self._blocked = []       # toasts of the last call: (agent, reason, title, body)
+        self.requests = []       # PR 14: the pending requests of every blocked agent in the last call (decisions)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
         self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
@@ -3095,7 +3111,7 @@ class WorkerFacts:
         return list(self._blocked)
 
     def __call__(self):
-        self._blocked = []
+        self._blocked, self.requests = [], []
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
         if engine is None or discovery is None or fault("no-worker-source"):
@@ -3104,10 +3120,11 @@ class WorkerFacts:
         facts = []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
             boss = _boss_of(observation)
-            if boss is None or observation.conflict or observation.problem:
+            if observation.conflict or observation.problem:
                 continue
             try:
-                facts.extend(self.finished(observation, boss, horizon))
+                if boss is not None:
+                    facts.extend(self.finished(observation, boss, horizon))
                 facts.extend(self.blocked(observation, boss))
             except V2Error as err:  # one worker's trouble never hides the others
                 engine._note("source.error", "worker_facts:" + observation.name, {"error": _one_line(str(err))})
@@ -3166,6 +3183,8 @@ class WorkerFacts:
         return text
 
     def blocked(self, observation, boss):
+        """The facts for a blocked worker's pending requests. PR 14: every blocked agent's requests are read and
+        kept in `requests` (a boss with no boss of its own waits on you too); only a worker has a fact."""
         if observation.status != "blocked":
             return []
         facts = []
@@ -3173,7 +3192,9 @@ class WorkerFacts:
                             ("question", self.pending_forms(observation))):
             for item in items if isinstance(items, list) else []:
                 if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
-                    facts.append(self.blocked_fact(observation, boss, kind, item))
+                    self.requests.append((observation, kind, item))
+                    if boss is not None:
+                        facts.append(self.blocked_fact(observation, boss, kind, item))
         return facts
 
     def pending_forms(self, observation):
@@ -3499,6 +3520,392 @@ def prune_report_riders(engine, discovery):
     return sorted(gone)
 
 
+# ======================================================================
+# PR 14: Decisions, a read-only list of what waits on you
+#
+# docs/switchboard.md, "Decisions (PR 14)". The list is derived on every pass from facts that already
+# exist and is never the source of truth (invariant 1): the issues that carry your awaiting-user label
+# (the hub's picture, kept by webhook events and the catch-up read), the pending permission requests and
+# questions of every fleet agent (WorkerFacts already reads them), and the `question` and `blocked`
+# reports a boss has been sent and nobody has answered. The daemon writes it to $STATE/decisions.json
+# when it changes, a disposable projection: deleting the file loses nothing and the next pass makes it
+# again. `fleet-switchboard decisions` and the TUI plugin only read the file.
+# ======================================================================
+
+DECISIONS_FILE = "decisions.json"
+DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
+DECISION_TITLE_MAX = 200
+DECISION_SOURCES = ("github", "v2", "reports")
+REPORT_LINE = re.compile(r"^- report from (\S+?)(?: \(issue #(\d+)\))?: ([a-z]+): (.*)$")
+SEND_LINE = re.compile(r"^- send from (\S+?)(?: \(issue #(\d+)\))?: ")
+
+
+def validate_decisions_config(config, source):
+    label = config["awaiting_label"]
+    if label is not None and (not isinstance(label, str) or not label.strip() or "\n" in label or "," in label):
+        raise ConfigError("%s: 'awaiting_label' must be a label name without a comma or a newline, or null (the "
+                          "default, `<OS user>:awaiting-user`), got %r" % (source, label))
+    hours = config["decisions_lookback_hours"]
+    if not _is_number(hours) or hours <= 0:
+        raise ConfigError("%s: 'decisions_lookback_hours' must be a positive number, got %r" % (source, hours))
+
+
+def _decision_number(seed):
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def _id_candidates(item, number):
+    ask, agent = item.get("ask"), item.get("agent")
+    if ask and item.get("bare"):
+        yield "#%d" % ask                      # an issue's own label is the issue number
+    if ask:
+        for step in range(26 * 26):            # `#2` and two letters taken from the decision's own hash
+            pair = (number + step) % 676
+            yield "#%d%s%s" % (ask, chr(97 + pair // 26), chr(97 + pair % 26))
+    else:
+        for step in range(900):                # `<agent>-` and three digits likewise
+            yield "%s-%03d" % (agent or "fleet", 100 + (number + step) % 900)
+    yield "%s-%x" % ("#%d" % ask if ask else agent or "fleet", number)
+
+
+def assign_decision_ids(items):
+    """The id of each decision in `items` (dicts with seed, ask, agent, bare, since), in the same order.
+
+    Derived from the decision's own identity (`seed`) and nothing else: no counter, no file. An issue's own
+    label is `#<issue>`; any other decision about an issue is `#<issue>` and two letters; one about no issue is
+    `<agent>-` and three digits. The letters and digits come from a hash of the seed, so an id does not change
+    when another decision resolves (a rank among the open ones would). Two open decisions never share an id: on
+    a collision, the one that has waited longer keeps the id and the later one takes the next free one."""
+    order = sorted(range(len(items)), key=lambda i: (items[i]["since"], items[i]["seed"]))
+    taken, ids = set(), [None] * len(items)
+    for index in order:
+        item = items[index]
+        for candidate in _id_candidates(item, _decision_number(item["seed"])):
+            if candidate not in taken:
+                break
+        taken.add(candidate)
+        ids[index] = candidate
+    return ids
+
+
+def decisions_from_github(engine, now):
+    """(items, problems): the open issues with your label, from the hub's picture. No `gh` call is made here."""
+    if not engine.config["github_repos"]:
+        return [], []
+    hub = engine.hub
+    if hub is None:
+        return [], ["GitHub is read by the daemon: this process holds no hub, so the issues that wait on you "
+                    "are not listed"]
+    records, problems = hub.awaiting_listing()
+    agents = engine.discovery.agents if engine.discovery is not None else {}
+    items = []
+    for record in records:
+        numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
+        items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
+                      "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
+                      "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
+                      "bare": True})
+    return items, problems
+
+
+def decisions_from_requests(engine, now):
+    """(items, problems): the pending permission requests and questions of every fleet agent, as WorkerFacts read them."""
+    source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
+    if source is None:
+        return [], []
+    items, seen = [], {}
+    for observation, kind, request in source.requests:
+        key = (observation.session_id, request["id"])
+        what = " ".join(str(part) for part in [request.get("action") or request.get("title") or kind]
+                        + [r for r in request.get("resources") or [] if isinstance(r, str)])
+        asked = _created(request)
+        seen[key] = asked if asked is not None else engine.decision_seen.get(key, now)
+        items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": _issue_of(observation.fleet),
+                      "agent": observation.name, "since": seen[key],
+                      "seed": "request:%s:%s" % key, "bare": False})
+    engine.decision_seen = seen  # memory only: a request with no time of its own keeps the first time it was seen
+    return items, []
+
+
+def synthetic_lines(engine, session_id, since):
+    """The lines of a session's synthetic messages since `since`: [(created, message id, line number, line)],
+    newest message first. The one read of what a message said, shared by both report checks."""
+    newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
+    newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
+    cached = engine.synthetic_cache.get(session_id)
+    if cached is not None and cached[0] == newest_id and cached[1] <= since:
+        return [line for line in cached[2] if line[0] >= since]  # nothing new since the last full read
+    found, complete = [], False
+    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+        for message in page:
+            created = _created(message) if isinstance(message, dict) else None
+            if created is None:
+                continue
+            if created < since:
+                complete = True
+                break
+            for number, line in enumerate(reply_text(message).splitlines()):
+                found.append((created, message.get("id"), number, line))
+        if complete or not more:
+            break
+    if len(engine.synthetic_cache) > 200:
+        engine.synthetic_cache.clear()
+    engine.synthetic_cache[session_id] = (newest_id, since, found)  # memory only, rebuilt after a restart
+    return found
+
+
+def decisions_from_reports(engine, now):
+    """(items, problems): `question` and `blocked` reports delivered to a boss that nobody has answered.
+
+    A report is answered when the boss has since sent that worker something on the same ask (a `send` with no
+    issue counts for any ask: the worker has one), or the worker has since reported again on that ask."""
+    discovery = engine.discovery
+    if discovery is None:
+        return [], []
+    if discovery.problems:
+        raise RuntimeError("the fleet cannot be read: %s" % "; ".join(discovery.problems))
+    since = now - engine.config["decisions_lookback_hours"] * 3600
+    bosses = sorted({_boss_of(o) for o in discovery.agents.values()} - {None})
+    items, problems, sends = [], [], {}
+    for boss in bosses:
+        observation = discovery.agents.get(boss)
+        if observation is None or observation.problem:
+            problems.append("cannot read what was reported to %s: %s" % (
+                boss, observation.problem if observation else "it is not running"))
+            continue
+        reports = []
+        for created, message_id, number, line in synthetic_lines(engine, observation.session_id, since):
+            match = REPORT_LINE.match(line)
+            if match:
+                reports.append({"at": (created, number), "message": message_id, "sender": match.group(1),
+                                "issue": int(match.group(2)) if match.group(2) else None,
+                                "state": match.group(3), "text": match.group(4), "boss": boss,
+                                "session": observation.session_id})
+        reports.sort(key=lambda r: r["at"])
+        for report in reports:
+            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
+                continue  # not a decision, or the worker that asked no longer runs: no one is waiting
+            if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
+                continue
+            title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
+            items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
+                          "since": report["at"][0], "bare": False,
+                          "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1])})
+    return items, problems
+
+
+def report_answered(engine, report, reports, since, sends):
+    """True when a newer report from the same worker on the same ask, or a newer `send` from the boss to the
+    worker on it, exists. `sends` caches one read of each worker's transcript per derivation."""
+    for other in reports:
+        if other is not report and other["sender"] == report["sender"] and other["issue"] == report["issue"] \
+                and other["at"] > report["at"]:
+            return True
+    worker = engine.discovery.agents[report["sender"]]
+    if worker.problem:
+        raise RuntimeError("cannot read what %s was sent: %s" % (worker.name, worker.problem))
+    if worker.name not in sends:
+        sends[worker.name] = synthetic_lines(engine, worker.session_id, since)
+    for created, _, _, line in sends[worker.name]:
+        match = SEND_LINE.match(line)
+        if match and match.group(1) == report["boss"] and created > report["at"][0] \
+                and (match.group(2) is None or int(match.group(2)) == report["issue"]):
+            return True
+    return False
+
+
+def derive_decisions(engine, now):
+    """(decisions, errors): every open decision, oldest first, and what could not be read.
+
+    Each decision is {id, title, ask, agent, kind, since}. A source that fails is an error entry and the
+    others are still listed (audited once per change). Call after `engine.discover` and a fact collection."""
+    items, errors = [], []
+    sources = (("github", decisions_from_github), ("v2", decisions_from_requests),
+               ("reports", decisions_from_reports))
+    for name, source in sources:
+        try:
+            found, problems = source(engine, now)
+        except Exception as err:
+            found, problems = [], [_one_line("%s: %s" % (type(err).__name__, err), 200)]
+        items.extend(found)
+        for problem in problems:
+            errors.append({"source": name, "error": _one_line(problem, 200)})
+            engine._note("decisions.error", name, {"error": _one_line(problem, 200)})
+    ids = assign_decision_ids(items)
+    decisions = [{"id": ident, "title": _line_of(item["title"], DECISION_TITLE_MAX), "ask": item["ask"],
+                  "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"])}
+                 for ident, item in zip(ids, items)]
+    decisions.sort(key=lambda d: (d["since"], d["id"]))
+    return decisions, errors
+
+
+def read_decisions_file(path):
+    """The parsed file, or None when it is missing or not a decisions file."""
+    try:
+        body = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(body, dict) and isinstance(body.get("decisions"), list) and isinstance(body.get("errors"), list)
+    return body if ok else None
+
+
+def publish_decisions(engine):
+    """The end of a pass: write decisions.json when the list changed (or the file is missing or unreadable),
+    atomically, mode 0600; otherwise touch it, so its age says the daemon is alive. Returns True when written."""
+    state = engine.state_dir
+    if state is None or engine.audit is None or fault("no-decisions-file"):
+        return False
+    now = engine.now()
+    decisions, errors = derive_decisions(engine, now)
+    path = state / DECISIONS_FILE
+    current = read_decisions_file(path)
+    if current is not None and current["decisions"] == decisions and current["errors"] == errors:
+        os.utime(str(path), (now, now))
+        return False
+    known = current.get("generation") if current is not None else None
+    engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + 1
+    body = {"generation": engine.decisions_generation, "written_at": iso(now), "daemon_pid": os.getpid(),
+            "decisions": decisions, "errors": errors}
+    temp = path.with_name("%s.%d.tmp" % (DECISIONS_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(body, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.utime(str(temp), (now, now))
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    return True  # not audited: a projection of facts, and the audit records writes to other systems
+
+
+def decisions_report(state_dir, now):
+    """What the file says now: {stale, message, age_seconds, written_at, generation, decisions, errors}.
+
+    `stale` is true when the file is missing, unreadable, or older than DECISIONS_STALE_SECONDS by mtime
+    (every pass refreshes it): a list the daemon does not keep current is never shown as current. Under the
+    `stale-as-fresh` fault an old file still counts as current."""
+    path = Path(state_dir) / DECISIONS_FILE
+    report = {"stale": True, "message": None, "age_seconds": None, "written_at": None, "generation": None,
+              "decisions": [], "errors": []}
+    try:
+        age = now - path.stat().st_mtime
+    except OSError:
+        report["message"] = "the daemon is not updating this list: there is no %s in %s" % (DECISIONS_FILE, state_dir)
+        return report
+    body = read_decisions_file(path)
+    if body is None:
+        report["message"] = "the daemon is not updating this list: %s cannot be read" % path
+        return report
+    report.update(decisions=body["decisions"], errors=body["errors"], written_at=body.get("written_at"),
+                  generation=body.get("generation"), age_seconds=max(0, int(age)))
+    if age > DECISIONS_STALE_SECONDS and not fault("stale-as-fresh"):
+        report["message"] = "the daemon is not updating this list: %s was last written %s ago" % (
+            DECISIONS_FILE, format_age(age))
+    else:
+        report["stale"] = False
+    return report
+
+
+def format_age(seconds):
+    """`45s`, `12m`, `1h05m`, `3d`: the longest unit that fits, never more than a few characters."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh%02dm" % (seconds // 3600, seconds % 3600 // 60) if seconds % 3600 // 60 else "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+def format_decisions(report, now):
+    """The human text: one line per decision, `<id>  waiting <age>  <agent>  <title>`, columns aligned."""
+    if report["stale"]:
+        return "Decisions unavailable: %s. Start it with `%s ensure`, or read the facts now with `%s decisions --fresh`." % (
+            report["message"], PROG, PROG)
+    decisions = report["decisions"]
+    if not decisions:
+        lines = ["No decisions are waiting on you."]
+    else:
+        agents = [d.get("agent") or "-" for d in decisions]
+        width_id, width_agent = max(len(d["id"]) for d in decisions), max(len(a) for a in agents)
+        lines = []
+        for decision, agent in zip(decisions, agents):
+            since = parse_iso(decision.get("since"))
+            lines.append("%s  waiting %s  %s  %s" % (decision["id"].ljust(width_id),
+                                                     format_age(now - since) if since is not None else "?",
+                                                     agent.ljust(width_agent), decision["title"]))
+        lines = [line.rstrip() for line in lines]
+    lines.extend("(could not read %s: %s)" % (e.get("source"), e.get("error")) for e in report["errors"])
+    return "\n".join(lines)
+
+
+def fresh_decisions(runner, now):
+    """`decisions --fresh`: derive the list in this process, read-only, and write nothing. GitHub is read once,
+    here, because this process has no hub kept current by webhook events."""
+    engine, state, config = build_engine(runner, now, "cli", writable=False)
+    engine.discover(now())
+    engine.collect_facts()
+    if config["github_repos"]:
+        hub = GitHubHub(config, state, None, runner, spawn_forwarder, now, "cli")
+        hub.engine, engine.hub = engine, hub
+        for repo in config["github_repos"]:
+            hub.read_awaiting(repo, now())
+    decisions, errors = derive_decisions(engine, now())
+    return {"stale": False, "message": None, "age_seconds": 0, "written_at": iso(now()), "generation": None,
+            "decisions": decisions, "errors": errors}
+
+
+def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clear=False):
+    """`decisions --watch`: draw the list, then every second look again and draw it when it differs. Stdlib
+    only, for a terminal that has no TUI plugin (a herdr side pane). Ends on Ctrl-C."""
+    write = write or sys.stdout.write
+    last = None
+    try:
+        while True:
+            text = format_decisions(decisions_report(state_dir, now()), now())
+            if text != last:
+                write(("\x1b[2J\x1b[H" if clear else "") + text + "\n")
+                last = text
+            sleep(1)
+    except KeyboardInterrupt:
+        return EXIT_OK
+
+
+def cmd_decisions(args, runner, now):
+    if args.watch and args.fresh:
+        sys.stderr.write("%s: --watch reads the file the daemon writes; it cannot be combined with --fresh\n" % PROG)
+        return EXIT_USAGE
+    state = state_dir_path()
+    if args.watch:
+        return watch_decisions(state, now, clear=sys.stdout.isatty())
+    report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
+    if args.json:
+        print(json.dumps(dict(report, message=report["message"] or None), indent=2, sort_keys=True))
+    else:
+        print(format_decisions(report, now()))
+    return EXIT_ERROR if report["stale"] else EXIT_OK
+
+
+def decisions_summary(state_dir, now):
+    """For `status`: how many decisions the file lists, and whether the daemon keeps it current."""
+    report = decisions_report(state_dir, now())
+    return {"count": len(report["decisions"]), "stale": report["stale"], "message": report["message"],
+            "age_seconds": report["age_seconds"], "errors": len(report["errors"])}
+
+
+def format_decisions_status(summary):
+    if summary["stale"]:
+        return ["      decisions  %s" % summary["message"]]
+    line = "      decisions  %d waiting on you (`%s decisions`)" % (summary["count"], PROG)
+    return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
+
+
 # ---- toasts
 
 def note_unreachable(engine, recipient, fresh, why):
@@ -3531,6 +3938,10 @@ def finish_pass(engine, discovery, report):
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
+    try:
+        publish_decisions(engine)
+    except Exception as err:
+        engine._failed("decisions", "decisions", err, report)
     schedule_judge_warm(engine, discovery)
 
 
@@ -3857,6 +4268,23 @@ def _url_number(url):
     return int(match.group(1)) if match else None
 
 
+def awaiting_label(config):
+    """The label that marks an issue as waiting on you: the config's, or the charter convention's
+    `<user>:awaiting-user`, where the prefix is the OS user (`whoami`), as in skills/fleet-charter."""
+    return config.get("awaiting_label") or "%s:awaiting-user" % getpass.getuser()
+
+
+def parse_iso(text):
+    """An ISO-8601 time with `Z` or an offset -> epoch seconds, or None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+
+
 def parent_of(issue):
     """The parent issue number a payload or REST issue names, if it does."""
     if not isinstance(issue, dict):
@@ -4167,12 +4595,15 @@ class GitHubHub:
         self._unrouted, self._snapshot = set(), None
         self.engine = None
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
+        self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
+        self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
 
     # -- wiring
 
     def attach(self, engine):
         """Make this hub one of `engine`'s fact sources, reading the fleet through it."""
         self.engine = engine
+        engine.hub = self  # PR 14: the decisions derivation reads the awaiting-user issues from it
         self.discover = lambda: engine.discover(engine.now())
         engine.sources.append(self.fact_source())
         return engine
@@ -4309,6 +4740,7 @@ class GitHubHub:
             return 400, "bad payload"
         self.enqueue(items)
         self.note_issue_edit(event, repo, payload)
+        self.note_awaiting_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [item.key for item in items]})
         return 202, "accepted"
@@ -4484,6 +4916,70 @@ class GitHubHub:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
 
+    # -- the issues that wait on you (PR 14): events keep the picture, the catch-up read makes it right
+
+    def note_awaiting_issue(self, repo, issue, when=None):
+        """One issue as a webhook payload or a read shows it: listed when it is open and carries the label,
+        forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
+        when (the issue's `updated_at`), and a read can only say when the issue last changed."""
+        number = _number(issue)
+        if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
+            return
+        names = {(label.get("name") if isinstance(label, dict) else label) for label in issue["labels"]}
+        key = (repo, number)
+        with self.lock:
+            if awaiting_label(self.config) in names and issue.get("state", "open") == "open":
+                known = self.awaiting.get(key)
+                stamp = parse_iso(issue.get("updated_at"))
+                since = known["since"] if known else (stamp if stamp is not None else when or self.now())
+                self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
+                                      "parent": parent_of(issue)}
+            else:
+                self.awaiting.pop(key, None)
+
+    def note_awaiting_event(self, event, repo, payload):
+        """A webhook event that carries an issue: keep the picture current with no read at all."""
+        issue = payload.get("issue") if event in ("issues", "issue_comment") else None
+        if isinstance(issue, dict):
+            self.note_awaiting_issue(repo, issue)
+
+    def read_awaiting(self, repo, now=None):
+        """The catch-up's read of the open issues with the label: authoritative for `repo`, so an issue that
+        lost the label while no forwarder ran is dropped. Returns None, or one line saying why it failed."""
+        path = "repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, quote(awaiting_label(self.config), safe=""))
+        try:
+            records = [r for r in _records(self.gh_api(path)) if not _is_pr(r) and _number(r) is not None]
+        except GitHubUnavailable as err:
+            with self.lock:
+                self.awaiting_read[repo] = _one_line(str(err), 200)
+            return "awaiting-user issues: %s" % self.awaiting_read[repo]
+        with self.lock:
+            old = {key: value for key, value in self.awaiting.items() if key[0] == repo}
+            self.awaiting = {key: value for key, value in self.awaiting.items() if key[0] != repo}
+        for record in records:
+            self.note_awaiting_issue(repo, dict(record, state="open", labels=[{"name": awaiting_label(self.config)}]),
+                                     now)
+            known = old.get((repo, _number(record)))
+            if known:
+                with self.lock:
+                    self.awaiting[(repo, _number(record))]["since"] = known["since"]
+        with self.lock:
+            self.awaiting_read[repo] = None
+        return None
+
+    def awaiting_listing(self):
+        """(records, errors) for the decisions: what the hub knows, and what it could not read."""
+        with self.lock:
+            records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
+                        "parent": entry["parent"]} for (repo, number), entry in sorted(self.awaiting.items())]
+            errors = []
+            for repo in sorted(self.watches):
+                if repo not in self.awaiting_read:
+                    errors.append("issues of %s that wait on you are not read yet" % repo)
+                elif self.awaiting_read[repo]:
+                    errors.append("issues of %s that wait on you could not be read: %s" % (repo, self.awaiting_read[repo]))
+        return records, errors
+
     # -- gh api, and the catch-up read
 
     def gh_api(self, path, paginate=True):
@@ -4550,6 +5046,9 @@ class GitHubHub:
 
     def catch_up(self, watch, now):
         items, errors = self.catch_up_items(watch.repo, now)
+        problem = self.read_awaiting(watch.repo, now)  # PR 14: one more read, here and not on every pass
+        if problem:
+            errors.append(problem)
         self.enqueue(items)
         with self.lock:
             watch.last_catch_up = now
@@ -4806,6 +5305,8 @@ def collect_status(runner=subprocess.run, now=time.time):
     report["agents"] = agents  # informational: an agent's trouble is not the switchboard's
     if config_ok and state_ok:
         report["github"] = github_status(config, state)
+    if state_ok:
+        report["decisions"] = decisions_summary(state, now)
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
     return report
 
@@ -4882,6 +5383,7 @@ def format_status(report):
     else:
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
+    lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     return "\n".join(lines)
 
 
@@ -4924,7 +5426,7 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
     return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
-                       intents=intent_reader_for(config, runner, now)), state, config
+                       intents=intent_reader_for(config, runner, now), state_dir=state), state, config
 
 
 def cmd_run(args, runner, now, wait):
@@ -7285,6 +7787,17 @@ def build_parser():
     report.add_argument("text", nargs="+", help="One line: what happened (at most %d characters)" % REPORT_MAX)
     report.add_argument("--issue", type=int, help="The issue the report is about (default: your own)")
     report.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    decisions = sub.add_parser(
+        "decisions", help="What waits on you: the open decisions, one line each, from the file the daemon keeps",
+        description="Print the decisions waiting on you: the issues with your awaiting-user label, the permission "
+                    "requests and questions of every fleet agent, and the questions and blocks workers reported "
+                    "that nobody has answered. Read-only: refer to one by its id in chat. By default it reads "
+                    "decisions.json, which the daemon rewrites when the list changes; a file older than %d s is "
+                    "said to be stale, never shown as current." % DECISIONS_STALE_SECONDS)
+    decisions.add_argument("--json", action="store_true", help="Emit the file's list as JSON (with `stale`)")
+    decisions.add_argument("--fresh", action="store_true", help="Derive the list now instead of reading the file")
+    decisions.add_argument("--watch", action="store_true", help="Redraw when the list changes, until Ctrl-C (a "
+                                                               "fallback for a terminal without the TUI plugin)")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
     launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
@@ -7344,6 +7857,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_send(args, runner, now)
         if args.action == "report":
             return cmd_report(args, runner, now)
+        if args.action == "decisions":
+            return cmd_decisions(args, runner, now)
         if args.action == "comment":
             return cmd_comment(args, runner, now)
         if args.action == "whoami":

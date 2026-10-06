@@ -62,9 +62,9 @@ Once ever: `init` (it also creates the charter labels in the repo and labels the
 | When | You run | It does |
 |---|---|---|
 | Start, or after a reboot | `bin/switchboard-trial up` | Starts whatever is not running: the v2 service, the daemon, the workspace, `cos` and `platform`. |
-| Run it again while things are up | `up` | Nothing to the parts that are running. It never restarts the v2 service, which would cut the panes off mid-turn. |
+| Run it again while things are up | `up` | Nothing to the parts that are running. It never restarts the v2 service, which would cut the panes off mid-turn. It installs the Decisions plugin into the profile (idempotent) and refreshes the wrapper if it is older than the plugin needs; a TUI that is already open does not see either until it is restarted. |
 | After `down` or a reboot | `up` | Reopens `cos` and `platform` on their **existing sessions**, so the conversation is kept. `up --fresh` creates new sessions instead. |
-| An agent needs a fresh process | `bin/switchboard-trial restart [cos] [platform]` | Closes the agent's pane and reopens it on the **same session**. Use it after updating the kit or the token: a new process gets the wrapper's current environment and the current role files. No names means both. |
+| An agent needs a fresh process | `bin/switchboard-trial restart [cos] [platform]` | Closes the agent's pane and reopens it on the **same session**. Use it after updating the kit or the token: a new process gets the wrapper's current environment, the current role files and the Decisions plugin. No names means both. |
 | Stop | `bin/switchboard-trial down` | Stops the daemon and the service. Closing the workspace is yours. |
 
 Not needed each time: logging in again, setting up the repo, or exporting the
@@ -103,6 +103,21 @@ Each of these is something the stack claims; watch whether it holds.
 7. **Nothing types into your panes.** A draft you leave in an agent's input box
    survives anything the switchboard delivers.
 
+8. **The Decisions list.** Open a session in a terminal at least 140 columns wide
+   and look at the right sidebar: below the session's own sections there is a
+   **Decisions (N)** section. Put the `<user>:awaiting-user` label on an issue in
+   the repo (`<user>` is `whoami`), or have a coder run `fleet-switchboard report
+   question "<one line>"`: within a few seconds a row appears with an id, how long
+   it has waited and its title. Refer to it by id in chat ("answer #5: yes"). Take
+   the label off, or answer the coder with `send`, and the row goes. An empty list
+   shows `none`. Stop the daemon (`down`, then wait two minutes) and the section
+   reads `daemon not updating` rather than a stale list. In a terminal without the
+   plugin, or before you restart a TUI, `fleet-switchboard decisions` prints the
+   same list (run it with the trial's config, as for `pending` below) and
+   `decisions --watch` keeps it on screen in a herdr side pane. Agents should say
+   a decision once, with its id, and not repeat it: ask `cos` "what is waiting on
+   me?" and it should answer "see Decisions".
+
 The sidebar badge (`unread`) is only shown if your herdr sidebar config uses
 the `$unread` token; that setting is yours.
 
@@ -112,6 +127,7 @@ the `$unread` token; that setting is yours.
 |---|---|
 | Everything the switchboard did | `<trial dir>/profile/state/fleet-switchboard/audit.jsonl` |
 | The daemon's own output | `<trial dir>/daemon.log` |
+| What waits on you | The **Decisions** section of the TUI sidebar, or `fleet-switchboard decisions` (with the trial's config, as below); the file is `<trial dir>/profile/state/fleet-switchboard/decisions.json` |
 | What is pending for an agent, and why it waits | `fleet-switchboard pending <name>` (run it with the trial's config: `XDG_CONFIG_HOME=<trial dir>/profile/config XDG_STATE_HOME=<trial dir>/profile/state`) |
 
 `<trial dir>` is `$XDG_DATA_HOME/fleet-switchboard-trial`, by default
@@ -138,6 +154,9 @@ the `$unread` token; that setting is yours.
 - The classifier acts (`classifier_mode: act`) in the trial, with the default
   confidence threshold of 0.7. It was right on 15 of 15 hand-written cases; real
   conversations are the test.
+- The Decisions section is only drawn on the session screen, and only in a
+  terminal wide enough for the sidebar; v2 gives plugins no documented API, so a
+  v2 upgrade can drop it silently (the command is the fallback).
 - The sidebar badge, the Lab tier of several scenarios and the lab-model
   scenarios are not exercised here; the trial is for you to find what they
   would have.

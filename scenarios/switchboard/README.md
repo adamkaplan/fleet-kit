@@ -62,6 +62,9 @@ is how many.
 | `tool-call` | a cast member | `tool` (`shell`, `edit`, `webfetch`, `subagent`, `read`, `glob`, `grep`, `skill`, `other`), `arguments`, [`configured`: `allow`, `ask`, `deny`] | The agent makes a tool call; the offline runner sends it through `judge-tool`'s own path against fakes and Jev's replay answers (`scenarios/jev/policy.json`). An `ask` blocks the agent as v2 does (PR 9). Offline only: the Lab tier is owed to the real plugin |
 | `import-v1` | world | `agent`, `fixture` | `fleet-switchboard import-v1` for that cast member, from a hand-made v1 export under `scenarios/` (`scenarios/v1-fixtures/`), with the cast's role, `reports_to`, issue and charter as its `metadata.fleet`. The member has no session until the step runs. Then the runner opens a pane on the imported session, the step a person does (PR 10) |
 | `report` | a cast member | `state` (`done`, `failed`, `blocked`, `question`, `working`, `paused`), `text` (one line), [`issue`] | `fleet-switchboard report` as that member (PR 13). Offline only |
+| `send` | a cast member | `to`, `text` (one line), [`issue`] | `fleet-switchboard send` as that member (PR 14). Offline only |
+| `awaiting` | you, world, a cast member | `issue`, `on` (true puts your awaiting-user label on the issue, false takes it off), [`title`] | The label changes on the fake GitHub and its `issues` webhook event reaches the hub (PR 14). Offline only |
+| `delete-decisions` | world | none | `decisions.json` is deleted, as in D4; the next pass writes it again (PR 14). Offline only |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations
@@ -89,6 +92,8 @@ is how many.
 | `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
 | `imported_messages` | `agent`, [`count`] | v2 holds the imported session with one message per v1 message (`count`, default: all of them), in v1's order, with v1's timestamps and the text that was typed (PR 10) |
 | `lists_asks` | `agent`, `issue` | `fleet-switchboard intents`, run in the pane that shows the agent's session, lists the ask `issue`: the agent is found by its `metadata.fleet` (PR 10) |
+| `decisions` | `at`, `count`, [`text`] | At the time `at`, the list `fleet-switchboard decisions` reads from `decisions.json` has `count` decisions (those whose title holds `text`, if given); a file the command calls stale lists none (PR 14). Offline only |
+| `decisions_say` | `at`, `text` | At the time `at`, the command's output contains `text` (PR 14). The Lab reads it only when the play ends, so `at` must be the time of the last step there |
 
 **Mode.** Whether a message was a note or a wake is read from what it did,
 in both runners, not from the flags it was sent with. A message is a **wake**

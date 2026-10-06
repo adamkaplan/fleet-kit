@@ -45,6 +45,11 @@ changes and failures; the final report names the result and its evidence link, t
 once, and the second time its orchestrator is told it stopped. When woken by something that
 changes nothing for you, do not report and do not answer at length.
 
+A `question` or `blocked` report is also what a decision waiting on someone looks like: the
+person you report to sees open ones in a read-only Decisions list, each with an id. Say it once, in
+the report, and do not repeat "I am still waiting" in later replies; the boss's `send` on that ask
+answers it.
+
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
 and CI is green on the PR head` is one, because a coder can tell on its own

@@ -39,6 +39,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.parse
 from unittest import mock
 
 BIN = Path(__file__).resolve().parent
@@ -161,6 +162,7 @@ class TestConfig(Base):
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
+            "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "intent_repo": None, "intent_required": True,
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
             "policy": sb.POLICY_DEFAULTS,  # PR 9
@@ -736,7 +738,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
               "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion",
               "no-import-metadata", "idle-wakes", "no-rider", "no-nudge-once", "no-fail-open",
-              "ignore-reports", "no-description")
+              "ignore-reports", "no-description",
+              "no-decisions-file", "stale-as-fresh", "decision-resolves-never")  # PR 14
 
 
 class TestFaults(Base):
@@ -1004,6 +1007,9 @@ STEP_EXAMPLES = {
     "launch": {"agent": "coder", "brief": "Add a health check"},
     "handoff": {"issue": 2, "brief": "Done so far: a\nNext steps: b"},  # PR 8
     "report": {"state": "done", "text": "PR is up", "issue": 2},  # PR 13
+    "awaiting": {"issue": 5, "on": True, "title": "Pick the database"},  # PR 14
+    "send": {"to": "platform", "text": "use postgres", "issue": 2},
+    "delete-decisions": {},
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1024,6 +1030,8 @@ EXPECT_EXAMPLES = {
     "no_typing": {"agent": "coder"},
     "message_shows": {"to": "platform", "text": "no intent recorded"},  # PR 6
     "intent_gap": {"issue": 2},
+    "decisions": {"at": "30s", "count": 1, "text": "Which database?"},  # PR 14
+    "decisions_say": {"at": "30s", "text": "not updating"},
 }
 
 
@@ -1920,7 +1928,7 @@ class World:
                               sb.HerdrClient(FAKE_HERDR, self.herdr, socket_call=self.herdr.socket),
                               sb.AuditLog(self.audit_path) if writable else None,
                               sb.fact_sources(self.state), self.clock.now, actor,
-                              intents=getattr(self, "intents", None))
+                              intents=getattr(self, "intents", None), state_dir=self.state)
 
     def route(self, argv, **kwargs):
         """One runner for the CLI: each fake answers its own binary; nothing else runs."""
@@ -3665,6 +3673,7 @@ class OfflineRun:
         self.daemon = True
         self.crashed_writes = set()
         self.launched = {}
+        self.snapshots = {}  # PR 14: second -> what `fleet-switchboard decisions` showed then, for the decisions oracles
 
     @staticmethod
     def fleet_of(member):
@@ -3680,7 +3689,19 @@ class OfflineRun:
                 self.apply(steps.pop(0))
             if self.daemon and second % self.POLL == 0:
                 self.one_pass(())
+            if second in self.snapshot_times():
+                self.snapshot(second)
         return self
+
+    def snapshot_times(self):
+        return {sc.duration_seconds(e["at"]) for e in self.scenario["expect"] if e["that"] in ("decisions", "decisions_say")}
+
+    def snapshot(self, second):
+        """PR 14: the file the daemon keeps, as `fleet-switchboard decisions` would read it at this second."""
+        os.environ[sb.FAULT_ENV] = ",".join(self.faults)
+        now = self.world.clock.now()
+        report = sb.decisions_report(self.world.state, now)
+        self.snapshots[second] = {"report": report, "text": sb.format_decisions(report, now)}
 
     def apply(self, step):
         do, world = step["do"], self.world
@@ -3704,6 +3725,12 @@ class OfflineRun:
         elif do == "report":  # PR 13: `fleet-switchboard report`, as the cast member's model would run it
             os.environ[sb.FAULT_ENV] = ",".join(self.faults)
             world.new_engine("cli").report(step["actor"], step["state"], step["text"], step.get("issue"))
+        elif do == "send":  # PR 14: `fleet-switchboard send`, as the cast member's model would run it
+            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
+            world.new_engine("cli").send(step["actor"], step["to"], step["text"], step.get("issue"))
+        elif do == "delete-decisions":  # PR 14: the projection is disposable; the daemon makes it again
+            if (world.state / sb.DECISIONS_FILE).exists():  # under `no-decisions-file` there is none to delete
+                (world.state / sb.DECISIONS_FILE).unlink()
         elif do == "pass":
             self.one_pass(step.get("faults", ()))
         elif do == "kill-daemon":
@@ -4083,7 +4110,7 @@ for _path in sc.scenario_files(sc.DEFAULT_DIR):
 
 GH_REPO = "fleet/scratch"
 GH_BIN = "/fake/bin/gh"
-GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook")
+GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook", "awaiting")
 
 
 class FakeProc:
@@ -4133,6 +4160,17 @@ class FakeGitHub:
             obj["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (self.repo, parent)
         self.issues[number] = obj
         return obj
+
+    def set_label(self, number, name, on, title=None):
+        """PR 14: put a label on an issue or take it off, and send the `issues` event GitHub would."""
+        issue = self.issues.get(number) or self.issue(number)
+        names = [label["name"] for label in issue["labels"] if label["name"] != name] + ([name] if on else [])
+        issue["labels"] = [{"name": n} for n in names]
+        if title:
+            issue["title"] = title
+        issue["updated_at"] = self.stamp()
+        return self.send("issues", {"action": "labeled" if on else "unlabeled", "issue": dict(issue),
+                                    "label": {"name": name}})
 
     def pull(self, number, closes=(), title="a change", state="open", merged=False):
         body = " ".join("Closes #%d." % n for n in closes)
@@ -4206,7 +4244,13 @@ class FakeGitHub:
         if path == "issues":
             as_issue = [dict(p, pull_request={"url": "https://api.github.com/repos/x/pulls/%d" % p["number"]})
                         for p in self.pulls.values()]
-            return self.since(list(self.issues.values()) + as_issue, query)
+            found = self.since(list(self.issues.values()) + as_issue, query)
+            if "labels" in query:  # PR 14: the read of the issues that carry one label
+                wanted = urllib.parse.unquote(query["labels"])
+                found = [i for i in found if wanted in [label["name"] for label in i.get("labels") or []]]
+            if query.get("state") == "open":
+                found = [i for i in found if i.get("state", "open") == "open"]
+            return found
         if parts[0] == "issues" and len(parts) == 2:
             number = int(parts[1])
             if number in self.issues:
@@ -4318,6 +4362,8 @@ def _github_extend_offline_run():
             self.gh.kill_forwarder()
         elif do == "occupy-hook":
             self.gh.occupied = True
+        elif do == "awaiting":  # PR 14
+            self.gh.set_label(int(step["issue"]), sb.awaiting_label(self.world.config), step["on"], step.get("title"))
         else:
             original_apply(self, step)
         if self.hub is not None and do == "kill-daemon":
@@ -12695,6 +12741,931 @@ class TestReportScenarios(Base):
 
     def test_the_report_step_is_in_the_vocabulary(self):
         self.assertEqual(set(sc.STEP_FIELDS["report"]), {"state", "text", "issue"})
+
+
+# ======================================================================
+# PR 14: Decisions, a read-only list of what waits on the human
+#
+# docs/switchboard.md, "Decisions (PR 14)". The faults added here:
+# no-decisions-file, stale-as-fresh, decision-resolves-never.
+# ======================================================================
+DECISION_LABEL = "me:awaiting-user"
+
+
+class DecisionsBase(ReportBase):
+    """A platform (the boss) and a coder (its worker, issue 2); the engine writes into the world's state dir."""
+
+    def decisions(self, world=None):
+        world = world or self.world
+        world.engine.discover(world.clock.now())
+        world.engine.collect_facts()
+        return sb.derive_decisions(world.engine, world.clock.now())
+
+    def listed(self, world=None):
+        return self.decisions(world)[0]
+
+    def file(self, world=None):
+        return json.loads(((world or self.world).state / sb.DECISIONS_FILE).read_text())
+
+    def ask_the_boss(self, text="Which database?", state="question", sender="coder", issue=None):
+        self.world.new_engine("cli").report(sender, state, text, issue)
+        self.world.tick(1)
+
+    def cli(self, *argv, **env):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for name, value in env.items():
+            os.environ[name] = value
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+
+class TestDecisionIds(unittest.TestCase):
+    def item(self, seed, ask=None, agent="coder", bare=False, since=EPOCH):
+        return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since}
+
+    def test_an_issues_own_label_is_the_bare_issue_number(self):
+        (found,) = sb.assign_decision_ids([self.item("gh:acme/x#5", ask=5, bare=True)])
+        self.assertEqual(found, "#5")
+
+    def test_other_decisions_on_an_issue_get_a_short_letter_suffix_the_same_every_time(self):
+        first = sb.assign_decision_ids([self.item("per:ses_1:a", ask=2)])
+        again = sb.assign_decision_ids([self.item("per:ses_1:a", ask=2)])
+        self.assertEqual(first, again)
+        self.assertRegex(first[0], r"^#2[a-z]{2}$")
+
+    def test_a_decision_with_no_issue_is_named_for_its_agent_and_a_number(self):
+        (found,) = sb.assign_decision_ids([self.item("per:ses_1:a", agent="platform")])
+        self.assertRegex(found, r"^platform-[0-9]{3}$")
+
+    def test_an_id_does_not_change_when_another_decision_on_the_issue_goes_away(self):
+        one, two = self.item("per:ses_1:a", ask=2), self.item("per:ses_1:b", ask=2, since=EPOCH + 1)
+        both = sb.assign_decision_ids([one, two])
+        alone = sb.assign_decision_ids([two])
+        self.assertEqual(both[1], alone[0])
+        self.assertNotEqual(both[0], both[1])
+
+    def test_two_open_decisions_never_share_an_id_even_when_their_hashes_collide(self):
+        items = [self.item("seed-%d" % n, ask=2, since=EPOCH + n) for n in range(300)]
+        ids = sb.assign_decision_ids(items)
+        self.assertEqual(len(set(ids)), 300)
+
+    def test_the_same_issue_number_in_two_repos_is_not_one_id(self):
+        ids = sb.assign_decision_ids([self.item("gh:a/x#5", ask=5, bare=True), self.item("gh:b/x#5", ask=5, bare=True,
+                                                                                    since=EPOCH + 1)])
+        self.assertEqual(ids[0], "#5")
+        self.assertNotEqual(ids[1], "#5")
+
+
+class TestDecisionDerivation(DecisionsBase):
+    def test_a_pending_permission_request_is_a_decision_for_its_agent(self):
+        ask = self.block(timed=True)
+        (found,) = self.listed()
+        self.assertEqual((found["kind"], found["agent"], found["ask"]), ("permission", "coder", 2))
+        self.assertRegex(found["id"], r"^#2[a-z]{2}$")
+        self.assertIn("shell echo hi", found["title"])
+        self.assertEqual(found["since"], sb.iso(EPOCH))
+        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "since", "title"])
+
+    def test_an_agent_with_no_boss_is_listed_too(self):
+        self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
+        (found,) = self.listed()
+        self.assertEqual((found["agent"], found["kind"], found["ask"]), ("platform", "permission", None))
+        self.assertRegex(found["id"], r"^platform-[0-9]{3}$")
+
+    def test_a_pending_question_is_a_decision_of_kind_question(self):
+        self.block()
+        self.world.v2.asks.pop(self.coder)
+        self.world.v2.__dict__.setdefault("forms", {})[self.coder] = [{"id": "frm_1", "title": "Which database?"}]
+        (found,) = self.listed()
+        self.assertEqual((found["kind"], found["title"].endswith("Which database?")), ("question", True))
+
+    def test_answering_the_request_ends_the_decision(self):
+        self.block()
+        self.assertEqual(len(self.listed()), 1)
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = None
+        self.world.v2.answer_permissions(self.coder)
+        self.assertEqual(self.listed(), [])
+
+    def test_a_request_without_a_time_keeps_one_since_across_passes(self):
+        self.block()
+        (first,) = self.listed()
+        self.world.tick(60)
+        (again,) = self.listed()
+        self.assertEqual((again["since"], again["id"]), (first["since"], first["id"]))
+
+    def test_a_report_question_delivered_to_the_boss_is_a_decision_of_kind_report(self):
+        self.ask_the_boss("Which database?")
+        (found,) = self.listed()
+        self.assertEqual((found["kind"], found["agent"], found["ask"], found["title"]),
+                         ("report", "coder", 2, "Which database?"))
+
+    def test_a_blocked_report_says_so_in_its_title(self):
+        self.ask_the_boss("waiting on the key", state="blocked")
+        (found,) = self.listed()
+        self.assertEqual(found["title"], "blocked: waiting on the key")
+
+    def test_done_failed_and_progress_reports_are_not_decisions(self):
+        for state in ("done", "failed", "working", "paused"):
+            self.ask_the_boss("something", state=state)
+        self.assertEqual(self.listed(), [])
+
+    def test_a_later_send_from_the_boss_on_the_same_ask_resolves_the_report(self):
+        self.ask_the_boss("Which database?")
+        self.assertEqual(len(self.listed()), 1)
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [])
+
+    def test_a_send_about_another_ask_does_not_resolve_it(self):
+        self.ask_the_boss("Which database?")
+        self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)
+        self.world.tick(1)
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_a_send_from_someone_else_does_not_resolve_it(self):
+        self.world.add_agent("coder2", fleet={"role": "coder", "reports_to": "platform", "issue": 3})
+        self.ask_the_boss("Which database?")
+        self.world.new_engine("cli").send("coder2", "coder", "i think postgres", 2)
+        self.world.tick(1)
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_a_send_that_came_before_the_report_does_not_resolve_it(self):
+        self.world.new_engine("cli").send("platform", "coder", "start on it", 2)
+        self.world.tick(2)
+        self.ask_the_boss("Which database?")
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_a_newer_report_from_the_worker_on_the_ask_resolves_the_older_one(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("never mind, found it", state="done")
+        self.assertEqual(self.listed(), [])
+
+    def test_a_second_question_replaces_the_first(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("And which region?")
+        (found,) = self.listed()
+        self.assertEqual(found["title"], "And which region?")
+
+    def test_a_report_on_another_ask_does_not_resolve_a_question(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("done with the other one", state="done", issue=9)
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_the_id_of_an_open_report_is_the_same_on_every_derivation(self):
+        self.ask_the_boss("Which database?")
+        (first,) = self.listed()
+        self.world.tick(30)
+        self.world.engine = self.world.new_engine()
+        (again,) = self.listed()
+        self.assertEqual((again["id"], again["since"]), (first["id"], first["since"]))
+
+    def test_an_unchanged_transcript_is_not_read_again_in_full(self):
+        self.ask_the_boss("Which database?")
+        self.listed()
+        with mock.patch.object(self.world.engine.v2, "message_pages", wraps=self.world.engine.v2.message_pages) as pages:
+            self.assertEqual(len(self.listed()), 1)
+        self.assertEqual(pages.call_count, 0, "one message of each boss and worker is enough to know nothing changed")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [], "a new message is read, and the answer is seen")
+
+    def test_the_list_is_oldest_first(self):
+        self.ask_the_boss("first question")
+        self.world.tick(30)
+        self.block(timed=True)
+        found = self.listed()
+        self.assertEqual([d["kind"] for d in found], ["report", "permission"])
+
+    def test_a_titles_credential_is_taken_out(self):
+        self.ask_the_boss("use Bearer sk-abcdef123456 to log in")
+        (found,) = self.listed()
+        self.assertNotIn("sk-abcdef123456", found["title"])
+
+    def test_the_decision_resolves_never_fault_keeps_a_resolved_report_listed(self):
+        self.ask_the_boss("Which database?")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        os.environ[sb.FAULT_ENV] = "decision-resolves-never"
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_a_failing_source_does_not_hide_the_others(self):
+        self.ask_the_boss("Which database?")
+        with mock.patch.object(sb, "decisions_from_requests", side_effect=RuntimeError("v2 is broken")):
+            found, errors = self.decisions()
+        self.assertEqual([d["kind"] for d in found], ["report"])
+        self.assertEqual([(e["source"], "v2 is broken" in e["error"]) for e in errors], [("v2", True)])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.error"])
+
+
+class TestDecisionsFromGitHub(Base):
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, config={"awaiting_label": DECISION_LABEL})
+        self.world, self.gh, self.hub = self.rig.world, self.rig.gh, self.rig.hub
+
+    def derive(self):
+        self.world.engine.discover(self.world.clock.now())
+        return sb.derive_decisions(self.world.engine, self.world.clock.now())
+
+    def test_a_labelled_open_issue_is_a_decision_of_kind_issue(self):
+        self.gh.issue(5, title="Close #2? and a second deploy run?", labels=[DECISION_LABEL, "bug"])
+        self.gh.issue(6, title="no label", labels=["bug"])
+        self.rig.pump(15)
+        found, errors = self.derive()
+        self.assertEqual(errors, [])
+        (one,) = found
+        self.assertEqual((one["id"], one["kind"], one["ask"], one["title"]),
+                         ("#5", "issue", 5, "Close #2? and a second deploy run?"))
+
+    def test_the_label_name_is_the_os_users_unless_the_config_names_one(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_label({"awaiting_label": None}), "osuser:awaiting-user")
+        self.assertEqual(sb.awaiting_label({"awaiting_label": "x:waiting"}), "x:waiting")
+
+    def test_the_owner_of_the_issue_is_the_agent(self):
+        self.gh.issue(1, title="charter", labels=[DECISION_LABEL])
+        self.rig.pump(15)
+        (one,) = self.derive()[0]
+        self.assertEqual(one["agent"], "platform")
+
+    def test_a_webhook_adds_and_removes_the_decision_with_no_gh_call(self):
+        self.rig.pump(15)
+        calls = len(self.gh.api_calls)
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.gh.send("issues", {"action": "labeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
+        self.assertEqual([d["id"] for d in self.derive()[0]], ["#7"])
+        issue["labels"] = []
+        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
+        self.assertEqual(self.derive()[0], [])
+        self.assertEqual(len(self.gh.api_calls), calls)
+
+    def test_a_closed_issue_is_not_a_decision(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.assertEqual(len(self.derive()[0]), 1)
+        issue["state"] = "closed"
+        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        self.assertEqual(self.derive()[0], [])
+
+    def test_derivation_adds_no_gh_call_per_pass(self):
+        self.gh.issue(5, title="A", labels=[DECISION_LABEL])
+        self.rig.pump(15)
+        calls = len(self.gh.api_calls)
+        for _ in range(5):
+            self.world.tick(5)
+            self.world.engine.run_pass()
+            self.derive()
+        self.assertEqual(len(self.gh.api_calls), calls)
+
+    def test_a_failed_read_is_an_error_in_the_list_and_not_a_hidden_list(self):
+        self.gh.issue(5, title="A", labels=[DECISION_LABEL])
+        self.gh.api_down = True
+        self.rig.pump(15)
+        found, errors = self.derive()
+        self.assertEqual(found, [])
+        self.assertEqual([e["source"] for e in errors], ["github"])
+
+    def test_before_the_first_read_the_list_says_github_is_not_read_yet(self):
+        found, errors = self.derive()
+        self.assertEqual((found, [e["source"] for e in errors]), ([], ["github"]))
+        self.assertIn("not read yet", errors[0]["error"])
+
+    def test_a_pull_request_with_the_label_is_not_a_decision(self):
+        self.gh.pull(8)
+        self.gh.pulls[8]["labels"] = [{"name": DECISION_LABEL}]
+        self.rig.pump(15)
+        self.assertEqual(self.derive()[0], [])
+
+
+class TestDecisionsFile(DecisionsBase):
+    def pass_(self, seconds=5):
+        self.world.tick(seconds)
+        return self.world.engine.run_pass()
+
+    def test_a_pass_writes_the_file_with_its_shape(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        body = self.file()
+        self.assertEqual(sorted(body), ["daemon_pid", "decisions", "errors", "generation", "written_at"])
+        self.assertEqual((body["generation"], body["daemon_pid"], body["errors"]), (1, os.getpid(), []))
+        self.assertEqual(body["written_at"], sb.iso(self.world.clock.now()))
+        self.assertEqual([d["title"] for d in body["decisions"]], ["Which database?"])
+
+    def test_an_empty_list_is_still_written(self):
+        self.pass_()
+        self.assertEqual(self.file()["decisions"], [])
+
+    def test_an_unchanged_list_is_not_rewritten_but_the_file_stays_fresh(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        path = self.world.state / sb.DECISIONS_FILE
+        text = path.read_text()
+        self.pass_(30)
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(path.stat().st_mtime, self.world.clock.now(), "the pass touched it: the daemon is alive")
+
+    def test_a_change_bumps_the_generation(self):
+        self.pass_()
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.assertEqual(self.file()["generation"], 2)
+
+    def test_the_file_is_replaced_by_rename_so_a_reader_never_sees_half_of_it(self):
+        self.ask_the_boss("Which database?")
+        with mock.patch.object(sb.os, "replace", wraps=os.replace) as replaced:
+            self.pass_()
+        (call,) = replaced.call_args_list
+        self.assertTrue(call[0][0].endswith(".tmp"))
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if "decisions" in p.name),
+                         [sb.DECISIONS_FILE])
+
+    def test_a_deleted_file_is_rewritten_by_the_next_pass_with_nothing_lost(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        before = self.file()["decisions"]
+        (self.world.state / sb.DECISIONS_FILE).unlink()
+        self.pass_()
+        self.assertEqual(self.file()["decisions"], before)
+
+    def test_a_file_that_is_not_json_is_replaced(self):
+        self.pass_()
+        (self.world.state / sb.DECISIONS_FILE).write_text("{not json")
+        self.pass_()
+        self.assertEqual(self.file()["decisions"], [])
+
+    def test_a_failing_source_is_recorded_in_the_file_and_audited_once(self):
+        self.ask_the_boss("Which database?")
+        with mock.patch.object(sb, "decisions_from_requests", side_effect=RuntimeError("v2 is broken")):
+            self.pass_()
+            self.pass_()
+        body = self.file()
+        self.assertEqual([d["kind"] for d in body["decisions"]], ["report"])
+        self.assertEqual([e["source"] for e in body["errors"]], ["v2"])
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "decisions.error"]), 1)
+
+    def test_a_pass_that_cannot_derive_still_finishes_and_says_so(self):
+        with mock.patch.object(sb, "derive_decisions", side_effect=RuntimeError("boom")):
+            report = self.pass_()
+        self.assertEqual([e["step"] for e in report["errors"]], ["decisions"])
+
+    def test_the_file_is_private(self):
+        self.pass_()
+        self.assertEqual(stat.S_IMODE((self.world.state / sb.DECISIONS_FILE).stat().st_mode), 0o600)
+
+    def test_the_no_decisions_file_fault_never_writes_it(self):
+        os.environ[sb.FAULT_ENV] = "no-decisions-file"
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.assertFalse((self.world.state / sb.DECISIONS_FILE).exists())
+
+    def test_a_read_only_engine_writes_nothing(self):
+        engine = self.world.new_engine(writable=False)
+        engine.run_pass()
+        self.assertFalse((self.world.state / sb.DECISIONS_FILE).exists())
+
+    def test_the_file_holds_no_secret_and_no_prompt_text(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-secret-value"
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.assertNotIn("sk-or-secret-value", (self.world.state / sb.DECISIONS_FILE).read_text())
+
+
+class TestDecisionsCommand(DecisionsBase):
+    def pass_(self, seconds=5):
+        self.world.tick(seconds)
+        self.world.engine.run_pass()
+
+    def test_an_empty_list_says_so_and_never_prints_nothing(self):
+        self.pass_()
+        code, out, err = self.cli("decisions")
+        self.assertEqual((code, out), (0, "No decisions are waiting on you.\n"), err)
+
+    def test_each_decision_is_one_line_with_id_age_agent_and_title(self):
+        self.ask_the_boss("Close #2? and a second deploy run?")
+        self.pass_(5)
+        self.world.tick(11 * 60)
+        os.utime(str(self.world.state / sb.DECISIONS_FILE), (self.world.clock.now(),) * 2)
+        code, out, err = self.cli("decisions")
+        (line,) = out.splitlines()
+        self.assertRegex(line, r"^#2[a-z]{2}  waiting 11m  coder  Close #2\? and a second deploy run\?$")
+
+    def test_columns_line_up_when_ids_differ_in_width(self):
+        self.ask_the_boss("first")
+        self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
+        self.pass_(1)
+        code, out, err = self.cli("decisions")
+        first, second = out.splitlines()
+        self.assertEqual(first.index("waiting"), second.index("waiting"))
+
+    def test_json_prints_the_files_list(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        code, out, err = self.cli("decisions", "--json")
+        body = json.loads(out)
+        self.assertEqual((code, body["stale"], [d["title"] for d in body["decisions"]]), (0, False, ["Which database?"]))
+
+    def test_a_missing_file_says_the_daemon_is_not_updating_in_every_format(self):
+        for argv in (["decisions"], ["decisions", "--json"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.cli(*argv)
+                self.assertEqual(code, 1)
+                self.assertIn("the daemon is not updating this list", out)
+
+    def test_a_file_older_than_two_minutes_is_stale_not_current(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.world.tick(121)
+        code, out, err = self.cli("decisions")
+        self.assertEqual(code, 1)
+        self.assertIn("the daemon is not updating this list", out)
+        self.assertNotIn("Which database?", out)
+        code, out, err = self.cli("decisions", "--json")
+        self.assertEqual((json.loads(out)["stale"], code), (True, 1))
+        self.world.clock.t -= 10
+        self.assertEqual(self.cli("decisions")[0], 0, "two minutes is the edge")
+
+    def test_a_file_that_is_not_json_is_unreadable_not_empty(self):
+        self.pass_()
+        (self.world.state / sb.DECISIONS_FILE).write_text("{nope")
+        code, out, err = self.cli("decisions")
+        self.assertEqual(code, 1)
+        self.assertIn("the daemon is not updating this list", out)
+
+    def test_the_stale_as_fresh_fault_shows_a_stale_list_as_current(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.world.tick(600)
+        code, out, err = self.cli("decisions", **{sb.FAULT_ENV: "stale-as-fresh"})
+        self.assertEqual(code, 0)
+        self.assertIn("Which database?", out)
+        self.assertNotIn("not updating", out)
+
+    def test_fresh_recomputes_without_the_file(self):
+        self.ask_the_boss("Which database?")
+        code, out, err = self.cli("decisions", "--fresh")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Which database?", out)
+        self.assertFalse((self.world.state / sb.DECISIONS_FILE).exists(), "--fresh writes nothing")
+
+    def test_fresh_json_has_the_list_and_the_errors(self):
+        self.ask_the_boss("Which database?")
+        code, out, err = self.cli("decisions", "--fresh", "--json")
+        body = json.loads(out)
+        self.assertEqual((code, body["stale"], body["errors"], len(body["decisions"])), (0, False, [], 1))
+
+    def test_watch_with_fresh_is_refused(self):
+        code, out, err = self.cli("decisions", "--watch", "--fresh")
+        self.assertEqual(code, 2)
+
+    def test_watch_redraws_when_the_file_changes_and_stops_on_interrupt(self):
+        self.pass_()
+        draws = []
+        steps = iter([lambda: self.ask_the_boss("Which database?") or self.pass_(), lambda: None,
+                      lambda: (_ for _ in ()).throw(KeyboardInterrupt)])
+
+        def sleep(seconds):
+            self.assertEqual(seconds, 1)
+            next(steps)()
+
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.watch_decisions(self.world.state, self.world.clock.now, sleep, out.write)
+            text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertEqual(text.count("No decisions are waiting on you."), 1)
+        self.assertEqual(text.count("Which database?"), 1, "redrawn once for one change")
+
+    def test_help_and_status_show_the_command(self):
+        with self.assertRaises(SystemExit), captured() as (out, err):
+            sb.build_parser().parse_args(["decisions", "--help"])
+        self.assertIn("decisions", sb.build_parser().format_help())
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertIn("decisions", report)
+        self.pass_()
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertEqual((report["decisions"]["stale"], report["decisions"]["count"]), (False, 0))
+        self.assertIn("decisions", sb.format_status(report))
+        self.assertIn("fleet-switchboard decisions", sb.__doc__)
+
+    def test_the_command_reads_a_file_and_asks_nobody(self):
+        self.pass_()
+        before = len(self.world.v2.calls)
+        self.cli("decisions")
+        self.assertEqual(len(self.world.v2.calls), before)
+        self.assertEqual(self.world.herdr.calls[len(self.world.herdr.calls):], [])
+
+
+@adds_to(OfflineRun)
+def oracle_decisions(self, e):
+    """PR 14: the list the command shows at `at`: `count` decisions, those whose title holds `text` when given.
+    A file the command calls stale shows no list at all."""
+    seen = self.snapshots[sc.duration_seconds(e["at"])]["report"]
+    shown = [] if seen["stale"] else [d for d in seen["decisions"] if e.get("text", "") in d["title"]]
+    return len(shown) == e["count"], "at %s the command %s; %d matching decision(s): %s" % (
+        e["at"], "calls the list stale" if seen["stale"] else "shows %d" % len(seen["decisions"]), len(shown),
+        [d["id"] for d in shown])
+
+
+@adds_to(OfflineRun)
+def oracle_decisions_say(self, e):
+    text = self.snapshots[sc.duration_seconds(e["at"])]["text"]
+    return e["text"] in text, "at %s the command printed: %s" % (e["at"], _one_line_of(text))
+
+
+def _one_line_of(text, limit=120):
+    return " / ".join(text.splitlines())[:limit]
+
+
+class TestDecisionsConfigAndDaemon(DecisionsBase):
+    def test_the_label_and_the_look_back_are_checked(self):
+        self.assertEqual(sb.validate_config({"awaiting_label": "me:waiting"})["awaiting_label"], "me:waiting")
+        for raw in ({"awaiting_label": ""}, {"awaiting_label": 3}, {"awaiting_label": "a,b"},
+                    {"decisions_lookback_hours": 0}, {"decisions_lookback_hours": "3"}):
+            with self.subTest(raw=raw), self.assertRaises(sb.ConfigError):
+                sb.validate_config(raw)
+
+    def test_run_once_writes_the_file(self):
+        self.ask_the_boss("Which database?")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured():
+            code = sb.main(["run", "--once"], runner=self.world.route, now=self.world.clock.now)
+        self.assertEqual(code, 0)
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+
+    def test_the_daemons_loop_keeps_the_file_current_every_pass(self):
+        self.ask_the_boss("Which database?")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        engine, state, _ = sb.build_engine(self.world.route, self.world.clock.now, "daemon")
+        sb.run_daemon(engine, state, 5, wait=lambda sock, seconds: self.world.tick(seconds), passes=3)
+        self.assertEqual(self.file()["generation"], 1)
+        self.assertEqual(self.world.state.joinpath(sb.DECISIONS_FILE).stat().st_mtime, self.world.clock.now())
+
+    def test_a_pass_never_writes_decisions_on_a_read_only_look_or_without_a_state_dir(self):
+        engine = sb.Switchboard(self.world.config, self.world.engine.v2, self.world.engine.herdr,
+                                sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state),
+                                self.world.clock.now)
+        engine.run_pass()
+        self.assertFalse((self.world.state / sb.DECISIONS_FILE).exists())
+
+    def test_a_boss_that_cannot_be_read_is_an_error_not_a_hidden_list(self):
+        self.ask_the_boss("Which database?")
+        self.world.engine.discover(self.world.clock.now())
+        self.world.engine.discovery.agents["platform"].problem = "cannot read platform's transcript: boom"
+        found, errors = sb.derive_decisions(self.world.engine, self.world.clock.now())
+        self.assertEqual([e["source"] for e in errors], ["reports"])
+
+    def test_a_worker_that_no_longer_runs_is_not_waited_on(self):
+        self.ask_the_boss("Which database?")
+        del self.world.herdr.panes[self.world.panes["coder"]]
+        self.assertEqual(self.listed(), [])
+
+
+DECISIONS_PLUGIN = REPO / "plugins" / "fleet-decisions-tui"
+DECISIONS_HARNESS = r"""
+import * as d from "%(url)s";
+import { mkdtempSync, writeFileSync, utimesSync, renameSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
+const dir = mkdtempSync(join(%(tmp)s, "dec-"));
+const now = Date.now();
+const results = {};
+const iso = (ms) => new Date(ms).toISOString();
+const put = (body, ageMs = 0) => {
+  const temp = join(dir, "decisions.json.tmp");
+  writeFileSync(temp, typeof body === "string" ? body : JSON.stringify(body));
+  utimesSync(temp, (now - ageMs) / 1000, (now - ageMs) / 1000);
+  renameSync(temp, join(dir, "decisions.json"));
+};
+const list = [
+  { id: "#2ab", title: "Close #2? and a second deploy run?", ask: 2, agent: "platform", kind: "report", since: iso(now - 12 * 60000) },
+  { id: "platform-481", title: "permission: shell " + "x".repeat(200), ask: null, agent: "platform", kind: "permission", since: iso(now - 45000) },
+];
+
+results.unset = [d.stateDirOf({}), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "" }), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "/s" })];
+results.noDir = d.loadSnapshot(null, now).status;
+results.missing = d.loadSnapshot(dir, now).status;
+put("{not json");
+results.garbage = d.loadSnapshot(dir, now).status;
+put({ nothing: true });
+results.wrongShape = d.loadSnapshot(dir, now).status;
+put({ decisions: list, errors: [] });
+const ok = d.loadSnapshot(dir, now);
+results.ok = { status: ok.status, n: ok.decisions.length };
+results.view = d.buildView(ok, now);
+put({ decisions: list, errors: [] }, 121000);
+results.staleStatus = d.loadSnapshot(dir, now).status;
+results.staleView = d.buildView(d.loadSnapshot(dir, now), now);
+put({ decisions: list, errors: [] }, 119000);
+results.edge = d.loadSnapshot(dir, now).status;
+put({ decisions: [], errors: [] });
+results.emptyView = d.buildView(d.loadSnapshot(dir, now), now);
+put({ decisions: [], errors: [{ source: "github", error: "x" }] });
+results.errorsView = d.buildView(d.loadSnapshot(dir, now), now);
+put({ decisions: [{ id: 3 }, null, { id: "#1", title: "fine", since: "nonsense" }], errors: [] });
+results.junkView = d.buildView(d.loadSnapshot(dir, now), now);
+results.ages = [0, 59, 60, 719, 3599, 3600, 3900, 7200, 86399, 86400, 259200, -5].map((s) => d.formatAge(s));
+results.oneLine = [d.oneLine("a\n b\t c", 20), d.oneLine("x".repeat(50), 10), d.oneLine(undefined, 5)];
+results.until = [d.msUntilStale({ status: "ok", ageMs: 100000 }), d.msUntilStale({ status: "ok", ageMs: 0 }), d.msUntilStale({ status: "stale", ageMs: 1 })];
+results.concerns = [d.concernsFile("decisions.json"), d.concernsFile("decisions.json.123.tmp"), d.concernsFile("audit.jsonl"), d.concernsFile(null), d.concernsFile(undefined)];
+results.constants = [d.STALE_MS, d.SAFETY_MS, d.STATE_ENV, d.DECISIONS_FILE, d.NOT_UPDATING];
+rmSync(dir, { recursive: true });
+console.log(JSON.stringify(results));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPlugin(Base):
+    def setUp(self):
+        super().setUp()
+        script = self.home / "decisions-harness.mjs"
+        script.write_text(DECISIONS_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri(),
+                                               "tmp": json.dumps(str(self.home))})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_state_directory_comes_from_the_environment_alone(self):
+        self.assertEqual(self.r["unset"], [None, None, "/s"])
+        self.assertEqual(self.r["noDir"], "unset")
+
+    def test_a_missing_or_unreadable_file_is_never_a_list(self):
+        self.assertEqual((self.r["missing"], self.r["garbage"], self.r["wrongShape"]),
+                         ("missing", "unreadable", "unreadable"))
+
+    def test_a_current_file_is_listed_one_row_each_with_id_age_and_title(self):
+        self.assertEqual(self.r["ok"], {"status": "ok", "n": 2})
+        view = self.r["view"]
+        self.assertEqual(view["title"], "Decisions (2)")
+        first, second = [row["text"] for row in view["rows"]]
+        self.assertEqual(first, "#2ab 12m Close #2? and a second d\u2026")
+        self.assertTrue(second.startswith("platform-481 45s permission:"))
+        for text in (first, second):
+            self.assertLessEqual(len(text), 34)
+            self.assertNotIn("\n", text)
+
+    def test_a_file_older_than_two_minutes_is_not_current_and_says_so(self):
+        self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
+        self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "rows": [{"key": "state", "text": "daemon not updating"}]})
+
+    def test_an_empty_list_shows_none_and_the_section_is_never_empty(self):
+        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0)", "rows": [{"key": "none", "text": "none"}]})
+        for key in ("view", "staleView", "emptyView", "errorsView", "junkView"):
+            self.assertTrue(self.r[key]["rows"], key)
+
+    def test_unreadable_sources_are_said_and_junk_entries_are_skipped(self):
+        self.assertEqual(self.r["errorsView"]["rows"][-1]["text"], "1 source(s) unreadable")
+        self.assertEqual([row["text"] for row in self.r["junkView"]["rows"]], ["#1 ? fine"])
+
+    def test_ages_read_the_same_as_the_command_prints_them(self):
+        self.assertEqual(self.r["ages"], ["0s", "59s", "1m", "11m", "59m", "1h", "1h05m", "2h", "23h59m", "1d", "3d", "0s"])
+        self.assertEqual([sb.format_age(s) for s in (0, 59, 60, 719, 3599, 3600, 3900, 7200, 86399, 86400, 259200, -5)],
+                         self.r["ages"])
+
+    def test_the_stale_timer_and_the_event_filter(self):
+        self.assertEqual(self.r["until"], [21000, 121000, None])
+        self.assertEqual(self.r["concerns"], [True, True, False, True, True])
+        self.assertEqual(self.r["oneLine"], ["a b c", "xxxxxxxxx\u2026", ""])
+
+    def test_the_constants_match_the_daemon_side(self):
+        self.assertEqual(self.r["constants"], [sb.DECISIONS_STALE_SECONDS * 1000, 60000, "FLEET_SWITCHBOARD_STATE",
+                                               sb.DECISIONS_FILE, "daemon not updating"])
+
+
+class TestDecisionsPluginSource(unittest.TestCase):
+    def code(self, name):
+        text = (DECISIONS_PLUGIN / name).read_text()
+        return "\n".join(re.sub(r"//.*$", "", line) for line in text.splitlines())
+
+    def test_the_plugin_has_the_shape_the_spike_verified(self):
+        text = self.code("tui.tsx")
+        self.assertIn("@opentui/solid", (DECISIONS_PLUGIN / "tui.tsx").read_text().splitlines()[0])
+        self.assertIn("export default {", text)
+        self.assertIn('id: "fleet.decisions"', text)
+        self.assertIn("setup(api", text)
+        self.assertIn('append: "sidebar.content"', text)
+        self.assertEqual(json.loads((DECISIONS_PLUGIN / "package.json").read_text())["type"], "module")
+
+    def test_it_watches_the_directory_and_never_the_file_because_the_file_is_replaced_by_rename(self):
+        text = self.code("tui.tsx")
+        self.assertRegex(text, r"watch\(dir,")
+        self.assertNotIn("DECISIONS_FILE", text)
+        self.assertIn("setInterval(refresh, SAFETY_MS)", text)
+
+    def test_it_is_read_only_holds_no_credential_spawns_nothing_and_calls_nothing_over_the_network(self):
+        for name in ("tui.tsx", "decisions.mjs"):
+            code = self.code(name).lower()
+            for needle in ("child_process", "spawn", "exec(", "execsync", "fetch(", "http", "net\"", "api.client",
+                           "writefile", "token", "secret", "password", "openrouter", "onmouse", "dialog", "keymap",
+                           "insertText".lower()):
+                self.assertNotIn(needle, code, "%s: %s" % (name, needle))
+
+    def test_the_files_carry_no_personalisation(self):
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]),
+                             re.IGNORECASE)
+        for path in sorted(DECISIONS_PLUGIN.iterdir()):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                self.assertIsNone(pattern.search(line), "%s:%d %s" % (path.name, number, line))
+
+
+class TestTrialDecisionsPlugin(Base):
+    """PR 14: the trial driver installs the Decisions plugin into its own profile, and says whether it is there."""
+
+    def trial(self):
+        trial = TRIAL.Trial(self.home / "trial")
+        os.makedirs(trial.lab.opencode_config, exist_ok=True)
+        return trial
+
+    def cli_json(self, trial):
+        return json.loads((Path(trial.lab.opencode_config) / "cli.json").read_text())
+
+    def test_it_copies_the_plugin_into_the_profile_and_names_the_directory_in_cli_json(self):
+        trial = self.trial()
+        self.assertEqual(trial.install_decisions_plugin(), "installed")
+        target = Path(trial.lab.opencode_config) / "fleet-decisions"
+        for name in ("tui.tsx", "decisions.mjs"):
+            self.assertEqual((target / name).read_text(), (REPO / "plugins" / "fleet-decisions-tui" / name).read_text())
+        self.assertEqual(self.cli_json(trial), {"plugins": ["./fleet-decisions"]})
+
+    def test_it_is_idempotent_and_keeps_what_cli_json_already_names(self):
+        trial = self.trial()
+        path = Path(trial.lab.opencode_config) / "cli.json"
+        path.write_text(json.dumps({"plugins": ["./herdr-opencode"], "other": {"kept": True}}))
+        trial.install_decisions_plugin()
+        first = path.read_text()
+        self.assertEqual(trial.install_decisions_plugin(), "unchanged")
+        self.assertEqual(path.read_text(), first)
+        self.assertEqual(self.cli_json(trial), {"plugins": ["./herdr-opencode", "./fleet-decisions"],
+                                                "other": {"kept": True}})
+
+    def test_a_cli_json_that_is_not_json_is_refused_not_overwritten(self):
+        trial = self.trial()
+        path = Path(trial.lab.opencode_config) / "cli.json"
+        path.write_text("{oops")
+        with self.assertRaises(TRIAL.TrialError) as caught:
+            trial.install_decisions_plugin()
+        self.assertIn("cli.json", str(caught.exception))
+        self.assertEqual(path.read_text(), "{oops")
+
+    def test_status_says_whether_it_is_installed_or_out_of_date(self):
+        trial = self.trial()
+        self.assertEqual(trial.decisions_plugin_status(), "not installed")
+        trial.install_decisions_plugin()
+        self.assertEqual(trial.decisions_plugin_status(), "installed")
+        (Path(trial.lab.opencode_config) / "fleet-decisions" / "tui.tsx").write_text("old")
+        self.assertEqual(trial.decisions_plugin_status(), "out of date: run `switchboard-trial up`")
+        trial.install_decisions_plugin()
+        (Path(trial.lab.opencode_config) / "cli.json").write_text('{"plugins": []}')
+        self.assertEqual(trial.decisions_plugin_status(), "not installed")
+
+    def test_an_older_trials_wrapper_is_refreshed_so_the_plugin_can_find_the_file(self):
+        trial = self.trial()
+        trial.wrapper.parent.mkdir(parents=True, exist_ok=True)
+        trial.wrapper.write_text("#!/bin/sh\nexec true\n")
+        self.assertEqual(trial.install_decisions_plugin(), "installed")
+        self.assertIn("FLEET_SWITCHBOARD_STATE", trial.wrapper.read_text())
+        self.assertTrue(os.access(str(trial.wrapper), os.X_OK))
+        self.assertEqual(trial.install_decisions_plugin(), "unchanged")
+
+    def test_the_wrapper_tells_the_plugin_where_the_state_directory_is(self):
+        trial = self.trial()
+        self.assertIn('export FLEET_SWITCHBOARD_STATE="$LAB/profile/state/fleet-switchboard"', trial.wrapper_text())
+        self.assertEqual(str(trial.switchboard_state), str(trial.root / "profile" / "state" / "fleet-switchboard"))
+
+    def test_up_installs_it_and_never_restarts_the_service(self):
+        trial = self.trial()
+        trial.save({"repo": "o/r", "charter": 1, "model": "p/m"})
+        calls = []
+        with mock.patch.object(TRIAL.Trial, "logged_in", return_value=True), \
+                mock.patch.object(TRIAL.Trial, "model_problem", return_value=None), \
+                mock.patch.object(TRIAL.Trial, "ensure_service", side_effect=lambda: calls.append("service") or "already running"), \
+                mock.patch.object(TRIAL.Trial, "start_daemon", return_value="already running"), \
+                mock.patch.object(TRIAL.Trial, "workspace_id", return_value="wT"), \
+                mock.patch.object(TRIAL.Trial, "checkout", return_value=self.home), \
+                mock.patch.object(TRIAL.Trial, "ensure_agent", return_value="already running"), \
+                mock.patch.object(TRIAL.Trial, "close_spare_pane"), \
+                mock.patch.object(TRIAL.Trial, "wrapper_run", side_effect=lambda *a, **k: calls.append(a) or
+                                  subprocess.CompletedProcess([], 0, "", "")), \
+                captured() as (out, err):
+            code = TRIAL.cmd_up(trial, types.SimpleNamespace(fresh=False))
+        self.assertEqual(code, 0)
+        self.assertEqual(trial.decisions_plugin_status(), "installed")
+        self.assertEqual(calls, ["service"], "the service was only asked to be running, never restarted or stopped")
+        self.assertIn("a TUI picks the plugin up when it is restarted", out.getvalue())
+
+    def test_status_reports_it(self):
+        trial = self.trial()
+        trial.save({"repo": "o/r", "charter": 1})
+        trial.install_decisions_plugin()
+        with mock.patch.object(TRIAL.Trial, "run_fleet", return_value=subprocess.CompletedProcess([], 0, "ok\n", "")), \
+                mock.patch.object(TRIAL.Trial, "workspace_id", return_value=None), captured() as (out, err):
+            TRIAL.cmd_status(trial, None)
+        self.assertRegex(out.getvalue(), r"decisions plugin\s+installed")
+
+    def test_the_plugin_files_the_trial_installs_are_the_kits_own(self):
+        self.assertEqual(sorted(TRIAL.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "tui.tsx"])
+        for name in TRIAL.DECISIONS_PLUGIN_FILES:
+            self.assertTrue((REPO / "plugins" / "fleet-decisions-tui" / name).is_file())
+
+
+class TestDecisionsRoleText(unittest.TestCase):
+    def test_the_boss_roles_say_a_decision_once_with_its_id_and_point_to_the_list(self):
+        for path in AGENT_FILES:
+            if role_of(path) not in ("chief-of-staff", "orchestrator"):
+                continue
+            text = " ".join(path.read_text().split())
+            with self.subTest(file=str(path.relative_to(REPO))):
+                self.assertIn("read-only Decisions", text)
+                self.assertIn('"see Decisions"', text)
+                self.assertIn("with its id", text)
+                self.assertIn("remove the label", text)
+                self.assertEqual("fleet-switchboard report question" in text, role_of(path) == "orchestrator")
+
+    def test_the_workers_are_not_given_the_boss_text(self):
+        for path in AGENT_FILES:
+            if role_of(path) in WORKER_ROLES:
+                self.assertNotIn("Decisions", path.read_text(), path.name)
+
+    def test_the_skills_say_it_briefly(self):
+        charter = " ".join((REPO / "skills" / "fleet-charter" / "SKILL.md").read_text().split())
+        for phrase in ("read-only **Decisions** list", "fleet-switchboard decisions", '("see Decisions")', "remove the\nlabel".replace("\n", " ")):
+            self.assertIn(phrase, charter)
+        coordination = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
+        for phrase in ("read-only Decisions list", "Say it once", "still waiting"):
+            self.assertIn(phrase, coordination)
+
+
+class TestDecisionsInTheLabTier(Base):
+    """The Lab runner reads the list only at the end of a play, and says so for any other time."""
+
+    def run_of(self, steps_end="6m"):
+        lab = _load("t_proof_switchboard_14", BIN / "proof-switchboard")
+        scenario = {"steps": [{"at": "10s"}, {"at": steps_end}]}
+        engine = types.SimpleNamespace(env=lambda: dict(os.environ))
+        fake = types.SimpleNamespace(scenario=scenario, engine=engine,
+                                     seconds=lambda text: sc.duration_seconds(text))
+        return lab, fake
+
+    def test_it_runs_the_command_on_the_engines_state_when_the_play_ends(self):
+        lab, fake = self.run_of()
+        done = subprocess.CompletedProcess([], 0, "No decisions are waiting on you.\n", "")
+        with mock.patch.object(lab.subprocess, "run", return_value=done) as ran:
+            ok, seen = lab.ScenarioRun.check_decisions_say(fake, {"at": "6m", "text": "No decisions are waiting"})
+        self.assertTrue(ok, seen)
+        self.assertEqual(ran.call_args[0][0][-1], "decisions")
+        with mock.patch.object(lab.subprocess, "run", return_value=done):
+            self.assertFalse(lab.ScenarioRun.check_decisions_say(fake, {"at": "6m", "text": "not updating"})[0])
+
+    def test_a_time_before_the_end_is_refused_not_guessed(self):
+        lab, fake = self.run_of()
+        with mock.patch.object(lab.subprocess, "run") as ran:
+            ok, seen = lab.ScenarioRun.check_decisions_say(fake, {"at": "30s", "text": "x"})
+        self.assertFalse(ok)
+        self.assertIn("only when the play ends", seen)
+        ran.assert_not_called()
+
+    def test_r3_carries_the_expectation_and_the_lab_tier_still_plays_it(self):
+        lab = _load("t_proof_switchboard_14b", BIN / "proof-switchboard")
+        r3 = sc.load(sc.DEFAULT_DIR / "r3-state-dir-deleted.json")
+        self.assertIn("decisions_say", [e["that"] for e in r3["expect"]])
+        self.assertEqual(r3["control"]["fails"], ["worker-once"])
+        self.assertEqual([r for r in lab.unsupported(r3, sc) if "decisions" in r], [])
+
+
+class TestDecisionsScenarios(Base):
+    def test_the_pr14_catalog_is_present_with_a_control_each(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, fault_name in (("D2", None), ("D3", "decision-resolves-never"), ("D4", "no-decisions-file"),
+                                ("D5", "stale-as-fresh")):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 14)
+                self.assertIn("offline", found[sid]["tiers"])
+                if fault_name:
+                    self.assertEqual(found[sid]["control"].get("fault"), fault_name)
+                else:
+                    self.assertIn("control", found[sid])
+
+    def test_every_new_fault_is_known_and_off_outside_the_lab(self):
+        for name in ("no-decisions-file", "stale-as-fresh", "decision-resolves-never"):
+            with self.subTest(fault=name):
+                self.assertIn(name, sb.KNOWN_FAULTS)
+                os.environ[sb.FAULT_ENV] = name
+                os.environ.pop(sb.LAB_ENV, None)
+                self.assertFalse(sb.fault(name))
+                os.environ[sb.LAB_ENV] = "1"
+                self.assertTrue(sb.fault(name))
+
+    def test_the_vocabulary_has_the_decision_steps_and_oracles(self):
+        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "title"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["send"]), ["issue", "text", "to"])
+        self.assertEqual(sc.STEP_FIELDS["delete-decisions"], {})
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions"]), ["at", "count", "text"])
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions_say"]), ["at", "text"])
 
 
 def main(argv):

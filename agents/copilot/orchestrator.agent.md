@@ -91,6 +91,11 @@ Your prefix is the output of `whoami`. Your charter carries
 removes your ability to say you are blocked. Labels are repo-wide, and the prefix
 is what keeps your fleet from mixing with a colleague's.
 
+Open decisions are listed, with ids, in your principal's read-only Decisions
+list. Record one (the label, or `fleet-switchboard report question`), say it once
+with its id, and never restate open decisions in later replies: "see Decisions".
+On "answer #2a: yes", act, then remove the label.
+
 Note that `gh issue list --label a --label b` is an AND. Adding a label to widen
 a search narrows it, usually to nothing, and it reads as though work vanished.
 

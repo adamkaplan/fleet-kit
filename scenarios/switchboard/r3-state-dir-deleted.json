@@ -25,7 +25,9 @@
     {"name": "worker-once", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "count": 1, "keys": 1,
      "why": "What was delivered is a fact of the transcript, not of the state directory"},
     {"name": "later", "that": "delivered", "to": "platform", "key": "lab.fact:r3-later", "count": 1},
-    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2}
+    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2},
+    {"name": "decisions-again", "that": "decisions_say", "at": "6m", "text": "No decisions are waiting on you.",
+     "why": "decisions.json went with the state directory; it is a projection, so the next pass wrote it again"}
   ],
   "control": {"fault": "no-dedupe", "fails": ["worker-once"]}
 }

@@ -299,7 +299,9 @@ orchestrator is an **ask**: a sub-issue of its charter opening with one Intent
 line and one Done-when line. Every message about it carries those lines, so a
 report is read against what you asked for, and only you, or the Chief of Staff
 with your yes, change them. Each role definition opens with a few maxims and one
-rubric for when to reach you. The design is in
+rubric for when to reach you. What waits on you is one read-only **Decisions**
+list, in the TUI sidebar and as `fleet-switchboard decisions`, each row with an id
+you can answer in chat, so agents say a decision once. The design is in
 [docs/switchboard.md](docs/switchboard.md); moving a live fleet from OpenCode v1 is
 in [docs/switchboard-cutover.md](docs/switchboard-cutover.md).
 

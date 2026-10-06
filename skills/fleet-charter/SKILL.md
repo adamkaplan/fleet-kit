@@ -145,6 +145,12 @@ Remove the label as soon as you have an answer, and remove or update the
 `## Decision required` section so the body does not go on claiming a decision is
 still open.
 
+The label is also what puts the issue in the person's read-only **Decisions** list (their TUI
+sidebar, or `fleet-switchboard decisions`), each decision with an id such as `#2`, derived from
+the label and never stored. Say a decision once, with its id, and do not restate open decisions in
+later replies ("see Decisions"). When they answer ("answer #2a: yes"), act on it, then remove the
+label: that is what takes it off the list.
+
 `gh issue list --label <user>:awaiting-user` is the complete and durable answer
 to "what is waiting on me?" across the whole fleet. If you sit blocked without
 the label, your blocker is invisible to the only person who can clear it. If you

@@ -81,12 +81,16 @@ read once at session start and never reloads. When they disagree, the skill wins
 ## Labels carry your prefix
 
 Your prefix is the output of `whoami`. A charter is marked `<user>:orchestrator`;
-a decision only your principal can make is marked `<user>:awaiting-user`. Labels
-are repo-wide, and the prefix is what stops your fleet mixing with a colleague's
-and reporting something confident and false.
+a decision only your principal can make is marked `<user>:awaiting-user`. The
+prefix stops your fleet mixing with a colleague's.
 
 `gh issue list --label <user>:awaiting-user` is the complete, durable answer to
 "what needs me?" Read it — never reconstruct it from memory.
+
+Open decisions are listed, with ids, in your principal's read-only Decisions
+list. Record one (the label), say it once with its id, and never restate open
+decisions in later replies: "see Decisions". On "answer #2a: yes", act, then
+remove the label.
 
 ## Supervision is divergence, not polling
 
@@ -111,7 +115,7 @@ for what the work is, **herdr** for what is alive — on the charter's `pane` fi
 accepts a wake, and a continuously busy one never accepts either, because every
 wake lands mid-turn and defers. Decide on process liveness plus agent presence.
 `blocked` in herdr can mean a tool call in flight. Where the evidence does not
-support a verdict, say *cannot determine*. That beats a guess.
+support a verdict, say *cannot determine*.
 
 ## Reporting up
 

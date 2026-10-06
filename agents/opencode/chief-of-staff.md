@@ -78,41 +78,39 @@ steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file
 
 ## Skills — load them, do not improvise them
 
-- **Before your first charter action** — reading, judging or correcting a charter
-  — load the `fleet-charter` skill. It is what you hold orchestrators to.
-- **Before you brief an orchestrator**, load the `fleet-coordination` skill. The
-  briefing and reporting shapes live there.
+- **Before your first charter action**, load the `fleet-charter` skill: it is what
+  you hold orchestrators to.
+- **Before you brief an orchestrator**, load the `fleet-coordination` skill.
 
-Load them as a real first action. Skills are re-read on every use; this file was
-read once at session start and never reloads. When they disagree, the skill wins.
+Load them as a real first action. Skills are re-read on every use; this file
+never reloads. When they disagree, the skill wins.
 
 ## Labels carry your prefix
 
 Your prefix is the output of `whoami`. A charter is marked `<user>:orchestrator`;
-a decision only your principal can make is marked `<user>:awaiting-user`. Labels
-are repo-wide, and the prefix stops your fleet mixing with a colleague's and
-reporting something confident and false. `gh issue list --label
+a decision only your principal can make is marked `<user>:awaiting-user`. The
+prefix stops your fleet mixing with a colleague's. `gh issue list --label
 <user>:awaiting-user` is the complete, durable answer to "what needs me?" Read
 it; never reconstruct it from memory.
 
 ## Supervision is divergence, not polling
 
 Do not ask an orchestrator whether it is alive: a busy one will not answer and a
-dead one cannot. Join two sources that do not know about each other — **GitHub**
-for what the work is, **herdr** for what is alive — on the charter's `pane` field.
+dead one cannot. Join **GitHub** (what the work is) and **herdr** (what is alive)
+on the charter's `pane` field.
 
 - **DEAD** — charter active, pane gone or a bare shell. Report it and propose a
   relaunch; never relaunch silently. DEAD suppresses every other finding about
   that orchestrator, because the rest presume a live agent.
 - **ABANDONED** — alive, acking idle for hours, open sub-issues on its charter.
   The failure that looks healthiest from outside.
-- **BUSY** — deferrals climbing with the agent present. That is productivity, and
-  saying **false alarm** is a finding about the alarm, not a fault in the agent.
+- **BUSY** — deferrals climbing with the agent present: productivity. Saying
+  **false alarm** is a finding about the alarm, not a fault in the agent.
 - **UNCHARTERED** — a pane working with nothing durable recording what it owns.
 - **PROTO_CHARTER** — an issue naming a pane that never got the
   `<user>:orchestrator` label. One label away from real.
-- **BLOCKED_SILENT** — durably blocked with nothing carrying
-  `<user>:awaiting-user`. Your principal cannot see what is held up.
+- **BLOCKED_SILENT** — durably blocked, nothing carrying `<user>:awaiting-user`:
+  your principal cannot see what is held up.
 
 **Never infer liveness from whether a pane answers a prompt.** A dead agent never
 accepts a wake, and a continuously busy one never does either: every wake lands
@@ -124,6 +122,10 @@ verdict, say *cannot determine*.
 
 Address orchestrators by **workspace name**, never `wN:pN` or a session id, which
 your principal cannot see. If GitHub is unreachable, say so and report live state.
+
+Open decisions are listed, with ids, in your principal's read-only Decisions
+list. Record one (the label), say it once with its id, never restate open ones:
+"see Decisions". On "answer #2a: yes", act, then remove the label.
 
 ## Wake protocol
 
@@ -137,10 +139,9 @@ modify it.
 
 ## Your instructions are a snapshot, not a source of truth
 
-Definitions load once per session, so a long-running orchestrator runs whatever
-its file said when it began, with no staleness signal. **Verify a policy against
-the file on disk before enforcing it on anyone**; `read` is allowed so you can.
-Disk wins.
+A long-running orchestrator runs the definition it began with, with no staleness
+signal. **Verify a policy against the file on disk before enforcing it**; `read`
+is allowed so you can. Disk wins.
 
 ## STOP
 
@@ -154,9 +155,8 @@ Disk wins.
 ## Briefing
 
 A brief you write is your artifact and its gaps are your fault: a requirement you
-leave out gets improvised, reasonably and wrongly. Fix the brief; do not charge
-the omission to the worker. A request you hand an orchestrator becomes an **ask**
-under its charter, with one Intent line and one Done-when line in your principal's
-terms, never widened (the `fleet-charter` skill has the shape). State the
-checkpoint and its deadline, the authority granted, the STOP list, and how the
-result will be verified. Then let them work.
+leave out gets improvised, reasonably and wrongly. A request you hand an
+orchestrator becomes an **ask** under its charter, with one Intent line and one
+Done-when line in your principal's terms, never widened (the `fleet-charter` skill
+has the shape). State the checkpoint and its deadline, the authority granted, the
+STOP list, and how the result will be verified. Then let them work.

@@ -34,6 +34,8 @@ DEFAULT_MODEL = "github-copilot/claude-sonnet-5.5"
 SERVICE_PORT = 49380  # v2 manages one service per profile on a fixed port; the Lab holds 49374
 WORKSPACE_LABEL = "Switchboard Trial"
 AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
+DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
 KEY_NAME_PATTERN = "(_API_KEY|_SECRET|_PASSWORD|_ACCESS_KEY|_ACCESS_KEY_ID)$"
 EXIT_OK, EXIT_ERROR = 0, 1
 
@@ -217,6 +219,7 @@ class Trial:
             proof.write_if_changed(os.path.join(self.lab.opencode_config, "agents", name + ".md"),
                                    proof.agent_copy(text, model))
         self.install_skills()
+        report["decisions plugin"] = self.install_decisions_plugin()
         plugin = (REPO_ROOT / "plugins" / "fleet-hooks" / "index.js").read_text()
         proof.write_if_changed(os.path.join(self.lab.opencode_config, "plugins", "fleet-hooks.js"), plugin)
         done = self.wrapper_run("service", "set", "port", str(SERVICE_PORT))
@@ -264,6 +267,59 @@ class Trial:
                 self.proof.write_if_changed(str(target / "SKILL.md"), (skill / "SKILL.md").read_text())
                 installed.append(skill.name)
         return installed
+
+    def decisions_plugin_dir(self):
+        return Path(self.lab.opencode_config) / DECISIONS_PLUGIN_NAME
+
+    def cli_json_path(self):
+        return Path(self.lab.opencode_config) / "cli.json"
+
+    def read_cli_json(self):
+        """The profile's cli.json as an object ({} when there is none). A file that is not a JSON object is
+        refused, never overwritten: it may hold plugins this driver knows nothing about."""
+        path = self.cli_json_path()
+        if not path.exists():
+            return {}
+        try:
+            body = json.loads(path.read_text())
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("plugins", []), list):
+            raise TrialError("%s is not a JSON object with a `plugins` list: fix it by hand, then run again" % path)
+        return body
+
+    def install_decisions_plugin(self):
+        """Copy the Decisions TUI plugin into the trial profile and name its directory in cli.json, keeping
+        every other plugin and key there. Idempotent. The wrapper (written by init) sets the environment
+        variable the plugin reads. Nothing is restarted: a TUI loads plugins when it starts."""
+        source = REPO_ROOT / "plugins" / "fleet-decisions-tui"
+        changed = False
+        for name in DECISIONS_PLUGIN_FILES:
+            os.makedirs(self.decisions_plugin_dir(), exist_ok=True)
+            changed |= self.proof.write_if_changed(str(self.decisions_plugin_dir() / name), (source / name).read_text())
+        body = self.read_cli_json()
+        wanted = "./" + DECISIONS_PLUGIN_NAME
+        if wanted not in body.get("plugins", []):
+            body["plugins"] = list(body.get("plugins", [])) + [wanted]
+            changed |= self.proof.write_if_changed(str(self.cli_json_path()), json.dumps(body, indent=2) + "\n")
+        if self.wrapper.exists() and self.proof.write_if_changed(str(self.wrapper), self.wrapper_text()):
+            os.chmod(self.wrapper, 0o755)  # an older trial's wrapper lacks FLEET_SWITCHBOARD_STATE, which the plugin reads
+            changed = True
+        return "installed" if changed else "unchanged"
+
+    def decisions_plugin_status(self):
+        """`installed`, `not installed`, or `out of date` (a file differs from the kit's), for `status`."""
+        try:
+            named = ("./" + DECISIONS_PLUGIN_NAME) in self.read_cli_json().get("plugins", [])
+        except TrialError:
+            named = False
+        source = REPO_ROOT / "plugins" / "fleet-decisions-tui"
+        have = [(self.decisions_plugin_dir() / name).is_file() for name in DECISIONS_PLUGIN_FILES]
+        if not named or not all(have):
+            return "not installed"
+        same = all((self.decisions_plugin_dir() / name).read_text() == (source / name).read_text()
+                   for name in DECISIONS_PLUGIN_FILES)
+        return "installed" if same else "out of date: run `switchboard-trial up`"
 
     def write_gitconfig(self):
         """git in an agent's shell (HOME is the trial's) pushes through gh's credential helper,
@@ -451,6 +507,8 @@ export TMPDIR="$LAB/profile/tmp"
 # XDG alone leaves `home` live: v2 would load the live fleet's skills.
 export HOME="$LAB/profile/home"
 export FLEET_SWITCHBOARD_BIN="{fleet_bin}"
+# The Decisions TUI plugin reads decisions.json from here (the daemon runs with the same XDG_STATE_HOME).
+export FLEET_SWITCHBOARD_STATE="$LAB/profile/state/fleet-switchboard"
 # The fleet-hooks plugin puts this first on PATH of every agent shell: a gh that signs what agents say.
 export FLEET_SWITCHBOARD_SHIMS="{kit_shims}"
 # Agents run `fleet-switchboard send`; their shell finds it here.
@@ -527,6 +585,8 @@ def cmd_up(trial, args):
     if problem:
         raise TrialError(problem + " (change it with `init --model ...`)")
     print("%-22s %s" % ("v2 service", trial.ensure_service()))
+    print("%-22s %s (a TUI picks the plugin up when it is restarted: `switchboard-trial restart`)"
+          % ("decisions plugin", trial.install_decisions_plugin()))
     print("%-22s %s" % ("daemon", trial.start_daemon()))
     workspace = trial.workspace_id(create=True)
     directory = trial.checkout(repo)
@@ -568,6 +628,7 @@ def cmd_status(trial, args):
     if trial.wrapper.exists():
         print("%-22s %s" % ("copilot login", "yes" if trial.logged_in() else "no"))
     print("%-22s %s" % ("daemon", "pid %s" % trial.daemon_pid() if trial.daemon_pid() else "not running"))
+    print("%-22s %s" % ("decisions plugin", trial.decisions_plugin_status()))
     print("%-22s %s" % ("workspace", trial.workspace_id() or "none"))
     done = trial.run_fleet("status", check=False)
     print(done.stdout.rstrip() or done.stderr.rstrip())
