@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fleet Switchboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Fleet Switchboard: a presentation.
+
+  Open this file in a browser. Arrow keys move between slides; "a" plays the whole thing with its
+  narration; "c" toggles captions; "f" goes full screen. Every animation is plain CSS, so the same
+  page can be seeked to any instant: build/render.mjs does exactly that to make the video.
+  The cue times come from timing.js (written by build/tts.py from the measured narration); without
+  it the slides use estimated cues.
+-->
+<script src="timing.js"></script>
+<style>
+:root{
+  --bg:#070b18; --bg2:#0d1430; --panel:#111a38; --panel2:#17234d; --line:#2a3766;
+  --ink:#eef1fb; --muted:#93a0c6; --dim:#5d6a94;
+  --teal:#2dd4bf; --amber:#fbbf24; --rose:#fb7185; --violet:#a78bfa; --blue:#60a5fa; --green:#4ade80;
+  --font: "SF Pro Display","Inter","Helvetica Neue",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: "SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:#000;overflow:hidden;font-family:var(--font);color:var(--ink)}
+#stage{position:absolute;left:0;top:0;width:1920px;height:1080px;transform-origin:0 0;overflow:hidden;
+  background:radial-gradient(1200px 800px at 70% 40%,#13204a 0%,transparent 60%),linear-gradient(160deg,var(--bg2),var(--bg) 70%)}
+#stage::before{content:"";position:absolute;inset:0;opacity:.35;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:96px 96px;mask-image:radial-gradient(900px 700px at 60% 45%,#000 0%,transparent 75%)}
+.slide{position:absolute;inset:0;display:none}
+.slide.active{display:block}
+
+/* ---- chrome ---- */
+#brand{position:absolute;left:96px;top:54px;font-size:26px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:14px;z-index:5}
+#brand i{width:18px;height:18px;border-radius:50%;background:var(--teal);box-shadow:0 0 0 6px rgba(45,212,191,.18),0 0 24px var(--teal)}
+#count{position:absolute;right:96px;top:58px;font-size:24px;color:var(--dim);font-family:var(--mono);z-index:5}
+#caption{position:absolute;left:180px;right:180px;bottom:44px;min-height:84px;display:none;align-items:center;justify-content:center;text-align:center;
+  font-size:38px;line-height:1.3;color:#fff;background:rgba(5,8,20,.72);border-radius:18px;padding:16px 36px;z-index:9;
+  backdrop-filter:blur(6px);text-shadow:0 2px 10px rgba(0,0,0,.6)}
+body.captions #caption{display:flex}
+#caption:empty{visibility:hidden}
+
+/* ---- type ---- */
+.kicker{font-size:26px;letter-spacing:.2em;text-transform:uppercase;color:var(--teal);font-weight:600}
+.title{font-size:78px;line-height:1.05;font-weight:750;letter-spacing:-.02em}
+.sub{font-size:34px;line-height:1.35;color:var(--muted)}
+.mono{font-family:var(--mono)}
+.hl{color:var(--teal)} .am{color:var(--amber)} .ro{color:var(--rose)} .vi{color:var(--violet)} .bl{color:var(--blue)} .gr{color:var(--green)}
+.abs{position:absolute}
+
+/* ---- building blocks ---- */
+.card{position:absolute;background:linear-gradient(180deg,var(--panel2),var(--panel));border:2px solid var(--line);border-radius:28px;box-shadow:0 30px 80px rgba(0,0,0,.45)}
+.chip{position:absolute;display:flex;align-items:center;gap:14px;padding:0 26px;height:68px;border-radius:18px;background:var(--panel2);border:2px solid var(--line);font-size:30px;font-weight:600;white-space:nowrap}
+.dot{display:inline-block;width:16px;height:16px;border-radius:50%;background:currentColor;flex:none}
+.tag{white-space:nowrap;display:inline-flex;align-items:center;height:46px;padding:0 20px;border-radius:12px;font-size:25px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.t-teal{background:rgba(45,212,191,.16);color:var(--teal);border:2px solid rgba(45,212,191,.5)}
+.t-amber{background:rgba(251,191,36,.16);color:var(--amber);border:2px solid rgba(251,191,36,.5)}
+.t-rose{background:rgba(251,113,133,.16);color:var(--rose);border:2px solid rgba(251,113,133,.5)}
+.t-green{background:rgba(74,222,128,.16);color:var(--green);border:2px solid rgba(74,222,128,.5)}
+.t-violet{background:rgba(167,139,250,.16);color:var(--violet);border:2px solid rgba(167,139,250,.5)}
+svg{position:absolute;left:0;top:0;width:1920px;height:1080px;overflow:visible;pointer-events:none}
+svg .ln{fill:none;stroke:var(--line);stroke-width:3}
+svg .ln.hot{stroke:var(--teal);stroke-width:3.5}
+
+/* ---- motion: nothing runs until its slide is active, and every delay is a cue ---- */
+@keyframes rise{from{opacity:0;transform:translateY(34px)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes pop{0%{opacity:0;transform:scale(.6)}70%{transform:scale(1.06)}100%{opacity:1;transform:none}}
+@keyframes fromL{from{opacity:0;transform:translateX(-90px)}to{opacity:1;transform:none}}
+@keyframes fromR{from{opacity:0;transform:translateX(90px)}to{opacity:1;transform:none}}
+@keyframes fromT{from{opacity:0;transform:translateY(-70px)}to{opacity:1;transform:none}}
+@keyframes draw{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+@keyframes gone{from{opacity:1}to{opacity:0}}
+@keyframes vanish{to{opacity:0}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.12);opacity:1}}
+@keyframes ring{0%{transform:scale(.55);opacity:.7}100%{transform:scale(1.5);opacity:0}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes blink{50%{opacity:0}}
+@keyframes travel{0%{offset-distance:0%;opacity:0}8%{opacity:1}92%{opacity:1}100%{offset-distance:100%;opacity:0}}
+@keyframes travelHold{0%{offset-distance:0%;opacity:0}6%{opacity:1}100%{offset-distance:100%;opacity:1}}
+@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(45,212,191,0)}50%{box-shadow:0 0 0 12px rgba(45,212,191,.22)}}
+@keyframes grow{from{width:0}to{width:var(--w,100%)}}
+@keyframes strike{from{background-size:0 4px}to{background-size:100% 4px}}
+@keyframes type{from{width:0}to{width:var(--ch)}}
+@keyframes bar{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@property --n{syntax:"<integer>";initial-value:0;inherits:false}
+@keyframes count{from{--n:0}to{--n:var(--to)}}
+.slide.active .rise{animation:rise .85s cubic-bezier(.2,.8,.2,1) var(--at,0s) both}
+.slide.active .fade{animation:fade .8s ease var(--at,0s) both}
+.slide.active .pop{animation:pop .6s cubic-bezier(.2,.9,.3,1.2) var(--at,0s) both}
+.slide.active .fromL{animation:fromL .8s cubic-bezier(.2,.8,.2,1) var(--at,0s) both}
+.slide.active .fromR{animation:fromR .8s cubic-bezier(.2,.8,.2,1) var(--at,0s) both}
+.slide.active .fromT{animation:fromT .8s cubic-bezier(.2,.8,.2,1) var(--at,0s) both}
+.slide.active .draw{stroke-dasharray:1;stroke-dashoffset:1;animation:draw var(--len,1.2s) ease-out var(--at,0s) both}
+.slide.active .vanish{animation:vanish .6s ease var(--at,0s) both}
+.slide.active .pulse{animation:pulse 2.4s ease-in-out var(--at,0s) infinite both}
+.slide.active .ringout{animation:ring 3s ease-out var(--at,0s) infinite both}
+.slide.active .glow{animation:glow 2.4s ease-in-out var(--at,0s) infinite}
+.slide.active .grow{animation:grow var(--len,1.4s) cubic-bezier(.3,.7,.3,1) var(--at,0s) both}
+.slide.active .typed{overflow:hidden;white-space:nowrap;animation:type var(--len,1.4s) steps(var(--steps,30),end) var(--at,0s) both}
+.slide.active .strike{background:linear-gradient(var(--rose),var(--rose)) left 55%/0 4px no-repeat;animation:strike .5s ease var(--at,0s) both}
+.slide.active .pkt{animation:travel var(--dur,3.2s) linear var(--at,0s) infinite both}
+.slide.active .pkt.once{animation:travelHold var(--dur,1.6s) cubic-bezier(.4,0,.2,1) var(--at,0s) 1 both}
+.slide.active .num::after{animation:count var(--len,2.2s) cubic-bezier(.2,.7,.2,1) var(--at,0s) both;counter-reset:n var(--n);content:counter(n)}
+.pkt{position:absolute;left:0;top:0;width:20px;height:20px;border-radius:50%;background:var(--teal);box-shadow:0 0 18px var(--teal);offset-rotate:0deg;opacity:0}
+.pkt.am{background:var(--amber);box-shadow:0 0 18px var(--amber)}
+.pkt.vi{background:var(--violet);box-shadow:0 0 18px var(--violet)}
+.pkt.bl{background:var(--blue);box-shadow:0 0 18px var(--blue)}
+.pkt.ro{background:var(--rose);box-shadow:0 0 18px var(--rose)}
+.pkt.sq{border-radius:6px;width:34px;height:24px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="brand" style="display:none"><i></i>Fleet Switchboard</div>
+  <div id="count"></div>
+  <div id="caption"></div>
+
+  <!-- 1 ─────────────────────────────── title -->
+  <section class="slide" data-id="title">
+    <div class="abs" id="orbit1" style="left:0;top:0"></div>
+    <div class="abs" style="left:130px;top:300px;width:1000px">
+      <div class="kicker rise" style="--at:var(--c0)">Open source &middot; OpenCode v2 &middot; herdr &middot; GitHub</div>
+      <div class="rise" style="--at:var(--c0);font-size:150px;line-height:1;font-weight:800;letter-spacing:-.035em;margin-top:26px">Fleet<br>Switchboard</div>
+      <div class="sub rise" style="--at:var(--c1);margin-top:40px;font-size:38px;max-width:1010px">Event-driven coordination for fleets of coding agents.</div>
+      <div class="rise" style="--at:calc(var(--c1) + 1.6s);margin-top:34px;font-size:34px;color:var(--teal)">Never interrupt the human. Never interrupt each other.</div>
+    </div>
+  </section>
+
+  <!-- 2 ─────────────────────────────── the problem -->
+  <section class="slide" data-id="problem">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">The problem</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Fleets of agents break in three places</div></div>
+
+    <div class="card rise" style="--at:var(--c1);left:96px;top:320px;width:560px;height:570px;padding:34px 38px">
+      <div class="tag t-rose">1 &middot; Telephone</div>
+      <div id="tel" style="margin-top:26px"></div>
+    </div>
+    <div class="card rise" style="--at:var(--c2);left:680px;top:320px;width:560px;height:570px;padding:34px 38px">
+      <div class="tag t-amber">2 &middot; One at a time</div>
+      <div class="abs" style="left:38px;top:96px;width:484px">
+        <div style="display:flex;align-items:center;gap:18px;font-size:28px;color:var(--muted)">
+          <svg style="position:static;width:50px;height:50px" viewBox="0 0 56 56"><circle cx="28" cy="28" r="22" fill="none" stroke="var(--line)" stroke-width="6"/><path d="M28 6 A22 22 0 0 1 50 28" fill="none" stroke="var(--amber)" stroke-width="6" stroke-linecap="round" class="spinarc" style="transform-origin:28px 28px"/></svg>
+          one agent, working</div>
+        <div class="abs" style="left:0;top:68px;width:484px">
+          <div class="qbar fromL" style="--at:calc(var(--c2) + .5s);background:rgba(251,191,36,.22);border-color:var(--amber)"><span>request 1</span><b class="am">working&hellip;</b></div>
+          <div class="qbar fromL" style="--at:calc(var(--c2) + 1.1s)"><span>request 2</span><b>waiting</b></div>
+          <div class="qbar fromL" style="--at:calc(var(--c2) + 1.7s)"><span>request 3</span><b>waiting</b></div>
+          <div class="qbar fromL" style="--at:calc(var(--c2) + 2.3s)"><span>request 4</span><b>waiting</b></div>
+        </div>
+        <div class="abs mono rise" style="--at:calc(var(--c2) + 2.6s);left:0;top:424px;font-size:30px;color:var(--rose)">queue: <span class="num" style="--to:4;--at:calc(var(--c2) + .5s);--len:2.2s"></span></div>
+      </div>
+    </div>
+    <div class="card rise" style="--at:var(--c3);left:1264px;top:320px;width:560px;height:570px;padding:34px 38px">
+      <div class="tag t-violet">3 &middot; Timers that type</div>
+      <svg style="left:1218px;top:342px;width:60px;height:60px" viewBox="0 0 60 60"><circle cx="30" cy="30" r="26" fill="none" stroke="var(--violet)" stroke-width="4"/><path d="M30 14 L30 30" stroke="var(--violet)" stroke-width="4" stroke-linecap="round" class="hand" style="transform-origin:30px 30px"/></svg>
+      <div class="abs" style="left:38px;top:110px;width:484px;height:290px;background:#060914;border:2px solid var(--line);border-radius:16px;padding:20px 22px;font-family:var(--mono);font-size:22px;line-height:1.5;overflow:hidden">
+        <div style="color:var(--dim)">chief-of-staff &rsaquo;</div>
+        <div id="draft" style="color:var(--ink);margin-top:6px">half-written thought: remind me to check the<span style="animation:blink 1s steps(1) infinite">&#9608;</span></div>
+        <div class="typed ro" style="--at:calc(var(--c3) + 1.8s);--len:1.6s;--steps:31;--ch:31ch;margin-top:18px;border-top:2px dashed rgba(251,113,133,.45);padding-top:12px">[heartbeat] 14:30 check workers</div>
+      </div>
+      <div class="abs rise ro" style="--at:calc(var(--c3) + 3.6s);left:38px;top:424px;width:484px;font-size:32px;line-height:1.3;font-weight:600">Your draft is gone.<br><span style="color:var(--muted);font-weight:500;font-size:28px">The agent loses its thread too.</span></div>
+    </div>
+  </section>
+
+  <!-- 3 ─────────────────────────────── the idea -->
+  <section class="slide" data-id="idea">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">The idea</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Events, not timers. <span class="hl">Facts, not typing.</span></div></div>
+    <svg viewBox="0 0 1920 1080" id="idea-svg"></svg>
+    <div id="idea-nodes"></div>
+    <div class="card fade" style="--at:var(--c2);left:700px;top:320px;width:520px;height:560px;border-color:rgba(45,212,191,.55)">
+      <div class="abs" style="left:0;right:0;top:24px;text-align:center"><span class="tag t-teal">switchboard daemon</span></div>
+      <div class="abs rise" style="--at:calc(var(--c2) + .3s);left:36px;right:36px;top:100px;height:118px;border-radius:20px;background:rgba(96,165,250,.12);border:2px solid rgba(96,165,250,.5);padding:18px 26px"><b style="font-size:36px" class="bl">Facts</b><div style="font-size:25px;color:var(--muted);margin-top:4px">derived from the sources</div></div>
+      <div class="abs rise" style="--at:calc(var(--c2) + .8s);left:36px;right:36px;top:232px;height:118px;border-radius:20px;background:rgba(167,139,250,.12);border:2px solid rgba(167,139,250,.5);padding:18px 26px"><b style="font-size:36px" class="vi">Pending</b><div style="font-size:25px;color:var(--muted);margin-top:4px">facts minus what's delivered</div></div>
+      <div class="abs rise" style="--at:calc(var(--c2) + 1.3s);left:36px;right:36px;top:364px;height:118px;border-radius:20px;background:rgba(45,212,191,.12);border:2px solid rgba(45,212,191,.5);padding:18px 26px"><b style="font-size:36px" class="hl">Deliver</b><div style="font-size:25px;color:var(--muted);margin-top:4px">a note or a wake, by one rule</div></div>
+      <div class="abs rise mono" style="--at:calc(var(--c2) + 1.8s);left:0;right:0;top:506px;text-align:center;font-size:22px;color:var(--dim)">state: an audit log, nothing else</div>
+    </div>
+    <div class="abs pop" style="--at:calc(var(--c2) + 4.6s);left:1290px;top:640px;width:520px;text-align:center">
+      <svg style="position:static;width:130px;height:96px" viewBox="0 0 150 110"><rect x="8" y="22" width="134" height="72" rx="12" fill="none" stroke="var(--rose)" stroke-width="6"/><g fill="var(--rose)"><rect x="26" y="40" width="14" height="12" rx="3"/><rect x="48" y="40" width="14" height="12" rx="3"/><rect x="70" y="40" width="14" height="12" rx="3"/><rect x="92" y="40" width="14" height="12" rx="3"/><rect x="40" y="66" width="70" height="12" rx="3"/></g><path d="M12 8 L138 102" stroke="var(--ink)" stroke-width="9" stroke-linecap="round"/></svg>
+      <div style="font-size:34px;font-weight:700;margin-top:6px">Never types into a pane</div>
+      <div class="mono" style="font-size:23px;color:var(--muted);margin-top:8px">harness API &middot; session.synthetic</div>
+    </div>
+  </section>
+
+  <!-- 4 ─────────────────────────────── note or wake -->
+  <section class="slide" data-id="delivery">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">Delivery</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">One rule: <span class="hl">note</span> or <span class="am">wake</span></div></div>
+
+    <div class="card rise" style="--at:var(--c1);left:96px;top:285px;width:1728px;height:215px">
+      <div class="abs" style="left:34px;top:22px"><span class="tag t-teal">You are talking to it</span></div>
+      <div class="bub" style="left:34px;top:118px;background:rgba(96,165,250,.18);border-color:var(--blue)">you: "check the staging config"</div>
+      <div class="bub fade" style="--at:calc(var(--c1) + .8s);left:460px;top:118px">agent: "found it, fixing"</div>
+      <div class="chip abs fromT" style="--at:calc(var(--c1) + 1.6s);left:880px;top:96px;height:58px;border-color:var(--teal);color:var(--teal);font-size:26px"><span class="dot"></span>worker finished</div>
+      <div class="abs rise" style="--at:calc(var(--c1) + 2.4s);left:880px;top:166px"><span class="tag t-teal" style="height:40px;font-size:21px">NOTE &middot; waits, no new turn</span></div>
+      <div class="bub rise" style="--at:calc(var(--c1) + 3.6s);left:1330px;top:96px;background:rgba(96,165,250,.18);border-color:var(--blue)">you: "and the logs?"</div>
+      <div class="abs rise" style="--at:calc(var(--c1) + 4.2s);left:1330px;top:166px"><span class="tag t-teal" style="height:40px;font-size:21px">&#8627; the note rides along</span></div>
+    </div>
+    <div class="card rise" style="--at:var(--c2);left:96px;top:516px;width:1728px;height:190px">
+      <div class="abs" style="left:34px;top:22px"><span class="tag t-amber">You are away</span></div>
+      <div class="abs" style="left:34px;top:110px;width:700px;height:34px;border-radius:17px;background:repeating-linear-gradient(90deg,#1b2650 0 18px,#141d40 18px 36px)"></div>
+      <div class="abs mono" style="left:34px;top:150px;font-size:22px;color:var(--dim)">agent idle</div>
+      <div class="chip abs fromT" style="--at:calc(var(--c2) + .8s);left:780px;top:30px;height:58px;border-color:var(--amber);color:var(--amber);font-size:26px"><span class="dot"></span>worker finished</div>
+      <div class="abs rise" style="--at:calc(var(--c2) + 1.6s);left:780px;top:100px"><span class="tag t-amber" style="height:40px;font-size:21px">WAKE &middot; starts a turn</span></div>
+      <div class="abs grow" style="--at:calc(var(--c2) + 2s);--len:1.8s;--w:560px;left:1150px;top:110px;height:34px;border-radius:17px;background:linear-gradient(90deg,var(--amber),#f59e0b);box-shadow:0 0 30px rgba(251,191,36,.45)"></div>
+      <div class="abs rise mono" style="--at:calc(var(--c2) + 2.6s);left:1150px;top:64px;font-size:25px;color:var(--amber)">the work keeps moving</div>
+    </div>
+    <div class="card rise" style="--at:var(--c3);left:96px;top:722px;width:840px;height:140px">
+      <div class="abs" style="left:34px;top:20px"><span class="tag t-teal" style="height:40px;font-size:21px">NOTE</span></div>
+      <div class="abs mono rise" style="--at:calc(var(--c3) + .6s);left:34px;top:70px;font-size:46px;color:var(--ink);font-weight:700">10:00</div>
+      <div class="abs rise" style="--at:calc(var(--c3) + .6s);left:210px;top:86px;font-size:25px;color:var(--muted)">nobody picked it up</div>
+      <div class="abs rise" style="--at:calc(var(--c3) + 1.8s);left:470px;top:66px"><span class="tag t-amber" style="height:48px;font-size:24px">&rarr; becomes a WAKE</span></div>
+    </div>
+    <div class="card rise" style="--at:calc(var(--c3) + 2.8s);left:984px;top:722px;width:840px;height:140px">
+      <div id="batch"></div>
+    </div>
+  </section>
+
+  <!-- 5 ─────────────────────────────── intent -->
+  <section class="slide" data-id="intent">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">Intent</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Every message carries <span class="hl">its ask</span></div></div>
+    <div class="card rise" style="--at:var(--c0);left:96px;top:320px;width:1040px;height:570px;padding:32px 44px">
+      <div class="mono" style="font-size:27px;color:var(--teal)">[switchboard] 2 items for platform</div>
+      <div style="margin-top:22px;border-left:7px solid var(--teal);padding:8px 0 8px 28px;background:linear-gradient(90deg,rgba(45,212,191,.1),transparent)">
+        <div style="font-size:28px;color:var(--muted);letter-spacing:.06em">ASK #2</div>
+        <div style="font-size:35px;font-weight:650;margin-top:8px;line-height:1.25">Intent: Add a GET /health endpoint.</div>
+        <div style="position:relative;height:118px;margin-top:14px" class="mono">
+          <div style="position:absolute;left:0;top:0;font-size:30px;white-space:nowrap"><span class="gr">Done when:</span> <span class="strike" style="--at:calc(var(--c2) + .4s)">returns 200 with {"ok": true}</span></div>
+          <div class="rise" style="position:absolute;left:0;top:58px;font-size:30px;color:var(--green);--at:calc(var(--c2) + 1.1s);white-space:nowrap">Done when: &hellip; + Cache-Control: no-store</div>
+        </div>
+      </div>
+      <div class="mono" style="margin-top:26px;font-size:26px;color:var(--muted);line-height:1.6">
+        &middot; worker.idle from coder: finished its turn<br>&middot; github.comment from you: show the headers</div>
+    </div>
+    <div class="card rise" style="--at:var(--c1);left:1180px;top:320px;width:644px;height:230px;padding:28px 36px">
+      <div style="font-size:27px;color:var(--muted)">Report from orchestrator</div>
+      <div style="font-size:34px;margin-top:8px;line-height:1.3">"Fixed one of two agents."</div>
+      <div class="rise" style="--at:calc(var(--c1) + 1.6s);margin-top:12px;display:flex;gap:16px;align-items:center"><span class="tag t-rose">&#10007; not done</span><span style="font-size:25px;color:var(--muted)">checked against Done when</span></div>
+    </div>
+    <div class="card rise" style="--at:calc(var(--c2) + 1.5s);left:1180px;top:580px;width:644px;height:310px;padding:28px 36px">
+      <div class="mono" style="font-size:25px;color:var(--violet)">intent.edit &rarr; chief of staff</div>
+      <div class="mono" style="font-size:26px;margin-top:18px;line-height:1.55"><span class="ro">&minus; returns 200 with {"ok": true}</span><br><span class="gr">+ &hellip; + Cache-Control: no-store</span></div>
+      <div style="margin-top:20px;font-size:26px;color:var(--muted)">old &rarr; new, at once</div>
+    </div>
+    <div class="abs fromR" style="--at:calc(var(--c2) + 2s);right:70px;top:40px;width:520px;padding:20px 26px;border-radius:18px;background:#0b1128;border:2px solid var(--amber);box-shadow:0 20px 60px rgba(0,0,0,.6);z-index:6">
+      <div style="font-size:24px;color:var(--amber);font-weight:700;letter-spacing:.05em">herdr &middot; toast</div>
+      <div style="font-size:30px;font-weight:650;margin-top:6px">Intent changed on #2</div></div>
+  </section>
+
+  <!-- 6 ─────────────────────────────── foreground / background -->
+  <section class="slide" data-id="foreground">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">Foreground &amp; background</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Stay in the conversation</div></div>
+    <div style="position:absolute;left:0;top:0;width:1920px;height:1080px;transform:translateY(-34px)">
+    <div class="lane rise" style="--at:var(--c0);top:310px"><span>You</span></div>
+    <div class="lane rise" style="--at:var(--c0);top:520px"><span>Chief of staff</span></div>
+    <div class="lane rise" style="--at:var(--c0);top:730px;border-style:dashed"><span>Background<br><i style="font-size:21px;color:var(--dim);font-style:normal">its own tab</i></span></div>
+
+    <div class="vanish" style="--at:calc(var(--c3) + .8s)"><div class="abs grow" style="--at:calc(var(--c0) + .6s);--len:11s;--w:760px;left:420px;top:578px;height:56px;border-radius:14px;background:linear-gradient(90deg,#3a4a8f,#4f64c4);border:2px solid #6d82e0"><span class="mono" style="position:absolute;left:20px;top:11px;font-size:25px;white-space:nowrap">long task: review every file&hellip;</span></div></div>
+    <div class="bub rise" style="--at:var(--c1);left:420px;top:372px;background:rgba(96,165,250,.18);border-color:var(--blue)">you: "name for a ginger cat?"</div>
+
+    <svg viewBox="0 0 1920 1080"><path d="M830 400 L 1150 400" class="ln hot draw" pathLength="1" style="--at:calc(var(--c1) + 1.6s);--len:.7s"/><path d="M1430 450 L 1430 560" class="ln hot draw" pathLength="1" style="--at:calc(var(--c2) + .6s);--len:.6s"/></svg>
+    <div class="card pop" style="--at:calc(var(--c1) + 2.4s);left:1150px;top:335px;width:560px;height:130px;padding:18px 28px;border-color:rgba(167,139,250,.6);z-index:3">
+      <div class="mono" style="font-size:23px;color:var(--violet)">decision model</div>
+      <div style="display:flex;align-items:center;gap:18px;margin-top:8px"><span style="font-size:38px;font-weight:750">new</span>
+        <div style="flex:1;height:22px;border-radius:11px;background:#0a1030;overflow:hidden"><div class="grow" style="--at:calc(var(--c1) + 2.7s);--len:1s;--w:99%;height:100%;background:var(--violet)"></div></div><span class="mono" style="font-size:30px">0.99</span></div>
+    </div>
+    <div class="abs rise" style="--at:calc(var(--c2) + 1s);left:1200px;top:566px"><span class="tag t-amber">decoration: hand off first</span></div>
+
+    <div class="abs rise" style="--at:calc(var(--c3) + .2s);left:1200px;top:780px"><span class="tag t-violet">handoff brief &rarr; GitHub</span></div>
+    <div class="abs grow" style="--at:calc(var(--c3) + .8s);--len:5s;--w:760px;left:420px;top:788px;height:56px;border-radius:14px;background:linear-gradient(90deg,#3a4a8f,#4f64c4);border:2px solid #6d82e0"><span class="mono" style="position:absolute;left:20px;top:11px;font-size:25px;white-space:nowrap">continues in the background</span></div>
+    <div class="bub rise" style="--at:calc(var(--c3) + 2.6s);left:420px;top:578px;background:rgba(45,212,191,.16);border-color:var(--teal);z-index:4">chief: "Marmalade."</div>
+    </div>
+  </section>
+
+  <!-- 7 ─────────────────────────────── the judge -->
+  <section class="slide" data-id="judge">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">The judge</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Judged in context. <span class="hl">Only ever tightened.</span></div></div>
+    <div id="judge-scene"></div>
+  </section>
+
+  <!-- 8 ─────────────────────────────── github -->
+  <section class="slide" data-id="github">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">GitHub is the memory</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Signed in, <span class="hl">signed out</span>, nothing to lose</div></div>
+    <svg viewBox="0 0 1920 1080">
+      <path d="M476 440 L 720 440" class="ln hot draw" pathLength="1" style="--at:var(--c1);--len:1s"/>
+      <path d="M1120 440 L 1380 440" class="ln hot draw" pathLength="1" style="--at:var(--c1);--len:1s"/>
+    </svg>
+    <div class="card rise" style="--at:var(--c1);left:96px;top:320px;width:380px;height:240px;padding:28px 34px">
+      <div style="font-size:40px;font-weight:700">GitHub</div>
+      <div class="mono" style="font-size:24px;color:var(--muted);margin-top:12px;line-height:1.55">issues &middot; comments<br>PRs &middot; labels</div></div>
+    <div class="abs pop" style="--at:calc(var(--c1) + .9s);left:510px;top:372px"><span class="tag t-green" style="font-size:22px">&#10003; signed</span></div>
+    <div class="card rise" style="--at:calc(var(--c1) + .4s);left:720px;top:320px;width:400px;height:240px;border-color:rgba(45,212,191,.55);padding:28px 34px"><div style="font-size:36px;font-weight:700" class="hl">switchboard</div><div class="mono" style="font-size:24px;color:var(--muted);margin-top:12px;line-height:1.55">HMAC-verified webhook<br>+ catch-up read</div></div>
+    <div class="card rise" style="--at:calc(var(--c1) + .8s);left:1380px;top:320px;width:444px;height:240px;padding:28px 34px"><div style="font-size:40px;font-weight:700">Agents</div><div class="mono" style="font-size:24px;color:var(--muted);margin-top:12px;line-height:1.55">chief of staff<br>orchestrators &middot; workers</div></div>
+    <div class="pkt" style="offset-path:path('M476 440 L 720 440');--at:calc(var(--c1) + 1.2s);--dur:2.2s"></div>
+    <div class="pkt" style="offset-path:path('M1120 440 L 1380 440');--at:calc(var(--c1) + 1.8s);--dur:2.2s"></div>
+
+    <div class="abs rise mono" style="--at:calc(var(--c1) + 3.4s);left:96px;top:610px;width:1050px;font-size:27px;color:var(--ink)"><span style="color:var(--dim)">$</span> gh issue comment 2 --body <span class="am">"standing by"</span><span style="color:var(--dim)">&nbsp;&nbsp;# plain gh</span></div>
+    <div class="abs rise" style="--at:calc(var(--c1) + 4.4s);left:96px;top:670px;width:1050px;padding:18px 26px;border-radius:16px;background:#0a1030;border:2px solid var(--line)">
+      <div class="mono" style="font-size:27px">standing by</div>
+      <div class="mono fade" style="--at:calc(var(--c1) + 5.2s);font-size:23px;color:var(--teal);margin-top:8px">&lt;!-- fleet-switchboard:from=platform --&gt; <span style="color:var(--dim)">&middot; invisible</span></div></div>
+    <div class="abs pop" style="--at:calc(var(--c1) + 6s);left:1180px;top:640px"><span class="tag t-rose" style="height:56px;font-size:26px">&#10007; echo dropped</span></div>
+    <div class="card rise" style="--at:var(--c2);left:1180px;top:730px;width:644px;height:160px;padding:24px 32px"><div class="mono" style="font-size:24px;color:var(--muted)">state/</div><div class="mono" style="font-size:27px;margin-top:8px">audit.jsonl &nbsp; reminders.json</div><div class="abs ro" style="right:30px;top:24px;font-size:27px;font-weight:600">delete &rarr; nothing lost</div></div>
+  </section>
+
+  <!-- 9 ─────────────────────────────── proven -->
+  <section class="slide" data-id="proven">
+    <div class="abs" style="left:96px;top:130px"><div class="kicker rise" style="--at:var(--c0)">Proof</div>
+      <div class="title rise" style="--at:var(--c0);margin-top:10px">Proven <span class="hl">the hard way</span></div></div>
+    <div class="card rise" style="--at:var(--c1);left:96px;top:320px;width:1040px;height:570px;padding:26px 34px">
+      <div class="mono" style="font-size:23px;color:var(--muted);display:grid;grid-template-columns:1fr 140px 330px;padding-bottom:12px;border-bottom:2px solid var(--line)"><span>scenario</span><span>run</span><span>control: safeguard off</span></div>
+      <div id="rows"></div>
+    </div>
+    <div class="abs" style="left:1190px;top:318px;width:634px">
+      <div class="rise" style="--at:var(--c2)"><div class="mono hl" style="font-size:104px;font-weight:800;line-height:1"><span class="num" style="--to:970;--at:var(--c2);--len:2.4s"></span>+</div><div style="font-size:28px;color:var(--muted)">tests, on stateful fakes</div></div>
+      <div class="rise" style="--at:calc(var(--c3) + .2s);margin-top:30px"><div class="mono am" style="font-size:104px;font-weight:800;line-height:1"><span class="num" style="--to:21;--at:calc(var(--c3) + .2s);--len:1.6s"></span></div><div style="font-size:28px;color:var(--muted)">scenarios on real OpenCode v2 + herdr</div></div>
+      <div class="rise" style="--at:calc(var(--c3) + 2s);margin-top:30px"><div class="mono vi" style="font-size:104px;font-weight:800;line-height:1"><span class="num" style="--to:12;--at:calc(var(--c3) + 2s);--len:1.6s"></span>+</div><div style="font-size:28px;color:var(--muted)">bugs found in a live run, fixed</div></div>
+    </div>
+  </section>
+
+  <!-- 10 ─────────────────────────────── outro -->
+  <section class="slide" data-id="outro">
+    <div class="abs" id="orbit2" style="left:0;top:0"></div>
+    <div class="abs" style="left:130px;top:290px;width:1100px">
+      <div class="rise" style="--at:var(--c0);font-size:140px;line-height:1;font-weight:800;letter-spacing:-.035em">Fleet<br>Switchboard</div>
+      <div class="rise" style="--at:var(--c1);margin-top:44px;font-size:56px;font-weight:650;line-height:1.25">Calm agents.<br><span class="hl">Clear intent.</span><br>Your attention, protected.</div>
+      <div class="mono rise" style="--at:calc(var(--c1) + 2s);margin-top:50px;font-size:30px;color:var(--muted)">bin/switchboard-trial up &nbsp;&middot;&nbsp; docs/switchboard.md</div>
+    </div>
+  </section>
+</div>
+
+<style>
+.bub{position:absolute;padding:14px 22px;border-radius:16px;background:var(--panel2);border:2px solid var(--line);font-size:26px;line-height:1.25;white-space:nowrap}
+.qbar{display:flex;justify-content:space-between;align-items:center;height:72px;margin-bottom:16px;padding:0 26px;border-radius:16px;background:var(--panel);border:2px solid var(--line);font-size:28px}
+.qbar b{font-weight:600;color:var(--dim)} .qbar b.am{color:var(--amber)}
+.lane{position:absolute;left:96px;width:1728px;height:200px;border:2px solid var(--line);border-radius:26px;background:rgba(17,26,56,.55)}
+.lane span{position:absolute;left:34px;top:24px;font-size:26px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);line-height:1.5}
+.slide.active .spinarc{animation:spin 1.1s linear infinite}
+.slide.active .hand{animation:spin 2.2s linear infinite}
+.trow{display:grid;grid-template-columns:1fr 140px 330px;align-items:center;height:74px;border-bottom:1px solid rgba(42,55,102,.7);font-size:26px}
+.trow .id{font-family:var(--mono);color:var(--teal);margin-right:14px}
+.trow .ok{color:var(--green);font-weight:700}
+.trow .no{color:var(--rose);font-weight:700}
+.telrow{display:flex;align-items:flex-start;gap:20px;margin-bottom:26px}
+.telrow .av{flex:none;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:22px;color:#06101f}
+.telrow .tx{font-size:27px;line-height:1.3}
+.telrow small{display:block;font-size:21px;color:var(--dim);margin-bottom:2px;text-transform:uppercase;letter-spacing:.1em}
+.jcmd{position:absolute;height:76px;display:flex;align-items:center;padding:0 24px;border-radius:16px;background:#0a1030;border:2px solid var(--line);font-family:var(--mono);font-size:27px;white-space:nowrap}
+.jq{position:absolute;left:740px;width:460px;height:70px;border-radius:14px;border:2px solid var(--line);background:var(--panel);display:flex;align-items:center;gap:16px;padding:0 22px;font-size:27px;font-weight:600}
+.jq i{width:20px;height:20px;border-radius:50%;background:var(--dim);flex:none}
+.bin{position:absolute;left:1380px;width:444px;height:110px;border-radius:20px;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:800;letter-spacing:.1em}
+</style>
+
+<script>
+(function(){
+  /* ---------------- cues ---------------- */
+  var T = window.PRESENTATION_TIMING;
+  var slides = Array.prototype.slice.call(document.querySelectorAll(".slide"));
+  var DEFAULT_LEAD = .7;
+  function timingFor(i){
+    if (T && T.slides[i]) return T.slides[i];
+    // estimated when timing.js is missing: four cues, six seconds apart
+    var segs=[]; for (var k=0;k<5;k++) segs.push({start:DEFAULT_LEAD+k*6,end:DEFAULT_LEAD+k*6+5,text:""});
+    return {id:slides[i].dataset.id,duration:30,segments:segs};
+  }
+  slides.forEach(function(el,i){
+    var tm=timingFor(i);
+    for (var k=0;k<6;k++){
+      var seg=tm.segments[Math.min(k,tm.segments.length-1)];
+      el.style.setProperty("--c"+k,(seg?seg.start:0)+"s");
+    }
+  });
+
+  /* ---------------- generated scenery (static DOM; the motion is CSS) ---------------- */
+  function el(tag,cls,style,html){var e=document.createElement(tag);if(cls)e.className=cls;if(style)e.style.cssText=style;if(html!=null)e.innerHTML=html;return e}
+  function orbit(host,cx,cy,r,cueVar){
+    var ns="http://www.w3.org/2000/svg", svg=document.createElementNS(ns,"svg"); svg.setAttribute("viewBox","0 0 1920 1080"); host.appendChild(svg);
+    var N=14, kinds=[["var(--amber)",1],["var(--violet)",3],["var(--teal)",10]];
+    [r*.55,r*.8,r*1.08].forEach(function(rr,i){var c=document.createElementNS(ns,"circle");c.setAttribute("cx",cx);c.setAttribute("cy",cy);c.setAttribute("r",rr);c.setAttribute("fill","none");c.setAttribute("stroke","var(--line)");c.setAttribute("stroke-width","2");c.setAttribute("stroke-dasharray","6 14");c.style.opacity=.55;svg.appendChild(c)});
+    var hub=el("div","pulse","position:absolute;left:"+(cx-70)+"px;top:"+(cy-70)+"px;width:140px;height:140px;border-radius:50%;background:radial-gradient(circle,#5eead4 0%,var(--teal) 35%,rgba(45,212,191,.15) 70%);box-shadow:0 0 90px rgba(45,212,191,.55)");
+    host.appendChild(hub);
+    host.appendChild(el("div","ringout","position:absolute;left:"+(cx-70)+"px;top:"+(cy-70)+"px;width:140px;height:140px;border-radius:50%;border:3px solid var(--teal)"));
+    var idx=0;
+    for (var i=0;i<N;i++){
+      var a=(i/N)*Math.PI*2-Math.PI/2, rr=i%2?r:r*.8, x=cx+Math.cos(a)*rr, y=cy+Math.sin(a)*rr;
+      var color= i===0?"var(--amber)":(i%3===0?"var(--violet)":"var(--teal)");
+      var line=document.createElementNS(ns,"path"); line.setAttribute("d","M"+x.toFixed(1)+" "+y.toFixed(1)+" L"+cx+" "+cy);
+      line.setAttribute("class","ln draw"); line.setAttribute("pathLength","1"); line.style.cssText="--at:calc("+cueVar+" + "+(.25+i*.13).toFixed(2)+"s);--len:.9s;stroke:"+color+";opacity:.5"; svg.appendChild(line);
+      host.appendChild(el("div","pop","position:absolute;left:"+(x-17)+"px;top:"+(y-17)+"px;width:34px;height:34px;border-radius:50%;background:"+color+";box-shadow:0 0 26px "+color+";--at:calc("+cueVar+" + "+(.15+i*.13).toFixed(2)+"s)"));
+      var out = i%2===0;
+      var p=el("div","pkt"+(i%3===0?" vi":""),"offset-path:path('M"+(out?(x.toFixed(1)+" "+y.toFixed(1)):(cx+" "+cy))+" L"+(out?(cx+" "+cy):(x.toFixed(1)+" "+y.toFixed(1)))+"');--at:calc("+cueVar+" + "+(1.2+i*.37).toFixed(2)+"s);--dur:"+(2.2+(i%4)*.5).toFixed(2)+"s");
+      host.appendChild(p);
+    }
+  }
+  orbit(document.getElementById("orbit1"),1450,540,330,"var(--c0)");
+  orbit(document.getElementById("orbit2"),1500,540,300,"var(--c0)");
+
+  // telephone chain (slide 2)
+  (function(){
+    var host=document.getElementById("tel");
+    var rows=[["Y","var(--blue)","You","Fix both agents and verify in prod",1],["C","var(--amber)","Chief of staff","Fix the agents",.8],["O","var(--violet)","Orchestrator","Look at an agent",.55],["W","var(--teal)","Worker","Check some logs?",.32]];
+    rows.forEach(function(r,i){
+      var d=el("div","telrow rise","--at:calc(var(--c1) + "+(.5+i*1.15).toFixed(2)+"s)");
+      d.appendChild(el("div","av","background:"+r[1],r[0]));
+      d.appendChild(el("div","tx","opacity:"+r[4],"<small>"+r[2]+"</small>&ldquo;"+r[3]+"&rdquo;"));
+      host.appendChild(d);
+    });
+    host.appendChild(el("div","mono rise","--at:calc(var(--c1) + 5.2s);margin-top:6px;font-size:28px;color:var(--rose)","meaning left: 100% &rarr; 30%"));
+  })();
+
+  // batching (slide 4)
+  (function(){
+    var host=document.getElementById("batch"); host.style.cssText="position:absolute;inset:0";
+    host.appendChild(el("div","","position:absolute;left:34px;top:20px","<span class='tag t-teal' style='height:40px;font-size:21px'>BATCH &middot; 90 s</span>"));
+    host.appendChild(el("div","","position:absolute;left:300px;top:26px;font-size:24px;color:var(--muted)","five events arrive"));
+    for (var i=0;i<5;i++){
+      var x0=40+i*40;
+      host.appendChild(el("div","pkt sq once","opacity:0;offset-path:path('M"+x0+" 100 C "+x0+" 120, 330 120, 440 92');--at:calc(var(--c3) + "+(3.1+i*.22).toFixed(2)+"s);--dur:1.3s;background:var(--teal)"));
+    }
+    host.appendChild(el("div","rise","--at:calc(var(--c3) + 4.7s);position:absolute;left:450px;top:62px;white-space:nowrap;padding:12px 22px;border-radius:14px;background:rgba(45,212,191,.16);border:2px solid var(--teal);font-size:26px;line-height:1.25","<b class='hl'>one message</b> <span style='color:var(--muted);font-size:22px'>&middot; 5 items</span>"));
+  })();
+
+  // proof rows (slide 9)
+  (function(){
+    var host=document.getElementById("rows");
+    [["W2","a mid-turn item waits for the reply","steer-not-queue"],["B1","five events become one message","no-batch"],["N2","an unread note becomes a wake","no-note-conversion"],["R2","a crash between send and read-back","no-dedupe"],["H1","a pane closed mid-delivery","no-recheck"],["D1","a draft in the box is never touched","typed-wake"]].forEach(function(r,i){
+      var at="calc(var(--c1) + "+(.9+i*1.0).toFixed(2)+"s)";
+      var d=el("div","trow","--at:"+at);
+      d.appendChild(el("span","fade","--at:"+at,"<span class='id'>"+r[0]+"</span>"+r[1]));
+      d.appendChild(el("span","fade ok","--at:calc("+at+" + .35s)","&#10003; pass"));
+      d.appendChild(el("span","fade no","--at:calc("+at+" + .75s)","&#10007; fails &nbsp;<span class='mono' style='font-size:21px;color:var(--dim)'>"+r[2]+"</span>"));
+      host.appendChild(d);
+    });
+  })();
+
+  // the idea (slide 3): sources -> the daemon -> agents
+  (function(){
+    var ns="http://www.w3.org/2000/svg", svg=document.getElementById("idea-svg"), nodes=document.getElementById("idea-nodes");
+    function path(d,at,cls){var p=document.createElementNS(ns,"path");p.setAttribute("d",d);p.setAttribute("class","ln hot draw");p.setAttribute("pathLength","1");p.style.cssText="--at:"+at+";--len:.8s;"+(cls||"");svg.appendChild(p)}
+    var srcs=[["GitHub events","var(--blue)"],["Finished workers","var(--teal)"],["Your messages","var(--violet)"],["Reminders","var(--amber)"]];
+    srcs.forEach(function(sr,i){
+      var top=330+i*100, at="calc(var(--c1) + "+(.2+i*.5).toFixed(2)+"s)", yy=470+i*50;
+      nodes.appendChild(el("div","chip fromL","--at:"+at+";left:96px;top:"+top+"px;width:420px;color:"+sr[1],"<span class='dot'></span><span style='color:var(--ink)'>"+sr[0]+"</span>"));
+      var d="M516 "+(top+34)+" C 620 "+(top+34)+", 610 "+yy+", 700 "+yy;
+      path(d,"calc("+at+" + .5s)");
+      nodes.appendChild(el("div","pkt"+(i===1?"":i===2?" vi":i===3?" am":" bl"),"offset-path:path('"+d+"');--at:calc(var(--c1) + "+(1.4+i*.6).toFixed(2)+"s);--dur:2.4s"));
+    });
+    var ag=[["Chief of staff","var(--amber)"],["Orchestrator","var(--violet)"],["Workers","var(--teal)"]];
+    ag.forEach(function(a,k){
+      var top=330+k*100, at="calc(var(--c2) + "+(1.8+k*.5).toFixed(2)+"s)", yy=500+k*50;
+      nodes.appendChild(el("div","chip fromR","--at:"+at+";left:1400px;top:"+top+"px;width:424px;color:"+a[1],"<span class='dot'></span><span style='color:var(--ink)'>"+a[0]+"</span>"));
+      var d="M1220 "+yy+" C 1310 "+yy+", 1310 "+(top+34)+", 1400 "+(top+34);
+      path(d,"calc("+at+" + .3s)");
+      nodes.appendChild(el("div","pkt"+(k===1?" vi":k===0?" am":""),"offset-path:path('"+d+"');--at:calc("+at+" + .9s);--dur:2.2s"));
+    });
+  })();
+
+  // the judge (slide 7)
+  (function(){
+    var host=document.getElementById("judge-scene");
+    var qs=["Outside the intent?","Hard to reverse?","Speaks for you?","Outside its scope?"];
+    host.appendChild(el("div","card fade","--at:var(--c0);left:720px;top:320px;width:500px;height:580px;border-color:rgba(251,191,36,.45)"));
+    host.appendChild(el("div","abs fade","--at:calc(var(--c1) + .4s);left:720px;top:338px;width:500px;text-align:center","<span class='tag t-amber' style='height:42px;font-size:22px'>four yes / no questions</span>"));
+    qs.forEach(function(q,i){
+      var d=el("div","jq rise","--at:calc(var(--c1) + "+(.8+i*.25).toFixed(2)+"s);top:"+(400+i*118)+"px",null);
+      d.appendChild(el("i","")); d.appendChild(el("span","",null,q)); host.appendChild(d);
+    });
+    var cmds=[["git log --oneline -3","allow",[],"var(--green)"],["gh workflow run deploy.yml","ask",[2],"var(--amber)"],["edit billing/export.py","deny",[0],"var(--rose)"]];
+    var t0=["calc(var(--c1) + 1.2s)","calc(var(--c1) + 4.2s)","calc(var(--c1) + 7.2s)"], ys=[400,590,780];
+    cmds.forEach(function(c,i){
+      host.appendChild(el("div","jcmd fromL","--at:"+t0[i]+";left:96px;top:"+ys[i]+"px;width:560px",c[0]));
+      var bg=c[1]==="allow"?"rgba(74,222,128,.16)":c[1]==="ask"?"rgba(251,191,36,.16)":"rgba(251,113,133,.16)";
+      host.appendChild(el("div","bin pop","--at:calc("+t0[i]+" + 1.6s);top:"+(ys[i]-18)+"px;background:"+bg+";border:2px solid "+c[3]+";color:"+c[3],c[1].toUpperCase()));
+      c[2].forEach(function(qi){
+        host.appendChild(el("div","pop","--at:calc("+t0[i]+" + 1.1s);position:absolute;left:1198px;top:"+(412+qi*118)+"px;width:26px;height:26px;border-radius:50%;background:"+c[3]+";box-shadow:0 0 22px "+c[3]));
+      });
+      host.appendChild(el("div","pkt sq once","offset-path:path('M660 "+(ys[i]+38)+" L1380 "+(ys[i]+38)+"');--at:calc("+t0[i]+" + .3s);--dur:1.5s;background:"+c[3]+";box-shadow:0 0 18px "+c[3]));
+    });
+    // the ratchet: a verdict only moves down this ladder
+    host.appendChild(el("div","abs rise","--at:calc(var(--c3) + 0s);left:1560px;top:496px;font-size:58px;line-height:1;color:var(--amber)","&darr;"));
+    host.appendChild(el("div","abs rise","--at:calc(var(--c3) + .3s);left:1560px;top:686px;font-size:58px;line-height:1;color:var(--rose)","&darr;"));
+    host.appendChild(el("div","abs rise","--at:calc(var(--c3) + .5s);left:1640px;top:506px;font-size:26px;color:var(--muted)","tighten only"));
+    host.appendChild(el("div","abs pop","--at:calc(var(--c3) + 1.6s);left:1380px;top:890px","<span class='tag t-rose' style='height:42px;font-size:22px'>&#10007; never the reverse</span>"));
+  })();
+})();
+</script>
+<!-- runtime: navigation, autoplay, captions, and the seek used by build/render.mjs -->
+<script>
+(function(){
+  var stage=document.getElementById("stage"), brand=document.getElementById("brand"), count=document.getElementById("count"), cap=document.getElementById("caption");
+  var slides=Array.prototype.slice.call(document.querySelectorAll(".slide"));
+  var T=window.PRESENTATION_TIMING, cur=-1, timer=null, audio=null, started=0;
+  function fit(){var s=Math.min(innerWidth/1920,innerHeight/1080);stage.style.transform="scale("+s+")";stage.style.left=((innerWidth-1920*s)/2)+"px";stage.style.top=((innerHeight-1080*s)/2)+"px"}
+  addEventListener("resize",fit);fit();
+  var params=new URLSearchParams(location.search);
+  if(params.get("captions")==="1")document.body.classList.add("captions");
+  if(params.get("chrome")==="0"){brand.remove();count.remove()}
+  function show(i){
+    i=Math.max(0,Math.min(slides.length-1,i));
+    slides.forEach(function(s){s.classList.remove("active")});
+    void stage.offsetWidth;                       // restart every animation
+    slides[i].classList.add("active");cur=i;
+    brand.style.display=i===0?"none":"flex";
+    count.textContent=(i+1)+" / "+slides.length;
+    caption(i,0);
+    return i;
+  }
+  function caption(i,t){
+    var tm=T&&T.slides[i];if(!tm){cap.textContent="";return}
+    var text="";tm.segments.forEach(function(g){if(t>=g.start-.05&&t<g.end+.25)text=g.text});
+    cap.textContent=text;
+  }
+  function stop(){clearTimeout(timer);timer=null;if(audio){audio.pause();audio=null}}
+  function play(i){
+    stop();i=show(i);started=performance.now();
+    var tm=T&&T.slides[i];var dur=(tm?tm.duration:30)*1000;
+    var n=String(i+1).padStart(2,"0");
+    try{audio=new Audio("audio/slide-"+n+".mp3");audio.play().catch(function(){})}catch(e){}
+    (function tick(){var t=(performance.now()-started)/1000;caption(i,t);
+      if(t*1000<dur){timer=requestAnimationFrame(tick)}else if(i<slides.length-1){play(i+1)}else{timer=null}})();
+  }
+  addEventListener("keydown",function(e){
+    if(e.key==="ArrowRight"||e.key==="PageDown"||e.key===" "){stop();show(cur+1);e.preventDefault()}
+    else if(e.key==="ArrowLeft"||e.key==="PageUp"){stop();show(cur-1);e.preventDefault()}
+    else if(e.key==="Home"){stop();show(0)}else if(e.key==="End"){stop();show(slides.length-1)}
+    else if(e.key==="a"){play(Math.max(cur,0))}
+    else if(e.key==="c"){document.body.classList.toggle("captions")}
+    else if(e.key==="f"){document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen()}
+  });
+  stage.addEventListener("click",function(e){stop();show(cur+(e.clientX<innerWidth/3?-1:1))});
+  // for the video build: show slide i with every animation parked at t seconds
+  window.deck={
+    count:slides.length,
+    durations:slides.map(function(_,i){return T&&T.slides[i]?T.slides[i].duration:30}),
+    seek:function(i,t){
+      if(i!==cur||t===0)show(i);
+      slides[i].getAnimations({subtree:true}).forEach(function(a){a.pause();a.currentTime=t*1000});
+      caption(i,t);
+    }
+  };
+  show(0);
+})();
+</script>
+</body>
+</html>

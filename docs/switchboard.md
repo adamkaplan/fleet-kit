@@ -21,6 +21,7 @@
 | 9 | `switchboard/policy` | Tool-call policy judge through the thin `fleet-hooks` plugin; spikes SP1–SP2 | ready for review [#25](https://github.com/adamkaplan/fleet-kit/pull/25); P1–P6 pass offline; SP1 measured in the Lab, then the real plugin end to end |
 | 10 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | ready for review [#26](https://github.com/adamkaplan/fleet-kit/pull/26); M1 passes offline; the import round trip is half-measured in the Lab |
 | 11 | `switchboard/trial` | `bin/switchboard-trial`: a Lab-isolated profile with GitHub Copilot, to try the system by hand; `launch --charter` | ready for review; see [switchboard-trial.md](switchboard-trial.md) |
+| 12 | `switchboard/presentation` | A three-minute narrated deck and video explaining the system: `docs/presentation/` | ready for review [#28](https://github.com/adamkaplan/fleet-kit/pull/28); see [presentation/README.md](presentation/README.md) |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -1738,4 +1739,13 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     marker is a name, not a proof: anyone who writes one into a comment suppresses
     its delivery. An HMAC over the body with a per-install secret would make it
     unforgeable; not done.
-
+- 2026-10-05: PR 12, a presentation. `docs/presentation/` holds a single-file
+  animated deck (`index.html`, no dependencies), its narration (spoken by a
+  text-to-speech model through OpenRouter, the script in `narration.json`) and the
+  scripts that build an MP4 of the two together (the MP4 itself is not committed). Each element
+  appears on the sentence that speaks of it:
+  `build/tts.py` writes the audio and `timing.js`, the page reads the sentence
+  start times, and `build/render.mjs` parks every animation at each frame time and
+  pipes the screenshots to ffmpeg. The numbers on the slides are the real ones
+  (970+ tests, 21 live scenarios, 12+ bugs found in a live run). The narration was
+  checked by transcribing it back with a speech-to-text model, not by ear.

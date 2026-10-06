@@ -1,0 +1,9 @@
+{
+  "name": "switchboard-presentation-build",
+  "private": true,
+  "type": "module",
+  "description": "Renders the presentation to an MP4 (see ../README.md)",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
