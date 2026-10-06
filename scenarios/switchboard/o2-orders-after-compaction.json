@@ -1,0 +1,96 @@
+{
+  "id": "O2",
+  "title": "A completed compaction sends the orders again, once; a failed one sends nothing",
+  "problem": 3,
+  "since_pr": 17,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    }
+  },
+  "issues": {
+    "1": {
+      "intent": null,
+      "authority": "approve deploys in this repo"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away"
+    },
+    {
+      "at": "20s",
+      "actor": "you",
+      "do": "message",
+      "to": "platform",
+      "text": "what is next?",
+      "why": "The orders note from the start is read"
+    },
+    {
+      "at": "60s",
+      "actor": "world",
+      "do": "compact",
+      "agent": "platform",
+      "status": "failed",
+      "why": "A compaction that failed lost nothing: nothing is sent"
+    },
+    {
+      "at": "120s",
+      "actor": "world",
+      "do": "compact",
+      "agent": "platform",
+      "status": "completed",
+      "why": "The completed one may have dropped the orders from the conversation: they are sent again"
+    },
+    {
+      "at": "200s",
+      "actor": "you",
+      "do": "message",
+      "to": "platform",
+      "text": "and now?",
+      "why": "The second note is read"
+    },
+    {
+      "at": "6m",
+      "actor": "world",
+      "do": "wait",
+      "why": "Many passes later nothing more"
+    }
+  ],
+  "expect": [
+    {
+      "name": "start-and-after-compaction",
+      "that": "delivered",
+      "to": "platform",
+      "key": "orders:*#1:*",
+      "mode": "note",
+      "count": 2,
+      "keys": 2
+    },
+    {
+      "name": "two-messages-not-three",
+      "that": "message_count",
+      "to": "platform",
+      "count": 2
+    },
+    {
+      "name": "no-machine-turn",
+      "that": "no_machine_turn",
+      "agent": "platform"
+    }
+  ],
+  "control": {
+    "fault": "orders-start-only",
+    "fails": [
+      "start-and-after-compaction",
+      "two-messages-not-three"
+    ]
+  }
+}

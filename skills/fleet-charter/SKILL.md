@@ -50,6 +50,17 @@ you report to about any merge, deploy, publish, message to others or spend it
 does not cover. With no such line it reads "none stated", and nothing of that
 kind is pre-authorised.
 
+Orders the owner gives live in a `## Standing orders` section of the charter
+body, one bullet each: `- <text> (ordered by <name>, <YYYY-MM-DD>)`. They count
+with that line. The switchboard sends them to every agent of the charter as a
+`[switchboard] standing orders` note at its start, after each compaction and
+when they change, and the judge reads them at every tool call; they only stop a
+pointless question, they never loosen a deny. Only the Chief of Staff records
+them, with `fleet-switchboard orders add|remove --charter <n>` (the owner may
+edit the issue directly); you never edit that section, and the judge stops an
+agent that edits its own charter. `fleet-switchboard orders list --charter <n>`
+shows them.
+
 An issue that names your pane but carries no `<user>:orchestrator` label is not a
 charter. It is one label away from being one, and until that label is on, nothing
 supervising the fleet can see it.

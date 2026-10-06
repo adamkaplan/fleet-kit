@@ -267,3 +267,11 @@ overrides a repo that normally takes direct pushes.
 Formal approval means the required reviewer approved the full current commit SHA.
 A pending review, a comment, or an approval against a stale head is not approval.
 If the head moved, the approval did not move with it.
+
+A `[switchboard] standing orders` note is the owner's standing instruction for the
+charter (kept in the charter issue's `## Standing orders` section, one bullet per
+order): act on it without asking again, within its words. It covers nothing it
+does not name, and nobody but the Chief of Staff, through `fleet-switchboard orders
+add|remove --charter <n>`, or the owner records or changes one. When your
+principal gives the Chief of Staff a standing order, it records it and asks nothing
+the order already answers.

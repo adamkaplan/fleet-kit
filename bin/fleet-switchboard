@@ -267,6 +267,10 @@ KNOWN_FAULTS = (
     "catch-up-blocks-pass",  # PR 16: GitHub reads have no time budget or cap, so a big catch-up holds the pass
     "catch-up-on-fresh-start",  # PR 16: a repo with no read marker reads the whole look-back window
     "full-window-every-time",   # PR 16: a forwarder repo reads the whole look-back window on every catch-up
+    "orders-start-only",
+    "orders-wake",
+    "anyone-can-order",
+    "orders-never-judged",
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -794,10 +798,11 @@ class Fact:
     window, as `send` does.
     """
 
-    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender", "rider", "repo")
+    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender", "rider", "repo",
+              "orders")
 
     def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None, rider=False,
-                 repo=None):
+                 repo=None, orders=False):
         for name, value in (("key", key), ("recipient", recipient), ("kind", kind)):
             if not isinstance(value, str) or not value.strip():
                 raise FactError("fact %s must be a non-empty string, got %r" % (name, value))
@@ -813,19 +818,22 @@ class Fact:
             raise FactError("fact from must be a string, got %r" % (sender,))
         if not isinstance(rider, bool):
             raise FactError("fact rider must be true or false, got %r" % (rider,))
+        if not isinstance(orders, bool):
+            raise FactError("fact orders must be true or false, got %r" % (orders,))
         self.key, self.recipient, self.kind, self.summary = key, recipient, kind, summary
         self.created, self.issue, self.batch, self.sender = float(created), issue, batch, sender
         self.rider = rider  # PR 13: carried in the next message, never the reason for one
         if repo is not None and not (isinstance(repo, str) and REPO_RE.match(repo)):
             raise FactError("fact repo must be OWNER/REPO, got %r" % (repo,))
         self.repo = repo  # PR 15: the repo `issue` is in; None means the recipient's own
+        self.orders = orders  # PR 17: the charter's standing orders: a note on its own, at once, never a wake
 
     @classmethod
     def from_json(cls, obj):
         if not isinstance(obj, dict):
             raise FactError("a fact must be a JSON object")
         unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider",
-                                  "repo"})
+                                  "repo", "orders"})
         if unknown:
             raise FactError("fact has unknown field(s): %s" % ", ".join(unknown))
         missing = [name for name in ("key", "recipient", "kind", "summary", "created") if name not in obj]
@@ -833,12 +841,12 @@ class Fact:
             raise FactError("fact is missing: %s" % ", ".join(missing))
         return cls(obj["key"], obj["recipient"], obj["kind"], obj["summary"], obj["created"],
                    obj.get("issue"), obj.get("batch", True), obj.get("from"), obj.get("rider", False),
-                   obj.get("repo"))
+                   obj.get("repo"), obj.get("orders", False))
 
     def to_json(self):
         body = {"key": self.key, "recipient": self.recipient, "kind": self.kind, "summary": self.summary,
                 "created": self.created, "issue": self.issue, "batch": self.batch, "from": self.sender,
-                "rider": self.rider}
+                "rider": self.rider, "orders": self.orders}
         if self.repo is not None:  # one repo: the shape is what it always was
             body["repo"] = self.repo
         return body
@@ -888,7 +896,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts()]
+            ForegroundFacts(), OrdersFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -956,6 +964,12 @@ def _fleet_keys(record):
     return [key for key in keys if isinstance(key, str)] if isinstance(keys, list) else []
 
 
+def _is_orders_note(record):
+    """PR 17: a record whose every key is a standing-orders key (`orders:...`)."""
+    keys = _fleet_keys(record)
+    return bool(keys) and all(key.startswith("orders:") for key in keys)
+
+
 def _created(record):
     times = record.get("time") if isinstance(record, dict) else None
     return _seconds(times.get("created")) if isinstance(times, dict) else None
@@ -980,6 +994,7 @@ class Observation:
         self.name, self.session_id, self.pane, self.status = name, session_id, pane, status
         self.fleet, self.idle_at, self.outcome = fleet, idle_at, outcome
         self.last_human_prompt, self.problem = last_human_prompt, problem
+        self.created = None  # PR 17: when v2 says the session began (epoch seconds)
         self.wrong_program = False  # the pane runs something other than the configured v2
         self.conflict = []  # other sessions that claim the same name
 
@@ -1060,6 +1075,16 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     engaged with it, else a wake.
     """
     pending = sorted(pending, key=lambda fact: (fact.created, fact.key))
+    # PR 17: standing orders go first and alone, at once, as a note (a wake only under `orders-wake`)
+    standing = [fact for fact in pending if fact.orders]
+    if standing:
+        reason = hold_reason(observation, missing)
+        if not reason:
+            return Plan(recipient, "wake" if fault("orders-wake") else "note",
+                        "standing orders are noted at once, and never wake anyone", standing, observation)
+        pending = [fact for fact in pending if not fact.orders]
+        if not pending:
+            return Plan(recipient, "hold", reason, standing, observation)
     # PR 13: riders are carried, never the reason for a message. Only the others choose the action
     # and start the batch clock; when there is any other, every rider goes with it.
     chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
@@ -1090,6 +1115,8 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     if not facts:
         raise ValueError("nothing to compose")
+    if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
+        return orders_note(recipient, facts[0], repos), facts[:1]
 
     def item(fact):
         where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
@@ -1112,6 +1139,18 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
             return text, facts[:count]
     marker = "\n[cut at %d characters]" % cap
     return text[:cap - len(marker)] + marker, facts[:1]
+
+
+ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "
+                  "again, within their words. They cover nothing they do not name.")
+
+
+def orders_note(recipient, fact, repos=None):
+    """The standing-orders note: each order on its own line, then the closing line. Never cut."""
+    lines = ["[switchboard] standing orders for %s (charter %s):" % (recipient, issue_tag(fact.repo, fact.issue, repos))]
+    lines.extend("- %s" % order for order in fact.summary.splitlines() if order.strip())
+    lines.append(ORDERS_CLOSING)
+    return "\n".join(lines)
 
 
 def collapse_riders(facts, now, max_age):
@@ -1153,6 +1192,8 @@ def describe_items(recipient, facts, repos=None):
     <first 100 characters>` for one item, `switchboard: <n> items for <recipient>: <first item, 80 characters>`
     for several. At most DESCRIPTION_MAX characters, never a newline."""
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
+    if all(fact.orders for fact in facts):
+        return "switchboard: standing orders for %s" % recipient
     lead = next((fact for fact in facts if not fact.rider), facts[0])
     if len(facts) == 1:
         where = " on %s" % issue_tag(lead.repo, lead.issue, repos) if lead.issue else ""
@@ -1323,6 +1364,7 @@ class Switchboard:
         observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
                                   STATUS.get(entry.get("agent_status"), "unknown"), fleet,
                                   _seconds(times.get("idle")), info.get("outcome"))
+        observation.created = _seconds(times.get("created"))
         self.check_program(observation)
         if observation.problem:
             return observation
@@ -1404,10 +1446,31 @@ class Switchboard:
             if acknowledge is not None:
                 acknowledge(keys)
 
+    def charter_repo(self, observation):
+        """PR 17: the repo an agent's charter is in: its own `repo`, else the intent repo."""
+        repo = (observation.fleet or {}).get("repo")
+        return repo if isinstance(repo, str) and repo else (self.intents.repo if self.intents is not None else None)
+
+    def charter_orders(self, observation, charter):
+        """PR 17: the standing orders of `charter` for one agent: the judge's warmed, cached read of the charter
+        when it holds one (the same file the judge reads, so no new `gh` call), else the reader's own cached read."""
+        reader = self.intents
+        if reader is None:
+            return []
+        fleet = observation.fleet or {}
+        repo = self.charter_repo(observation)
+        ttl = (self.config.get("policy") or {}).get("cache_seconds") or 0
+        if self.state_dir is not None and ttl:
+            cache = BoundedFileCache(self.state_dir / POLICY_CONTEXT_FILE, self.now, ttl, 1)
+            known = _valid_context(cache.get("ask:%s:%s:%s" % (repo, fleet.get("issue"), fleet.get("charter"))))
+            if known is not None and known["charter"] == charter:
+                return known["orders"]
+        return reader.charter_orders(charter, repo)
+
     # -- derive
 
     def collect_facts(self):
-        """Every fact from every source, first key wins. A failing source is audited and skipped."""
+        """Every fact from every source, first key wins for each recipient. A failing source is audited and skipped."""
         facts, seen, problems = [], set(), []
         for source in self.sources:
             name = getattr(source, "__name__", "source")
@@ -1418,8 +1481,9 @@ class Switchboard:
                 self._note("source.error", name, {"error": _one_line(str(err))})
                 continue
             for fact in found:
-                if fact.key not in seen:
-                    seen.add(fact.key)
+                # PR 17: first key wins per recipient (the orders key is the charter's, the same for every agent of it)
+                if (fact.recipient, fact.key) not in seen:
+                    seen.add((fact.recipient, fact.key))
                     facts.append(fact)
         return facts, problems
 
@@ -1556,7 +1620,8 @@ class Switchboard:
         inbox = self.v2.inbox_list(observation.session_id)
         notes = [item for item in (inbox if isinstance(inbox, list) else [])
                  if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
-                 and item.get("delivery") == "steer" and item.get("resume") is not True]
+                 and item.get("delivery") == "steer" and item.get("resume") is not True
+                 and not _is_orders_note(item)]  # PR 17: an unread orders note never becomes a wake
         converted = []
         for item in notes:
             if not fault("no-recheck"):
@@ -2277,7 +2342,7 @@ def policy_questions():
 
 def policy_state(role, intent, done_when, authority, tool, arguments):
     return {"role": role, "intent": _clip(intent, 600), "done_when": _clip(done_when, 400),
-            "standing_authority": _clip(authority, 300), "tool": tool,
+            "standing_authority": _clip(authority, ORDERS_STATE_CLIP), "tool": tool,
             "arguments": _clip(_canonical(arguments) if not isinstance(arguments, str) else arguments, 1500)}
 
 
@@ -6666,7 +6731,7 @@ class IntentReader:
     def invalidate(self, issue, repo=None):
         """Forget what is cached about `issue`; the next read asks GitHub again."""
         repo = repo or self.repo
-        for kind in ("issue", "parent"):
+        for kind in ("issue", "parent", "orders"):
             self._cache.pop((kind, repo, issue), None)
 
     # -- reading
@@ -6680,6 +6745,11 @@ class IntentReader:
             return found
 
         return self._cached(("issue", repo, number), fetch)
+
+    def charter_orders(self, number, repo=None):
+        """PR 17: the charter's standing orders (a list), read like the rest: cached for `ttl` seconds."""
+        repo = repo or self.repo
+        return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
     def parent(self, number, repo=None):
         """The parent issue's number, or None when the issue has no parent."""
@@ -7240,8 +7310,23 @@ def redact_command_text(text, extra=()):
 
 _STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
 
+# PR 17: standing orders. The charter issue's `## Standing orders` section, one order per bullet,
+# `- <text> (ordered by <name>, <YYYY-MM-DD>)`; the one-line `Standing authority:` stays valid and
+# counts as one more order. `parse_orders` is the one parser.
+ORDERS_HEADING = "## Standing orders"
+ORDERS_MAX = 20          # orders a charter may carry
+ORDER_MAX_CHARS = 300    # characters of one order's text
+ORDERS_STATE_CLIP = 600  # characters of the joined orders the judge's model sees
+_ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
+_ANY_HEADING = re.compile(r"^#{1,6}\s")
+_ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
 
-def parse_standing_authority(body):
+
+class OrdersError(Exception):
+    """An order that cannot be recorded or removed, and why."""
+
+
+def _legacy_authority(body):
     """The charter's one-line `Standing authority:` text, or None when it states none.
 
     It lives in the charter issue's prose, below the yaml block; fenced code is
@@ -7259,10 +7344,146 @@ def parse_standing_authority(body):
     return None
 
 
-def fetch_standing_authority(reader, charter, repo):
-    """The charter issue's standing authority through the reader's GET-only `gh api`."""
+def _orders_section(body):
+    """The first `## Standing orders` section outside a fenced block: None, or a dict with the character
+    offsets `start` (its heading), `head_end`, `end` (the next heading, or the end of the body) and
+    `bullets`, a list of (start, end, text), one per order, in the body's own bytes."""
+    body = body or ""
+    fenced, offset, found = False, 0, None
+    for line in body.splitlines(keepends=True):
+        start, offset = offset, offset + len(line)
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if found is None:
+            if _ORDERS_HEADING.match(stripped):
+                found = {"start": start, "head_end": offset, "end": len(body), "bullets": []}
+            continue
+        if _ANY_HEADING.match(stripped):
+            found["end"] = start
+            break
+        match = _ORDER_BULLET.match(stripped)
+        if match:
+            found["bullets"].append((start, offset, match.group(1)))
+    return found
+
+
+def section_orders(body):
+    """The orders of the `## Standing orders` section alone, in order."""
+    found = _orders_section(body)
+    return [text for _, _, text in found["bullets"]] if found else []
+
+
+def parse_orders(body):
+    """Every standing order the charter body states: the section's bullets in order, then the legacy
+    `Standing authority:` line when there is one. [] when there are none."""
+    legacy = _legacy_authority(body)
+    return section_orders(body) + ([legacy] if legacy else [])
+
+
+def parse_standing_authority(body):
+    """The orders joined into one line, or None when the charter states none (the old one-line form,
+    kept for its callers: it answers through `parse_orders`)."""
+    orders = parse_orders(body)
+    return "; ".join(orders) if orders else None
+
+
+def _eol_of(body):
+    return "\r\n" if "\r\n" in body else "\n"
+
+
+def add_order_to_body(body, text, by, date):
+    """`body` with one more order, `- <text> (ordered by <by>, <date>)`, added to the section (made at the
+    end of the body when there is none). Every byte outside the section is kept. OrdersError for a text
+    that is empty, longer than ORDER_MAX_CHARS or on more than one line, and for a twenty-first order."""
+    body = body or ""
+    text = (text or "").strip()
+    by = " ".join(str(by or "").split())[:60]
+    if not text:
+        raise OrdersError("an order needs some text")
+    if "\n" in text or "\r" in text:
+        raise OrdersError("an order is one line")
+    if len(text) > ORDER_MAX_CHARS:
+        raise OrdersError("an order is at most %d characters; this one has %d" % (ORDER_MAX_CHARS, len(text)))
+    if not by:
+        raise OrdersError("an order records who ordered it (--by)")
+    eol = _eol_of(body)
+    bullet = "- %s (ordered by %s, %s)" % (text, by, date)
+    found = _orders_section(body)
+    if found is not None:
+        if len(found["bullets"]) >= ORDERS_MAX:
+            raise OrdersError("this charter already has %d standing orders, the most it carries; remove one first"
+                              % ORDERS_MAX)
+        if found["bullets"]:
+            at = found["bullets"][-1][1]
+            lead = "" if body[:at].endswith(("\n", "\r")) else eol
+            return body[:at] + lead + bullet + eol + body[at:]
+        at = found["head_end"]
+        lead = "" if body[:at].endswith(("\n", "\r")) else eol
+        return body[:at] + lead + eol + bullet + eol + body[at:]
+    if not body:
+        sep = ""
+    elif body.endswith(eol + eol):
+        sep = ""
+    elif body.endswith(eol):
+        sep = eol
+    else:
+        sep = eol + eol
+    return body + sep + ORDERS_HEADING + eol + eol + bullet + eol
+
+
+def remove_order_from_body(body, number):
+    """`body` without order `number` (as `orders list` numbers them). Only the section changes; when the last
+    order goes the section goes with it. The legacy `Standing authority:` line is numbered after the section's
+    orders but lies outside the section, so it is refused: edit it on GitHub."""
+    body = body or ""
+    found = _orders_section(body)
+    bullets = found["bullets"] if found else []
+    total = len(parse_orders(body))
+    if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= total:
+        raise OrdersError("no order %s: this charter has %d" % (number, total))
+    if number > len(bullets):
+        raise OrdersError("order %d is the legacy `Standing authority:` line, outside the %s section: edit or "
+                          "delete that line on GitHub" % (number, ORDERS_HEADING))
+    start, end, _ = bullets[number - 1]
+    kept = [line for line in body[found["start"]:found["end"]].splitlines()
+            if line.strip() and not _ORDERS_HEADING.match(line.strip())]
+    if len(bullets) == 1 and len(kept) == 1:  # nothing but this order: the section goes
+        start, end = found["start"], found["end"]
+        out = body[:start] + body[end:]
+        eol = _eol_of(body)
+        if end == len(body) and out.endswith(eol + eol):
+            out = out[:-len(eol)]  # the blank line that set the section off
+        return out
+    return body[:start] + body[end:]
+
+
+def os_user():
+    """The operating-system user, the default for `orders add --by`."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def fetch_charter_body(reader, charter, repo):
+    """The charter issue's body (or None) through the reader's GET-only `gh api`: the one read of it."""
     data = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
-    return parse_standing_authority(data.get("body") if isinstance(data, dict) else None)
+    return data.get("body") if isinstance(data, dict) and isinstance(data.get("body"), str) else None
+
+
+def fetch_orders(reader, charter, repo):
+    """The charter issue's standing orders (a list) through the reader's GET-only `gh api`."""
+    return parse_orders(fetch_charter_body(reader, charter, repo))
+
+
+def fetch_standing_authority(reader, charter, repo):
+    """The orders joined into one line, or None (kept for the callers that want a single string)."""
+    orders = fetch_orders(reader, charter, repo)
+    return "; ".join(orders) if orders else None
 
 
 def resolve_policy_context(reader, fleet):
@@ -7284,8 +7505,62 @@ def resolve_policy_context(reader, fleet):
         if work is not None and reader.issue(work, repo).intent:
             intent = "%s (work item: %s)" % (intent or NO_INTENT, reader.issue(work, repo).intent)
         charter = reader.parent(ask, repo)
-    authority = fetch_standing_authority(reader, charter, repo) if _is_issue_number(charter) else None
-    return {"issue": ask if intent else None, "intent": intent, "done_when": done_when, "authority": authority}
+    orders = authority = None
+    if _is_issue_number(charter):
+        body = fetch_charter_body(reader, charter, repo)
+        orders = parse_orders(body)
+        # PR 17: the model's question sees every order; `orders-never-judged` shows it only the old one-line form
+        seen = [_legacy_authority(body)] if fault("orders-never-judged") else orders
+        seen = [text for text in seen if text]
+        authority = "; ".join(seen) if seen else None
+    return {"issue": ask if intent else None, "intent": intent, "done_when": done_when, "authority": authority,
+            "charter": charter if _is_issue_number(charter) else None, "charter_repo": repo, "orders": orders or []}
+
+
+# PR 17: an agent must not edit the charter it works under: that would grant itself authority. This is a
+# deterministic rule beside the model's questions. It is a guard, not a proof: a shell can build the call
+# out of pieces this text never shows (a variable, a script, an alias, another tool), and the rule sees only
+# the agent's own charter. It reads the command's words, as the redaction does.
+_GH_ISSUE_EDIT = re.compile(r"\bgh(?:\s+(?:-R|--repo)[ =]\S+)?\s+issue\s+edit\b([^;&|\n]*)", re.IGNORECASE)
+_GH_API = re.compile(r"\bgh(?:\s+(?:-R|--repo)[ =]\S+)?\s+api\b([^;&|\n]*)", re.IGNORECASE)
+_GH_REPO_FLAG = re.compile(r"\bgh\s+(?:-R|--repo)[ =]['\"]?([\w.-]+/[\w.-]+)", re.IGNORECASE)
+_REPO_FLAG = re.compile(r"(?:^|\s)(?:-R|--repo)(?:\s+|=)['\"]?([\w.-]+/[\w.-]+)", re.IGNORECASE)
+_API_WRITE_METHOD = re.compile(r"(?:-X|--method)(?:\s+|=)?['\"]?(?:PATCH|PUT|DELETE)\b", re.IGNORECASE)
+_API_ISSUE_PATH = re.compile(r"repos/([\w.-]+/[\w.-]+)/issues/(\d+)(?![\w/])")
+_ISSUE_WORD = re.compile(r"^['\"]?(?:(?:([\w.-]+/[\w.-]+)#|#)(\d+)|(\d+)|\S*?(?:([\w.-]+/[\w.-]+)/issues/)(\d+))['\"]?$")
+
+
+def charter_edit_target(command, charters):
+    """The number of the charter that a shell command rewrites with gh's issue subcommand or `gh api` PATCH, PUT
+    or DELETE of `repos/<repo>/issues/<n>`, or None. `charters` holds what the agent works under: a bare number
+    (any repo) or a `(repo, number)` pair, which a command that names another repo (`--repo`, `-R`, a URL, an
+    `owner/repo#N` word or the api path) does not hit: issue 1 of another repo is not this charter."""
+    text = command if isinstance(command, str) else ""
+
+    def owns(repo, number):
+        return any(number == (c[1] if isinstance(c, tuple) else c) and (repo is None or not isinstance(c, tuple)
+                                                                        or c[0] is None or c[0].lower() == repo.lower())
+                   for c in charters)
+
+    for found in _GH_ISSUE_EDIT.finditer(text):
+        rest, repo = found.group(1), None
+        flagged = _REPO_FLAG.search(" " + rest) or _GH_REPO_FLAG.search(found.group(0))
+        if flagged:
+            repo = flagged.group(1)
+        for word in rest.split():
+            match = _ISSUE_WORD.match(word)
+            if not match:
+                continue
+            named = match.group(1) or match.group(4)
+            number = int(match.group(2) or match.group(3) or match.group(5))
+            if owns(named or repo, number):
+                return number
+    for found in _GH_API.finditer(text):
+        rest = found.group(1)
+        path = _API_ISSUE_PATH.search(rest)
+        if path and _API_WRITE_METHOD.search(rest) and owns(path.group(1), int(path.group(2))):
+            return int(path.group(2))
+    return None
 
 
 # ------------------------------------------------------------------ the caches
@@ -7418,7 +7693,16 @@ def _valid_context(value):
     ok = isinstance(value, dict) and all(k in value for k in keys) \
         and all(value[k] is None or isinstance(value[k], str) for k in keys[1:]) \
         and (value["issue"] is None or _is_issue_number(value["issue"]))
-    return {k: value[k] for k in keys} if ok else None
+    if not ok:
+        return None
+    context = {k: value[k] for k in keys}
+    # PR 17: the charter and its orders ride along (an older cache entry has neither: they read as none)
+    orders = value.get("orders")
+    context["charter"] = value.get("charter") if _is_issue_number(value.get("charter")) else None
+    context["charter_repo"] = value["charter_repo"] if isinstance(value.get("charter_repo"), str) \
+        and REPO_RE.match(value["charter_repo"]) else None
+    context["orders"] = [t for t in orders if isinstance(t, str)] if isinstance(orders, list) else []
+    return context
 
 
 # ------------------------------------------------------------------ the judge
@@ -7496,6 +7780,20 @@ class PolicyJudge:
             # trial found the Chief of Staff, which has no ask by design, asked about every routine
             # `gh` and `ls`. The two consequential questions (hard to reverse, speaks for you) still do.
             thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0
+        guarded = self.charter_guard(request, fleet, context)
+        if guarded is not None:  # PR 17: no model needed, and the cache is not asked
+            answers = dict.fromkeys(POLICY_QUESTIONS)
+            answers.update(hard_to_reverse=1.0, speaks_for_you=1.0)
+            combined = combine_policy(answers, thresholds, request["configured"])
+            combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+            box["detail"].update(combined=combined, cached=False, thresholds=thresholds, guard="charter-edit")
+            reply = self.reply_of(combined, False, fleet, context, request)
+            if combined["outcome"] != "allow":
+                reply["reason"] = _one_line(
+                    "Needs your yes: this edits charter #%d, the one this agent works under, and an agent must "
+                    "not grant itself authority. Standing orders are the owner's, recorded by the Chief of Staff "
+                    "(%s)." % (guarded, _what_text(request)), 600)
+            return reply
         cached = _valid_answers(self.verdicts.get(key))
         if cached is not None:
             combined = combine_policy(cached, thresholds, request["configured"])
@@ -7525,6 +7823,17 @@ class PolicyJudge:
 
     # -- the pieces
 
+    @staticmethod
+    def charter_guard(request, fleet, context):
+        """PR 17: the charter number when a shell call by an agent other than the Chief of Staff edits the
+        charter it works under, else None."""
+        if request["tool"] != "shell" or fleet.get("role") == "chief-of-staff":
+            return None
+        own = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        charters = {(context.get("charter_repo") if n == context.get("charter") else own, n)
+                    for n in (context.get("charter"), fleet.get("charter")) if _is_issue_number(n)}
+        return charter_edit_target(request["arguments"], charters) if charters else None
+
     def identify(self, session, refresh=False):
         known = None if refresh else _valid_session_fleet(self.contexts.get("session:" + session))
         if known is not None:
@@ -7547,7 +7856,8 @@ class PolicyJudge:
 
     def context_of(self, fleet, refresh=False):
         if self.reader is None:
-            return {"issue": None, "intent": None, "done_when": None, "authority": None}
+            return {"issue": None, "intent": None, "done_when": None, "authority": None, "charter": None,
+                    "charter_repo": None, "orders": []}
         key = "ask:%s:%s:%s" % (fleet.get("repo") or self.reader.repo, fleet.get("issue"), fleet.get("charter"))
         known = None if refresh else _valid_context(self.contexts.get(key))
         if known is not None:
@@ -8819,6 +9129,7 @@ def build_parser():
     add_policy_parsers(sub)  # PR 9
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
+    add_orders_parsers(sub)  # PR 17
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -8875,6 +9186,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return INTENT_COMMANDS[args.action](args, runner, now)
         if args.action in V1_MOVE_COMMANDS:  # PR 10
             return V1_MOVE_COMMANDS[args.action](args, runner, now)
+        if args.action == "orders":  # PR 17
+            return cmd_orders(args, runner, now)
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
@@ -10416,6 +10729,248 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
 
 
 INSTALL_COMMANDS = {"key": cmd_key}
+# PR 17: standing orders, `fleet-switchboard orders list|add|remove`
+#
+# docs/switchboard.md, "Standing orders (PR 17)". The orders live in the charter
+# issue's `## Standing orders` section on GitHub (parse_orders, above). Only the
+# Chief of Staff writes them, through this one command, which edits only that
+# section of the body through `gh api` PATCH, reads the issue back and fails
+# loudly when the change is not there. The reader (IntentReader) stays GET-only.
+# ============================================================================
+
+ORDERS_KIND = "orders"
+COMPACTIONS_READ = 20  # compaction messages read per agent per pass, newest first
+
+
+def orders_hash(orders):
+    """Eight hex characters of the orders text: what changes when the owner edits an order."""
+    return hashlib.sha256("\n".join(orders).encode("utf-8")).hexdigest()[:8]
+
+
+def completed_compaction(messages):
+    """(id, created) of the newest COMPLETED compaction in `messages` (newest first), or (None, None). v2
+    represents a compaction as a message of type `compaction` with a status of running, completed or
+    failed; a running or failed one changes nothing."""
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict) and message.get("type") == "compaction" and message.get("status") == "completed" \
+                and isinstance(message.get("id"), str) and message["id"]:
+            return message["id"], _created(message)
+    return None, None
+
+
+class OrdersFacts:
+    """PR 17: the standing orders of a charter, for every fleet agent whose session metadata names it.
+
+    `orders:<charter>:<hash8 of the orders>:<compaction id, or "start">`: derived on every call and stored
+    nowhere. It is pending exactly when no such key is in the agent's transcript or inbox, so an agent is
+    told at its start, again after each completed compaction (the id is the newest completed compaction
+    message's), and again when the owner edits an order (the hash). The fact is delivered as a note, never
+    a wake (`Fact.orders`). A charter with no orders gives no fact.
+    """
+
+    __name__ = "orders_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None)
+        if engine is None or discovery is None:
+            return []
+        facts = []
+        for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
+            charter = (observation.fleet or {}).get("charter")
+            repo = engine.charter_repo(observation)
+            if not _is_issue_number(charter) or not repo or observation.conflict or observation.problem:
+                continue
+            try:
+                orders = engine.charter_orders(observation, charter)
+                compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
+                    engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+            except (IntentError, V2Error) as err:  # one agent's trouble never hides the others; nothing is guessed
+                engine._note("orders.unreadable", observation.name, {"charter": charter,
+                                                                      "error": _one_line(str(err), 200)})
+                continue
+            if not orders:
+                continue
+            key = "%s:%s#%d:%s:%s" % (ORDERS_KIND, repo, charter, orders_hash(orders), compaction or "start")
+            facts.append(Fact(key, observation.name, ORDERS_KIND, "\n".join(orders),
+                              max(observation.created or 0.0, when or 0.0), issue=charter, batch=False,
+                              orders=True, repo=repo))
+        return facts
+
+
+def write_issue_body(reader, repo, number, body):
+    """The one writer of an issue's body: `gh api repos/R/issues/N --method PATCH --input -` with
+    {"body": ...} as its input and nothing else, through the reader's injected runner. IntentError when
+    gh fails."""
+    path = "repos/%s/issues/%d" % (repo, number)
+    env = reader.env_for(repo)  # PR 17 on PR 15: the repo's own gh account, in the child's environment only
+    extra = {"env": env} if env is not None else {}
+    try:
+        done = reader.runner([reader.gh, "api", path, "--method", "PATCH", "--input", "-"],
+                             input=json.dumps({"body": body}), capture_output=True, text=True,
+                             timeout=reader.timeout, **extra)
+    except subprocess.TimeoutExpired:
+        raise IntentError("unavailable", "gh did not answer within %ss" % reader.timeout) from None
+    except OSError as err:
+        raise IntentError("unavailable", "cannot run %s: %s" % (reader.gh, err.strerror or err)) from None
+    if done.returncode != 0:
+        detail = _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode
+        raise IntentError("gh", reader.accounts.scrub(detail) if reader.accounts is not None else detail)
+
+
+def _charter_body(reader, repo, charter):
+    """The charter issue's body, read now (never from the cache). OrdersError when it is no charter."""
+    data = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+    body = data.get("body") if isinstance(data, dict) and isinstance(data.get("body"), str) else ""
+    if not _CHARTER_BLOCK.search(body):
+        raise OrdersError("%s#%d is not a charter issue (it has no ```yaml orchestrator: block)" % (repo, charter))
+    return body
+
+
+def edit_charter_orders(engine, repo, charter, event, detail, change):
+    """Edit the charter's orders: read the body, `change(body)` it, write it, read it back; once more
+    when the readback does not show the change (somebody edited in between); fail loudly when it still
+    does not. Audited before and after. Returns the orders after the change."""
+    reader = engine.intents
+    body = _charter_body(reader, repo, charter)
+    new_body = change(body)  # an OrdersError here is a refusal: nothing is written, nothing audited as a write
+    with engine._external(event, "charter:%s#%d" % (repo, charter), dict(detail, charter=charter, repo=repo)) as result:
+        for attempt in (1, 2):
+            if attempt == 2:
+                body = _charter_body(reader, repo, charter)
+                new_body = change(body)
+            write_issue_body(reader, repo, charter, new_body)
+            back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+            got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
+            if got == new_body or section_orders(got) == section_orders(new_body):
+                result["attempts"] = attempt
+                reader.invalidate(charter, repo)
+                return parse_orders(got)
+        raise OrdersError("wrote #%d twice and read back the issue without the change: the Standing orders "
+                          "section there is not what was written. Look at the issue; nothing was recorded" % charter)
+
+
+def orders_caller(engine, args):
+    """(name, role, fleet) of who runs `orders add|remove`: its pane's fleet agent; `--from` in the Lab."""
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            raise CallerError("--from is only for the Lab (%s=1); an agent is identified by its pane" % LAB_ENV)
+        found = engine.discover(engine.now()).agents.get(args.sender)
+        if found is None:
+            raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
+        return found.name, (found.fleet or {}).get("role"), found.fleet or {}
+    fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+    return fleet["name"], fleet.get("role"), fleet
+
+
+def _orders_charter(config, charter, fleet, watched):
+    """(repo, number) of the charter an `orders` command names: `owner/repo#N`, or a bare number in the caller's
+    own repo, as every issue reference is (PR 15). Refused, listing the choices, when several repos are watched
+    and the caller has none."""
+    repo, number = resolve_issue(config, charter, fleet, watched)
+    if repo is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    return repo, number
+
+
+def cmd_orders(args, runner, now):
+    if args.orders_action == "list":
+        reader = _intent_reader(runner, now)
+        fleet, watched = soft_caller(runner, now)
+        try:
+            repo, number = _orders_charter(load_config(), args.charter, fleet, watched)
+        except IssueRefError as err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return EXIT_USAGE
+        orders = fetch_orders(reader, number, repo)
+        if args.json:
+            print(json.dumps({"charter": number, "repo": repo,
+                              "orders": [{"number": n, "text": t} for n, t in enumerate(orders, 1)]}, sort_keys=True))
+        elif not orders:
+            print("no standing orders for charter %s" % issue_tag(repo, number))
+        for n, text in ([] if args.json else enumerate(orders, 1)):
+            print("%d. %s" % (n, text))
+        return EXIT_OK
+    engine, _, _ = build_engine(runner, now, "cli")
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    caller, role, fleet = orders_caller(engine, args)
+    try:
+        watched = watched_repos(engine.config, discovered_fleets(engine.discover(engine.now())))
+        repo, number = _orders_charter(engine.config, args.charter, fleet, watched)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    return orders_write(engine, args, caller, role, repo, number)
+
+
+def orders_write(engine, args, caller, role, repo, charter):
+    """`orders add|remove` on `repo`'s charter for `caller` (a fleet name) whose fleet role is `role`: refused
+    unless it is the chief-of-staff (and audited either way). Prints the orders after the change; returns the
+    exit code."""
+    where = "%s#%d" % (repo, charter)
+    if role != "chief-of-staff" and not fault("anyone-can-order"):
+        engine.audit.append(engine.actor, "orders.refused", "charter:%s" % where,
+                            {"caller": caller, "role": role, "action": args.orders_action, "repo": repo})
+        sys.stderr.write("%s: only the chief-of-staff records or removes standing orders; %s is %s. Ask the Chief "
+                         "of Staff, or edit the charter on GitHub yourself\n"
+                         % (PROG, caller, "a %s" % role if role else "not given a role"))
+        return EXIT_USAGE
+    try:
+        if args.orders_action == "add":
+            by = args.by or os_user()
+            date = datetime.fromtimestamp(engine.now(), timezone.utc).strftime("%Y-%m-%d")
+            detail = {"caller": caller, "by": by, "text": (args.text or "").strip()}
+            orders = edit_charter_orders(engine, repo, charter, "orders.add", detail,
+                                         lambda body: add_order_to_body(body, args.text, by, date))
+        else:
+            current = parse_orders(_charter_body(engine.intents, repo, charter))
+            if not 1 <= args.number <= len(current):
+                raise OrdersError("no order %d: this charter has %d" % (args.number, len(current)))
+            detail = {"caller": caller, "number": args.number, "text": current[args.number - 1]}
+            orders = edit_charter_orders(engine, repo, charter, "orders.remove", detail,
+                                         lambda body: remove_order_from_body(body, args.number))
+    except (OrdersError, IntentError) as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE if isinstance(err, OrdersError) else EXIT_ERROR
+    for number, text in enumerate(orders, 1):
+        print("%d. %s" % (number, text))
+    if not orders:
+        print("no standing orders for charter %s" % issue_tag(repo, charter))
+    return EXIT_OK
+
+
+CHARTER_HELP = "The charter issue: N (in your own repo) or owner/repo#N"
+
+
+def add_orders_parsers(sub):
+    orders = sub.add_parser(
+        "orders", help="A charter's standing orders: list them; the Chief of Staff adds and removes them",
+        description="The owner's standing orders live in the charter issue's `%s` section on GitHub, one per "
+                    "bullet: `- <text> (ordered by <name>, <YYYY-MM-DD>)`. The switchboard re-supplies them to "
+                    "every agent of the charter at its start, after each compaction and when they change, and "
+                    "the policy judge reads them at every tool call. `list` is open to anyone. `add` and `remove` "
+                    "are for the chief-of-staff only (you are identified by your pane); they edit only that "
+                    "section of the issue body." % ORDERS_HEADING)
+    kinds = orders.add_subparsers(dest="orders_action", required=True)
+    listing = kinds.add_parser("list", help="The charter's standing orders, numbered")
+    listing.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
+    listing.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    add = kinds.add_parser("add", help="Chief of Staff only: record one standing order the owner gave")
+    add.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
+    add.add_argument("text", help="The order, in the owner's words (1 to %d characters, one line)" % ORDER_MAX_CHARS)
+    add.add_argument("--by", help="Who ordered it (default: the operating-system user)")
+    add.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    remove = kinds.add_parser("remove", help="Chief of Staff only: remove one order the owner revoked")
+    remove.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
+    remove.add_argument("number", type=int, help="The order's number in `orders list`")
+    remove.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
 if __name__ == "__main__":

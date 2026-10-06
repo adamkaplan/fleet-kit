@@ -767,7 +767,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "key-missing-silent", "no-ensure-on-use", "shared-profile-default",  # PR 16
               "key-env-only-unseen",  # PR 16, the first real install
               "config-read-once", "catch-up-blocks-pass",  # PR 16, reload and the slow catch-up
-              "catch-up-on-fresh-start", "full-window-every-time")  # PR 16, forward only
+              "catch-up-on-fresh-start", "full-window-every-time",  # PR 16, forward only
+              "orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged")  # PR 17
 
 
 class TestFaults(Base):
@@ -1043,6 +1044,9 @@ STEP_EXAMPLES = {
     "bootstrap": {},
     "close-agent": {"agent": "coder"},
     "edit-config": {"add_repo": "acme/web", "broken": False},  # PR 16
+    "orders": {"charter": 1, "action": "add", "text": "approve deploys here", "number": 1},  # PR 17
+    "edit-orders": {"charter": 1, "text": "approve deploys here"},
+    "compact": {"agent": "platform", "status": "completed"},
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1073,6 +1077,8 @@ EXPECT_EXAMPLES = {
     "status_first_line": {"text": "No decision-model key"},  # PR 16
     "bootstrap_says": {"step": 1, "text": "already runs"},
     "fleet_sessions": {"agent": "coder", "count": 1},
+    "orders_on_github": {"charter": 1, "count": 1, "text": "approve deploys"},  # PR 17
+    "orders_refused": {"agent": "coder", "count": 1},
 }
 
 
@@ -1589,6 +1595,27 @@ class FakeV2:
 
     def admissions(self, sid):
         return [a for a in self.admitted.values() if a["session"] == sid]
+
+    def compact(self, sid, status="completed"):
+        """PR 17: a compaction in the transcript, in the shape the Lab measured on v2 2.0.22 (docs/switchboard.md,
+        "Standing orders", Lab proof): a message of type `compaction`, id `msg_...`, `time.created`, `status`
+        running, completed or failed, a `reason`, `summary` and `recent` while running and when completed, an
+        `error` when failed. It keeps its id as it goes from running to completed. Returns its id."""
+        s = self.sessions[sid]
+        message = self._message(s, "compaction", None, None, self.clock.now())
+        del message["text"]
+        message.update(status=status, reason="manual")
+        if status == "failed":
+            message["error"] = {"type": "compaction.failed", "message": "Compaction summary did not match the required template"}
+        else:
+            message.update(summary="## Objective\n- probe\n", recent="[User]: hi")
+        return message["id"]
+
+    def finish_compaction(self, sid, mid, status="completed"):
+        for message in self.sessions[sid]["messages"]:
+            if message["id"] == mid:
+                message["status"] = status
+                message.pop("error", None)
 
     def human_prompt_while_busy(self, sid, text):
         """PR 8: you send a message while the session works. It is in the transcript at once,
@@ -2147,7 +2174,7 @@ class TestFacts(Base):
                                   "summary": "s", "created": EPOCH})
         self.assertEqual(made.to_json(), {"key": "lab.fact:1", "recipient": "platform", "kind": "review",
                                           "summary": "s", "created": EPOCH, "issue": None, "batch": True,
-                                          "from": None, "rider": False})
+                                          "from": None, "rider": False, "orders": False})
 
     def test_bad_facts_are_refused_with_the_field_named(self):
         good = {"key": "k", "recipient": "platform", "kind": "x", "summary": "s", "created": EPOCH}
@@ -2182,7 +2209,9 @@ class TestFacts(Base):
         self.assertIn(":2:", str(caught.exception))
 
     def test_the_registration_point_lists_the_lab_source(self):
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts"])
+        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                          "orders_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -6867,6 +6896,8 @@ class FakeGH:
         self.api = "repos/%s/issues/" % repo
 
     def body(self, number):
+        if number in getattr(self, "bodies", {}):  # PR 17: a body written by PATCH, or set by a test
+            return self.bodies[number]
         if number in self.charters:
             line = self.issues[number].get("authority")  # PR 9: a charter's Standing authority line
             workspace = self.issues[number].get("workspace")  # PR 15: a charter's `workspace:` line
@@ -6892,6 +6923,8 @@ class FakeGH:
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append(argv)
+        if "--method" in argv and argv[argv.index("--method") + 1] == "PATCH":  # PR 17: a charter's body
+            return self.patch_body(argv, kwargs)
         if "--method" in argv:  # PR 8: the handoff comment, the one write
             return self.post_comment(argv, kwargs)
         if len(argv) != 3 or argv[:2] != [FAKE_GH, "api"]:
@@ -6939,6 +6972,43 @@ def post_comment(self, argv, kwargs):
     comments.append({"issue": number, "body": json.loads(kwargs["input"])["body"]})
     return subprocess.CompletedProcess(argv, 0, json.dumps({
         "id": 9000 + len(comments), "html_url": "https://example.test/%s/issues/%d#c%d" % (self.repo, number, len(comments))}), "")
+
+
+@adds_to(FakeGH)
+def patch_body(self, argv, kwargs):
+    """PR 17: `gh api repos/R/issues/N --method PATCH --input -` with {"body": ...} as the input and nothing
+    else: the one way the switchboard edits an issue. Any other shape raises. `before_patch` (a test's hook)
+    runs first, to change the body between a read and the write; `drop_patches` loses that many writes
+    (answers success, changes nothing), as a race would."""
+    found = re.match(r"^%s(\d+)$" % re.escape(self.api), argv[2] if len(argv) > 2 else "")
+    if argv[:2] != [FAKE_GH, "api"] or argv[3:] != ["--method", "PATCH", "--input", "-"] or not found:
+        raise AssertionError("fake gh patches only a body: gh api <issues>/N --method PATCH --input -; got %r"
+                             % (argv,))
+    if "stdin" in kwargs:
+        raise AssertionError("a write passes its body as input, not stdin")
+    number = int(found.group(1))
+    sent = json.loads(kwargs["input"])
+    if set(sent) != {"body"}:
+        raise AssertionError("a body patch sends only the body, got %r" % sorted(sent))
+    if self.down:
+        return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
+    if self.token is not None and (kwargs.get("env") or {}).get("GH_TOKEN") != self.token:  # PR 17: the repo's own account
+        if getattr(self, "leak", False):
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 401 bad credentials %s\n"
+                                               % (kwargs.get("env") or {}).get("GH_TOKEN"))
+        return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+    if number not in self.issues:
+        return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+    hook = self.__dict__.get("before_patch")
+    if hook:
+        hook(number)
+    self.patches = self.__dict__.get("patches", []) + [{"issue": number, "body": sent["body"]}]
+    if self.__dict__.get("drop_patches", 0) > 0:
+        self.drop_patches -= 1
+    else:
+        self.__dict__.setdefault("bodies", {})[number] = sent["body"]
+        self.updated[number] = _utc(self.clock.now())
+    return subprocess.CompletedProcess(argv, 0, json.dumps(self.record(number)), "")
 
 
 def attach_intent_lab(run):
@@ -9112,7 +9182,7 @@ class TestHandoff(HandoffCase):
         self.assertEqual(len(writes), 1)
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
         source = SWITCHBOARD.read_text()
-        self.assertEqual(source.count('"--method"'), 1)
+        self.assertEqual(source.count('"--method"'), 2)  # the handoff comment, and (PR 17) `write_issue_body`
 
 
 class TestForegroundScenarios(Base):
@@ -12510,7 +12580,7 @@ class TestRiders(ReportBase):
         carried = fact("k2", rider=True)
         self.assertTrue(sb.Fact.from_json(carried.to_json()).rider)
         self.assertEqual(sorted(carried.to_json()), sorted(
-            ["key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider"]))
+            ["key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider", "orders"]))
         with self.assertRaises(sb.FactError):
             fact("k3", rider="yes")
         self.assertEqual(sorted(set(sb.Fact.FIELDS) - {"sender", "repo"}), sorted(set(carried.to_json()) - {"from"}))
@@ -14280,6 +14350,8 @@ def _repos_extend_offline_run():
                 workspace = issue.get("workspace")
                 body = "```yaml\norchestrator: platform\n%sstatus: active\n```\n\nThe charter.\n" % (
                     "workspace: %s\n" % workspace if workspace else "")
+                if issue.get("authority"):  # PR 17: a charter's standing order, in its own repo
+                    body += "\nStanding authority: %s\n" % issue["authority"]
             else:
                 body = intent_body(issue.get("intent"), issue.get("done_when"))
             self.farm.repos[name].issue(number, parent=issue.get("parent"), body=body)
@@ -14622,11 +14694,14 @@ class TwoRepoGH:
     def __init__(self, clock, accounts):
         self.repos = {repo: FakeGH(issues, {1}, clock, repo, FAKE_TOKENS[accounts[repo]])
                       for repo, issues in self.ISSUES.items()}
-        self.ran = []
+        self.ran, self.envs, self.patch_tokens = [], [], []
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.ran.append((argv, kwargs.get("input")))
+        self.envs.append(kwargs.get("env"))
+        if "PATCH" in argv:
+            self.patch_tokens.append((argv[2], (kwargs.get("env") or {}).get("GH_TOKEN")))
         if argv[1:3] == ["auth", "token"]:
             token = FAKE_TOKENS.get(argv[4])
             return subprocess.CompletedProcess(argv, 0 if token else 1, (token or "") + "\n", "" if token else "no token\n")
@@ -15041,17 +15116,24 @@ class TestSecretNeverText(TwoRepoCase):
         for argv in (("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--repo", ACME_WEB),
                      ("intent", "acme/web#2"), ("intent", "acme/api#2"),
                      ("send", "web-orch", "--from", "cos", "--issue", "acme/web#2", "hello"),
+                     ("orders", "list", "--charter", "acme/web#1"),  # PR 17: the orders read and the orders write
+                     ("orders", "add", "--charter", "acme/web#1", "ship on fridays", "--by", "bob", "--from", "cos"),
+                     ("orders", "remove", "--charter", "acme/web#1", "1", "--from", "cos"),
                      ("launch", "other-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--repo", "other/x")):
             outputs.append(self.main(*argv))
         for repo in (ACME_API, ACME_WEB):  # now every read is refused, and the refusal echoes the token it saw
             self.gh.repos[repo].token, self.gh.repos[repo].leak = "someone-elses", True
-        for argv in (("intent", "acme/web#2"), ("send", "web-orch", "--from", "cos", "--issue", "acme/api#2", "again")):
+        for argv in (("intent", "acme/web#2"), ("send", "web-orch", "--from", "cos", "--issue", "acme/api#2", "again"),
+                     ("orders", "list", "--charter", "acme/api#1"),
+                     ("orders", "add", "--charter", "acme/web#1", "again", "--by", "bob", "--from", "cos")):
             outputs.append(self.main(*argv))
         errors = "\n".join(out + err for _, out, err in outputs)
         self.assertEqual(secrets_in(errors), [], "a command's output")
         self.assertEqual(secrets_in(self.everything()), [], "the state, the messages, the argv")
         launched = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"]
         self.assertEqual(launched[0]["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"], "it is in the child's environment")
+        self.assertIn(("repos/acme/web/issues/1", FAKE_TOKENS["acme-ci"]), self.gh.patch_tokens,
+                      "the orders write ran, with the repo's own account, in the child's environment")
 
     def test_a_token_gh_will_not_give_names_the_account_in_the_error(self):
         self.write_config(dict(self.raw, gh_users={ACME_API: "alice-bot", ACME_WEB: "nobody"}))
@@ -17918,6 +18000,877 @@ class TestInstallDocs(unittest.TestCase):
                               capture_output=True, text=True)
         if done.returncode == 0:
             self.assertEqual(done.stdout.strip(), "")
+
+
+# ======================================================================
+# PR 17: standing orders an agent does not forget
+#
+# docs/switchboard.md, "Standing orders (PR 17)". The faults added here:
+# orders-start-only, orders-wake, anyone-can-order, orders-never-judged.
+# ======================================================================
+ORDERS_CHARTER_BODY = "```yaml\norchestrator: platform\nstatus: active\n```\n\nThe charter.\n"
+
+
+class TestParseOrders(unittest.TestCase):
+    def test_the_section_is_one_order_per_bullet(self):
+        body = ("```yaml\norchestrator: platform\n```\n\nThe charter.\n\n## Standing orders\n\n"
+                "- approve deploys in this repo (ordered by alice, 2027-01-05)\n"
+                "* self-certify (ordered by alice, 2027-01-06)\n\n## Notes\n- not an order\n")
+        self.assertEqual(sb.parse_orders(body), ["approve deploys in this repo (ordered by alice, 2027-01-05)",
+                                                  "self-certify (ordered by alice, 2027-01-06)"])
+
+    def test_the_legacy_line_counts_as_one_more_order(self):
+        body = "## Standing orders\n- one (ordered by alice, 2027-01-05)\n\nStanding authority: may merge green PRs\n"
+        self.assertEqual(sb.parse_orders(body), ["one (ordered by alice, 2027-01-05)", "may merge green PRs"])
+        self.assertEqual(sb.parse_orders("Standing authority: may merge\n"), ["may merge"])
+
+    def test_nothing_in_a_fenced_block_counts(self):
+        for body in ("```\n## Standing orders\n- hidden\n```\n", "~~~\n## Standing orders\n- hidden\n~~~\n",
+                     "## Standing orders\n```\n- hidden\n```\n"):
+            with self.subTest(body=body):
+                self.assertEqual(sb.parse_orders(body), [])
+
+    def test_absent_empty_or_none_is_no_orders(self):
+        for body in (None, "", "no section", "## Standing orders\n\nnothing here\n", "Standing authority: none"):
+            with self.subTest(body=body):
+                self.assertEqual(sb.parse_orders(body), [])
+
+    def test_heading_levels_case_and_crlf(self):
+        self.assertEqual(sb.parse_orders("### standing ORDERS  \r\n- a\r\n- b\r\n"), ["a", "b"])
+
+    def test_the_old_function_still_answers_through_the_one_parser(self):
+        self.assertEqual(sb.parse_standing_authority("## Standing orders\n- a\n- b\n"), "a; b")
+        self.assertEqual(sb.parse_standing_authority("Standing authority: may merge\n"), "may merge")
+        self.assertIsNone(sb.parse_standing_authority("nothing"))
+
+
+class TestOrdersBodyEdits(unittest.TestCase):
+    def test_add_creates_the_section_at_the_end_and_keeps_every_other_byte(self):
+        new = sb.add_order_to_body(ORDERS_CHARTER_BODY, "approve deploys", "alice", "2027-01-05")
+        self.assertTrue(new.startswith(ORDERS_CHARTER_BODY))
+        self.assertEqual(new[len(ORDERS_CHARTER_BODY):],
+                         "\n## Standing orders\n\n- approve deploys (ordered by alice, 2027-01-05)\n")
+
+    def test_add_appends_to_an_existing_section(self):
+        body = "Intro\n\n## Standing orders\n\n- one (ordered by alice, 2027-01-01)\n\n## Notes\nkept\n"
+        new = sb.add_order_to_body(body, "two", "bob", "2027-01-02")
+        self.assertEqual(new, "Intro\n\n## Standing orders\n\n- one (ordered by alice, 2027-01-01)\n"
+                              "- two (ordered by bob, 2027-01-02)\n\n## Notes\nkept\n")
+
+    def test_remove_edits_only_the_section_and_the_last_one_deletes_it(self):
+        added = sb.add_order_to_body(ORDERS_CHARTER_BODY, "a", "alice", "2027-01-05")
+        added = sb.add_order_to_body(added, "b", "alice", "2027-01-05")
+        one = sb.remove_order_from_body(added, 1)
+        self.assertEqual(sb.parse_orders(one), ["b (ordered by alice, 2027-01-05)"])
+        self.assertTrue(one.startswith(ORDERS_CHARTER_BODY))
+        self.assertEqual(sb.remove_order_from_body(one, 1), ORDERS_CHARTER_BODY)
+
+    def test_remove_keeps_what_follows_the_section(self):
+        body = "Intro\n\n## Standing orders\n- only (ordered by alice, 2027-01-01)\n\n## Notes\nkept\n"
+        self.assertEqual(sb.remove_order_from_body(body, 1), "Intro\n\n## Notes\nkept\n")
+
+    def test_a_crlf_body_gets_crlf_lines(self):
+        new = sb.add_order_to_body("Intro\r\n", "a", "alice", "2027-01-05")
+        self.assertNotIn("\n", new.replace("\r\n", ""))
+
+    def test_the_legacy_line_is_numbered_but_cannot_be_removed(self):
+        body = "## Standing orders\n- a (ordered by alice, 2027-01-01)\n\nStanding authority: may merge\n"
+        with self.assertRaises(sb.OrdersError) as raised:
+            sb.remove_order_from_body(body, 2)
+        self.assertIn("Standing authority", str(raised.exception))
+        with self.assertRaises(sb.OrdersError):
+            sb.remove_order_from_body(body, 3)
+
+    def test_the_text_is_one_line_of_one_to_300_characters(self):
+        for text in ("", "   ", "a\nb", "x" * 301):
+            with self.subTest(text=text[:20]):
+                with self.assertRaises(sb.OrdersError):
+                    sb.add_order_to_body(ORDERS_CHARTER_BODY, text, "alice", "2027-01-05")
+        sb.add_order_to_body(ORDERS_CHARTER_BODY, "x" * 300, "alice", "2027-01-05")
+
+    def test_at_most_twenty_orders(self):
+        body = ORDERS_CHARTER_BODY
+        for n in range(sb.ORDERS_MAX):
+            body = sb.add_order_to_body(body, "order %d" % n, "alice", "2027-01-05")
+        with self.assertRaises(sb.OrdersError) as raised:
+            sb.add_order_to_body(body, "one more", "alice", "2027-01-05")
+        self.assertIn("20", str(raised.exception))
+
+
+class OrdersCase(IntentCase):
+    """Charter 1 (platform's), a Chief of Staff, an orchestrator and a coder; the CLI on the fakes."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 3, "charter": 1})
+        self.gh.bodies = {1: ORDERS_CHARTER_BODY}
+
+    def main(self, *argv):
+        def route(argv, **kwargs):
+            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def orders_in_github(self):
+        return sb.parse_orders(self.gh.body(1))
+
+
+class TestOrdersCLI(OrdersCase):
+    def test_the_chief_of_staff_adds_lists_and_removes(self):
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("orders", "add", "--charter", "1", "approve deploys here", "--by", "alice")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(self.orders_in_github(), ["approve deploys here (ordered by alice, 2027-01-15)"])
+        code, out, _ = self.main("orders", "list", "--charter", "1")
+        self.assertEqual(out.splitlines(), ["1. approve deploys here (ordered by alice, 2027-01-15)"])
+        self.main("orders", "add", "--charter", "1", "self-certify", "--by", "alice")
+        self.assertEqual(len(self.orders_in_github()), 2)
+        code, out, _ = self.main("orders", "remove", "--charter", "1", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.orders_in_github(), ["self-certify (ordered by alice, 2027-01-15)"])
+        self.main("orders", "remove", "--charter", "1", "1")
+        self.assertEqual(self.gh.body(1), ORDERS_CHARTER_BODY)
+
+    def test_the_rest_of_the_body_is_never_touched(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertTrue(self.gh.body(1).startswith(ORDERS_CHARTER_BODY))
+
+    def test_by_defaults_to_the_os_user(self):
+        self.as_agent("chief-of-staff")
+        with mock.patch.object(sb, "os_user", return_value="carol"):
+            self.main("orders", "add", "--charter", "1", "x")
+        self.assertIn("(ordered by carol, ", self.orders_in_github()[0])
+
+    def test_anyone_else_is_refused_and_nothing_is_written(self):
+        for who in ("orch", "worker"):
+            with self.subTest(who=who):
+                self.as_agent(who)
+                for argv in (("add", "--charter", "1", "widen it"), ("remove", "--charter", "1", "1")):
+                    code, _, err = self.main("orders", *argv)
+                    self.assertNotEqual(code, 0)
+                    self.assertIn("only the chief-of-staff", err)
+        self.assertEqual(getattr(self.gh, "patches", []), [])
+
+    def test_a_caller_that_is_no_fleet_agent_is_refused_and_list_is_open(self):
+        code, _, err = self.main("orders", "add", "--charter", "1", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("HERDR_PANE_ID", err)
+        self.as_agent("worker")
+        self.assertEqual(self.main("orders", "list", "--charter", "1")[0], 0)
+        os.environ.pop("HERDR_PANE_ID")
+        self.assertEqual(self.main("orders", "list", "--charter", "1")[0], 0)
+
+    def test_from_is_only_for_the_lab(self):
+        os.environ.pop(sb.LAB_ENV, None)
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--from", "chief-of-staff")
+        self.assertNotEqual(code, 0)
+        self.assertIn("only for the Lab", err)
+        os.environ[sb.LAB_ENV] = "1"
+        self.assertEqual(self.main("orders", "add", "--charter", "1", "x", "--from", "chief-of-staff")[0], 0)
+        code, _, err = self.main("orders", "add", "--charter", "1", "y", "--from", "orch")
+        self.assertNotEqual(code, 0)
+
+    def test_list_json(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "one", "--by", "alice")
+        data = json.loads(self.main("orders", "list", "--charter", "1", "--json")[1])
+        self.assertEqual(data, {"charter": 1, "repo": FAKE_REPO,
+                                "orders": [{"number": 1, "text": "one (ordered by alice, 2027-01-15)"}]})
+
+    def test_a_charter_only_and_the_limits(self):
+        self.as_agent("chief-of-staff")
+        code, _, err = self.main("orders", "add", "--charter", "2", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a charter", err)
+        code, _, err = self.main("orders", "add", "--charter", "1", "x" * 301)
+        self.assertNotEqual(code, 0)
+        self.assertIn("300", err)
+        code, _, err = self.main("orders", "remove", "--charter", "1", "5")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no order 5", err)
+
+    def test_every_add_and_remove_is_audited_with_the_text(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "approve deploys", "--by", "alice")
+        self.main("orders", "remove", "--charter", "1", "1")
+        events = [e for e in self.world.audit() if e["event"] in ("orders.add", "orders.remove")]
+        self.assertEqual([(e["event"], e.get("phase")) for e in events],
+                         [("orders.add", "intent"), ("orders.add", "result"),
+                          ("orders.remove", "intent"), ("orders.remove", "result")])
+        self.assertEqual(events[0]["detail"]["by"], "alice")
+        self.assertEqual(events[0]["detail"]["charter"], 1)
+        self.assertEqual(events[0]["detail"]["caller"], "chief-of-staff")
+        self.assertEqual(events[0]["detail"]["text"], "approve deploys")
+        self.assertIn("approve deploys", events[2]["detail"]["text"])
+
+    def test_a_refusal_is_audited_too(self):
+        self.as_agent("orch")
+        self.main("orders", "add", "--charter", "1", "widen it")
+        refused = [e for e in self.world.audit() if e["event"] == "orders.refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["detail"]["caller"], "orch")
+
+    def test_the_write_is_a_body_patch_through_the_runner_and_nothing_else(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        writes = [c for c in self.gh.calls if "--method" in c]
+        self.assertEqual(writes, [[FAKE_GH, "api", "repos/%s/issues/1" % FAKE_REPO, "--method", "PATCH",
+                                   "--input", "-"]])
+
+    def test_a_body_that_changed_in_between_is_read_again_once(self):
+        self.as_agent("chief-of-staff")
+        self.gh.drop_patches = 1  # the first write is lost, as if someone else's edit won the race
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.patches), 2)
+        self.assertEqual(len(self.orders_in_github()), 1)
+
+    def test_a_readback_without_the_change_fails_loudly(self):
+        self.as_agent("chief-of-staff")
+        self.gh.drop_patches = 5
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertNotEqual(code, 0)
+        self.assertIn("read back", err)
+        self.assertEqual(len(self.gh.patches), 2)  # once, and the one retry
+        failed = [e for e in self.world.audit() if e["event"] == "orders.add" and e.get("phase") == "result"]
+        self.assertFalse(failed[0]["ok"])
+
+    def test_an_unreachable_github_is_an_error_not_a_silent_success(self):
+        self.as_agent("chief-of-staff")
+        self.gh.down = True
+        code, _, err = self.main("orders", "add", "--charter", "1", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("unreachable", err)
+
+    def test_the_reader_stays_get_only(self):
+        self.assertNotIn("PATCH", class_source("IntentReader"))
+        self.assertNotIn("--method", class_source("IntentReader"))
+
+    def test_help_shows_the_feature(self):
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["orders", "--help"])
+        text = out.getvalue()
+        for word in ("list", "add", "remove", "chief-of-staff"):
+            self.assertIn(word, text)
+
+
+class TestCharterEditGuard(unittest.TestCase):
+    def hits(self, command, charters=(1,)):
+        return sb.charter_edit_target(command, set(charters))
+
+    def test_gh_issue_edit_of_a_charter(self):
+        for command in ("gh issue edit 1 --body-file x", "gh issue edit #1 --add-label a",
+                        "gh issue edit https://github.com/acme/api/issues/1 --title t", "gh -R acme/api issue edit 1 -b x",
+                        "echo hi && gh issue edit 1 -b x", "bash -c 'gh issue edit 1 -b x'", "GH issue edit 1"[:0] + "gh  issue   edit  1"):
+            with self.subTest(command=command):
+                self.assertEqual(self.hits(command), 1)
+
+    def test_gh_api_patch_put_delete_of_a_charter(self):
+        for command in ("gh api repos/acme/api/issues/1 --method PATCH --input body.json",
+                        "gh api repos/acme/api/issues/1 -X PUT -f state=closed",
+                        "gh api -X DELETE repos/acme/api/issues/1", "gh api repos/acme/api/issues/1 -XPATCH",
+                        "gh api repos/acme/api/issues/1 --method=patch -f body=x"):
+            with self.subTest(command=command):
+                self.assertEqual(self.hits(command), 1)
+
+    def test_what_is_not_an_edit_of_a_charter(self):
+        for command in ("gh issue edit 2 --body x", "gh issue view 1", "gh issue comment 1 -b hi",
+                        "gh api repos/acme/api/issues/1", "gh api repos/acme/api/issues/1/comments --method POST",
+                        "gh api repos/acme/api/issues/12 --method PATCH", "gh pr edit 1 --title t",
+                        "git log --oneline", "echo gh issue edit 1"[:0] + "ls"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.hits(command))
+
+    def test_no_known_charter_is_no_hit(self):
+        self.assertIsNone(self.hits("gh issue edit 1 -b x", charters=()))
+
+
+class TestJudgeCharterEditRule(PolicyCase):
+    def test_an_orchestrator_may_not_edit_its_own_charter(self):
+        for command in ("gh issue edit 1 --body-file orders.md",
+                        "gh api repos/acme/fleet/issues/1 --method PATCH --input b.json"):
+            with self.subTest(command=command):
+                reply = self.judge_tool(self.orch, "shell", command)
+                self.assertEqual(reply["outcome"], "ask", reply)
+                self.assertTrue(reply["judged"])
+                self.assertIn("charter", reply["reason"])
+        event = self.audit_events()[-1]
+        self.assertEqual(sorted(event["detail"]["fired"]), ["hard_to_reverse", "speaks_for_you"])
+
+    def test_the_repo_a_command_names_is_the_charters_repo_or_it_is_another_issue(self):
+        for command in ("gh issue edit 1 --repo acme/fleet --body x", "gh -R acme/fleet issue edit 1 -b x",
+                        "gh api repos/acme/fleet/issues/1 -X PATCH -f body=x"):
+            with self.subTest(command=command):
+                self.assertEqual(self.judge_tool(self.orch, "shell", command)["outcome"], "ask")
+        for command in ("gh issue edit 1 --repo other/x --body x", "gh api repos/other/x/issues/1 -X PATCH -f body=x"):
+            with self.subTest(command=command):
+                self.assertEqual(self.judge_tool(self.orch, "shell", command)["outcome"], "allow")
+
+    def test_a_coder_may_not_edit_the_charter_above_its_ask_either(self):
+        self.assertEqual(self.judge_tool(self.coder, "shell", "gh issue edit 1 --body x")["outcome"], "ask")
+
+    def test_the_rule_needs_no_model(self):
+        self.configure(rules=[{"error": "unreachable"}])
+        self.assertEqual(self.judge_tool(self.orch, "shell", "gh issue edit 1 --body x")["outcome"], "ask")
+
+    def test_it_never_loosens_a_configured_deny(self):
+        self.assertEqual(self.judge_tool(self.orch, "shell", "gh issue edit 1 -b x", "deny")["outcome"], "deny")
+
+    def test_the_chief_of_staff_is_exempt_and_other_issues_are_not_touched(self):
+        self.assertEqual(self.judge_tool(self.cos, "shell", "gh issue edit 1 --body x")["outcome"], "allow")
+        self.assertEqual(self.judge_tool(self.orch, "shell", "gh issue edit 2 --body x")["outcome"], "allow")
+        self.assertEqual(self.judge_tool(self.orch, "shell", "gh issue comment 1 -b x")["outcome"], "allow")
+
+    def test_the_limits_are_documented(self):
+        text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        self.assertIn("a guard, not a proof", text)
+        self.assertIn("a shell can build the call from pieces", text.lower())
+
+
+class TestJudgeSeesTheOrders(PolicyCase):
+    BODY = ORDERS_CHARTER_BODY + "\n## Standing orders\n\n- approve deploys here (ordered by alice, 2027-01-05)\n"
+
+    def test_the_context_carries_every_order_joined_and_the_charter(self):
+        self.gh.bodies = {1: self.BODY + "- self-certify (ordered by alice, 2027-01-06)\n"}
+        context = sb.resolve_policy_context(self.reader, {"role": "orchestrator", "charter": 1})
+        self.assertEqual(context["authority"], "approve deploys here (ordered by alice, 2027-01-05); "
+                                               "self-certify (ordered by alice, 2027-01-06)")
+        self.assertEqual((context["charter"], len(context["orders"])), (1, 2))
+
+    def test_the_state_the_model_sees_holds_the_orders_clipped_to_600(self):
+        state = sb.policy_state("orchestrator", "i", "d", "o" * 900, "shell", "ls")
+        self.assertEqual(len(state["standing_authority"]), 600)
+        self.assertEqual(sb.policy_state("orchestrator", "i", "d", "o" * 500, "shell", "ls")["standing_authority"],
+                         "o" * 500)
+
+    def test_the_question_is_asked_with_the_orders_in_it(self):
+        self.gh.bodies = {1: self.BODY}
+        seen = []
+
+        class Spy:
+            def decide(self, state, questions):
+                seen.append(json.dumps(state))
+                raise sb.JevError("unreachable", "spy")
+
+        self.direct_judge(Spy()).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1",
+                                         "configured": "allow"})
+        self.assertTrue(any("approve deploys here" in text for text in seen), seen)
+
+
+def apply_orders_step(run, step):
+    """`orders`: the cast member runs `fleet-switchboard orders add|remove`, as its model would (the role
+    check, the PATCH and the audit all run). Output is not kept: the oracles read GitHub and the audit."""
+    os.environ[sb.FAULT_ENV] = ",".join(run.faults)
+    member = run.scenario["cast"][step["actor"]]
+    args = types.SimpleNamespace(orders_action=step["action"], charter=step["charter"], text=step.get("text"),
+                                 by="alice", number=step.get("number"), sender=None)
+    engine = run.world.new_engine("cli")
+    repo = sb.issue_repo(step["charter"]) or member.get("repo") or engine.intents.repo
+    with captured():
+        sb.orders_write(engine, args, step["actor"], member["role"], repo, int(step["charter"]))
+
+
+def apply_edit_orders(run, step):
+    """`edit-orders`: the owner adds an order on GitHub with no tool of ours, and the webhook handler's
+    job is done: the reader forgets the issue."""
+    gh, number = run.ask_gh, step["charter"]
+    bodies = dict(getattr(gh, "bodies", {}))
+    bodies[number] = sb.add_order_to_body(gh.body(number), step["text"], "alice", "2027-01-15")
+    gh.bodies = bodies
+    gh.updated[number] = _utc(run.world.clock.now())
+    run.world.intents.invalidate(number)
+
+
+def oracle_orders_on_github(self, e):
+    orders = sb.parse_orders(self.ask_gh.body(e["charter"]))
+    found = [o for o in orders if e.get("text", "") in o]
+    return len(found) == e["count"], "the charter holds %d order(s), %d matching: %s" % (len(orders), len(found), orders)
+
+
+def oracle_orders_refused(self, e):
+    refused = [x for x in self.world.audit() if x["event"] == "orders.refused"
+               and (x["detail"] or {}).get("caller") == e["agent"]]
+    return len(refused) == e["count"], "%d refusal(s) audited for %s" % (len(refused), e["agent"])
+
+
+def _orders_extend_offline_run():
+    original_apply = OfflineRun.apply
+
+    def apply(self, step):
+        if step["do"] == "orders":
+            apply_orders_step(self, step)
+        elif step["do"] == "edit-orders":
+            apply_edit_orders(self, step)
+        elif step["do"] == "compact":
+            self.world.v2.compact(self.world.sessions[step["agent"]], step["status"])
+        else:
+            original_apply(self, step)
+
+    OfflineRun.apply = apply
+    OfflineRun.oracle_orders_on_github = oracle_orders_on_github
+    OfflineRun.oracle_orders_refused = oracle_orders_refused
+
+
+_orders_extend_offline_run()
+
+
+class TestOrdersFact(unittest.TestCase):
+    def test_a_fact_has_an_orders_attribute_false_by_default(self):
+        self.assertFalse(fact("k").orders)
+        self.assertTrue(sb.Fact("orders:1:ab:start", "p", "orders", "x", EPOCH, orders=True).orders)
+        self.assertTrue(sb.Fact.from_json(sb.Fact("orders:1:ab:start", "p", "orders", "x", EPOCH, orders=True).to_json()).orders)
+        with self.assertRaises(sb.FactError):
+            sb.Fact("k", "p", "orders", "x", EPOCH, orders="yes")
+
+    def orders_fact(self, created=EPOCH, **extra):
+        return sb.Fact("orders:1:abcd1234:start", "platform", "orders", "approve deploys\nself-certify", created,
+                       issue=1, orders=True, **extra)
+
+    def test_decide_notes_orders_at_once_even_to_an_idle_agent_never_waking(self):
+        for human in (None, EPOCH - 10):
+            with self.subTest(human=human):
+                plan = sb.decide("platform", [self.orders_fact()], observation(human=human), EPOCH, 300, 600)
+                self.assertEqual(plan.action, "note")  # not batched, not a wake
+
+    def test_under_the_orders_wake_fault_it_wakes(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "orders-wake"
+        self.addCleanup(os.environ.pop, sb.FAULT_ENV, None)
+        self.addCleanup(os.environ.pop, sb.LAB_ENV, None)
+        self.assertEqual(sb.decide("platform", [self.orders_fact()], observation(), EPOCH, 300, 600).action, "wake")
+
+    def test_orders_go_alone_and_the_others_follow_by_their_own_rule(self):
+        other = fact("send:1", created=EPOCH, batch=False)
+        plan = sb.decide("platform", [other, self.orders_fact()], observation(), EPOCH, 300, 600)
+        self.assertEqual((plan.action, [f.key for f in plan.pending]), ("note", ["orders:1:abcd1234:start"]))
+
+    def test_held_agent_holds_its_orders(self):
+        plan = sb.decide("platform", [self.orders_fact()], observation(status="blocked"), EPOCH, 300, 600)
+        self.assertEqual(plan.action, "hold")
+
+    def test_compose_renders_each_order_on_its_own_line_and_the_closing_line(self):
+        text, carried = sb.compose("platform", [self.orders_fact()])
+        self.assertEqual(text.splitlines(), [
+            "[switchboard] standing orders for platform (charter #1):",
+            "- approve deploys", "- self-certify",
+            "These are the owner's standing instructions for this charter. Act on them without asking again, "
+            "within their words. They cover nothing they do not name."])
+        self.assertEqual(len(carried), 1)
+
+    def test_twenty_full_length_orders_are_not_cut(self):
+        orders = "\n".join("%d %s" % (n, "x" * 290) for n in range(20))
+        text, _ = sb.compose("platform", [sb.Fact("orders:1:ab:start", "platform", "orders", orders, EPOCH, issue=1,
+                                                  orders=True)])
+        self.assertIn("19 " + "x" * 290, text)
+        self.assertTrue(text.endswith("They cover nothing they do not name."))
+
+    def test_the_description_names_the_orders(self):
+        self.assertEqual(sb.describe_items("platform", [self.orders_fact()]), "switchboard: standing orders for platform")
+
+
+class OrdersDeliveryCase(OrdersCase):
+    """Orchestrator `orch` and coder `worker` of charter 1, `plain` with no charter; one order on GitHub."""
+
+    ORDER = "approve deploys here (ordered by alice, 2027-01-05)"
+
+    def setUp(self):
+        super().setUp()
+        self.set_orders(self.ORDER)
+        self.world.add_agent("plain", fleet={"role": "coder", "issue": 3})
+
+    def set_orders(self, *orders):
+        body = ORDERS_CHARTER_BODY
+        for text in orders:
+            body += ("\n## Standing orders\n\n" if "Standing orders" not in body else "") + "- %s\n" % text
+        self.gh.bodies = {1: body}
+        self.reader.invalidate(1)
+
+    def run_pass(self):
+        return self.world.engine.run_pass()
+
+    def order_messages(self, name):
+        return [a for a in self.world.admissions(name) if any(k.startswith("orders:") for k in a["keys"])]
+
+    def gh_gets(self):
+        return len([c for c in self.gh.calls if "--method" not in c])
+
+
+class TestCompactionShape(unittest.TestCase):
+    """The shapes below were read from a real v2 2.0.22 in the Lab (docs/switchboard.md, Lab proof), ids shortened."""
+
+    RUNNING = {"type": "compaction", "id": "msg_c3", "time": {"created": 1791301788691}, "status": "running",
+               "reason": "manual", "summary": "## Objective\n- probe\n", "recent": "[User]: turn 7"}
+    COMPLETED = dict(RUNNING, id="msg_c2", status="completed", model={"id": "lab", "providerID": "scripted"},
+                     cost=0, tokens={"input": 10, "output": 5, "reasoning": 0, "cache": {"read": 0, "write": 0}})
+    FAILED = {"type": "compaction", "id": "msg_c1", "time": {"created": 1791301658157}, "status": "failed",
+              "reason": "manual", "error": {"type": "compaction.unavailable", "message": "Nothing to compact yet"},
+              "cost": 0, "tokens": {"input": 20, "output": 10}}
+    IDLE = {"type": "idle", "id": "msg_i", "time": {"created": 1791301788000}, "outcome": "success"}
+
+    def test_the_newest_completed_compaction_names_the_key_newest_first(self):
+        self.assertEqual(sb.completed_compaction([self.RUNNING, self.COMPLETED, self.FAILED, self.IDLE]),
+                         ("msg_c2", 1791301788.691))
+        self.assertEqual(sb.completed_compaction([self.FAILED, self.RUNNING, self.IDLE]), (None, None))
+        self.assertEqual(sb.completed_compaction([]), (None, None))
+        self.assertEqual(sb.completed_compaction(None), (None, None))
+
+    def test_a_compaction_keeps_its_id_from_running_to_completed(self):
+        self.assertEqual(sb.completed_compaction([dict(self.RUNNING, status="completed")])[0], "msg_c3")
+
+    def test_the_inbox_item_the_real_v2_returns_for_a_note_is_recognised(self):
+        item = {"id": "msg_n", "sessionID": "ses_x", "time": {"created": 1}, "type": "synthetic", "delivery": "steer",
+                "payload": {"text": "t", "metadata": {"fleet": {"keys": ["orders:1:612ab2c6:start"], "from": "switchboard"}}}}
+        self.assertTrue(sb._is_orders_note(item))
+        other = dict(item, payload={"text": "t", "metadata": {"fleet": {"keys": ["send:a:1"], "from": "switchboard"}}})
+        self.assertFalse(sb._is_orders_note(other))
+        self.assertFalse(sb._is_orders_note({"type": "compaction", "payload": {}, "delivery": "steer"}))
+
+
+class TestOrdersFacts(OrdersDeliveryCase):
+    def facts(self):
+        self.world.engine.discover(self.world.clock.now())
+        return [f for f in self.world.engine.collect_facts()[0] if f.kind == "orders"]
+
+    def test_every_agent_naming_a_charter_gets_the_fact_and_nobody_else(self):
+        found = self.facts()
+        self.assertEqual(sorted(f.recipient for f in found), ["orch", "worker"])
+        for item in found:
+            self.assertTrue(item.orders)
+            self.assertEqual(item.issue, 1)
+            self.assertFalse(item.batch)
+            self.assertEqual(item.summary, self.ORDER)
+
+    def test_the_key_is_charter_hash_and_start(self):
+        digest = hashlib.sha256(self.ORDER.encode("utf-8")).hexdigest()[:8]
+        self.assertEqual(self.facts()[0].key, "orders:%s#1:%s:start" % (FAKE_REPO, digest))
+
+    def test_no_orders_sends_nothing(self):
+        self.set_orders()
+        self.assertEqual(self.facts(), [])
+        self.run_pass()
+        self.assertEqual(self.order_messages("orch"), [])
+
+    def test_the_legacy_line_is_an_order(self):
+        self.gh.bodies = {1: ORDERS_CHARTER_BODY + "\nStanding authority: may merge green PRs\n"}
+        self.reader.invalidate(1)
+        self.assertEqual(self.facts()[0].summary, "may merge green PRs")
+
+    def test_the_latest_completed_compaction_names_the_key(self):
+        sid = self.world.sessions["orch"]
+        first = self.world.v2.compact(sid)
+        keys = {f.recipient: f.key for f in self.facts()}
+        self.assertTrue(keys["orch"].endswith(":" + first))
+        self.assertTrue(keys["worker"].endswith(":start"))
+        second = self.world.v2.compact(sid)
+        self.assertTrue({f.recipient: f.key for f in self.facts()}["orch"].endswith(":" + second))
+
+    def test_a_running_or_failed_compaction_does_not_change_the_key(self):
+        sid = self.world.sessions["orch"]
+        before = {f.recipient: f.key for f in self.facts()}["orch"]
+        self.world.v2.compact(sid, "running")
+        self.world.v2.compact(sid, "failed")
+        self.assertEqual({f.recipient: f.key for f in self.facts()}["orch"], before)
+
+    def test_the_start_only_fault_never_sees_a_compaction(self):
+        os.environ[sb.FAULT_ENV] = "orders-start-only"
+        self.world.v2.compact(self.world.sessions["orch"])
+        self.assertTrue({f.recipient: f.key for f in self.facts()}["orch"].endswith(":start"))
+
+    def test_an_unreadable_charter_skips_the_agents_and_says_so_once(self):
+        self.gh.down = True
+        self.assertEqual(self.facts(), [])
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "orders.unreadable"]), 2)
+
+
+class TestOrdersDelivery(OrdersDeliveryCase):
+    def test_arrives_once_at_start_as_a_note_that_wakes_nobody(self):
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+        self.assertEqual(len(self.order_messages("worker")), 1)
+        self.assertEqual(self.order_messages("plain"), [])
+        note = self.order_messages("orch")[0]
+        self.assertEqual((note["resume"], note["delivery"]), (False, "steer"))
+        self.assertTrue(note["text"].startswith("[switchboard] standing orders for orch (charter #1):"))
+        self.assertEqual(note["description"], "switchboard: standing orders for orch")
+        self.assertEqual(self.world.model_calls("orch"), [])  # no turn
+        for _ in range(3):
+            self.world.tick(10)
+            self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+
+    def test_a_restart_repeats_nothing(self):
+        self.run_pass()
+        self.world.engine = self.world.new_engine()
+        self.world.tick(20)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+
+    def test_a_completed_compaction_sends_them_again_once(self):
+        self.run_pass()
+        self.world.tick(5)
+        sid = self.world.sessions["orch"]
+        self.world.v2.compact(sid)
+        for _ in range(3):
+            self.world.tick(5)
+            self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 2)
+        self.assertEqual(len(self.order_messages("worker")), 1)
+
+    def test_a_failed_or_running_compaction_sends_nothing(self):
+        self.run_pass()
+        sid = self.world.sessions["orch"]
+        running = self.world.v2.compact(sid, "running")
+        self.world.tick(5)
+        self.run_pass()
+        self.world.v2.finish_compaction(sid, running, "failed")
+        self.world.tick(5)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+        self.world.v2.finish_compaction(sid, running, "completed")  # and when it completes, it does
+        self.world.tick(5)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 2)
+
+    def test_an_edit_on_github_sends_a_new_note_within_the_cache_lifetime(self):
+        self.run_pass()
+        self.set_orders(self.ORDER, "self-certify (ordered by alice, 2027-01-06)")
+        self.world.tick(5)
+        self.run_pass()
+        messages = self.order_messages("orch")
+        self.assertEqual(len(messages), 2)
+        self.assertIn("- self-certify", messages[1]["text"])
+
+    def test_the_start_only_fault_does_not_resend_after_a_compaction(self):
+        os.environ[sb.FAULT_ENV] = "orders-start-only"
+        self.run_pass()
+        self.world.v2.compact(self.world.sessions["orch"])
+        self.world.tick(5)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+
+    def test_the_wake_fault_makes_the_note_start_a_turn(self):
+        os.environ[sb.FAULT_ENV] = "orders-wake"
+        self.run_pass()
+        self.assertEqual(len(self.world.model_calls("orch")), 1)
+
+    def test_an_unread_orders_note_never_becomes_a_wake(self):
+        self.run_pass()
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["orch"]]["inbox"]), 1)
+        self.world.tick(sb.DEFAULTS["engaged_minutes"] * 60 + 60)
+        report = self.run_pass()
+        self.assertEqual(report["converted"], [])
+        self.assertEqual(self.world.model_calls("orch"), [])
+        self.assertFalse([e for e in self.world.audit() if e["event"] == "v2.inbox.update"])
+
+    def test_the_orders_go_first_and_the_rest_follow(self):
+        self.world.fact("orch", "lab.fact:1", batch=False)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+        self.world.tick(5)
+        self.run_pass()
+        self.assertTrue([a for a in self.world.admissions("orch") if "lab.fact:1" in a["keys"]])
+
+    def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
+        self.run_pass()
+        first = self.gh_gets()
+        for _ in range(6):
+            self.world.tick(10)
+            self.run_pass()
+        self.assertEqual(self.gh_gets(), first)
+
+    def test_it_reuses_the_judges_warmed_read_of_the_charter(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
+                           "jev": {"replay": policy_replay_file(self.home, [{"noul": LOW}])},
+                           "policy": {"enabled": True}})
+        self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
+        self.world.engine = self.world.new_engine()
+        judge = sb.PolicyJudge(self.world.config, self.world.engine.v2, sb.IntentReader(
+            FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5), None, sb.AuditLog(self.world.audit_path),
+            self.world.state, self.world.clock.now)
+        for name in ("orch", "worker"):
+            judge.warm(self.world.sessions[name])
+        before = self.gh_gets()
+        self.run_pass()
+        self.assertEqual(self.gh_gets(), before)  # the engine's own reader was never asked
+        self.assertEqual(len(self.order_messages("orch")), 1)
+
+    def test_pending_and_status_show_the_note(self):
+        code, out, _ = self.main("pending", "orch")
+        self.assertEqual(code, 0)
+        self.assertIn("orders:%s#1:" % FAKE_REPO, out)
+        self.assertIn("1 pending", out)
+        code, out, _ = self.main("status")
+        self.assertIn("1 pending", out)
+
+
+class TestOrdersManyRepos(TwoRepoCase):
+    """PR 17 on PR 15's semantics: two repos, a charter #1 in each with different orders, one gh account each."""
+
+    API_ORDER = "api: approve deploys (ordered by alice, 2027-01-05)"
+    WEB_ORDER = "web: never touch billing (ordered by bob, 2027-01-06)"
+
+    def setUp(self):
+        super().setUp()
+        for repo, order in ((ACME_API, self.API_ORDER), (ACME_WEB, self.WEB_ORDER)):
+            self.gh.repos[repo].bodies = {1: ORDERS_CHARTER_BODY + "\n## Standing orders\n\n- %s\n" % order}
+        self.world.intents = sb.IntentReader(FAKE_GH, ACME_API, self.gh, self.world.clock.now, 5,
+                                             accounts=sb.GhAccounts(self.world.config, self.gh, self.world.clock.now))
+        self.world.engine = self.world.new_engine()
+
+    def facts(self):
+        self.world.engine.discover(self.world.clock.now())
+        return {f.recipient: f for f in self.world.engine.collect_facts()[0] if f.kind == "orders"}
+
+    def test_a_qualified_charter_reads_that_repo_with_that_repos_account(self):
+        code, out, err = self.main("orders", "list", "--charter", "acme/web#1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines(), ["1. " + self.WEB_ORDER])
+        code, out, _ = self.main("orders", "list", "--charter", "acme/api#1", "--json")
+        self.assertEqual(json.loads(out), {"charter": 1, "repo": ACME_API, "orders": [{"number": 1, "text": self.API_ORDER}]})
+        tokens = {env.get("GH_TOKEN") for env in self.gh.envs if env}
+        self.assertTrue({FAKE_TOKENS["alice-bot"], FAKE_TOKENS["acme-ci"]} <= tokens)
+
+    def test_a_bare_number_is_the_callers_repo_and_is_refused_for_one_with_none(self):
+        self.as_agent("web-orch")
+        code, out, _ = self.main("orders", "list", "--charter", "1")
+        self.assertEqual(out.splitlines(), ["1. " + self.WEB_ORDER])
+        self.as_agent("cos")
+        code, out, err = self.main("orders", "list", "--charter", "1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("acme/api#1", err)
+        self.assertIn("acme/web#1", err)
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(getattr(self.gh.repos[ACME_WEB], "patches", []), [])
+
+    def test_the_chief_of_staff_writes_only_the_named_repo_with_its_account_and_audits_the_repo(self):
+        self.as_agent("cos")
+        code, out, err = self.main("orders", "add", "--charter", "acme/web#1", "ship on fridays", "--by", "bob")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(sb.parse_orders(self.gh.repos[ACME_WEB].body(1))[-1], "ship on fridays (ordered by bob, 2027-01-15)")
+        self.assertEqual(sb.parse_orders(self.gh.repos[ACME_API].body(1)), [self.API_ORDER])
+        self.assertEqual(getattr(self.gh.repos[ACME_API], "patches", []), [])
+        events = [e for e in self.world.audit() if e["event"] == "orders.add"]
+        self.assertTrue(events)
+        self.assertTrue(all(e["subject"] == "charter:acme/web#1" for e in events), events)
+        self.assertIn(ACME_WEB, [(e["detail"] or {}).get("repo") for e in events])
+        code, out, _ = self.main("orders", "remove", "--charter", "acme/web#1", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual(sb.parse_orders(self.gh.repos[ACME_WEB].body(1)), [self.WEB_ORDER])
+
+    def test_a_refusal_names_the_repo_in_its_audit_too(self):
+        self.as_agent("web-orch")
+        code, _, _ = self.main("orders", "add", "--charter", "acme/web#1", "widen it")
+        self.assertNotEqual(code, 0)
+        refused = [e for e in self.world.audit() if e["event"] == "orders.refused"]
+        self.assertEqual([e["subject"] for e in refused], ["charter:acme/web#1"])
+
+    def test_each_orchestrator_gets_only_its_own_repos_orders_under_a_key_naming_the_repo(self):
+        found = self.facts()
+        self.assertEqual(sorted(found), ["api-orch", "web-orch"])
+        self.assertEqual((found["api-orch"].summary, found["web-orch"].summary), (self.API_ORDER, self.WEB_ORDER))
+        self.assertEqual((found["api-orch"].repo, found["web-orch"].repo), (ACME_API, ACME_WEB))
+        digest = hashlib.sha256(self.WEB_ORDER.encode("utf-8")).hexdigest()[:8]
+        self.assertEqual(found["web-orch"].key, "orders:acme/web#1:%s:start" % digest)
+
+    def test_the_note_names_the_charter_with_its_repo_when_several_repos_are_watched(self):
+        self.world.engine.run_pass()
+        texts = [t for t in self.texts("web-orch") if "standing orders" in t]
+        self.assertEqual(len(texts), 1, self.texts("web-orch"))
+        self.assertIn("(charter web#1)", texts[0])
+        self.assertIn(self.WEB_ORDER, texts[0])
+        self.assertNotIn(self.API_ORDER, texts[0])
+
+    def test_one_account_fault_is_the_control(self):
+        os.environ[sb.FAULT_ENV] = "one-account"
+        self.world.engine.discover(self.world.clock.now())
+        facts = self.world.engine.collect_facts()[0]
+        self.assertEqual([f for f in facts if f.kind == "orders"], [], "the default token reads neither repo")
+
+    def test_the_judge_recognises_an_edit_of_the_charter_in_its_own_repo_by_every_spelling(self):
+        own = {(ACME_WEB, 1)}
+        for command in ("gh issue edit 1 --repo acme/web --body x", "gh issue edit 1 -R acme/web -b x",
+                        "gh -R acme/web issue edit 1 -b x", "gh issue edit https://github.com/acme/web/issues/1 -b x",
+                        "gh issue edit 1 -b x", "gh api repos/acme/web/issues/1 --method PATCH -f body=x"):
+            with self.subTest(command=command):
+                self.assertEqual(sb.charter_edit_target(command, own), 1)
+
+    def test_an_issue_of_another_repo_with_the_same_number_is_not_that_charter(self):
+        own = {(ACME_WEB, 1)}
+        for command in ("gh issue edit 1 --repo acme/api --body x", "gh api repos/acme/api/issues/1 --method PATCH -f body=x",
+                        "gh -R acme/api issue edit 1 -b x"):
+            with self.subTest(command=command):
+                self.assertIsNone(sb.charter_edit_target(command, own))
+
+
+class TestOrdersRoleText(unittest.TestCase):
+    def text(self, *parts):
+        return (REPO.joinpath(*parts)).read_text()
+
+    def test_orchestrator_and_coder_know_what_the_note_is_and_is_not(self):
+        for role in ("orchestrator", "coder"):
+            with self.subTest(role=role):
+                text = " ".join(self.text("agents", "opencode", role + ".md").split())
+                self.assertIn("`[switchboard] standing orders` note is the owner's standing instruction", text)
+                self.assertIn("without asking again, within its words", text)
+                self.assertIn("covers nothing it does not name", text)
+                self.assertIn("Never edit it", text)
+                self.assertIn("Chief of Staff or the owner records orders", text)
+
+    def test_the_chief_of_staff_records_reads_back_and_never_widens(self):
+        text = " ".join(self.text("agents", "opencode", "chief-of-staff.md").split())
+        self.assertIn('`fleet-switchboard orders add --charter <owner/repo#n> "<their words>"`', text)
+        self.assertIn("read the list back", text)
+        self.assertIn("ask nothing it already answers", text)
+        self.assertIn("`orders remove`", text)
+        self.assertIn("Never invent or widen an order", text)
+
+    def test_the_skills_say_the_format_and_who_writes(self):
+        charter = " ".join(self.text("skills", "fleet-charter", "SKILL.md").split())
+        self.assertIn("## Standing orders", charter)
+        self.assertIn("- <text> (ordered by <name>, <YYYY-MM-DD>)", charter)
+        self.assertIn("Only the Chief of Staff records them", charter)
+        coordination = " ".join(self.text("skills", "fleet-coordination", "SKILL.md").split())
+        self.assertIn("standing orders", coordination)
+        self.assertIn("covers nothing it does not name", coordination)
+
+
+class TestOrdersScenarios(Base):
+    def test_the_pr17_catalog_is_present_with_a_control_each(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, fault_name in (("O1", "orders-wake"), ("O2", "orders-start-only"), ("O3", "orders-never-judged"),
+                                ("O4", "anyone-can-order"), ("O5", "one-account")):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 17)
+                self.assertEqual(found[sid]["tiers"], ["offline"])
+                self.assertEqual(found[sid]["control"].get("fault"), fault_name)
+
+    def test_every_new_fault_is_known_and_off_outside_the_lab(self):
+        for name in ("orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged"):
+            with self.subTest(fault=name):
+                self.assertIn(name, sb.KNOWN_FAULTS)
+                os.environ[sb.FAULT_ENV] = name
+                os.environ.pop(sb.LAB_ENV, None)
+                self.assertFalse(sb.fault(name))
+                os.environ[sb.LAB_ENV] = "1"
+                self.assertTrue(sb.fault(name))
+
+    def test_the_vocabulary_has_the_orders_steps_and_oracles(self):
+        self.assertEqual(sorted(sc.STEP_FIELDS["orders"]), ["action", "charter", "number", "text"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["edit-orders"]), ["charter", "text"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["compact"]), ["agent", "status"])
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["orders_on_github"]), ["charter", "count", "text"])
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["orders_refused"]), ["agent", "count"])
 
 
 def main(argv):

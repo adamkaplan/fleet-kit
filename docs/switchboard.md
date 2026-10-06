@@ -1,7 +1,7 @@
 # Switchboard: tracking
 
 > Event-driven delivery for Fleet Kit on OpenCode v2 that never interrupts.
-> This plan is updated as each PR lands. Last updated 2026-10-02.
+> This plan is updated as each PR lands. Last updated 2026-10-06.
 >
 > It lives at `docs/switchboard.md` on the stack. After PR 1 it is edited only
 > on the current top branch, so status updates never rebase lower PRs.
@@ -26,6 +26,7 @@
 | 14 | `switchboard/decisions` | A read-only Decisions list for you: derived from labels, pending requests and unanswered reports, written to `decisions.json`, read by `fleet-switchboard decisions` and a TUI sidebar plugin | ready for review |
 | 15 | `switchboard/multi-repo` | One Chief of Staff, many independent projects: the watched repos are derived, `owner/repo#N` issue references, a `gh` account per repo, `launch --new-workspace`, repo creation is a decision and always hard to reverse, per-repo status | ready for review |
 | 16 | `switchboard/install` | `fleet-switchboard install`: config, the kit's pieces in OpenCode's profile, the herdr plugin and a service that keeps the daemon alive; the decision-model key as a private file; the daemon started on use; `bootstrap` opens the Chief of Staff | ready for review |
+| 17 | `switchboard/orders` | Standing orders an agent does not forget: kept on the charter issue, recorded by the Chief of Staff with `fleet-switchboard orders`, re-supplied to every agent of the charter at its start, after each compaction and when they change, and read by the judge at every tool call | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -458,6 +459,9 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
 | `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
 | `fleet-switchboard launch <name> --agent <a> --dir <d> [--repo owner/repo] [--new-workspace <label>]` | Chief of Staff, an orchestrator (PR 3; PR 15) | Starts a fleet agent in a new tab, without typing. `--repo` sets its `metadata.fleet.repo` and gives it its repo's `gh` account as `GH_TOKEN`; `--new-workspace` first creates a herdr workspace (never focused) in `--dir`, refusing a `--charter` whose `workspace:` line differs from the label |
+| `fleet-switchboard orders list --charter <n or owner/repo#n> [--json]` | Anyone (PR 17) | The charter's standing orders, numbered: the `## Standing orders` bullets, then the legacy `Standing authority:` line if there is one |
+| `fleet-switchboard orders add --charter <n or owner/repo#n> "<text>" [--by <name>]` | Chief of Staff only (PR 17) | Records one order the owner gave: 1 to 300 characters on one line, at most 20 per charter, `--by` defaults to the operating-system user. Edits only the `## Standing orders` section of the issue body, then reads it back. Anyone else is refused, and the refusal is audited |
+| `fleet-switchboard orders remove --charter <n or owner/repo#n> <number>` | Chief of Staff only (PR 17) | Removes the order with that number in `orders list`; the last one takes the section with it. The legacy `Standing authority:` line is numbered but lies outside the section, so it is refused (edit it on GitHub) |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -1498,6 +1502,148 @@ owner's screen did not move); `install` against a real v2 binary and a real prof
 integration install opencode` under the private `HOME` (the trial's profile does this, the installer's
 same steps are tested against a fake herdr); a v1 OpenCode reading the shared directory after an
 install (it is not written any more).
+### Standing orders (PR 17)
+
+The owner tells an orchestrator "self-certify and approve deploys in this repo",
+and it forgets: the order lived in a chat that compaction later discarded. The
+fix is that an order is a fact the system supplies again, not something an agent
+is trusted to remember.
+
+**Where an order lives.** On the project's charter issue, in a `## Standing
+orders` section of the body, one order per bullet:
+`- <text> (ordered by <name>, <YYYY-MM-DD>)`. The legacy one-line `Standing
+authority: ...` stays valid and counts as one more order. One parser,
+`parse_orders(body)`, returns the list (`parse_standing_authority` answers
+through it, joined with `; `); the section inside a fenced block is ignored, as
+the old line is. Nothing is kept in a file: GitHub is the only copy, as it is
+for Intent.
+
+**Who writes one.** Only the Chief of Staff, or you on GitHub. The Chief of
+Staff has `edit: deny` and never does project work; recording your orders is
+record-keeping, and it goes through one command (see the agents table).
+`orders add` and `orders remove` identify the caller from its pane, as `send`
+does (`--from` is Lab only), and refuse any role but `chief-of-staff` with a
+clear message and an `orders.refused` audit event. The write is the narrowest
+one possible: `IntentReader` is still GET-only, and `write_issue_body` runs
+`gh api repos/<repo>/issues/<n> --method PATCH --input -` with `{"body": ...}`
+through the same injected runner (the account's token reaches `gh` only through
+the child's environment, as everywhere: the read and the write both use the
+charter's own repo's `gh` account, `GhAccounts`). It reads the body, changes only the
+section (made at the end of the body when missing, deleted when its last order
+goes, every other byte kept), writes, reads back, and once more when the readback
+does not show the change; when it still does not, it fails loudly and records
+nothing. A failure and a success are both audited, before and after, with who
+ordered, the charter (`owner/repo#N`, in the audit subject) and the order's text (the text is not a secret). A window
+remains between the read and the write, as for any edit of an issue body: the
+readback is what catches a lost write, not a lock.
+
+**Many repos (PR 15 semantics).** `--charter` takes `owner/repo#N`; a bare number is
+in the caller's own repo (its `metadata.fleet.repo`), else `intent_repo`, and with
+several repos watched a caller with no repo is refused with the choices listed,
+as for every issue reference. Each repo's charter is read and written with that
+repo's own account, so with two repos each orchestrator gets only its own
+repo's orders (scenario O5; the `one-account` fault is its control). The
+fact's repo is the agent's own `repo`, else `intent_repo`.
+
+**The judge reads them.** `resolve_policy_context` returns every order, joined
+with `; ` and clipped to 600 characters for the model's state, so the existing
+`speaks_for_you` question sees all of them; they can only stop a pointless
+question, never loosen a deny (invariant 9 is untouched). Beside the model's
+questions there is one deterministic rule, with no model call: a shell call by
+any agent whose role is not `chief-of-staff` that runs `gh issue edit` on the
+charter it works under, or `gh api` with PATCH, PUT or DELETE on
+`repos/<repo>/issues/<charter>` (the repo named by `--repo`, `-R`, a URL, an
+`owner/repo#N` word or the api path must be the charter's own repo: issue 1 of
+another repo is not this charter), answers `speaks_for_you` and `hard_to_reverse`
+both: an agent must not grant itself authority. The limits are real: it is a
+guard, not a proof. A shell can build the call from pieces this rule never sees
+(a variable, a script, an alias, another tool), and it knows only the agent's own
+charter. The branch protections, the audit log and the token's reach are what
+stand behind it.
+
+**The note.** A new fact kind `orders` for every fleet agent whose session
+metadata names a `charter`. Its key is
+`orders:<owner/repo>#<charter>:<hash8 of the orders text>:<compaction id, or "start">`, where
+the compaction id is the id of the newest *completed* compaction message in that
+agent's transcript. A running or failed compaction does not change it. It is
+derived on every pass and stored nowhere: it is pending exactly when no such key
+is in the agent's transcript or inbox (the `delivered_keys` read the delivery
+rule already makes), so a daemon restart repeats nothing, a charter with no
+orders sends nothing, and the note goes out again only after a completed
+compaction (the id changed) or an edit (the hash changed). Orders reach an agent
+at its start, after each compaction and when they change; not on every message
+and not on every model call. This is the one path: the launch brief does not
+carry orders, the note does.
+
+It is a `Fact` with `orders` set, which `decide` treats as neither a rider nor a
+batched fact: it goes first and alone, at once, as a note (a steered synthetic,
+no turn, never a wake) even to an idle agent, by the same `plan` and `deliver` as
+everything else. `compose` renders
+`[switchboard] standing orders for <agent> (charter #N):` (`web#N` when several repos are watched, as every message names an issue), each order on its own
+line, and a last line: "These are the owner's standing instructions for this
+charter. Act on them without asking again, within their words. They cover
+nothing they do not name." Twenty orders of 300 characters are not cut. The
+description (PR 13) says `switchboard: standing orders for <agent>`.
+`convert_lapsed_notes` skips a note whose every key is an `orders:` key, so an
+unread orders note never becomes a wake. A fact key is now unique per recipient
+rather than across the fleet, because every agent of a charter has the same
+orders key.
+
+**Cost.** Reading the charter reuses the judge's warmed, cached read: the
+daemon's warmer already refreshes each session's context, which now carries the
+charter number and the orders, and the engine reads that same file (the key the
+judge uses) before it asks GitHub. Without a warmed entry (the judge is off, or
+the entry expired) it uses the reader's own read, cached for `INTENT_TTL` (300 s):
+no new `gh` call per pass either way. An edit on GitHub reaches the note within
+the cache lifetime.
+
+Roles: an orchestrator and a coder are told that the note is the owner's standing
+instruction for the charter, to be acted on without asking again, within its
+words, that it covers nothing it does not name, never to edit it, and that the
+Chief of Staff or you records orders. The Chief of Staff is told to run `orders
+add` when you give a standing order, to read the list back to you, to ask nothing
+the order already answers, to `orders remove` when you revoke one, and never to
+invent or widen one. `fleet-charter` and `fleet-coordination` say the same,
+briefly, and the format.
+
+Faults (Lab only), one per behaviour: `orders-start-only` (the compaction id is
+never read, so the orders are never sent again), `orders-wake` (the note wakes
+the agent), `anyone-can-order` (the role check is off), `orders-never-judged`
+(the judge's question sees only the legacy line). Scenarios O1 to O4 are new.
+
+**Lab proof (v2 2.0.22).** The design assumed v2 represents a compaction as a
+message of type `compaction` with a status of running, completed or failed (read
+from its API schema and client code, never seen live). Measured in a throwaway
+profile on its own service port (49451; a second v2 on another XDG directory
+collides with the Lab's service unless its `service.json` names another port),
+with the Lab's v2 binary and a scripted model that answers a compaction request
+with a template-shaped summary, on a session with fleet metadata `charter: 1`:
+`session.compact` returns an inbox-style record (`type` `compaction`, `delivery`
+`steer`, `payload` `{}`) whose `id` is the id of the message that follows.
+`session.message.list` (with `type=compaction`, newest first, as for any other
+type) then returns that message: `type` `compaction`, `id` `msg_...`,
+`time.created` in milliseconds, `status`, `reason` (`manual`), and, while
+`running` and when `completed`, `summary` and `recent` (the turns kept
+verbatim; everything before them, including an orders note, is replaced by the
+summary in what the model sees, which is why the note is sent again), when
+`completed` also `model`, `cost` and `tokens`, when `failed` an `error`
+(`compaction.failed`: "Compaction summary did not match the required template",
+which the unmodified scripted model produced; `compaction.unavailable`: "Nothing
+to compact yet", on a second compaction with nothing new). The id is the same
+from `running` to `completed` (seen by polling twice a second), and a failed
+compaction is also a message, with its own id. The shape matches the assumption,
+so no code changed; `completed_compaction` and the fake v2 now follow the
+measured shape. Against that session the real client code derived the key
+`orders:1:612ab2c6:<the completed compaction's id>`, found no such key in the
+transcript or inbox, delivered the note (a synthetic message, `steer`, `resume`
+false, admitted), found the key in the inbox afterwards (the inbox item carries
+`payload.metadata.fleet.keys`, and the conversion filter recognised it), and,
+after a turn consumed the note and a second compaction completed, found the old
+key in the transcript and the new key pending. The probe, its profile, its
+scripted model and its service (the two pids recorded, stopped by pid, never by
+name) are gone; the Lab itself was only read. Not measured: an automatic
+compaction (`reason` `auto`), which should look the same, and the herdr agent
+state during a compaction.
 
 ### Data
 
@@ -1948,6 +2094,11 @@ R1.
 | E2 | `bootstrap` is run three times | — | One Chief of Staff: opened once, a second refused naming the one that runs, resumed in a workspace when its pane is gone | PR 16 | offline; the control is a variant that expects a second one |
 | E3 | The decision-model key is missing | — | `status` says so in its first line, in plain words | PR 16 | offline; control `key-missing-silent` |
 | C2 | An edit to the config file is applied without a restart; a broken edit leaves the daemon running and says so; a fix recovers | — | The daemon reloads its config when the file changes, and never stops on an invalid one | PR 16 | offline; control `config-read-once` |
+| O1 | A charter has a standing order | 3 | Every agent of the charter gets it once, at its start, as a note that wakes nobody | PR 17 | offline; control `orders-wake` |
+| O2 | An agent's conversation is compacted | 3 | A completed compaction sends the orders again, once; a failed one sends nothing | PR 17 | offline; control `orders-start-only` |
+| O3 | The owner adds an order on GitHub | 3 | A new note arrives, and the judge's next question sees the order | PR 17 | offline; control `orders-never-judged` |
+| O4 | An orchestrator tries to give itself an order | 1 | Only the Chief of Staff records one; `gh issue edit` of its own charter is stopped by the judge | PR 17 | offline; control `anyone-can-order` |
+| O5 | Two repos, two accounts, a charter each with different orders | 3 | Each orchestrator gets only its own repo's orders, in a note keyed with its repo | PR 17 | offline; control `one-account` |
 
 ## Repo and PR conventions
 
@@ -2516,6 +2667,40 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   slow-catch-up tests now start from a marker an hour old (a fresh start reads nothing); a restart test leaves
   a marker file behind; and G3's first comment moved. After deleting the state, a test shows nothing is
   replayed and nothing is delivered twice.
+- 2026-10-06: PR 17, standing orders. Found repeatedly: the owner tells an
+  orchestrator "self-certify and approve deploys in this repo", and it forgets,
+  because the order lived in a chat that compaction later discarded. Changed:
+  orders live on the charter issue (`## Standing orders`, one bullet each; the
+  legacy `Standing authority:` line still counts) and `parse_orders` is the one
+  parser; `fleet-switchboard orders list|add|remove` (Chief of Staff only for the
+  writes, a narrow PATCH of the section with a readback, audited); the judge
+  reads every order and has one deterministic rule against an agent editing its
+  own charter; a fact kind `orders`, keyed by charter, orders hash and the
+  newest completed compaction (or `start`), delivered as a note that never wakes
+  and is never converted to a wake; role files and skills. Measured in the Lab:
+  v2 2.0.22 shows a compaction as a message of type `compaction` with the status
+  assumed (details in "Standing orders (PR 17)"). Two things the tests found: a
+  fact key was unique across the fleet, but every agent of a charter shares the
+  orders key, so it is now unique per recipient; and the role-file guards needed
+  older text trimmed to make room. Scenarios O1 to O4 are new (the brief called
+  them S2 to S5, ids the spikes already hold).
+- 2026-10-06: PR 17 rebased onto PR 16 and made multi-repo (the TODO above is
+  done). `orders list|add|remove --charter` accepts `owner/repo#N` (a bare number
+  is the caller's repo, as PR 15 defined); the orders note key is
+  `orders:<owner/repo>#<charter>:<hash8>:<compaction id|start>` and the audit
+  subject is `charter:<owner/repo>#<charter>`; the orders read and the PATCH use
+  the repo's own `gh` account in the child's environment only (the "secret never
+  text" test of PR 15 covers both); the judge's charter rule reads the repo a
+  command names and does not take issue 1 of another repo for the charter.
+  Scenario O5 (S6 is a spike's id) with `one-account` as its control. The rebase
+  conflicted in the fact fields (`repo` and `orders` both kept), the fault list,
+  the scenario vocabulary, the CLI parsers, and `fetch_standing_authority`
+  (PR 15's per-repo read and PR 17's orders reader merged: the orders reader
+  takes the repo and passes it to every `_api`). The compaction detection code
+  was not touched by any conflict, so the Lab proof above was not repeated. Its
+  notes name a throwaway profile on its own port and nothing under
+  `~/.config/opencode`, so none needed correcting to PR 16's private profile
+  layout.
 - 2026-10-07: three more things the first real use found, fixed on PR 16.
   - **A large reply was cut short.** OpenCode v2's `api` command loses the end of a large reply when it
     writes to a pipe and exits: a real 500 KB transcript arrived cut at 293 KB inside a string, so every read

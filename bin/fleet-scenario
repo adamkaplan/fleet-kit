@@ -62,6 +62,9 @@ POLICY_TOOL_NAMES = tuple(_load_switchboard().POLICY_TOOLS)
 POLICY_RESULTS = tuple(_load_switchboard().POLICY_REQUEST_OUTCOMES)  # allow, ask, deny
 # PR 13: the states `fleet-switchboard report` takes
 REPORT_STATE_NAMES = tuple(_load_switchboard().REPORT_STATES)
+# PR 17: what `fleet-switchboard orders` does, and the states v2 gives a compaction message
+ORDERS_ACTIONS = ("add", "remove")
+COMPACTION_STATUSES = ("running", "completed", "failed")
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -123,6 +126,12 @@ STEP_FIELDS = {
     "close-agent": {"agent": (True, _CAST)},
     # PR 16: the person edits the daemon's config file: a watched repo is added, or the file is left broken
     "edit-config": {"add_repo": (False, "repo"), "broken": (False, "bool")},
+    # PR 17: standing orders. A cast member's `fleet-switchboard orders add|remove` on a charter; the owner's own
+    # edit of the charter on GitHub (adds a bullet); a compaction message of that status in an agent's transcript
+    "orders": {"charter": (True, "issue"), "action": (True, "orders_action"), "text": (False, "line"),
+               "number": (False, "count1")},
+    "edit-orders": {"charter": (True, "issue"), "text": (True, "line")},
+    "compact": {"agent": (True, _CAST), "status": (True, "compaction_status")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -144,6 +153,9 @@ STEP_ACTORS = {
     "bootstrap": ("world",),
     "close-agent": ("world",),
     "edit-config": ("world",),  # PR 16
+    "orders": ("cast",),  # PR 17
+    "edit-orders": ("you", "world"),
+    "compact": ("world",),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -193,6 +205,10 @@ EXPECT_FIELDS = {
     "fleet_sessions": {"agent": (True, _CAST), "count": (True, "count0")},
     # PR 16: the daemon's own account of its config in `status`, at that time: it holds `text`
     "config_says": {"at": (True, "duration"), "text": (True, "text")},
+    # PR 17: the orders on the charter issue (those holding `text`, if given), and how many `orders add|remove`
+    # by that agent were refused
+    "orders_on_github": {"charter": (True, "issue"), "count": (True, "count0"), "text": (False, "text")},
+    "orders_refused": {"agent": (True, _CAST), "count": (True, "count0")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
@@ -293,6 +309,10 @@ def _field_ok(check, value, cast, steps=0):
         return value in POLICY_RESULTS
     if check == "report_state":  # PR 13
         return value in REPORT_STATE_NAMES
+    if check == "orders_action":  # PR 17
+        return value in ORDERS_ACTIONS
+    if check == "compaction_status":
+        return value in COMPACTION_STATUSES
     raise AssertionError("no such check: %s" % check)
 
 
@@ -311,7 +331,9 @@ _CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenari
                "watch_how": "one of " + ", ".join(WATCH_HOWS)}
 _CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # PR 9
                     "policy_result": "one of " + ", ".join(POLICY_RESULTS),
-                    "report_state": "one of " + ", ".join(REPORT_STATE_NAMES)})  # PR 13
+                    "report_state": "one of " + ", ".join(REPORT_STATE_NAMES),  # PR 13
+                    "orders_action": "one of " + ", ".join(ORDERS_ACTIONS),  # PR 17
+                    "compaction_status": "one of " + ", ".join(COMPACTION_STATUSES)})
 
 
 def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):

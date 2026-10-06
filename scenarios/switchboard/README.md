@@ -70,6 +70,9 @@ is how many.
 | `bootstrap` | world | none | `fleet-switchboard bootstrap` on the fakes: opens the Chief of Staff (`cos`, which the cast names but the play does not create), or resumes it, or is refused (PR 16). Offline only |
 | `edit-config` | world | [`add_repo`], [`broken`] | PR 16, offline, with `repos`. The person edits the daemon's config file: `add_repo` adds a watched repo to `github_repos`; `broken` leaves the file half written. The daemon's own config watch looks at it every pass and reloads through `reload_in_place` |
 | `close-agent` | world | `agent` | The agent's pane is closed, as you would close it (PR 16). Offline only |
+| `orders` | a cast member | `charter`, `action` (`add`, `remove`), [`text` (one line)], [`number`] | `fleet-switchboard orders add\|remove --charter N` as that member (PR 17): the role check, the PATCH of the fake charter issue and the audit all run. Offline only |
+| `edit-orders` | you, world | `charter`, `text` (one line) | You add an order to the charter issue on GitHub yourself, and the cached read of it is dropped, as the webhook handler does (PR 17). Offline only |
+| `compact` | world | `agent`, `status` (`running`, `completed`, `failed`) | A compaction message of that status in the agent's transcript, in the shape v2 2.0.22 returns (PR 17). Offline only |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations
@@ -102,6 +105,8 @@ is how many.
 | `imported_messages` | `agent`, [`count`] | v2 holds the imported session with one message per v1 message (`count`, default: all of them), in v1's order, with v1's timestamps and the text that was typed (PR 10) |
 | `lists_asks` | `agent`, `issue` | `fleet-switchboard intents`, run in the pane that shows the agent's session, lists the ask `issue`: the agent is found by its `metadata.fleet` (PR 10) |
 | `decisions` | `at`, `count`, [`text`] | At the time `at`, the list `fleet-switchboard decisions` reads from `decisions.json` has `count` decisions (those whose title holds `text`, if given); a file the command calls stale lists none (PR 14). Offline only |
+| `orders_on_github` | `charter`, `count`, [`text`] | The charter issue on the fake GitHub holds `count` standing orders (those holding `text`, if given), the legacy `Standing authority:` line counted (PR 17). Offline only |
+| `orders_refused` | `agent`, `count` | `count` `orders add` or `orders remove` by that agent were refused and audited (PR 17). Offline only |
 | `decisions_say` | `at`, `text` | At the time `at`, the command's output contains `text` (PR 14). The Lab reads it only when the play ends, so `at` must be the time of the last step there |
 | `status_says` | `text` | The first line `fleet-switchboard status` prints, for a machine whose config asks for the decision model and which has no key, contains `text` (PR 16). Offline only |
 | `bootstrap_says` | `step`, `text` | What the `bootstrap` step with that index printed contains `text` (PR 16). Offline only |
