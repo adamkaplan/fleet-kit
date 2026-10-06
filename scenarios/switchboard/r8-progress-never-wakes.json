@@ -1,0 +1,96 @@
+{
+  "id": "R8",
+  "title": "Progress reports never wake the boss, and ride in the next report",
+  "problem": 4,
+  "since_pr": 13,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [
+    "lab-scripted-owed-sp1"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "coder": {
+      "role": "coder",
+      "reports_to": "platform",
+      "issue": 2
+    }
+  },
+  "issues": {
+    "2": {
+      "intent": "Add a readiness probe",
+      "done_when": "GET /ready returns 200"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away"
+    },
+    {
+      "at": "0s",
+      "actor": "coder",
+      "do": "turn",
+      "lasts": "60s",
+      "steps": 3
+    },
+    {
+      "at": "10s",
+      "actor": "coder",
+      "do": "report",
+      "state": "working",
+      "text": "wiring the route",
+      "why": "Progress: a rider"
+    },
+    {
+      "at": "30s",
+      "actor": "coder",
+      "do": "report",
+      "state": "paused",
+      "text": "waiting for CI"
+    },
+    {
+      "at": "90s",
+      "actor": "coder",
+      "do": "report",
+      "state": "done",
+      "text": "PR is up and green",
+      "why": "Attention: delivered now, and the two riders go with it"
+    },
+    {
+      "at": "4m",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "one-message",
+      "that": "message_count",
+      "to": "platform",
+      "count": 1,
+      "why": "Only the done report was a message"
+    },
+    {
+      "name": "riders-ride",
+      "that": "delivered",
+      "to": "platform",
+      "key": "report:coder:*",
+      "keys": 3,
+      "count": 1,
+      "mode": "wake"
+    }
+  ],
+  "control": {
+    "fault": "no-rider",
+    "fails": [
+      "one-message",
+      "riders-ride"
+    ]
+  }
+}

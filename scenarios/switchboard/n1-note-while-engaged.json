@@ -23,7 +23,7 @@
   "expect": [
     {"name": "no-machine-turn", "that": "no_machine_turn", "agent": "platform",
      "why": "Only your two messages started a model call on the orchestrator"},
-    {"name": "noted", "that": "delivered", "to": "platform", "key": "worker.idle:*", "mode": "note", "count": 1,
+    {"name": "noted", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "mode": "note", "count": 1,
      "text": "issue #2"},
     {"name": "one-message", "that": "message_count", "to": "platform", "count": 1}
   ],

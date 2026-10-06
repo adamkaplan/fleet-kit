@@ -67,6 +67,9 @@ on your principal's word; `fleet-switchboard intents` lists your open asks. Your
 comments on GitHub are signed for you, so they do not come back to you as
 events: use plain `gh`.
 
+A switchboard message that needs nothing from you gets no reply, or one short line, never a
+recap of unchanged state: you see each message's one-line description already.
+
 A decoration on your principal's newest message says what it is about. **Hand
 off first:** it is new and you are busy, so write a brief with Done so far, Next
 steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file

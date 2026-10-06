@@ -22,6 +22,7 @@
 | 10 | `switchboard/v1-move` | Import a v1 session into v2; cutover runbook | ready for review [#26](https://github.com/adamkaplan/fleet-kit/pull/26); M1 passes offline; the import round trip is half-measured in the Lab |
 | 11 | `switchboard/trial` | `bin/switchboard-trial`: a Lab-isolated profile with GitHub Copilot, to try the system by hand; `launch --charter` | ready for review; see [switchboard-trial.md](switchboard-trial.md) |
 | 12 | `switchboard/presentation` | A three-minute narrated deck and video explaining the system: `docs/presentation/` | ready for review [#28](https://github.com/adamkaplan/fleet-kit/pull/28); see [presentation/README.md](presentation/README.md) |
+| 13 | `switchboard/reports` | Workers report with `fleet-switchboard report`; a bare idle is a rider and wakes nobody; a stop without a report is triaged; every message carries a one-line description for the TUI | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -173,9 +174,22 @@ message. A `send` from another agent skips the batch.
   from you and a note is still waiting in v2's inbox, it becomes a wake:
   `session.inbox.update` to `queue` and then to `steer`, which starts a turn
   (S3). v2 refuses to change a waiting steer item to steer directly.
-- **Invisible in the TUI.** v2's TUI shows neither notes nor wakes, only the
-  agent's reply (S3). What was delivered is visible in the herdr badge,
-  `fleet-switchboard status` and the audit log.
+- **Riders (PR 13).** A fact may be a rider: carried, never the reason for a
+  message. `decide` ignores riders when it picks the action and starts the
+  batch clock: pending that is all riders yields no plan, and a note left
+  unread is converted to a wake, so "make it a note" silences nothing. When any
+  other fact is pending, every rider for that recipient goes in the same
+  message. Before composing, riders are collapsed to the newest `worker.idle`
+  per sender, and a rider older than `rider_max_age_seconds` (default 3600) is
+  dropped. Delivered riders are recorded by key like any fact. `pending` and
+  `status` still list riders, marked `[rider]`.
+- **One line in the TUI (PR 13).** v2's TUI does not show a synthetic message's
+  text, but it shows its `description` as one row. Every message the switchboard
+  writes carries one, at most 200 characters, no newline: `switchboard: <sender>
+  <what> on #<issue>: <first 100 characters>` for one item, `switchboard: <n>
+  items for <recipient>: <first item, 80 characters>` for several. The message
+  itself stays invisible; the description, the herdr badge, `fleet-switchboard
+  status` and the audit log show what was delivered.
 
 ```mermaid
 flowchart TD
@@ -430,6 +444,7 @@ fleet metadata), so `--from` is never typed.
 | Command | Who | Effect |
 |---|---|---|
 | `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6 |
+| `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working` and `paused` are riders: kept until a message carries them, never waking. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
@@ -895,6 +910,55 @@ daemon. The key is in no file under the Lab and not in v2's service
 environment. A file write is the action `edit`; a fetch is `webfetch`; a
 subagent launch is `subagent`.
 
+### Workers report (PR 13)
+
+The trial showed that every time a worker ended a turn the switchboard derived a
+`worker.idle` fact for its boss; the Chief of Staff was woken, had nothing to act
+on and answered "no change", and those answers were all you saw. The fix is that
+workers say what happened, and a bare idle stops being news.
+
+**`fleet-switchboard report`.** See the agents table. A report is a fact of kind
+`report`, key `report:<sender>:<id>`, summary starting with its state. An
+attention report goes through `send`'s path (`plan`/`deliver`): there is one
+delivery path, not two. A progress report is the one thing stored: a CLI
+process cannot wait for a message to ride in, so it is kept in
+`report-riders.json` (mode 0600) until its key shows in the boss's transcript or
+inbox, or it is older than `rider_max_age_seconds`. An attention report also
+carries the progress reports waiting for that boss.
+
+**A bare idle is a rider.** `worker.idle` keeps its text (outcome and last
+reply, 600 characters) and never wakes anyone. `worker.blocked` is unchanged.
+
+**A stop without a report** is derived from facts only. An *assigning input* to
+a worker is a message in its transcript that is not a switchboard rider: a prompt
+(yours, the fleet's, or the brief `launch` sent) or a message from its boss
+(`send`, a handoff). A GitHub notice, decoration, reminder, nudge or toast is not
+one. The worker has *reported* when its boss's transcript holds a `report:<worker>:*`
+key newer than its latest assigning input (the same `delivered_keys` read the
+delivery rule uses, which now also returns when each key arrived). When a turn ends
+and the worker has not reported, the decision model is asked one question,
+`report_owed`: did this turn end with work done, blocked, failed or needing a
+decision that the boss has not been told about? Its state is the ask's Intent and
+Done when, the worker's role and its last reply.
+
+| Outcome | When | What happens |
+|---|---|---|
+| Nudge | probability at or above `report_triage.owed_threshold` (0.5), and no nudge yet for this assigning input | One wake for the worker: "You stopped without telling the boss. If your work is done, failed, blocked or needs a decision, run: fleet-switchboard report <state> \"one line\". If nothing changed since your last report, say nothing." The key `nudge:<session>:<assigning message id>` makes it once; a key found in the worker's transcript means it was sent |
+| Silent | probability below the threshold | The idle stays a rider |
+| Tell the boss | a nudge was already sent and the worker stopped again without reporting, or the model failed, timed out (`report_triage.budget_seconds`, 3) or is not configured, or the boss cannot be read | One `worker.stopped` fact for the boss (not a rider), replacing the idle: "<worker> stopped without reporting (<outcome>): <last reply>" |
+
+A stop older than `rider_max_age_seconds` is not triaged, a read-only
+`status` or `pending` never asks the model, and a stop is asked about once per
+daemon life (a cache, rebuilt after a restart). Each triage writes one
+`report.triage` audit event: the question, the answer, the outcome, the latency
+and the model, never a credential.
+
+Faults (Lab only), one per behaviour: `idle-wakes` (a bare idle wakes again),
+`no-rider` (riders wake, progress reports are delivered), `no-nudge-once` (every
+stop is nudged), `no-fail-open` (a failed model call stays quiet),
+`ignore-reports` (a report is not recognised), `no-description` (a message goes
+without its one line).
+
 ### Data
 
 The switchboard keeps almost nothing. Each fact lives in the system that owns
@@ -1320,6 +1384,11 @@ R1.
 | P5 | Jev is slow or unreachable | — | The configured outcome stands; nothing blocks on the judge | PR 9 | offline; as P1 |
 | P6 | A command the configured rules deny | — | Final; the judge is not consulted | PR 9 | offline |
 | M1 | A v1 Chief of Staff session is imported | — | Same messages; open asks listed | PR 10 | offline, lab-model |
+| R4 | A worker reports done, then stops | 4 | A stop that follows a report is only a rider | PR 13 | offline; control `idle-wakes` |
+| R5 | A worker stops with no ask and no report | 4 | A bare idle wakes nobody | PR 13 | offline; control `idle-wakes` |
+| R6 | A worker stops without reporting work it owes | 4 | Nudged once, then the boss is told | PR 13 | offline; control `no-nudge-once` |
+| R7 | The decision model is down when a worker stops without reporting | 4 | Fails open: one wake | PR 13 | offline; control `no-fail-open` |
+| R8 | Progress reports | 4 | Riders never wake, and ride in the next report | PR 13 | offline; control `no-rider` |
 
 ## Repo and PR conventions
 
@@ -1749,3 +1818,16 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   pipes the screenshots to ffmpeg. The numbers on the slides are the real ones
   (970+ tests, 21 live scenarios, 12+ bugs found in a live run). The narration was
   checked by transcribing it back with a speech-to-text model, not by ear.
+- 2026-10-06: PR 13, workers report. Found live in the trial: every worker turn
+  end woke the Chief of Staff with a `worker.idle`, it answered "no change", and
+  those answers, which were all the human saw, were noise; and v2's TUI shows no
+  synthetic message at all. Measured: `session.synthetic` accepts an optional
+  `description`, which the TUI draws as a one-line row. Changed: `fleet-switchboard
+  report` (attention reports wake, progress reports ride); the rider attribute on
+  facts, collapsed and aged out before composing; a bare idle is a rider; a stop
+  with no report since the worker's latest assigning input is triaged by the
+  `report_owed` question (nudge once, silent, or one `worker.stopped` for the boss,
+  failing open); a description on every synthetic message; role files and the
+  coordination skill tell agents to report. Scenarios R4 to R8 are new, and
+  N1, N2, W1, F4, H1, R1 and R3 now go through the stop triage and wait for
+  `worker.stopped` where they waited for `worker.idle`.

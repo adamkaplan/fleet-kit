@@ -60,6 +60,8 @@ WATCH_STATES = tuple(_load_switchboard().WATCH_STATES)
 # PR 9: the tool-call policy judge's vocabulary has one home too, in the engine.
 POLICY_TOOL_NAMES = tuple(_load_switchboard().POLICY_TOOLS)
 POLICY_RESULTS = tuple(_load_switchboard().POLICY_REQUEST_OUTCOMES)  # allow, ask, deny
+# PR 13: the states `fleet-switchboard report` takes
+REPORT_STATE_NAMES = tuple(_load_switchboard().REPORT_STATES)
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -106,6 +108,8 @@ STEP_FIELDS = {
                   "configured": (False, "policy_result")},
     # PR 10: copy a v1 session into v2, from a fixture file (a path under the repo's scenarios/)
     "import-v1": {"agent": (True, _CAST), "fixture": (True, "name")},
+    # PR 13: a cast member's `fleet-switchboard report <state> [--issue N] "one line"`
+    "report": {"state": (True, "report_state"), "text": (True, "line"), "issue": (False, "issue")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -119,6 +123,7 @@ STEP_ACTORS = {
     "handoff": ("cast",),
     "tool-call": ("cast",),  # PR 9
     "import-v1": ("world",),
+    "report": ("cast",),  # PR 13
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -240,6 +245,8 @@ def _field_ok(check, value, cast, steps=0):
         return value in POLICY_TOOL_NAMES
     if check == "policy_result":  # PR 9
         return value in POLICY_RESULTS
+    if check == "report_state":  # PR 13
+        return value in REPORT_STATE_NAMES
     raise AssertionError("no such check: %s" % check)
 
 
@@ -256,7 +263,8 @@ _CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenari
                "watch_state": "one of " + ", ".join(WATCH_STATES), "fleet": "an object or null",
                "faults": "a non-empty list of known fault names"}
 _CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # PR 9
-                    "policy_result": "one of " + ", ".join(POLICY_RESULTS)})
+                    "policy_result": "one of " + ", ".join(POLICY_RESULTS),
+                    "report_state": "one of " + ", ".join(REPORT_STATE_NAMES)})  # PR 13
 
 
 def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):

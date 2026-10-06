@@ -23,7 +23,7 @@
   ],
   "expect": [
     {"name": "no-machine-turn", "that": "no_machine_turn", "agent": "cos"},
-    {"name": "noted", "that": "delivered", "to": "cos", "key": "worker.idle:*", "mode": "note", "count": 1,
+    {"name": "noted", "that": "delivered", "to": "cos", "key": "worker.stopped:*", "mode": "note", "count": 1,
      "text": "issue #615",
      "why": "The finishing is the worker-done fact (PR 4), here for a cos-subagent, delivered with the ask's number"},
     {"name": "one-message", "that": "message_count", "to": "cos", "count": 1}

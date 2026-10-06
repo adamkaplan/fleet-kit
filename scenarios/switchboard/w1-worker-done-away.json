@@ -18,9 +18,9 @@
     {"at": "3m", "actor": "world", "do": "wait"}
   ],
   "expect": [
-    {"name": "woken", "that": "delivered", "to": "platform", "key": "worker.idle:*", "mode": "wake", "count": 1,
+    {"name": "woken", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "mode": "wake", "count": 1,
      "text": "issue #2"},
-    {"name": "prompt", "that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.idle:*",
+    {"name": "prompt", "that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.stopped:*",
      "why": "20 s of work, 90 s of batching, one poll and a reply, with slack for the Lab"}
   ],
   "control": {"fault": "no-worker-source", "fails": ["woken", "prompt"]}

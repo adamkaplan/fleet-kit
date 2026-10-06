@@ -61,6 +61,7 @@ is how many.
 | `kill-daemon`, `restart-daemon` | world | none | While the daemon is down only `pass` steps run the engine; a restart forgets everything in memory |
 | `tool-call` | a cast member | `tool` (`shell`, `edit`, `webfetch`, `subagent`, `read`, `glob`, `grep`, `skill`, `other`), `arguments`, [`configured`: `allow`, `ask`, `deny`] | The agent makes a tool call; the offline runner sends it through `judge-tool`'s own path against fakes and Jev's replay answers (`scenarios/jev/policy.json`). An `ask` blocks the agent as v2 does (PR 9). Offline only: the Lab tier is owed to the real plugin |
 | `import-v1` | world | `agent`, `fixture` | `fleet-switchboard import-v1` for that cast member, from a hand-made v1 export under `scenarios/` (`scenarios/v1-fixtures/`), with the cast's role, `reports_to`, issue and charter as its `metadata.fleet`. The member has no session until the step runs. Then the runner opens a pane on the imported session, the step a person does (PR 10) |
+| `report` | a cast member | `state` (`done`, `failed`, `blocked`, `question`, `working`, `paused`), `text` (one line), [`issue`] | `fleet-switchboard report` as that member (PR 13). Offline only |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations

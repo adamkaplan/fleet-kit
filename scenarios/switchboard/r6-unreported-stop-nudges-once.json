@@ -1,0 +1,88 @@
+{
+  "id": "R6",
+  "title": "A worker stops without reporting work it owes: nudged once, then the boss is told",
+  "problem": 4,
+  "since_pr": 13,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [
+    "lab-scripted-owed-sp1"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "coder": {
+      "role": "coder",
+      "reports_to": "platform",
+      "issue": 2
+    }
+  },
+  "issues": {
+    "2": {
+      "intent": "Rotate the signing keys",
+      "done_when": "the new key serves traffic"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away"
+    },
+    {
+      "at": "0s",
+      "actor": "coder",
+      "do": "turn",
+      "lasts": "20s",
+      "why": "The worker stops at 20 s and never runs `report`. The answers file says a report is owed for this ask"
+    },
+    {
+      "at": "4m",
+      "actor": "world",
+      "do": "wait",
+      "why": "The nudge wakes the worker, its turn ends again without a report, and the boss is woken after the batch window"
+    }
+  ],
+  "expect": [
+    {
+      "name": "nudged-once",
+      "that": "delivered",
+      "to": "coder",
+      "key": "nudge:*",
+      "mode": "wake",
+      "count": 1,
+      "text": "fleet-switchboard report"
+    },
+    {
+      "name": "one-nudge-message",
+      "that": "message_count",
+      "to": "coder",
+      "count": 1
+    },
+    {
+      "name": "boss-told",
+      "that": "delivered",
+      "to": "platform",
+      "key": "worker.stopped:*",
+      "mode": "wake",
+      "count": 1,
+      "text": "stopped without reporting"
+    },
+    {
+      "name": "one-boss-message",
+      "that": "message_count",
+      "to": "platform",
+      "count": 1
+    }
+  ],
+  "control": {
+    "fault": "no-nudge-once",
+    "fails": [
+      "boss-told",
+      "one-boss-message"
+    ]
+  }
+}

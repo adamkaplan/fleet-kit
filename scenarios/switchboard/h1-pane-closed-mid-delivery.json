@@ -8,6 +8,9 @@
     "platform": {"role": "orchestrator", "charter": 1},
     "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
   },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
   "steps": [
     {"at": "0s", "actor": "coder", "do": "turn", "lasts": "20s"},
     {"at": "100s", "actor": "world", "do": "close-pane", "agent": "platform",
@@ -16,7 +19,7 @@
   ],
   "expect": [
     {"name": "nothing-sent", "that": "message_count", "to": "platform", "count": 0},
-    {"name": "not-delivered", "that": "delivered", "to": "platform", "key": "worker.idle:*", "count": 0},
+    {"name": "not-delivered", "that": "delivered", "to": "platform", "key": "worker.stopped:*", "count": 0},
     {"name": "toast", "that": "toast", "agent": "platform", "text": "nothing sent"}
   ],
   "control": {"fault": "no-recheck", "fails": ["nothing-sent", "not-delivered", "toast"]}

@@ -88,6 +88,8 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "poll_seconds": 5,
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
+    "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
+    "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
     # GitHub events (PR 5)
     "github_repos": [],
     "gh": "gh",
@@ -161,7 +163,7 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds",
-                "worker_lookback_hours"):
+                "worker_lookback_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
     validate_intent_config(config, source)
@@ -171,6 +173,7 @@ def validate_config(raw, source="config"):
     validate_jev_config(config, raw, source)
     validate_foreground_config(config, source)  # PR 8
     validate_policy_config(config, source)  # PR 9
+    validate_report_triage_config(config, source)  # PR 13
     return config
 
 
@@ -230,6 +233,12 @@ KNOWN_FAULTS = (
     "no-worker-source",
     "no-note-conversion",
     "no-import-metadata",
+    "idle-wakes",
+    "no-rider",
+    "no-nudge-once",
+    "no-fail-open",
+    "ignore-reports",
+    "no-description",
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -379,6 +388,12 @@ def _one_line(text, limit=300):
 
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
 MAX_READ_PAGES = 5   # pages of READ_LIMIT messages `delivered_keys` reads before it holds
+DESCRIPTION_MAX = 200  # characters of the one line v2's TUI shows for a synthetic message (PR 13)
+
+
+def valid_description(text):
+    return isinstance(text, str) and bool(text.strip()) and len(text) <= DESCRIPTION_MAX \
+        and "\n" not in text and "\r" not in text
 
 
 class V2Client:
@@ -493,16 +508,23 @@ class V2Client:
             if not more:
                 return
 
-    def synthetic(self, session_id, text, metadata, resume, delivery, message_id):
+    def synthetic(self, session_id, text, metadata, resume, delivery, message_id, description=None):
+        """`description` is the one human line the TUI shows for this message (`session.synthetic` takes it,
+        measured in PR 13): at most DESCRIPTION_MAX characters, one line. Every message the switchboard writes
+        carries one."""
+        if description is not None and not valid_description(description):
+            raise ValueError("description must be one non-empty line of at most %d characters: %r"
+                             % (DESCRIPTION_MAX, description))
         if not isinstance(resume, bool):
             raise ValueError("resume must be true or false")
         if delivery not in self.DELIVERIES:
             raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
         if not isinstance(message_id, str) or not message_id.startswith("msg_"):
             raise ValueError("message id must start with msg_: %r" % message_id)
-        return self._call("session.synthetic", {"sessionID": session_id}, {
-            "id": message_id, "text": text, "metadata": metadata,
-            "resume": resume, "delivery": delivery})
+        body = {"id": message_id, "text": text, "metadata": metadata, "resume": resume, "delivery": delivery}
+        if description is not None:
+            body["description"] = description
+        return self._call("session.synthetic", {"sessionID": session_id}, body)
 
     def prompt(self, session_id, text, metadata=None, delivery=None, resume=None):
         if delivery is not None and delivery not in self.DELIVERIES:
@@ -714,9 +736,9 @@ class Fact:
     window, as `send` does.
     """
 
-    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender")
+    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender", "rider")
 
-    def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None):
+    def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None, rider=False):
         for name, value in (("key", key), ("recipient", recipient), ("kind", kind)):
             if not isinstance(value, str) or not value.strip():
                 raise FactError("fact %s must be a non-empty string, got %r" % (name, value))
@@ -730,25 +752,29 @@ class Fact:
             raise FactError("fact batch must be true or false, got %r" % (batch,))
         if sender is not None and not isinstance(sender, str):
             raise FactError("fact from must be a string, got %r" % (sender,))
+        if not isinstance(rider, bool):
+            raise FactError("fact rider must be true or false, got %r" % (rider,))
         self.key, self.recipient, self.kind, self.summary = key, recipient, kind, summary
         self.created, self.issue, self.batch, self.sender = float(created), issue, batch, sender
+        self.rider = rider  # PR 13: carried in the next message, never the reason for one
 
     @classmethod
     def from_json(cls, obj):
         if not isinstance(obj, dict):
             raise FactError("a fact must be a JSON object")
-        unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from"})
+        unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider"})
         if unknown:
             raise FactError("fact has unknown field(s): %s" % ", ".join(unknown))
         missing = [name for name in ("key", "recipient", "kind", "summary", "created") if name not in obj]
         if missing:
             raise FactError("fact is missing: %s" % ", ".join(missing))
         return cls(obj["key"], obj["recipient"], obj["kind"], obj["summary"], obj["created"],
-                   obj.get("issue"), obj.get("batch", True), obj.get("from"))
+                   obj.get("issue"), obj.get("batch", True), obj.get("from"), obj.get("rider", False))
 
     def to_json(self):
         return {"key": self.key, "recipient": self.recipient, "kind": self.kind, "summary": self.summary,
-                "created": self.created, "issue": self.issue, "batch": self.batch, "from": self.sender}
+                "created": self.created, "issue": self.issue, "batch": self.batch, "from": self.sender,
+                "rider": self.rider}
 
     def __repr__(self):
         return "Fact(%r -> %r)" % (self.key, self.recipient)
@@ -794,7 +820,8 @@ def fact_sources(state_dir):
     reminders join this list. `send` is not a source: it delivers directly, by
     the same rule, and stores nothing.
     """
-    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ForegroundFacts()]
+    return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
+            ForegroundFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -956,10 +983,13 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     engaged with it, else a wake.
     """
     pending = sorted(pending, key=lambda fact: (fact.created, fact.key))
-    if not pending:
+    # PR 13: riders are carried, never the reason for a message. Only the others choose the action
+    # and start the batch clock; when there is any other, every rider goes with it.
+    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
+    if not chosen:
         return None
-    if not fault("no-batch") and all(fact.batch for fact in pending):
-        ready_at = pending[0].created + batch_seconds
+    if not fault("no-batch") and all(fact.batch for fact in chosen):
+        ready_at = chosen[0].created + batch_seconds
         if now < ready_at:
             return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)
     reason = hold_reason(observation, missing)
@@ -990,7 +1020,8 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None):
         return "- %s from %s%s: %s" % (fact.kind, fact.sender or "the fleet", where, body)
 
     def render(count):
-        head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(facts[0].summary, 200))
+        lead = next((fact for fact in facts if not fact.rider), facts[0])
+        head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(lead.summary, 200))
         lines = [head] + (sectioned_lines(facts[:count], section, item) if section
                           else [item(fact) for fact in facts[:count]])
         rest = len(facts) - count
@@ -1004,6 +1035,55 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None):
             return text, facts[:count]
     marker = "\n[cut at %d characters]" % cap
     return text[:cap - len(marker)] + marker, facts[:1]
+
+
+def collapse_riders(facts, now, max_age):
+    """PR 13: riders cut to what is still worth carrying. A rider older than `max_age` seconds is
+    dropped, and only the newest `worker.idle` of each sender stays. Facts that are not riders pass."""
+    newest = {}
+    for fact in facts:
+        if fact.rider and fact.kind == WORKER_IDLE:
+            known = newest.get(fact.sender)
+            if known is None or (fact.created, fact.key) > (known.created, known.key):
+                newest[fact.sender] = fact
+    kept = []
+    for fact in facts:
+        if not fact.rider:
+            kept.append(fact)
+        elif now - fact.created > max_age:
+            continue
+        elif fact.kind == WORKER_IDLE and newest.get(fact.sender) is not fact:
+            continue
+        else:
+            kept.append(fact)
+    return kept
+
+
+DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
+                "worker.blocked": "blocked", "nudge": "nudge"}
+
+
+def _line_of(text, limit):
+    """`text` as one line of at most `limit` characters, with anything shaped like a bearer
+    credential or a provider key taken out."""
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [key]", str(text if text is not None else ""))
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{6,}", "[key]", text)
+    return _one_line(text, limit)
+
+
+def describe_items(recipient, facts):
+    """The one human line v2's TUI shows for a message (PR 13): `switchboard: <sender> <what> on #<issue>:
+    <first 100 characters>` for one item, `switchboard: <n> items for <recipient>: <first item, 80 characters>`
+    for several. At most DESCRIPTION_MAX characters, never a newline."""
+    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
+    lead = next((fact for fact in facts if not fact.rider), facts[0])
+    if len(facts) == 1:
+        where = " on #%d" % lead.issue if lead.issue else ""
+        line = "switchboard: %s %s%s: %s" % (lead.sender or "the fleet", DESCRIBED_AS.get(lead.kind, lead.kind),
+                                             where, _line_of(lead.summary, 100))
+    else:
+        line = "switchboard: %d items for %s: %s" % (len(facts), recipient, _line_of(lead.summary, 80))
+    return _one_line(line, DESCRIPTION_MAX)
 
 
 # ---------------------------------------------------------------- the engine
@@ -1028,6 +1108,22 @@ def single_instance(state_dir):
         yield path
     finally:
         os.close(fd)  # closing the descriptor releases the lock
+
+
+class KeyTimes(set):
+    """The keys `delivered_keys` found, a plain set, with `at[key]`: when the message that carries it was
+    created (the oldest, when several do; None when v2 gave no time). PR 13 reads when a report arrived."""
+
+    def __init__(self):
+        super().__init__()
+        self.at = {}
+
+    def add_all(self, keys, created):
+        for key in keys:
+            self.add(key)
+            known = self.at.get(key)
+            if key not in self.at or (created is not None and (known is None or created < known)):
+                self.at[key] = created
 
 
 class Switchboard:
@@ -1221,7 +1317,7 @@ class Switchboard:
         """Keys already in the session: its messages since `since`, read newest
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
-        keys, complete = set(), False
+        keys, complete = KeyTimes(), False
         # Only synthetic messages carry keys; asking for just those keeps the read
         # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
         # PR 8: more than READ_LIMIT of them are read page by page, up to MAX_READ_PAGES.
@@ -1232,18 +1328,44 @@ class Switchboard:
                 if created is not None and created < since:
                     reached = True
                     break
-                keys.update(_fleet_keys(message))
+                keys.add_all(_fleet_keys(message), created)
             if reached or len(page) < READ_LIMIT or more is False:
                 complete = True
             if complete:
                 break
         inbox = self.v2.inbox_list(session_id)
         for item in inbox if isinstance(inbox, list) else []:
-            keys.update(_fleet_keys(item))
+            keys.add_all(_fleet_keys(item), _created(item))
         return keys, complete
 
     def plan(self, recipient, facts, discovery, now):
         """Pending = facts minus delivered keys, then the rule. None if nothing is pending."""
+        return self.plan_with_riders(recipient, facts, discovery, now)[0]
+
+    def plan_with_riders(self, recipient, facts, discovery, now):
+        """(plan, riders): the plan `plan` returns, and the riders that wait for a message to ride in
+        when the plan is None because only riders are pending (PR 13; `pending` and `status` show them)."""
+        facts = collapse_riders(facts, now, self.config["rider_max_age_seconds"])
+        if not facts:
+            return None, []
+        plan = self._plan_pending(recipient, facts, discovery, now)
+        if plan is not None:
+            return plan, []
+        return None, self._undelivered(recipient, facts, discovery)
+
+    def _undelivered(self, recipient, facts, discovery):
+        """`facts` whose keys the recipient does not have yet; all of them when that cannot be read."""
+        observation = discovery.agents.get(recipient)
+        if observation is None or fault("no-dedupe"):
+            return list(facts)
+        try:
+            since = min(fact.created - getattr(fact, "look_back", 0) for fact in facts) - SINCE_SLACK
+            delivered, _ = self.delivered_keys(observation.session_id, since)
+        except V2Error:
+            return list(facts)
+        return [fact for fact in facts if fact.key not in delivered]
+
+    def _plan_pending(self, recipient, facts, discovery, now):
         observation = discovery.agents.get(recipient)
         if observation is None:
             return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
@@ -1296,10 +1418,12 @@ class Switchboard:
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        description = None if fault("no-description") else describe_items(plan.recipient, carried)
+        detail["description"] = description
         with self._external("v2.synthetic", plan.recipient, detail) as result:
             record = self.v2.synthetic(observation.session_id, text,
                                        {"fleet": {"keys": keys, "from": "switchboard"}},
-                                       resume, delivery, message_id)
+                                       resume, delivery, message_id, description)
             if fault("crash-after-send"):
                 raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
                                      % message_id)
@@ -1491,12 +1615,49 @@ class Switchboard:
         now = self.now()
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=issue, batch=False, sender=sender)
-        plan = self.plan(recipient, [fact], self.discover(now), now)
+        return self.send_fact(fact, self.discover(now), now)
+
+    def send_fact(self, fact, discovery, now, carried=()):
+        """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule."""
+        recipient = fact.recipient
+        plan = self.plan(recipient, [fact] + list(carried), discovery, now)
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan)
+
+    def report(self, sender, state, text, issue=None):
+        """PR 13: `sender` tells the one it reports to what happened. An attention report (done, failed, blocked,
+        question) is delivered now, by `send`'s own path, with the progress reports waiting for that boss. A
+        progress report (working, paused) is a rider: recorded, and carried by the next message. Raises
+        ReportError when it cannot be a report."""
+        if state not in REPORT_STATES:
+            raise ReportError("state must be one of %s, got %r" % (", ".join(REPORT_STATES), state))
+        text = " ".join((text or "").split())
+        if not text:
+            raise ReportError("a report needs one line saying what happened")
+        if len(text) > REPORT_MAX:
+            raise ReportError("a report is one line of at most %d characters (this one is %d): put the detail on "
+                              "GitHub and report its link" % (REPORT_MAX, len(text)))
+        now = self.now()
+        discovery = self.discover(now)
+        me = discovery.agents.get(sender)
+        if me is None:
+            raise ReportError(discovery.missing(sender))
+        boss = _boss_of(me)
+        if boss is None:
+            raise ReportError("%s reports to nobody: its fleet metadata has no reports_to, so there is no one to "
+                              "tell (use `%s send <name> ...` for a message)" % (sender, PROG))
+        fact = Fact("%s:%s:%s" % (REPORT, sender, uuid.uuid4().hex[:16]), boss, REPORT, "%s: %s" % (state, text),
+                    now, issue=issue if issue is not None else _issue_of(me.fleet), batch=False, sender=sender,
+                    rider=state in REPORT_PROGRESS and not fault("no-rider"))
+        if fact.rider:
+            record_report_rider(self, fact)
+            return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
+                    "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
+        waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
+        return self.send_fact(fact, discovery, now, waiting)
 
     def pending(self, name, discovery=None, facts=None):
         """Read-only: what is pending for `name`, and what the rule says about it."""
@@ -1506,11 +1667,12 @@ class Switchboard:
         if facts is None:
             facts, problems = self.collect_facts()
         mine = [fact for fact in facts if fact.recipient == name]
-        plan = self.plan(name, mine, discovery, now) if mine else None
+        plan, riders = self.plan_with_riders(name, mine, discovery, now) if mine else (None, [])
         observation = discovery.agents.get(name)
         return {"name": name, "observation": observation.to_json() if observation else None,
                 "missing": None if observation else discovery.missing(name),
-                "plan": plan.to_json() if plan else None, "source_problems": problems}
+                "plan": plan.to_json() if plan else None, "source_problems": problems,
+                "riders": [fact.to_json() for fact in riders]}
 
 
 # ============================================================================
@@ -2854,6 +3016,13 @@ def add_foreground_parsers(sub):
 
 WORKER_IDLE = "worker.idle"
 WORKER_BLOCKED = "worker.blocked"
+WORKER_STOPPED = "worker.stopped"  # PR 13: a worker stopped without reporting and the boss must know
+NUDGE = "nudge"                    # PR 13: the one reminder to a worker that stopped without reporting
+REPORT = "report"
+REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss when it is not engaged
+REPORT_PROGRESS = ("working", "paused")                       # riders: carried, never the reason for a message
+REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
+REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
 LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
 REMINDERS = "reminders.json"
@@ -2916,6 +3085,7 @@ class WorkerFacts:
         self.engine = None
         self._blocked = []       # toasts of the last call: (agent, reason, title, body)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
+        self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
 
     def bind(self, engine):
@@ -2944,14 +3114,44 @@ class WorkerFacts:
         return facts
 
     def finished(self, observation, boss, horizon):
+        """The facts of one worker's finished turn. PR 13: a bare idle is a rider; whether the boss must hear
+        about the stop is `stop_facts`'s question."""
         if observation.status != "idle" or observation.idle_at is None or observation.idle_at < horizon:
             return []
         idle_ms = int(round(observation.idle_at * 1000))
         key = "%s:%s:%d" % (WORKER_IDLE, observation.session_id, idle_ms)
         head = "%s finished its turn (%s)" % (observation.name, observation.outcome or "no outcome recorded")
         reply = self.last_reply(observation.session_id, idle_ms)
-        return [Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
-                     issue=_issue_of(observation.fleet), sender=observation.name)]
+        idle = Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
+                    issue=_issue_of(observation.fleet), sender=observation.name, rider=not fault("idle-wakes"))
+        return self.stop_facts(observation, boss, idle_ms, idle, reply)
+
+    def stop_facts(self, observation, boss, idle_ms, idle, reply):
+        """The facts for one stop, worked out once (a stop is asked about once; the cache is rebuilt after a
+        restart). The idle rider, plus a nudge for the worker, or instead a `worker.stopped` for the boss."""
+        memo = (observation.session_id, idle_ms)
+        engine = self.engine
+        if memo in self._stops:
+            return list(self._stops[memo])
+        if engine.audit is None:
+            return [idle]  # a read-only look never asks the decision model
+        verdict = triage_stop(engine, self, observation, boss, idle_ms, reply)
+        if verdict is None:
+            found = [idle]   # reported, not worth asking, or not readable: only the rider
+        elif verdict["outcome"] == "stopped":
+            found = [Fact("%s:%s:%d" % (WORKER_STOPPED, observation.session_id, idle_ms), boss, WORKER_STOPPED,
+                          "%s stopped without reporting (%s)%s" % (
+                              observation.name, observation.outcome or "no outcome recorded",
+                              ": " + reply if reply else ""), observation.idle_at,
+                          issue=_issue_of(observation.fleet), sender=observation.name)]
+        elif verdict["outcome"] == "nudge":
+            found = [idle, verdict["nudge"]]
+        else:
+            found = [idle]
+        if len(self._stops) > 500:
+            self._stops.clear()
+        self._stops[memo] = list(found)
+        return found
 
     def last_reply(self, session_id, idle_ms):
         """The worker's last assistant reply, cut to SUMMARY_CAP; read once per turn."""
@@ -3007,6 +3207,298 @@ class WorkerFacts:
                     issue=issue, batch=asked is not None, sender=observation.name)
 
 
+# ---- PR 13: workers report, and a stop without a report is triaged
+#
+# docs/switchboard.md, "Workers report (PR 13)". A worker tells its boss with `fleet-switchboard report`. A
+# worker whose turn ends without a report since its latest assigning input is an unreported stop: the decision
+# model is asked `report_owed`, and the answer nudges the worker once, stays silent, or (a second stop, or no
+# answer) wakes the boss with one `worker.stopped`. Everything here is derived from transcripts, nothing stored.
+
+REPORT_OWED_ID = "report_owed"
+REPORT_OWED_TEXT = ("Did this turn end with work done, blocked, failed or needing a decision that the boss has "
+                    "not been told about?")
+REPORT_TRIAGE_DEFAULTS = {
+    "owed_threshold": 0.5,  # the probability at which the answer is "owed": the worker is nudged
+    "budget_seconds": 3,    # the longest the decision model may take for one stop; no answer fails open
+}
+NUDGE_TEXT = ("You stopped without telling %s. If your work is done, failed, blocked or needs a decision, run: "
+              "%s report <state> \"one line\". If nothing changed since your last report, say nothing.")
+
+
+def validate_report_triage_config(config, source):
+    raw = config.get("report_triage")
+    if raw is None:
+        config["report_triage"] = dict(REPORT_TRIAGE_DEFAULTS)
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'report_triage' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(REPORT_TRIAGE_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'report_triage' contains key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(REPORT_TRIAGE_DEFAULTS)))
+    settings = dict(REPORT_TRIAGE_DEFAULTS, **raw)
+    if not _is_number(settings["owed_threshold"]) or not 0 < settings["owed_threshold"] <= 1:
+        raise ConfigError("%s: 'report_triage.owed_threshold' must be a number above 0 and at most 1, got %r"
+                          % (source, settings["owed_threshold"]))
+    if not _is_number(settings["budget_seconds"]) or settings["budget_seconds"] <= 0:
+        raise ConfigError("%s: 'report_triage.budget_seconds' must be a positive number, got %r"
+                          % (source, settings["budget_seconds"]))
+    config["report_triage"] = settings
+
+
+class ReportError(Exception):
+    """A report that cannot be made: an unknown state, no line, a line too long, a caller with no boss."""
+
+
+def report_owed_questions():
+    """The one question, by id: a yes/no `noul` like the policy judge's."""
+    return {REPORT_OWED_ID: {"type": "noul", "instructions": REPORT_OWED_TEXT,
+                             "criteria": {"true": "The turn ended with something the boss has not been told: "
+                                                  "work done, blocked, failed, or a decision needed.",
+                                          "false": "Nothing happened that the boss needs to hear, or it was "
+                                                   "already reported."}}}
+
+
+def report_owed_state(role, intent, done_when, last_reply, boss):
+    return {"role": role or "unknown", "boss": boss, "intent": _clip(intent or "not stated: no ask is recorded", 600),
+            "done_when": _clip(done_when or "not stated", 400), "last_reply": _clip(last_reply, 800)}
+
+
+def assigning_input(engine, observation, boss):
+    """(message id, created) of the newest message in the worker's transcript that assigned it work, or None.
+
+    Assigning: a prompt (yours, the fleet's task, or the brief `launch` sent), or a message from its boss
+    (`send`, a handoff). Not assigning: a GitHub notice, a decoration, a reminder, a nudge, a toast, a
+    report from one of its own workers. Newest first, within READ_LIMIT messages."""
+    for message in engine._messages(observation.session_id):
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") == "user" or (
+                message.get("type") == "synthetic"
+                and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(message))):
+            created = _created(message)
+            return (message.get("id"), created) if message.get("id") and created is not None else None
+    return None
+
+
+def report_jev(engine, settings):
+    """The decision model for triage: the engine's, with a shorter timeout (its budget). None when none is set."""
+    base = engine.config.get("jev")
+    if not base:
+        return None
+    capped = dict(base, timeout_seconds=min(base["timeout_seconds"], settings["budget_seconds"]))
+    return build_jev(dict(engine.config, jev=capped))
+
+
+def triage_stop(engine, source, observation, boss, idle_ms, reply):
+    """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
+    {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
+    now = engine.now()
+    if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
+        return None  # a stop that old is not news, and a nudge would be late
+    boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
+    if boss_view is None:  # the boss cannot be read, so nothing can be said to have been reported: tell it (held)
+        verdict = {"outcome": "stopped", "reason": "the boss %s is not running, so its transcript cannot show a report" % boss}
+        try:
+            engine.audit.append(engine.actor, "report.triage", "stop:%s:%d" % (observation.session_id, idle_ms), {
+                "worker": observation.name, "boss": boss, "session": observation.session_id, "idle_ms": idle_ms,
+                "question": None, "answer": None, "latency_ms": 0, "outcome": "stopped", "reason": verdict["reason"]})
+        except OSError:
+            pass
+        return verdict
+    assigned = assigning_input(engine, observation, boss)
+    if assigned is None:
+        return None
+    assigned_id, assigned_at = assigned
+    keys, complete = engine.delivered_keys(boss_view.session_id, assigned_at - SINCE_SLACK)
+    prefix = "%s:%s:" % (REPORT, observation.name)
+    if not fault("ignore-reports") and any(
+            key.startswith(prefix) and (keys.at.get(key) is None or keys.at[key] >= assigned_at) for key in keys):
+        return None  # it reported since it was last given work: this stop is only a rider
+    if not complete:
+        return None  # the read did not reach back far enough to say it did not report
+    nudge_key = "%s:%s:%s" % (NUDGE, observation.session_id, assigned_id)
+    if fault("no-nudge-once"):
+        nudge_key += ":%d" % idle_ms  # the fault: every stop is a first stop
+    worker_keys, _ = engine.delivered_keys(observation.session_id, assigned_at - SINCE_SLACK)
+    sent_at = worker_keys.at.get(nudge_key) if nudge_key in worker_keys else None
+    audit = {"worker": observation.name, "boss": boss, "session": observation.session_id, "ask": _issue_of(observation.fleet),
+             "assigned": assigned_id, "idle_ms": idle_ms, "question": None, "answer": None, "latency_ms": 0,
+             "model": None, "usage": {}, "error": None}
+    if nudge_key in worker_keys:
+        if sent_at is not None and observation.idle_at < sent_at:
+            return None  # this is the stop the nudge answered, not a second one
+        verdict = {"outcome": "stopped", "reason": "nudged already for this assignment and stopped again "
+                                                   "without reporting"}
+    else:
+        verdict = ask_report_owed(engine, observation, boss, reply, audit)
+        if verdict["outcome"] == "nudge":
+            verdict["nudge"] = Fact(
+                nudge_key, observation.name, NUDGE, NUDGE_TEXT % (boss, PROG), observation.idle_at,
+                issue=_issue_of(observation.fleet), batch=False, sender="switchboard")
+    audit["outcome"], audit["reason"] = verdict["outcome"], verdict["reason"]
+    try:
+        engine.audit.append(engine.actor, "report.triage", "stop:%s:%d" % (observation.session_id, idle_ms), audit)
+    except OSError:
+        pass  # the audit is best effort here, as the judge's is: a full disk must not hide a stopped worker
+    return verdict
+
+
+def ask_report_owed(engine, observation, boss, reply, audit):
+    """Ask `report_owed`. {"outcome": "nudge" | "silent" | "stopped", "reason"}; fails open to "stopped"."""
+    settings = engine.config["report_triage"]
+    questions = report_owed_questions()
+    ask = ask_intent(engine, _ask_of(observation.fleet, observation.name)) or {}
+    state = report_owed_state(observation.fleet.get("role"), ask.get("intent"), ask.get("done_when"), reply, boss)
+    audit["question"] = {"state": state, "ids": list(questions)}
+    failure = None
+    try:
+        jev = report_jev(engine, settings)
+        if jev is None:
+            failure = "no decision model is configured"
+        else:
+            result = jev.decide(state, questions)
+            audit.update(latency_ms=result["latency_ms"], model=result["model"], usage=result["usage"])
+            owed = result["answers"][REPORT_OWED_ID]["noul"]
+            audit["answer"] = {REPORT_OWED_ID: owed}
+    except JevError as err:
+        failure = "decision model unavailable (%s)" % err.reason
+        audit.update(latency_ms=err.latency_ms or 0, error=_one_line(str(err), 160))
+    if failure:
+        if fault("no-fail-open"):
+            return {"outcome": "silent", "reason": failure + "; the fault keeps quiet"}
+        return {"outcome": "stopped", "reason": failure + ": the boss is told"}
+    if owed >= settings["owed_threshold"]:
+        return {"outcome": "nudge", "reason": "owed at %.2f, threshold %.2f" % (owed, settings["owed_threshold"])}
+    return {"outcome": "silent", "reason": "owed at %.2f, below %.2f" % (owed, settings["owed_threshold"])}
+
+
+# ---- progress reports: riders that wait for a message to ride in
+
+REPORT_RIDERS = "report-riders.json"
+REPORT_RIDER_LOCK = "report-riders.lock"
+
+
+@contextmanager
+def report_riders_lock(state_dir):
+    fd = os.open(str(Path(state_dir) / REPORT_RIDER_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_report_riders(state_dir):
+    path = Path(state_dir) / REPORT_RIDERS
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as err:
+        raise ReminderError("cannot read %s: %s" % (path, err)) from None
+    items = raw.get("riders") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        raise ReminderError("%s must hold {\"riders\": [...]}" % path)
+    for item in items:
+        if not (isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("to"), str)
+                and _is_number(item.get("created")) and isinstance(item.get("summary"), str)):
+            raise ReminderError("%s has a rider without key, to, created and summary: %r" % (path, item))
+    return items
+
+
+def write_report_riders(state_dir, items):
+    """Replace the file atomically, mode 0600 (the way reminders.json is written)."""
+    path = Path(state_dir) / REPORT_RIDERS
+    temp = path.with_name("%s.%d.tmp" % (REPORT_RIDERS, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"riders": items}, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+
+
+class ReportRiderFacts:
+    """The progress reports (`working`, `paused`) that no message has carried yet, as rider facts.
+
+    A progress report is the one thing `report` stores: it must wait for a message to ride in, and a CLI
+    process cannot wait. It stays in report-riders.json until its key shows in the boss's transcript or inbox,
+    or it is older than `rider_max_age_seconds` (prune_report_riders)."""
+
+    __name__ = "report_rider_facts"
+
+    def __init__(self, state_dir):
+        self.state_dir, self.engine = Path(state_dir), None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def entries(self):
+        return read_report_riders(self.state_dir)
+
+    def __call__(self):
+        return [Fact(item["key"], item["to"], REPORT, item["summary"], item["created"], issue=item.get("issue"),
+                     batch=False, sender=item.get("from"), rider=True) for item in self.entries()]
+
+
+def _report_rider_source(engine):
+    return next((source for source in engine.sources if isinstance(source, ReportRiderFacts)), None)
+
+
+def record_report_rider(engine, fact):
+    source = _report_rider_source(engine)
+    if source is None:
+        raise ReportError("this engine has nowhere to keep a progress report")
+    item = {"key": fact.key, "to": fact.recipient, "created": fact.created, "summary": fact.summary,
+            "issue": fact.issue, "from": fact.sender}
+    with report_riders_lock(source.state_dir):
+        write_report_riders(source.state_dir, read_report_riders(source.state_dir) + [item])
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "report.rider", fact.recipient, {"key": fact.key, "from": fact.sender})
+
+
+def report_rider_facts(engine):
+    source = _report_rider_source(engine)
+    return source() if source is not None else []
+
+
+def prune_report_riders(engine, discovery):
+    """Forget the progress reports a message has carried, and those too old to be carried. Returns the keys."""
+    source = _report_rider_source(engine)
+    if source is None:
+        return []
+    items = source.entries()
+    by_recipient = {}
+    for item in items:
+        by_recipient.setdefault(item["to"], []).append(item)
+    gone = {item["key"] for item in items if engine.now() - item["created"] > engine.config["rider_max_age_seconds"]}
+    for name, mine in sorted(by_recipient.items()):
+        observation = discovery.agents.get(name)
+        if observation is None:
+            continue
+        try:
+            keys, _ = engine.delivered_keys(observation.session_id, min(i["created"] for i in mine) - SINCE_SLACK)
+        except V2Error:
+            continue
+        gone.update(item["key"] for item in mine if item["key"] in keys)
+    if gone:
+        with report_riders_lock(source.state_dir):
+            write_report_riders(source.state_dir, [i for i in read_report_riders(source.state_dir)
+                                                   if i["key"] not in gone])
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "report.prune", None, {"keys": sorted(gone)})
+    return sorted(gone)
+
+
 # ---- toasts
 
 def note_unreachable(engine, recipient, fresh, why):
@@ -3035,6 +3527,10 @@ def finish_pass(engine, discovery, report):
         prune_delivered_reminders(engine, discovery)
     except Exception as err:
         engine._failed("reminders", "reminders", err, report)
+    try:
+        prune_report_riders(engine, discovery)
+    except Exception as err:
+        engine._failed("report-riders", "report-riders", err, report)
     schedule_judge_warm(engine, discovery)
 
 
@@ -4326,10 +4822,13 @@ def fleet_overview(engine, entries):
 
 
 def _plan_line(entry):
-    plan = entry["plan"]
+    plan, riders = entry["plan"], entry.get("riders") or []
     if plan is None:
-        return "nothing pending"
-    return "%d pending: %s (%s)" % (len(plan["pending"]), plan["action"], plan["reason"])
+        return ("nothing pending; %d rider(s) wait for a message to ride in" % len(riders)) if riders \
+            else "nothing pending"
+    waiting = sum(1 for fact in plan["pending"] if fact.get("rider"))
+    return "%d pending%s: %s (%s)" % (len(plan["pending"]), " (%d rider)" % waiting if waiting else "",
+                                      plan["action"], plan["reason"])
 
 
 def _agent_line(entry):
@@ -4533,6 +5032,35 @@ def cmd_send(args, runner, now):
     return EXIT_OK
 
 
+def cmd_report(args, runner, now):
+    """PR 13: tell the one you report to what happened. Delivered like `send`; a progress report is a rider."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
+                             % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    try:
+        outcome = engine.report(sender, args.state, " ".join(args.text), args.issue)
+    except ReportError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    if outcome.get("action") == "rider":
+        sys.stderr.write("%s: %s\n" % (PROG, outcome["reason"]))
+        print(outcome["key"])
+        return EXIT_OK
+    if not outcome["sent"]:
+        sys.stderr.write("%s: not reported to %s: %s (%s)\n" % (PROG, outcome.get("recipient", "your boss"),
+                                                               outcome["action"], outcome["reason"]))
+        return EXIT_HELD
+    print(outcome["message_id"])
+    sys.stderr.write("%s: %s delivered to the one you report to\n" % (PROG, outcome["action"]))
+    return EXIT_OK
+
+
 def cmd_pending(args, runner, now):
     engine, _, _ = build_engine(runner, now, "cli", writable=False)
     entry = engine.pending(args.name)
@@ -4542,10 +5070,11 @@ def cmd_pending(args, runner, now):
     print(_agent_line(entry))
     if entry["missing"]:
         print("  %s" % entry["missing"])
-    for fact in (entry["plan"] or {}).get("pending", []):
+    for fact in (entry["plan"] or {}).get("pending", []) + entry.get("riders", []):
         where = " issue #%d" % fact["issue"] if fact["issue"] else ""
-        print("  - %s  %s from %s%s at %s: %s" % (fact["key"], fact["kind"], fact["from"] or "the fleet", where,
-                                                 iso(fact["created"]), _one_line(fact["summary"], 200)))
+        print("  - %s%s  %s from %s%s at %s: %s" % (fact["key"], " [rider]" if fact.get("rider") else "", fact["kind"],
+                                                    fact["from"] or "the fleet", where, iso(fact["created"]),
+                                                    _one_line(fact["summary"], 200)))
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     return EXIT_OK
@@ -6745,6 +7274,17 @@ def build_parser():
     send.add_argument("text", nargs="+", help="The message")
     send.add_argument("--issue", type=int, help="The issue the message is about")
     send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    report = sub.add_parser(
+        "report", help="Tell the one you report to what happened: done, failed, blocked, question (they wake it) "
+                       "or working, paused (progress: carried by the next message, never waking)",
+        description="Tell the agent you report to what happened, in one line (at most %d characters; detail "
+                    "goes on GitHub). `done`, `failed`, `blocked` and `question` are attention reports: delivered "
+                    "now, by the rule `send` uses. `working` and `paused` are progress reports: they ride in the "
+                    "next message to your boss and never wake it by themselves." % REPORT_MAX)
+    report.add_argument("state", choices=REPORT_STATES, help="What happened")
+    report.add_argument("text", nargs="+", help="One line: what happened (at most %d characters)" % REPORT_MAX)
+    report.add_argument("--issue", type=int, help="The issue the report is about (default: your own)")
+    report.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
     launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
@@ -6802,6 +7342,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_run(args, runner, now, wait)
         if args.action == "send":
             return cmd_send(args, runner, now)
+        if args.action == "report":
+            return cmd_report(args, runner, now)
         if args.action == "comment":
             return cmd_comment(args, runner, now)
         if args.action == "whoami":

@@ -87,8 +87,11 @@ Each of these is something the stack claims; watch whether it holds.
 3. **An Intent edit is surfaced.** Edit the ask's `## Intent` line on GitHub.
    `cos` gets a message showing old and new, and herdr shows a toast.
 4. **A worker finishes while you talk to someone else.** Have `platform`
-   launch a `coder` (`fleet-switchboard launch`). When it finishes, `platform`
-   gets a note, not a turn, while you are mid-conversation with it.
+   launch a `coder` (`fleet-switchboard launch`). The coder should end with
+   `fleet-switchboard report done "<one line>"`; `platform` then gets a note,
+   not a turn, while you are mid-conversation with it, and the bare idle that
+   follows wakes nobody. A coder that stops without reporting is nudged once.
+   Every switchboard message shows as a one-line row in the transcript.
 5. **An unrelated message while `cos` is busy.** Give `cos` a long task, then
    ask something unrelated. It should be told to hand the first task off
    (`fleet-switchboard handoff`) before it answers you. If the decoration

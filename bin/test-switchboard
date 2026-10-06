@@ -157,6 +157,7 @@ class TestConfig(Base):
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
             "worker_lookback_hours": 24,
+            "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
@@ -734,7 +735,8 @@ class TestAuditLog(Base):
 DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue", "no-batch",
               "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
               "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion",
-              "no-import-metadata")
+              "no-import-metadata", "idle-wakes", "no-rider", "no-nudge-once", "no-fail-open",
+              "ignore-reports", "no-description")
 
 
 class TestFaults(Base):
@@ -1001,6 +1003,7 @@ STEP_EXAMPLES = {
     "pass": {"faults": ["no-dedupe", "crash-after-send"]},
     "launch": {"agent": "coder", "brief": "Add a health check"},
     "handoff": {"issue": 2, "brief": "Done so far: a\nNext steps: b"},  # PR 8
+    "report": {"state": "done", "text": "PR is up", "issue": 2},  # PR 13
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1495,6 +1498,8 @@ class FakeV2:
 
     def _finish(self, s, at):
         """The final reply; then whatever waits runs in the same busy span (S3, S4)."""
+        if s["idle"] is not None and at <= s["idle"]:
+            at = s["idle"] + 0.001  # v2's time.idle only moves forward, even for a turn that takes no time
         self._message(s, "assistant", "reply", None, at)
         while s["inbox"]:
             steer = [i for i in s["inbox"] if i["delivery"] == "steer"]
@@ -1606,7 +1611,8 @@ class FakeV2:
         fleet = (body.get("metadata") or {}).get("fleet") or {}
         self.admitted[mid] = {"id": mid, "session": s["id"], "resume": body["resume"], "delivery": body["delivery"],
                               "at": at, "delivered_at": None, "keys": list(fleet.get("keys") or []),
-                              "from": fleet.get("from"), "text": body["text"], "record": record}
+                              "from": fleet.get("from"), "text": body["text"], "record": record,
+                              "description": body.get("description")}
         self._write("session.synthetic", s["id"], mid)
         s["inbox"].append(item)
         if s["turn"] is None and body["resume"]:
@@ -2059,7 +2065,7 @@ class TestFacts(Base):
                                   "summary": "s", "created": EPOCH})
         self.assertEqual(made.to_json(), {"key": "lab.fact:1", "recipient": "platform", "kind": "review",
                                           "summary": "s", "created": EPOCH, "issue": None, "batch": True,
-                                          "from": None})
+                                          "from": None, "rider": False})
 
     def test_bad_facts_are_refused_with_the_field_named(self):
         good = {"key": "k", "recipient": "platform", "kind": "x", "summary": "s", "created": EPOCH}
@@ -2094,7 +2100,7 @@ class TestFacts(Base):
         self.assertIn(":2:", str(caught.exception))
 
     def test_the_registration_point_lists_the_lab_source(self):
-        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts", "foreground_facts"])
+        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)], ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -3695,6 +3701,9 @@ class OfflineRun:
             world.herdr.input_box[world.panes[step["to"]]] = step["text"]  # you, typing; nothing is sent
         elif do == "launch":
             self.launch(step)
+        elif do == "report":  # PR 13: `fleet-switchboard report`, as the cast member's model would run it
+            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
+            world.new_engine("cli").report(step["actor"], step["state"], step["text"], step.get("issue"))
         elif do == "pass":
             self.one_pass(step.get("faults", ()))
         elif do == "kill-daemon":
@@ -5697,10 +5706,11 @@ class TestWorkerIdleFacts(PR4Base):
     def test_a_finished_worker_is_a_fact_for_the_one_it_reports_to(self):
         self.finish_turn()
         (found,) = self.derive()
-        self.assertEqual(found.key, "worker.idle:%s:%d" % (self.coder, EPOCH * 1000))
-        self.assertEqual((found.recipient, found.kind, found.issue, found.sender), ("platform", "worker.idle", 2, "coder"))
+        # PR 13: with no report and no decision model the stop fails open into one fact for the boss
+        self.assertEqual(found.key, "worker.stopped:%s:%d" % (self.coder, EPOCH * 1000))
+        self.assertEqual((found.recipient, found.kind, found.issue, found.sender), ("platform", "worker.stopped", 2, "coder"))
         self.assertEqual(found.created, EPOCH)
-        self.assertIn("coder finished its turn (success): reply", found.summary)
+        self.assertIn("coder stopped without reporting (success): reply", found.summary)
 
     def test_deriving_again_gives_the_same_facts_and_writes_nothing(self):
         self.finish_turn()
@@ -5708,7 +5718,8 @@ class TestWorkerIdleFacts(PR4Base):
         self.world.tick(30)
         self.assertEqual([f.to_json() for f in self.derive()], first)
         self.assertEqual(self.world.v2.writes, [])
-        self.assertEqual(self.world.audit(), [])
+        # the one thing written is the triage of the stop, once (PR 13); deriving again asks nothing more
+        self.assertEqual([e["event"] for e in self.world.audit()], ["report.triage"])
 
     def test_each_turn_has_its_own_key(self):
         self.finish_turn()
@@ -5762,7 +5773,7 @@ class TestWorkerIdleFacts(PR4Base):
         self.finish_turn()
         self.world.v2.sessions[self.coder]["messages"][-1]["text"] = "word " * 400
         (found,) = self.derive()
-        self.assertLessEqual(len(found.summary), len("coder finished its turn (success): ") + sb.SUMMARY_CAP)
+        self.assertLessEqual(len(found.summary), len("coder stopped without reporting (success): ") + sb.SUMMARY_CAP)
         self.assertTrue(found.summary.endswith("\u2026"))
         self.derive()
         reads = [c for c in self.world.v2.calls if "type=assistant" in c and "sessionID=" + self.coder in c]
@@ -5830,9 +5841,9 @@ class TestWorkerDelivery(PR4Base):
         report = self.world.engine.run_pass()
         self.assertEqual([s["action"] for s in report["sent"]], ["wake"])
         (message,) = self.world.admissions("platform")
-        self.assertEqual(message["keys"], ["worker.idle:%s:%d" % (self.coder, EPOCH * 1000)])
+        self.assertEqual(message["keys"], ["worker.stopped:%s:%d" % (self.coder, EPOCH * 1000)])
         self.assertIn("(issue #2)", message["text"])
-        self.assertIn("worker.idle from coder", message["text"])
+        self.assertIn("worker.stopped from coder", message["text"])
         for _ in range(3):
             self.world.tick(5)
             self.assertEqual(self.world.engine.run_pass()["sent"], [])
@@ -5848,7 +5859,7 @@ class TestWorkerDelivery(PR4Base):
         self.assertEqual(len(self.world.admissions("platform")), 1)
 
     def worker_keys_sent(self):
-        return [k for a in self.world.admissions("platform") for k in a["keys"] if k.startswith("worker.idle")]
+        return [k for a in self.world.admissions("platform") for k in a["keys"] if k.startswith("worker.stopped")]
 
     def deliver_then_a_later_fact(self, fault=None):
         self.finish_turn()
@@ -5924,7 +5935,7 @@ class TestWorkerBlockedFacts(PR4Base):
         self.world.herdr.panes[self.world.panes["coder"]]["status"] = None
         self.world.v2.answer_permissions(self.coder)
         kinds = [f.kind for f in self.derive()]
-        self.assertEqual(kinds, ["worker.idle"])
+        self.assertEqual(kinds, ["worker.stopped"])  # PR 13: it stopped, and never reported
 
     def test_the_blocked_fact_reaches_the_orchestrator_at_once_and_the_human_gets_one_toast(self):
         self.block()
@@ -6396,7 +6407,7 @@ class TestOfflineScenariosPR4(Base):
     def test_the_within_oracle_judges_delivery_and_answer_against_a_step(self):
         scenario = sc.load(sc.DEFAULT_DIR / "w1-worker-done-away.json")
         run = OfflineRun(self, scenario, "within").run()
-        e = {"that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.idle:*"}
+        e = {"that": "within", "agent": "platform", "step": 1, "seconds": 150, "key": "worker.stopped:*"}
         self.assertTrue(run.oracle_within(e)[0])
         self.assertFalse(run.oracle_within(dict(e, seconds=60))[0], "batching alone takes 90 s")
         self.assertFalse(run.oracle_within(dict(e, key="nothing:*"))[0])
@@ -7068,8 +7079,9 @@ COS_ONLY_MAXIMS = ("The last message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 120, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
-ROLE_BYTE_LIMITS = {"coder": 5300, "orchestrator": 9000, "chief-of-staff": 8450, "cos-subagent": 3500}  # chief-of-staff +150: the signed-comment sentence
+ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+# chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 8550, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -12109,6 +12121,580 @@ class TestTrialDriver(Base):
     def test_the_service_port_is_not_the_labs(self):
         self.assertEqual(TRIAL.SERVICE_PORT, 49380)
         self.assertNotEqual(TRIAL.SERVICE_PORT, 49374)
+
+
+# ======================================================================
+# PR 13: workers report, a bare idle wakes nobody, every message has a line
+#
+# docs/switchboard.md, "Workers report (PR 13)". The faults added here:
+# idle-wakes, no-rider, no-nudge-once, no-fail-open, ignore-reports,
+# no-description.
+# ======================================================================
+REPORT_REPLAY_RULES = [
+    {"contains": "OWED-ME", "noul": {"report_owed": 0.95}},
+    {"contains": "JEV-DOWN", "error": "unreachable"},
+    {"noul": {"report_owed": 0.05}},
+]
+
+
+def write_report_replay(home, rules=None):
+    path = Path(home) / "report-replay.json"
+    path.write_text(json.dumps({"rules": REPORT_REPLAY_RULES if rules is None else rules}))
+    return str(path)
+
+
+class ReportBase(PR4Base):
+    """A platform (the boss) and a coder (its worker, issue 2), a decision model that replays rules."""
+
+    def make_world(self, **kwargs):
+        config = {"jev": {"replay": write_report_replay(self.home)}}
+        config.update(kwargs.pop("config", None) or {})
+        return super().make_world(config=config, **kwargs)
+
+    def set_reply(self, text, name="coder"):
+        session = self.world.v2.sessions[self.world.sessions[name]]
+        session["messages"][-1]["text"] = text
+
+    def stop(self, reply="all quiet", lasts=0, name="coder"):
+        """The worker is given a task, ends its turn, and says `reply`."""
+        self.world.v2.start_turn(self.world.sessions[name], "fleet task", fleet=True, lasts=lasts)
+        if lasts:
+            self.world.tick(lasts)
+        self.set_reply(reply, name)
+
+    def report(self, state="done", text="finished", sender="coder"):
+        outcome = self.world.new_engine("cli").report(sender, state, text)
+        return outcome
+
+    def kinds(self, facts):
+        return sorted((f.kind, f.recipient, f.rider) for f in facts)
+
+    def triage_events(self):
+        return [e for e in self.world.audit() if e["event"] == "report.triage"]
+
+    def pass_after(self, seconds):
+        self.world.tick(seconds)
+        return self.world.engine.run_pass()
+
+
+class TestRiders(ReportBase):
+    def test_a_fact_is_not_a_rider_unless_it_says_so_and_the_field_round_trips(self):
+        self.assertIn("rider", sb.Fact.FIELDS)
+        plain = fact("k")
+        self.assertFalse(plain.rider)
+        carried = fact("k2", rider=True)
+        self.assertTrue(sb.Fact.from_json(carried.to_json()).rider)
+        self.assertEqual(sorted(carried.to_json()), sorted(
+            ["key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider"]))
+        with self.assertRaises(sb.FactError):
+            fact("k3", rider="yes")
+        self.assertEqual(sorted(set(sb.Fact.FIELDS) - {"sender"}), sorted(set(carried.to_json()) - {"from"}))
+
+    def test_pending_that_is_all_riders_yields_no_plan(self):
+        plan = sb.decide("platform", [fact("a", rider=True), fact("b", rider=True)], observation(), EPOCH + 999,
+                         90, 600)
+        self.assertIsNone(plan)
+
+    def test_a_plan_with_one_ordinary_fact_carries_every_rider(self):
+        rider = fact("r", EPOCH, rider=True)
+        plan = sb.decide("platform", [rider, fact("n", EPOCH + 1, batch=False)], observation(), EPOCH + 2, 90, 600)
+        self.assertEqual((plan.action, [f.key for f in plan.pending]), ("wake", ["r", "n"]))
+
+    def test_riders_do_not_start_the_batch_clock(self):
+        old = fact("r", EPOCH, rider=True)
+        new = fact("n", EPOCH + 100)
+        plan = sb.decide("platform", [old, new], observation(), EPOCH + 150, 90, 600)
+        self.assertEqual(plan.action, "wait")
+        plan = sb.decide("platform", [old, new], observation(), EPOCH + 200, 90, 600)
+        self.assertEqual(plan.action, "wake")
+
+    def test_the_no_rider_fault_makes_a_rider_wake_again(self):
+        os.environ[sb.FAULT_ENV] = "no-rider"
+        plan = sb.decide("platform", [fact("r", EPOCH, rider=True, batch=False)], observation(), EPOCH, 90, 600)
+        self.assertEqual(plan.action, "wake")
+
+    def test_riders_are_collapsed_to_the_newest_idle_per_sender_and_old_ones_drop(self):
+        idle = lambda key, at, sender: fact(key, at, kind="worker.idle", sender=sender, rider=True)
+        facts = [idle("i1", EPOCH + 10, "coder"), idle("i2", EPOCH + 20, "coder"), idle("i3", EPOCH + 15, "other"),
+                 idle("old", EPOCH - 4000, "third"), fact("n", EPOCH), fact("p", EPOCH + 1, kind="report", rider=True)]
+        kept = sb.collapse_riders(facts, EPOCH + 30, 3600)
+        self.assertEqual(sorted(f.key for f in kept), ["i2", "i3", "n", "p"])
+
+    def test_the_rider_age_is_a_validated_setting(self):
+        self.assertEqual(sb.validate_config({})["rider_max_age_seconds"], 3600)
+        self.assertEqual(sb.validate_config({"rider_max_age_seconds": 60})["rider_max_age_seconds"], 60)
+        for bad in (0, -1, "1h", True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"rider_max_age_seconds": bad})
+
+    def test_a_bare_idle_after_a_report_is_a_rider_that_keeps_its_text(self):
+        self.stop("the work is done")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(5)
+        (found,) = [f for f in self.derive() if f.kind == "worker.idle"]
+        self.assertTrue(found.rider)
+        self.assertIn("coder finished its turn (success): the work is done", found.summary)
+
+    def test_a_rider_alone_is_never_delivered_nor_converted_into_a_wake(self):
+        self.stop("the work is done")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(1)
+        before = len(self.world.admissions("platform"))
+        for _ in range(5):
+            self.assertEqual(self.pass_after(200)["sent"], [])
+        self.assertEqual(len(self.world.admissions("platform")), before)
+
+    def test_riders_ride_in_the_next_message_and_never_again(self):
+        self.stop("the work is done")
+        self.world.tick(1)
+        self.report("working", "halfway")
+        self.world.fact("platform", "lab.fact:real", "something real")
+        self.pass_after(100)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        keys = self.world.admissions("platform")[0]["keys"]
+        self.assertIn("lab.fact:real", keys)
+        self.assertTrue(any(k.startswith("report:coder:") for k in keys), keys)
+        self.world.fact("platform", "lab.fact:second", "again")
+        self.pass_after(100)
+        self.assertEqual(sum(1 for a in self.world.admissions("platform") for k in a["keys"]
+                             if k.startswith("report:coder:")), 1)
+
+    def test_pending_and_status_still_show_riders_marked(self):
+        self.stop("the work is done")
+        self.world.tick(1)
+        self.report("working", "halfway")
+        engine = self.world.new_engine(writable=False)
+        entry = engine.pending("platform")
+        self.assertIsNone(entry["plan"])
+        self.assertIn("report", [r["kind"] for r in entry["riders"]])
+        self.assertTrue(all(r["rider"] for r in entry["riders"]))
+        with captured() as (out, err):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+            code = sb.main(["pending", "platform"], runner=self.world.route, now=self.world.clock.now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("rider", out.getvalue())
+        self.assertIn("working: halfway", out.getvalue())
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        text = sb.format_status(report)
+        self.assertIn("rider", text)
+
+
+class TestReportCommand(ReportBase):
+    def cli(self, *argv, **env):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+                           "jev": {"replay": write_report_replay(self.home)}})
+        os.environ[sb.LAB_ENV] = "1"
+        for name, value in env.items():
+            os.environ[name] = value
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_an_attention_report_is_delivered_at_once_like_send_with_its_state_first(self):
+        code, out, err = self.cli("report", "done", "--from", "coder", "PR is up and green")
+        self.assertEqual(code, 0, err)
+        (message,) = self.world.admissions("platform")
+        (key,) = message["keys"]
+        self.assertRegex(key, r"^report:coder:[0-9a-f]{16}$")
+        self.assertIn("done: PR is up and green", message["text"])
+        self.assertIn("(issue #2)", message["text"])  # the caller's own issue by default
+        self.assertEqual((message["resume"], message["delivery"]), (True, "queue"))
+        self.assertEqual(out.strip(), message["id"])
+
+    def test_the_issue_can_be_named_and_the_text_is_taken_from_the_remaining_words(self):
+        code, _, err = self.cli("report", "blocked", "--issue", "9", "--from", "coder", "need", "a", "decision")
+        self.assertEqual(code, 0, err)
+        (message,) = self.world.admissions("platform")
+        self.assertIn("(issue #9)", message["text"])
+        self.assertIn("blocked: need a decision", message["text"])
+
+    def test_every_state_is_known_and_nothing_else_is(self):
+        self.assertEqual(sb.REPORT_ATTENTION, ("done", "failed", "blocked", "question"))
+        self.assertEqual(sb.REPORT_PROGRESS, ("working", "paused"))
+        code, _, err = self.cli("report", "finished", "--from", "coder", "x")
+        self.assertEqual(code, 2)
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_a_caller_with_no_reports_to_is_refused_clearly(self):
+        code, _, err = self.cli("report", "done", "--from", "platform", "all done")
+        self.assertEqual(code, 2)
+        self.assertIn("reports to nobody", err)
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_the_line_is_required_and_is_refused_not_cut_over_300_characters(self):
+        code, _, err = self.cli("report", "done", "--from", "coder", "   ")
+        self.assertEqual(code, 2)
+        self.assertIn("one line", err)
+        code, _, err = self.cli("report", "done", "--from", "coder", "x" * 301)
+        self.assertEqual(code, 2)
+        self.assertIn("300", err)
+        self.assertEqual(self.world.admissions("platform"), [])
+        code, _, err = self.cli("report", "done", "--from", "coder", "x" * 300)
+        self.assertEqual(code, 0, err)
+        self.assertIn("x" * 300, self.world.admissions("platform")[0]["text"])
+
+    def test_from_is_for_the_lab_only(self):
+        os.environ.pop(sb.LAB_ENV, None)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["report", "done", "--from", "coder", "x"], runner=self.world.route,
+                           now=self.world.clock.now)
+        self.assertEqual(code, 2)
+        self.assertIn("only for the Lab", err.getvalue())
+
+    def test_the_caller_is_identified_by_its_pane(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        with captured() as (out, err):
+            code = sb.main(["report", "done", "from the pane"], runner=self.world.route, now=self.world.clock.now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("from the pane", self.world.admissions("platform")[0]["text"])
+
+    def test_an_attention_report_is_a_note_when_you_are_engaged_with_the_boss(self):
+        self.world.you("platform")
+        code, _, err = self.cli("report", "failed", "--from", "coder", "tests red")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.admissions("platform")[0]["resume"], False)
+
+    def test_a_report_to_a_boss_that_cannot_be_written_to_is_held_like_send(self):
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        code, _, err = self.cli("report", "done", "--from", "coder", "done")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_a_progress_report_is_recorded_not_delivered_and_wakes_nobody(self):
+        for state in ("working", "paused"):
+            code, out, err = self.cli("report", state, "--from", "coder", "step %s" % state)
+            self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(self.world.model_calls("platform"), [])
+        self.assertIn("rider", err)
+        self.assertEqual(self.pass_after(300)["sent"], [])
+
+    def test_an_attention_report_carries_the_progress_reports_waiting_for_the_boss(self):
+        self.cli("report", "working", "--from", "coder", "halfway")
+        self.cli("report", "done", "--from", "coder", "finished")
+        (message,) = self.world.admissions("platform")
+        self.assertEqual(len(message["keys"]), 2)
+        self.assertIn("working: halfway", message["text"])
+        self.assertIn("done: finished", message["text"])
+        self.assertEqual(self.pass_after(100)["sent"], [])
+
+    def test_the_no_rider_fault_makes_a_progress_report_wake(self):
+        os.environ[sb.FAULT_ENV] = "no-rider"
+        code, _, err = self.cli("report", "working", "--from", "coder", "halfway")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def test_help_names_the_states(self):
+        with captured() as (out, err), self.assertRaises(SystemExit):
+            sb.build_parser().parse_args(["report", "--help"])
+        text = out.getvalue()
+        for word in ("done", "failed", "blocked", "question", "working", "paused", "--issue", "300"):
+            self.assertIn(word, text)
+
+
+class TestUnreportedStop(ReportBase):
+    def facts(self):
+        return self.derive()
+
+    def assigning_id(self):
+        return next(m["id"] for m in self.world.v2.sessions[self.coder]["messages"] if m["type"] == "user")
+
+    def test_a_stop_after_a_report_is_only_a_rider_and_jev_is_not_asked(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(5)
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])
+        self.assertEqual(self.triage_events(), [])
+
+    def test_a_stop_with_no_report_and_a_jev_answer_of_owed_nudges_the_worker_once(self):
+        self.stop("OWED-ME: the migration is finished")
+        found = self.facts()
+        self.assertEqual(self.kinds(found), [("nudge", "coder", False), ("worker.idle", "platform", True)])
+        nudge = next(f for f in found if f.kind == "nudge")
+        self.assertEqual(nudge.key, "nudge:%s:%s" % (self.coder, self.assigning_id()))
+        for part in ("You stopped without telling platform", "fleet-switchboard report <state>",
+                     "If nothing changed since your last report, say nothing"):
+            self.assertIn(part, nudge.summary)
+        (event,) = self.triage_events()
+        self.assertEqual(event["detail"]["outcome"], "nudge")
+
+    def test_the_nudge_is_delivered_to_the_worker_as_a_wake_and_only_once(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.engine.run_pass()
+        (nudge,) = self.world.admissions("coder")
+        self.assertEqual((nudge["resume"], nudge["delivery"]), (True, "queue"))
+        self.assertEqual(nudge["keys"], ["nudge:%s:%s" % (self.coder, self.assigning_id())])
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_a_second_unreported_stop_after_the_nudge_wakes_the_boss_with_one_fact(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.engine.run_pass()   # the nudge wakes the worker; its turn ends again at once
+        self.world.tick(2)
+        self.set_reply("OWED-ME still quiet")
+        found = self.facts()
+        stopped = [f for f in found if f.kind == "worker.stopped"]
+        self.assertEqual(len(stopped), 1)
+        self.assertFalse(stopped[0].rider)
+        self.assertEqual(stopped[0].recipient, "platform")
+        self.assertIn("coder stopped without reporting (success): OWED-ME still quiet", stopped[0].summary)
+        self.assertEqual([f.kind for f in found if f.kind == "nudge"], [])
+        self.assertEqual([f.kind for f in found if f.kind == "worker.idle"], [])  # the stop is not said twice
+        self.assertEqual(self.triage_events()[-1]["detail"]["outcome"], "stopped")
+        self.world.tick(100)
+        self.world.engine.run_pass()
+        self.assertEqual([k for a in self.world.admissions("platform") for k in a["keys"]
+                          if k.startswith("worker.stopped:")].__len__(), 1)
+
+    def test_the_idle_that_caused_the_nudge_is_not_a_second_stop(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.engine.run_pass()
+        # herdr may still show the old idle for a moment: the nudge is newer than that idle (a restart: no memory)
+        self.world.v2.sessions[self.coder]["idle"] = EPOCH
+        self.world.engine = self.world.new_engine()
+        found = self.derive()
+        self.assertEqual([f.kind for f in found if f.kind in ("worker.stopped", "nudge")], [])
+
+    def test_without_the_once_check_the_worker_is_nudged_at_every_stop(self):
+        os.environ[sb.FAULT_ENV] = "no-nudge-once"
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.engine.run_pass()
+        self.world.tick(2)
+        self.set_reply("OWED-ME")
+        found = self.facts()
+        self.assertEqual(sorted(f.kind for f in found), ["nudge", "worker.idle"])
+        self.assertEqual([f for f in found if f.kind == "worker.stopped"], [])
+
+    def test_a_low_probability_is_silent_and_the_idle_stays_a_rider(self):
+        self.stop("nothing to say")
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])
+        (event,) = self.triage_events()
+        self.assertEqual(event["detail"]["outcome"], "silent")
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_the_threshold_is_configurable(self):
+        world = self.make_world(config={"report_triage": {"owed_threshold": 0.99}})
+        world.v2.start_turn(world.sessions["coder"], "fleet task", fleet=True)
+        world.v2.sessions[world.sessions["coder"]]["messages"][-1]["text"] = "OWED-ME"
+        found = self.derive(world)
+        self.assertEqual([f.kind for f in found], ["worker.idle"])
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"report_triage": {"owed_threshold": 0}})
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"report_triage": {"nonsense": 1}})
+
+    def test_jev_failing_fails_open_to_one_stopped_fact(self):
+        self.stop("JEV-DOWN: something happened")
+        found = self.facts()
+        self.assertEqual(self.kinds(found), [("worker.stopped", "platform", False)])
+        (event,) = self.triage_events()
+        self.assertEqual(event["detail"]["outcome"], "stopped")
+        self.assertIn("unreachable", event["detail"]["reason"])
+
+    def test_the_no_fail_open_fault_goes_quiet_when_jev_fails(self):
+        os.environ[sb.FAULT_ENV] = "no-fail-open"
+        self.stop("JEV-DOWN")
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])
+
+    def test_no_decision_model_at_all_also_fails_open(self):
+        world = World(self, agents=("platform",))
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "platform", "issue": 2})
+        world.v2.start_turn(world.sessions["coder"], "fleet task", fleet=True)
+        self.assertEqual(self.kinds(self.derive(world)), [("worker.stopped", "platform", False)])
+
+    def test_a_stop_is_asked_about_once_across_passes(self):
+        self.stop("OWED-ME")
+        self.facts()
+        self.facts()
+        self.assertEqual(len(self.triage_events()), 1)
+
+    def test_the_audit_records_question_answer_outcome_and_latency_and_no_credential(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-secret-value"
+        self.stop("OWED-ME")
+        self.facts()
+        (event,) = self.triage_events()
+        detail = event["detail"]
+        self.assertEqual(detail["question"]["ids"], ["report_owed"])
+        self.assertEqual(detail["question"]["state"]["role"], "coder")
+        self.assertEqual(detail["answer"], {"report_owed": 0.95})
+        self.assertIn("latency_ms", detail)
+        self.assertEqual((detail["worker"], detail["boss"]), ("coder", "platform"))
+        self.assertNotIn("sk-or-secret-value", json.dumps(self.world.audit()))
+
+    def test_the_question_carries_the_ask_the_role_and_the_last_reply(self):
+        state = sb.report_owed_state("coder", "Add a health check", "GET /health is 200", "the reply", "platform")
+        self.assertEqual(state["intent"], "Add a health check")
+        self.assertEqual(state["done_when"], "GET /health is 200")
+        question = sb.report_owed_questions()["report_owed"]
+        self.assertEqual(question["type"], "noul")
+        self.assertIn("boss has not been told", question["instructions"])
+
+    def test_only_a_human_prompt_or_the_boss_or_the_brief_assigns_not_a_notice(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(1)
+        self.world.fact("coder", "github:notice:1", "an update", kind="github")
+        self.world.fact("coder", "reminder:1", "a reminder", kind="reminder")
+        self.world.tick(100)
+        self.world.engine.run_pass()
+        self.world.tick(2)
+        self.set_reply("OWED-ME")
+        # the notices are in the worker's transcript, newer than the report, and assign nothing
+        kinds = [f.kind for f in self.facts()]
+        self.assertNotIn("nudge", kinds)
+        self.assertNotIn("worker.stopped", kinds)
+
+    def test_a_new_message_from_the_boss_is_a_new_assignment_and_a_report_before_it_does_not_count(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(5)
+        self.world.new_engine("cli").send("platform", "coder", "now do the second thing")
+        self.world.tick(5)
+        self.set_reply("OWED-ME")
+        self.assertIn("nudge", [f.kind for f in self.facts()])
+
+    def test_a_stop_older_than_the_rider_age_is_not_triaged(self):
+        self.stop("OWED-ME")
+        self.world.tick(3700)
+        self.assertEqual([f.kind for f in self.facts()], ["worker.idle"])  # only the rider, which the engine drops
+        self.assertEqual(self.triage_events(), [])
+
+    def test_a_read_only_engine_never_asks_jev(self):
+        self.stop("OWED-ME")
+        engine = self.world.new_engine(writable=False)
+        engine.discover(self.world.clock.now())
+        found = engine.collect_facts()[0]
+        self.assertEqual([f.kind for f in found], ["worker.idle"])
+        self.assertEqual(self.world.audit(), [])
+
+    def test_the_idle_wakes_fault_makes_a_bare_idle_wake_again(self):
+        os.environ[sb.FAULT_ENV] = "idle-wakes"
+        self.stop("nothing")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(5)
+        found = [f for f in self.derive() if f.kind == "worker.idle"]
+        self.assertFalse(found[0].rider)
+
+    def test_the_ignore_reports_fault_forgets_that_the_worker_reported(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.report()
+        self.world.tick(5)
+        os.environ[sb.FAULT_ENV] = "ignore-reports"
+        self.assertIn("nudge", [f.kind for f in self.derive()])
+
+    def test_the_pass_end_to_end_reported_work_wakes_the_boss_once(self):
+        self.stop("OWED-ME", lasts=0)
+        self.world.tick(1)
+        self.report("done", "PR up")
+        self.world.tick(300)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.world.admissions("coder"), [])
+
+
+class TestSyntheticDescription(PR4Base):
+    def test_the_client_passes_the_description_and_refuses_a_bad_one(self):
+        client = sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5)
+        client.synthetic(self.coder, "text", {"fleet": {"keys": ["k"], "from": "switchboard"}}, False, "steer",
+                         "msg_" + "a" * 26, "switchboard: a thing")
+        self.assertEqual(self.world.v2.admitted["msg_" + "a" * 26]["description"], "switchboard: a thing")
+        for bad in ("", "two\nlines", "x" * 201, 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                client.synthetic(self.coder, "t", {}, False, "steer", "msg_" + "b" * 26, bad)
+
+    def test_a_description_for_one_item_and_for_several(self):
+        one = sb.describe_items("platform", [fact("report:coder:1", kind="report", sender="coder", issue=2,
+                                                  summary="done: " + "w" * 300)])
+        self.assertTrue(one.startswith("switchboard: coder report on #2: done: "), one)
+        self.assertEqual(one, "switchboard: coder report on #2: " + ("done: " + "w" * 300)[:99] + "\u2026")
+        many = sb.describe_items("platform", [fact("a", kind="send", sender="x", summary="p" * 200),
+                                              fact("b", kind="send", sender="y", summary="q")])
+        self.assertEqual(many, "switchboard: 2 items for platform: " + "p" * 79 + "\u2026")
+        for text in (one, many):
+            self.assertLessEqual(len(text), 200)
+            self.assertNotIn("\n", text)
+
+    def test_a_description_has_no_newline_and_no_secret_and_is_capped(self):
+        text = sb.describe_items("platform", [fact("a", kind="send", sender="x", issue=3,
+                                                   summary="line one\nline two Bearer sk-abcdef123 end")])
+        self.assertNotIn("\n", text)
+        self.assertNotIn("sk-abcdef123", text)
+        long = sb.describe_items("p" * 300, [fact("a"), fact("b")])
+        self.assertLessEqual(len(long), 200)
+
+    def test_every_synthetic_written_by_every_path_has_a_description(self):
+        world = self.world
+        world.add_agent("coder2", fleet={"role": "coder", "reports_to": "platform", "issue": 3})
+        engine = world.new_engine("cli")
+        engine.send("coder", "platform", "a plain message", 2)                       # send: a wake
+        world.you("coder2")
+        engine.send("coder", "coder2", "a note while engaged", 2)                    # send: a note
+        engine.report("coder2", "done", "report line")                                # a report
+        world.fact("platform", "lab.fact:1", "a lab fact")                            # the pass, a wake
+        world.fact("coder", "reminder:x", "remember", kind="reminder")
+        world.v2.start_turn(world.sessions["coder"], "task", fleet=True)
+        world.tick(200)
+        world.engine.run_pass()
+        written = world.v2.admitted
+        self.assertGreaterEqual(len(written), 4)
+        for message_id, admission in written.items():
+            with self.subTest(message=message_id, keys=admission["keys"]):
+                self.assertTrue(admission.get("description"), admission)
+                self.assertLessEqual(len(admission["description"]), 200)
+                self.assertNotIn("\n", admission["description"])
+                self.assertTrue(admission["description"].startswith("switchboard: "))
+
+    def test_decorations_and_nudges_carry_one_too(self):
+        world = self.world
+        engine = world.new_engine()
+        for kind, recipient in (("decoration", "coder"), ("nudge", "coder")):
+            engine.deliver(engine.plan(recipient, [fact("%s:1" % kind, recipient=recipient, kind=kind,
+                                                       batch=False, sender="switchboard")],
+                                       engine.discover(world.clock.now()), world.clock.now()))
+        self.assertTrue(all(a.get("description") for a in world.v2.admitted.values()))
+        self.assertEqual(len(world.v2.admitted), 2)
+
+    def test_the_no_description_fault_leaves_it_out(self):
+        os.environ[sb.FAULT_ENV] = "no-description"
+        self.world.new_engine("cli").send("coder", "platform", "hello", 2)
+        (admission,) = self.world.v2.admitted.values()
+        self.assertFalse(admission.get("description"))
+
+
+class TestReportScenarios(Base):
+    def test_the_pr13_catalog_is_present_with_a_control_each(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, fault_name in (("R4", "idle-wakes"), ("R5", "idle-wakes"), ("R6", "no-nudge-once"),
+                                ("R7", "no-fail-open"), ("R8", "no-rider")):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 13)
+                self.assertEqual(found[sid]["control"].get("fault"), fault_name)
+
+    def test_every_new_fault_is_known_and_off_outside_the_lab(self):
+        for name in ("idle-wakes", "no-rider", "no-nudge-once", "no-fail-open", "ignore-reports", "no-description"):
+            with self.subTest(fault=name):
+                self.assertIn(name, sb.KNOWN_FAULTS)
+                os.environ[sb.FAULT_ENV] = name
+                os.environ.pop(sb.LAB_ENV, None)
+                self.assertFalse(sb.fault(name))
+                os.environ[sb.LAB_ENV] = "1"
+                self.assertTrue(sb.fault(name))
+
+    def test_the_report_step_is_in_the_vocabulary(self):
+        self.assertEqual(set(sc.STEP_FIELDS["report"]), {"state", "text", "issue"})
 
 
 def main(argv):

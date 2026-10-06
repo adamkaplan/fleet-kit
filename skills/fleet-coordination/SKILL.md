@@ -36,8 +36,14 @@ CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
 charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this
 assignment; they never widen it, and a report is held to the ask's Done when as
-well as to `DONE`. Reports and questions go to the orchestrator with
-`fleet-switchboard send <name> --issue <n> "<text>"`, never by typing into a pane.
+well as to `DONE`. Messages to the orchestrator go with
+`fleet-switchboard send <name> --issue <n> "<text>"`, never by typing into a pane; reports
+go with `fleet-switchboard report <done|failed|blocked|question|working|paused> [--issue <n>]
+"one line"` (at most 300 characters; detail goes on GitHub). Report at real deliverables, state
+changes and failures; the final report names the result and its evidence link, then stop. After
+`blocked` or `question`, end the turn at once. A worker that stops without reporting is nudged
+once, and the second time its orchestrator is told it stopped. When woken by something that
+changes nothing for you, do not report and do not answer at length.
 
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
@@ -70,7 +76,7 @@ It creates the v2 session, opens the tab by argv in your workspace
 (`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
 brief. It never types into a pane, and it runs the configured OpenCode, not whichever
 `opencode` is first on PATH. A worker started this way reports with
-`fleet-switchboard send`, and its finishing reaches you as a fact. Do **not** use the
+`fleet-switchboard report`, and its report reaches you as a fact. Do **not** use the
 `herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:
 they type into a shell, and a bare `opencode` there is the old v1 install, outside the
 switchboard, with no `fleet-switchboard` on its PATH. The rest of this section is the
