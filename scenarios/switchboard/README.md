@@ -19,8 +19,9 @@ The full format, tiers, oracles and catalog are in
 | `since_pr` | yes | The PR that adds it; every later PR keeps it passing |
 | `tiers` | yes | Any of `offline`, `lab-scripted`, `lab-model` |
 | `tags` | no | Free labels, such as `spike` |
-| `cast` | yes | Agent name → `role` (`chief-of-staff`, `orchestrator`, `coder`, `cos-subagent`), optional `reports_to` (another cast name), `issue`, `charter` |
-| `issues` | no | Issue number (as a string) → `intent`, optional `done_when`, `parent`, `authority` (a charter's `Standing authority:` line). `intent: null` is an issue with no Intent section |
+| `cast` | yes | Agent name → `role` (`chief-of-staff`, `orchestrator`, `coder`, `cos-subagent`), optional `reports_to` (another cast name), `issue`, `charter`, `repo` (`owner/name`, PR 15) |
+| `issues` | no | Issue number (as a string) → `intent`, optional `done_when`, `parent`, `authority` (a charter's `Standing authority:` line), `workspace` (a charter's `workspace:` line, PR 15). With `repos`, a key may be `owner/name#N`; a bare number is in the first repo. `intent: null` is an issue with no Intent section |
+| `repos` | no | PR 15, offline only. Repo (`owner/name`) → optional `account` (a `gh` account: the only token that can read the repo), `webhook` (false: that account cannot create a webhook), `exists` (false: the repo is not there yet). Gives the play a fake GitHub per repo, a daemon that derives the watched set, and `gh_users` from the accounts. Four steps and four expectations below need it |
 | `steps` | yes | Timed actions: `at` (`0s`, `10s`, `2m`, `2h`; never decreasing), `actor` (`you`, `world` or a cast name), `do`, plus the action's own fields |
 | `expect` | yes | What must and must not happen: `that` (the oracle), optional unique `name`, plus the oracle's own fields |
 | `config` | no | Engine timing the scenario shortens (`batch_seconds`, `engaged_minutes`; positive numbers), applied by both runners, so the Lab need not wait real minutes |
@@ -49,14 +50,14 @@ is how many.
 | `away` | you | none | You stop prompting |
 | `permission` | a cast member | none | The agent asks to run a shell command |
 | `permission` | you | `to`, [`decision`: `once`, `always`, `reject`] | Your answer to that ask |
-| `comment` | world | `issue`, `body` | A GitHub comment (PR 5) |
+| `comment` | world | `issue`, `body`, [`id`], [`from`], [`repo`] | A GitHub comment (PR 5); `repo` (PR 15) names the repo of a play with `repos` (default: the first) |
+| `leave` | world | `agent` | PR 15, offline. The agent's pane is gone: it is no longer a live fleet agent, so a repo only it named is no longer watched |
 | `edit-intent` | you, world | `issue`, [`intent`], [`done_when`] | An Intent edit (PR 6); `null` removes the line |
 | `close-pane` | world | `agent` | Arms a race: the agent's pane closes the moment the engine reads it again just before writing, after it decided to deliver (PR 4). Offline, a herdr runner wrapper; in the Lab, the engine's herdr shim runs `herdr pane close` on the next `agent get` of that pane |
 | `delete-state` | world | none | The engine's state directory is deleted (the daemon is down); the next start makes it again (PR 4) |
 | `synthetic`, `note`, `wake` | world | `to`, `key`, `text`, [`id`], [`resume`], [`delivery`: `queue`, `steer`] | A v2 synthetic message sent directly, without the engine (spikes). `note` defaults to resume false + steer, `wake` to resume true + queue, `synthetic` to resume false + steer. The same `id` name in one play is the same derived message id |
 | `fact` | world | `to`, `key`, `summary`, [`kind`], [`issue`], [`from`], [`batch`] | A fact for the engine: a line in its Lab fact source, `$STATE/lab-facts.jsonl`, read only when `FLEET_SWITCHBOARD_LAB=1` |
-| `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with the cast's role, `reports_to` and issue, into the herdr workspace of the play. The member has no session until the step runs. The brief is the first prompt, once the pane is verified |
-| `launch` | world | `agent`, [`brief`] | `fleet-switchboard launch` for that cast member, with its role, `reports_to` and issue from the cast, into the play's herdr workspace. The member has no session until the step runs. The brief is the first prompt, sent once the pane is verified |
+| `launch` | world | `agent`, [`brief`], [`new_workspace`] | `fleet-switchboard launch` for that cast member, with the cast's role, `reports_to`, issue and `repo`, into the herdr workspace of the play. The member has no session until the step runs. The brief is the first prompt, once the pane is verified. With `new_workspace` (PR 15, offline) the step runs the command line, `--new-workspace <label>` and the cast's `--charter`, so the charter's label check and the workspace creation are the real ones |
 | `pass` | world | [`faults`] | One engine pass with these faults on, such as `crash-after-send` |
 | `kill-daemon`, `restart-daemon` | world | none | While the daemon is down only `pass` steps run the engine; a restart forgets everything in memory |
 | `tool-call` | a cast member | `tool` (`shell`, `edit`, `webfetch`, `subagent`, `read`, `glob`, `grep`, `skill`, `other`), `arguments`, [`configured`: `allow`, `ask`, `deny`] | The agent makes a tool call; the offline runner sends it through `judge-tool`'s own path against fakes and Jev's replay answers (`scenarios/jev/policy.json`). An `ask` blocks the agent as v2 does (PR 9). Offline only: the Lab tier is owed to the real plugin |
@@ -87,7 +88,11 @@ is how many.
 | `intent_gap` | `issue` | `fleet-switchboard status` lists the issue as referenced by an agent but lacking an Intent section (PR 6) |
 | `classified` | `agent`, `step`, `as` | Jev classified that message so (PR 7) |
 | `handed_off` | `issue` | A brief on the ask and a `cos-subagent` session for it (PR 8) |
-| `toast` | [`agent`], [`text`] | herdr was asked to show a toast naming `agent` in its title or body and carrying `text` in its body. In the Lab, read from the engine's herdr shim, which records each `notification show` |
+| `toast` | [`agent`], [`text`], [`count`] | herdr was asked to show a toast naming `agent` in its title or body and carrying `text` in its body (`count`: exactly that many; default: at least one). In the Lab, read from the engine's herdr shim, which records each `notification show` |
+| `repo_watch` | `repo`, `how` (`forwarder`, `polling`, `failed`, `absent`) | PR 15, offline. How the daemon's hub watches the repo at the end of the play; `absent`: it does not |
+| `repo_membership` | `repo`, `joined`, `left` | PR 15, offline. The audit shows the daemon started a watch for the repo (`joined`) and stopped it (`left`) |
+| `status_says` | `text` | PR 15, offline. The GitHub lines of `fleet-switchboard status` at the end of the play contain `text` |
+| `launch_refused` | `agent`, [`text`] | PR 15, offline. The `launch` step with `new_workspace` exited non-zero with `text` in its error, and no herdr workspace and no session were made |
 | `policy_outcome` | `agent`, `step`, `outcome` (`allow`, `ask`, `deny`), [`reason`], [`judged`], [`cached`], [`jev_calls`] | What `judge-tool` answered for that `tool-call` step: the outcome, a reason containing `reason`, whether Jev's verdict was used, whether it was cached, and how many times Jev was asked (PR 9; offline) |
 | `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
 | `imported_messages` | `agent`, [`count`] | v2 holds the imported session with one message per v1 message (`count`, default: all of them), in v1's order, with v1's timestamps and the text that was typed (PR 10) |
@@ -113,7 +118,7 @@ Exactly one of:
 | Control | Fields | What it does |
 |---|---|---|
 | `fault` | a known fault name | The scenario plays again with `FLEET_SWITCHBOARD_FAULT` set on every engine process; only scenarios that run the engine |
-| `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}, "issues": {"<number>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
+| `variant` | `{"steps": {"<index>": {fields}}, "expect": {"<name or index>": {fields}}, "issues": {"<number>": {fields}}, "repos": {"<owner/name>": {fields}}}` | The scenario plays again with these fields patched in. The patched scenario must itself be valid |
 | `baseline` | `fleet-heartbeat` or `timer-heartbeat` | `timer-heartbeat` (offline only, not built in the Lab) is the old timer waking each orchestrator every 30 minutes. `fleet-heartbeat`: today's system delivers instead. The runner, the only code allowed to type and only into Lab panes, types each `fact`'s wake with `herdr agent prompt` (`[heartbeat] <summary>`), and the engine's daemon does not run. The fake herdr's `agent prompt` does what the TUI does: it submits the input box's text followed by the prompt |
 
 plus `fails`: the expectations, by `name` or `that`, the control must break.

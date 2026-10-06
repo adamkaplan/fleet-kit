@@ -24,6 +24,7 @@
 | 12 | `switchboard/presentation` | A three-minute narrated deck and video explaining the system: `docs/presentation/` | ready for review [#28](https://github.com/adamkaplan/fleet-kit/pull/28); see [presentation/README.md](presentation/README.md) |
 | 13 | `switchboard/reports` | Workers report with `fleet-switchboard report`; a bare idle is a rider and wakes nobody; a stop without a report is triaged; every message carries a one-line description for the TUI | ready for review |
 | 14 | `switchboard/decisions` | A read-only Decisions list for you: derived from labels, pending requests and unanswered reports, written to `decisions.json`, read by `fleet-switchboard decisions` and a TUI sidebar plugin | ready for review |
+| 15 | `switchboard/multi-repo` | One Chief of Staff, many independent projects: the watched repos are derived, `owner/repo#N` issue references, a `gh` account per repo, `launch --new-workspace`, repo creation is a decision and always hard to reverse, per-repo status | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -380,8 +381,10 @@ extension ([cli/gh-webhook](https://github.com/cli/gh-webhook)). Nothing is
 polled on a timer.
 
 - **One forwarder per watched repo,** started and supervised by the daemon as a
-  child process. Watched repos are the ones holding the issues named in fleet
-  agents' metadata. The forwarder runs
+  child process. Which repos are watched is derived on every pass (PR 15,
+  [Many repos](#many-repos-pr-15)): the config's `github_repos`, plus every repo
+  a live fleet agent names, plus the repo of every charter it holds. The
+  forwarder runs
   `gh webhook forward --repo=<repo> --events=<list> --url=http://127.0.0.1:<port>/github --secret=<secret>`,
   where `<port>` belongs to a listener the daemon opens on localhost only.
 - **Events:** `issues` (including edits and label changes such as
@@ -429,7 +432,7 @@ SG1 before PR 5 builds on them.
 |---|---|
 | "Webhook forwarding is only designed for use during testing and development. It is not supported for use in production environments." | Acceptable for one person's local fleet. If GitHub withdraws it, fall back to the catch-up read on a long interval |
 | "Only one person can use webhook forwarding at a time for each repository and organization." A second forwarder gets `Hook already exists` | The daemon reports the conflict in `status` and a toast, and falls back to catch-up reads for that repo |
-| Creating the hook requires admin on the repo; `--org` needs the `admin:org_hook` scope | `fleet-doctor` checks for admin before a repo is watched |
+| Creating the hook requires admin on the repo; `--org` needs the `admin:org_hook` scope | `fleet-doctor` checks for admin before a repo is watched. From PR 15, a repo whose forwarder fails for this reason (or because the repo does not exist yet) is read on a poll instead, shown in `status`, with one toast |
 | `--secret` is passed on the command line, so other local users can see it in `ps` | A new secret for every forwarder start, never stored. Acceptable on a single-user machine |
 
 | Spike | Passes when |
@@ -444,13 +447,14 @@ fleet metadata), so `--from` is never typed.
 
 | Command | Who | Effect |
 |---|---|---|
-| `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6 |
+| `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working` and `paused` are riders: kept until a message carries them, never waking. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
 | `fleet-switchboard decisions [--json] [--fresh] [--watch]` | You, or any agent (PR 14) | The open decisions waiting on you, one line each: `#2a  waiting 12m  platform  Close #2? and a second deploy run?`. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `errors`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty list prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
 | `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
+| `fleet-switchboard launch <name> --agent <a> --dir <d> [--repo owner/repo] [--new-workspace <label>]` | Chief of Staff, an orchestrator (PR 3; PR 15) | Starts a fleet agent in a new tab, without typing. `--repo` sets its `metadata.fleet.repo` and gives it its repo's `gh` account as `GH_TOKEN`; `--new-workspace` first creates a herdr workspace (never focused) in `--dir`, refusing a `--charter` whose `workspace:` line differs from the label |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -971,13 +975,13 @@ decision by its id in chat ("answer #2a: yes"). It is **derived, never the sourc
 of truth** (invariant 1): every row comes from a fact that already lives
 somewhere else, and deleting the file loses nothing.
 
-**What is a decision.** Each is `{id, title, ask, agent, kind, since}`, oldest
+**What is a decision.** Each is `{id, title, ask, repo, agent, kind, since}`, oldest
 first, from three sources, one function (`derive_decisions`) that reuses the
 readers the pass already has:
 
 | Source | `kind` | Row | Read from |
 |---|---|---|---|
-| An open issue with your label (`awaiting_label`, default `<OS user>:awaiting-user`, as in `skills/fleet-charter`) | `issue` | The issue title; agent is the orchestrator that owns the issue | The hub's picture: `issues` and `issue_comment` webhook events keep it, and the catch-up read (one `gh api` call per forwarder start, never per pass) makes it right |
+| An open issue with your label (`awaiting_label`, default `<OS user>:awaiting-user`, as in `skills/fleet-charter`) | `issue` | The issue title; agent is the orchestrator that owns the issue | The hub's picture of every watched repo (PR 15): `issues` and `issue_comment` webhook events keep it, and the catch-up read (one `gh api` call per repo per forwarder start, never per pass, with that repo's own account) makes it right |
 | A pending permission request or question of any fleet agent, a boss with no boss included | `permission`, `question` | `permission: shell echo hi`, the agent that asked | What `WorkerFacts` already reads for a blocked agent |
 | A `question` or `blocked` report delivered to a boss and not answered | `report` | The report's line, the worker that sent it | The boss's transcript (`decisions_lookback_hours`, default 72) |
 
@@ -998,6 +1002,20 @@ hash collision the decision that has waited longer keeps its id and the later on
 takes the next free one, so two open decisions never share an id. An id can be
 reused later for a different decision only by chance, after the first has
 resolved. The price of hashing is that ids are not `a`, `b`, `c`.
+
+**Ids and repos (PR 15).** A decision names its repo (`repo`, `owner/name`, or
+null for one about no issue) and its id is written as a message writes an issue:
+`#5` while one repo is watched, `api#5` or `api#2ka` while several are
+(`acme/api#5` if two of them share a name). The same number in two repos is two
+decisions with two ids (scenario D6; the `bare-issue-number` fault drops the
+repo from the id). The list reads **every watched repo**, the derived set of
+"Many repos (PR 15)", not the baseline in the config and not only `intent_repo`,
+each with its own `gh` account (`gh_users`); `decisions --fresh` does the same.
+A repo that cannot be read is an entry in `errors` naming it, and the issues
+last seen there stay listed. A pending request or report takes its repo from
+the worker's `repo` (or the tag its report line carries). `status` adds the
+count per repo when decisions span several, `pending` and the blocked-worker
+toast and message say `(issue api#2)`, and the plugin shows the id, so the tag.
 
 **`decisions.json`.** The daemon recomputes the list at the end of every pass and
 writes `$STATE/decisions.json` (mode 0600; temp file and rename, so a reader
@@ -1060,6 +1078,117 @@ Faults (Lab only), one per behaviour: `no-decisions-file` (the file is never
 written), `stale-as-fresh` (an old file is shown as current), `decision-resolves-never`
 (an answered report stays listed). Scenarios D2 to D5 are new, and R3 now also expects
 the file back.
+
+### Many repos (PR 15)
+
+One Chief of Staff, many independent projects. The structure is fixed:
+
+- **One Chief of Staff,** in its own herdr workspace. It never does work; it
+  commissions it.
+- **One orchestrator per project,** in that project's own herdr workspace (one
+  workspace per repo checkout); its coders are tabs in that workspace. The
+  charter's `workspace:` line is the exact herdr workspace label. The
+  orchestrator keeps the name `orchestrator`.
+- **The projects are independent:** different repos, usually different GitHub
+  owners and different `gh` accounts (one account cannot see another's repos).
+  One daemon, one fleet, many repos.
+
+**The watched repos are derived, not listed.** On every pass the daemon watches
+the config's `github_repos` (the baseline), plus every `repo` named in a live
+fleet agent's session metadata, plus the repo of every charter it holds (an agent
+with a `charter` and no `repo` is in `intent_repo`). The pass reconciles the
+forwarders: it starts one for a repo that joins and stops it when no live agent
+and no baseline names the repo any more. There is no registry file; deleting the
+state loses nothing (invariant 8), because the next pass derives the same set. A
+fleet that cannot be read (herdr or v2 unreachable) changes nothing: a glitch
+never drops a watch. The `static-repos` fault reads the baseline only.
+
+**A repo whose forwarder cannot work is polled.** When a forwarder exits because
+the repo does not exist yet, or the account cannot create a webhook (it needs
+admin on the repo), the repo falls back to the catch-up read, run on a poll every
+`github_poll_seconds` (default 60, at least 15). A poll asks only for what
+changed since the poll before, with two polls of slack, so it costs about four
+`gh api` calls (comments, issues, pulls and runs, plus two per PR that changed),
+not a day's reading. The forwarder keeps retrying on its own backoff, so a repo
+that does not exist yet starts forwarding when it appears, and the polling stops
+once it has connected. While a repo is polled, `status` says so and why, and one
+toast is raised (not one per retry).
+
+**Issue references are repo-qualified.** An issue number alone is ambiguous across
+repos, so `owner/repo#N` is accepted wherever a number is: `send --issue`,
+`report --issue`, `intent`, `handoff`, `remind`, `comment` and `launch --issue`.
+Internally a fact carries its repo beside its issue. With no qualifier the repo
+is the caller's own (`metadata.fleet.repo`), else `intent_repo`. When more than
+one repo is watched, a bare number from a caller with no repo is refused, and the
+refusal lists the choices (`acme/api#2` or `acme/web#2`). With more than one repo
+in play a message names an issue with a short tag, `api#2` (`acme/api#2` if two
+repos share a name), and the ask header, `intents`, `pending` and the judge's
+context all read the right repo's Intent. The `intent.edit` key includes the repo.
+With one repo nothing changes: no tag, no qualifier needed. The `bare-issue-number`
+fault ignores the qualifier.
+
+**A `gh` account per repo, and never a secret in text.** The config's `gh_users`
+maps `"owner/repo"` or `"owner/*"` to a `gh` account name: the repo entry first,
+then the owner entry, then the default (the token in the daemon's own
+environment, or `gh`'s active account). The token comes from `gh auth token --user
+<account>` at the moment it is used, is held in memory for a minute, and is
+passed only in a child's environment as `GH_TOKEN`: the daemon's forwarders, its
+catch-up and lookup reads, its Intent reads, the judge's reads, `comment`, and an
+agent that `launch` starts. It is never in an argument list, a URL, a log, an
+audit entry, a message or an error (text read back from a child has it scrubbed
+out). The audit names the variable (`GH_TOKEN`), never its value. `launch`
+refuses, naming the entry it wants, when `gh_users` is set, the repo's owner has
+no entry, and no default token is in the environment. The `one-account` fault
+uses the default token for every repo.
+
+**Commissioning a project.** The Chief of Staff does not create repos and never
+runs `gh repo create`; it commissions a worker to. The `fleet-setup` skill is the
+procedure: check the account map, record a decision for the person ("Create
+acme/web (private) under account acme-ci?": an `awaiting-user` issue in an
+existing repo, or a question through an orchestrator, or chat), and on a yes
+create the workspace and launch an orchestrator whose brief is to create the
+repo, its `<user>:orchestrator` and `<user>:awaiting-user` labels and the charter
+issue; then confirm with `status` that the repo is watched and say plainly if it
+is not.
+
+- `launch --new-workspace <label> --dir <checkout> ...` runs `herdr workspace
+  create --cwd <dir> --label <label> --no-focus` (it never takes the person's
+  focus), takes the workspace id it returns, and then follows the existing launch
+  path unchanged. If the `--charter` it was given has a `workspace:` line that
+  differs from the label, it refuses before anything is made (an exact match). A
+  charter that cannot be read is refused too. `--workspace` and `--new-workspace`
+  together are refused. If the launch fails after the workspace was created, the
+  error says the workspace is left for the person to close.
+- **Creating a repo is a decision, and the judge says so without asking a model.**
+  The tool-call judge treats `gh repo create`, `gh repo delete`, `gh repo edit
+  --visibility` and a POST to `/orgs/*/repos` (or `/user/repos`, with `-X POST`
+  or any `-f` field) as `hard_to_reverse` whatever the thresholds say, and
+  without a model call or a GitHub read, so a slow or unreachable model does not
+  change it. Like every judgement it only tightens: the configured outcome is
+  the floor. It applies where the judge is enabled (PR 9). The `repo-create-allowed`
+  fault switches the rule off.
+
+**Status.** `status` lists, for each watched repo, how it is watched
+(`forwarder`, `polling every Ns`, `failed` with the reason, or `conflict`), the
+account name it uses (`default` when none is mapped; never a token) and the fleet
+agents in it. `--json` carries the same under `github.detail`. `fleet-doctor`
+is unchanged.
+
+| Config key | Default | What |
+|---|---|---|
+| `github_repos` | `[]` | The baseline of watched repos; the derived set adds to it |
+| `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
+| `github_poll_seconds` | `60` | How often a repo with no forwarder is read; at least 15 |
+
+| Fault (Lab only) | What it switches off | Proved by |
+|---|---|---|
+| `static-repos` | The watched set is read once from the config | M2 |
+| `bare-issue-number` | A qualifier is ignored: the caller's repo is used; a decision's id drops its repo | tests of `intent` and `send`, D6 |
+| `one-account` | Every repo is read with the default token | M3 |
+| `repo-create-allowed` | The judge's rule on `gh repo create` and its kin | M5 |
+
+A decision's identity across repos is done: see "Ids and repos (PR 15)" under
+Decisions.
 
 ### Data
 
@@ -1416,7 +1545,9 @@ removes it:
   the scenario. Faults: `no-engagement-gate`, `no-recheck`, `no-dedupe`,
   `steer-not-queue`, `no-batch`, `no-intent-header`, `no-classify`,
   `crash-after-send`, `no-policy-judge`, `judge-loosens`, `no-maxims` (the
-  role definitions without their Maxims block).
+  role definitions without their Maxims block), and the PR 15 faults
+  `static-repos`, `bare-issue-number`, `one-account` and `repo-create-allowed`
+  (see [Many repos](#many-repos-pr-15)).
 - **A baseline.** The same scenario run against today's system, for example
   with `fleet-heartbeat` delivering wakes. This shows the scenario catches the
   original problem.
@@ -1497,6 +1628,12 @@ R1.
 | D3 | A worker's `report question` is listed until its boss answers with `send` | — | Resolution is derived from both transcripts | PR 14 | offline; control `decision-resolves-never` |
 | D4 | The decisions file is deleted | — | A disposable projection: the next pass writes it again | PR 14 | offline; control `no-decisions-file` |
 | D5 | The daemon stops | — | A list older than 120 s is stale, never current | PR 14 | offline; control `stale-as-fresh` |
+| D6 | Two repos, an `awaiting-user` issue each with the same number | — | Two decisions, each with its own repo tag (`api#2`, `web#2`) | PR 15 | offline; control `bare-issue-number` |
+| M2 | A repo joins the watch when an agent naming it launches, and leaves it when the agent is gone | — | The watched repos are derived on every pass | PR 15 | offline; control `static-repos` |
+| M3 | Two repos, two `gh` accounts, the same issue number | — | One account per repo; each agent sees its own repo's Intent and nothing of the other's | PR 15 | offline; control `one-account` |
+| M4 | A repo whose account cannot create a webhook | — | Read on a poll; `status` and one toast say so | PR 15 | offline; control: the account may create it |
+| M5 | A worker runs `gh repo create` | — | Repo creation is always hard to reverse (deterministic rule) | PR 15 | offline; control `repo-create-allowed` |
+| M6 | `launch --new-workspace` with a label the charter does not name | — | Refused before anything is made | PR 15 | offline; control: the label matches |
 
 ## Repo and PR conventions
 
@@ -1960,3 +2097,34 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   change cannot say the daemon is alive. Scenarios D2 to D5 are new; R3 also expects
   the file back; every offline scenario now also writes `decisions.json`, which
   changed nothing else.
+- 2026-10-06: PR 15, one Chief of Staff, many independent projects. Before this
+  the daemon read `github_repos` once at start, so a new repo's events never
+  arrived and nothing said so; an issue number named no repo; and one `gh`
+  account served everything. Changed: the watched set is derived on every pass
+  (baseline, live agents' `repo`, charters' repos), forwarders are reconciled, and
+  a repo whose forwarder cannot work is read on a poll, with one toast and a line
+  in `status`; `owner/repo#N` is accepted wherever an issue number is, facts carry
+  their repo, and a bare number from a caller with no repo is refused when several
+  are watched; `gh_users` gives each repo or owner its `gh` account, the token
+  coming from `gh auth token --user` into a child's environment only (a test
+  searches every audit line, message and error of a two-account play, with a `gh`
+  that echoes the token into its own errors, for the fake tokens); `launch --repo`
+  and `launch --new-workspace` (`herdr workspace create ... --no-focus`, charter
+  label checked exactly); the judge treats `gh repo create` and its kin as
+  `hard_to_reverse` with no model; the Chief of Staff's role file and the new
+  `fleet-setup` skill say how to commission a project. Faults `static-repos`,
+  `bare-issue-number`, `one-account` and `repo-create-allowed`; scenarios M2 to M6.
+  Not measured against real GitHub: the exact text the real forwarder prints when
+  the account lacks admin or the repo is missing (classified by the words "admin
+  rights", "403", "Not Found"), and the real `herdr workspace create` reply (read
+  as `result.workspace.workspace_id`, from herdr's own agent guide).
+  This branch was first built in parallel with PR 14 (the Decisions list) and
+  rebased onto it, which left a join open; it is closed here. A decision carries
+  its repo and its id is tagged like a message (`api#2`, only when several repos
+  are watched); `pending`, `status` and `decisions` show it; the Decisions list,
+  the `awaiting-user` read and the blocked-worker toast read every watched repo
+  (the derived set, not the config's list or `intent_repo`), each with its own
+  account. The rebase conflicted in `catch_up` (PR 14's awaiting read and PR 15's
+  poll window both kept) and `build_engine` (`state_dir` and `engine.accounts`
+  both set). Scenario D6 (two repos, the same issue number, two decisions) with
+  `bare-issue-number` as its control.

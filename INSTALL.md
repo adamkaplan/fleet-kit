@@ -169,15 +169,16 @@ it. Create the prefixed one alongside.
 ## STEP 8 — Install the skills
 
 ```
-CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination
-         Both present?  -> skip to STEP 9.
+CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination ~/.agents/skills/fleet-setup
+         All present?  -> skip to STEP 9.
 DO:      mkdir -p ~/.agents/skills
          ln -s "$PWD/skills/fleet-charter"     ~/.agents/skills/fleet-charter
          ln -s "$PWD/skills/fleet-coordination" ~/.agents/skills/fleet-coordination
+         ln -s "$PWD/skills/fleet-setup"       ~/.agents/skills/fleet-setup
 VERIFY:  Copilot CLI:  copilot skill list
          opencode:     ls ~/.agents/skills/fleet-*/SKILL.md
-PROVES:  Copilot CLI: both named under "Personal skills", with their descriptions.
-         opencode: both SKILL.md paths listed, through the links.
+PROVES:  Copilot CLI: all three named under "Personal skills", with their descriptions.
+         opencode: all three SKILL.md paths listed, through the links.
 ```
 
 **Symlink, do not copy.** `~/.agents/skills/` is read natively by Copilot CLI,

@@ -164,6 +164,7 @@ class TestConfig(Base):
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "intent_repo": None, "intent_required": True,
+            "gh_users": {}, "github_poll_seconds": 60,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
             "policy": sb.POLICY_DEFAULTS,  # PR 9
             **sb.V1_MOVE_DEFAULTS})  # PR 10: pinned in TestImportV1Config
@@ -550,7 +551,7 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_process_info",
-                                  "pane_report_metadata_token"])
+                                  "pane_report_metadata_token", "workspace_create"])
 
     def test_the_socket_admits_one_method_and_sends_no_focus_key(self):
         sent = []
@@ -739,7 +740,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion",
               "no-import-metadata", "idle-wakes", "no-rider", "no-nudge-once", "no-fail-open",
               "ignore-reports", "no-description",
-              "no-decisions-file", "stale-as-fresh", "decision-resolves-never")  # PR 14
+              "no-decisions-file", "stale-as-fresh", "decision-resolves-never",  # PR 14
+              "static-repos", "bare-issue-number", "one-account", "repo-create-allowed")  # PR 15
 
 
 class TestFaults(Base):
@@ -994,7 +996,8 @@ STEP_EXAMPLES = {
     "away": {},
     "delete-state": {},
     "permission": {"to": "coder", "decision": "always"},
-    "comment": {"issue": 2, "body": "looks good"},
+    "comment": {"issue": 2, "body": "looks good", "repo": "acme/web"},  # PR 15
+    "leave": {"agent": "coder"},  # PR 15
     "kill-daemon": {}, "restart-daemon": {}, "wait": {},
     "close-pane": {"agent": "coder"},
     "edit-intent": {"issue": 2, "intent": "Add a health check and a probe", "done_when": None},
@@ -1004,7 +1007,7 @@ STEP_EXAMPLES = {
     "fact": {"to": "platform", "key": "lab.fact:1", "summary": "s", "kind": "review", "issue": 2,
              "from": "coder", "batch": False},
     "pass": {"faults": ["no-dedupe", "crash-after-send"]},
-    "launch": {"agent": "coder", "brief": "Add a health check"},
+    "launch": {"agent": "coder", "brief": "Add a health check", "new_workspace": "Acme Web"},
     "handoff": {"issue": 2, "brief": "Done so far: a\nNext steps: b"},  # PR 8
     "report": {"state": "done", "text": "PR is up", "issue": 2},  # PR 13
     "awaiting": {"issue": 5, "on": True, "title": "Pick the database"},  # PR 14
@@ -1021,7 +1024,11 @@ EXPECT_EXAMPLES = {
     "message_has_intent": {"to": "platform", "issue": 2},
     "classified": {"agent": "cos", "step": 1, "as": "current-work"},
     "handed_off": {"issue": 3},
-    "toast": {"agent": "coder", "text": "held"},
+    "toast": {"agent": "coder", "text": "held", "count": 1},
+    "repo_watch": {"repo": "acme/web", "how": "polling"},  # PR 15
+    "repo_membership": {"repo": "acme/web", "joined": True, "left": False},
+    "status_says": {"text": "polling every"},
+    "launch_refused": {"agent": "coder", "text": "Acme Web"},
     "tool_outcome": {"agent": "coder", "tool": "shell", "outcome": "completed"},
     "judged": {"agent": "cos", "question": "Does it say plainly that the work failed?", "threshold": 0.8},
     "status_is": {"agent": "coder", "status": ["working", "blocked"], "at": "5s"},
@@ -1659,7 +1666,7 @@ class FakeV2:
 
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
-                 ["pane", "process-info"], ["pane", "close"])
+                 ["pane", "process-info"], ["pane", "close"], ["workspace", "create"])
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -1770,7 +1777,8 @@ class FakeHerdr:
         handler = {("agent", "list"): self._agent_list, ("agent", "get"): self._agent_get,
                    ("agent", "prompt"): self._agent_prompt, ("pane", "report-metadata"): self._report_metadata,
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
-                   ("pane", "close"): self._pane_close}.get(tuple(args[:2]))
+                   ("pane", "close"): self._pane_close,
+                   ("workspace", "create"): self._workspace_create}.get(tuple(args[:2]))
         if handler is None:
             return _usage(argv, "fake herdr: refused %r" % args)
         try:
@@ -1850,6 +1858,23 @@ class FakeHerdr:
         processes = [{"cmdline": program, "name": program.split(" ")[0].rsplit("/", 1)[-1], "pid": 4242}] if program else []
         return {"result": {"type": "pane_process_info", "process_info": {
             "pane_id": pane, "foreground_processes": processes, "shell_pid": 4242}}}
+
+    def _workspace_create(self, rest):
+        """`herdr workspace create [--cwd PATH] [--label TEXT] [--env K=V] [--focus|--no-focus]`, as 0.9.3
+        has it: nothing positional, no other flag, and the two focus flags never together."""
+        positional, flags = parse_flags(rest, ("--cwd", "--label", "--env"), ("--focus", "--no-focus"))
+        if positional:
+            raise ValueError("workspace create takes no positional argument")
+        if "--focus" in flags and "--no-focus" in flags:
+            raise ValueError("--focus and --no-focus conflict")
+        self.workspaces = getattr(self, "workspaces", [])
+        number = len(self.workspaces) + 2
+        entry = {"workspace_id": "w%d" % number, "label": (flags.get("--label") or [None])[0],
+                 "cwd": (flags.get("--cwd") or [None])[0], "focused": "--focus" in flags}
+        self.workspaces.append(entry)
+        return {"id": "cli:workspace:create", "result": {"type": "workspace_created", "workspace": dict(entry),
+                                                        "tab": {"tab_id": "w%d:t1" % number},
+                                                        "root_pane": {"pane_id": "w%d:p0" % number}}}
 
     def _pane_close(self, rest):
         positional, _ = parse_flags(rest, ())
@@ -3677,7 +3702,7 @@ class OfflineRun:
 
     @staticmethod
     def fleet_of(member):
-        return {key: member[key] for key in ("role", "reports_to", "issue", "charter") if key in member}
+        return {key: member[key] for key in ("role", "reports_to", "issue", "charter", "repo") if key in member}
 
     def run(self):
         steps = list(self.scenario["steps"])
@@ -3762,7 +3787,8 @@ class OfflineRun:
         done = sb.launch_agent(
             world.new_engine("cli"), name, "coder" if member["role"] == "coder" else member["role"], str(self.work),
             "w1", member["role"], member.get("reports_to"), member.get("issue"), step.get("brief"),
-            patience=5, sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+            patience=5, sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds),
+            repo=member.get("repo"))
         world.sessions[name], world.panes[name] = done["session"], done["pane"]
         self.launched[name] = done
 
@@ -4147,6 +4173,8 @@ class FakeGitHub:
         self.issues, self.comments, self.pulls, self.reviews, self.suites, self.runs = {}, [], {}, {}, [], []
         self.procs, self.api_calls, self.occupied = [], [], False
         self.api_down, self.spawn_error, self.exit_text = False, None, "error: Hook already exists on %s\n" % repo
+        self.token, self.exists, self.webhook_ok = None, True, True  # PR 15: who may read it, whether it is there
+        self.leak = False
 
     def stamp(self):
         return sb.iso(self.clock.now())
@@ -4209,13 +4237,23 @@ class FakeGitHub:
         if proc is not None:
             proc.exit(1)
 
-    def spawn(self, argv, log_path):
+    def spawn(self, argv, log_path, env=None):
         if self.spawn_error:
             raise OSError(self.spawn_error)
         proc = FakeProc(argv)
+        proc.env = env
         self.procs.append(proc)
         if self.occupied:
             Path(log_path).write_text(self.exit_text)
+            proc.exit(1)
+        elif not self.exists:
+            Path(log_path).write_text("error: HTTP 404: Not Found (https://api.github.com/repos/%s/hooks)\n" % self.repo)
+            proc.exit(1)
+        elif not self.webhook_ok:
+            Path(log_path).write_text("error: Must have admin rights to Repository.\n")
+            proc.exit(1)
+        elif self.token is not None and (env or {}).get("GH_TOKEN") != self.token:
+            Path(log_path).write_text("error: HTTP 401: Bad credentials\n")
             proc.exit(1)
         return proc
 
@@ -4225,9 +4263,26 @@ class FakeGitHub:
             raise AssertionError("a test reached for a real binary: %r" % argv[:2])
         path = argv[-1]
         self.api_calls.append(path)
+        if not self.exists or (self.token is not None and (kwargs.get("env") or {}).get("GH_TOKEN") != self.token):
+            if self.leak:  # a hostile gh that echoes the credential it was given into its error
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 401 bad credentials %s\n"
+                                                   % (kwargs.get("env") or {}).get("GH_TOKEN"))
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
         if self.api_down:
             return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502\n")
-        data = self.answer(path.split("?")[0][len("repos/%s/" % self.repo):], urllib_query(path))
+        bare = path.split("?")[0][len("repos/%s/" % self.repo):]
+        found = re.match(r"^issues/(\d+)/(parent|sub_issues)$", bare)
+        if found:  # PR 15: what the Intent reader asks (GET only)
+            number, which = int(found.group(1)), found.group(2)
+            mine = self.issues.get(number, {})
+            children = [i for i in self.issues.values()
+                        if str(i.get("parent_issue_url", "")).endswith("/issues/%d" % number)]
+            parent = self.issues.get(_url_tail(mine.get("parent_issue_url")))
+            if which == "parent" and parent is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+            data = parent if which == "parent" else children
+        else:
+            data = self.answer(bare, urllib_query(path))
         pages = data if "--paginate" in argv and isinstance(data, list) else [data]
         if isinstance(data, list):
             pages = [[item] for item in data] if "--paginate" in argv else [data]
@@ -4267,6 +4322,11 @@ class FakeGitHub:
         if path == "actions/runs":
             return {"workflow_runs": self.runs}
         raise AssertionError("fake gh api: no route for %r" % path)
+
+
+def _url_tail(url):
+    match = re.search(r"/issues/(\d+)$", url or "")
+    return int(match.group(1)) if match else None
 
 
 def urllib_query(path):
@@ -4328,6 +4388,8 @@ def _github_extend_offline_run():
     original_init, original_apply, original_pass = OfflineRun.__init__, OfflineRun.apply, OfflineRun.one_pass
 
     def uses_github(scenario):
+        if "repos" in scenario:  # PR 15: see _repos_extend_offline_run
+            return False
         return any(s["do"] in GITHUB_STEPS for s in scenario["steps"]) or \
             any(e["that"] == "github_watch" for e in scenario["expect"])
 
@@ -5418,11 +5480,16 @@ class TestGithubDaemon(Base):
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
 
-    def test_no_repo_means_no_hub_and_no_change_to_the_daemon(self):
+    def test_no_repo_means_a_hub_with_no_watches_that_opens_and_starts_nothing(self):
+        # PR 15: the watched set is derived on every pass, so the hub always exists; with nothing to watch it idles
         engine, state, config = sb.build_engine(self.world.route, self.world.clock.now, "daemon")
-        before = list(engine.sources)
-        self.assertIsNone(sb.attach_github(engine, config, state, self.world.route, self.world.clock.now))
-        self.assertEqual(engine.sources, before)
+        with mock.patch.object(sb.signal, "signal"):
+            hub = sb.attach_github(engine, config, state, self.world.route, self.world.clock.now)
+        self.assertIsNotNone(hub)
+        self.assertEqual(hub.watches, {})
+        with mock.patch.object(sb.GitHubHub, "open_listener") as opened:
+            engine.run_pass()
+        opened.assert_not_called()
 
     def test_with_repos_the_hub_is_a_fact_source_and_the_daemon_starts_it_only_inside_its_lock(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO]})
@@ -5479,7 +5546,7 @@ class TestGithubScenarios(Base):
     def test_the_vocabulary_has_the_github_kinds(self):
         for do in ("kill-forwarder", "occupy-hook"):
             self.assertEqual(sc.STEP_ACTORS[do], ("world",))
-        self.assertEqual(sorted(sc.STEP_FIELDS["comment"]), ["body", "from", "id", "issue"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["comment"]), ["body", "from", "id", "issue", "repo"])
         self.assertEqual(sc.WATCH_STATES, sb.WATCH_STATES)
 
     def test_a_scenario_that_loses_its_forwarder_without_catch_up_loses_the_comment(self):
@@ -5678,7 +5745,8 @@ def _toasts(world):
 def oracle_toast(self, e):
     shown = [t for t in _toasts(self.world)
              if e.get("agent", "") in t["title"] + " " + t["body"] and e.get("text", "") in t["title"] + " " + t["body"]]
-    return bool(shown), "%d matching toast(s) of %d: %s" % (
+    ok = len(shown) == e["count"] if "count" in e else bool(shown)  # PR 15: `count` is exact
+    return ok, "%d matching toast(s) of %d: %s" % (
         len(shown), len(_toasts(self.world)), [t["title"] for t in shown][:3])
 
 
@@ -6588,16 +6656,20 @@ class FakeGH:
     done_when, parent. A charter's body is its yaml block.
     """
 
-    def __init__(self, issues, charters, clock):
+    def __init__(self, issues, charters, clock, repo=FAKE_REPO, token=None):
         self.issues = {int(n): dict(v) for n, v in issues.items()}
         self.charters, self.clock = set(charters), clock
         self.revision, self.updated = {}, {}
         self.calls, self.down = [], False
+        self.repo, self.token = repo, token  # PR 15: which repo this is, and the one token that may read it
+        self.api = "repos/%s/issues/" % repo
 
     def body(self, number):
         if number in self.charters:
             line = self.issues[number].get("authority")  # PR 9: a charter's Standing authority line
-            return "```yaml\norchestrator: platform\nstatus: active\n```\n\nThe charter.\n" + (
+            workspace = self.issues[number].get("workspace")  # PR 15: a charter's `workspace:` line
+            return "```yaml\norchestrator: platform\n%sstatus: active\n```\n\nThe charter.\n" % (
+                "workspace: %s\n" % workspace if workspace else "") + (
                 "\nStanding authority: %s\n" % line if line else "")
         issue = self.issues[number]
         return intent_body(issue.get("intent"), issue.get("done_when"), self.revision.get(number, 0))
@@ -6624,7 +6696,12 @@ class FakeGH:
             raise AssertionError("fake gh serves `gh api <path>` only, a GET; got %r" % argv)
         if self.down:
             return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
-        match = re.match(r"^%s(\d+)(/parent|/sub_issues\?per_page=100)?$" % re.escape(ISSUES_API), argv[2])
+        if self.token is not None and (kwargs.get("env") or {}).get("GH_TOKEN") != self.token:
+            if getattr(self, "leak", False):  # a hostile gh that echoes the credential into its error
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 401 bad credentials %s\n"
+                                                   % (kwargs.get("env") or {}).get("GH_TOKEN"))
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        match = re.match(r"^%s(\d+)(/parent|/sub_issues\?per_page=100)?$" % re.escape(self.api), argv[2])
         if not match or int(match.group(1)) not in self.issues:
             return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
         number, tail = int(match.group(1)), match.group(2)
@@ -6645,7 +6722,7 @@ def post_comment(self, argv, kwargs):
     """PR 8: `gh api repos/R/issues/N/comments --method POST --input -` with {"body": ...} on stdin,
     and nothing else. Any other write raises, so a stray write cannot pass for the handoff."""
     path = argv[2] if len(argv) > 2 else ""
-    found = re.match(r"^%s(\d+)/comments$" % re.escape(ISSUES_API), path)
+    found = re.match(r"^%s(\d+)/comments$" % re.escape(self.api), path)
     if argv[:2] != [FAKE_GH, "api"] or argv[3:] != ["--method", "POST", "--input", "-"] or not found:
         raise AssertionError("fake gh writes only a comment: gh api <issues>/N/comments --method POST --input -; got %r"
                              % (argv,))
@@ -6659,13 +6736,13 @@ def post_comment(self, argv, kwargs):
     comments = self.__dict__.setdefault("comments", [])
     comments.append({"issue": number, "body": json.loads(kwargs["input"])["body"]})
     return subprocess.CompletedProcess(argv, 0, json.dumps({
-        "id": 9000 + len(comments), "html_url": "https://example.test/%s/issues/%d#c%d" % (FAKE_REPO, number, len(comments))}), "")
+        "id": 9000 + len(comments), "html_url": "https://example.test/%s/issues/%d#c%d" % (self.repo, number, len(comments))}), "")
 
 
 def attach_intent_lab(run):
     """The offline runner's seam: a scenario with `issues` gets a fake GitHub and a reader over it."""
     run.ask_gh = None
-    if "issues" not in run.scenario:
+    if "issues" not in run.scenario or "repos" in run.scenario:  # PR 15: a play with repos has its own GitHub
         return
     charters = {m["charter"] for m in run.scenario["cast"].values() if "charter" in m}
     run.ask_gh = FakeGH(run.scenario["issues"], charters, run.world.clock)
@@ -12234,7 +12311,8 @@ class TestRiders(ReportBase):
             ["key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider"]))
         with self.assertRaises(sb.FactError):
             fact("k3", rider="yes")
-        self.assertEqual(sorted(set(sb.Fact.FIELDS) - {"sender"}), sorted(set(carried.to_json()) - {"from"}))
+        self.assertEqual(sorted(set(sb.Fact.FIELDS) - {"sender", "repo"}), sorted(set(carried.to_json()) - {"from"}))
+        self.assertEqual(fact("k4", repo="acme/api").to_json()["repo"], "acme/api")  # PR 15: only when it has one
 
     def test_pending_that_is_all_riders_yields_no_plan(self):
         plan = sb.decide("platform", [fact("a", rider=True), fact("b", rider=True)], observation(), EPOCH + 999,
@@ -12825,7 +12903,7 @@ class TestDecisionDerivation(DecisionsBase):
         self.assertRegex(found["id"], r"^#2[a-z]{2}$")
         self.assertIn("shell echo hi", found["title"])
         self.assertEqual(found["since"], sb.iso(EPOCH))
-        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "since", "title"])
+        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "repo", "since", "title"])
 
     def test_an_agent_with_no_boss_is_listed_too(self):
         self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=86400)
@@ -13661,11 +13739,1252 @@ class TestDecisionsScenarios(Base):
                 self.assertTrue(sb.fault(name))
 
     def test_the_vocabulary_has_the_decision_steps_and_oracles(self):
-        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "title"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "repo", "title"])
         self.assertEqual(sorted(sc.STEP_FIELDS["send"]), ["issue", "text", "to"])
         self.assertEqual(sc.STEP_FIELDS["delete-decisions"], {})
         self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions"]), ["at", "count", "text"])
         self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions_say"]), ["at", "text"])
+
+
+# ============================================================ PR 15: many repos, one fleet
+
+class TestMultiRepoRefs(Base):
+    def test_a_bare_number_stays_an_int_and_a_qualified_one_names_its_repo(self):
+        bare, qualified = sb.parse_issue_ref("7"), sb.parse_issue_ref("acme/api#7")
+        self.assertEqual((int(bare), sb.issue_repo(bare)), (7, None))
+        self.assertEqual((int(qualified), sb.issue_repo(qualified)), (7, "acme/api"))
+        self.assertEqual(qualified + 1, 8)
+        self.assertEqual(json.dumps({"n": qualified}), '{"n": 7}')
+
+    def test_nonsense_is_refused_with_the_accepted_forms(self):
+        for text in ("", "0", "-1", "acme#2", "acme/api#", "acme/api/x#2", "a b#2", "#"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError) as caught:
+                    sb.parse_issue_ref(text)
+                self.assertIn("owner/repo#N", str(caught.exception))
+
+    def test_the_cli_takes_a_qualified_reference_everywhere_an_issue_goes(self):
+        parser = sb.build_parser()
+        for argv in (["send", "bob", "hi", "--issue", "acme/api#2"], ["report", "done", "ok", "--issue", "acme/api#2"],
+                     ["intent", "acme/api#2"], ["handoff", "--issue", "acme/api#2", "--brief-file", "-"],
+                     ["remind", "bob", "5m", "hi", "--issue", "acme/api#2"],
+                     ["comment", "--issue", "acme/api#2", "--body-file", "-"]):
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                self.assertEqual(sb.issue_repo(args.issue), "acme/api")
+                self.assertEqual(int(args.issue), 2)
+
+    def test_a_tag_is_the_repo_name_and_the_owner_when_two_repos_share_a_name(self):
+        self.assertEqual(sb.issue_tag("acme/api", 2, ["acme/api", "acme/web"]), "api#2")
+        self.assertEqual(sb.issue_tag("acme/api", 2, ["acme/api", "other/api"]), "acme/api#2")
+        self.assertEqual(sb.issue_tag(None, 2, ["acme/api", "acme/web"]), "#2")
+
+
+class TestMultiRepoResolution(Base):
+    def cfg(self, **raw):
+        return sb.validate_config(raw)
+
+    def test_a_qualifier_wins(self):
+        config = self.cfg(intent_repo="acme/api", github_repos=["acme/api", "acme/web"])
+        self.assertEqual(sb.resolve_issue(config, sb.parse_issue_ref("acme/web#3"), {"repo": "acme/api"},
+                                          ["acme/api", "acme/web"]), ("acme/web", 3))
+
+    def test_a_bare_number_is_the_callers_repo_then_the_intent_repo(self):
+        config = self.cfg(intent_repo="acme/api")
+        self.assertEqual(sb.resolve_issue(config, 3, {"repo": "acme/web"}, ["acme/api", "acme/web"]), ("acme/web", 3))
+        self.assertEqual(sb.resolve_issue(config, 3, {}, ["acme/api"]), ("acme/api", 3))
+        self.assertEqual(sb.resolve_issue(self.cfg(), 3, {}, []), (None, 3))
+        self.assertEqual(sb.resolve_issue(config, None, {}, []), (None, None))
+
+    def test_a_bare_number_from_a_caller_with_no_repo_is_refused_when_two_repos_are_watched(self):
+        config = self.cfg(intent_repo="acme/api")
+        with self.assertRaises(sb.IssueRefError) as caught:
+            sb.resolve_issue(config, 3, {"name": "cos"}, ["acme/api", "acme/web"])
+        self.assertIn("acme/api#3", str(caught.exception))
+        self.assertIn("acme/web#3", str(caught.exception))
+
+    def test_the_bare_issue_number_fault_ignores_the_qualifier(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "bare-issue-number"
+        config = self.cfg(intent_repo="acme/api")
+        self.assertEqual(sb.resolve_issue(config, sb.parse_issue_ref("acme/web#3"), {"repo": "acme/api"},
+                                          ["acme/api", "acme/web"]), ("acme/api", 3))
+
+
+class TestMultiRepoConfig(Base):
+    def cfg(self, **raw):
+        return sb.validate_config(raw)
+
+    def test_defaults(self):
+        config = self.cfg()
+        self.assertEqual((config["gh_users"], config["github_poll_seconds"]), ({}, 60))
+
+    def test_good_gh_users(self):
+        config = self.cfg(gh_users={"acme/api": "alice-bot", "acme/*": "acme-ci"}, github_poll_seconds=30)
+        self.assertEqual(config["gh_users"], {"acme/api": "alice-bot", "acme/*": "acme-ci"})
+        self.assertIsNot(config["gh_users"], self.cfg(gh_users=config["gh_users"])["gh_users"])
+
+    def test_bad_values_are_refused_by_name(self):
+        for key, value in (("gh_users", ["a"]), ("gh_users", {"acme": "x"}), ("gh_users", {"acme/api": ""}),
+                           ("gh_users", {"acme/api": 3}), ("gh_users", {"*/api": "x"}),
+                           ("gh_users", {"acme/api": "--token"}), ("gh_users", {"acme/a b": "x"}),
+                           ("github_poll_seconds", 0), ("github_poll_seconds", True), ("github_poll_seconds", "60"),
+                           ("github_poll_seconds", 5)):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    self.cfg(**{key: value})
+                self.assertIn(key, str(caught.exception))
+
+    def test_the_account_is_the_repo_entry_then_the_owner_entry(self):
+        accounts = sb.GhAccounts(self.cfg(gh_users={"acme/api": "alice-bot", "acme/*": "acme-ci"}), FakeRunner())
+        self.assertEqual(accounts.account_for("acme/api"), "alice-bot")
+        self.assertEqual(accounts.account_for("acme/web"), "acme-ci")
+        self.assertIsNone(accounts.account_for("other/x"))
+
+    def test_the_watched_set_is_the_baseline_and_every_live_agents_repo_and_charter(self):
+        config = self.cfg(github_repos=["acme/api"], intent_repo="acme/ops")
+        agents = {"a": {"repo": "acme/web"}, "b": {"charter": 1}, "c": {"role": "coder"}, "d": {"repo": "acme/api"}}
+        self.assertEqual(sb.watched_repos(config, agents), ["acme/api", "acme/ops", "acme/web"])
+        self.assertEqual(sb.watched_repos(self.cfg(), {"c": {"role": "coder"}}), [])
+
+    def test_the_static_repos_fault_reads_only_the_baseline(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "static-repos"
+        config = self.cfg(github_repos=["acme/api"])
+        self.assertEqual(sb.watched_repos(config, {"a": {"repo": "acme/web"}}), ["acme/api"])
+
+    def test_the_four_faults_are_known(self):
+        for name in ("static-repos", "bare-issue-number", "one-account", "repo-create-allowed"):
+            self.assertIn(name, sb.KNOWN_FAULTS)
+
+
+ACME_API, ACME_WEB = "acme/api", "acme/web"
+FAKE_TOKENS = {"alice-bot": "tok-alice-bot-SECRET-1111", "acme-ci": "tok-acme-ci-SECRET-2222"}
+DEFAULT_TOKEN = "tok-default-SECRET-0000"
+
+
+class GitHubFarm:
+    """Several fake repos behind one `gh`. A repo mapped to an account answers only to that account's
+    token, as a repo another account owns would answer 404 to a stranger. `gh auth token --user` hands
+    out the fake tokens. Everything the hub ran is kept in `ran`, for the "secret never text" scan."""
+
+    def __init__(self, clock, repos, accounts=None):
+        self.repos = {repo: FakeGitHub(clock, repo) for repo in repos}
+        self.accounts = dict(accounts or {})  # repo -> gh account
+        for repo, account in self.accounts.items():
+            self.repos[repo].token = FAKE_TOKENS[account]
+        self.ran, self.token_asks = [], []
+        self.hub = None
+
+    def attach(self, hub):
+        self.hub = hub
+        for gh in self.repos.values():
+            gh.hub = hub
+
+    def runner(self, argv, **kwargs):
+        argv = list(argv)
+        self.ran.append(argv)
+        if argv[:2] == [GH_BIN, "auth"]:
+            if argv[2:4] != ["token", "--user"] or "GH_TOKEN" in (kwargs.get("env") or {}):
+                raise AssertionError("fake gh: `auth token --user NAME`, with no GH_TOKEN in the environment: %r" % argv)
+            self.token_asks.append(argv[4])
+            token = FAKE_TOKENS.get(argv[4])
+            if token is None:
+                return subprocess.CompletedProcess(argv, 1, "", "no token found for %s\n" % argv[4])
+            return subprocess.CompletedProcess(argv, 0, token + "\n", "")
+        found = re.match(r"^repos/([^/]+/[^/]+)/", argv[-1])
+        gh = self.repos.get(found.group(1)) if found else None
+        if gh is None:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        return gh.runner(argv, **kwargs)
+
+    def spawn(self, argv, log_path, env=None):
+        self.ran.append(list(argv))
+        repo = next(a for a in argv if a.startswith("--repo="))[len("--repo="):]
+        return self.repos[repo].spawn(argv, log_path, env)
+
+
+class FarmRig:
+    """A hub on a farm of fake repos, over an engine on the fake fleet, on one simulated clock."""
+
+    def __init__(self, test, agents=None, repos=(ACME_API, ACME_WEB), accounts=None, baseline=(), config=None):
+        raw = {"github_repos": list(baseline), "gh": GH_BIN,
+               "gh_users": {repo: account for repo, account in (accounts or {}).items()}}
+        raw.update(config or {})
+        self.world = World(test, agents=(), config=raw)
+        for name, fleet in (agents or {}).items():
+            self.world.add_agent(name, fleet=fleet)
+        self.farm = GitHubFarm(self.world.clock, repos, accounts)
+        self.hub = sb.GitHubHub(self.world.config, self.world.state, sb.AuditLog(self.world.audit_path),
+                                self.farm.runner, self.farm.spawn, self.world.clock.now)
+        self.hub.autostart, self.hub.port = False, 4711
+        self.farm.attach(self.hub)
+        self.world.engine = self.hub.attach(self.world.new_engine())
+
+    def pump(self, seconds, every=5):
+        for _ in range(0, int(seconds), every):
+            self.world.tick(every)
+            self.hub.tick()
+            self.world.engine.run_pass()
+
+    def repo(self, name):
+        return self.farm.repos[name]
+
+    def leave(self, name):
+        self.world.herdr.panes.pop(self.world.panes.pop(name))
+
+    def toasts(self):
+        return [t["title"] for t in self.world.herdr.toasts]
+
+
+# ------------------------------------------- the offline runner's repos (PR 15)
+
+def _repos_extend_offline_run():
+    """Give OfflineRun a play with `repos`: a fake GitHub per repo behind one `gh` (each readable only with its
+    own account's token), a daemon with the hub that derives the watched set, the `comment` step on a named repo,
+    `leave`, `launch` with `new_workspace` (through the CLI, as the Chief of Staff's worker would run it), and the
+    `repo_watch`, `repo_membership`, `status_says` and `launch_refused` oracles. Wraps `__init__` and `apply`;
+    nothing else of the runner is touched."""
+    original_init, original_apply = OfflineRun.__init__, OfflineRun.apply
+
+    def split(key, default):
+        repo, _, number = key.rpartition("#")
+        return repo or default, int(number)
+
+    def charter_numbers(scenario, default):
+        return {(member.get("repo") or default, member["charter"]) for member in scenario["cast"].values()
+                if "charter" in member}
+
+    def init(self, test, scenario, label, faults=(), baseline=None):
+        original_init(self, test, scenario, label, faults, baseline)
+        self.farm, self.launch_results = None, {}
+        if "repos" not in scenario:
+            return
+        repos, world = scenario["repos"], self.world
+        default = sorted(repos)[0]
+        raw = dict(JEV_SCENARIO_CONFIG, **(scenario.get("config") or {}))
+        raw.update({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": GH_BIN, "intent_repo": default,
+                    "gh_users": {name: repo["account"] for name, repo in repos.items() if "account" in repo},
+                    "github_poll_seconds": 30})
+        world.config = sb.validate_config(raw)
+        self.test, self.raw_config = test, {k: v for k, v in raw.items() if k != "jev"}
+        self.farm = GitHubFarm(world.clock, sorted(repos), {n: r["account"] for n, r in repos.items() if "account" in r})
+        for name, repo in repos.items():
+            self.farm.repos[name].webhook_ok = repo.get("webhook", True)
+            self.farm.repos[name].exists = repo.get("exists", True)
+        charters = charter_numbers(scenario, default)
+        for key, issue in sorted(scenario.get("issues", {}).items()):
+            name, number = split(key, default)
+            if (name, number) in charters:
+                workspace = issue.get("workspace")
+                body = "```yaml\norchestrator: platform\n%sstatus: active\n```\n\nThe charter.\n" % (
+                    "workspace: %s\n" % workspace if workspace else "")
+            else:
+                body = intent_body(issue.get("intent"), issue.get("done_when"))
+            self.farm.repos[name].issue(number, parent=issue.get("parent"), body=body)
+        world.intents = sb.IntentReader(GH_BIN, default, self.farm.runner, world.clock.now, 5,
+                                        accounts=sb.GhAccounts(world.config, self.farm.runner, world.clock.now))
+        self.hub = sb.GitHubHub(world.config, world.state, sb.AuditLog(world.audit_path), self.farm.runner,
+                                self.farm.spawn, world.clock.now)
+        self.hub.autostart, self.hub.port = False, 4711
+        self.farm.attach(self.hub)
+        make_engine = world.new_engine
+
+        def new_engine(actor="daemon", writable=True):
+            engine = make_engine(actor, writable)
+            engine.accounts = sb.GhAccounts(world.config, self.farm.runner, world.clock.now)
+            return self.hub.attach(engine) if actor == "daemon" else engine
+
+        world.new_engine = new_engine
+        world.engine = world.new_engine()
+
+    def route(self, argv, **kwargs):
+        return self.farm.runner(argv, **kwargs) if argv[0] == GH_BIN else self.world.route(argv, **kwargs)
+
+    def launch_cli(self, step):
+        name, world = step["agent"], self.world
+        member = self.scenario["cast"][name]
+        argv = ["launch", name, "--agent", "coder" if member["role"] == "coder" else member["role"],
+                "--dir", str(self.work), "--new-workspace", step["new_workspace"], "--role", member["role"]]
+        for flag, key in (("--repo", "repo"), ("--charter", "charter"), ("--issue", "issue")):
+            if key in member:
+                argv += [flag, str(member[key])]
+        if member.get("reports_to"):
+            argv += ["--reports-to", member["reports_to"]]
+        os.environ[sb.FAULT_ENV] = ",".join(self.faults)
+        self.test.write_config(self.raw_config)  # the CLI reads its config from the file, as a person's would
+        with captured() as (out, err):
+            code = sb.main(argv, runner=lambda a, **k: route(self, a, **k), now=world.clock.now,
+                           socket_call=world.herdr.socket)
+        if code == 0:
+            done = json.loads(out.getvalue())
+            world.sessions[name], world.panes[name] = done["session"], done["pane"]
+        self.launch_results[name] = (code, err.getvalue())
+
+    def apply(self, step):
+        do = step["do"]
+        if self.farm is None:
+            return original_apply(self, step)
+        if do == "comment":
+            default = sorted(self.scenario["repos"])[0]
+            self.farm.repos[step.get("repo", default)].comment(
+                int(step["issue"]), step["body"], step.get("id", 1000 + self.scenario["steps"].index(step)),
+                step.get("from", "octocat"))
+        elif do == "awaiting":  # PR 15: the label goes on that repo's issue, with the event that repo would send
+            default = sorted(self.scenario["repos"])[0]
+            self.farm.repos[step.get("repo", default)].set_label(
+                int(step["issue"]), sb.awaiting_label(self.world.config), step["on"], step.get("title"))
+        elif do == "leave":
+            self.world.herdr.panes.pop(self.world.panes[step["agent"]], None)
+        elif do == "launch" and step.get("new_workspace"):
+            launch_cli(self, step)
+        else:
+            original_apply(self, step)
+
+    def audited(self, repo, state):
+        return [e for e in self.world.audit() if e["event"] == "github.watch" and e["subject"] == repo
+                and (e.get("detail") or {}).get("state") == state]
+
+    def oracle_repo_watch(self, e):
+        watch = self.hub.watches.get(e["repo"])
+        how = watch.mode if watch else "absent"
+        return how == e["how"], "%s is watched how: %s (last error: %s)" % (
+            e["repo"], how, watch.last_error if watch else None)
+
+    def oracle_repo_membership(self, e):
+        joined, left = bool(audited(self, e["repo"], "joined")), bool(audited(self, e["repo"], "left"))
+        return (joined, left) == (e["joined"], e["left"]), "%s joined: %s, left: %s" % (e["repo"], joined, left)
+
+    def oracle_status_says(self, e):
+        fleets = sb.discovered_fleets(self.world.engine.discovery)
+        text = "\n".join(sb.format_github(sb.github_status(self.world.config, self.world.state, fleets)))
+        return e["text"] in text, "status says: %s" % " | ".join(text.splitlines())
+
+    def oracle_launch_refused(self, e):
+        code, err = self.launch_results.get(e["agent"], (None, ""))
+        made = getattr(self.world.herdr, "workspaces", [])
+        ok = code not in (None, 0) and e.get("text", "") in err and not made and e["agent"] not in self.world.sessions
+        return ok, "launch exit %s, stderr %r, workspaces created: %d" % (code, err.strip(), len(made))
+
+    OfflineRun.__init__, OfflineRun.apply = init, apply
+    OfflineRun.oracle_repo_watch, OfflineRun.oracle_repo_membership = oracle_repo_watch, oracle_repo_membership
+    OfflineRun.oracle_status_says, OfflineRun.oracle_launch_refused = oracle_status_says, oracle_launch_refused
+
+
+_repos_extend_offline_run()
+
+
+class TestWatchedReposAreDerived(Base):
+    def test_a_repo_joins_when_an_agent_naming_it_appears_and_leaves_when_the_agent_goes(self):
+        rig = FarmRig(self, baseline=[ACME_API])
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API])
+        rig.world.add_agent("web-orch", fleet={"role": "orchestrator", "charter": 1, "repo": ACME_WEB})
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API, ACME_WEB])
+        forwarder = rig.repo(ACME_WEB).forwarder()
+        self.assertIsNotNone(forwarder)
+        rig.leave("web-orch")
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API], "no live agent and no baseline names it any more")
+        self.assertEqual(forwarder.poll(), -15, "its forwarder was stopped")
+        self.assertIsNotNone(rig.repo(ACME_API).forwarder(), "the baseline repo is untouched")
+
+    def test_a_charter_with_no_repo_of_its_own_watches_the_intent_repo(self):
+        rig = FarmRig(self, agents={"orch": {"role": "orchestrator", "charter": 1}}, config={"intent_repo": ACME_WEB})
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_WEB])
+
+    def test_the_static_repos_fault_never_notices_a_new_repo(self):
+        os.environ[sb.FAULT_ENV] = "static-repos"
+        rig = FarmRig(self, agents={"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}},
+                      baseline=[ACME_API])
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API])
+
+    def test_a_watch_that_left_is_never_started_again_by_a_tick_that_already_held_it(self):
+        rig = FarmRig(self, agents={"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}})
+        rig.pump(10)
+        old = rig.hub.watches[ACME_WEB]
+        rig.leave("web-orch")
+        rig.pump(10)
+        before = len(rig.repo(ACME_WEB).procs)
+        rig.world.clock.t += 600
+        rig.hub._tick_watch(old, rig.world.clock.now())  # the supervisor's copy of the list was taken before
+        self.assertEqual(len(rig.repo(ACME_WEB).procs), before)
+
+    def test_an_unreadable_fleet_never_drops_a_watch(self):
+        rig = FarmRig(self, agents={"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}})
+        rig.pump(10)
+        rig.world.herdr.down = True
+        rig.pump(10)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_WEB])
+
+    def test_a_restart_with_no_state_derives_the_same_set_in_one_pass(self):
+        rig = FarmRig(self, agents={"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}})
+        rig.pump(10)
+        shutil.rmtree(str(rig.world.state))
+        rig.world.state.mkdir(mode=0o700)
+        fresh = FarmRig.__new__(FarmRig)
+        fresh.__dict__.update(rig.__dict__)
+        fresh.hub = sb.GitHubHub(rig.world.config, rig.world.state, sb.AuditLog(rig.world.audit_path),
+                                 rig.farm.runner, rig.farm.spawn, rig.world.clock.now)
+        fresh.hub.autostart, fresh.hub.port = False, 4711
+        rig.farm.attach(fresh.hub)
+        fresh.world.engine = fresh.hub.attach(fresh.world.new_engine())
+        fresh.pump(10)
+        self.assertEqual(sorted(fresh.hub.watches), [ACME_WEB])
+
+
+class TestForwarderFallback(Base):
+    AGENTS = {"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}}
+
+    def rig(self, **kwargs):
+        rig = FarmRig(self, agents=self.AGENTS, **kwargs)
+        rig.repo(ACME_WEB).issue(2, parent=1)
+        return rig
+
+    def test_a_repo_without_webhook_rights_is_polled_says_so_and_toasts_once(self):
+        rig = self.rig()
+        rig.repo(ACME_WEB).webhook_ok = False
+        rig.pump(300)
+        watch = rig.hub.watches[ACME_WEB]
+        self.assertTrue(watch.polling)
+        info = watch.to_json()
+        self.assertEqual(info["mode"], "polling")
+        self.assertIn("admin rights", info["last_error"])
+        self.assertEqual(len([t for t in rig.toasts() if ACME_WEB in t]), 1, rig.toasts())
+
+    def test_a_polled_repos_events_still_arrive_without_a_forwarder(self):
+        rig = self.rig()
+        rig.repo(ACME_WEB).webhook_ok = False
+        rig.pump(20)
+        rig.repo(ACME_WEB).comment(2, "please look", 5001, forward=False)
+        rig.pump(260)
+        keys = [k for a in rig.world.admissions("web-orch") for k in a["keys"]]
+        self.assertEqual(keys, ["github.comment:5001"])
+
+    def test_the_poll_is_gentle_on_the_api(self):
+        rig = self.rig(config={"github_poll_seconds": 60})
+        rig.repo(ACME_WEB).webhook_ok = False
+        rig.pump(660)
+        reads = [c for c in rig.repo(ACME_WEB).api_calls if c.startswith("repos/%s/issues/comments" % ACME_WEB)]
+        self.assertLessEqual(len(reads), 13, "one read of comments a minute, not one a pass")
+        self.assertGreaterEqual(len(reads), 8)
+
+    def test_a_repo_that_does_not_exist_yet_retries_and_starts_when_it_appears(self):
+        rig = self.rig()
+        rig.repo(ACME_WEB).exists = False
+        rig.pump(60)
+        watch = rig.hub.watches[ACME_WEB]
+        self.assertEqual(watch.to_json()["mode"], "failed")
+        self.assertIn("Not Found", watch.last_error)
+        rig.repo(ACME_WEB).exists = True
+        rig.pump(400)
+        self.assertEqual(rig.hub.watches[ACME_WEB].to_json()["mode"], "forwarder")
+        self.assertIsNotNone(rig.repo(ACME_WEB).forwarder())
+
+    def test_a_forwarder_that_recovers_stops_the_polling(self):
+        rig = self.rig()
+        rig.repo(ACME_WEB).webhook_ok = False
+        rig.pump(60)
+        self.assertTrue(rig.hub.watches[ACME_WEB].polling)
+        rig.repo(ACME_WEB).webhook_ok = True
+        rig.pump(400)
+        self.assertFalse(rig.hub.watches[ACME_WEB].polling)
+        self.assertEqual(rig.hub.watches[ACME_WEB].state, "running")
+
+
+class TestAccountPerRepo(Base):
+    ACCOUNTS = {ACME_API: "alice-bot", ACME_WEB: "acme-ci"}
+    AGENTS = {"api-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_API},
+              "web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}}
+
+    def rig(self, **kwargs):
+        rig = FarmRig(self, agents=self.AGENTS, accounts=self.ACCOUNTS, **kwargs)
+        for repo in (ACME_API, ACME_WEB):
+            rig.repo(repo).issue(2, parent=1)
+        return rig
+
+    def test_each_forwarder_gets_its_own_accounts_token_in_its_environment_only(self):
+        rig = self.rig()
+        rig.pump(20)
+        for repo, account in self.ACCOUNTS.items():
+            proc = rig.repo(repo).forwarder()
+            self.assertIsNotNone(proc, repo)
+            self.assertEqual(proc.env["GH_TOKEN"], FAKE_TOKENS[account])
+            self.assertNotIn(FAKE_TOKENS[account], " ".join(proc.argv))
+
+    def test_catch_up_and_lookup_reads_use_the_repos_own_account(self):
+        rig = self.rig()
+        rig.repo(ACME_WEB).webhook_ok = False
+        rig.pump(120)
+        self.assertEqual(rig.hub.watches[ACME_WEB].catch_up_error, None, "the right token reads the repo")
+        self.assertIn("acme-ci", rig.farm.token_asks)
+
+    def test_the_one_account_fault_reads_every_repo_with_the_default_token(self):
+        os.environ[sb.FAULT_ENV] = "one-account"
+        rig = self.rig()
+        rig.pump(60)
+        self.assertEqual(rig.farm.token_asks, [])
+        self.assertTrue(all(not rig.repo(r).forwarder() for r in (ACME_API, ACME_WEB)), "the strangers' token is refused")
+
+    def test_a_token_gh_will_not_give_is_a_failure_that_names_the_account_never_a_token(self):
+        rig = self.rig(config={"gh_users": {ACME_API: "alice-bot", ACME_WEB: "nobody"}})
+        rig.pump(20)
+        error = rig.hub.watches[ACME_WEB].last_error
+        self.assertIn("nobody", error)
+        self.assertNotIn("SECRET", error)
+
+
+class TwoRepoGH:
+    """`gh` for two repos with the same issue numbers and different asks, each readable by one account only."""
+
+    ISSUES = {
+        ACME_API: {"1": {"intent": None}, "2": {"intent": "API: add the health check", "done_when": "api answers",
+                                                "parent": 1}},
+        ACME_WEB: {"1": {"intent": None, "workspace": "Acme Web"}, "2": {"intent": "WEB: build the landing page", "done_when": "web renders",
+                                                "parent": 1}},
+    }
+
+    def __init__(self, clock, accounts):
+        self.repos = {repo: FakeGH(issues, {1}, clock, repo, FAKE_TOKENS[accounts[repo]])
+                      for repo, issues in self.ISSUES.items()}
+        self.ran = []
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.ran.append((argv, kwargs.get("input")))
+        if argv[1:3] == ["auth", "token"]:
+            token = FAKE_TOKENS.get(argv[4])
+            return subprocess.CompletedProcess(argv, 0 if token else 1, (token or "") + "\n", "" if token else "no token\n")
+        found = re.match(r"^repos/([^/]+/[^/]+)/", argv[2])
+        gh = self.repos.get(found.group(1)) if found else None
+        if gh is None:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        return gh(argv, **kwargs)
+
+
+class TwoRepoCase(Base):
+    ACCOUNTS = {ACME_API: "alice-bot", ACME_WEB: "acme-ci"}
+
+    def setUp(self):
+        super().setUp()
+        self.raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": ACME_API,
+                    "gh_users": dict(self.ACCOUNTS)}
+        self.write_config(self.raw)
+        self.world = World(self, agents=(), config={k: v for k, v in self.raw.items()
+                                                    if k not in ("opencode", "herdr")})
+        self.gh = TwoRepoGH(self.world.clock, self.ACCOUNTS)
+        for name, fleet in (("api-orch", {"role": "orchestrator", "charter": 1, "repo": ACME_API}),
+                            ("web-orch", {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}),
+                            ("web-coder", {"role": "coder", "issue": 2, "repo": ACME_WEB, "reports_to": "web-orch"}),
+                            ("cos", {"role": "chief-of-staff"})):
+            self.world.add_agent(name, fleet=fleet)
+        os.environ[sb.LAB_ENV] = "1"
+
+    def main(self, *argv):
+        def route(argv, **kwargs):
+            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def texts(self, name):
+        return [a["text"] for a in self.world.admissions(name)]
+
+
+class TestRepoQualifiedIssues(TwoRepoCase):
+    def test_intent_reads_the_named_repo_with_that_repos_account(self):
+        code, out, err = self.main("intent", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], "Ask web#2 Intent: WEB: build the landing page")
+        self.assertIn("Done when: web renders", out)
+        self.assertIn("acme-ci", [argv[4] for argv, _ in self.gh.ran if argv[1:3] == ["auth", "token"]])
+
+    def test_a_bare_number_from_a_caller_with_a_repo_is_in_that_repo(self):
+        self.as_agent("web-coder")
+        self.assertIn("WEB: build the landing page", self.main("intent", "2")[1])
+        self.as_agent("api-orch")
+        self.assertIn("API: add the health check", self.main("intent", "2")[1])
+
+    def test_a_bare_number_from_a_caller_with_no_repo_is_refused_with_the_choices(self):
+        self.as_agent("cos")
+        code, out, err = self.main("intent", "2")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("acme/api#2", err)
+        self.assertIn("acme/web#2", err)
+
+    def test_the_bare_issue_number_fault_reads_the_wrong_repos_intent(self):
+        os.environ[sb.FAULT_ENV] = "bare-issue-number"
+        self.as_agent("api-orch")
+        out = self.main("intent", "acme/web#2")[1]
+        self.assertIn("API: add the health check", out)
+        self.assertNotIn("WEB:", out)
+
+    def test_send_to_another_repos_ask_carries_that_asks_intent_and_a_repo_tag(self):
+        code, _, err = self.main("send", "web-orch", "--from", "cos", "--issue", "acme/web#2", "landing page is blocked")
+        self.assertEqual(code, 0, err)
+        (text,) = self.texts("web-orch")
+        self.assertIn("Ask web#2 Intent: WEB: build the landing page", text)
+        self.assertIn("(issue web#2)", text)
+        self.assertNotIn("API:", text)
+
+    def test_a_bare_issue_in_send_from_a_sender_with_no_repo_sends_nothing(self):
+        code, _, err = self.main("send", "web-orch", "--from", "cos", "--issue", "2", "hello")
+        self.assertEqual(code, 2)
+        self.assertIn("acme/web#2", err)
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_a_bare_issue_in_send_from_a_sender_with_a_repo_is_in_its_repo(self):
+        code, _, err = self.main("send", "web-orch", "--from", "web-coder", "--issue", "2", "done")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Ask web#2 Intent: WEB:", self.texts("web-orch")[0])
+
+    def test_two_asks_with_the_same_number_stay_in_their_own_sections(self):
+        for repo, to in ((ACME_API, "cos"), (ACME_WEB, "cos")):
+            code, _, err = self.main("send", to, "--from", "api-orch", "--issue", "%s#2" % repo, "status %s" % repo)
+            self.assertEqual(code, 0, err)
+        both = "\n".join(self.texts("cos"))
+        self.assertIn("Ask api#2 Intent: API:", both)
+        self.assertIn("Ask web#2 Intent: WEB:", both)
+
+    def test_report_remind_and_pending_take_a_qualified_issue(self):
+        self.as_agent("web-coder")
+        code, _, err = self.main("report", "done", "landed", "--issue", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("(issue web#2)", self.texts("web-orch")[0])
+        code, _, err = self.main("remind", "web-orch", "1m", "check it", "--issue", "acme/web#2", "--from", "web-coder")
+        self.assertEqual(code, 0, err)
+        reminders = sb.read_reminders(self.world.state)
+        self.assertEqual((reminders[0]["issue"], reminders[0]["repo"]), (2, ACME_WEB))
+
+    def test_a_chief_of_staff_sees_the_asks_of_every_repo_each_with_its_tag(self):
+        self.as_agent("cos")
+        code, out, err = self.main("intents")
+        self.assertEqual(code, 0, err)
+        self.assertIn("api#2  [api-orch]  API: add the health check", out)
+        self.assertIn("web#2  [web-orch]  WEB: build the landing page", out)
+
+    def test_comment_posts_on_the_named_repo_with_its_account(self):
+        self.as_agent("web-coder")
+        body = self.home / "body.md"
+        body.write_text("a note")
+        code, _, err = self.main("comment", "--issue", "acme/web#2", "--body-file", str(body))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([c["body"].startswith("a note") for c in self.gh.repos[ACME_WEB].__dict__["comments"]], [True])
+        self.assertNotIn("comments", self.gh.repos[ACME_API].__dict__)
+
+
+class TestLaunchIntoARepo(TwoRepoCase):
+    def launch(self, *extra, name="web-new"):
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        return self.main("launch", name, "--agent", "coder", "--dir", str(work), "--workspace", "w1",
+                         "--role", "coder", *extra)
+
+    def opened(self):
+        return [params for method, params in self.world.herdr.socket_calls if method == "layout.apply"]
+
+    def test_repo_sets_the_sessions_fleet_repo_and_the_agents_token_is_its_accounts(self):
+        code, out, err = self.launch("--repo", ACME_WEB)
+        self.assertEqual(code, 0, err)
+        session = self.world.v2.sessions[json.loads(out)["session"]]
+        self.assertEqual(session["metadata"]["fleet"]["repo"], ACME_WEB)
+        (params,) = self.opened()
+        self.assertEqual(params["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"])
+
+    def test_a_qualified_issue_names_the_repo_too_and_two_that_disagree_are_refused(self):
+        code, out, err = self.launch("--issue", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"]["repo"], ACME_WEB)
+        code, _, err = self.launch("--issue", "acme/web#2", "--repo", ACME_API, name="web-two")
+        self.assertEqual(code, 1)
+        self.assertIn("acme/web", err)
+
+    def test_an_unmapped_owner_with_no_default_is_refused_naming_the_missing_entry(self):
+        before = len(self.world.v2.sessions)
+        code, _, err = self.launch("--repo", "other/tool")
+        self.assertEqual(code, 1)
+        self.assertIn("other/tool", err)
+        self.assertIn("other/*", err)
+        self.assertIn("gh_users", err)
+        self.assertEqual((len(self.world.v2.sessions), self.opened()), (before, []))
+
+    def test_an_unmapped_owner_is_launched_when_a_default_token_is_set_and_gets_no_token_from_us(self):
+        os.environ["GH_TOKEN"] = DEFAULT_TOKEN
+        code, _, err = self.launch("--repo", "other/tool")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+    def test_the_audit_names_the_token_variable_never_its_value(self):
+        self.launch("--repo", ACME_WEB)
+        text = (self.world.state / "audit.jsonl").read_text()
+        self.assertIn("GH_TOKEN", text)
+        for token in FAKE_TOKENS.values():
+            self.assertNotIn(token, text)
+
+    def test_without_gh_users_a_launch_is_what_it_was(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": ACME_API})
+        code, _, err = self.launch("--repo", "other/tool")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+
+class TestLaunchNewWorkspace(TwoRepoCase):
+    def launch(self, label="Acme Web", charter=None, extra=()):
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        argv = ["launch", "web-orch2", "--agent", "orchestrator", "--dir", str(work), "--new-workspace", label,
+                "--role", "orchestrator", "--repo", ACME_WEB]
+        if charter:
+            argv += ["--charter", str(charter)]
+        return self.main(*argv, *extra)
+
+    def test_it_creates_the_workspace_without_taking_focus_and_launches_into_it(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        create = [argv for argv in self.world.herdr.calls if argv[1:3] == ["workspace", "create"]]
+        self.assertEqual(len(create), 1)
+        self.assertEqual(create[0][3:], ["--cwd", str(self.home / "checkout"), "--label", "Acme Web", "--no-focus"])
+        (workspace,) = self.world.herdr.workspaces
+        self.assertFalse(workspace["focused"])
+        (params,) = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"]
+        self.assertEqual(params["workspace_id"], workspace["workspace_id"])
+        self.assertEqual(json.loads(out)["name"], "web-orch2")
+
+    def test_a_charter_naming_another_workspace_is_refused_before_anything_is_made(self):
+        before = len(self.world.v2.sessions)
+        code, _, err = self.launch(label="Acme Website", charter=1)
+        self.assertEqual(code, 1)
+        self.assertIn("Acme Web", err)
+        self.assertIn("Acme Website", err)
+        self.assertEqual((getattr(self.world.herdr, "workspaces", []), len(self.world.v2.sessions)), ([], before))
+
+    def test_the_label_must_match_exactly(self):
+        code, _, _ = self.launch(label="acme web", charter=1)
+        self.assertEqual(code, 1)
+
+    def test_a_matching_charter_label_is_launched(self):
+        code, _, err = self.launch(charter=1)
+        self.assertEqual(code, 0, err)
+
+    def test_a_charter_with_no_workspace_line_does_not_stop_it(self):
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        code, _, err = self.main("launch", "api-new", "--agent", "orchestrator", "--dir", str(work), "--new-workspace",
+                                 "Acme API", "--role", "orchestrator", "--repo", ACME_API, "--charter", "1")
+        self.assertEqual(code, 0, err)
+
+    def test_new_workspace_and_workspace_together_are_refused(self):
+        code, _, err = self.launch(extra=("--workspace", "w1"))
+        self.assertEqual(code, 1)
+        self.assertIn("--workspace", err)
+
+    def test_the_fake_herdr_refuses_the_shapes_the_real_one_refuses(self):
+        herdr = self.world.herdr
+        for argv in (["workspace", "create", "stray"], ["workspace", "create", "--bogus"],
+                     ["workspace", "create", "--focus", "--no-focus"], ["workspace", "create", "--label"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(herdr([FAKE_HERDR] + argv).returncode, 2)
+
+
+
+class TestRepoInKeysAndListings(TwoRepoCase):
+    def test_an_intent_edit_key_names_the_repo_when_the_payload_does(self):
+        payload = {"action": "edited", "issue": {"number": 7, "body": "## Intent\nnew\n", "updated_at": "2027-01-15T08:00:00Z"},
+                   "sender": {"login": "alice"}, "changes": {"body": {"from": "## Intent\nold\n"}},
+                   "repository": {"full_name": ACME_WEB}}
+        change = sb.intent_change_fact(payload)
+        self.assertEqual((change.key, change.repo), ("intent.edit:acme/web#7:2027-01-15T08:00:00Z", ACME_WEB))
+        other = sb.intent_change_fact(dict(payload, repository={"full_name": ACME_API}))
+        self.assertNotEqual(change.key, other.key, "the same number in two repos is two items")
+
+    def test_pending_names_the_repo_of_an_item_when_several_are_in_play(self):
+        self.world.fact("web-orch", "lab.fact:1", issue=2, repo=ACME_WEB)
+        code, out, err = self.main("pending", "web-orch")
+        self.assertEqual(code, 0, err)
+        self.assertIn("issue web#2", out)
+
+    def test_the_judges_context_is_the_agents_own_repos_intent_read_with_its_account(self):
+        reader = sb.IntentReader(FAKE_GH, ACME_API, self.gh, self.world.clock.now, 5,
+                                 accounts=sb.GhAccounts(self.world.config, self.gh, self.world.clock.now))
+        web = sb.resolve_policy_context(reader, {"name": "web-coder", "issue": 2, "repo": ACME_WEB})
+        api = sb.resolve_policy_context(reader, {"name": "x", "issue": 2, "repo": ACME_API})
+        self.assertEqual((web["intent"], api["intent"]), ("WEB: build the landing page", "API: add the health check"))
+
+
+
+class TestRepoCommissioningRule(PolicyCase):
+    """The Chief of Staff commissions a repo; nobody creates, deletes or exposes one quietly."""
+
+    CREATING = ("gh repo create acme/web --private", "gh repo delete acme/web --yes",
+                "gh repo edit acme/web --visibility public --accept-visibility-change-consequences",
+                "gh api -X POST /orgs/acme/repos -f name=web", "gh api --method POST orgs/acme/repos -f name=web",
+                "gh api /orgs/acme/repos -f name=web -f private=true", "gh api -XPOST user/repos -f name=web",
+                "cd /tmp && gh repo create acme/web --private", "bash -c 'gh repo create acme/web'",
+                "/opt/homebrew/bin/gh repo create acme/web", "GH_TOKEN=x gh repo create acme/web",
+                "true; gh repo delete acme/old --yes")
+    HARMLESS = ("gh repo view acme/web", "gh repo edit acme/web --description 'the web'", "gh api /orgs/acme/repos",
+                "gh api repos/acme/web/issues -f title=hello", "gh issue create --repo acme/web --title x",
+                "gh repo clone acme/web", "git status", "ghost repo create")
+
+    def test_the_rule_names_what_it_found(self):
+        for command in self.CREATING:
+            with self.subTest(command=command):
+                self.assertTrue(sb.repo_commissioning_rule(command), command)
+        for command in self.HARMLESS:
+            with self.subTest(command=command):
+                self.assertIsNone(sb.repo_commissioning_rule(command), command)
+
+    def test_each_is_hard_to_reverse_whatever_the_model_says_and_whatever_the_threshold(self):
+        self.configure([{"noul": LOW}], thresholds={"hard_to_reverse": 1})
+        for command in self.CREATING:
+            with self.subTest(command=command):
+                reply = self.judge_tool(self.coder, "shell", command)
+                self.assertEqual(reply["outcome"], "ask", reply)
+                self.assertIn("hard to reverse", reply["reason"])
+
+    def test_it_needs_no_decision_model(self):
+        self.configure([{"error": "unreachable"}])
+        self.assertEqual(self.judge_tool(self.coder, "shell", "gh repo create acme/web")["outcome"], "ask")
+
+    def test_harmless_commands_pass_a_quiet_model(self):
+        for command in self.HARMLESS:
+            with self.subTest(command=command):
+                self.assertEqual(self.judge_tool(self.coder, "shell", command)["outcome"], "allow")
+
+    def test_it_only_tightens(self):
+        self.assertEqual(self.judge_tool(self.coder, "shell", "gh repo create acme/web", "deny")["outcome"], "deny")
+        self.assertEqual(self.judge_tool(self.coder, "shell", "gh repo create acme/web", "ask")["outcome"], "ask")
+
+    def test_it_is_audited_as_a_judgement(self):
+        self.judge_tool(self.coder, "shell", "gh repo create acme/web")
+        (entry,) = [e["detail"] for e in self.audit_events()]
+        self.assertEqual((entry["outcome"], entry["fired"]), ("ask", ["hard_to_reverse"]))
+        self.assertIn("gh repo create", entry["reason"])
+
+    def test_the_repo_create_allowed_fault_turns_it_off(self):
+        os.environ[sb.FAULT_ENV] = "repo-create-allowed"
+        self.assertEqual(self.judge_tool(self.coder, "shell", "gh repo create acme/web")["outcome"], "allow")
+
+
+class TestStatusPerRepo(Base):
+    AGENTS = {"api-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_API},
+              "web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB},
+              "web-coder": {"role": "coder", "issue": 2, "repo": ACME_WEB}, "cos": {"role": "chief-of-staff"}}
+    ACCOUNTS = {ACME_API: "alice-bot", ACME_WEB: "acme-ci"}
+
+    def setUp(self):
+        super().setUp()
+        self.rig = FarmRig(self, agents=self.AGENTS, accounts=self.ACCOUNTS, baseline=[ACME_API])
+        self.rig.repo(ACME_WEB).webhook_ok = False
+        for repo in (ACME_API, ACME_WEB):
+            self.rig.repo(repo).issue(2, parent=1)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": GH_BIN, "github_repos": [ACME_API],
+                           "gh_users": self.ACCOUNTS})
+        self.rig.pump(60)
+
+    def status(self, *argv):
+        with captured() as (out, _):
+            code = sb.main(["status", *argv], runner=self.rig.world.route, now=self.rig.world.clock.now)
+        return code, out.getvalue()
+
+    def test_json_lists_each_repo_how_it_is_watched_its_account_and_its_agents(self):
+        code, out = self.status("--json")
+        detail = {d["repo"]: d for d in json.loads(out)["github"]["detail"]}
+        self.assertEqual(sorted(detail), [ACME_API, ACME_WEB])
+        self.assertEqual((detail[ACME_API]["how"], detail[ACME_API]["account"], detail[ACME_API]["agents"]),
+                         ("forwarder", "alice-bot", ["api-orch"]))
+        self.assertEqual((detail[ACME_WEB]["how"], detail[ACME_WEB]["account"], detail[ACME_WEB]["agents"]),
+                         ("polling", "acme-ci", ["web-coder", "web-orch"]))
+        self.assertIn("cannot create a webhook", detail[ACME_WEB]["why"])
+
+    def test_the_text_says_it_in_a_line_per_repo(self):
+        _, out = self.status()
+        lines = {line.split()[0]: line for line in out.splitlines() if line.strip().startswith("acme/")}
+        self.assertIn("forwarder", lines[ACME_API])
+        self.assertIn("account alice-bot", lines[ACME_API])
+        self.assertIn("api-orch", lines[ACME_API])
+        self.assertIn("polling every 60s", lines[ACME_WEB])
+        self.assertIn("account acme-ci", lines[ACME_WEB])
+        self.assertIn("web-coder, web-orch", lines[ACME_WEB])
+
+    def test_no_token_appears_anywhere_in_status(self):
+        for argv in ((), ("--json",)):
+            _, out = self.status(*argv)
+            for token in list(FAKE_TOKENS.values()) + [DEFAULT_TOKEN]:
+                self.assertNotIn(token, out)
+
+    def test_a_repo_no_agent_or_baseline_names_is_not_listed(self):
+        self.rig.leave("web-orch")
+        self.rig.leave("web-coder")
+        self.rig.pump(10)
+        _, out = self.status("--json")
+        self.assertEqual([d["repo"] for d in json.loads(out)["github"]["detail"]], [ACME_API])
+
+    def test_without_a_daemon_the_how_is_unknown_but_the_account_and_agents_are_known(self):
+        (self.rig.world.state / sb.WATCH_FILE).unlink()
+        _, out = self.status("--json")
+        detail = {d["repo"]: d for d in json.loads(out)["github"]["detail"]}
+        self.assertEqual((detail[ACME_WEB]["how"], detail[ACME_WEB]["account"]), ("unknown", "acme-ci"))
+
+    def test_a_repo_with_no_mapped_account_says_default(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": GH_BIN, "github_repos": [ACME_API]})
+        _, out = self.status("--json")
+        self.assertEqual({d["account"] for d in json.loads(out)["github"]["detail"]}, {"default"})
+
+
+ALL_FAKE_TOKENS = list(FAKE_TOKENS.values()) + [DEFAULT_TOKEN]
+
+
+def secrets_in(text):
+    return [token for token in ALL_FAKE_TOKENS if token in text]
+
+
+class TestSecretNeverText(TwoRepoCase):
+    """Two accounts at work, a gh that leaks the token into its own errors, and every byte the switchboard
+    wrote, said or printed is searched for the fake tokens."""
+
+    def everything(self):
+        pieces = [(self.world.state / name).read_text(errors="replace")
+                  for name in sorted(p.name for p in self.world.state.glob("*")) if (self.world.state / name).is_file()]
+        for session in self.world.v2.sessions.values():
+            pieces.extend(m.get("text") or "" for m in session["messages"])
+            pieces.append(json.dumps(session["metadata"]))
+        pieces.extend(t["title"] + (t["body"] or "") for t in self.world.herdr.toasts)
+        pieces.extend(" ".join(argv) for argv in self.world.herdr.calls)
+        pieces.extend(" ".join(argv) for argv, _ in self.gh.ran)
+        return "\n".join(pieces)
+
+    def test_across_launch_send_intent_comment_and_failures_no_token_is_ever_text(self):
+        work = self.home / "checkout"
+        work.mkdir()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["web-coder"]
+        outputs = []
+        for argv in (("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--repo", ACME_WEB),
+                     ("intent", "acme/web#2"), ("intent", "acme/api#2"),
+                     ("send", "web-orch", "--from", "cos", "--issue", "acme/web#2", "hello"),
+                     ("launch", "other-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--repo", "other/x")):
+            outputs.append(self.main(*argv))
+        for repo in (ACME_API, ACME_WEB):  # now every read is refused, and the refusal echoes the token it saw
+            self.gh.repos[repo].token, self.gh.repos[repo].leak = "someone-elses", True
+        for argv in (("intent", "acme/web#2"), ("send", "web-orch", "--from", "cos", "--issue", "acme/api#2", "again")):
+            outputs.append(self.main(*argv))
+        errors = "\n".join(out + err for _, out, err in outputs)
+        self.assertEqual(secrets_in(errors), [], "a command's output")
+        self.assertEqual(secrets_in(self.everything()), [], "the state, the messages, the argv")
+        launched = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"]
+        self.assertEqual(launched[0]["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"], "it is in the child's environment")
+
+    def test_a_token_gh_will_not_give_names_the_account_in_the_error(self):
+        self.write_config(dict(self.raw, gh_users={ACME_API: "alice-bot", ACME_WEB: "nobody"}))
+        code, out, err = self.main("intent", "acme/web#2")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nobody", err)
+        self.assertEqual(secrets_in(out + err + self.everything()), [])
+
+    def test_a_token_is_never_in_a_gh_argv(self):
+        self.main("intent", "acme/web#2")
+        for argv, _ in self.gh.ran:
+            self.assertEqual(secrets_in(" ".join(argv)), [], argv)
+            self.assertIn(argv[1], ("api", "auth"))
+            if argv[1] == "auth":
+                self.assertEqual(argv[2:4], ["token", "--user"])
+
+
+class TestSecretNeverTextInTheHub(Base):
+    def test_a_forwarder_and_a_poll_that_fail_with_a_leaking_gh_leave_no_token_anywhere(self):
+        rig = FarmRig(self, agents=TestAccountPerRepo.AGENTS, accounts=TestAccountPerRepo.ACCOUNTS)
+        for repo in (ACME_API, ACME_WEB):
+            rig.repo(repo).issue(2, parent=1)
+        rig.pump(20)
+        for repo in (ACME_API, ACME_WEB):
+            rig.repo(repo).leak, rig.repo(repo).exists = True, False
+            rig.repo(repo).token = "someone-elses"
+            rig.repo(repo).kill_forwarder()
+        rig.pump(400)
+        self.assertTrue(all(w.polling for w in rig.hub.watches.values()), "the polls ran, and failed")
+        self.assertTrue(all(w.catch_up_error for w in rig.hub.watches.values()))
+        rig.world.engine.audit.append("daemon", "probe", None, {})
+        found = []
+        for watch in rig.hub.watches.values():
+            found += secrets_in(json.dumps(watch.to_json()))
+        found += secrets_in(rig.world.state_text() if hasattr(rig.world, "state_text") else "")
+        text = "\n".join(p.read_text(errors="replace") for p in sorted(rig.world.state.rglob("*")) if p.is_file())
+        text += "\n".join(m.get("text") or "" for s in rig.world.v2.sessions.values() for m in s["messages"])
+        text += "\n".join(t["title"] + (t["body"] or "") for t in rig.world.herdr.toasts)
+        self.assertEqual(found + secrets_in(text), [])
+        argvs = " ".join(" ".join(a) for a in rig.farm.ran)
+        self.assertEqual(secrets_in(argvs), [], "no argv, forwarder or read, holds a token")
+
+
+class TestCommissioningDocs(unittest.TestCase):
+    SKILL = REPO / "skills" / "fleet-setup" / "SKILL.md"
+
+    def test_the_skill_is_written_like_the_installer_and_names_the_decision_and_the_check(self):
+        text = self.SKILL.read_text()
+        self.assertTrue(text.startswith("---\nname: fleet-setup\n"))
+        for phrase in ("CHECK:", "DO:", "VERIFY:", "PROVES:", "Create <owner>/<repo>", "(private) under account",
+                       "<user>:awaiting-user", "report question", "--new-workspace", "<user>:orchestrator",
+                       "fleet-switchboard status", "gh_users", "gh repo create", "A token is never text"):
+            self.assertIn(phrase, text, phrase)
+        self.assertEqual(len(re.findall(r"^## STEP \d", text, re.M)), 4)
+
+    def test_the_chief_of_staff_loads_it_and_never_creates_a_repo(self):
+        for path in AGENT_FILES:
+            if role_of(path) != "chief-of-staff":
+                continue
+            text = path.read_text()
+            with self.subTest(file=path.name):
+                self.assertIn("`fleet-setup`", text)
+                self.assertIn("Never run `gh repo create`", text)
+
+    def test_install_links_the_skill(self):
+        self.assertIn('ln -s "$PWD/skills/fleet-setup"', (REPO / "INSTALL.md").read_text())
+
+    def test_the_pr15_catalog_is_present_with_a_control_each(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, key, value in (("M2", "fault", "static-repos"), ("M3", "fault", "one-account"),
+                                ("M4", "variant", None), ("M5", "fault", "repo-create-allowed"),
+                                ("M6", "variant", None)):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 15)
+                self.assertIn("offline", found[sid]["tiers"])
+                self.assertIn(key, found[sid]["control"])
+                if value:
+                    self.assertEqual(found[sid]["control"][key], value)
+
+    def test_the_docs_say_what_pr15_built(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        for phrase in ("| 15 | `switchboard/multi-repo` |", "### Many repos (PR 15)", "gh_users", "github_poll_seconds",
+                       "--new-workspace", "owner/repo#N", "static-repos", "bare-issue-number", "one-account",
+                       "repo-create-allowed"):
+            self.assertIn(phrase, text, phrase)
+        self.assertNotIn("TODO(PR 14)", text, "the join with the Decisions list is done, and the Log says so")
+        for sid in ("M2", "M3", "M4", "M5", "M6"):
+            self.assertRegex(text, r"(?m)^\| %s \|" % sid)
+
+
+class TestOneRepoIsUnchanged(IntentCase):
+    def test_with_one_repo_a_message_carries_no_tag_and_a_bare_number_needs_no_qualifier(self):
+        os.environ[sb.LAB_ENV] = "1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        runner = lambda argv, **kw: self.gh(argv) if argv[0] == FAKE_GH else self.world.route(argv, **kw)
+        with captured():
+            code = sb.main(["send", "platform", "--from", "coder", "--issue", "3", "PR is up"], runner=runner,
+                           now=self.world.clock.now)
+        self.assertEqual(code, 0)
+        (admitted,) = self.world.admissions("platform")
+        self.assertIn("(issue #3)", admitted["text"])
+        self.assertIn("Ask #2 Intent: Fix the agents", admitted["text"])
+
+
+# ============================================== PR 14 + PR 15: a decision names its repo
+
+class TestDecisionsAcrossRepos(Base):
+    """The Decisions list (PR 14) over many repos (PR 15): an id carries its repo, every watched repo is read
+    with its own account, and nothing depends on the intent repo."""
+    ACCOUNTS = {ACME_API: "alice-bot", ACME_WEB: "acme-ci"}
+    AGENTS = {"api-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_API},
+              "web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}}
+
+    def rig(self, agents=None, repos=(ACME_API, ACME_WEB), accounts=None, **config):
+        rig = FarmRig(self, agents=self.AGENTS if agents is None else agents, repos=repos,
+                      accounts=accounts, config=dict({"awaiting_label": DECISION_LABEL}, **config))
+        rig.world.engine.hub = rig.hub
+        return rig
+
+    def derive(self, rig):
+        rig.world.engine.discover(rig.world.clock.now())
+        rig.world.engine.collect_facts()
+        return sb.derive_decisions(rig.world.engine, rig.world.clock.now())
+
+    def label_both(self, rig):
+        rig.repo(ACME_API).issue(2, title="Ship the API?", labels=[DECISION_LABEL])
+        rig.repo(ACME_WEB).issue(2, title="Launch the page?", labels=[DECISION_LABEL])
+        rig.pump(70)
+
+    def test_one_issue_number_in_two_repos_is_two_decisions_each_naming_its_repo(self):
+        rig = self.rig()
+        self.label_both(rig)
+        found, errors = self.derive(rig)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted((d["id"], d["repo"], d["ask"]) for d in found),
+                         [("api#2", ACME_API, 2), ("web#2", ACME_WEB, 2)])
+
+    def test_with_one_repo_the_id_is_the_bare_number_and_the_repo_is_still_recorded(self):
+        rig = self.rig(agents={"api-orch": self.AGENTS["api-orch"]}, repos=(ACME_API,))
+        rig.repo(ACME_API).issue(2, title="Ship the API?", labels=[DECISION_LABEL])
+        rig.pump(70)
+        (one,), errors = self.derive(rig)
+        self.assertEqual((one["id"], one["repo"]), ("#2", ACME_API))
+
+    def test_two_repos_that_share_a_name_are_told_apart_by_their_owner(self):
+        rig = self.rig(agents={"a": {"role": "orchestrator", "charter": 1, "repo": "acme/site"},
+                               "b": {"role": "orchestrator", "charter": 1, "repo": "beta/site"}},
+                       repos=("acme/site", "beta/site"))
+        rig.repo("acme/site").issue(2, title="one", labels=[DECISION_LABEL])
+        rig.repo("beta/site").issue(2, title="two", labels=[DECISION_LABEL])
+        rig.pump(70)
+        found, _ = self.derive(rig)
+        self.assertEqual(sorted(d["id"] for d in found), ["acme/site#2", "beta/site#2"])
+
+    def test_every_watched_repo_is_read_whatever_the_intent_repo_and_the_baseline_are(self):
+        rig = self.rig(intent_repo="acme/elsewhere")
+        self.assertEqual(rig.world.config["github_repos"], [])
+        self.label_both(rig)
+        found, errors = self.derive(rig)
+        self.assertEqual((len(found), errors), (2, []))
+
+    def test_each_repo_is_read_with_its_own_account(self):
+        rig = self.rig(accounts=self.ACCOUNTS)
+        self.label_both(rig)
+        found, errors = self.derive(rig)
+        self.assertEqual((sorted(d["repo"] for d in found), errors), ([ACME_API, ACME_WEB], []))
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "one-account"
+        lone = self.rig(accounts=self.ACCOUNTS)
+        self.label_both(lone)
+        found, errors = self.derive(lone)
+        self.assertEqual(found, [], "with one account for everything, the repos the other account owns are unreadable")
+        self.assertTrue(errors)
+
+    def test_a_repo_read_that_fails_is_said_by_repo_and_does_not_hide_the_other(self):
+        rig = self.rig(accounts=self.ACCOUNTS)
+        rig.repo(ACME_WEB).token = "tok-revoked"  # the account's token no longer opens this repo
+        self.label_both(rig)
+        found, errors = self.derive(rig)
+        self.assertEqual([d["id"] for d in found], ["api#2"])
+        self.assertTrue(any(ACME_WEB in e["error"] for e in errors), errors)
+        self.assertFalse(any(ACME_API in e["error"] for e in errors), errors)
+
+    def test_the_bare_issue_number_fault_drops_the_repo_from_the_id(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "bare-issue-number"
+        rig = self.rig()
+        self.label_both(rig)
+        found, _ = self.derive(rig)
+        self.assertNotIn("api#2", [d["id"] for d in found])
+        self.assertEqual(len({d["id"] for d in found}), 2, "the ids still never collide")
+
+    def test_the_file_and_the_command_show_the_repo_tag(self):
+        rig = self.rig()
+        self.label_both(rig)
+        rig.world.engine.run_pass()
+        body = json.loads((rig.world.state / sb.DECISIONS_FILE).read_text())
+        self.assertEqual(sorted(d["id"] for d in body["decisions"]), ["api#2", "web#2"])
+        text = sb.format_decisions(sb.decisions_report(rig.world.state, rig.world.clock.now()), rig.world.clock.now())
+        self.assertIn("api#2  waiting", text)
+        self.assertIn("web#2  waiting", text)
+
+    def test_status_counts_the_decisions_of_each_repo_when_several_are_watched(self):
+        rig = self.rig()
+        self.label_both(rig)
+        rig.world.engine.run_pass()
+        summary = sb.decisions_summary(rig.world.state, rig.world.clock.now)
+        self.assertEqual(summary["by_repo"], {ACME_API: 1, ACME_WEB: 1})
+        self.assertIn("(acme/api 1, acme/web 1;", "\n".join(sb.format_decisions_status(summary)))
+
+    def test_status_names_no_repo_with_one_repo(self):
+        rig = self.rig(agents={"api-orch": self.AGENTS["api-orch"]}, repos=(ACME_API,))
+        rig.repo(ACME_API).issue(2, title="Ship the API?", labels=[DECISION_LABEL])
+        rig.pump(70)
+        rig.world.engine.run_pass()
+        text = "\n".join(sb.format_decisions_status(sb.decisions_summary(rig.world.state, rig.world.clock.now)))
+        self.assertIn("1 waiting on you", text)
+        self.assertNotIn("acme", text)
+
+    def test_decisions_fresh_reads_every_watched_repo_with_its_account(self):
+        rig = self.rig(accounts=self.ACCOUNTS)
+        self.label_both(rig)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": GH_BIN, "awaiting_label": DECISION_LABEL,
+                           "gh_users": self.ACCOUNTS})
+        route = lambda argv, **kw: rig.farm.runner(argv, **kw) if argv[0] == GH_BIN else rig.world.route(argv, **kw)
+        report = sb.fresh_decisions(route, rig.world.clock.now)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(sorted(d["id"] for d in report["decisions"]), ["api#2", "web#2"])
+
+    def block(self, rig, name, boss, repo):
+        rig.world.add_agent(name, fleet={"role": "coder", "reports_to": boss, "issue": 2, "repo": repo})
+        rig.world.v2.start_turn(rig.world.sessions[name], "fleet task", fleet=True, lasts=86400)
+        rig.world.herdr.panes[rig.world.panes[name]]["status"] = "blocked"
+        rig.world.v2.ask_permission(rig.world.sessions[name])
+
+    def test_a_blocked_workers_decision_and_toast_and_pending_name_its_repo(self):
+        rig = self.rig()
+        self.block(rig, "w-api", "api-orch", ACME_API)
+        self.block(rig, "w-web", "web-orch", ACME_WEB)
+        found, _ = self.derive(rig)
+        self.assertEqual(sorted((d["repo"], d["id"][:5]) for d in found), [(ACME_API, "api#2"), (ACME_WEB, "web#2")])
+        rig.pump(10)
+        toasts = [t["body"] for t in rig.world.herdr.toasts]
+        self.assertTrue(any("(issue api#2)" in body for body in toasts), toasts)
+        self.assertTrue(any("(issue web#2)" in body for body in toasts), toasts)
+        (admitted,) = rig.world.admissions("web-orch")  # what `pending` would have shown, delivered by the pass
+        self.assertIn("from w-web (issue web#2)", admitted["text"])
+        self.assertNotIn("api#2", admitted["text"])
+
+    def test_a_reports_issue_tag_is_read_back_to_its_repo(self):
+        match = sb.REPORT_LINE.match("- report from w-web (issue web#2): question: which db?")
+        self.assertEqual(match.groups(), ("w-web", "web", "2", "question", "which db?"))
+        bare = sb.REPORT_LINE.match("- report from coder (issue #2): question: which db?")
+        self.assertEqual(bare.groups(), ("coder", None, "2", "question", "which db?"))
+        self.assertEqual(sb.repo_of_tag("web", [ACME_API, ACME_WEB]), ACME_WEB)
+        self.assertEqual(sb.repo_of_tag("beta/site", ["acme/site", "beta/site"]), "beta/site")
+        self.assertIsNone(sb.repo_of_tag("site", ["acme/site", "beta/site"]), "an ambiguous short tag names nobody")
+
+    def test_the_decision_id_helper_prefixes_the_tag(self):
+        items = [{"seed": "a", "ask": 2, "agent": "x", "bare": True, "since": EPOCH, "repo": ACME_API},
+                 {"seed": "b", "ask": 2, "agent": "x", "bare": True, "since": EPOCH, "repo": ACME_WEB},
+                 {"seed": "c", "ask": 2, "agent": "x", "bare": False, "since": EPOCH, "repo": ACME_WEB}]
+        ids = sb.assign_decision_ids(items, [ACME_API, ACME_WEB])
+        self.assertEqual(ids[:2], ["api#2", "web#2"])
+        self.assertRegex(ids[2], r"^web#2[a-z]{2}$")
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPluginShowsTheRepoTag(Base):
+    def test_a_row_starts_with_the_tag_and_a_row_never_wraps(self):
+        script = self.home / "tag-harness.mjs"
+        script.write_text("""import { rowOf } from "%s";
+const now = Date.now();
+const d = { id: "acme/site#2ab", repo: "acme/site", title: "x".repeat(80), since: new Date(now - 90000).toISOString() };
+console.log(JSON.stringify([rowOf(d, now), rowOf({ ...d, id: "api#2", repo: "acme/api" }, now)]));
+""" % (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri())
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        long_row, short_row = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertTrue(long_row.startswith("acme/site#2ab 1m "), long_row)
+        self.assertTrue(short_row.startswith("api#2 1m "), short_row)
+        self.assertLessEqual(len(long_row), 34)
+
+    def test_the_view_counts_decisions_and_keys_rows_by_the_tagged_id(self):
+        script = self.home / "tag-view.mjs"
+        script.write_text("""import { buildView } from "%s";
+const now = Date.now();
+const mk = (id) => ({ id, title: "t", since: new Date(now).toISOString() });
+console.log(JSON.stringify(buildView({ status: "ok", errors: [], decisions: [mk("api#2"), mk("web#2")] }, now)));
+""" % (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri())
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        view = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual([row["key"] for row in view["rows"]], ["api#2", "web#2"])
+
+
+class TestD6Scenario(Base):
+    def test_d6_is_present_with_a_control_that_names_what_it_breaks(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        self.assertIn("D6", found)
+        d6 = found["D6"]
+        self.assertEqual((d6["since_pr"], d6["control"]["fault"]), (15, "bare-issue-number"))
+        self.assertIn("offline", d6["tiers"])
+        self.assertEqual(sorted(d6["repos"]), [ACME_API, ACME_WEB])
+        self.assertEqual([s["repo"] for s in d6["steps"] if s["do"] == "awaiting"], [ACME_API, ACME_WEB])
+
+    def test_the_awaiting_step_may_name_a_repo(self):
+        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "repo", "title"])
 
 
 def main(argv):

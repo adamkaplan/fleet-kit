@@ -83,7 +83,7 @@ STEP_FIELDS = {
     "away": {},
     "permission": {"to": (False, _CAST), "decision": (False, "decision")},
     "comment": {"issue": (True, "issue"), "body": (True, "text"), "id": (False, "count1"),
-                "from": (False, "name")},
+                "from": (False, "name"), "repo": (False, "repo")},  # repo: PR 15
     "kill-daemon": {},
     "restart-daemon": {},
     "close-pane": {"agent": (True, _CAST)},
@@ -94,7 +94,8 @@ STEP_FIELDS = {
     "note": _SYNTHETIC,
     "wake": _SYNTHETIC,
     "wait": {},
-    "launch": {"agent": (True, _CAST), "brief": (False, "text")},
+    "launch": {"agent": (True, _CAST), "brief": (False, "text"), "new_workspace": (False, "name")},  # PR 15
+    "leave": {"agent": (True, _CAST)},  # PR 15: the agent's pane is gone
     "fact": {"to": (True, _CAST), "key": (True, "name"), "summary": (True, "text"), "kind": (False, "name"),
              "issue": (False, "issue"), "from": (False, "name"), "batch": (False, "bool")},
     "pass": {"faults": (False, "faults")},
@@ -111,7 +112,8 @@ STEP_FIELDS = {
     # PR 13: a cast member's `fleet-switchboard report <state> [--issue N] "one line"`
     "report": {"state": (True, "report_state"), "text": (True, "line"), "issue": (False, "issue")},
     # PR 14: Decisions. A label put on or taken off an issue; a boss's message to a worker; the projection deleted
-    "awaiting": {"issue": (True, "issue"), "on": (True, "bool"), "title": (False, "text")},
+    "awaiting": {"issue": (True, "issue"), "on": (True, "bool"), "title": (False, "text"),
+                 "repo": (False, "repo")},  # repo: PR 15, the repo of the issue
     "send": {"to": (True, _CAST), "text": (True, "line"), "issue": (False, "issue")},
     "delete-decisions": {},
 }
@@ -123,7 +125,7 @@ STEP_ACTORS = {
     "restart-daemon": ("world",), "close-pane": ("world",), "edit-intent": ("you", "world"),
     "synthetic": ("world",), "note": ("world",), "wake": ("world",), "wait": ("world",),
     "fact": ("world",), "pass": ("world",), "launch": ("world",), "delete-state": ("world",),
-    "kill-forwarder": ("world",), "occupy-hook": ("world",),
+    "kill-forwarder": ("world",), "occupy-hook": ("world",), "leave": ("world",),
     "handoff": ("cast",),
     "tool-call": ("cast",),  # PR 9
     "import-v1": ("world",),
@@ -145,7 +147,7 @@ EXPECT_FIELDS = {
     "message_has_intent": {"to": (True, _CAST), "issue": (True, "issue")},
     "classified": {"agent": (True, _CAST), "step": (True, _STEP), "as": (True, "name")},
     "handed_off": {"issue": (True, "issue")},
-    "toast": {"agent": (False, _CAST), "text": (False, "text")},
+    "toast": {"agent": (False, _CAST), "text": (False, "text"), "count": (False, "count1")},
     "tool_outcome": {"agent": (True, _CAST), "tool": (False, "name"), "outcome": (True, "outcome")},
     "judged": {"agent": (True, _CAST), "question": (True, "text"), "threshold": (False, "probability")},
     "status_is": {"agent": (True, _CAST), "status": (True, "status"), "at": (True, "duration")},
@@ -154,6 +156,11 @@ EXPECT_FIELDS = {
     "metadata_roundtrip": {"agent": (True, _CAST), "of": (True, "of"), "key": (False, "name"),
                            "text": (False, "text"), "fleet": (False, "fleet")},
     "github_watch": {"state": (True, "watch_state"), "repo": (False, "name")},
+    # PR 15: many repos, one fleet
+    "repo_watch": {"repo": (True, "repo"), "how": (True, "watch_how")},
+    "repo_membership": {"repo": (True, "repo"), "joined": (True, "bool"), "left": (True, "bool")},
+    "status_says": {"text": (True, "text")},
+    "launch_refused": {"agent": (True, _CAST), "text": (False, "text")},
     # PR 6
     "message_shows": {"to": (True, _CAST), "text": (True, "name")},
     "intent_gap": {"issue": (True, "issue")},
@@ -176,16 +183,22 @@ EXPECT_COMMON = ("that", "name", "why")
 # {"steps": {"<index>": {field: value}}, "expect": {"<name or index>": {field: value}},
 #  "issues": {"<number>": {field: value}}}.
 # The patched scenario must itself be valid.
-VARIANT_KEYS = ("steps", "expect", "issues")
+VARIANT_KEYS = ("steps", "expect", "issues", "repos")
 
 REQUIRED = ("id", "title", "problem", "since_pr", "tiers", "cast", "steps", "expect", "control")
-OPTIONAL = ("tags", "issues", "config")
-CAST_KEYS = ("role", "reports_to", "issue", "charter")
-ISSUE_KEYS = ("intent", "done_when", "parent", "authority")  # authority (PR 9): a charter's Standing authority line
+OPTIONAL = ("tags", "issues", "config", "repos")
+CAST_KEYS = ("role", "reports_to", "issue", "charter", "repo")
+# authority (PR 9): a charter's Standing authority line; workspace (PR 15): its `workspace:` line
+ISSUE_KEYS = ("intent", "done_when", "parent", "authority", "workspace")
+# PR 15: a repo of the play. `account`: the gh account that owns it (its token is the only one that can read it);
+# `webhook` false: that account cannot create a webhook; `exists` false: it does not exist yet.
+REPO_KEYS = ("account", "webhook", "exists")
+WATCH_HOWS = ("forwarder", "polling", "failed", "absent")
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 CONTROL_KINDS = ("fault", "baseline", "variant")
 
 ID_RE = re.compile(r"^[A-Z]{1,2}[0-9]+$")
-ISSUE_RE = re.compile(r"^[1-9][0-9]*$")
+ISSUE_RE = re.compile(r"^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#)?[1-9][0-9]*$")  # PR 15: owner/repo#N too
 DURATION_RE = re.compile(r"^([0-9]+)(s|m|h)$")
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
@@ -250,6 +263,10 @@ def _field_ok(check, value, cast, steps=0):
         return value in WATCH_STATES
     if check == "fleet":
         return value is None or isinstance(value, dict)
+    if check == "repo":  # PR 15
+        return isinstance(value, str) and bool(REPO_NAME_RE.match(value))
+    if check == "watch_how":
+        return value in WATCH_HOWS
     if check == "faults":
         return isinstance(value, list) and bool(value) and all(v in KNOWN_FAULTS for v in value)
     if check == "policy_tool":  # PR 9
@@ -272,7 +289,8 @@ _CHECK_TEXT = {_CAST: "a cast name", _STEP: "the index of a step in this scenari
                "status": "one of %s, or a non-empty list of them" % ", ".join(STATUSES),
                "of": " or ".join(OF), "outcome": " or ".join(OUTCOMES),
                "watch_state": "one of " + ", ".join(WATCH_STATES), "fleet": "an object or null",
-               "faults": "a non-empty list of known fault names"}
+               "faults": "a non-empty list of known fault names", "repo": "a repo such as acme/api",
+               "watch_how": "one of " + ", ".join(WATCH_HOWS)}
 _CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # PR 9
                     "policy_result": "one of " + ", ".join(POLICY_RESULTS),
                     "report_state": "one of " + ", ".join(REPORT_STATE_NAMES)})  # PR 13
@@ -315,6 +333,8 @@ def _validate_cast(cast, errors):
         for key in ("issue", "charter"):
             if key in member and not (_int(member[key]) and member[key] >= 1):
                 errors.append("%s.%s: must be an issue number (integer >= 1), got %r" % (where, key, member[key]))
+        if "repo" in member and not _field_ok("repo", member["repo"], cast):
+            errors.append("%s.repo: must be a repo such as acme/api, got %r" % (where, member["repo"]))
     return cast
 
 
@@ -341,6 +361,28 @@ def _validate_issues(issues, errors):
             errors.append("%s.parent: must be an issue number (integer >= 1)" % where)
         if "authority" in issue and not (issue["authority"] is None or isinstance(issue["authority"], str)):
             errors.append("%s.authority: must be a string or null" % where)  # PR 9
+        if "workspace" in issue and not (isinstance(issue["workspace"], str) and issue["workspace"]):
+            errors.append("%s.workspace: must be a non-empty string" % where)  # PR 15
+
+
+def _validate_repos(repos, errors):
+    if not isinstance(repos, dict) or not repos:
+        errors.append("repos: must be a non-empty object of owner/repo -> {account, webhook, exists}")
+        return
+    for name, repo in repos.items():
+        where = "repos.%s" % name
+        if not REPO_NAME_RE.match(name):
+            errors.append("%s: key must be a repo such as acme/api" % where)
+        if not isinstance(repo, dict):
+            errors.append("%s: must be an object" % where)
+            continue
+        for key in sorted(set(repo) - set(REPO_KEYS)):
+            errors.append("%s: unknown key %r" % (where, key))
+        if "account" in repo and not (isinstance(repo["account"], str) and repo["account"].strip()):
+            errors.append("%s.account: must be a gh account name" % where)
+        for key in ("webhook", "exists"):
+            if key in repo and not isinstance(repo[key], bool):
+                errors.append("%s.%s: must be true or false" % (where, key))
 
 
 # ---- scenario-level config (PR 4)
@@ -459,6 +501,10 @@ def apply_variant(scenario, variant):
         if not isinstance(patch, dict) or not patch:
             raise VariantError("steps.%s: must be a non-empty object of fields" % index)
         steps[int(index)].update(copy.deepcopy(patch))
+    for name, patch in sorted((variant.get("repos") or {}).items()):
+        if not isinstance(patch, dict) or not patch:
+            raise VariantError("repos.%s: must be a non-empty object of fields" % name)
+        out.setdefault("repos", {}).setdefault(name, {}).update(copy.deepcopy(patch))
     for number, patch in sorted((variant.get("issues") or {}).items()):
         if not isinstance(patch, dict) or not patch:
             raise VariantError("issues.%s: must be a non-empty object of fields" % number)
@@ -514,6 +560,8 @@ def _validate_body(obj):
     cast = _validate_cast(obj["cast"], errors) if "cast" in obj else {}
     if "issues" in obj:
         _validate_issues(obj["issues"], errors)
+    if "repos" in obj:
+        _validate_repos(obj["repos"], errors)
     if "steps" in obj:
         _validate_steps(obj["steps"], cast, errors)
     steps = len(obj["steps"]) if isinstance(obj.get("steps"), list) else 0

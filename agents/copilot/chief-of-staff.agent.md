@@ -72,11 +72,11 @@ steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file
 
 - **Before your first charter action** — reading, judging or correcting a charter
   — load the `fleet-charter` skill. It is what you hold orchestrators to.
-- **Before you brief an orchestrator**, load the `fleet-coordination` skill. The
-  briefing and reporting shapes live there.
+- **Before you brief an orchestrator**, load the `fleet-coordination` skill.
+- **Before you commission a project**, load `fleet-setup`; a worker creates it.
 
-Load them as a real first action. Skills are re-read on every use; this file was
-read once at session start and never reloads. When they disagree, the skill wins.
+Load them as a real first action. Skills are re-read on every use; this file
+never reloads. When they disagree, the skill wins.
 
 ## Labels carry your prefix
 
@@ -143,6 +143,7 @@ those files; do it. When disk contradicts you, disk wins.
 ## STOP
 
 - Never write product code, never merge, never deploy, never touch credentials.
+- Never run `gh repo create`, `gh repo delete` or `gh repo edit --visibility`.
 - Never dispatch another orchestrator's coder. Coders belong to their
   orchestrator; you talk to the orchestrator.
 - Never answer a `<user>:awaiting-user` question on your principal's behalf.

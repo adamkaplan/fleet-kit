@@ -103,6 +103,9 @@ DEFAULTS = {
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
     "awaiting_label": None,         # PR 14: the label that marks a decision for you; None means `<OS user>:awaiting-user`
     "decisions_lookback_hours": 72,  # PR 14: how far back a boss's transcript is read for open report questions
+    # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
+    "gh_users": {},
+    "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -248,6 +251,10 @@ KNOWN_FAULTS = (
     "no-decisions-file",
     "stale-as-fresh",
     "decision-resolves-never",
+    "static-repos",         # PR 15: the watched repos are read once, from the config
+    "bare-issue-number",    # PR 15: an `owner/repo#N` qualifier is ignored
+    "one-account",          # PR 15: every repo uses the default token
+    "repo-create-allowed",  # PR 15: the judge's deterministic rule on `gh repo create` is off
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -715,6 +722,16 @@ class HerdrClient:
     def pane_close(self, pane):
         return self._call("pane", "close", pane)
 
+    def workspace_create(self, cwd, label):
+        """A new herdr workspace for a project, never focused (PR 15): `herdr workspace create --cwd DIR --label
+        LABEL --no-focus`. Returns its id."""
+        body = self._call("workspace", "create", "--cwd", cwd, "--label", label, "--no-focus")
+        found = (body or {}).get("result", {}).get("workspace") if isinstance(body, dict) else None
+        ident = found.get("workspace_id") or found.get("id") if isinstance(found, dict) else found
+        if not isinstance(ident, str) or not ident:
+            raise HerdrError("bad_shape", "expected result.workspace.workspace_id in herdr's reply")
+        return ident
+
     def open_tab_running(self, workspace, label, cwd, argv, env):
         """A new tab in `workspace` whose one pane execs `argv` directly. Never
         types, never takes focus. Returns {"tab_id", "pane_id"}."""
@@ -745,9 +762,10 @@ class Fact:
     window, as `send` does.
     """
 
-    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender", "rider")
+    FIELDS = ("key", "recipient", "kind", "summary", "created", "issue", "batch", "sender", "rider", "repo")
 
-    def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None, rider=False):
+    def __init__(self, key, recipient, kind, summary, created, issue=None, batch=True, sender=None, rider=False,
+                 repo=None):
         for name, value in (("key", key), ("recipient", recipient), ("kind", kind)):
             if not isinstance(value, str) or not value.strip():
                 raise FactError("fact %s must be a non-empty string, got %r" % (name, value))
@@ -766,24 +784,32 @@ class Fact:
         self.key, self.recipient, self.kind, self.summary = key, recipient, kind, summary
         self.created, self.issue, self.batch, self.sender = float(created), issue, batch, sender
         self.rider = rider  # PR 13: carried in the next message, never the reason for one
+        if repo is not None and not (isinstance(repo, str) and REPO_RE.match(repo)):
+            raise FactError("fact repo must be OWNER/REPO, got %r" % (repo,))
+        self.repo = repo  # PR 15: the repo `issue` is in; None means the recipient's own
 
     @classmethod
     def from_json(cls, obj):
         if not isinstance(obj, dict):
             raise FactError("a fact must be a JSON object")
-        unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider"})
+        unknown = sorted(set(obj) - {"key", "recipient", "kind", "summary", "created", "issue", "batch", "from", "rider",
+                                  "repo"})
         if unknown:
             raise FactError("fact has unknown field(s): %s" % ", ".join(unknown))
         missing = [name for name in ("key", "recipient", "kind", "summary", "created") if name not in obj]
         if missing:
             raise FactError("fact is missing: %s" % ", ".join(missing))
         return cls(obj["key"], obj["recipient"], obj["kind"], obj["summary"], obj["created"],
-                   obj.get("issue"), obj.get("batch", True), obj.get("from"), obj.get("rider", False))
+                   obj.get("issue"), obj.get("batch", True), obj.get("from"), obj.get("rider", False),
+                   obj.get("repo"))
 
     def to_json(self):
-        return {"key": self.key, "recipient": self.recipient, "kind": self.kind, "summary": self.summary,
+        body = {"key": self.key, "recipient": self.recipient, "kind": self.kind, "summary": self.summary,
                 "created": self.created, "issue": self.issue, "batch": self.batch, "from": self.sender,
                 "rider": self.rider}
+        if self.repo is not None:  # one repo: the shape is what it always was
+            body["repo"] = self.repo
+        return body
 
     def __repr__(self):
         return "Fact(%r -> %r)" % (self.key, self.recipient)
@@ -1010,7 +1036,7 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     """One message for `facts`, oldest first. Returns (text, the facts it carries).
 
     The first line names the count and the first item; each item follows in
@@ -1024,7 +1050,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None):
         raise ValueError("nothing to compose")
 
     def item(fact):
-        where = " (issue #%d)" % fact.issue if fact.issue else ""
+        where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
         body = fact.summary.strip().replace("\n", "\n  ")
         return "- %s from %s%s: %s" % (fact.kind, fact.sender or "the fleet", where, body)
 
@@ -1080,14 +1106,14 @@ def _line_of(text, limit):
     return _one_line(text, limit)
 
 
-def describe_items(recipient, facts):
+def describe_items(recipient, facts, repos=None):
     """The one human line v2's TUI shows for a message (PR 13): `switchboard: <sender> <what> on #<issue>:
     <first 100 characters>` for one item, `switchboard: <n> items for <recipient>: <first item, 80 characters>`
     for several. At most DESCRIPTION_MAX characters, never a newline."""
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     lead = next((fact for fact in facts if not fact.rider), facts[0])
     if len(facts) == 1:
-        where = " on #%d" % lead.issue if lead.issue else ""
+        where = " on %s" % issue_tag(lead.repo, lead.issue, repos) if lead.issue else ""
         line = "switchboard: %s %s%s: %s" % (lead.sender or "the fleet", DESCRIBED_AS.get(lead.kind, lead.kind),
                                              where, _line_of(lead.summary, 100))
     else:
@@ -1424,7 +1450,9 @@ class Switchboard:
                 note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
-        text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation))
+        repos = self.repos_in_play()
+        text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
+                                repos=repos)
         keys = [fact.key for fact in carried]
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
@@ -1433,7 +1461,7 @@ class Switchboard:
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
-        description = None if fault("no-description") else describe_items(plan.recipient, carried)
+        description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
         detail["description"] = description
         with self._external("v2.synthetic", plan.recipient, detail) as result:
             record = self.v2.synthetic(observation.session_id, text,
@@ -1625,12 +1653,19 @@ class Switchboard:
 
     # -- the CLI's entry points
 
-    def send(self, sender, recipient, text, issue=None):
+    def send(self, sender, recipient, text, issue=None, repo=None):
         """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing."""
         now = self.now()
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
-                    issue=issue, batch=False, sender=sender)
+                    issue=None if issue is None else int(issue), batch=False, sender=sender,
+                    repo=repo or issue_repo(issue))
         return self.send_fact(fact, self.discover(now), now)
+
+    def repos_in_play(self):
+        """The repos messages may be about: every watched repo. With one, a message names `#2`; with
+        several, `api#2` (PR 15)."""
+        discovery = getattr(self, "discovery", None)
+        return watched_repos(self.config, discovered_fleets(discovery))
 
     def send_fact(self, fact, discovery, now, carried=()):
         """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule."""
@@ -1664,8 +1699,11 @@ class Switchboard:
         if boss is None:
             raise ReportError("%s reports to nobody: its fleet metadata has no reports_to, so there is no one to "
                               "tell (use `%s send <name> ...` for a message)" % (sender, PROG))
+        repo, number = resolve_issue(self.config, issue, me.fleet, watched_repos(self.config, discovered_fleets(discovery)))
+        if number is None:
+            number, repo = _issue_of(me.fleet), _fleet_repo(me.fleet, self.config) if _issue_of(me.fleet) else None
         fact = Fact("%s:%s:%s" % (REPORT, sender, uuid.uuid4().hex[:16]), boss, REPORT, "%s: %s" % (state, text),
-                    now, issue=issue if issue is not None else _issue_of(me.fleet), batch=False, sender=sender,
+                    now, issue=number, batch=False, sender=sender, repo=repo,
                     rider=state in REPORT_PROGRESS and not fault("no-rider"))
         if fact.rider:
             record_report_rider(self, fact)
@@ -2185,7 +2223,7 @@ def _ask_of(fleet, owner=None):
     issue = fleet.get("issue")
     if issue is None:
         return None
-    return {"issue": issue, "intent": fleet.get("intent") or "", "owner": owner}
+    return {"issue": issue, "intent": fleet.get("intent") or "", "owner": owner, "repo": fleet.get("repo")}
 
 
 def open_asks_of(discovery, cos_name):
@@ -2197,8 +2235,8 @@ def open_asks_of(discovery, cos_name):
     asks, seen = [], set()
     for name, other in sorted(discovery.agents.items()):
         ask = _ask_of(other.fleet, name)
-        if name != cos_name and ask and ask["issue"] not in seen:
-            seen.add(ask["issue"])
+        if name != cos_name and ask and (ask["repo"], ask["issue"]) not in seen:
+            seen.add((ask["repo"], ask["issue"]))
             asks.append(ask)
     return asks
 
@@ -2471,8 +2509,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None):
-    fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": issue, "charter": charter}
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None):
+    fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
+             "charter": charter, "repo": repo}
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -2520,7 +2559,7 @@ def close_own_pane(engine, name, pane, why):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -2535,12 +2574,21 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    accounts = getattr(engine, "accounts", None)
+    if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
+        problem = launch_account_problem(engine.config, accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+        try:
+            env.update(accounts.token_env(repo))
+        except AccountError as err:
+            raise LaunchError(str(err)) from None
     with engine._external("v2.session.create", name, {"agent": agent, "directory": directory,
                                                       "fleet": fleet}) as result:
         session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
         result["session"] = session_id
-    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
@@ -2694,7 +2742,7 @@ def ask_intent(engine, ask):
     if not ask or engine.intents is None:
         return ask
     try:
-        issue = engine.intents.issue(ask["issue"])
+        issue = engine.intents.issue(ask["issue"], ask.get("repo"))
     except IntentError:
         return ask
     return dict(ask, intent=issue.intent or ask.get("intent") or "", done_when=issue.done_when)
@@ -2886,26 +2934,29 @@ def handoff_markdown(issue, parsed):
     return "\n".join(lines)
 
 
-def post_ask_comment(engine, issue, body, author=None):
+def post_ask_comment(engine, issue, body, author=None, repo=None):
     """Comment on the ask through the configured `gh`. The GitHub writes the switchboard makes: the handoff
     brief, so the record survives (docs: Hand off), and an agent's own comment (`comment`). Signed with
     the author's name when there is one, so it is never delivered back as an event. Audited before and after."""
     reader = engine.intents
     if author:
         body = body.rstrip("\n") + "\n\n" + fleet_mark(author)
-    path = "repos/%s/issues/%d/comments" % (reader.repo, issue)
-    with engine._external("github.comment", "issue:%d" % issue, {"repo": reader.repo, "issue": issue,
-                                                                   "chars": len(body)}) as result:
+    repo = repo or reader.repo
+    path = "repos/%s/issues/%d/comments" % (repo, issue)
+    subject = "issue:%d" % issue if repo == reader.repo else "issue:%s#%d" % (repo, issue)
+    with engine._external("github.comment", subject, {"repo": repo, "issue": int(issue), "chars": len(body)}) as result:
+        env = reader.env_for(repo)
         try:
             done = reader.runner([reader.gh, "api", path, "--method", "POST", "--input", "-"],
                                  input=json.dumps({"body": body}), capture_output=True, text=True,
-                                 timeout=reader.timeout)
+                                 timeout=reader.timeout, **({"env": env} if env is not None else {}))
         except subprocess.TimeoutExpired:
             raise IntentError("unavailable", "gh did not answer within %ss" % reader.timeout) from None
         except OSError as err:
             raise IntentError("unavailable", "cannot run %s: %s" % (reader.gh, err.strerror or err)) from None
         if done.returncode != 0:
-            raise IntentError("gh", _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode)
+            detail = _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode
+            raise IntentError("gh", reader.accounts.scrub(detail) if reader.accounts else detail)
         try:
             posted = json.loads(done.stdout)
         except ValueError:
@@ -2915,13 +2966,13 @@ def post_ask_comment(engine, issue, body, author=None):
     return result["url"]
 
 
-def handoff_refusals(engine, issue, name, directory, workspace, agent):
+def handoff_refusals(engine, issue, name, directory, workspace, agent, repo=None):
     """Why nothing may be written, found before anything is: the ask, the agent's name and place.
     Returns the ask (an IssueIntent)."""
     if engine.intents is None:
         raise HandoffRefused("'intent_repo' is not configured: a handoff fills Goal from the ask and posts "
                              "the brief on it")
-    ask = engine.intents.issue(issue)
+    ask = engine.intents.issue(issue, repo)
     if ask.charter:
         raise HandoffRefused("#%d is a charter, not an ask: hand off an ask under it" % issue)
     if ask.state != "open":
@@ -2942,20 +2993,26 @@ def subagent_prompt(caller, issue, markdown):
 
 
 def handoff_ask(engine, caller, issue, brief, name=None, directory=None, workspace=None, agent=SUBAGENT_AGENT,
-                patience=LAUNCH_PATIENCE, sleep=time.sleep):
+                patience=LAUNCH_PATIENCE, sleep=time.sleep, repo=None):
     """The Chief of Staff's handoff: check, post the brief on the ask, launch the subagent. Returns a dict.
 
     Everything that can be refused is refused before the comment is posted.
     A launch that fails after the comment says so: the record stands.
     """
+    explicit = issue_repo(issue)
+    repo = repo or explicit
+    issue = int(issue)
+    # The subagent's own metadata names a repo only when the caller did, or when several repos are in play:
+    # with one repo its metadata is what it always was.
+    record = explicit or (repo if len(engine.repos_in_play()) > 1 else None)
     name = name or "cos-%d" % issue
     parsed = parse_brief(brief)
-    ask = handoff_refusals(engine, issue, name, directory, workspace, agent)
+    ask = handoff_refusals(engine, issue, name, directory, workspace, agent, repo)
     markdown = handoff_markdown(ask, parsed)
-    url = post_ask_comment(engine, issue, markdown, author=caller)
+    url = post_ask_comment(engine, issue, markdown, author=caller, repo=repo)
     try:
         done = launch_agent(engine, name, agent, directory, workspace, COS_SUBAGENT, caller, issue,
-                            subagent_prompt(caller, issue, markdown), patience, sleep)
+                            subagent_prompt(caller, issue, markdown), patience, sleep, repo=record)
     except LaunchError as err:
         raise LaunchError("the brief was posted on ask #%d, but the subagent did not start: %s" % (issue, err)) from err
     return dict(done, issue=issue, reports_to=caller, role=COS_SUBAGENT, comment=url,
@@ -2968,8 +3025,10 @@ def cmd_handoff(args, runner, now, socket_call=None):
     engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
-        done = handoff_ask(engine, caller, args.issue, brief, args.name, args.dir or os.getcwd(), workspace)
-    except HandoffRefused as err:
+        repo, number = resolve_for_sender(engine, engine.config, args.issue, caller)
+        done = handoff_ask(engine, caller, RepoIssue(number, issue_repo(args.issue)), brief, args.name,
+                           args.dir or os.getcwd(), workspace, repo=repo)
+    except (HandoffRefused, IssueRefError) as err:
         sys.stderr.write("%s: handoff refused: %s\n" % (PROG, err))
         return EXIT_USAGE
     if done.pop("replaced_goal"):
@@ -2987,8 +3046,13 @@ def cmd_comment(args, runner, now):
     if body is None:
         raise IntentError("usage", "--body-file is required (a file, or - for stdin)")
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
-    url = post_ask_comment(engine, args.issue, body, author=caller)
-    print(json.dumps({"issue": args.issue, "author": caller, "comment": url}, sort_keys=True))
+    try:
+        repo, number = resolve_for_sender(engine, config, args.issue, caller)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    url = post_ask_comment(engine, number, body, author=caller, repo=repo)
+    print(json.dumps({"issue": number, "author": caller, "comment": url}, sort_keys=True))
     return EXIT_OK
 
 
@@ -3004,11 +3068,11 @@ def add_foreground_parsers(sub):
     sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
-    comment.add_argument("--issue", type=int, required=True, help="The issue to comment on")
+    comment.add_argument("--issue", type=issue_arg, required=True, help="The issue to comment on")
     comment.add_argument("--body-file", dest="body_file", required=True, help="The comment: a file, or - for stdin")
     handoff = sub.add_parser("handoff", help="Hand your current work to a background subagent: post the brief on "
                                              "the ask and launch it, without typing")
-    handoff.add_argument("--issue", type=int, required=True, help="The ask being handed off")
+    handoff.add_argument("--issue", type=issue_arg, required=True, help="The ask being handed off")
     handoff.add_argument("--brief-file", dest="brief_file", required=True,
                          help="The brief (Done so far, Next steps, Watch out for): a file, or - for stdin")
     handoff.add_argument("--name", help="The subagent's fleet name (default: cos-<issue>)")
@@ -3218,14 +3282,16 @@ class WorkerFacts:
         if isinstance(item.get("message"), str) and item["message"].strip():
             summary += " (reason given: %s)" % _one_line(item["message"], 200)
         issue = _issue_of(observation.fleet)
+        repo = _fleet_repo(observation.fleet, self.engine.config) if issue else None  # PR 15: the issue's repo
         # A hook's message (PR 9: the policy judge's reason) is on the request as `message`: say it first.
         note = _one_line(item["message"], 120) if isinstance(item.get("message"), str) else ""
         shown = "%s (%s)" % (note, _one_line(what, 60)) if note else what
         self._blocked.append((observation.name, key, "Fleet: %s is blocked" % observation.name,
                               _one_line("%s is waiting for you: %s%s" % (
-                                  observation.name, shown, " (issue #%d)" % issue if issue else ""), 200)))
+                                  observation.name, shown,
+                                  " (issue %s)" % issue_tag(repo, issue, self.engine.repos_in_play()) if issue else ""), 200)))
         return Fact(key, boss, WORKER_BLOCKED, summary, asked if asked is not None else self.engine.now(),
-                    issue=issue, batch=asked is not None, sender=observation.name)
+                    issue=issue, batch=asked is not None, sender=observation.name, repo=repo)
 
 
 # ---- PR 13: workers report, and a stop without a report is triaged
@@ -3468,7 +3534,7 @@ class ReportRiderFacts:
 
     def __call__(self):
         return [Fact(item["key"], item["to"], REPORT, item["summary"], item["created"], issue=item.get("issue"),
-                     batch=False, sender=item.get("from"), rider=True) for item in self.entries()]
+                     batch=False, sender=item.get("from"), rider=True, repo=item.get("repo")) for item in self.entries()]
 
 
 def _report_rider_source(engine):
@@ -3481,6 +3547,8 @@ def record_report_rider(engine, fact):
         raise ReportError("this engine has nowhere to keep a progress report")
     item = {"key": fact.key, "to": fact.recipient, "created": fact.created, "summary": fact.summary,
             "issue": fact.issue, "from": fact.sender}
+    if fact.repo:
+        item["repo"] = fact.repo
     with report_riders_lock(source.state_dir):
         write_report_riders(source.state_dir, read_report_riders(source.state_dir) + [item])
     if engine.audit is not None:
@@ -3536,8 +3604,18 @@ DECISIONS_FILE = "decisions.json"
 DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
 DECISION_TITLE_MAX = 200
 DECISION_SOURCES = ("github", "v2", "reports")
-REPORT_LINE = re.compile(r"^- report from (\S+?)(?: \(issue #(\d+)\))?: ([a-z]+): (.*)$")
-SEND_LINE = re.compile(r"^- send from (\S+?)(?: \(issue #(\d+)\))?: ")
+# `(issue #2)` with one repo in play, `(issue api#2)` or `(issue owner/api#2)` with several (issue_tag)
+REPORT_LINE = re.compile(r"^- report from (\S+?)(?: \(issue (?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?))?#(\d+)\))?: ([a-z]+): (.*)$")
+SEND_LINE = re.compile(r"^- send from (\S+?)(?: \(issue (?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?))?#(\d+)\))?: ")
+
+
+def repo_of_tag(tag, repos):
+    """The repo a message's issue tag names (`web` or `acme/web`) among `repos`, or None when it names none or
+    several (the tag is the repo name, or owner/name when two of the repos share a name: issue_tag)."""
+    if not tag:
+        return None
+    found = [repo for repo in repos or [] if repo == tag or (("/" not in tag) and repo.split("/")[1] == tag)]
+    return found[0] if len(found) == 1 else None
 
 
 def validate_decisions_config(config, source):
@@ -3554,22 +3632,24 @@ def _decision_number(seed):
     return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16)
 
 
-def _id_candidates(item, number):
+def _id_candidates(item, number, repos=None):
     ask, agent = item.get("ask"), item.get("agent")
+    tag = issue_tag(None if fault("bare-issue-number") else item.get("repo"), ask, repos) if ask else None
     if ask and item.get("bare"):
-        yield "#%d" % ask                      # an issue's own label is the issue number
+        yield tag                              # an issue's own label is the issue's tag: `#2`, or `api#2` with several repos
     if ask:
-        for step in range(26 * 26):            # `#2` and two letters taken from the decision's own hash
+        for step in range(26 * 26):            # the tag and two letters taken from the decision's own hash
             pair = (number + step) % 676
-            yield "#%d%s%s" % (ask, chr(97 + pair // 26), chr(97 + pair % 26))
+            yield "%s%s%s" % (tag, chr(97 + pair // 26), chr(97 + pair % 26))
     else:
         for step in range(900):                # `<agent>-` and three digits likewise
             yield "%s-%03d" % (agent or "fleet", 100 + (number + step) % 900)
-    yield "%s-%x" % ("#%d" % ask if ask else agent or "fleet", number)
+    yield "%s-%x" % (tag if ask else agent or "fleet", number)
 
 
-def assign_decision_ids(items):
-    """The id of each decision in `items` (dicts with seed, ask, agent, bare, since), in the same order.
+def assign_decision_ids(items, repos=None):
+    """The id of each decision in `items` (dicts with seed, ask, agent, bare, since, repo), in the same order.
+    `repos` are the watched repos: with more than one, an issue's tag names its repo, as in a message.
 
     Derived from the decision's own identity (`seed`) and nothing else: no counter, no file. An issue's own
     label is `#<issue>`; any other decision about an issue is `#<issue>` and two letters; one about no issue is
@@ -3580,7 +3660,7 @@ def assign_decision_ids(items):
     taken, ids = set(), [None] * len(items)
     for index in order:
         item = items[index]
-        for candidate in _id_candidates(item, _decision_number(item["seed"])):
+        for candidate in _id_candidates(item, _decision_number(item["seed"]), repos):
             if candidate not in taken:
                 break
         taken.add(candidate)
@@ -3588,9 +3668,15 @@ def assign_decision_ids(items):
     return ids
 
 
+def decision_repos(engine):
+    """Every repo being watched now (the derived set, as the hub's): the baseline, the repos of the live agents
+    and of the charters they hold. Not the config's list alone, and not the intent repo alone."""
+    return watched_repos(engine.config, discovered_fleets(engine.discovery))
+
+
 def decisions_from_github(engine, now):
     """(items, problems): the open issues with your label, from the hub's picture. No `gh` call is made here."""
-    if not engine.config["github_repos"]:
+    if not decision_repos(engine):
         return [], []
     hub = engine.hub
     if hub is None:
@@ -3604,7 +3690,7 @@ def decisions_from_github(engine, now):
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
                       "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
-                      "bare": True})
+                      "bare": True, "repo": record["repo"]})
     return items, problems
 
 
@@ -3620,7 +3706,9 @@ def decisions_from_requests(engine, now):
                         + [r for r in request.get("resources") or [] if isinstance(r, str)])
         asked = _created(request)
         seen[key] = asked if asked is not None else engine.decision_seen.get(key, now)
-        items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": _issue_of(observation.fleet),
+        ask = _issue_of(observation.fleet)
+        items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": ask,
+                      "repo": _fleet_repo(observation.fleet, engine.config) if ask else None,
                       "agent": observation.name, "since": seen[key],
                       "seed": "request:%s:%s" % key, "bare": False})
     engine.decision_seen = seen  # memory only: a request with no time of its own keeps the first time it was seen
@@ -3666,6 +3754,7 @@ def decisions_from_reports(engine, now):
         raise RuntimeError("the fleet cannot be read: %s" % "; ".join(discovery.problems))
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({_boss_of(o) for o in discovery.agents.values()} - {None})
+    repos = decision_repos(engine)
     items, problems, sends = [], [], {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
@@ -3677,9 +3766,12 @@ def decisions_from_reports(engine, now):
         for created, message_id, number, line in synthetic_lines(engine, observation.session_id, since):
             match = REPORT_LINE.match(line)
             if match:
+                sender = discovery.agents.get(match.group(1))
+                issue = int(match.group(3)) if match.group(3) else None
                 reports.append({"at": (created, number), "message": message_id, "sender": match.group(1),
-                                "issue": int(match.group(2)) if match.group(2) else None,
-                                "state": match.group(3), "text": match.group(4), "boss": boss,
+                                "issue": issue, "state": match.group(4), "text": match.group(5), "boss": boss,
+                                "repo": (repo_of_tag(match.group(2), repos)
+                                         or (_fleet_repo(sender.fleet, engine.config) if sender else None)) if issue else None,
                                 "session": observation.session_id})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
@@ -3689,6 +3781,7 @@ def decisions_from_reports(engine, now):
                 continue
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
+                          "repo": report["repo"],
                           "since": report["at"][0], "bare": False,
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1])})
     return items, problems
@@ -3699,7 +3792,7 @@ def report_answered(engine, report, reports, since, sends):
     worker on it, exists. `sends` caches one read of each worker's transcript per derivation."""
     for other in reports:
         if other is not report and other["sender"] == report["sender"] and other["issue"] == report["issue"] \
-                and other["at"] > report["at"]:
+                and other["repo"] == report["repo"] and other["at"] > report["at"]:
             return True
     worker = engine.discovery.agents[report["sender"]]
     if worker.problem:
@@ -3709,7 +3802,8 @@ def report_answered(engine, report, reports, since, sends):
     for created, _, _, line in sends[worker.name]:
         match = SEND_LINE.match(line)
         if match and match.group(1) == report["boss"] and created > report["at"][0] \
-                and (match.group(2) is None or int(match.group(2)) == report["issue"]):
+                and (match.group(3) is None or (int(match.group(3)) == report["issue"]
+                                                and repo_of_tag(match.group(2), decision_repos(engine)) in (None, report["repo"]))):
             return True
     return False
 
@@ -3717,7 +3811,7 @@ def report_answered(engine, report, reports, since, sends):
 def derive_decisions(engine, now):
     """(decisions, errors): every open decision, oldest first, and what could not be read.
 
-    Each decision is {id, title, ask, agent, kind, since}. A source that fails is an error entry and the
+    Each decision is {id, title, ask, repo, agent, kind, since}. A source that fails is an error entry and the
     others are still listed (audited once per change). Call after `engine.discover` and a fact collection."""
     items, errors = [], []
     sources = (("github", decisions_from_github), ("v2", decisions_from_requests),
@@ -3731,9 +3825,9 @@ def derive_decisions(engine, now):
         for problem in problems:
             errors.append({"source": name, "error": _one_line(problem, 200)})
             engine._note("decisions.error", name, {"error": _one_line(problem, 200)})
-    ids = assign_decision_ids(items)
+    ids = assign_decision_ids(items, decision_repos(engine))
     decisions = [{"id": ident, "title": _line_of(item["title"], DECISION_TITLE_MAX), "ask": item["ask"],
-                  "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"])}
+                  "repo": item.get("repo"), "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"])}
                  for ident, item in zip(ids, items)]
     decisions.sort(key=lambda d: (d["since"], d["id"]))
     return decisions, errors
@@ -3851,10 +3945,11 @@ def fresh_decisions(runner, now):
     engine, state, config = build_engine(runner, now, "cli", writable=False)
     engine.discover(now())
     engine.collect_facts()
-    if config["github_repos"]:
+    repos = decision_repos(engine)
+    if repos:
         hub = GitHubHub(config, state, None, runner, spawn_forwarder, now, "cli")
         hub.engine, engine.hub = engine, hub
-        for repo in config["github_repos"]:
+        for repo in repos:  # every watched repo, each read with its own account (the hub's gh_api picks it)
             hub.read_awaiting(repo, now())
     decisions, errors = derive_decisions(engine, now())
     return {"stale": False, "message": None, "age_seconds": 0, "written_at": iso(now()), "generation": None,
@@ -3895,14 +3990,22 @@ def cmd_decisions(args, runner, now):
 def decisions_summary(state_dir, now):
     """For `status`: how many decisions the file lists, and whether the daemon keeps it current."""
     report = decisions_report(state_dir, now())
+    by_repo = {}
+    for decision in report["decisions"]:
+        if decision.get("repo"):
+            by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(report["decisions"]), "stale": report["stale"], "message": report["message"],
-            "age_seconds": report["age_seconds"], "errors": len(report["errors"])}
+            "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo}
 
 
 def format_decisions_status(summary):
     if summary["stale"]:
         return ["      decisions  %s" % summary["message"]]
     line = "      decisions  %d waiting on you (`%s decisions`)" % (summary["count"], PROG)
+    by_repo = summary.get("by_repo") or {}
+    if len(by_repo) > 1:  # with one repo there is nothing to tell apart
+        line = "      decisions  %d waiting on you (%s; `%s decisions`)" % (
+            summary["count"], ", ".join("%s %d" % (repo, count) for repo, count in sorted(by_repo.items())), PROG)
     return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
 
 
@@ -4015,13 +4118,15 @@ def write_reminders(state_dir, items):
         raise
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None):
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
         raise ReminderError("a reminder needs text")
     item = {"id": uuid.uuid4().hex[:12], "to": to, "at": float(at), "created": float(created),
             "text": text, "issue": issue, "from": sender}
+    if repo:
+        item["repo"] = repo  # PR 15: the repo `issue` is in
     with reminders_lock(state_dir):
         write_reminders(state_dir, read_reminders(state_dir) + [item])
     return item
@@ -4059,7 +4164,7 @@ class ReminderFacts:
 
     def __call__(self):
         return [Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
-                     issue=item.get("issue"), batch=False, sender=item.get("from"))
+                     issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo"))
                 for item in self.due()]
 
 
@@ -4088,7 +4193,7 @@ def prune_delivered_reminders(engine, discovery):
 
 
 def cmd_remind(args, runner, now):
-    engine, state, _ = build_engine(runner, now, "cli")
+    engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
@@ -4098,10 +4203,15 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
+    try:
+        repo, number = resolve_for_sender(engine, config, args.issue, sender)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), args.issue, sender)
+                        " ".join(args.text).strip(), number, sender, repo)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
-                                                          "from": sender, "issue": args.issue})
+                                                          "from": sender, "issue": number, "repo": repo})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s at %s\n" % (PROG, args.name, iso(item["at"])))
     return EXIT_OK
@@ -4144,6 +4254,8 @@ WATCH_FILE = "github-watch.json"
 WATCH_STATES = ("starting", "running", "backoff", "conflict")
 
 
+GH_USERS_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+/(?:[A-Za-z0-9_.-]+|\*)$")
+GITHUB_POLL_MIN = 15           # seconds: a poll reads a repo's comments, issues, pulls and runs
 GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,34}\[bot\])$")
 
 
@@ -4173,6 +4285,17 @@ def _validate_github(config, source):
         raise ConfigError("%s: 'github_ignore_authors' must be a list of GitHub logins, got %r" % (source, ignore))
     config["github_repos"], config["github_events"] = list(repos), list(events)
     config["github_ignore_authors"] = list(ignore)
+    users = config["gh_users"]
+    if not isinstance(users, dict) or not all(
+            isinstance(k, str) and GH_USERS_KEY_RE.match(k) and isinstance(v, str) and GITHUB_LOGIN_RE.match(v)
+            for k, v in users.items()):
+        raise ConfigError("%s: 'gh_users' must map \"owner/repo\" or \"owner/*\" to a gh account name, got %r"
+                          % (source, users))
+    config["gh_users"] = dict(users)
+    poll = config["github_poll_seconds"]
+    if not _is_number(poll) or poll < GITHUB_POLL_MIN:
+        raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
+                          "several API calls), got %r" % (source, GITHUB_POLL_MIN, poll))
 
 
 # ------------------------------------------------------------- verification
@@ -4481,7 +4604,7 @@ def _is_orchestrator(observation):
     return (observation.fleet or {}).get("role") == "orchestrator"
 
 
-def pick_owner(agents, numbers, repo=None):
+def pick_owner(agents, numbers, repo=None, default_repo=None):
     """The fleet agent that owns the first of `numbers`, or None. One recipient per item.
 
     An agent owns the issues in its metadata.fleet `issue` and `charter`. An
@@ -4491,7 +4614,8 @@ def pick_owner(agents, numbers, repo=None):
     best = None
     for name in sorted(agents):
         fleet = agents[name].fleet or {}
-        if repo and isinstance(fleet.get("repo"), str) and fleet["repo"] != repo:
+        theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo  # PR 15: with several repos
+        if repo and theirs and theirs != repo:                                               # an agent has one
             continue
         owned = set()
         for field in ("issue", "charter"):
@@ -4523,21 +4647,40 @@ class Watch:
         self.next_start = 0.0
         self.started = self.catchup_at = self.last_catch_up = None
         self.last_error = self.catch_up_error = None
+        # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
+        # a poll instead: the existing catch-up read, every github_poll_seconds.
+        self.polling, self.poll_reason, self.next_poll, self.last_poll = False, None, 0.0, None
+
+    @property
+    def mode(self):
+        """How the repo is watched: forwarder, polling, failed (polling, and the poll cannot read it either),
+        or the supervisor's own state while the forwarder starts, backs off or finds a conflict."""
+        try:
+            alive = self.proc is not None and self.proc.poll() is None
+        except Exception:  # describing a watch must never be what fails
+            alive = True
+        if alive:
+            return "forwarder"
+        if self.polling:
+            return "failed" if self.catch_up_error else "polling"
+        return self.state
 
     def to_json(self):
         """What `status` may show. Never the secret."""
-        return {"repo": self.repo, "state": self.state, "starts": self.starts, "failures": self.failures,
+        return {"repo": self.repo, "state": self.state, "mode": self.mode, "poll_reason": self.poll_reason,
+                "starts": self.starts, "failures": self.failures,
                 "forwarder_pid": getattr(self.proc, "pid", None), "started": iso(self.started),
                 "next_start": iso(self.next_start) if self.proc is None else None,
                 "last_catch_up": iso(self.last_catch_up), "last_error": self.last_error,
                 "catch_up_error": self.catch_up_error}
 
 
-def spawn_forwarder(argv, log_path):
-    """Start the forwarder detached, its output in `log_path`. It never inherits our pipes."""
+def spawn_forwarder(argv, log_path, env=None):
+    """Start the forwarder detached, its output in `log_path`. It never inherits our pipes. `env` (PR 15)
+    is the repo's account's environment, the only place its token ever is."""
     fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd, env=env,
                                 start_new_session=True, close_fds=True)
     finally:
         os.close(fd)
@@ -4556,6 +4699,19 @@ def _terminate(proc):
 
 _USAGE_LINE = re.compile(r"^\s*(-{1,2}[A-Za-z]|usage:|flags:|examples?:|global flags:|\$ |#|use \")", re.I)
 _ERROR_LINE = re.compile(r"\b(error|failed|failure|unauthorized|forbidden|denied|not found|refused|timed? ?out|invalid)\b", re.I)
+
+
+NO_RIGHTS_RE = re.compile(r"admin rights|Resource not accessible|HTTP 40[13]|Bad credentials|forbidden", re.I)
+NOT_FOUND_RE = re.compile(r"Not Found|HTTP 404|Could not resolve", re.I)
+
+
+def unwatchable_reason(tail):
+    """Why a forwarder that exited can never work here (so the repo is polled), or None for an ordinary failure."""
+    if NO_RIGHTS_RE.search(tail):
+        return "the account cannot create a webhook"
+    if NOT_FOUND_RE.search(tail):
+        return "the repo does not exist yet, or this account cannot see it"
+    return None
 
 
 def forwarder_reason_line(lines):
@@ -4585,6 +4741,7 @@ class GitHubHub:
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
         self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.accounts = GhAccounts(config, runner, now)  # PR 15: a gh account per repo
         self.lookback = config["github_lookback_hours"] * 3600
         self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
         self.conflict_retry, self.catchup_delay = GITHUB_CONFLICT_RETRY, GITHUB_CATCHUP_DELAY
@@ -4819,18 +4976,49 @@ class GitHubHub:
                     if toast is not None:
                         number, updated, _ = _payload_issue(payload)
                         found.append((name, "intent edit #%d %s" % (number, updated), toast["title"], toast["body"]))
+        found.extend(self.polling_toasts())
         return found
+
+    def polling_toasts(self):
+        """PR 15: one toast per repo that is polled because its forwarder cannot work, for as long as it is."""
+        with self.lock:
+            polled = [(w.repo, w.poll_reason, w.last_error) for _, w in sorted(self.watches.items()) if w.polling]
+        return [("github:%s" % repo, "polling: %s" % reason, "GitHub: %s is read on a poll" % repo,
+                 _one_line("no webhook (%s); read every %gs. %s" % (reason, self.config["github_poll_seconds"],
+                                                                    last_error or ""), 200))
+                for repo, reason, last_error in polled]
 
     # -- the fact source
 
     def fact_source(self):
         def github_facts():
-            if self.autostart:
+            self.reconcile(getattr(self.engine, "discovery", None))  # PR 15: the watched set, every pass
+            if self.autostart and self.watches:
                 self.start()  # inside the daemon's lock: the first pass starts it
             return self.facts()
         github_facts.acknowledge = self.acknowledge
         github_facts.toasts = self.toasts
         return github_facts
+
+    def reconcile(self, discovery):
+        """PR 15: make the watches the derived set (`watched_repos`): start one for a repo that joined, stop
+        one that nobody names any more. A fleet that cannot be read changes nothing."""
+        if discovery is None or discovery.problems:
+            return
+        wanted = set(watched_repos(self.config, discovered_fleets(discovery)))
+        with self.lock:
+            joined = sorted(wanted - set(self.watches))
+            left = sorted(set(self.watches) - wanted)
+            for repo in joined:
+                self.watches[repo] = Watch(repo)
+            gone = [(repo, self.watches.pop(repo)) for repo in left]
+        for repo in joined:
+            self._audit("github.watch", repo, {"state": "joined"})
+        for repo, watch in gone:
+            if watch.proc is not None:
+                _terminate(watch.proc)
+            watch.proc = watch.secret = None
+            self._audit("github.watch", repo, {"state": "left"})
 
     def facts(self):
         """Every queued item that has an owner now, as Facts. Expired items are dropped."""
@@ -4844,7 +5032,8 @@ class GitHubHub:
             for item in waiting:
                 self._route(item, discovery, now)
         with self.lock:
-            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender)
+            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
+                          repo=i.repo)
                      for i in self.queue.values() if i.recipient]
         found.extend(self.intent_edit_facts())
         for fact in found:
@@ -4874,7 +5063,8 @@ class GitHubHub:
         and to the issues a PR closes. Raises GitHubUnavailable when a read fails."""
         known, pending, done = list(item.issues), list(item.lookups), set()
         while True:
-            owner = pick_owner(agents, known, item.repo)
+            owner = pick_owner(agents, known, item.repo,
+                               self.config.get("intent_repo") if len(self.watches) > 1 else None)
             if owner and _is_orchestrator(agents[owner]):
                 return owner
             if not pending:
@@ -4982,24 +5172,38 @@ class GitHubHub:
 
     # -- gh api, and the catch-up read
 
+    def child_env(self, repo):
+        """The repo's account's environment for a child, or None for the default account. Raises
+        GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
+        try:
+            return self.accounts.env_for(repo)
+        except AccountError as err:
+            raise GitHubUnavailable(str(err)) from None
+
     def gh_api(self, path, paginate=True):
         argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
+        named = re.match(r"^repos/([^/]+/[^/]+)/", path)
+        env = self.child_env(named.group(1)) if named else None
+        extra = {"env": env} if env is not None else {}
         try:
-            done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"])
+            done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"],
+                               **extra)
         except (OSError, subprocess.SubprocessError) as err:
-            raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0], _one_line(str(err)))) from None
+            raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0],
+                                                       self.accounts.scrub(_one_line(str(err))))) from None
         if done.returncode != 0:
-            raise GitHubUnavailable("gh api %s failed: %s" % (path.split("?")[0], _one_line(done.stderr or "", 200)))
+            raise GitHubUnavailable("gh api %s failed: %s" % (path.split("?")[0], self.accounts.scrub(
+                _one_line(done.stderr or "", 200))))
         try:
             return decode_json_stream(done.stdout or "")
         except ValueError:
             raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
 
-    def catch_up_items(self, repo, now):
-        """The items for everything that changed on `repo` since now - look-back,
-        keyed exactly as the webhooks are. Returns (items, errors): one read
-        failing does not stop the others."""
-        since, items, errors, pulls = iso(now - self.lookback), [], [], []
+    def catch_up_items(self, repo, now, since_epoch=None):
+        """The items for everything that changed on `repo` since now - look-back (or `since_epoch`, a later
+        time, for a poll that asks only for what is new), keyed exactly as the webhooks are. Returns
+        (items, errors): one read failing does not stop the others."""
+        since, items, errors, pulls = iso(since_epoch if since_epoch is not None else now - self.lookback), [], [], []
 
         def read(name, path, key=None):
             try:
@@ -5044,17 +5248,26 @@ class GitHubHub:
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
         return [item for item in items if item is not None], errors
 
-    def catch_up(self, watch, now):
-        items, errors = self.catch_up_items(watch.repo, now)
+    def catch_up(self, watch, now, polled=False):
+        """The catch-up read. `polled`: this is the poll of a repo with no forwarder, which asks only for what
+        changed since the poll before (two polls' slack), so a poll costs a few calls, not a day's reading."""
+        since = None
+        if polled and watch.last_poll is not None:
+            since = max(now - self.lookback, watch.last_poll - 2 * self.config["github_poll_seconds"])
+        items, errors = self.catch_up_items(watch.repo, now, since)
         problem = self.read_awaiting(watch.repo, now)  # PR 14: one more read, here and not on every pass
         if problem:
             errors.append(problem)
         self.enqueue(items)
+        said = "; ".join(errors) if errors else None
         with self.lock:
+            changed = items or said != watch.catch_up_error or watch.last_catch_up is None
             watch.last_catch_up = now
-            watch.catch_up_error = "; ".join(errors) if errors else None
-            watch.catchup_at = now + GITHUB_LOOKUP_RETRY if errors else None  # a failed read is read again
-        self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items], "errors": errors})
+            watch.catch_up_error = said
+            watch.catchup_at = now + GITHUB_LOOKUP_RETRY if errors and not polled else None  # a failed read is read again
+        if not polled or changed:  # a quiet poll every minute is not worth an audit line
+            self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items], "errors": errors,
+                                                        "polled": polled})
 
     # -- the supervisor
 
@@ -5066,19 +5279,30 @@ class GitHubHub:
                 self._tick_watch(watch, now)
             except Exception as err:
                 with self.lock:
-                    watch.last_error = _scrub(_one_line(str(err)), watch.secret)
+                    watch.last_error = self.accounts.scrub(_scrub(_one_line(str(err)), watch.secret))
                 self._audit("github.error", watch.repo, {"error": watch.last_error})
         self._write_snapshot(now)
 
     def _tick_watch(self, watch, now):
+        if self.watches.get(watch.repo) is not watch:
+            return  # PR 15: it left the watched set after this tick took its copy of the list
         if watch.proc is not None:
             code = watch.proc.poll()
             if code is not None:
                 self._exited(watch, code, now)
             elif watch.failures and now - watch.started >= GITHUB_STABLE:
                 watch.failures = 0
+            if watch.proc is not None and watch.polling and now - watch.started >= self.catchup_delay:
+                with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
+                    watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
         if watch.proc is None and now >= watch.next_start:
             self._start(watch, now)
+        if watch.polling and now >= watch.next_poll:
+            with self.lock:
+                watch.next_poll = now + self.config["github_poll_seconds"]
+            self.catch_up(watch, now, polled=True)
+            with self.lock:
+                watch.last_poll = now
         if watch.catchup_at is not None and now >= watch.catchup_at:
             self.catch_up(watch, now)
 
@@ -5094,11 +5318,16 @@ class GitHubHub:
         return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
 
     def _start(self, watch, now):
+        try:
+            env = self.child_env(watch.repo)
+        except GitHubUnavailable as err:
+            self._failed(watch, now, str(err))
+            return
         secret = secrets.token_hex(32)  # a new one for every start; memory and argv only
         with self.lock:
             watch.secret = secret
         try:
-            proc = self.spawn(self.argv_for(watch), self.log_path(watch))
+            proc = self.spawn(self.argv_for(watch), self.log_path(watch), **({"env": env} if env is not None else {}))
         except OSError as err:
             with self.lock:
                 watch.secret = None
@@ -5107,7 +5336,7 @@ class GitHubHub:
         with self.lock:
             watch.proc, watch.started, watch.starts = proc, now, watch.starts + 1
             watch.state, watch.next_start = "running", now
-            watch.catchup_at = now + self.catchup_delay
+            watch.catchup_at = None if watch.polling else now + self.catchup_delay  # a polled repo is read already
         self._audit("github.watch", watch.repo, {"state": "running", "starts": watch.starts})
 
     def _log_tail(self, watch):
@@ -5134,6 +5363,12 @@ class GitHubHub:
         reason = "exited with code %s%s" % (code, ": " + _one_line(forwarder_reason_line(lines), 200) if lines else "")
         if now - (watch.started or now) >= GITHUB_STABLE:
             watch.failures = 0
+        unwatchable = unwatchable_reason(tail)
+        if unwatchable:  # PR 15: no webhook can be made here, so the repo is read on a poll instead
+            with self.lock:
+                if not watch.polling:
+                    watch.polling, watch.next_poll = True, now
+                watch.poll_reason = unwatchable
         self._failed(watch, now, reason)
 
     def _failed(self, watch, now, reason):
@@ -5149,7 +5384,9 @@ class GitHubHub:
     def describe(self):
         with self.lock:
             return {"port": self.port, "lookback_hours": self.lookback / 3600.0,
-                    "watches": [w.to_json() for _, w in sorted(self.watches.items())]}
+                    "poll_seconds": self.config["github_poll_seconds"],
+                    "watches": [dict(w.to_json(), account=self.accounts.describe(w.repo))
+                                for _, w in sorted(self.watches.items())]}
 
     def _write_snapshot(self, now, stopped=False):
         """A copy of `describe()` for `status`, which runs in another process. No secret,
@@ -5176,9 +5413,8 @@ def _header(headers, name):
 
 
 def attach_github(engine, config, state_dir, runner, now):
-    """The daemon's hub, or None when no repo is watched. SIGTERM becomes a clean stop."""
-    if not config["github_repos"]:
-        return None
+    """The daemon's hub (PR 15: always; the repos it watches are derived on every pass, and with none it opens
+    nothing). SIGTERM becomes a clean stop."""
     hub = GitHubHub(config, state_dir, engine.audit, runner, spawn_forwarder, now, engine.actor)
     hub.attach(engine)
 
@@ -5188,14 +5424,19 @@ def attach_github(engine, config, state_dir, runner, now):
     return hub
 
 
-def github_status(config, state_dir):
-    """What `status` says about GitHub: the config, and the daemon's last snapshot of its watches."""
-    report = {"repos": list(config["github_repos"]), "lookback_hours": config["github_lookback_hours"],
-              "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None}
+def github_status(config, state_dir, fleets=None):
+    """What `status` says about GitHub: the repos watched (the config's and every live agent's, PR 15), how each
+    is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
+    agents in it."""
+    repos = watched_repos(config, fleets or {})
+    report = {"repos": repos, "lookback_hours": config["github_lookback_hours"],
+              "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None,
+              "poll_seconds": config["github_poll_seconds"]}
+    snapshot = {}
     try:
         snapshot = json.loads((Path(state_dir) / WATCH_FILE).read_text())
     except (OSError, ValueError):
-        return report
+        pass
     pid = snapshot.get("pid")
     try:
         if isinstance(pid, int):
@@ -5205,9 +5446,27 @@ def github_status(config, state_dir):
         pass
     except OSError:
         report["daemon"] = True  # alive, but not ours to signal
-    report["port"] = snapshot.get("port")
-    report["updated"] = snapshot.get("updated")
-    report["watches"] = [w for w in snapshot.get("watches", []) if w.get("repo") in report["repos"]]
+    if snapshot:
+        report["port"] = snapshot.get("port")
+        report["updated"] = snapshot.get("updated")
+        report["watches"] = [w for w in snapshot.get("watches", []) if w.get("repo") in repos]
+    accounts = GhAccounts(config)
+    by_repo = {w["repo"]: w for w in report["watches"]}
+    members = {}
+    for name, fleet in sorted((fleets or {}).items()):
+        repo = _fleet_repo(fleet, config)
+        if repo:
+            members.setdefault(repo, []).append(name)
+    report["detail"] = []
+    for repo in repos:
+        watch = by_repo.get(repo) if report["daemon"] else None
+        how = "unknown" if not report["daemon"] else (watch.get("mode") or watch["state"] if watch else "not yet")
+        why = None
+        if watch:
+            why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("last_error"),
+                                        watch.get("catch_up_error")) if x) or None
+        report["detail"].append({"repo": repo, "how": how, "account": accounts.describe(repo),
+                                 "agents": members.get(repo, []), "why": why})
     return report
 
 
@@ -5219,14 +5478,21 @@ def format_github(report):
              % (", ".join(report["repos"]), report["lookback_hours"])]
     if not report["daemon"]:
         lines.append("        daemon not running: forwarder state is unknown")
-    for watch in report["watches"] if report["daemon"] else []:
-        line = "        %-24s %s" % (watch["repo"], watch["state"])
-        if watch["state"] == "conflict":
+    watches = {w["repo"]: w for w in report["watches"]}
+    for entry in report.get("detail", []):
+        watch = watches.get(entry["repo"]) if report["daemon"] else None
+        how = entry["how"]
+        if how in ("polling", "failed"):
+            how += " every %gs" % report.get("poll_seconds", 60) if how == "polling" else ""
+        line = "        %-24s %s" % (entry["repo"], how)
+        if watch and watch["state"] == "conflict":
             line += " (someone else is forwarding; catch-up reads only)"
-        if watch["failures"]:
+        if watch and watch["failures"]:
             line += ", %d failure(s)" % watch["failures"]
-        if watch["last_error"]:
-            line += ": " + watch["last_error"]
+        line += "  account %s" % entry["account"]
+        line += "  agents: %s" % (", ".join(entry["agents"]) or "none")
+        if entry["why"]:
+            line += "  [%s]" % entry["why"]
         lines.append(line)
     return lines
 
@@ -5304,7 +5570,9 @@ def collect_status(runner=subprocess.run, now=time.time):
     report["herdr"] = {"ok": herdr_ok, ("detail" if herdr_ok else "error"): herdr_line}
     report["agents"] = agents  # informational: an agent's trouble is not the switchboard's
     if config_ok and state_ok:
-        report["github"] = github_status(config, state)
+        fleets = {entry["observation"]["name"]: entry["observation"].get("fleet") or {}
+                  for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")}
+        report["github"] = github_status(config, state, fleets)
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
@@ -5425,8 +5693,10 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
-    return Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
-                       intents=intent_reader_for(config, runner, now), state_dir=state), state, config
+    engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
+                         intents=intent_reader_for(config, runner, now), state_dir=state)
+    engine.accounts = GhAccounts(config, runner, now)  # PR 15
+    return engine, state, config
 
 
 def cmd_run(args, runner, now, wait):
@@ -5500,11 +5770,71 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    repo = launch_repo(args)
     brief = read_brief(args.brief_file, sys.stdin)
-    done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                        args.issue, brief, charter=args.charter)
+    created = None
+    if args.new_workspace:
+        if args.workspace:
+            raise LaunchError("--new-workspace makes the workspace: do not also pass --workspace")
+        problems = launch_problems(args.name, args.agent, args.dir, args.new_workspace, args.issue, args.charter)
+        if problems:
+            raise LaunchError("; ".join(problems))
+        problem = launch_account_problem(engine.config, engine.accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+        check_charter_workspace(engine, runner, now, args.charter, repo, args.new_workspace)
+        with engine._external("herdr.workspace.create", args.name, {"label": args.new_workspace,
+                                                                    "cwd": args.dir}) as result:
+            created = workspace = result["workspace"] = engine.herdr.workspace_create(args.dir, args.new_workspace)
+    try:
+        done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+    except LaunchError as err:
+        if created:
+            raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
+        raise
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK
+
+
+def launch_repo(args):
+    """The repo a launch is for: `--repo`, or the one a qualified `--issue` names; both must agree."""
+    named = getattr(args, "repo", None)
+    if named is not None and not REPO_RE.match(named):
+        raise LaunchError("--repo must be OWNER/REPO, got %r" % named)
+    qualified = issue_repo(args.issue)
+    if named and qualified and named != qualified:
+        raise LaunchError("--repo %s and --issue %s#%d name different repos" % (named, qualified, args.issue))
+    return named or qualified
+
+
+def check_charter_workspace(engine, runner, now, charter, repo, label):
+    """Refuse a new workspace whose label is not the one the charter names (an exact match). A charter with no
+    `workspace:` line, or no charter, is no objection. A charter that cannot be read is: the label is the one
+    name the person you report to is shown, and a wrong one cannot be told from a right one."""
+    if charter is None:
+        return
+    reader = engine.intents
+    if reader is None and repo:
+        reader = IntentReader(engine.config["gh"], repo, runner, now, engine.config["call_timeout_seconds"],
+                              accounts=engine.accounts)
+    if reader is None:
+        return
+    try:
+        named = reader.issue(charter, repo).workspace
+    except IntentError as err:
+        raise LaunchError("cannot read charter #%d to check its workspace label: %s" % (charter, err)) from None
+    if named is not None and named != label:
+        raise LaunchError("charter #%d names workspace %r but --new-workspace is %r: the label must match exactly"
+                          % (charter, named, label))
+
+
+def resolve_for_sender(engine, config, issue, sender):
+    """(repo, number) for an issue reference given by `sender`: its own repo is the default (PR 15)."""
+    if issue is None:
+        return None, None
+    fleets = discovered_fleets(engine.discover(engine.now()))
+    return resolve_issue(config, issue, fleets.get(sender, {}), watched_repos(config, fleets))
 
 
 def cmd_send(args, runner, now):
@@ -5525,7 +5855,12 @@ def cmd_send(args, runner, now):
     if not text:
         sys.stderr.write("%s: nothing to send\n" % PROG)
         return EXIT_USAGE
-    outcome = engine.send(sender, args.name, text, args.issue)
+    try:
+        repo, number = resolve_for_sender(engine, config, args.issue, sender)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    outcome = engine.send(sender, args.name, text, number, repo)
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
@@ -5547,7 +5882,7 @@ def cmd_report(args, runner, now):
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
         outcome = engine.report(sender, args.state, " ".join(args.text), args.issue)
-    except ReportError as err:
+    except (ReportError, IssueRefError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
     if outcome.get("action") == "rider":
@@ -5572,14 +5907,239 @@ def cmd_pending(args, runner, now):
     print(_agent_line(entry))
     if entry["missing"]:
         print("  %s" % entry["missing"])
+    repos = engine.repos_in_play()
     for fact in (entry["plan"] or {}).get("pending", []) + entry.get("riders", []):
-        where = " issue #%d" % fact["issue"] if fact["issue"] else ""
+        where = " issue %s" % issue_tag(fact.get("repo"), fact["issue"], repos) if fact["issue"] else ""
         print("  - %s%s  %s from %s%s at %s: %s" % (fact["key"], " [rider]" if fact.get("rider") else "", fact["kind"],
                                                     fact["from"] or "the fleet", where, iso(fact["created"]),
                                                     _one_line(fact["summary"], 200)))
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     return EXIT_OK
+
+
+# ============================================================================
+# PR 15: one Chief of Staff, many independent projects
+#
+# One section. docs/switchboard.md, "Many repos (PR 15)". The watched repos are
+# derived on every pass, never listed (`watched_repos`); an issue is named by
+# repo and number (`RepoIssue`, `resolve_issue`); and every repo has its own
+# `gh` account (`GhAccounts`), whose token exists only in a child's environment.
+# ============================================================================
+
+class IssueRefError(Exception):
+    """An issue reference that cannot be resolved to one repo."""
+
+
+class RepoIssue(int):
+    """An issue number that also says which repo it is in. It is an int, so every place that
+    takes a number takes this; `.repo` is "owner/name", or None for a bare number."""
+
+    repo = None
+
+    def __new__(cls, number, repo=None):
+        self = super().__new__(cls, number)
+        self.repo = repo
+        return self
+
+
+_ISSUE_REF = re.compile(r"^(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#|#?)([0-9]+)$")
+
+
+def parse_issue_ref(text):
+    """`7`, `#7` or `owner/repo#7` -> a RepoIssue. Raises ValueError saying the accepted forms."""
+    found = _ISSUE_REF.match(text.strip()) if isinstance(text, str) else None
+    if not found or int(found.group(2)) < 1:
+        raise ValueError("%r is not an issue: write N or owner/repo#N" % (text,))
+    return RepoIssue(int(found.group(2)), found.group(1))
+
+
+def issue_arg(text):
+    """argparse's `type` for every --issue and issue argument."""
+    try:
+        return parse_issue_ref(text)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err)) from None
+
+
+def issue_repo(issue):
+    """The repo an issue reference names, or None."""
+    return getattr(issue, "repo", None)
+
+
+def issue_tag(repo, number, repos=None):
+    """How a message names an issue: `#2` with one repo in play, `api#2` with several (the repo name,
+    or owner/name when two of them share a name)."""
+    if not repo or not repos or len(repos) < 2:
+        return "#%d" % number
+    short = repo.split("/")[1]
+    clash = [r for r in repos if r.split("/")[1] == short]
+    return "%s#%d" % (repo if len(clash) > 1 else short, number)
+
+
+def _fleet_repo(fleet, config):
+    """The repo a fleet agent works in: its metadata, else (for an agent with a charter) `intent_repo`."""
+    repo = (fleet or {}).get("repo")
+    if isinstance(repo, str) and REPO_RE.match(repo):
+        return repo
+    if _is_issue_number((fleet or {}).get("charter")):
+        return config.get("intent_repo")
+    return None
+
+
+def watched_repos(config, fleets):
+    """The repos to watch now, sorted: the config baseline, every `repo` a live fleet agent names, and the
+    repo of every charter it holds. `fleets` maps agent name -> metadata.fleet. Derived on every call, so
+    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only."""
+    found = set(config["github_repos"])
+    if fault("static-repos"):
+        return sorted(found)
+    for fleet in fleets.values():
+        repo = _fleet_repo(fleet, config)
+        if repo:
+            found.add(repo)
+    return sorted(found)
+
+
+def discovered_fleets(discovery):
+    return {name: seen.fleet or {} for name, seen in (discovery.agents.items() if discovery else [])}
+
+
+def resolve_issue(config, issue, fleet=None, watched=None):
+    """(repo, number) for an issue reference. A qualifier wins; a bare number is in the caller's own repo,
+    else `intent_repo`. With several repos watched, a caller with no repo gets a refusal listing the choices.
+    (None, number) when no repo is known at all (the old one-repo behaviour); (None, None) for no issue."""
+    if issue is None:
+        return None, None
+    number = int(issue)
+    repo = None if fault("bare-issue-number") else issue_repo(issue)
+    if repo:
+        return repo, number
+    repo = (fleet or {}).get("repo")
+    if isinstance(repo, str) and repo:
+        return repo, number
+    choices = sorted(watched or [])
+    if len(choices) > 1:
+        raise IssueRefError("issue %d does not say which repo it is in, and %d are watched: write %s"
+                            % (number, len(choices), " or ".join("%s#%d" % (c, number) for c in choices)))
+    return config.get("intent_repo") or (choices[0] if choices else None), number
+
+
+# ------------------------------------------------------- a gh account per repo
+
+class AccountError(Exception):
+    """No token could be had for a repo's gh account. The text never holds a token."""
+
+
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+TOKEN_TTL = 60  # seconds a token is kept in memory; never written anywhere
+
+
+class GhAccounts:
+    """Which gh account a repo uses, and its token at the moment of use.
+
+    `gh_users` maps `owner/repo` or `owner/*` to an account name: the repo entry first, then the owner
+    entry, then nothing (the environment's own default). The token comes from `gh auth token --user
+    <account>` when it is needed, is held in memory for TOKEN_TTL seconds, and is handed to a child ONLY
+    as GH_TOKEN in that child's environment: never in argv, a URL, a log, an audit entry, a message or an
+    error (`scrub` takes it out of any text that was read back from a child).
+    """
+
+    def __init__(self, config, runner=subprocess.run, now=time.time, environ=None):
+        self.config, self.runner, self.now = config, runner, now
+        self.environ = os.environ if environ is None else environ
+        self._tokens = {}
+
+    def account_for(self, repo):
+        if fault("one-account"):
+            return None  # the fault: the default token reads every repo
+        users = self.config.get("gh_users") or {}
+        if repo in users:
+            return users[repo]
+        return users.get("%s/*" % repo.split("/")[0]) if isinstance(repo, str) and "/" in repo else None
+
+    def default_available(self):
+        return any(self.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN"))
+
+    def token_for(self, account):
+        hit = self._tokens.get(account)
+        if hit is not None and self.now() < hit[0]:
+            return hit[1]
+        clean = {k: v for k, v in self.environ.items() if k not in TOKEN_ENV_NAMES}
+        try:
+            done = self.runner([self.config["gh"], "auth", "token", "--user", account], capture_output=True,
+                               text=True, timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
+                               env=clean)
+        except (OSError, subprocess.SubprocessError) as err:
+            raise AccountError("cannot ask gh for the token of account %s: %s" % (account, _one_line(str(err), 120))) from None
+        token = (done.stdout or "").strip()
+        if done.returncode != 0 or not token:
+            raise AccountError("gh has no token for account %s: %s" % (
+                account, _one_line(self.scrub(done.stderr or ""), 160) or "exit %d" % done.returncode))
+        self._tokens[account] = (self.now() + TOKEN_TTL, token)
+        return token
+
+    def env_for(self, repo):
+        """The environment for a child that works on `repo`, or None when the repo uses the default account."""
+        account = self.account_for(repo) if repo else None
+        if account is None:
+            return None
+        return dict(self.environ, GH_TOKEN=self.token_for(account))
+
+    def token_env(self, repo):
+        """{"GH_TOKEN": token} for an agent working in `repo`, {} when the repo uses the default account."""
+        account = self.account_for(repo) if repo else None
+        return {} if account is None else {"GH_TOKEN": self.token_for(account)}
+
+    def scrub(self, text):
+        for _, token in self._tokens.values():
+            if token:
+                text = text.replace(token, REDACTED)
+        return text
+
+    def describe(self, repo):
+        """The account name `status` shows. Never a token."""
+        return self.account_for(repo) or "default"
+
+
+def launch_account_problem(config, accounts, repo):
+    """Why a launch into `repo` must be refused (a sentence naming the missing entry), or None."""
+    if not repo or not config.get("gh_users") or accounts.account_for(repo) or accounts.default_available() \
+            or fault("one-account"):
+        return None
+    owner = repo.split("/")[0]
+    return ("no gh account for %s: add \"%s\" or \"%s/*\" to gh_users in %s (and no default token is set)"
+            % (repo, repo, owner, config_path()))
+
+
+# ---------------------------------------------------------------- the judge's rule
+
+_GH_SEG = re.compile(r"(?:^|[\s;&|(`'\"/])gh\s+([^;&|\n`]*)")
+_API_REPOS = re.compile(r"(?:^|[\s'\"])/?(?:orgs/[^/\s'\"]+|user)/repos/?(?=$|[\s'\"?])")
+_POST_FLAG = re.compile(r"(?:^|\s)(?:-X\s*|--method[=\s]\s*)POST\b", re.I)
+_FIELD_FLAG = re.compile(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b")
+
+
+def repo_commissioning_rule(command):
+    """The sentence naming what a shell command does to a repo's existence or visibility, or None.
+
+    `gh repo create`, `gh repo delete`, `gh repo edit --visibility` and a POST to `/orgs/*/repos` are
+    `hard_to_reverse` whatever the thresholds say: the Chief of Staff commissions a worker to do these, after
+    a decision, and no agent does one quietly. Deterministic, so it needs no model; judge machinery only
+    ever tightens."""
+    if not isinstance(command, str):
+        return None
+    for found in _GH_SEG.finditer(command):
+        words = found.group(1)
+        positional = [w for w in words.split() if not w.startswith("-")]
+        if positional[:2] in (["repo", "create"], ["repo", "delete"]):
+            return "gh repo %s" % positional[1]
+        if positional[:2] == ["repo", "edit"] and re.search(r"(?:^|\s)--visibility\b", words):
+            return "gh repo edit --visibility"
+        if positional[:1] == ["api"] and _API_REPOS.search(" " + words) \
+                and (_POST_FLAG.search(words) or (_FIELD_FLAG.search(words) and not re.search(r"(?:-X|--method)", words))):
+            return "gh api POST to a repo-creating endpoint"
+    return None
 
 
 # ------------------------------------------------- intent lines (PR 6)
@@ -5656,12 +6216,28 @@ class IntentError(Exception):
         super().__init__("%s: %s" % (reason, detail) if detail else reason)
 
 
+_CHARTER_YAML = re.compile(r"```ya?ml\s*\n(\s*orchestrator\s*:.*?)```", re.IGNORECASE | re.DOTALL)
+_WORKSPACE_LINE = re.compile(r"^\s*workspace\s*:\s*(.*?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def charter_workspace(body):
+    """The `workspace:` line of a charter's yaml block (the exact herdr workspace label), or None."""
+    block = _CHARTER_YAML.search(body or "")
+    line = _WORKSPACE_LINE.search(block.group(1)) if block else None
+    value = line.group(1) if line else ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value or None
+
+
 class IssueIntent:
     """What the switchboard knows of one issue: its Intent lines, and what kind it is."""
 
     def __init__(self, number, state, title, intent, done_when, updated_at, charter):
         self.number, self.state, self.title = number, state, title
         self.intent, self.done_when, self.updated_at, self.charter = intent, done_when, updated_at, charter
+        self.repo = None  # PR 15: set by the reader that fetched it
+        self.workspace = None  # PR 15: a charter's `workspace:` line
 
     @classmethod
     def from_api(cls, data):
@@ -5670,24 +6246,28 @@ class IssueIntent:
             raise IntentError("gh", "an issue came back without a number")
         body = data.get("body") if isinstance(data.get("body"), str) else ""
         intent, done_when = parse_intent(body)
-        return cls(number, data.get("state"), data.get("title") or "", intent, done_when,
-                   data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
+        found = cls(number, data.get("state"), data.get("title") or "", intent, done_when,
+                    data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
+        found.workspace = charter_workspace(body)
+        return found
 
 
 def _header_line(text):
     return _one_line(text, INTENT_LINE_LIMIT)
 
 
-def ask_lines(issue):
-    """The ask's header lines: Intent, then Done when; one line when neither is recorded."""
+def ask_lines(issue, tag=None):
+    """The ask's header lines: Intent, then Done when; one line when neither is recorded. `tag` (PR 15) is how
+    the ask is named when several repos are in play: `web#2`."""
+    tag = tag or "#%d" % issue.number
     if issue.intent is None and issue.done_when is None:
-        return [_header_line("Ask #%d: %s" % (issue.number, NO_INTENT))]
-    return [_header_line("Ask #%d Intent: %s" % (issue.number, issue.intent or NO_INTENT)),
+        return [_header_line("Ask %s: %s" % (tag, NO_INTENT))]
+    return [_header_line("Ask %s Intent: %s" % (tag, issue.intent or NO_INTENT)),
             _header_line("Done when: %s" % (issue.done_when or "not recorded"))]
 
 
-def work_lines(issue):
-    return [_header_line("Work item #%d Intent: %s" % (issue.number, issue.intent or NO_INTENT))]
+def work_lines(issue, tag=None):
+    return [_header_line("Work item %s Intent: %s" % (tag or "#%d" % issue.number, issue.intent or NO_INTENT))]
 
 
 class IntentReader:
@@ -5700,24 +6280,38 @@ class IntentReader:
     call, PR 5). A failed read is never cached.
     """
 
-    def __init__(self, gh, repo, runner=subprocess.run, now=time.time, timeout=20, ttl=INTENT_TTL):
+    def __init__(self, gh, repo, runner=subprocess.run, now=time.time, timeout=20, ttl=INTENT_TTL, accounts=None):
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
+        self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
         self._cache = {}
 
     # -- GitHub
 
-    def _api(self, path):
+    def env_for(self, repo):
+        """The child environment for `repo`'s account, or None. Raises IntentError, never with a token in it."""
+        if self.accounts is None or not repo:
+            return None
+        try:
+            return self.accounts.env_for(repo)
+        except AccountError as err:
+            raise IntentError("gh", str(err)) from None
+
+    def _api(self, path, repo=None):
         argv = [self.gh, "api", path]
+        env = self.env_for(repo)
+        extra = {"env": env} if env is not None else {}
         try:
             result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 stdin=subprocess.DEVNULL)
+                                 stdin=subprocess.DEVNULL, **extra)
         except subprocess.TimeoutExpired:
             raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
         except OSError as err:
             raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
         if result.returncode != 0:
             detail = _one_line(result.stderr) or _one_line(result.stdout) or "exit %d" % result.returncode
+            if self.accounts is not None:
+                detail = self.accounts.scrub(detail)
             if re.search(r"\b404\b|Not Found", detail):
                 raise IntentError("not_found", detail)
             raise IntentError("gh", detail)
@@ -5744,8 +6338,13 @@ class IntentReader:
 
     def issue(self, number, repo=None):
         repo = repo or self.repo
-        return self._cached(("issue", repo, number), lambda: IssueIntent.from_api(
-            self._api("repos/%s/issues/%d" % (repo, number))))
+
+        def fetch():
+            found = IssueIntent.from_api(self._api("repos/%s/issues/%d" % (repo, number), repo))
+            found.repo = repo
+            return found
+
+        return self._cached(("issue", repo, number), fetch)
 
     def parent(self, number, repo=None):
         """The parent issue's number, or None when the issue has no parent."""
@@ -5753,7 +6352,7 @@ class IntentReader:
 
         def fetch():
             try:
-                found = self._api("repos/%s/issues/%d/parent" % (repo, number))
+                found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo)
             except IntentError as err:
                 if err.reason == "not_found":
                     return None
@@ -5773,9 +6372,11 @@ class IntentReader:
             return parent, number
         return number, None
 
-    def header(self, number, repo=None):
+    def header(self, number, repo=None, repos=None):
         """(ask, ask lines, work item, work lines) for a message about `number`, at most
-        three lines; None for a charter, which is never repeated."""
+        three lines; None for a charter, which is never repeated. `repos`: the repos in play; with several,
+        the lines name their issue with a repo tag."""
+        repo = repo or self.repo
         if self.issue(number, repo).charter:
             return None
         ask, work = self.ask_of(number, repo)
@@ -5783,8 +6384,9 @@ class IntentReader:
         if ask_issue.charter:
             return None
         if work is None:
-            return ask, ask_lines(ask_issue), None, []
-        return ask, ask_lines(ask_issue), work, work_lines(self.issue(work, repo))
+            return ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), None, []
+        return (ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), work,
+                work_lines(self.issue(work, repo), issue_tag(repo, work, repos)))
 
     def missing_intent(self, number, repo=None):
         """The issues in this one's ask chain (ask, work item) with no Intent line. Charters are exempt."""
@@ -5797,10 +6399,11 @@ class IntentReader:
     def open_asks(self, charter, repo=None):
         """The open sub-issues of a charter, derived from GitHub on every call."""
         repo = repo or self.repo
-        found = self._api("repos/%s/issues/%d/sub_issues?per_page=100" % (repo, charter))
+        found = self._api("repos/%s/issues/%d/sub_issues?per_page=100" % (repo, charter), repo)
         asks = []
         for data in found if isinstance(found, list) else []:
             issue = IssueIntent.from_api(data)
+            issue.repo = repo
             self._cache[("issue", repo, issue.number)] = (self.now(), issue)
             if issue.state == "open":
                 asks.append(issue)
@@ -5811,7 +6414,8 @@ def intent_reader_for(config, runner=subprocess.run, now=time.time):
     """The IntentReader the config asks for, or None when no `intent_repo` is set."""
     if not config.get("intent_repo"):
         return None
-    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"])
+    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
+                        accounts=GhAccounts(config, runner, now))
 
 
 # -- composing: one section per ask
@@ -5828,13 +6432,15 @@ def section_resolver(engine, observation):
     reader = getattr(engine, "intents", None)
     if reader is None or fault("no-intent-header"):
         return None
-    repo = ((observation.fleet or {}).get("repo") if observation else None) or reader.repo
+    own = ((observation.fleet or {}).get("repo") if observation else None) or reader.repo
+    repos = engine.repos_in_play()
 
-    def section(issue):
+    def section(issue, repo=None):
+        repo = repo or own
         try:
-            return reader.header(issue, repo)
+            return reader.header(issue, repo, repos)
         except IntentError as err:
-            return issue, [_header_line("Ask #%d: intent unavailable (%s)" % (issue, err))], None, []
+            return issue, [_header_line("Ask %s: intent unavailable (%s)" % (issue_tag(repo, issue, repos), err))], None, []
 
     return section
 
@@ -5845,12 +6451,12 @@ def sectioned_lines(facts, section, item):
     own items, then each work item's line followed by that work item's items."""
     lines, asks = [], {}
     for fact in facts:
-        found = section(fact.issue) if fact.issue else None
+        found = section(fact.issue, fact.repo) if fact.issue else None
         if found is None:
             lines.append(item(fact))
             continue
         ask, ask_header, work, work_header = found
-        entry = asks.setdefault(ask, {"header": ask_header, "direct": [], "work": {}})
+        entry = asks.setdefault((fact.repo, ask), {"header": ask_header, "direct": [], "work": {}})  # PR 15: per repo
         if work is None:
             entry["direct"].append(item(fact))
         else:
@@ -5909,9 +6515,13 @@ def intent_change_fact(payload, recipient="chief-of-staff"):
         return None
     number, updated, created = _payload_issue(payload)
     login = (payload.get("sender") or {}).get("login")
+    repo = (payload.get("repository") or {}).get("full_name")
+    repo = repo if isinstance(repo, str) and REPO_RE.match(repo) else None
     summary = "\n".join(["The Intent section of #%d was edited on GitHub:" % number] + _change_lines(changes))
-    return Fact("intent.edit:%d:%s" % (number, updated), recipient, "intent.edit", summary, created,
-                issue=number, sender=login if isinstance(login, str) and login else "github")
+    # PR 15: the same number in two repos is two issues, so the key that stops a repeat names the repo
+    key = "intent.edit:%s:%s" % ("%s#%d" % (repo, number) if repo else number, updated)
+    return Fact(key, recipient, "intent.edit", summary, created, issue=number,
+                sender=login if isinstance(login, str) and login else "github", repo=repo)
 
 
 def intent_change_toast(payload):
@@ -5981,13 +6591,36 @@ def _intent_reader(runner, now):
     return reader
 
 
+def soft_caller(runner, now):
+    """(caller's fleet, watched repos) for a command that may be run by hand: what the fleet says when it
+    can be read and the caller is a fleet agent, else nothing (and the config's repos)."""
+    config = load_config()
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        fleets = discovered_fleets(engine.discover(engine.now()))
+        watched = watched_repos(config, fleets)
+    except (ConfigError, V2Error, HerdrError):
+        return {}, watched_repos(config, {})
+    try:
+        return caller_fleet(engine.herdr, engine.v2, os.environ), watched
+    except (CallerError, V2Error, HerdrError):
+        return {}, watched
+
+
 def cmd_intent(args, runner, now):
     """Print the ask's Intent and Done-when, and the work item's Intent line."""
     reader = _intent_reader(runner, now)
-    found = reader.header(args.issue)
+    fleet, watched = soft_caller(runner, now)
+    try:
+        repo, number = resolve_issue(load_config(), args.issue, fleet, watched)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    repos = watched if len(watched) > 1 else None
+    found = reader.header(number, repo, repos)
     if found is None:
-        print("#%d is a charter: its standing job is not repeated in messages. Ask for an ask under it."
-              % args.issue)
+        print("%s is a charter: its standing job is not repeated in messages. Ask for an ask under it."
+              % issue_tag(repo or reader.repo, number, repos))
         return EXIT_OK
     _, ask_header, _, work_header = found
     print("\n".join(ask_header + work_header))
@@ -6022,11 +6655,11 @@ def asks_of_caller(engine, fleet, now):
     reader = engine.intents
     repo = fleet.get("repo") or reader.repo
     if fleet.get("role") == "chief-of-staff":
-        charters = [(agent.name, (agent.fleet or {}).get("charter"))
+        charters = [(agent.name, (agent.fleet or {}).get("charter"), _fleet_repo(agent.fleet, engine.config) or repo)
                     for agent in sorted(engine.discover(now).agents.values(), key=lambda a: a.name)
                     if (agent.fleet or {}).get("role") == "orchestrator"]
     elif fleet.get("role") == "orchestrator":
-        charters = [(fleet["name"], fleet.get("charter"))]
+        charters = [(fleet["name"], fleet.get("charter"), repo)]
     else:
         issue = fleet.get("issue")
         if not _is_issue_number(issue):
@@ -6034,15 +6667,15 @@ def asks_of_caller(engine, fleet, now):
         ask, _ = reader.ask_of(issue, repo)
         return [(fleet["name"], reader.issue(ask, repo))]
     asks = []
-    for owner, charter in charters:
+    for owner, charter, charter_repo in charters:
         if _is_issue_number(charter):
-            asks.extend((owner, issue) for issue in reader.open_asks(charter, repo))
+            asks.extend((owner, issue) for issue in reader.open_asks(charter, charter_repo))
     return asks
 
 
-def ask_row(owner, issue):
-    return "#%d  [%s]  %s  | Done when: %s" % (issue.number, owner, issue.intent or NO_INTENT,
-                                              issue.done_when or "not recorded")
+def ask_row(owner, issue, repos=None):
+    return "%s  [%s]  %s  | Done when: %s" % (issue_tag(issue.repo, issue.number, repos), owner,
+                                              issue.intent or NO_INTENT, issue.done_when or "not recorded")
 
 
 def cmd_intents(args, runner, now):
@@ -6054,8 +6687,10 @@ def cmd_intents(args, runner, now):
     rows = asks_of_caller(engine, fleet, engine.now())
     if not rows:
         print("no open asks for %s" % fleet["name"])
+    engine.discover(engine.now())
+    repos = engine.repos_in_play()
     for owner, issue in rows:
-        print(ask_row(owner, issue))
+        print(ask_row(owner, issue, repos))
     return EXIT_OK
 
 
@@ -6064,7 +6699,7 @@ INTENT_COMMANDS = {"intent": cmd_intent, "intents": cmd_intents}
 
 def add_intent_parsers(sub):
     intent = sub.add_parser("intent", help="Print an issue's ask: its Intent and Done-when, and the work item's Intent")
-    intent.add_argument("issue", type=int, help="The issue number")
+    intent.add_argument("issue", type=issue_arg, help="The issue number")
     sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
 
 
@@ -6291,7 +6926,7 @@ def parse_standing_authority(body):
 
 def fetch_standing_authority(reader, charter, repo):
     """The charter issue's standing authority through the reader's GET-only `gh api`."""
-    data = reader._api("repos/%s/issues/%d" % (repo, charter))
+    data = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
     return parse_standing_authority(data.get("body") if isinstance(data, dict) else None)
 
 
@@ -6511,6 +7146,10 @@ class PolicyJudge:
             return policy_reply(request["configured"], "not a fleet agent (no metadata.fleet): not judged")
         if request["tool"] == "shell" and plain_switchboard_message(request["arguments"]):
             return policy_reply(request["configured"], "a plain %s message is the agents' own channel: not judged" % PROG)
+        rule = None if fault("repo-create-allowed") or request["tool"] != "shell" \
+            else repo_commissioning_rule(request["arguments"])
+        if rule:  # PR 15: no model and no GitHub read stands between this call and an ask
+            return self.rule_reply(request, fleet, rule, box)
         box["stage"] = "resolving the ask"
         context = self.context_of(fleet)
         box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
@@ -6535,6 +7174,19 @@ class PolicyJudge:
                 self.verdicts.put(key, {"answers": combined["answers"]})
         box["detail"].update(combined=combined, cached=cached is not None, thresholds=thresholds)
         return self.reply_of(combined, cached is not None, fleet, context, request)
+
+    def rule_reply(self, request, fleet, rule, box):
+        """`hard_to_reverse`, decided by the code: the commissioning rule (repo_commissioning_rule). Never looser
+        than configured, like every judgement."""
+        answers = {"hard_to_reverse": 1.0}
+        thresholds = {"hard_to_reverse": 0.0}
+        combined = combine_policy(answers, thresholds, request["configured"])
+        combined.update(answers=answers, latency_ms=0, usage={}, model=None, rule=rule)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=None, combined=combined, cached=False,
+                             thresholds=thresholds, rule=rule)
+        reply = self.reply_of(combined, False, fleet, {"issue": None}, dict(request, arguments=self.redacted(request["arguments"])))
+        reply["reason"] = _one_line("%s [rule: %s is hard to reverse whatever the thresholds say]" % (reply["reason"], rule), 600)
+        return reply
 
     # -- the pieces
 
@@ -7774,7 +8426,7 @@ def build_parser():
     send = sub.add_parser("send", help="Deliver a message to another fleet agent now, by the delivery rule")
     send.add_argument("name", help="The recipient's fleet name")
     send.add_argument("text", nargs="+", help="The message")
-    send.add_argument("--issue", type=int, help="The issue the message is about")
+    send.add_argument("--issue", type=issue_arg, help="The issue the message is about")
     send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     report = sub.add_parser(
         "report", help="Tell the one you report to what happened: done, failed, blocked, question (they wake it) "
@@ -7785,7 +8437,7 @@ def build_parser():
                     "next message to your boss and never wake it by themselves." % REPORT_MAX)
     report.add_argument("state", choices=REPORT_STATES, help="What happened")
     report.add_argument("text", nargs="+", help="One line: what happened (at most %d characters)" % REPORT_MAX)
-    report.add_argument("--issue", type=int, help="The issue the report is about (default: your own)")
+    report.add_argument("--issue", type=issue_arg, help="The issue the report is about (default: your own)")
     report.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     decisions = sub.add_parser(
         "decisions", help="What waits on you: the open decisions, one line each, from the file the daemon keeps",
@@ -7809,7 +8461,12 @@ def build_parser():
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
-    launch.add_argument("--issue", type=int, help="metadata.fleet.issue")
+    launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
+    launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
+                                       "account (config gh_users) is the agent's GH_TOKEN")
+    launch.add_argument("--new-workspace", dest="new_workspace", metavar="LABEL",
+                        help="Create a herdr workspace with this label in --dir (never focused), and launch "
+                             "into it. A --charter whose `workspace:` line differs is refused")
     launch.add_argument("--charter", type=int, help="metadata.fleet.charter: an orchestrator's charter issue")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
@@ -7819,7 +8476,7 @@ def build_parser():
     remind.add_argument("name", help="The recipient's fleet name")
     remind.add_argument("when", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
     remind.add_argument("text", nargs="+", help="The reminder")
-    remind.add_argument("--issue", type=int, help="The issue the reminder is about")
+    remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     add_intent_parsers(sub)
     add_foreground_parsers(sub)  # PR 8
