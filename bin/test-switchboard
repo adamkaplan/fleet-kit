@@ -334,7 +334,9 @@ class TestV2Client(Base):
             with self.subTest(op=tail[0]):
                 self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api"] + tail)
                 self.assertEqual(runner.kwargs["timeout"], 7)
-                self.assertTrue(runner.kwargs["capture_output"])
+                # the reply goes to a file, never inherited and never a pipe: v2 cuts a large reply on a pipe
+                self.assertNotIn(runner.kwargs["stdout"], (None, subprocess.PIPE))
+                self.assertEqual(runner.kwargs["stderr"], subprocess.PIPE)
                 self.assertEqual(runner.kwargs["stdin"], subprocess.DEVNULL)
 
     def test_every_call_goes_through_one_method(self):
@@ -6305,6 +6307,42 @@ class TestV2ClientPR4(Base):
             call(sb.V2Client("/opt/lab/bin/opencode", {}, runner, 7))
             self.assertEqual(runner.argv, ["/opt/lab/bin/opencode", "api", op, "--param", "sessionID=" + SES])
         self.assertEqual(class_source("V2Client").count("self.runner("), 1)
+
+
+class PipeTruncatingRunner:
+    """OpenCode v2's `api` command loses the end of a large reply when it writes to a pipe and exits
+    (measured on a real 500 KB transcript: 293 KB arrived, cut inside a string); to a file it is whole.
+    This runner does the same: a captured pipe gets the first PIPE_LIMIT bytes, a file gets everything."""
+
+    PIPE_LIMIT = 65536
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __call__(self, argv, **kwargs):
+        sink = kwargs.get("stdout")
+        if sink is not None and sink != subprocess.PIPE:
+            sink.write(self.payload)
+            sink.flush()
+            return subprocess.CompletedProcess(argv, 0, None, "")
+        return subprocess.CompletedProcess(argv, 0, self.payload[:self.PIPE_LIMIT], "")
+
+
+class TestV2ClientBigReply(Base):
+    def test_a_reply_larger_than_a_pipe_survives_whole(self):
+        # The first real use: the Chief of Staff's transcript grew past what v2 flushes to a pipe, and
+        # every read of it failed with bad_json, which held deliveries to it and hid its decisions.
+        filler = "x" * 4000
+        messages = [{"id": "msg_%03d" % n, "type": "assistant", "text": filler} for n in range(60)]
+        payload = json.dumps({"data": messages, "cursor": {}})
+        self.assertGreater(len(payload), 2 * PipeTruncatingRunner.PIPE_LIMIT)
+        client = sb.V2Client("/opt/lab/bin/opencode", {}, PipeTruncatingRunner(payload), 7)
+        self.assertEqual(len(client.message_list(SES, limit=200)), 60)
+
+    def test_a_reply_that_fits_still_reads(self):
+        payload = json.dumps({"data": [{"id": "msg_001"}]})
+        client = sb.V2Client("/opt/lab/bin/opencode", {}, PipeTruncatingRunner(payload), 7)
+        self.assertEqual(client.message_list(SES), [{"id": "msg_001"}])
 
 
 class TestUnreachableToast(PR4Base):

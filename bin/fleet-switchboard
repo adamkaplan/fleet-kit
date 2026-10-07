@@ -445,14 +445,22 @@ class V2Client:
             argv += ["-d", json.dumps(data, separators=(",", ":"), sort_keys=True)]
         env = dict(os.environ)
         env.update(self.env)
-        try:
-            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 env=env, stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            raise V2Error("timeout", None, "%s did not answer within %ss" % (operation, self.timeout)) from None
-        except OSError as err:
-            raise V2Error("unavailable", None, "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
-        stdout = result.stdout or ""
+        # OpenCode v2's `api` command loses the end of a large reply when it writes to a pipe and exits
+        # (a real 500 KB transcript arrived cut at 293 KB, inside a string, and every read failed with
+        # bad_json). Into a file the reply is whole, so the reply goes to a file and is read back.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
+            try:
+                result = self.runner(argv, stdout=sink, stderr=subprocess.PIPE, text=True, timeout=self.timeout,
+                                     env=env, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                raise V2Error("timeout", None, "%s did not answer within %ss" % (operation, self.timeout)) from None
+            except OSError as err:
+                raise V2Error("unavailable", None, "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
+            stdout = result.stdout
+            if stdout is None:  # a real run wrote to the file
+                sink.seek(0)
+                stdout = sink.read()
+        stdout = stdout or ""
         stderr = result.stderr or ""
         if result.returncode != 0:
             match = re.search(r"\bHTTP (\d{3})\b", stderr)
