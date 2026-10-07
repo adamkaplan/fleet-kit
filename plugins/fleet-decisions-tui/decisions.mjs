@@ -11,6 +11,7 @@ export const STALE_MS = 120_000       // older than this (by mtime, which every 
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
 export const HEADLINE_LINES = 2       // lines of one entry's headline
+export const ROW_LINES = 2            // lines of one row of a batch (`short-ref: recommendation`)
 export const FACTS_LINES = 3          // lines of a heads-up's facts line (it wraps at ROW_WIDTH)
 export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
@@ -160,6 +161,9 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title
   const entry = { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
+  const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
+  if (rows.length) entry.rows = rows.map((r) => wrapText(r.text, width, ROW_LINES))
   if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
   return entry
 }
@@ -230,7 +234,7 @@ export function viewLines(view, width = ROW_WIDTH) {
       out.push(g.repo)
       g.entries.forEach((e, j) => {
         if (j) out.push(THIN(width))
-        out.push(...e.lines, ...(e.facts ?? []), e.head)
+        out.push(...e.lines, ...(e.rows ?? []).flat(), ...(e.facts ?? []), e.head)
       })
     })
   }
