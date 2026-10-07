@@ -47,6 +47,7 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -66,6 +67,31 @@ import threading
 import time
 from urllib.parse import quote
 import uuid
+
+
+def load_decision_core():
+    """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
+
+    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
+    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
+    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
+    same file is reused, so two loads of this script share one module."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_core.py")
+    held = sys.modules.get("decision_core")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("decision_core", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["decision_core"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("decision_core", None)
+        raise
+    return module
+
+
+decision_core = load_decision_core()
 
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
@@ -426,8 +452,7 @@ class V2Error(Exception):
 
 
 def _one_line(text, limit=300):
-    text = " ".join((text or "").split())
-    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
+    return decision_core.one_line(text, limit)
 
 
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
@@ -1011,9 +1036,7 @@ def _created(record):
 
 
 def iso(epoch):
-    if epoch is None:
-        return None
-    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return decision_core.iso(epoch)
 
 
 class Observation:
@@ -1241,9 +1264,7 @@ DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished"
 def _line_of(text, limit):
     """`text` as one line of at most `limit` characters, with anything shaped like a bearer
     credential or a provider key taken out."""
-    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [key]", str(text if text is not None else ""))
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]{6,}", "[key]", text)
-    return _one_line(text, limit)
+    return decision_core.line_of(text, limit)
 
 
 def describe_items(recipient, facts, repos=None):
@@ -3439,7 +3460,7 @@ REPORT = "report"
 REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss when it is not engaged
 REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
-WITHDRAW_ALL = "[all] "  # leads a `withdrawn` report made with --all: it clears every open question of the worker
+WITHDRAW_ALL = decision_core.WITHDRAW_ALL  # leads a `withdrawn` report made with --all: it clears every open question of the worker
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
 LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
@@ -3942,23 +3963,15 @@ def prune_report_riders(engine, discovery):
 
 DECISIONS_FILE = "decisions.json"
 DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
-DECISION_TITLE_MAX = 200
-# a report line may be REPORT_MAX characters and a `blocked` one gets a "blocked: " lead, so a report decision
-# keeps its whole line (only reports: the other sources keep DECISION_TITLE_MAX)
-DECISION_REPORT_TITLE_MAX = 300 + len("blocked: ")
+DECISION_TITLE_MAX = decision_core.DECISION_TITLE_MAX
+DECISION_REPORT_TITLE_MAX = decision_core.DECISION_REPORT_TITLE_MAX
 DECISION_SOURCES = ("github", "v2", "reports")
-# `(issue #2)` with one repo in play, `(issue api#2)` or `(issue owner/api#2)` with several (issue_tag)
-REPORT_LINE = re.compile(r"^- report from (\S+?)(?: \(issue (?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?))?#(\d+)\))?: ([a-z]+): (.*)$")
-SEND_LINE = re.compile(r"^- send from (\S+?)(?: \(issue (?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?))?#(\d+)\))?: ")
+REPORT_LINE = decision_core.REPORT_LINE   # the line shapes of a delivered report and send: the module's, with the rules that read them
+SEND_LINE = decision_core.SEND_LINE
 
 
 def repo_of_tag(tag, repos):
-    """The repo a message's issue tag names (`web` or `acme/web`) among `repos`, or None when it names none or
-    several (the tag is the repo name, or owner/name when two of the repos share a name: issue_tag)."""
-    if not tag:
-        return None
-    found = [repo for repo in repos or [] if repo == tag or (("/" not in tag) and repo.split("/")[1] == tag)]
-    return found[0] if len(found) == 1 else None
+    return decision_core.repo_of_tag(tag, repos)
 
 
 def validate_decisions_config(config, source):
@@ -3991,43 +4004,13 @@ def validate_decisions_config(config, source):
 
 
 def _decision_number(seed):
-    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16)
-
-
-def _id_candidates(item, number, repos=None):
-    ask, agent = item.get("ask"), item.get("agent")
-    tag = issue_tag(None if fault("bare-issue-number") else item.get("repo"), ask, repos) if ask else None
-    if ask and item.get("bare"):
-        yield tag                              # an issue's own label is the issue's tag: `#2`, or `api#2` with several repos
-    if ask:
-        for step in range(26 * 26):            # the tag and two letters taken from the decision's own hash
-            pair = (number + step) % 676
-            yield "%s%s%s" % (tag, chr(97 + pair // 26), chr(97 + pair % 26))
-    else:
-        for step in range(900):                # `<agent>-` and three digits likewise
-            yield "%s-%03d" % (agent or "fleet", 100 + (number + step) % 900)
-    yield "%s-%x" % (tag if ask else agent or "fleet", number)
+    return decision_core.decision_number(seed)
 
 
 def assign_decision_ids(items, repos=None):
-    """The id of each decision in `items` (dicts with seed, ask, agent, bare, since, repo), in the same order.
-    `repos` are the watched repos: with more than one, an issue's tag names its repo, as in a message.
-
-    Derived from the decision's own identity (`seed`) and nothing else: no counter, no file. An issue's own
-    label is `#<issue>`; any other decision about an issue is `#<issue>` and two letters; one about no issue is
-    `<agent>-` and three digits. The letters and digits come from a hash of the seed, so an id does not change
-    when another decision resolves (a rank among the open ones would). Two open decisions never share an id: on
-    a collision, the one that has waited longer keeps the id and the later one takes the next free one."""
-    order = sorted(range(len(items)), key=lambda i: (items[i]["since"], items[i]["seed"]))
-    taken, ids = set(), [None] * len(items)
-    for index in order:
-        item = items[index]
-        for candidate in _id_candidates(item, _decision_number(item["seed"]), repos):
-            if candidate not in taken:
-                break
-        taken.add(candidate)
-        ids[index] = candidate
-    return ids
+    """The id of each decision in `items`, in the same order (the rules are decision_core.assign_ids's). The Lab's
+    `bare-issue-number` fault is read here, not by the module."""
+    return decision_core.assign_ids(items, repos, bare_issue_number=fault("bare-issue-number"))
 
 
 def decision_repos(engine):
@@ -4038,78 +4021,38 @@ def decision_repos(engine):
 
 # ---- a batch: related findings raised as ONE decision (one issue, one `decision-rows` block in its body)
 
-BATCH_FENCE = "decision-rows"
-BATCH_ROWS_MAX = 40            # rows one batch may carry (the panel draws one line or two per row)
-BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = 100, 200, 120
-BATCH_TITLE_MAX = 120
-_ROWS_BLOCK = re.compile(r"^```%s[ \t]*\r?\n(.*?)^```[ \t]*\r?$" % BATCH_FENCE, re.M | re.S)
-_ROW_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$")
-
-
-class BatchError(Exception):
-    """A batch that cannot be raised, and why. Nothing was created."""
+BATCH_FENCE = decision_core.BATCH_FENCE
+BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row)
+BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = (decision_core.BATCH_REF_MAX, decision_core.BATCH_FINDING_MAX,
+                                                   decision_core.BATCH_REC_MAX)
+BATCH_TITLE_MAX = decision_core.BATCH_TITLE_MAX
+BatchError = decision_core.BatchError
+_ROWS_BLOCK = decision_core._ROWS_BLOCK
+_ROW_REF = decision_core._ROW_REF
 
 
 def short_ref_of(ref):
-    """`repo#N` for a row's ref given as `repo#N`, `owner/repo#N` or an issue or pull request URL."""
-    ref = short_refs(ref.strip())
-    return ref.split("/")[-1] if "/" in ref else ref
+    return decision_core.short_ref_of(ref)
 
 
 def parse_batch_row(line):
-    """One row line `<ref> | <finding> | <recommendation>` as {ref, short, finding, recommendation, text}. Raises
-    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut."""
-    parts = [" ".join(part.split()) for part in line.split("|", 2)]
-    if len(parts) != 3 or not all(parts):
-        raise BatchError("a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: %r" % _one_line(line, 80))
-    ref, finding, rec = parts
-    if "```" in line:
-        raise BatchError("a row may not contain a code fence: %r" % _one_line(line, 80))
-    if len(ref) > BATCH_REF_MAX or not (_ROW_REF.match(ref) or _GITHUB_REF.match(ref)):
-        raise BatchError("%r is not an issue: write repo#N, owner/repo#N or the issue's URL" % _one_line(ref, 60))
-    return row_of(ref, finding, rec)
+    return decision_core.parse_batch_row(line)
 
 
 def row_repo(ref):
-    """The `owner/repo` a row's ref names (`owner/repo#N` or an issue URL), or None for a short `name#N`."""
-    found = _GITHUB_REF.match(ref)
-    if found:
-        return "%s/%s" % (found.group(1), found.group(2))
-    return ref.split("#")[0] if "/" in ref.split("#")[0] else None
+    return decision_core.row_repo(ref)
 
 
 def row_of(ref, finding, rec):
-    cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
-    finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
-    short = short_ref_of(ref)
-    return {"ref": ref, "short": short, "finding": finding, "recommendation": rec,
-            "text": "%s: %s" % (short, short_refs(rec))}
+    return decision_core.row_of(ref, finding, rec)
 
 
 def parse_decision_rows(body):
-    """The rows in an issue body's fenced `decision-rows` block, in order; [] for a body with none. Lenient: a line
-    that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
-    found = _ROWS_BLOCK.search(body) if isinstance(body, str) else None
-    rows = []
-    for line in (found.group(1).splitlines() if found else []):
-        if not line.strip():
-            continue
-        try:
-            rows.append(parse_batch_row(line))
-        except BatchError:
-            continue
-        if len(rows) >= BATCH_ROWS_MAX:
-            break
-    return rows
+    return decision_core.parse_decision_rows(body)
 
 
 def batch_headline(title, count):
-    """`<title> (n rows)`: the title is cut to leave the count whole."""
-    suffix = " (%d row%s)" % (count, "" if count == 1 else "s")
-    text = short_refs(" ".join(str(title).split()))
-    if _wrap_count((text + suffix).split(), HEADLINE_WIDTH) <= HEADLINE_LINES:
-        return text + suffix
-    return fit_lines(text, HEADLINE_WIDTH, 1) + suffix
+    return decision_core.batch_headline(title, count)
 
 
 def batch_body(name, rows):
@@ -4160,11 +4103,11 @@ def decisions_from_requests(engine, now):
         asked = _created(request)
         seen[key] = asked if asked is not None else engine.decision_seen.get(key, now)
         ask = _issue_of(observation.fleet)
-        human = "%s:%s" % key in escalated or now - seen[key] >= grace
+        tier = decision_core.request_tier(now, seen[key], grace, "%s:%s" % key in escalated)
         items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": ask,
                       "repo": _fleet_repo(observation.fleet, engine.config),
                       "agent": observation.name, "since": seen[key],
-                      "seed": "request:%s:%s" % key, "bare": False, "tier": "human" if human else "cos",
+                      "seed": "request:%s:%s" % key, "bare": False, "tier": tier,
                       "session": observation.session_id, "request": request["id"]})
     engine.decision_seen = seen  # memory only: a request with no time of its own keeps the first time it was seen
     engine.request_keys = {"%s:%s" % key for key in seen}
@@ -4348,7 +4291,7 @@ def decisions_from_reports(engine, now):
                 considered = considered_send(engine, report, repos, since, sends)
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
-                          "repo": report["repo"], "tier": "orchestrator" if above else "cos",
+                          "repo": report["repo"], "tier": decision_core.report_tier(bool(above)),
                           "since": report["at"][0], "bare": False,
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
                           "considered": considered})
@@ -4385,105 +4328,43 @@ def considered_send(engine, report, repos, since, sends):
 
 
 def report_answered(engine, report, reports, since, sends):
-    """True when the boss sent the worker something on the ask (or on none), or the same worker later reported on
-    the same ask and repo a newer `question`, a `done`, `failed` or `withdrawn` (`withdrawn --all` on any ask).
-    An untagged report is answered only by a later untagged `done`, `failed` or `withdrawn`. `sends` caches one read of each worker's transcript per derivation."""
-    for other in reports:
-        if other is report or other["sender"] != report["sender"] or other["at"] <= report["at"]:
-            continue
-        if other["state"] == "withdrawn" and other["text"].startswith(WITHDRAW_ALL):
-            return True  # `withdrawn --all`: every open question of the worker, on any ask
-        if other["issue"] != report["issue"] or other["repo"] != report["repo"]:
-            continue
-        # working, paused and blocked never answer; an untagged report answers only by finishing or withdrawing
-        if other["state"] in (("done", "failed", "withdrawn") if report["issue"] is None
-                              else ("question", "done", "failed", "withdrawn")):
-            return True
+    """True when the report is answered (the rules are decision_core's: a later report of the worker, or a send of
+    the boss on the ask). `sends` caches one read of each worker's transcript per derivation. The sends are read
+    only when no later report answers, as before, and an unreadable worker raises here."""
+    if decision_core.answered_by_later_report(report, reports):
+        return True
     worker = engine.discovery.agents[report["sender"]]
     if worker.problem:
         raise RuntimeError("cannot read what %s was sent: %s" % (worker.name, worker.problem))
     if worker.name not in sends:
         sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
-    for created, _, _, line in sends[worker.name]:
-        match = SEND_LINE.match(line)
-        if match and match.group(1) == report["boss"] and created > report["at"][0] \
-                and (match.group(3) is None or (int(match.group(3)) == report["issue"]
-                                                and repo_of_tag(match.group(2), decision_repos(engine)) in (None, report["repo"]))):
-            return True
-    return False
+    return decision_core.answered_by_send(report, sends[worker.name], decision_repos(engine))
 
 
 # ---- the readable headline of a decision (the panel shows this; `title` stays for older readers)
 
-HEADLINE_WIDTH = 34   # the Decisions panel's ROW_WIDTH (plugins/fleet-decisions-tui/decisions.mjs); a test keeps them equal
-HEADLINE_LINES = 2
-_URL = re.compile(r"https?://[^\s<>\"'`]+")
-_GITHUB_REF = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(?:issues|pull)/(\d+)(?:[/?#].*)?$")
-_ISSUE_URL = re.compile(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)(?![\w])")
-_SHORT_REF = re.compile(r"(?<![\w/.-])((?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)#(\d+)(?!\w)")
+HEADLINE_WIDTH = decision_core.HEADLINE_WIDTH   # the Decisions panel's ROW_WIDTH (plugins/fleet-decisions-tui/decisions.mjs); a test keeps them equal
+HEADLINE_LINES = decision_core.HEADLINE_LINES
+_URL = decision_core._URL
+_GITHUB_REF = decision_core._GITHUB_REF
+_ISSUE_URL = decision_core._ISSUE_URL
+_SHORT_REF = decision_core._SHORT_REF
 
 
 def short_refs(text):
-    """`text` with every URL as a short ref: a GitHub issue or pull request URL is `repo#N`, any other URL its host."""
-    def one(match):
-        url = match.group(0)
-        tail = ""
-        while url and url[-1] in ".,;:!?)]}":
-            url, tail = url[:-1], url[-1] + tail
-        found = _GITHUB_REF.match(url)
-        if found:
-            return "%s#%s%s" % (found.group(2), found.group(3), tail)
-        host = re.match(r"^https?://([^/?#\s]+)", url)
-        return (host.group(1) if host else url) + tail
-    return _URL.sub(one, text)
+    return decision_core.short_refs(text)
 
 
 def _wrap_count(words, width):
-    """How many lines `words` take at `width`: the panel's word wrap (a word wider than a line is broken hard)."""
-    lines, line = 0, 0
-    for word in words:
-        while len(word) > width:
-            if line:
-                lines, line = lines + 1, 0
-            lines, word = lines + 1, word[width:]
-        if not line:
-            line = len(word)
-        elif line + 1 + len(word) <= width:
-            line += 1 + len(word)
-        else:
-            lines, line = lines + 1, len(word)
-    return lines + (1 if line else 0)
+    return decision_core.wrap_count(words, width)
 
 
 def fit_lines(text, width=HEADLINE_WIDTH, lines=HEADLINE_LINES):
-    """`text` cut at a word boundary to what fits `lines` lines of `width`; an ellipsis only when something was cut."""
-    words = text.split()
-    if _wrap_count(words, width) <= lines:
-        return " ".join(words)
-    kept = []
-    for word in words:
-        if _wrap_count(kept + [word + "\u2026"], width) > lines:
-            break
-        kept.append(word)
-    if not kept:  # one word wider than the whole headline: break it hard
-        return words[0][:width * lines - 1] + "\u2026"
-    return " ".join(kept) + "\u2026"
+    return decision_core.fit_lines(text, width, lines)
 
 
 def headline_of(item, issue_title):
-    """One decision's headline: an issue its title; a report the title of the issue it is about (when known) and
-    its gist, else the report line. URLs are short refs; at most HEADLINE_LINES panel lines."""
-    text = short_refs(" ".join(str(item["title"]).split()))
-    if item["kind"] != "report" or not issue_title:
-        return fit_lines(text)
-    about = short_refs(" ".join(issue_title.split()))
-    if _wrap_count((about + ": " + text).split(), HEADLINE_WIDTH) <= HEADLINE_LINES:
-        return about + ": " + text
-    if _wrap_count(about.split(), HEADLINE_WIDTH) > 1:  # one line for the issue, the rest for the report
-        about = fit_lines(about, HEADLINE_WIDTH, 1)
-    first = about
-    room = HEADLINE_WIDTH * HEADLINE_LINES - len(first) - 2
-    return fit_lines(first + ": " + text, HEADLINE_WIDTH, HEADLINE_LINES) if room > 8 else fit_lines(text)
+    return decision_core.headline_of(item, issue_title)
 
 
 def cached_issue_title(engine, repo, number, listed):
@@ -4498,18 +4379,7 @@ def cached_issue_title(engine, repo, number, listed):
 
 
 def named_issues(text, repo, wanted):
-    """The issue numbers `text` names, as a short ref (`name#N`, or `owner/name#N`) or an issue URL, among `wanted`
-    (the open issue decisions of `repo`)."""
-    found = set()
-    for match in _ISSUE_URL.finditer(text):
-        if match.group(1) == repo and int(match.group(2)) in wanted:
-            found.add(int(match.group(2)))
-    bare = _URL.sub(" ", text)
-    for match in _SHORT_REF.finditer(bare):
-        name = match.group(1)
-        if repo and (name == repo or name == repo.split("/")[-1]) and int(match.group(2)) in wanted:
-            found.add(int(match.group(2)))
-    return found
+    return decision_core.named_issues(text, repo, wanted)
 
 
 # ---- PR notices: a heads-up that an orchestrator opened (or means to merge) a PR
@@ -4779,16 +4649,8 @@ def decisions_from_notices(engine, now):
             engine.notice_effects["unreadable"][key] = None
         name = repo.split("/")[-1]
         tag = repo if names.count(name) > 1 else name
-        facts = facts or {}
-        headline = fit_lines(" ".join(("%s#%d" % (tag, number), facts.get("title") or "")).strip())
-        entry = {"id": "pr:%s#%d" % (tag, number), "title": _line_of(headline, DECISION_TITLE_MAX),
-                 "headline": headline, "ask": None, "repo": repo, "agent": item.get("from"), "kind": "notice",
-                 "tier": "human", "since": iso(item["created"]), "number": number,
-                 "url": "https://github.com/%s/pull/%d" % (repo, number), "state": facts.get("state"),
-                 "additions": facts.get("additions"), "deletions": facts.get("deletions"),
-                 "files": facts.get("files"), "ci": facts.get("ci"), "review": facts.get("review"),
-                 "stale": held["stale"], "note": item.get("note") or None,
-                 "merge_after": iso(item["created"] + hold * 60) if hold > 0 else None}
+        entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
+                                           item["created"], item.get("note"), hold)
         entries.append((order(item), entry))
     return [entry for _, entry in sorted(entries, key=lambda pair: pair[0])], []
 
@@ -4816,54 +4678,9 @@ def derive_decisions(engine, now):
     ids = assign_decision_ids(items, decision_repos(engine))
     watched = decision_repos(engine)
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
-    yours = {(item["repo"] or home, item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
-    listed = {(item["repo"] or home, item["ask"]): item["title"] for item in items if item["kind"] == "issue"}
-    wanted = {}
-    for repo, number in listed:
-        wanted.setdefault(repo, set()).add(number)
-    ids = dict(zip((id(item) for item in items), ids))
-    # one question, shown once: a report on an issue that is itself a decision (same repo and number) is folded into
-    # the issue's decision; so is an untagged report whose text names exactly one such issue in its repo
-    folded = {}
-    for item in items:
-        if item["kind"] != "report":
-            continue
-        repo, number = item["repo"] or home, item["ask"]
-        if not number:
-            named = named_issues(str(item["title"]), repo, wanted.get(repo, set()))
-            number = named.pop() if len(named) == 1 else None
-        if number and (repo, number) in listed:
-            folded[id(item)] = (repo, number)
-    reporters = {}
-    for item in items:
-        if id(item) in folded:
-            reporters.setdefault(folded[id(item)], []).append(item["agent"])
-    decisions = []
-    for item in items:
-        if id(item) in folded:
-            continue
-        ident, tier = ids[id(item)], item["tier"]
-        if item["kind"] == "report" and item["ask"] and (item["repo"] or home, item["ask"]) in yours:
-            tier = "human"  # the Chief of Staff escalated its issue: the report that raised it is yours too
-        repo = item.get("repo")
-        decision = {"id": ident, "title": _line_of(item["title"], DECISION_REPORT_TITLE_MAX if item["kind"] == "report"
-                                                  else DECISION_TITLE_MAX), "ask": item["ask"],
-                    "repo": repo, "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"]),
-                    "tier": "human" if fault("tier-flat") else tier}
-        about = cached_issue_title(engine, item["repo"] or home, item["ask"], listed) if item["kind"] == "report" and item["ask"] else None
-        decision["headline"] = headline_of(item, about)
-        if item.get("rows"):  # a batch: one decision, one row each
-            decision["rows"] = item["rows"]
-            decision["headline"] = batch_headline(item["title"], len(item["rows"]))
-            if item.get("raised_by"):
-                decision["raised_by"] = item["raised_by"]
-        if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
-            decision["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
-        if item.get("considered"):
-            decision["considered"] = item["considered"]
-        if item.get("request"):
-            decision.update(session=item["session"], request=item["request"])
-        decisions.append(decision)
+    decisions = decision_core.build_entries(
+        items, ids, home, lambda repo, number: cached_issue_title(engine, repo, number, {}),
+        tier_flat=fault("tier-flat"))
     try:  # the fourth source: PR notices, information rather than decisions (never folded, never counted)
         found, problems = decisions_from_notices(engine, now)
     except Exception as err:
@@ -4872,7 +4689,7 @@ def derive_decisions(engine, now):
     for problem in problems:
         errors.append({"source": "notices", "error": _one_line(problem, 200)})
         engine._note("decisions.error", "notices", {"error": _one_line(problem, 200)})
-    decisions.sort(key=lambda d: (d["since"], d["id"]))
+    decision_core.order_decisions(decisions)
     return decisions, errors
 
 
@@ -4965,46 +4782,23 @@ def format_age(seconds):
     return "%dd" % (seconds // 86400)
 
 
-DECISION_TIERS = ("cos", "human", "orchestrator")
-DECISION_LONG_WAIT = 3600   # seconds: a decision waiting longer is "over 1h" (the panel's LONG_WAIT_SECONDS; a test keeps them equal)
+DECISION_TIERS = decision_core.DECISION_TIERS
+DECISION_LONG_WAIT = decision_core.DECISION_LONG_WAIT   # seconds: a decision waiting longer is "over 1h" (the panel's LONG_WAIT_SECONDS; a test keeps them equal)
 
 
 def count_over_an_hour(decisions, now):
-    """How many of `decisions` have waited longer than DECISION_LONG_WAIT at `now` (one with no readable time is
-    not counted). The one place that decides it: the status line uses it."""
-    waited = (parse_iso(d.get("since")) for d in decisions)
-    return sum(1 for since in waited if since is not None and now - since > DECISION_LONG_WAIT)
+    return decision_core.count_over_an_hour(decisions, now)
 
 
 def decisions_view(fleet, config, repo=None, tier=None):
-    """PR 18: which decisions a caller sees. {"role", "repo", "tiers", "text"}: `repo` None is every repo, `tiers`
-    None is every tier.
-
-    With no flag: the Chief of Staff sees every repo and tier; an orchestrator its own repo (the repo in its fleet
-    metadata), every tier; anyone else (a plain shell, a TUI that is not a fleet agent) the `human` tier, every repo.
-    A flag overrides its own part and leaves the other at the caller's default."""
+    """PR 18: which decisions a caller sees (the rules are decision_core's): {"role", "repo", "tiers", "text"}."""
     role = (fleet or {}).get("role")
-    if role == "chief-of-staff":
-        shown, tiers = None, None
-    elif role == "orchestrator":
-        shown, tiers = _fleet_repo(fleet, config), None
-    else:
-        shown, tiers = None, ["human"]
-    if repo is not None:
-        shown = repo
-    if tier is not None:
-        tiers = None if tier == "all" else [tier]
-    who = role if role in ("chief-of-staff", "orchestrator") else "you"
-    text = "%s, %s (for %s)" % ("repo %s" % shown if shown else "all repos",
-                                "tier %s" % ", ".join(tiers) if tiers else "all tiers", who)
-    return {"role": role, "repo": shown, "tiers": tiers, "text": text}
+    return decision_core.decisions_view(role, _fleet_repo(fleet, config) if role == "orchestrator" else None,
+                                        repo, tier)
 
 
 def select_decisions(decisions, view):
-    """The decisions in `view`. One with no tier (a file an older daemon wrote) is the human's."""
-    return [d for d in decisions if d.get("kind") != "notice"
-            and (view["repo"] is None or d.get("repo") == view["repo"])
-            and (view["tiers"] is None or d.get("tier", "human") in view["tiers"])]
+    return decision_core.select_decisions(decisions, view)
 
 
 def format_decisions(report, now, view=None):
@@ -5617,13 +5411,7 @@ def awaiting_label(config):
 
 def parse_iso(text):
     """An ISO-8601 time with `Z` or an offset -> epoch seconds, or None."""
-    if not isinstance(text, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+    return decision_core.parse_iso(text)
 
 
 def parent_of(issue):
@@ -6481,8 +6269,7 @@ class GitHubHub:
             return
         names = {(label.get("name") if isinstance(label, dict) else label) for label in issue["labels"]}
         key = (repo, number)
-        tier = "human" if awaiting_label(self.config) in names \
-            else "cos" if awaiting_cos_label(self.config) in names else None
+        tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
             if tier is not None and issue.get("state", "open") == "open":
                 known = self.awaiting.get(key)
@@ -7521,11 +7308,7 @@ def issue_repo(issue):
 def issue_tag(repo, number, repos=None):
     """How a message names an issue: `#2` with one repo in play, `api#2` with several (the repo name,
     or owner/name when two of them share a name)."""
-    if not repo or not repos or len(repos) < 2:
-        return "#%d" % number
-    short = repo.split("/")[1]
-    clash = [r for r in repos if r.split("/")[1] == short]
-    return "%s#%d" % (repo if len(clash) > 1 else short, number)
+    return decision_core.issue_tag(repo, number, repos)
 
 
 def _fleet_repo(fleet, config):
