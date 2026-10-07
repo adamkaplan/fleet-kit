@@ -22527,8 +22527,24 @@ def baseline_derive(engine, now):
     return sb.derive_decisions(engine, now())
 
 
+_BASELINE_JSON_ERROR = re.compile(r"(?:Expecting|Extra data|Unterminated|Invalid|Illegal)[^\n]*")
+
+
+def baseline_portable(data):
+    """`data` with the interpreter's own wording taken out (a json parse error reads differently from Python
+    3.9 to 3.12), so the files are the same on every Python. The product cuts the message at a fixed width, so it is dropped to its end."""
+    if isinstance(data, str):
+        return _BASELINE_JSON_ERROR.sub("<json parse error>", data)
+    if isinstance(data, list):
+        return [baseline_portable(x) for x in data]
+    if isinstance(data, dict):
+        return {k: baseline_portable(v) for k, v in data.items()}
+    return data
+
+
 def baseline_golden(test, name, data):
     """Compare `data` with the golden file `name`.json (or record it under DECISIONS_BASELINE_UPDATE=1)."""
+    data = baseline_portable(data)
     text = json.dumps(data, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
     path = BASELINE_DIR / (name + ".json")
     if BASELINE_UPDATE:
