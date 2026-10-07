@@ -4656,6 +4656,78 @@ def decisions_from_notices(engine, now):
 
 
 
+# ---- the sources behind the DecisionSource port. Each wraps the reader that was always called here (looked up by
+# name at call time, so a replaced reader is used); a later adapter registers a class of its own.
+
+class GitHubIssuesSource(decision_core.DecisionSource):
+    name = "github"
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read_open(self, now):
+        return decisions_from_github(self.engine, now)
+
+
+class HarnessRequestsSource(decision_core.DecisionSource):
+    name = "v2"
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read_open(self, now):
+        return decisions_from_requests(self.engine, now)
+
+
+class ReportsSource(decision_core.DecisionSource):
+    name = "reports"
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read_open(self, now):
+        return decisions_from_reports(self.engine, now)
+
+
+class PrNoticesSource(decision_core.DecisionSource):
+    name = "notices"
+    entries = True
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read_open(self, now):
+        return decisions_from_notices(self.engine, now)
+
+
+# The registry, in the order the list is built: sources of items (folded and numbered) in registration order, then
+# the sources of finished entries. A later adapter appends a factory (`factory(engine)` -> a DecisionSource).
+DECISION_SOURCE_REGISTRY = [GitHubIssuesSource, HarnessRequestsSource, ReportsSource, PrNoticesSource]
+
+
+def register_decision_source(factory):
+    """Add a source (a class or any `factory(engine)` returning a DecisionSource) after the ones already there."""
+    DECISION_SOURCE_REGISTRY.append(factory)
+    return factory
+
+
+def decision_sources(engine):
+    return [factory(engine) for factory in DECISION_SOURCE_REGISTRY]
+
+
+def read_source(engine, source, now, errors):
+    """(found, problems) of one source: a source that fails is one error entry (audited once per change) and the
+    others are still listed. Every problem is appended to `errors`."""
+    try:
+        found, problems = source.read_open(now)
+    except Exception as err:
+        found, problems = [], [_one_line("%s: %s" % (type(err).__name__, err), 200)]
+    for problem in problems:
+        errors.append({"source": source.name, "error": _one_line(problem, 200)})
+        engine._note("decisions.error", source.name, {"error": _one_line(problem, 200)})
+    return found, problems
+
+
 def derive_decisions(engine, now):
     """(decisions, errors): every open decision, oldest first, and what could not be read.
 
@@ -4664,31 +4736,19 @@ def derive_decisions(engine, now):
     permission request or question also names its `session` and `request`). A source that fails is an error entry and the
     others are still listed (audited once per change). Call after `engine.discover` and a fact collection."""
     items, errors = [], []
-    sources = (("github", decisions_from_github), ("v2", decisions_from_requests),
-               ("reports", decisions_from_reports))
-    for name, source in sources:
-        try:
-            found, problems = source(engine, now)
-        except Exception as err:
-            found, problems = [], [_one_line("%s: %s" % (type(err).__name__, err), 200)]
+    sources = decision_sources(engine)
+    for source in (x for x in sources if not x.entries):
+        found, problems = read_source(engine, source, now, errors)
         items.extend(found)
-        for problem in problems:
-            errors.append({"source": name, "error": _one_line(problem, 200)})
-            engine._note("decisions.error", name, {"error": _one_line(problem, 200)})
     ids = assign_decision_ids(items, decision_repos(engine))
     watched = decision_repos(engine)
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
     decisions = decision_core.build_entries(
         items, ids, home, lambda repo, number: cached_issue_title(engine, repo, number, {}),
         tier_flat=fault("tier-flat"))
-    try:  # the fourth source: PR notices, information rather than decisions (never folded, never counted)
-        found, problems = decisions_from_notices(engine, now)
-    except Exception as err:
-        found, problems = [], [_one_line("%s: %s" % (type(err).__name__, err), 200)]
-    decisions.extend(found)
-    for problem in problems:
-        errors.append({"source": "notices", "error": _one_line(problem, 200)})
-        engine._note("decisions.error", "notices", {"error": _one_line(problem, 200)})
+    for source in (x for x in sources if x.entries):  # PR notices: information rather than decisions (never folded, never counted)
+        found, problems = read_source(engine, source, now, errors)
+        decisions.extend(found)
     decision_core.order_decisions(decisions)
     return decisions, errors
 
@@ -4703,43 +4763,96 @@ def read_decisions_file(path):
     return body if ok else None
 
 
+class LocalStore(decision_core.DecisionStore):
+    """What the Switchboard keeps about decisions on this machine: the projection decisions.json and the
+    escalated-requests file. Today's behaviour, behind the DecisionStore port; the functions it calls are unchanged."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read(self, now):
+        return decisions_report(self.engine.state_dir, now)
+
+    def publish(self, decisions, errors, now):
+        """Write decisions.json when the list changed (or the file is missing or unreadable), atomically, mode
+        0600; otherwise touch it, so its age says the daemon is alive. Returns True when written."""
+        engine = self.engine
+        path = engine.state_dir / DECISIONS_FILE
+        current = read_decisions_file(path)
+        if current is not None and current["decisions"] == decisions and current["errors"] == errors:
+            os.utime(str(path), (now, now))
+            return False
+        known = current.get("generation") if current is not None else None
+        engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + 1
+        body = {"generation": engine.decisions_generation, "written_at": iso(now), "daemon_pid": os.getpid(),
+                "decisions": decisions, "errors": errors}
+        temp = path.with_name("%s.%d.tmp" % (DECISIONS_FILE, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(body, handle, indent=1, sort_keys=True)
+                handle.write("\n")
+            os.utime(str(temp), (now, now))
+            os.replace(str(temp), str(path))
+        except BaseException:
+            try:
+                os.unlink(str(temp))
+            except OSError:
+                pass
+            raise
+        return True  # not audited: a projection of facts, and the audit records writes to other systems
+
+    def escalated(self):
+        return read_escalated(self.engine.state_dir)
+
+    def mark_escalated(self, key, when):
+        mark_escalated(self.engine.state_dir, key, when)
+
+    def prune_escalated(self, pending):
+        prune_escalated(self.engine.state_dir, pending)
+
+
+class NullExternal(decision_core.ExternalDecisionAdapter):
+    """The adapter hook point with nothing behind it: healthy, takes every push as a no-op and has no changes. It is
+    what the Switchboard uses while no external adapter is configured, so nothing leaves the machine."""
+
+    def health(self):
+        return None
+
+    def push(self, decision, idempotency_key):
+        return None
+
+    def pull_changes(self, cursor):
+        return [], cursor
+
+
+NULL_EXTERNAL = NullExternal()
+
+
+def decision_store(engine):
+    return LocalStore(engine)
+
+
+def decision_external(engine):
+    """The external adapter of this engine: its `external` when one was set, else the NullExternal."""
+    return getattr(engine, "external", None) or NULL_EXTERNAL
+
+
 def publish_decisions(engine):
-    """The end of a pass: write decisions.json when the list changed (or the file is missing or unreadable),
-    atomically, mode 0600; otherwise touch it, so its age says the daemon is alive. Returns True when written."""
+    """The end of a pass: derive the list and hand it to the store (decisions.json when it changed, else a touch, so
+    its age says the daemon is alive). Returns True when written."""
     state = engine.state_dir
     if state is None or engine.audit is None or fault("no-decisions-file"):
         return False
     now = engine.now()
     decisions, errors = derive_decisions(engine, now)
     apply_notice_effects(engine)
+    store = decision_store(engine)
     try:
-        prune_escalated(state, engine.request_keys)
+        store.prune_escalated(engine.request_keys)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
-    path = state / DECISIONS_FILE
-    current = read_decisions_file(path)
-    if current is not None and current["decisions"] == decisions and current["errors"] == errors:
-        os.utime(str(path), (now, now))
-        return False
-    known = current.get("generation") if current is not None else None
-    engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + 1
-    body = {"generation": engine.decisions_generation, "written_at": iso(now), "daemon_pid": os.getpid(),
-            "decisions": decisions, "errors": errors}
-    temp = path.with_name("%s.%d.tmp" % (DECISIONS_FILE, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(body, handle, indent=1, sort_keys=True)
-            handle.write("\n")
-        os.utime(str(temp), (now, now))
-        os.replace(str(temp), str(path))
-    except BaseException:
-        try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
-    return True  # not audited: a projection of facts, and the audit records writes to other systems
+    return store.publish(decisions, errors, now)
 
 
 def decisions_report(state_dir, now):

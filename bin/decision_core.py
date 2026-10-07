@@ -525,47 +525,81 @@ def count_over_an_hour(decisions, now):
     return sum(1 for since in waited if since is not None and now - since > DECISION_LONG_WAIT)
 
 
-# ---------------------------------------------------------------- ports (no implementation yet; used from step 3)
+# ---------------------------------------------------------------- ports
+#
+# Abstract: no implementation here. bin/fleet-switchboard holds the implementations that are today's behaviour
+# (GitHub issues, harness requests, reports and PR notices as sources; a send, a harness reply and an issue
+# comment with labels as deliveries; decisions.json and escalated-requests.json as the local store) and a
+# registry a later adapter extends.
 
 
 class DecisionSource(abc.ABC):
     """Reads the open decisions of one kind from some store (GitHub issues, a harness's pending requests, a boss's
-    reports). The Switchboard's three readers become implementations of this port; an external store may add one."""
+    reports, recorded PR notices). `name` is how an error entry names the source."""
+
+    name = ""
+    # True: read_open returns finished list entries (a notice) appended after folding; False: it returns the items
+    # build_entries folds and numbers.
+    entries = False
 
     @abc.abstractmethod
     def read_open(self, now):
         """(items, problems): the open decisions this source holds at `now` (the caller's clock), as the dicts
-        build_entries takes, and what could not be read (one line each). A source that fails raises; the
-        caller records it as an error entry and still lists the other sources."""
+        build_entries takes (or, for an `entries` source, finished entries), and what could not be read (one line
+        each). A source that fails raises; the caller records it as an error entry and still lists the others."""
 
 
 class AnswerDelivery(abc.ABC):
-    """Delivers an answer to the asker (the agent that is waiting). The module decides that an answer exists and
-    what it means; the Switchboard, which knows the harness, is the one that delivers it."""
+    """Delivers an answer to the asker (the agent that is waiting, or the issue that holds the question). The core
+    decides that an answer exists and what it means; the Switchboard, which knows the harness, delivers it."""
 
     @abc.abstractmethod
     def deliver(self, decision, answer):
-        """Deliver `answer` (a dict: choice or text, who answered with what role, when) for `decision` (an entry
-        of the list) to the agent it waits on, once. Returns a result dict; raises when it could not be delivered,
-        in which case the decision stays open."""
+        """Deliver `answer` (a dict; its keys are the delivery's own) for `decision` (an entry of the list), once.
+        Returns the delivery's result; raises when it could not be delivered, in which case nothing is claimed."""
 
 
 class DecisionStore(abc.ABC):
-    """The hook point for an adapter that holds decisions outside the Switchboard and takes answers from there.
+    """Where the Switchboard keeps what it must remember about decisions: the projection a reader sees, and the
+    requests the Chief of Staff escalated. Disposable and rebuildable: never the source of truth."""
+
+    @abc.abstractmethod
+    def read(self, now):
+        """What the projection says now: {stale, message, age_seconds, written_at, generation, decisions, errors}."""
+
+    @abc.abstractmethod
+    def publish(self, decisions, errors, now):
+        """Make `decisions` and `errors` the projection when they changed (otherwise only say it is alive).
+        Returns True when it was written."""
+
+    @abc.abstractmethod
+    def escalated(self):
+        """{"<session>:<request id>": time} of the requests escalated to the human."""
+
+    @abc.abstractmethod
+    def mark_escalated(self, key, when):
+        """Remember that the request `key` was escalated."""
+
+    @abc.abstractmethod
+    def prune_escalated(self, pending):
+        """Forget every escalation of a request that is not in `pending`."""
+
+
+class ExternalDecisionAdapter(abc.ABC):
+    """The hook point of an adapter that holds decisions outside the Switchboard and takes answers from there.
     Optional capabilities are named in `capabilities`; a missing one is reported, not guessed."""
 
     capabilities = frozenset()
 
     @abc.abstractmethod
     def health(self):
-        """None when the store can be used now, else one line saying why not."""
+        """None when the adapter can be used now, else one line saying why not."""
 
     @abc.abstractmethod
     def push(self, decision, idempotency_key):
-        """Record or update `decision` in the store; the same key twice is the same write. Returns the store's
-        own id for it (and any link)."""
+        """Record or update `decision` outside; the same key twice is the same write. Returns the outside id."""
 
     @abc.abstractmethod
     def pull_changes(self, cursor):
-        """(events, next_cursor): what changed in the store since `cursor` (answers, withdrawals), at least once;
+        """(events, next_cursor): what changed outside since `cursor` (answers, withdrawals), at least once;
         the caller de-duplicates by event id."""
