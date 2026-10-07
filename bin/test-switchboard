@@ -14061,6 +14061,30 @@ class TestMultiRepoConfig(Base):
         self.assertEqual(accounts.account_for("acme/web"), "acme-ci")
         self.assertIsNone(accounts.account_for("other/x"))
 
+    def test_an_underscore_login_is_an_account(self):
+        config = self.cfg(gh_users={"acme-infra/*": "alice_corp"})
+        self.assertEqual(config["gh_users"], {"acme-infra/*": "alice_corp"})
+        self.assertEqual(sb.GhAccounts(config, FakeRunner()).account_for("acme-infra/x"), "alice_corp")
+
+    def test_an_underscore_login_is_an_ignored_author(self):
+        config = self.cfg(github_ignore_authors=["alice_corp"])
+        self.assertEqual(config["github_ignore_authors"], ["alice_corp"])
+
+    def test_a_launch_into_acme_infra_uses_the_underscore_account(self):
+        config = self.cfg(gh_users={"acme-infra/*": "alice_corp"})
+        runner = FakeRunner(default=(0, "tok\n", ""))
+        accounts = sb.GhAccounts(config, runner, environ={})
+        self.assertIsNone(sb.launch_account_problem(config, accounts, "acme-infra/x"))
+        accounts.token_for(accounts.account_for("acme-infra/x"))
+        self.assertEqual(runner.argv, [config["gh"], "auth", "token", "--user", "alice_corp"])
+
+    def test_logins_that_are_still_refused(self):
+        for bad in ("--token", "_x", "a b"):
+            for key, value in (("gh_users", {"acme/api": bad}), ("github_ignore_authors", [bad])):
+                with self.subTest(login=bad, key=key):
+                    with self.assertRaises(sb.ConfigError):
+                        self.cfg(**{key: value})
+
     def test_the_watched_set_is_the_baseline_and_every_live_agents_repo_and_charter(self):
         config = self.cfg(github_repos=["acme/api"], intent_repo="acme/ops")
         agents = {"a": {"repo": "acme/web"}, "b": {"charter": 1}, "c": {"role": "coder"}, "d": {"repo": "acme/api"}}
