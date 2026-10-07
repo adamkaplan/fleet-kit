@@ -4248,10 +4248,7 @@ def synthetic_lines(engine, session_id, since, waiting=False):
     found = transcript_lines(engine, session_id, since)
     if not waiting:
         return found
-    try:
-        inbox = engine.v2.inbox_list(session_id)
-    except V2Error:
-        return found  # an inbox that cannot be read leaves the transcript's lines, as before
+    inbox = engine.v2.inbox_list(session_id)  # an inbox that cannot be read raises: the caller says so, it is not guessed
     have = {line[1] for line in found}
     waiting = []
     for item in inbox if isinstance(inbox, list) else []:
@@ -4303,7 +4300,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({_boss_of(o) for o in discovery.agents.values()} - {None})
     repos = decision_repos(engine)
-    items, problems, sends = [], [], {}
+    items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
         if observation is None or observation.problem:
@@ -4333,10 +4330,22 @@ def decisions_from_reports(engine, now):
         for report in reports:
             if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
                 continue  # not a decision, or the worker that asked no longer runs: no one is waiting
-            if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
-                continue
+            worker = report["sender"]
+            if worker not in unread:
+                try:
+                    if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
+                        continue
+                except (V2Error, RuntimeError) as err:
+                    # one worker's unreadable inbox or transcript: its reports stay listed (not answered), the error is
+                    # shown once, and every other worker is unaffected
+                    unread[worker] = _one_line(str(err), 150)
+                    problems.append(unread[worker] if unread[worker].startswith("cannot read what %s" % worker)
+                                    else "cannot read what %s was sent: %s" % (worker, unread[worker]))
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
-            considered = considered_send(engine, report, repos, since, sends)
+            if worker in unread:
+                considered = "could not read what %s was sent (%s): listed as not answered" % (worker, unread[worker])
+            else:
+                considered = considered_send(engine, report, repos, since, sends)
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": "orchestrator" if above else "cos",
@@ -12622,9 +12631,12 @@ def batch_answer_rows(decision, args):
 
 
 def answer_batch(engine, runner, decision, args, name):
-    """ONE comment on the batch issue recording every row's outcome, then both awaiting labels off it, so the batch
-    and all its rows leave the list together; then, when it can, a note to the orchestrator that raised it. Never
-    touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
+    """First the note to the orchestrator that raised the batch; only once it is delivered, ONE comment on the batch
+    issue recording every row's outcome, then both awaiting labels off it, so the batch and all its rows leave the
+    list together. A note that cannot be delivered (agent gone, held, error) refuses the answer and writes nothing:
+    the batch stays in the cos tier with its labels and no comment, and the same answer can be run again once, with
+    no duplicate note or comment. (A batch with no known raiser, or answered with no caller name, has no one to tell.)
+    Never touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
     ident = decision["id"]
     target = _issue_target(engine, decision)
     if target is None or target[0] is None:
@@ -12639,12 +12651,6 @@ def answer_batch(engine, runner, decision, args, name):
     if args.note:
         lines.append("Note: %s" % _one_line(args.note, 300))
     lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
-    comment_as(engine, runner, repo, number, "\n".join(lines), name)
-    change_issue_labels(engine, runner, repo, number, (),
-                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
-    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
-                                            "rows": len(outcomes), "changed": changed,
-                                            "note": _one_line(args.note or "", 200)})
     told = ""
     raised = decision.get("raised_by")
     if raised and name:
@@ -12652,10 +12658,21 @@ def answer_batch(engine, runner, decision, args, name):
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
         try:
             outcome = engine.send(name, raised, text, number, repo)
-            told = "; told %s" % raised if outcome.get("sent") else "; could not tell %s (%s): the comment is the record" % (
-                raised, outcome.get("reason") or outcome.get("action"))
         except Exception as err:
-            told = "; could not tell %s (%s): the comment is the record" % (raised, _one_line(str(err), 100))
+            raise DecisionError("%s was not answered: the note to %s could not be delivered (%s); its labels stay, the "
+                                "batch stays with the Chief of Staff, nothing was commented. Run the same answer again "
+                                "once %s can be reached" % (ident, raised, _one_line(str(err), 100), raised)) from None
+        if not outcome.get("sent"):
+            raise DecisionError("%s was not answered: the note to %s was not delivered (%s); its labels stay, the batch "
+                                "stays with the Chief of Staff, nothing was commented. Run the same answer again once "
+                                "%s can be reached" % (ident, raised, outcome.get("reason") or outcome.get("action"), raised))
+        told = "; told %s" % raised
+    comment_as(engine, runner, repo, number, "\n".join(lines), name)
+    change_issue_labels(engine, runner, repo, number, (),
+                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
+                                            "rows": len(outcomes), "changed": changed,
+                                            "note": _one_line(args.note or "", 200)})
     return "answered %s: %d rows (%d as recommended, %d changed); %s and %s are off %s#%d%s" % (
         ident, len(outcomes), len(outcomes) - changed, changed, awaiting_cos_label(engine.config),
         awaiting_label(engine.config), repo, number, told)

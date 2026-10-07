@@ -482,7 +482,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard decisions escalate <id> [--reason "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Moves a decision to you: your label on and the Chief of Staff's off, on the issue (with the repo's own account), or at once for a prompt or question. Not judged. A report with no issue is refused: put it in chat |
 | `fleet-switchboard decisions resolve <id> [--note "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Takes both awaiting labels off the issue. Judged against the Chief of Staff's standing orders |
 | `fleet-switchboard decisions answer <id> allow\|deny` / `answer <id> "<text>"` | Chief of Staff, or you in a plain shell (PR 18) | Replies to an agent's pending permission request or question through v2. Judged against the Chief of Staff's standing orders |
-| `fleet-switchboard decisions answer <batch id> --as-recommended` / `--row N=<choice> ...` `[--note "..."]` | Chief of Staff, or you in a plain shell | Answers a batch (below): one comment on the batch issue records every row's outcome, then both awaiting labels come off, so the batch and all its rows leave the list together. Rows not named by `--row` keep their recommendation. Judged like any `answer` |
+| `fleet-switchboard decisions answer <batch id> --as-recommended` / `--row N=<choice> ...` `[--note "..."]` | Chief of Staff, or you in a plain shell | Answers a batch (below): the raising orchestrator is sent a note first (if it cannot be delivered, nothing else happens and the batch stays); then one comment on the batch issue records every row's outcome and both awaiting labels come off, so the batch and all its rows leave the list together. Rows not named by `--row` keep their recommendation. Judged like any `answer` |
 | `fleet-switchboard decisions batch --title "<title>" --row "<repo#N> \| <finding> \| <recommendation>" ... [--file F]` | An orchestrator | Raises related findings as ONE decision: one issue in the caller's own repo with the awaiting-cos label and a fenced `decision-rows` block. Prints the issue's decision id. Rows come from `--row`, `--file` (`-` is stdin), or piped stdin |
 | `fleet-switchboard decisions supersede <id> [<id> ...] --by <repo#N \| URL> [--note "..."]` | Chief of Staff, or you in a plain shell | Several open decisions made moot by one issue: an issue decision gets a comment `Superseded by <ref>` and both labels off; a report gets your `send` to its worker naming the issue (which clears it) and its issue's labels off; a permission request or question is refused (use `answer`). One result line per id, `done` or `refused: <why>`; it carries on past a failure and exits non-zero if any failed. Judged like `resolve` |
 | `fleet-switchboard labels ensure [--repo OWNER/REPO]` | Anyone (PR 18) | Creates `<user>:orchestrator`, `<user>:awaiting-cos` and `<user>:awaiting-user` where missing (every watched repo by default), each with the repo's own account; idempotent |
@@ -1826,9 +1826,11 @@ one entry: the headline, one line per row (`web#7: close it`, URLs as short refs
 `<id> <age>`.
 
 `decisions escalate <id>` works on a batch unchanged: it is one issue, so the owner sees one item. `decisions answer
-<id> --as-recommended` (or `--row 2=keep it open`, rows not named keep their recommendation; `--note` is added) posts
-ONE comment on the batch issue recording each row's outcome, takes both awaiting labels off it, and, when it can, sends
-the raising orchestrator a note from the answerer naming the batch. A row may name an issue that is only being
+<id> --as-recommended` (or `--row 2=keep it open`, rows not named keep their recommendation; `--note` is added) first
+sends the raising orchestrator a note from the answerer naming the batch, and only once it is delivered posts ONE comment
+on the batch issue recording each row's outcome and takes both awaiting labels off it. A note that cannot be delivered
+(agent gone, held, error) refuses the answer: nothing is commented, the labels stay, the batch stays in the Chief of
+Staff's tier, the command says why and exits non-zero, and the same answer can be run again. A row may name an issue that is only being
 *proposed* for closing: the code never closes, labels or edits a row's issue. The answer is the record, and the
 orchestrator acts on the rows. `answer` keeps its meaning for permission requests and questions, and goes through the
 same judge as before. `decisions supersede` (command table) clears several open decisions made moot by one issue.
