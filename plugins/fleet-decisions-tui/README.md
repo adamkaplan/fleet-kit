@@ -2,8 +2,9 @@
 
 A read-only OpenCode v2 TUI plugin: a **Decisions (N)** section in the right
 sidebar, below the session's own sections, listing what waits on you (docs/switchboard.md,
-"Decisions (PR 14)"). One row per decision: its id, how long it has waited and one
-line of its title. You read it and refer to a decision by its id in chat.
+"Decisions (PR 14)"). Decisions are grouped by repo (a header per repo and a rule
+between repos; repos by name, oldest decision first). Each shows its id and how long it has waited on
+one line, then its whole title word-wrapped to 34 characters on the lines below. You read it and refer to a decision by its id in chat.
 
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
   changes and touches on every pass. It never derives anything itself.

@@ -9,7 +9,8 @@ export const STATE_ENV = "FLEET_SWITCHBOARD_STATE"
 export const DECISIONS_FILE = "decisions.json"
 export const STALE_MS = 120_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
-export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); a row never wraps
+export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
+export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
 
 // The state directory: FLEET_SWITCHBOARD_STATE when it is set, else the one the daemon writes to by default,
@@ -72,27 +73,78 @@ export function oneLine(text, width) {
   return flat.length <= width ? flat : flat.slice(0, Math.max(0, width - 1)) + "\u2026"
 }
 
-// One row of the list: `<id> <age> <title>`, at most `width` characters.
-export function rowOf(decision, nowMs, width = ROW_WIDTH) {
-  const since = Date.parse(decision.since)
-  const age = Number.isNaN(since) ? "?" : formatAge((nowMs - since) / 1000)
-  const head = `${decision.id} ${age} `
-  return head + oneLine(decision.title, Math.max(8, width - head.length))
+// Word-wrap `text` to lines of at most `width` characters. Whitespace is collapsed; a word longer than a
+// line is broken hard. Nothing is dropped, except past `maxLines` (a safety cap no real title reaches),
+// where the last line ends in an ellipsis.
+export function wrapText(text, width, maxLines = WRAP_MAX_LINES) {
+  const w = Math.max(1, width)
+  const lines = []
+  let line = ""
+  for (let word of String(text ?? "").split(/\s+/).filter(Boolean)) {
+    while (word.length > w) {
+      if (line) { lines.push(line); line = "" }
+      lines.push(word.slice(0, w))
+      word = word.slice(w)
+    }
+    if (!line) line = word
+    else if (line.length + 1 + word.length <= w) line += " " + word
+    else { lines.push(line); line = word }
+  }
+  if (line) lines.push(line)
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines)
+    kept[maxLines - 1] = kept[maxLines - 1].slice(0, w - 1) + "\u2026"
+    return kept
+  }
+  return lines
 }
 
-// The section: a title and its rows. Never empty, never absent: an empty list says "none", and a list the
-// daemon does not keep current says so instead of showing as current.
+// One decision: its first line `<id> <age>`, then the whole title wrapped to `width`.
+export function entryOf(decision, nowMs, width = ROW_WIDTH) {
+  const since = Date.parse(decision.since)
+  const age = Number.isNaN(since) ? "?" : formatAge((nowMs - since) / 1000)
+  return { key: decision.id, head: `${decision.id} ${age}`, lines: wrapText(decision.title, width) }
+}
+
+// The section: a title, decisions grouped by repo (repos by name, oldest decision first within one), and
+// `rows` for the states that are not decisions. Never empty, never absent: an empty list says "none", and
+// a list the daemon does not keep current says so instead of showing as current.
 export function buildView(snapshot, nowMs, width = ROW_WIDTH) {
   if (snapshot.status !== "ok") {
-    return { title: "Decisions (?)", rows: [{ key: "state", text: NOT_UPDATING }] }
+    return { title: "Decisions (?)", groups: [], rows: [{ key: "state", text: NOT_UPDATING }] }
   }
-  const rows = snapshot.decisions.length
-    ? snapshot.decisions.map((d) => ({ key: d.id, text: rowOf(d, nowMs, width) }))
-    : [{ key: "none", text: "none" }]
+  const sinceOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? Infinity : t }
+  const byRepo = new Map()
+  for (const d of snapshot.decisions) {
+    const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
+    if (!byRepo.has(repo)) byRepo.set(repo, [])
+    byRepo.get(repo).push(d)
+  }
+  const groups = [...byRepo.keys()].sort().map((repo) => ({
+    repo,
+    entries: byRepo.get(repo)
+      .map((d, i) => ({ d, i }))
+      .sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i)
+      .map(({ d }) => entryOf(d, nowMs, width)),
+  }))
+  const rows = []
+  if (!groups.length) rows.push({ key: "none", text: "none" })
   if (snapshot.errors.length) {
     rows.push({ key: "errors", text: oneLine(`${snapshot.errors.length} source(s) unreadable`, width) })
   }
-  return { title: `Decisions (${snapshot.decisions.length})`, rows }
+  return { title: `Decisions (${snapshot.decisions.length})`, groups, rows }
+}
+
+// The view as plain text lines (a rule between repos): what the sidebar shows, for tests and captures.
+export function viewLines(view, width = ROW_WIDTH) {
+  const out = [view.title]
+  view.groups.forEach((g, i) => {
+    if (i) out.push("\u2500".repeat(width))
+    out.push(g.repo)
+    for (const e of g.entries) out.push(e.head, ...e.lines)
+  })
+  for (const r of view.rows) out.push(r.text)
+  return out
 }
 
 // Milliseconds until a list that is "ok" now turns stale if no pass touches the file again; null otherwise.

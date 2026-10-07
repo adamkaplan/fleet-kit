@@ -5,7 +5,7 @@
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, For } from "solid-js"
 import { watch } from "node:fs"
-import { SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf } from "./decisions.mjs"
+import { ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
@@ -45,6 +45,24 @@ export default {
           <text>
             <b>{view().title}</b>
           </text>
+          <For each={view().groups}>
+            {(group, i) => (
+              <box flexDirection="column">
+                {i() > 0 ? <text>{"\u2500".repeat(ROW_WIDTH)}</text> : null}
+                <text>
+                  <b>{group.repo}</b>
+                </text>
+                <For each={group.entries}>
+                  {(entry) => (
+                    <box flexDirection="column">
+                      <text>{entry.head}</text>
+                      <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
+                    </box>
+                  )}
+                </For>
+              </box>
+            )}
+          </For>
           <For each={view().rows}>{(row) => <text>{row.text}</text>}</For>
         </box>
       ),

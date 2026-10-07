@@ -13656,10 +13656,22 @@ results.errorsView = d.buildView(d.loadSnapshot(dir, now), now);
 put({ decisions: [{ id: 3 }, null, { id: "#1", title: "fine", since: "nonsense" }], errors: [] });
 results.junkView = d.buildView(d.loadSnapshot(dir, now), now);
 results.ages = [0, 59, 60, 719, 3599, 3600, 3900, 7200, 86399, 86400, 259200, -5].map((s) => d.formatAge(s));
+results.wrap = {
+  words: d.wrapText("aaa bbb ccc dddd", 7),
+  long: d.wrapText("x" + "y".repeat(20) + " z", 8),
+  whole: d.wrapText("word ".repeat(60).trim(), 34),
+  capped: d.wrapText("w ".repeat(100), 4, 5),
+  empty: d.wrapText("  ", 10),
+};
+const two = (id, repo, title, ago) => ({ id, repo, title, since: iso(now - ago * 60000) });
+results.grouped = d.buildView({ status: "ok", errors: [], decisions: [
+  two("web#9", "acme/web", "newer web", 5), two("api#1", "acme/api", "api only", 3),
+  two("web#2", "acme/web", "older web " + "q".repeat(40), 50) ] }, now);
+results.groupedLines = d.viewLines(results.grouped);
 results.oneLine = [d.oneLine("a\n b\t c", 20), d.oneLine("x".repeat(50), 10), d.oneLine(undefined, 5)];
 results.until = [d.msUntilStale({ status: "ok", ageMs: 100000 }), d.msUntilStale({ status: "ok", ageMs: 0 }), d.msUntilStale({ status: "stale", ageMs: 1 })];
 results.concerns = [d.concernsFile("decisions.json"), d.concernsFile("decisions.json.123.tmp"), d.concernsFile("audit.jsonl"), d.concernsFile(null), d.concernsFile(undefined)];
-results.constants = [d.STALE_MS, d.SAFETY_MS, d.STATE_ENV, d.DECISIONS_FILE, d.NOT_UPDATING];
+results.constants = [d.STALE_MS, d.SAFETY_MS, d.STATE_ENV, d.DECISIONS_FILE, d.NOT_UPDATING, d.WRAP_MAX_LINES];
 rmSync(dir, { recursive: true });
 console.log(JSON.stringify(results));
 """
@@ -13696,29 +13708,56 @@ class TestDecisionsPlugin(Base):
         self.assertEqual((self.r["missing"], self.r["garbage"], self.r["wrongShape"]),
                          ("missing", "unreadable", "unreadable"))
 
-    def test_a_current_file_is_listed_one_row_each_with_id_age_and_title(self):
+    def test_a_current_file_is_listed_by_repo_with_id_and_age_then_the_whole_wrapped_title(self):
         self.assertEqual(self.r["ok"], {"status": "ok", "n": 2})
         view = self.r["view"]
         self.assertEqual(view["title"], "Decisions (2)")
-        first, second = [row["text"] for row in view["rows"]]
-        self.assertEqual(first, "#2ab 12m Close #2? and a second d\u2026")
-        self.assertTrue(second.startswith("platform-481 45s permission:"))
-        for text in (first, second):
-            self.assertLessEqual(len(text), 34)
-            self.assertNotIn("\n", text)
+        self.assertEqual(view["rows"], [])
+        (group,) = view["groups"]  # these two carry no repo: one group
+        first, second = group["entries"]
+        self.assertEqual((first["head"], first["lines"]), ("#2ab 12m", ["Close #2? and a second deploy run?"]))
+        self.assertEqual(second["head"], "platform-481 45s")
+        self.assertEqual("".join(second["lines"]).replace(" ", ""), "permission:shell" + "x" * 200)
+        for entry in (first, second):
+            for line in entry["lines"] + [entry["head"]]:
+                self.assertLessEqual(len(line), 34)
+
+    def test_wrapping_keeps_every_word_and_breaks_an_over_long_word_hard(self):
+        w = self.r["wrap"]
+        self.assertEqual(w["words"], ["aaa bbb", "ccc", "dddd"])
+        self.assertEqual(w["long"], ["xyyyyyyy", "yyyyyyyy", "yyyyy z"])
+        self.assertEqual(" ".join(w["whole"]), " ".join(["word"] * 60))
+        self.assertTrue(all(len(x) <= 34 for x in w["whole"]))
+        self.assertEqual(w["empty"], [])
+
+    def test_only_a_safety_cap_far_above_any_real_title_ever_cuts_a_title(self):
+        self.assertEqual(len(self.r["wrap"]["capped"]), 5)
+        self.assertTrue(self.r["wrap"]["capped"][-1].endswith("\u2026"))
+        self.assertGreaterEqual(self.r["constants"][5], 20)
+
+    def test_two_repos_are_two_groups_by_name_oldest_first_with_a_rule_between(self):
+        g = self.r["grouped"]["groups"]
+        self.assertEqual([x["repo"] for x in g], ["acme/api", "acme/web"])
+        self.assertEqual([e["key"] for e in g[1]["entries"]], ["web#2", "web#9"])
+        lines = self.r["groupedLines"]
+        self.assertEqual(lines[0], "Decisions (3)")
+        self.assertEqual(lines.count("\u2500" * 34), 1)
+        self.assertEqual(lines[1:5], ["acme/api", "api#1 3m", "api only", "\u2500" * 34])
+        self.assertEqual(lines[5:10], ["acme/web", "web#2 50m", "older web", "q" * 34, "q" * 6])
 
     def test_a_file_older_than_two_minutes_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
-        self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "rows": [{"key": "state", "text": "daemon not updating"}]})
+        self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "groups": [], "rows": [{"key": "state", "text": "daemon not updating"}]})
 
     def test_an_empty_list_shows_none_and_the_section_is_never_empty(self):
-        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0)", "rows": [{"key": "none", "text": "none"}]})
+        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0)", "groups": [], "rows": [{"key": "none", "text": "none"}]})
         for key in ("view", "staleView", "emptyView", "errorsView", "junkView"):
-            self.assertTrue(self.r[key]["rows"], key)
+            self.assertTrue(self.r[key]["rows"] or self.r[key]["groups"], key)
 
     def test_unreadable_sources_are_said_and_junk_entries_are_skipped(self):
         self.assertEqual(self.r["errorsView"]["rows"][-1]["text"], "1 source(s) unreadable")
-        self.assertEqual([row["text"] for row in self.r["junkView"]["rows"]], ["#1 ? fine"])
+        (group,) = self.r["junkView"]["groups"]
+        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("#1 ?", ["fine"])])
 
     def test_ages_read_the_same_as_the_command_prints_them(self):
         self.assertEqual(self.r["ages"], ["0s", "59s", "1m", "11m", "59m", "1h", "1h05m", "2h", "23h59m", "1d", "3d", "0s"])
@@ -13732,7 +13771,7 @@ class TestDecisionsPlugin(Base):
 
     def test_the_constants_match_the_daemon_side(self):
         self.assertEqual(self.r["constants"], [sb.DECISIONS_STALE_SECONDS * 1000, 60000, "FLEET_SWITCHBOARD_STATE",
-                                               sb.DECISIONS_FILE, "daemon not updating"])
+                                               sb.DECISIONS_FILE, "daemon not updating", 40])
 
 
 class TestDecisionsPluginSource(unittest.TestCase):
@@ -15262,31 +15301,32 @@ class TestDecisionsAcrossRepos(Base):
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
 class TestDecisionsPluginShowsTheRepoTag(Base):
-    def test_a_row_starts_with_the_tag_and_a_row_never_wraps(self):
+    def test_a_decision_starts_with_the_tag_and_no_line_is_wider_than_a_row(self):
         script = self.home / "tag-harness.mjs"
-        script.write_text("""import { rowOf } from "%s";
+        script.write_text("""import { entryOf } from "%s";
 const now = Date.now();
 const d = { id: "acme/site#2ab", repo: "acme/site", title: "x".repeat(80), since: new Date(now - 90000).toISOString() };
-console.log(JSON.stringify([rowOf(d, now), rowOf({ ...d, id: "api#2", repo: "acme/api" }, now)]));
+console.log(JSON.stringify([entryOf(d, now), entryOf({ ...d, id: "api#2", repo: "acme/api" }, now)]));
 """ % (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri())
         done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
-        long_row, short_row = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertTrue(long_row.startswith("acme/site#2ab 1m "), long_row)
-        self.assertTrue(short_row.startswith("api#2 1m "), short_row)
-        self.assertLessEqual(len(long_row), 34)
+        long_e, short_e = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(long_e["head"], "acme/site#2ab 1m")
+        self.assertEqual(short_e["head"], "api#2 1m")
+        self.assertEqual("".join(long_e["lines"]), "x" * 80)
+        self.assertTrue(all(len(x) <= 34 for x in long_e["lines"]))
 
-    def test_the_view_counts_decisions_and_keys_rows_by_the_tagged_id(self):
+    def test_the_view_counts_decisions_and_keys_entries_by_the_tagged_id(self):
         script = self.home / "tag-view.mjs"
         script.write_text("""import { buildView } from "%s";
 const now = Date.now();
-const mk = (id) => ({ id, title: "t", since: new Date(now).toISOString() });
-console.log(JSON.stringify(buildView({ status: "ok", errors: [], decisions: [mk("api#2"), mk("web#2")] }, now)));
+const mk = (id, repo) => ({ id, repo, title: "t", since: new Date(now).toISOString() });
+console.log(JSON.stringify(buildView({ status: "ok", errors: [], decisions: [mk("api#2", "a/api"), mk("web#2", "a/web")] }, now)));
 """ % (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri())
         done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         view = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertEqual([row["key"] for row in view["rows"]], ["api#2", "web#2"])
+        self.assertEqual([e["key"] for g in view["groups"] for e in g["entries"]], ["api#2", "web#2"])
 
 
 class TestD6Scenario(Base):

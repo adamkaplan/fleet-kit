@@ -1041,8 +1041,9 @@ shows it), and the plugin shows a row `daemon not updating` (scenario D5).
 `decisions.mjs`, whose pure functions (read the file, staleness, rows) are tested
 with node. v2 loads it from the profile's `cli.json` (`{"plugins":
 ["./fleet-decisions"]}`, a directory holding `tui.tsx`), into the `sidebar.content`
-slot, as a section titled **Decisions (N)** with a row `<id> <age> <title>` for
-each decision, cut to 34 characters so a row never wraps. The section never
+slot, as a section titled **Decisions (N)**, grouped by repo (a header and a rule
+between repos; repos by name, oldest decision first), each decision a line
+`<id> <age>` and then its whole title word-wrapped to 34 characters. The section never
 disappears (design law: no disappearing UI): an empty list is a row `none`, and a
 missing, unreadable or stale file, or a state directory it cannot place, is a row
 `daemon not updating`. It watches the **directory** of `decisions.json` with
@@ -1071,7 +1072,7 @@ each rename, and the sidebar row the probe drew went from `probe events: 0` to
 `Decisions (2)` and both rows within 3 s; and a list written with an mtime 100 s
 old turned to `daemon not updating` 25 s later with no file event, from the stale
 timer. (The same run showed that a row wrapped at the sidebar's width, which is why
-rows are cut to 34 characters.) The probe, the throwaway profile and its service
+titles are wrapped to 34 characters.) The probe, the throwaway profile and its service
 (pid recorded, stopped with `service stop`, never by name) are gone, and a
 checksum of the Lab's config, wrapper and `lab.json` was identical before and
 after: the proof used the Lab's binary and none of its state, because a second v2
@@ -2397,7 +2398,7 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   `sidebar.content` slot as a section; `fs.watch` on the state directory fires
   inside that runtime on macOS (bun 1.4.2, 2.0.22), six events for three
   renames, and re-rendered the section; a row longer than the sidebar (about 36
-  columns at a width of 160) wraps, so rows are cut to 34 characters. Changed:
+  columns at a width of 160) wraps, so the plugin wraps titles to 34 characters. Changed:
   `derive_decisions` (labels, pending requests, unanswered reports; ids derived
   from a hash, so they stay put while a decision is open), `decisions.json` kept
   by the daemon (rewritten on change, touched otherwise, so its age is the
