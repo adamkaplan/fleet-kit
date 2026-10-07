@@ -1,0 +1,17 @@
+{
+ "escalate": {
+  "argv": "decisions escalate api#2df",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "escalated_requests": [
+   "ses_fake000004:per_fake000008"
+  ],
+  "out": "escalated api#2df to you: the api-coder permission is waiting on you\n"
+ },
+ "marked after the request is gone": 0,
+ "marked while pending": 1,
+ "tier while pending": [
+  "human"
+ ]
+}

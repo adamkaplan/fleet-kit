@@ -23538,6 +23538,18 @@ class TestDecisionBaselineSeams(BaselineWorld):
                         {"tiers": {r["number"]: r["tier"] for r in records},
                          "errors": [e for e in errors if "not read yet" not in e]})
 
+    def test_an_escalation_is_forgotten_once_the_request_is_gone(self):
+        self.ask_permission("api-coder")
+        ident = self.fresh()["decisions"][0]["id"]
+        steps = {"escalate": self.step("cos", "decisions", "escalate", ident)}
+        self.daemon_pass()
+        steps["marked while pending"] = len(sb.read_escalated(self.world.state))
+        steps["tier while pending"] = [d["tier"] for d in self.file_body()["decisions"]]
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])
+        self.daemon_pass()
+        steps["marked after the request is gone"] = len(sb.read_escalated(self.world.state))
+        baseline_golden(self, "seams-escalation-pruned", steps)
+
     def test_the_lab_faults_tier_flat_and_bare_issue_number(self):
         self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
         self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])
