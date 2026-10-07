@@ -23614,6 +23614,1077 @@ console.log(JSON.stringify(out));
         baseline_golden(self, "plugin-views", json.loads(done.stdout.strip().splitlines()[-1]))
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# The generic external adapter (bin/external_adapter.py): tested against a fake server that speaks a made-up
+# protocol shaped like the contract (two channels, idempotent raise, a cursor feed, error injection, 429 with
+# Retry-After, down and slow). Generic words only: items, seats, feed. No product name appears here.
+
+EXTERNAL_ADAPTER = BIN / "external_adapter.py"
+EA = _load("external_adapter_under_test", EXTERNAL_ADAPTER)
+
+
+class FakeDoorServer:
+    """A stdlib http.server: an HTTP API under /v1 and a JSON-RPC tool channel at /rpc, one credential header."""
+
+    KEY = "k-test-secret-0123456789"
+    NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+    def __init__(self):
+        import http.server
+        self.items, self.changes, self.log, self.requests = {}, [], [], []
+        self.inject, self.delay, self.down, self.disabled, self.sse = [], 0, False, False, False
+        self.seq, self.now, self.tasks, self.sessions, self.sid = 100, 1000.0, {}, set(), 0
+        self.seen, self.lock = {}, threading.Lock()
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                outer.handle(self, "GET")
+
+            def do_POST(self):
+                outer.handle(self, "POST")
+
+            def do_PUT(self):
+                outer.handle(self, "PUT")
+
+            def do_PATCH(self):
+                outer.handle(self, "PATCH")
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    # ---- helpers for tests
+    def add_change(self, what, item, gap=1, **fields):
+        self.seq += gap
+        change = {"n": self.seq, "what": what, "item": item, "when": "t%d" % self.seq}
+        change.update(fields)
+        self.changes.append(change)
+        return change
+
+    def fail_next(self, op=None, status=500, body=None, headers=None, level="http", count=1):
+        self.inject.append({"op": op, "status": status, "body": body if body is not None else {"code": "x",
+                            "message": "injected"}, "headers": headers or {}, "level": level, "count": count})
+
+    def count(self, op, channel=None):
+        return len([1 for c, o in self.log if o == op and (channel is None or c == channel)])
+
+    # ---- the transport
+    def send(self, h, status, body=None, headers=None, raw=None):
+        data = raw if raw is not None else json.dumps(body).encode("utf-8") if body is not None else b""
+        h.send_response(status)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            h.send_header(k, v)
+        h.end_headers()
+        h.wfile.write(data)
+
+    def handle(self, h, method):
+        length = int(h.headers.get("Content-Length") or 0)
+        raw = h.rfile.read(length) if length else b""
+        if self.down:
+            h.close_connection = True
+            h.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if self.delay:
+            time.sleep(self.delay)
+        with self.lock:
+            self.dispatch_http(h, method, raw)
+
+    def take(self, op, level):
+        for one in self.inject:
+            if one["level"] == level and one["op"] in (None, op):
+                one["count"] -= 1
+                if one["count"] <= 0:
+                    self.inject.remove(one)
+                return one
+        return None
+
+    def dispatch_http(self, h, method, raw):
+        parts = urllib.parse.urlsplit(h.path)
+        got = h.headers.get("X-Auth", "")
+        if got != "Key " + self.KEY:
+            return self.send(h, 401, {"code": "cred", "message": "credential refused: %s" % got})
+        if method in ("POST", "PUT", "PATCH") and "json" not in (h.headers.get("Content-Type") or ""):
+            return self.send(h, 415, {"code": "media", "message": "json only"})
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        if parts.path == "/rpc":
+            return self.rpc(h, raw)
+        op, ident, seat = self.route(method, parts.path)
+        if op is None:
+            return self.send(h, 404, {"code": "nf", "message": "no such path"})
+        shot = self.take(op, "http")
+        if shot:
+            return self.send(h, shot["status"], shot["body"], shot["headers"])
+        try:
+            args = json.loads(raw) if raw else {}
+        except ValueError:
+            return self.send(h, 400, {"code": "bad", "message": "not json"})
+        args.update(query)
+        self.log.append(("http", op))
+        self.requests.append(("http", op, args))
+        status, body, headers = self.run(op, args, ident, seat)
+        self.send(h, status, body, headers)
+
+    ROUTES = [("GET", r"^/v1/seats$", "feed"), ("POST", r"^/v1/items$", "raise"), ("GET", r"^/v1/items$", "items"),
+              ("POST", r"^/v1/items/([^/]+)/revise$", "revise"), ("POST", r"^/v1/items/([^/]+)/withdraw$", "withdraw"),
+              ("POST", r"^/v1/items/([^/]+)/acted$", "acted"),
+              ("PUT", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_put"),
+              ("PATCH", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_patch"),
+              ("POST", r"^/v1/seats/([^/]+)/tasks/([^/]+)/finish$", "work_finish"),
+              ("GET", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_get"),
+              ("GET", r"^/v1/seats/([^/]+)/tasks$", "work_list")]
+
+    def route(self, method, path):
+        for m, pattern, op in self.ROUTES:
+            found = re.match(pattern, path)
+            if m == method and found:
+                groups = [urllib.parse.unquote(g) for g in found.groups()]
+                if op.startswith("work"):
+                    return op, (groups[1] if len(groups) > 1 else None), groups[0]
+                return op, (groups[0] if groups else None), None
+        return None, None, None
+
+    TOOLS = {"seats_list": "feed", "item_raise": "raise", "items_read": "items", "item_revise": "revise",
+             "item_withdraw": "withdraw", "item_acted": "acted"}
+
+    def rpc(self, h, raw):
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return self.send(h, 400, {"code": "bad", "message": "not json"})
+        method, mid = msg.get("method"), msg.get("id")
+        if method == "initialize":
+            self.sid += 1
+            session = "sess-%d" % self.sid
+            self.sessions.add(session)
+            return self.reply(h, mid, {"protocolVersion": "2025-03-26", "capabilities": {}}, {"Mcp-Session-Id": session})
+        if h.headers.get("Mcp-Session-Id") not in self.sessions:
+            return self.send(h, 404, {"code": "nf", "message": "no session"})
+        if mid is None:
+            return self.send(h, 202, raw=b"")
+        if method == "tools/list":
+            return self.reply(h, mid, {"tools": [{"name": n} for n in self.TOOLS]})
+        if method != "tools/call":
+            return self.reply(h, mid, None, error={"code": -32601, "message": "no method"})
+        name, args = msg["params"]["name"], msg["params"].get("arguments", {})
+        op = self.TOOLS.get(name)
+        if op is None:
+            return self.reply(h, mid, {"content": [{"type": "text", "text": "MCP error -32602: unknown tool"}],
+                                       "isError": True})
+        shot = self.take(op, "http")
+        if shot:
+            return self.send(h, shot["status"], shot["body"], shot["headers"])
+        if "bad_schema" in args:
+            return self.reply(h, mid, {"content": [{"type": "text", "text": "MCP error -32602: Input validation "
+                                                                          "error: bad_schema"}], "isError": True})
+        shot = self.take(op, "result")
+        if shot:
+            return self.reply(h, mid, {"content": [{"type": "text", "text": json.dumps(shot["body"])}],
+                                       "isError": True})
+        self.log.append(("tool", op))
+        self.requests.append(("tool", op, args))
+        args = dict(args)
+        ident = args.pop("id", None)
+        status, body, _ = self.run(op, args, ident, None)
+        self.reply(h, mid, {"content": [{"type": "text", "text": json.dumps(body)}], "isError": status >= 300})
+
+    def reply(self, h, mid, result, headers=None, error=None):
+        envelope = {"jsonrpc": "2.0", "id": mid}
+        envelope.update({"error": error} if error else {"result": result})
+        if self.sse:
+            data = ("event: message\ndata: %s\n\n" % json.dumps(envelope)).encode("utf-8")
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.send_header("Content-Length", str(len(data)))
+            for k, v in (headers or {}).items():
+                h.send_header(k, v)
+            h.end_headers()
+            h.wfile.write(data)
+        else:
+            self.send(h, 200, envelope, headers)
+
+    # ---- the made-up protocol
+    RAISE_KEYS = {"op_id", "seat", "label", "body", "advice", "floor", "choices"}
+    RAISE_OPT = {"because", "stakes", "refs"}
+
+    def run(self, op, args, ident, seat):
+        if self.disabled and op not in ("feed", "items", "work_get", "work_list"):
+            return (409 if op.startswith("work") else 403), {"code": "off", "message": "disabled"}, {}
+        return getattr(self, "op_" + op)(args, ident, seat)
+
+    def op_feed(self, args, ident, seat):
+        since = int(args.get("since") or 0)
+        new = [c for c in self.changes if c["n"] > since]
+        return 200, {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": new,
+                     "cursor": max([c["n"] for c in new] + [since])}, {}
+
+    def op_raise(self, args, ident, seat):
+        if not self.RAISE_KEYS <= set(args) or set(args) - self.RAISE_KEYS - self.RAISE_OPT:
+            return 400, {"code": "bad", "message": "invalid body"}, {}
+        try:
+            uuid.UUID(args["op_id"])
+        except ValueError:
+            return 400, {"code": "bad", "message": "invalid body"}, {}
+        if args["seat"] != "seat-1":
+            return 404, {"code": "nf", "message": "no such seat"}, {}
+        if not args["body"] or not args["advice"]:
+            return 400, {"code": "bad", "message": "invalid body"}, {}
+        item_id = "it-" + hashlib.sha256(args["op_id"].encode()).hexdigest()[:8]
+        if item_id in self.items:
+            if self.items[item_id]["_args"] != args:
+                return 409, {"code": "clash", "message": "operation conflict"}, {}
+            return 201, {"item": item_id}, {}
+        choices = []
+        for index, choice in enumerate(args["choices"]):
+            one = dict(choice)
+            one.setdefault("key", "k%d" % (index + 1))
+            choices.append(one)
+        self.items[item_id] = {"item": item_id, "state": "unrated", "body": args["body"], "choices": choices,
+                               "advice": args["advice"], "answer": None, "ask_back": None, "withdrawn": None,
+                               "reversals": [], "opened": "t0", "op_id": args["op_id"], "floor": args["floor"],
+                               "label": args["label"], "_args": args}
+        return 201, {"item": item_id}, {}
+
+    def visible(self, item):
+        return {k: v for k, v in item.items() if not k.startswith("_")}
+
+    def op_items(self, args, ident, seat):
+        return 200, {"items": [self.visible(i) for i in self.items.values()], "state": "on"}, {}
+
+    def find(self, ident):
+        return self.items.get(ident)
+
+    def op_revise(self, args, ident, seat):
+        item = self.find(ident)
+        if item is None:
+            return 404, {"code": "nf", "message": "no such item"}, {}
+        if item["answer"] is not None and item["state"] == "closed" or item["withdrawn"]:
+            return 409, {"code": "decided", "message": "read its answer instead"}, {}
+        if not ({"body", "advice", "choices"} & set(args)):
+            return 400, {"code": "bad", "message": "incomplete"}, {}
+        item.update({k: v for k, v in args.items() if k in ("body", "advice", "choices")})
+        item["state"] = "unrated"
+        return 200, {"ok": True}, {}
+
+    def op_withdraw(self, args, ident, seat):
+        item = self.find(ident)
+        if item is None:
+            return 404, {"code": "nf", "message": "no such item"}, {}
+        if item["state"] == "closed":
+            return 409, {"code": "decided", "message": "read its answer instead"}, {}
+        item["withdrawn"] = {"why": args.get("why")}
+        item["state"] = "pulled"
+        return 200, {"ok": True, "withdrawn": item["withdrawn"]}, {}
+
+    def op_acted(self, args, ident, seat):
+        item = self.find(ident)
+        if item is None:
+            return 404, {"code": "nf", "message": "no such item"}, {}
+        known = {(item["answer"] or {}).get("answer_id")} | {r.get("answer_id") for r in item["reversals"]}
+        if args.get("on") not in known:
+            return 409, {"code": "clash", "message": "that is not an answer to this item"}, {}
+        return 200, {"ok": True, "on": args["on"]}, {}
+
+    def task_of(self, seat, ident):
+        return self.tasks.get((seat, ident))
+
+    def op_work_put(self, args, ident, seat):
+        if not args.get("title"):
+            return 400, {"code": "bad", "message": "title"}, {}
+        task = self.task_of(seat, ident)
+        if task is None:
+            task = {"id": ident, "end": None, "recorded_at": self.now}
+            task.update(args)
+            self.tasks[(seat, ident)] = task
+            return 200, {"task": task, "recorded": True}, {}
+        if task["end"]:
+            return 409, {"code": "task_done", "message": "finished"}, {}
+        return 200, {"task": task, "recorded": False}, {}
+
+    def op_work_patch(self, args, ident, seat):
+        task = self.task_of(seat, ident)
+        if task is None:
+            return 404, {"code": "nf", "message": "no task"}, {}
+        if task["end"]:
+            return 409, {"code": "task_done", "message": "finished"}, {}
+        if all(task.get(k) == v for k, v in args.items()):
+            return 200, {"task": task, "recorded": False}, {}
+        if self.now - task["recorded_at"] < 60:
+            return 429, {"code": "slow", "message": "too soon", "retry_after_s": 60}, {"Retry-After": "60"}
+        task.update(args)
+        task["recorded_at"] = self.now
+        return 200, {"task": task, "recorded": True}, {}
+
+    def op_work_finish(self, args, ident, seat):
+        task = self.task_of(seat, ident)
+        if task is None:
+            return 404, {"code": "nf", "message": "no task"}, {}
+        if task["end"] and task["end"]["state"] != args.get("end"):
+            return 409, {"code": "task_done", "message": "finished otherwise"}, {}
+        task["end"] = {"state": args.get("end"), "said": args.get("said")}
+        return 200, {"task": task, "recorded": True}, {}
+
+    def op_work_get(self, args, ident, seat):
+        task = self.task_of(seat, ident)
+        return (200, {"task": task}, {}) if task else (404, {"code": "nf", "message": "no task"}, {})
+
+    def op_work_list(self, args, ident, seat):
+        return 200, {"tasks": [t for (s, _), t in self.tasks.items() if s == seat]}, {}
+
+
+FAKE_MAPPING = {
+    "mapping_version": 1, "base_url": "http://127.0.0.1:1", "tool_path": "/rpc", "http_prefix": "/v1",
+    "auth": {"header": "X-Auth", "scheme": "Key"}, "key_source": "env:FAKE_DOOR_KEY", "channel": "tool",
+    "project": "seat-1", "timeouts": {"request": 2, "command": 5},
+    "retry": {"attempts": 3, "base_delay": 0.5, "max_delay": 1.5, "max_retry_after_sleep": 5,
+              "default_retry_after": 1},
+    "poll_interval": 30, "work_interval": 60, "idempotency": {"namespace": FakeDoorServer.NAMESPACE},
+    "operations": {
+        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since"},
+        "raise": {"tool": "item_raise", "http": {"method": "POST", "path": "/items"}},
+        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}},
+        "revise": {"tool": "item_revise", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/revise"}},
+        "withdraw": {"tool": "item_withdraw", "id_arg": "id",
+                     "http": {"method": "POST", "path": "/items/{id}/withdraw"}},
+        "acted": {"tool": "item_acted", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/acted"}},
+        "work_put": {"http": {"method": "PUT", "path": "/seats/{project}/tasks/{id}"}},
+        "work_patch": {"http": {"method": "PATCH", "path": "/seats/{project}/tasks/{id}"}},
+        "work_finish": {"http": {"method": "POST", "path": "/seats/{project}/tasks/{id}/finish"}},
+        "work_get": {"http": {"method": "GET", "path": "/seats/{project}/tasks/{id}"}},
+        "work_list": {"http": {"method": "GET", "path": "/seats/{project}/tasks"}}},
+    "fields": {
+        "raise": {"idempotency": "op_id", "project": "seat", "class": "label", "text": "body",
+                  "recommendation": "advice", "floor": "floor", "options": "choices", "grounds": "because",
+                  "stakes": "stakes", "evidence": "refs"},
+        "option": {"label": "name", "cost": "price", "recommended": "preferred", "id": "key"},
+        "evidence": {"text": "note", "link": "href"},
+        "revise": {"idempotency": "op_id", "text": "body", "recommendation": "advice", "options": "choices"},
+        "withdraw": {"reason": "why"},
+        "acted": {"idempotency": "op_id", "answer": "on", "outcome": "result", "note": "note"},
+        "work": {"title": "title", "kind": "kind", "state": "state", "progress": "progress", "progress_text": "text",
+                 "doer": "doer", "end": "end", "summary": "said"}},
+    "responses": {
+        "item_id": "item", "items": "items",
+        "item": {"id": "item", "status": "state", "text": "body", "answer": "answer", "clarification": "ask_back",
+                 "withdrawn": "withdrawn", "reversals": "reversals", "opened_at": "opened", "idempotency": "op_id"},
+        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"},
+        "change": {"seq": "n", "kind": "what", "item_id": "item", "at": "when", "tier": "level", "floor": "floor",
+                   "text": "body", "awaits_rating": "rerate", "replaces": "replaces", "reason": "why"},
+        "answer": {"id": "answer_id", "disposition": "how", "option_id": "chosen", "text": "words", "rationale": "why",
+                   "clarification": "ask_back", "rejection": "no_reason", "by": "who"},
+        "work": {"item": "task", "items": "tasks", "recorded": "recorded"}},
+    "enums": {
+        "tier": {"low": "minor", "moderate": "middling", "high": "major", "reserved": "sealed"},
+        "disposition": {"accept": "yes", "edit": "reword", "reject": "no", "clarify": "ask"},
+        "status": {"awaiting_rating": "unrated", "with_owner": "waiting", "sent_back": "returned",
+                   "decided": "closed", "withdrawn": "pulled"},
+        "change_kind": {"answered": "answer", "rated": "rating", "revised": "restated", "reversed": "flip",
+                        "withdrawn": "pull"},
+        "outcome": {"done": "did", "undone": "undid", "not_undone": "could_not"},
+        "work_state": {"queued": "waiting", "running": "going", "awaiting": "paused", "blocked": "stuck"},
+        "work_end": {"done": "ok", "failed": "bad", "cancelled": "dropped"},
+        "integration_status": {"active": "on", "disabled": "off"}},
+    "tier_map": {"orchestrator": {"class": "routine", "floor": "low"}, "cos": {"class": "notable", "floor": "high"},
+                 "human": {"class": "grave", "floor": "reserved"}},
+    "roles": [{"when": {"type": "person"}, "role": "human"}, {"when": {"type": "bot"}, "role": "orchestrator"},
+              {"when": {"type": "owner_bot"}, "role": "cos"}],
+    "errors": {"code_field": "code", "message_field": "message", "retry_after_field": "retry_after_s",
+               "codes": {"off": "DisabledError", "decided": "AlreadyDecided", "clash": "Conflict",
+                         "slow": "RateLimited"}},
+    "options": {"id_prefix": "c"}, "defaults": {"recommendation": "proceed"}}
+
+
+def fake_mapping(base_url, channel="tool", **over):
+    data = copy.deepcopy(FAKE_MAPPING)
+    data["base_url"], data["channel"] = base_url, channel
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(data.get(key), dict):
+            data[key].update(value)
+        else:
+            data[key] = value
+    return data
+
+
+class ExternalAdapterCase(unittest.TestCase):
+    """A fake server, and an adapter on it with recorded sleeps and a controllable clock."""
+
+    def setUp(self):
+        self.server = FakeDoorServer()
+        self.addCleanup(self.server.close)
+        self.slept, self.clock_now = [], [0.0]
+        self.tmp = Path(tempfile.mkdtemp(prefix="ext-adapter-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def adapter(self, channel="tool", **over):
+        return EA.McpRestAdapter(fake_mapping(self.server.url, channel, **over), sleep=self.slept.append,
+                                 clock=lambda: self.clock_now[0], environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+
+    def decision(self, **over):
+        found = {"title": "Ship it?", "body": "The build is green.", "tier": "orchestrator",
+                 "recommendation": "yes", "options": ["approve", {"label": "hold", "cost": "a day"}]}
+        found.update(over)
+        return found
+
+    def answer_fields(self, **over):
+        found = {"answer_id": "a-1", "how": "yes", "chosen": "k1", "words": "approve", "who": {"type": "person"}}
+        found.update(over)
+        return found
+
+
+class TestExternalAdapterMapping(ExternalAdapterCase):
+    def good(self):
+        return fake_mapping("http://127.0.0.1:9")
+
+    def refused(self, data, needle):
+        with self.assertRaises(EA.MappingError) as ctx:
+            EA.MappingFile.from_dict(data)
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_a_good_mapping_loads_from_a_file(self):
+        path = self.tmp / "m.json"
+        path.write_text(json.dumps(self.good()))
+        mapping = EA.MappingFile.load(path)
+        self.assertEqual(mapping.channel, "tool")
+        self.assertEqual(mapping.to_external("tier", "reserved"), "sealed")
+        self.assertEqual(mapping.to_generic("tier", "major"), "high")
+
+    def test_refusals(self):
+        data = self.good()
+        data["surprise"] = 1
+        self.refused(data, "unknown top-level keys")
+        data = self.good()
+        data["api_key"] = "x"
+        self.refused(data, "never inline")
+        data = self.good()
+        data["key_source"] = "sk-literal-key-value"
+        self.refused(data, "never inline")
+        data = self.good()
+        data["base_url"] = "http://example.invalid"
+        self.refused(data, "loopback")
+        data = self.good()
+        data["base_url"] = "http://user:pw@127.0.0.1:9"
+        self.refused(data, "credential")
+        data = self.good()
+        data["work_interval"] = 30
+        self.refused(data, "work_interval")
+        data = self.good()
+        data["tier_map"].pop("cos")
+        self.refused(data, "tier_map")
+        data = self.good()
+        data["roles"][0]["role"] = "king"
+        self.refused(data, "role rule")
+        data = self.good()
+        data["operations"]["work_put"]["tool"] = "w"
+        self.refused(data, "HTTP only")
+        data = self.good()
+        data["operations"]["revise"]["http"]["path"] = "/items/revise"
+        self.refused(data, "{id}")
+        data = self.good()
+        data["enums"]["tier"].pop("high")
+        self.refused(data, "enums.tier")
+        data = self.good()
+        data["fields"]["raise"].pop("floor")
+        self.refused(data, "fields.raise.floor")
+        data = self.good()
+        data["errors"]["codes"]["x"] = "NoSuchClass"
+        self.refused(data, "errors.codes")
+        data = self.good()
+        data["operations"].pop("feed")
+        self.refused(data, "operations.feed")
+        data = self.good()
+        data["key_source"] = ["env:A", "env:B", "env:C"]
+        self.refused(data, "two for a rotation")
+
+    def test_a_bad_file_is_refused(self):
+        with self.assertRaises(EA.MappingError):
+            EA.MappingFile.load(self.tmp / "missing.json")
+        (self.tmp / "bad.json").write_text("{nope")
+        with self.assertRaises(EA.MappingError):
+            EA.MappingFile.load(self.tmp / "bad.json")
+
+    def test_the_port_and_the_capabilities(self):
+        adapter = self.adapter()
+        self.assertIsInstance(adapter, sb.decision_core.ExternalDecisionAdapter)
+        for name in ("push", "pull", "revise", "withdraw", "acted", "work", "lookup", "options", "idempotent_raise"):
+            self.assertIn(name, adapter.capabilities)
+        self.assertNotIn("status", adapter.capabilities)
+        data = fake_mapping(self.server.url)
+        for name in ("work_put", "work_patch", "work_finish", "work_get", "work_list", "acted"):
+            data["operations"].pop(name)
+        slim = EA.McpRestAdapter(data, environ={"FAKE_DOOR_KEY": "k"})
+        self.assertNotIn("work", slim.capabilities)
+        self.assertNotIn("acted", slim.capabilities)
+        self.assertIsNone(slim.work)
+
+
+class TestExternalAdapterKeys(ExternalAdapterCase):
+    def test_env_source(self):
+        self.assertEqual(EA.load_key(EA.parse_key_source("env:K"), environ={"K": " abc \n"}).reveal(), "abc")
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source("env:K"), environ={})
+
+    def test_file_source_needs_mode_0600(self):
+        path = self.tmp / "key"
+        path.write_text("file-key-value\n")
+        os.chmod(path, 0o600)
+        self.assertEqual(EA.load_key(EA.parse_key_source("file:%s" % path)).reveal(), "file-key-value")
+        for mode in (0o644, 0o640, 0o604, 0o660):
+            os.chmod(path, mode)
+            with self.assertRaises(EA.KeySourceError) as ctx:
+                EA.load_key(EA.parse_key_source("file:%s" % path))
+            self.assertIn("0600", str(ctx.exception))
+            self.assertNotIn("file-key-value", str(ctx.exception))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source("file:%s" % (self.tmp / "absent")))
+
+    def test_command_source_runs_without_a_shell_and_is_held_in_memory(self):
+        argv = [sys.executable, "-c", "print('cmd-key-value')"]
+        self.assertEqual(EA.load_key(EA.parse_key_source({"command": argv})).reveal(), "cmd-key-value")
+        self.assertEqual(EA.load_key(EA.parse_key_source("command:" + json.dumps(argv))).reveal(), "cmd-key-value")
+        # a shell metacharacter is an argument, not a shell
+        marker = self.tmp / "ran"
+        argv = [sys.executable, "-c", "import sys; print(sys.argv[1])", "x; touch %s" % marker]
+        EA.load_key(EA.parse_key_source({"command": argv}))
+        self.assertFalse(marker.exists())
+
+    def test_command_timeout_failure_and_empty_output(self):
+        slow = [sys.executable, "-c", "import time; time.sleep(5)"]
+        started = time.time()
+        with self.assertRaises(EA.KeySourceError) as ctx:
+            EA.load_key(EA.parse_key_source({"command": slow, "timeout": 0.3}))
+        self.assertIn("did not answer", str(ctx.exception))
+        self.assertLess(time.time() - started, 3)
+        bad = [sys.executable, "-c", "import sys; print('leaked-key-value'); sys.exit(3)"]
+        with self.assertRaises(EA.KeySourceError) as ctx:
+            EA.load_key(EA.parse_key_source({"command": bad}))
+        self.assertIn("exit 3", str(ctx.exception))
+        self.assertNotIn("leaked-key-value", str(ctx.exception))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source({"command": [sys.executable, "-c", "pass"]}))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source({"command": ["/nonexistent/binary-xyz"]}))
+
+    def test_the_key_never_appears_in_any_text(self):
+        key = FakeDoorServer.KEY
+        adapter = self.adapter("http")
+        texts = [repr(adapter.keys.current()), str(adapter.keys.current()), repr(adapter.keys)]
+        with self.assertRaises(EA.CredentialError) as ctx:  # the server echoes the credential it was shown
+            self.server.fail_next("raise", 401, {"code": "cred", "message": "refused Key %s for %s" % (key, key)})
+            adapter.push(self.decision(), "k-1")
+        texts.append(str(ctx.exception))
+        self.assertIn("[key]", str(ctx.exception))
+        self.server.fail_next("raise", 400, {"code": "bad", "message": "Bearer %s" % key})
+        with self.assertRaises(EA.InvalidRequest) as ctx:
+            adapter.push(self.decision(), "k-2")
+        texts.append(str(ctx.exception))
+        self.server.fail_next("raise", 500, {"code": "x", "message": key}, count=5)
+        with self.assertRaises(EA.Unavailable) as ctx:
+            adapter.push(self.decision(), "k-3")
+        texts.append(str(ctx.exception))
+        self.server.down = True
+        texts.append(str(adapter.health()))
+        self.server.down = False
+        self.server.fail_next(None, 401, {"code": "cred", "message": key})
+        texts.append(str(adapter.health()))
+        for text in texts:
+            self.assertNotIn(key, text)
+        with self.assertRaises(TypeError):
+            import pickle
+            pickle.dumps(adapter.keys.current())
+        self.assertEqual(EA.scrub("a %s b Bearer abc.def" % key, [EA.Secret(key)]), "a [key] b Bearer [key]")
+
+    def test_a_refused_key_rotates_to_the_next_source(self):
+        env = {"OLD": "stale-key", "NEW": FakeDoorServer.KEY}
+        data = fake_mapping(self.server.url, "http", key_source=["env:OLD", "env:NEW"])
+        adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ=env)
+        self.assertEqual(adapter.push(self.decision(), "k-1")[:3], "it-")
+        self.assertEqual(adapter.keys.index, 1)
+
+    def test_a_bad_source_is_found_at_start(self):
+        adapter = EA.McpRestAdapter(fake_mapping(self.server.url), environ={})
+        self.assertIn("not set", adapter.start())
+        self.assertIsNone(self.adapter().start())
+        self.assertIn("not set", adapter.health())
+
+
+class TestExternalAdapterOperations(ExternalAdapterCase):
+    def each_channel(self):
+        for channel in ("tool", "http"):
+            self.setUp()
+            yield channel
+            self.server.close()
+
+    def test_raise_maps_the_decision_over_both_channels(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            ident = adapter.push(self.decision(), "decision-key-1")
+            sent = [a for c, o, a in self.server.requests if o == "raise"][0]
+            self.assertEqual(self.server.log[-1], (channel, "raise"))
+            self.assertEqual(sent["label"], "routine", channel)
+            self.assertEqual(sent["floor"], "minor")
+            self.assertEqual(sent["seat"], "seat-1")
+            self.assertEqual(sent["body"], "Ship it?\n\nThe build is green.")
+            self.assertEqual(sent["advice"], "yes")
+            self.assertEqual(sent["choices"], [{"name": "approve", "key": "c1"},
+                                               {"name": "hold", "price": "a day", "key": "c2"}])
+            self.assertEqual(str(uuid.UUID(sent["op_id"])), sent["op_id"])
+            self.assertEqual(self.server.items[ident]["floor"], "minor")
+
+    def test_the_floor_follows_the_tier_and_a_hint_may_only_raise_it(self):
+        adapter = self.adapter("http")
+        for tier, hint, floor in (("orchestrator", None, "minor"), ("cos", None, "major"), ("human", None, "sealed"),
+                                  ("orchestrator", "moderate", "middling"), ("cos", "low", "major")):
+            adapter.push(self.decision(tier=tier, consequence=hint), "k-%s-%s" % (tier, hint))
+            self.assertEqual(self.server.requests[-1][2]["floor"], floor)
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.push(self.decision(tier="nobody"), "k-x")
+
+    def test_options_with_their_own_ids_and_optional_fields(self):
+        adapter = self.adapter("tool")
+        adapter.push(self.decision(options=[{"label": "a", "id": "mine-1", "recommended": True}],
+                                   grounds="g", stakes="s", evidence=[{"text": "t", "link": "http://127.0.0.1/e"}]),
+                     "k-o")
+        sent = self.server.requests[-1][2]
+        self.assertEqual(sent["choices"], [{"name": "a", "preferred": True, "key": "mine-1"}])
+        self.assertEqual((sent["because"], sent["stakes"]), ("g", "s"))
+        self.assertEqual(sent["refs"], [{"note": "t", "href": "http://127.0.0.1/e"}])
+
+    def test_a_recommendation_is_required_or_defaulted(self):
+        adapter = self.adapter("http")
+        adapter.push(self.decision(recommendation=None), "k-d")
+        self.assertEqual(self.server.requests[-1][2]["advice"], "proceed")
+        data = fake_mapping(self.server.url, "http")
+        data.pop("defaults")
+        bare = EA.McpRestAdapter(data, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+        with self.assertRaises(EA.InvalidRequest):
+            bare.push(self.decision(recommendation=None), "k-e")
+
+    def test_revise_withdraw_and_acted_over_both_channels(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            ident = adapter.push(self.decision(), "k-1")
+            self.assertEqual(adapter.push({"op": "revise", "external_id": ident, "body": "new words"}, "k-r"), ident)
+            self.assertEqual(self.server.items[ident]["body"], "new words")
+            self.assertEqual(self.server.log[-1], (channel, "revise"))
+            self.server.items[ident]["answer"] = {"answer_id": "a-1"}
+            self.assertEqual(adapter.acted(ident, "a-1", "done", "did it", "k-a"), ident)
+            self.assertEqual(self.server.requests[-1][2]["result"], "did")
+            with self.assertRaises(EA.Conflict):
+                adapter.acted(ident, "not-an-answer", "done")
+            second = adapter.push(self.decision(), "k-2")
+            adapter.push({"external_id": second, "status": "withdrawn", "reason": "gone"}, "k-w")
+            self.assertEqual(self.server.items[second]["withdrawn"], {"why": "gone"})
+            self.assertEqual(self.server.log[-1], (channel, "withdraw"))
+            adapter.push({"op": "withdraw", "external_id": second}, "k-w")  # idempotent
+
+    def test_revise_and_withdraw_after_a_decision_are_refused(self):
+        adapter = self.adapter("tool")
+        ident = adapter.push(self.decision(), "k-1")
+        self.server.items[ident].update(state="closed", answer={"answer_id": "a-1"})
+        with self.assertRaises(EA.AlreadyDecided):
+            adapter.push({"op": "revise", "external_id": ident, "body": "late"}, "k-r")
+        with self.assertRaises(EA.AlreadyDecided):
+            adapter.push({"op": "withdraw", "external_id": ident}, "k-w")
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.push({"op": "revise", "external_id": ident}, "k-r2")
+
+    def test_status_is_unsupported_without_a_mapping_for_it(self):
+        with self.assertRaises(EA.Unsupported):
+            self.adapter().push({"op": "status", "external_id": "x", "status": "s"}, "k")
+
+    def test_idempotent_replay_and_conflict(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            first = adapter.push(self.decision(), "same-key")
+            self.assertEqual(adapter.push(self.decision(), "same-key"), first)
+            self.assertEqual(len(self.server.items), 1)
+            with self.assertRaises(EA.Conflict):
+                adapter.push(self.decision(body="a different body"), "same-key")
+            other = adapter.push(self.decision(), "another-key")
+            self.assertNotEqual(other, first)
+            # a key that already is a UUID is kept as it is
+            ident = str(uuid.uuid4())
+            adapter.push(self.decision(), ident)
+            self.assertEqual(self.server.requests[-1][2]["op_id"], ident)
+
+    def test_lookup_replays_the_raise_and_searches_by_the_mapped_field(self):
+        adapter = self.adapter("http")
+        first = adapter.push(self.decision(), "k-1")
+        self.assertEqual(adapter.lookup("k-1", self.decision()), first)
+        self.assertEqual(len(self.server.items), 1)
+        self.assertEqual(adapter.lookup("k-1"), first)  # the read carries the id we sent (mapped field)
+        self.assertIsNone(adapter.lookup("never-raised"))
+        self.assertEqual(adapter.lookup("k-1", self.decision(body="changed")), first)  # a conflict falls back to read
+
+    def test_read_items_are_normalised(self):
+        adapter = self.adapter("tool")
+        ident = adapter.push(self.decision(), "k-1")
+        self.server.items[ident].update(state="closed", answer=self.answer_fields(), ask_back=None)
+        found = adapter.read_items()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["external_id"], ident)
+        self.assertEqual(found[0]["status"], "decided")
+        self.assertEqual(found[0]["answer"]["option_id"], "k1")
+        self.assertEqual(found[0]["answer"]["by"]["role"], "human")
+
+    def test_health(self):
+        adapter = self.adapter("http")
+        self.assertIsNone(adapter.health())
+        self.server.disabled = True
+        self.assertIn("disabled", adapter.health())
+        self.server.disabled = False
+        self.server.down = True
+        self.assertIn("request failed", adapter.health())
+        self.server.down = False
+        data = fake_mapping(self.server.url)
+        data["key_source"] = "env:NOT_SET_ANYWHERE"
+        self.assertIn("not set", EA.McpRestAdapter(data, environ={}).health())
+
+
+class TestExternalAdapterErrors(ExternalAdapterCase):
+    def test_http_statuses_map_to_the_hierarchy_and_4xx_is_not_retried(self):
+        cases = ((401, "cred", EA.CredentialError), (403, "off", EA.DisabledError), (404, "nf", EA.NotFound),
+                 (400, "bad", EA.InvalidRequest), (415, "media", EA.InvalidRequest), (409, "clash", EA.Conflict),
+                 (422, "odd", EA.InvalidRequest), (409, "decided", EA.AlreadyDecided))
+        adapter = self.adapter("http")
+        for status, code, cls in cases:
+            self.slept.clear()
+            before = len(self.server.requests)
+            self.server.fail_next("raise", status, {"code": code, "message": "m"})
+            with self.assertRaises(cls) as ctx:
+                adapter.push(self.decision(), "k-%d" % status)
+            self.assertIs(type(ctx.exception), cls)
+            self.assertEqual(self.slept, [], status)
+            self.assertEqual(len(self.server.requests), before)  # the injected reply is the one and only call
+
+    def test_a_4xx_is_asked_once(self):
+        adapter = self.adapter("http")
+        for status in (400, 401, 403, 404, 409):
+            self.server.fail_next("raise", status, {"code": "z", "message": "m"}, count=10)
+            with self.assertRaises(EA.AdapterError):
+                adapter.push(self.decision(), "k")
+            self.assertEqual(len([1 for i in self.server.inject if i["count"] == 9]), 1, status)
+            self.server.inject.clear()
+
+    def test_429_honours_retry_after_then_succeeds(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "2"})
+        self.assertTrue(adapter.push(self.decision(), "k-1").startswith("it-"))
+        self.assertEqual(self.slept, [2.0])
+
+    def test_a_long_retry_after_is_reported_not_slept(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "60"})
+        with self.assertRaises(EA.RateLimited) as ctx:
+            adapter.push(self.decision(), "k-1")
+        self.assertEqual(ctx.exception.retry_after, 60.0)
+        self.assertEqual(self.slept, [])
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later", "retry_after_s": 7})
+        with self.assertRaises(EA.RateLimited) as ctx:
+            adapter.push(self.decision(), "k-2")
+        self.assertEqual(ctx.exception.retry_after, 7.0)  # no header: the mapped body field
+        self.server.fail_next("raise", 429, {"code": "x", "message": "later"}, count=10)
+        with self.assertRaises(EA.RateLimited) as ctx:
+            adapter.push(self.decision(), "k-3")
+        self.assertEqual(ctx.exception.retry_after, 1.0)  # neither: the default (short: slept, then given up)
+        self.assertEqual(self.slept, [1.0, 1.0])
+
+    def test_5xx_is_retried_with_a_doubling_delay_and_a_cap(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 503, count=2)
+        self.assertTrue(adapter.push(self.decision(), "k-1").startswith("it-"))
+        self.assertEqual(self.slept, [0.5, 1.0])
+        self.slept.clear()
+        self.server.fail_next("raise", 500, count=10)
+        with self.assertRaises(EA.Unavailable):
+            adapter.push(self.decision(), "k-2")
+        self.assertEqual(self.slept, [0.5, 1.0])  # three attempts, two waits
+        self.slept.clear()
+        many = self.adapter("http", retry={"attempts": 5})
+        self.server.inject.clear()
+        self.server.fail_next("raise", 500, count=10)
+        with self.assertRaises(EA.Unavailable):
+            many.push(self.decision(), "k-3")
+        self.assertEqual(self.slept, [0.5, 1.0, 1.5, 1.5])  # capped at max_delay
+
+    def test_a_timeout_a_dropped_connection_and_a_closed_port_are_unavailable_and_retried(self):
+        data = fake_mapping(self.server.url, "http", timeouts={"request": 0.3}, retry={"attempts": 2})
+        adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+        self.server.delay = 1.0
+        with self.assertRaises(EA.Unavailable):
+            adapter.push(self.decision(), "k-1")
+        self.assertEqual(self.slept, [0.5])
+        self.server.delay = 0
+        self.server.down = True
+        with self.assertRaises(EA.Unavailable):
+            adapter.push(self.decision(), "k-2")
+        self.server.down = False
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        data["base_url"] = "http://127.0.0.1:%d" % port
+        self.slept.clear()
+        with self.assertRaises(EA.Unavailable):
+            EA.McpRestAdapter(data, sleep=self.slept.append,
+                              environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}).push(self.decision(), "k-3")
+        self.assertEqual(self.slept, [0.5])
+
+    def test_tool_channel_refusals_map_by_code(self):
+        adapter = self.adapter("tool")
+        for code, cls in (("off", EA.DisabledError), ("decided", EA.AlreadyDecided), ("clash", EA.Conflict),
+                          ("slow", EA.RateLimited), ("nf", EA.InvalidRequest), ("bad", EA.InvalidRequest)):
+            self.slept.clear()
+            self.server.fail_next("raise", 400, {"code": code, "message": "refused: %s" % code, "retry_after_s": 90},
+                                  level="result")
+            with self.assertRaises(cls) as ctx:
+                adapter.push(self.decision(), "k-" + code)
+            self.assertIs(type(ctx.exception), cls)
+            self.assertEqual(self.slept, [])
+
+    def test_tool_channel_credential_and_schema_failures(self):
+        adapter = self.adapter("tool")
+        self.server.fail_next("raise", 401, {"code": "cred", "message": "no"}, level="http")
+        with self.assertRaises(EA.CredentialError):
+            adapter.push(self.decision(), "k-1")
+        self.server.fail_next("raise", 503, level="http")
+        self.assertTrue(adapter.push(self.decision(), "k-2").startswith("it-"))  # retried
+        # schema failures arrive as text, not JSON
+        with self.assertRaises(EA.InvalidRequest) as ctx:
+            adapter.door.mcp.call_tool("item_raise", {"bad_schema": 1})
+        self.assertIn("validation", str(ctx.exception))
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.door.mcp.call_tool("no_such_tool", {})
+
+    def test_the_tool_session_sse_and_expiry(self):
+        adapter = self.adapter("tool")
+        self.assertEqual(adapter.door.mcp.list_tools()[:2], ["seats_list", "item_raise"])
+        self.assertEqual(adapter.door.mcp.session, "sess-1")
+        adapter.push(self.decision(), "k-1")
+        self.assertEqual(self.server.sid, 1)  # one session for all of it
+        self.server.sessions.clear()  # the server forgot it
+        adapter.push(self.decision(), "k-2")
+        self.assertEqual(self.server.sid, 2)
+        self.server.sse = True
+        fresh = self.adapter("tool")
+        self.assertTrue(fresh.push(self.decision(), "k-3").startswith("it-"))
+        self.assertEqual(fresh.pull_changes(None)[1], 0)
+
+    def test_a_redirect_is_never_followed(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 302, {"code": "x", "message": "moved"}, {"Location": "http://127.0.0.1:1/"})
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.push(self.decision(), "k-1")
+
+
+class TestExternalAdapterFeed(ExternalAdapterCase):
+    def test_the_cursor_is_stable_when_nothing_happened_and_a_repeat_is_safe(self):
+        for channel in ("tool", "http"):
+            self.server.changes.clear()
+            self.server.seq = 100
+            adapter = self.adapter(channel)
+            events, cursor = adapter.pull_changes(None)
+            self.assertEqual(events, [])
+            self.server.add_change("rating", "it-1", level="major", floor="minor")
+            self.server.add_change("restated", "it-1", gap=7, body="x", rerate=True)  # gaps are normal
+            events, cursor = adapter.pull_changes(0)
+            self.assertEqual([e["seq"] for e in events], [101, 108])
+            self.assertEqual(cursor, 108)
+            again, same = adapter.pull_changes(0)
+            self.assertEqual(([e["event_id"] for e in again], same), ([e["event_id"] for e in events], 108))
+            nothing, kept = adapter.pull_changes(cursor)
+            self.assertEqual((nothing, kept), ([], 108))
+            self.assertEqual(adapter.pull_changes(cursor)[1], 108)
+            ahead, held = adapter.pull_changes(500)  # never goes backwards
+            self.assertEqual((ahead, held), ([], 500))
+
+    def test_the_result_unpacks_and_reads_by_name(self):
+        result = self.adapter().pull_changes(None)
+        events, cursor = result
+        self.assertEqual((result["events"], result["next_cursor"], result.events, result.next_cursor),
+                         (events, cursor, events, cursor))
+
+    def test_events_are_normalised(self):
+        s = self.server
+        s.add_change("rating", "it-1", level="major", floor="minor")
+        s.add_change("answer", "it-1", **self.answer_fields())
+        s.add_change("answer", "it-2", **self.answer_fields(answer_id="a-2", how="reword", chosen=None, words="do B",
+                                                           who={"type": "owner_bot"}))
+        s.add_change("answer", "it-3", **self.answer_fields(answer_id="a-3", how="no", chosen=None,
+                                                           words="the original", no_reason="too risky",
+                                                           who={"type": "bot"}))
+        s.add_change("answer", "it-4", **self.answer_fields(answer_id="a-4", how="ask", chosen=None, words=None,
+                                                           ask_back="which branch?"))
+        s.add_change("flip", "it-1", **self.answer_fields(answer_id="a-5", how="no", chosen=None, no_reason="changed my mind"),
+                     replaces=self.answer_fields())
+        s.add_change("pull", "it-5", why="gone")
+        s.add_change("restated", "it-6", body="new text", rerate=True)
+        s.add_change("seat_paused", None)
+        for channel in ("tool", "http"):
+            events = self.adapter(channel).pull_changes(None)[0]
+            by = {e["seq"]: e for e in events}
+            self.assertEqual([e["type"] for e in events],
+                             ["rated", "answered", "answered", "answered", "sent_back", "reversed", "withdrawn",
+                              "revised", "other"])
+            self.assertEqual((by[101]["tier"], by[101]["floor"]), ("high", "low"))
+            a = by[102]["answer"]
+            self.assertEqual((a["id"], a["disposition"], a["meaning"], a["option_id"], a["text"]),
+                             ("a-1", "accept", "allow", "k1", "approve"))
+            self.assertEqual(by[102]["by"]["role"], "human")
+            self.assertEqual((by[103]["answer"]["disposition"], by[103]["answer"]["meaning"],
+                              by[103]["answer"]["option_id"], by[103]["answer"]["text"], by[103]["by"]["role"]),
+                             ("edit", "text", None, "do B", "cos"))
+            self.assertEqual((by[104]["answer"]["disposition"], by[104]["answer"]["meaning"],
+                              by[104]["answer"]["rejection"], by[104]["by"]["role"]),
+                             ("reject", "deny", "too risky", "orchestrator"))
+            self.assertNotIn("answer", by[105])
+            self.assertEqual(by[105]["clarification"], "which branch?")
+            self.assertEqual(by[106]["answer"]["disposition"], "reject")
+            self.assertEqual(by[106]["replaces"]["id"], "a-1")
+            self.assertEqual(by[106]["replaces"]["option_id"], "k1")
+            self.assertEqual(by[107]["reason"], "gone")
+            self.assertEqual((by[108]["text"], by[108]["awaits_rating"]), ("new text", True))
+            self.assertEqual(by[109]["raw_kind"], "seat_paused")
+            self.assertEqual(len({e["event_id"] for e in events}), len(events))
+
+    def test_an_unknown_answerer_has_no_role(self):
+        self.server.add_change("answer", "it-1", **self.answer_fields(who={"type": "stranger"}))
+        event = self.adapter().pull_changes(None)[0][0]
+        self.assertEqual(event["by"]["role"], "unknown")
+        self.assertEqual(event["by"]["raw"], {"type": "stranger"})
+
+
+class TestExternalAdapterWork(ExternalAdapterCase):
+    def test_put_is_idempotent_and_goes_over_http_only(self):
+        adapter = self.adapter("tool")
+        first = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
+        self.assertTrue(first["recorded"])
+        self.assertEqual(first["item"]["state"], "going")
+        again = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
+        self.assertFalse(again["recorded"])
+        self.assertEqual(self.server.count("work_put", "tool"), 0)
+        self.assertEqual(self.server.count("work_put", "http"), 2)
+        self.assertEqual(adapter.work.get("w-1")["item"]["title"], "Build the thing")
+        self.assertEqual(len(adapter.work.list()), 1)
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.work.put("w-2", "t", unmapped_field=1)
+        with self.assertRaises(EA.Unsupported):
+            adapter.door.call("work_put", {}, ident="w", force="tool")
+
+    def test_updates_are_coalesced_and_the_last_state_wins(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t", state="running")
+        self.server.now, self.clock_now[0] = 1000.0, 0.0
+        first = adapter.work.patch("w-1", progress="a")
+        self.assertEqual((first["sent"], first["deferred"]), (False, True))  # the put just recorded: wait
+        self.clock_now[0] = 30
+        adapter.work.patch("w-1", progress="b")
+        second = adapter.work.patch("w-1", progress="c", doer="d")
+        self.assertAlmostEqual(second["due_in"], 30)
+        self.assertEqual(self.server.count("work_patch"), 0)
+        self.server.now, self.clock_now[0] = 1061.0, 61
+        self.assertEqual(adapter.work.flush()["w-1"]["sent"], True)
+        self.assertEqual(self.server.count("work_patch"), 1)
+        task = self.server.tasks[("seat-1", "w-1")]
+        self.assertEqual((task["progress"], task["doer"]), ({"text": "c"}, "d"))  # b was never sent
+        again = adapter.work.patch("w-1", progress="c")
+        self.assertEqual(again, {"sent": False, "unchanged": True})
+        self.assertEqual(adapter.work.flush(), {})
+
+    def test_a_rate_limit_defers_and_keeps_the_pending_state(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t")
+        self.clock_now[0] = 100  # our clock says it is due, the server's says it is not
+        self.server.now = 1010.0
+        result = adapter.work.patch("w-1", progress="x")
+        self.assertEqual((result["sent"], result["deferred"], result["due_in"]), (False, True, 60.0))
+        self.assertEqual(self.slept, [])  # not slept: reported
+        self.assertEqual(adapter.work.flush(), {})  # still deferred by the wait
+        self.clock_now[0], self.server.now = 161, 1100.0
+        self.assertTrue(adapter.work.flush()["w-1"]["sent"])
+        self.assertEqual(self.server.tasks[("seat-1", "w-1")]["progress"], {"text": "x"})
+
+    def test_finish_is_final_and_idempotent(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t")
+        adapter.work.patch("w-1", progress="pending")
+        done = adapter.work.finish("w-1", "done", "all good")
+        self.assertEqual(done["item"]["end"], {"state": "ok", "said": "all good"})
+        self.assertNotIn("w-1", adapter.work.items)  # pending dropped
+        adapter.work.finish("w-1", "done", "all good")  # the same outcome again is fine
+        with self.assertRaises(EA.Conflict):
+            adapter.work.finish("w-1", "failed", "no")
+        self.server.now = 5000.0
+        with self.assertRaises(EA.Conflict):
+            adapter.door.call("work_patch", {"progress": "late"}, ident="w-1", force="http")
+
+    def test_work_errors_map_like_the_rest(self):
+        adapter = self.adapter()
+        self.server.disabled = True
+        with self.assertRaises(EA.DisabledError):
+            adapter.work.put("w-1", "t")
+        self.server.disabled = False
+        with self.assertRaises(EA.NotFound):
+            adapter.work.get("never")
+
+    def test_the_interval_is_at_least_a_minute(self):
+        self.assertEqual(self.adapter().work.interval, 60.0)
+
+
+class TestExternalAdapterHygiene(unittest.TestCase):
+    # Fragments, so this list does not spell the words it forbids.
+    DENYLIST = ["sp" + "ire", "ven" + "ue", "jan" + "us", "plug" + "in", "spp" + "k", "under" + "study",
+                "fleet-conn" + "ector", "don" + "ald", "/api/" + "plugin", "open" + "router"]
+
+    def test_the_module_names_no_product(self):
+        text = EXTERNAL_ADAPTER.read_text().lower()
+        for word in self.DENYLIST:
+            self.assertNotIn(word, text, "the module must stay generic: %r" % word)
+
+    def test_the_module_is_stdlib_only_and_python_3_9_syntax(self):
+        tree = ast.parse(EXTERNAL_ADAPTER.read_text(), feature_version=(3, 9))
+        allowed = {"collections", "hashlib", "http", "importlib", "json", "os", "re", "stat", "subprocess", "sys",
+                   "time", "urllib", "uuid", "abc"}
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                found.add((node.module or "").split(".")[0])
+        self.assertLessEqual(found, allowed)
+
+    def test_it_imports_under_python_3_9(self):
+        old = shutil.which("python3.9") or ("/usr/bin/python3" if os.path.exists("/usr/bin/python3") else None)
+        if old is None:
+            self.skipTest("no python 3.9 interpreter to import it with")
+        shown = subprocess.run([old, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
+                               text=True).stdout.strip()
+        if shown != "(3, 9)":
+            self.skipTest("no python 3.9 interpreter (found %s)" % shown)
+        done = subprocess.run([old, "-I", "-B", "-c",
+                               "import importlib.util as u; s = u.spec_from_file_location('ea', %r); m = "
+                               "u.module_from_spec(s); s.loader.exec_module(m); print(m.McpRestAdapter.__name__)"
+                               % str(EXTERNAL_ADAPTER)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "McpRestAdapter")
+
+    def test_no_sudo_anywhere_in_it(self):
+        self.assertNotIn("sudo", EXTERNAL_ADAPTER.read_text())
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
