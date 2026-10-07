@@ -158,7 +158,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
-            "worker_lookback_hours": 24,
+            "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
@@ -1459,6 +1459,8 @@ class FakeV2:
         self.down = False
         self.audit_path = None
         self.wake_lasts = 0
+        self.before_synthetic = None   # a hook run as a synthetic arrives (the end-of-turn race)
+        self.interrupts = []           # every session.interrupt: {"session", "resume", "was_busy", "at"}
         self._ids = 0
 
     def _id(self, prefix):
@@ -1680,7 +1682,29 @@ class FakeV2:
                                     "previous": self.CURSOR_PREFIX + str(max(0, start - size)) if start else None}}
         return page
 
+    def op_session_interrupt(self, params, body):
+        """VERIFIED in a throwaway v2 2.0.24 (steer probe): the running turn is cut at once (its in-flight tool
+        call aborted), the session is idle with outcome interrupted, and a waiting steering input stays in the
+        inbox unless `resume` is true, which runs it as a new turn. Idle: a no-op, {"interrupted": false}."""
+        s = self._session(params)
+        resume = params.get("resume") == "true"
+        busy = s["turn"] is not None
+        at = self.clock.now()
+        self.interrupts.append({"session": s["id"], "resume": resume, "was_busy": busy, "at": at})
+        self._write("session.interrupt", s["id"], None)
+        if busy:
+            s["turn"] = None
+            s["idle"] = max(at, (s["idle"] or 0) + 0.001)
+            s["idle_writes"].append(s["idle"])
+            s["outcome"] = "interrupted"
+            if resume and s["inbox"]:
+                self._start(s, at, self.wake_lasts, 1, items=[i for i in s["inbox"] if i["delivery"] == "steer"])
+        return {"interrupted": busy}
+
     def op_session_synthetic(self, params, body):
+        if self.before_synthetic is not None:
+            hook, self.before_synthetic = self.before_synthetic, None
+            hook()
         s = self._session(params)
         mid = body["id"]
         if mid in self.admitted:  # admitted once; the repeat returns the original (S2)
@@ -2654,6 +2678,158 @@ class TestConversion(Base):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         self.world.tick(600)
         self.assertEqual(self.world.engine.run_pass()["converted"], [])
+
+
+# ------------------------------------------------------------------ steer into a working agent
+
+class TestSteerToWorking(Base):
+    """A boss's `send` to a working agent is steered into its turn (probe: lands after the in-flight tool call,
+    before the next model request); an idle agent is woken; an engaged one gets the note; `send --interrupt`
+    is the explicit stop."""
+
+    def setUp(self):
+        super().setUp()
+        self.build({})
+
+    def build(self, config):
+        self.world = World(self, agents=("cos",), config=config)
+        self.sid = self.world.add_agent("platform", fleet={"role": "orchestrator", "reports_to": "cos"})
+        self.world.add_agent("coder", fleet={"role": "coder", "reports_to": "platform", "issue": 2})
+        self.write_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, **config))
+
+    def work(self, lasts=60, steps=3):
+        self.world.v2.start_turn(self.sid, "task", fleet=True, lasts=lasts, steps=steps)
+        self.world.tick(5)
+
+    def send(self, sender="cos", to="platform", interrupt=False):
+        return self.world.engine.send(sender, to, "answer: use plan B", interrupt=interrupt)
+
+    def admission(self):
+        (admitted,) = self.world.admissions("platform")
+        return admitted
+
+    def test_a_boss_send_to_a_working_agent_is_steered_and_lands_before_its_turn_ends(self):
+        self.work()
+        self.assertTrue(self.send()["sent"])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("steer", True))
+        self.world.tick(60)
+        self.assertEqual(admitted["delivered_at"], EPOCH + 20)  # the next step boundary, not the end (EPOCH + 60)
+        between = self.world.model_calls("platform", "between_steps")
+        self.assertEqual([[i["keys"] for i in c["inputs"]] for c in between][0], [admitted["keys"]])
+        intent = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e["phase"] == "intent"][0]
+        self.assertEqual((intent["detail"]["delivery"], intent["detail"]["busy"]), ("steer", True))
+        self.assertEqual(self.world.v2.interrupts, [])  # a steer never interrupts
+
+    def test_an_idle_agent_is_still_woken(self):
+        self.assertTrue(self.send()["sent"])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("queue", True))
+        self.assertEqual([c["phase"] for c in self.world.model_calls("platform")], ["turn_start"])
+        intent = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e["phase"] == "intent"][0]
+        self.assertNotIn("busy", intent["detail"])
+
+    def test_an_engaged_agent_gets_the_note_even_while_working(self):
+        self.world.you("platform")
+        self.work()
+        self.assertTrue(self.send()["sent"])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("steer", False))
+
+    def test_the_queue_setting_restores_the_old_behaviour(self):
+        self.build({"send_to_working": "queue"})
+        self.work()
+        self.assertTrue(self.send()["sent"])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("queue", True))
+        self.world.tick(60)
+        self.assertEqual(admitted["delivered_at"], EPOCH + 60)  # after the final reply
+
+    def test_only_a_send_from_its_own_boss_is_steered(self):
+        self.work()
+        self.assertTrue(self.send(sender="coder")["sent"])  # a worker's message to its boss's boss's peer: not a boss
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("queue", True))
+
+    def test_a_steer_that_meets_a_finished_turn_wakes_the_agent_and_is_not_lost(self):
+        self.work()
+        # the turn ends between the engine's fresh look and the write
+        self.world.v2.before_synthetic = lambda: (setattr(self.world.clock, "t", EPOCH + 61), self.world.v2.advance())
+        self.assertTrue(self.send()["sent"])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("steer", True))
+        self.assertIsNotNone(admitted["delivered_at"])
+        self.assertEqual(self.world.v2.sessions[self.sid]["inbox"], [])
+        self.assertEqual(self.world.model_calls("platform", "turn_start")[-1]["inputs"][-1]["keys"], admitted["keys"])
+
+    def test_the_setting_is_validated(self):
+        for bad in ("steer ", "now", True, None, 1):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"send_to_working": bad})
+        self.assertEqual(sb.validate_config({})["send_to_working"], "steer")
+        self.assertEqual(sb.validate_config({"send_to_working": "queue"})["send_to_working"], "queue")
+
+    # -- send --interrupt
+
+    def test_an_interrupt_cuts_the_turn_then_delivers_a_wake_in_that_order(self):
+        self.work()
+        outcome = self.send(interrupt=True)
+        self.assertTrue(outcome["sent"])
+        self.assertEqual([w["op"] for w in self.world.v2.writes], ["session.interrupt", "session.synthetic"])
+        self.assertEqual(self.world.v2.interrupts, [{"session": self.sid, "resume": False, "was_busy": True,
+                                                     "at": EPOCH + 5}])
+        admitted = self.admission()
+        self.assertEqual((admitted["delivery"], admitted["resume"]), ("queue", True))
+        self.assertEqual(self.world.model_calls("platform", "turn_start")[-1]["inputs"][-1]["keys"], admitted["keys"])
+        audit = [(e["event"], e["phase"]) for e in self.world.audit() if e["event"] in ("v2.interrupt", "v2.synthetic")]
+        self.assertEqual(audit, [("v2.interrupt", "intent"), ("v2.interrupt", "result"),
+                                 ("v2.synthetic", "intent"), ("v2.synthetic", "result")])
+        result = [e for e in self.world.audit() if e["event"] == "v2.interrupt" and e["phase"] == "result"][0]
+        self.assertTrue(result["detail"]["interrupted"])
+
+    def test_an_interrupt_to_an_engaged_agent_is_still_a_wake(self):
+        self.world.you("platform")
+        self.work()
+        self.assertTrue(self.send(interrupt=True)["sent"])
+        self.assertEqual((self.admission()["delivery"], self.admission()["resume"]), ("queue", True))
+
+    def test_an_interrupt_is_refused_unless_the_sender_is_the_recipients_boss(self):
+        self.work()
+        for sender, to in (("coder", "platform"), ("platform", "cos"), ("cos", "coder"), ("cos", "nobody")):
+            with self.assertRaises(sb.InterruptRefused):
+                self.send(sender=sender, to=to, interrupt=True)
+        self.assertEqual(self.world.v2.interrupts, [])
+        self.assertEqual(self.world.v2.writes, [])
+        refused = [e for e in self.world.audit() if e["event"] == "interrupt.refused"]
+        self.assertEqual([(e["subject"], e["detail"]["from"]) for e in refused],
+                         [("platform", "coder"), ("cos", "platform"), ("coder", "cos"), ("nobody", "cos")])
+
+    def test_a_held_interrupt_cuts_nothing(self):
+        self.work()
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.assertFalse(self.send(interrupt=True)["sent"])
+        self.assertEqual(self.world.v2.interrupts, [])
+
+    def test_the_cli_flag_interrupts_and_a_stranger_is_refused(self):
+        self.work()
+
+        def main(*argv):
+            with captured() as (out, err):
+                code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
+                               wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+            return code, out.getvalue(), err.getvalue()
+        code, _, err = main("send", "--interrupt", "--from", "coder", "platform", "stop")
+        self.assertEqual(code, sb.EXIT_USAGE)
+        self.assertIn("does not report to coder", err)
+        self.assertEqual(self.world.v2.interrupts, [])
+        code, _, err = main("send", "--interrupt", "--from", "cos", "platform", "stop", "now")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.v2.interrupts), 1)
+        self.assertIn("stop now", self.admission()["text"])
+        self.world.tick(1)
+        code, _, err = main("send", "--from", "cos", "platform", "plain")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
 
 
 # ------------------------------------------------------------------- the CLI
