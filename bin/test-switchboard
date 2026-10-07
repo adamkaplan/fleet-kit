@@ -24483,6 +24483,13 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         self.assertTrue(fresh.push(self.decision(), "k-3").startswith("it-"))
         self.assertEqual(fresh.pull_changes(None)[1], 0)
 
+    def test_a_list_of_messages_is_joined(self):
+        adapter = self.adapter("tool")
+        self.server.fail_next("raise", 400, {"code": "bad", "message": ["first", "second"]}, level="result")
+        with self.assertRaises(EA.InvalidRequest) as ctx:
+            adapter.push(self.decision(), "k-1")
+        self.assertIn("first; second", str(ctx.exception))
+
     def test_a_redirect_is_never_followed(self):
         adapter = self.adapter("http")
         self.server.fail_next("raise", 302, {"code": "x", "message": "moved"}, {"Location": "http://127.0.0.1:1/"})

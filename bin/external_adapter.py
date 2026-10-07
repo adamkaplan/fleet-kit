@@ -682,6 +682,8 @@ class Http:
             code = body.get(errors.get("code_field", "code"))
             message = body.get(errors.get("message_field", "message"))
             code = code if isinstance(code, str) else None
+            if isinstance(message, list):
+                message = "; ".join(str(m) for m in message if isinstance(m, str)) or None
             message = message if isinstance(message, str) else None
             if status is None and errors.get("status_field"):
                 got = body.get(errors["status_field"])
