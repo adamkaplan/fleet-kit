@@ -12451,6 +12451,74 @@ def comment_as(engine, runner, repo, number, text, author):
         _gh_write(engine, runner, repo, "repos/%s/issues/%d/comments" % (repo, number), "POST", {"body": body})
 
 
+# ---- how an answer reaches the asker, behind the AnswerDelivery port: each class is a path that was always taken
+# here, with its refusals and messages unchanged (the callers keep the wording that is theirs).
+
+class IssueDelivery(decision_core.AnswerDelivery):
+    """The issue path: a comment signed by the answerer and awaiting-label changes on the issue. The answer is
+    {repo, number, add, remove, comment (text or None), author, comment_first}; the labels go first unless
+    `comment_first`. Audited before and after, each write on its own."""
+
+    def __init__(self, engine, runner):
+        self.engine, self.runner = engine, runner
+
+    def deliver(self, decision, answer):
+        engine, runner, repo, number = self.engine, self.runner, answer["repo"], answer["number"]
+        steps = [lambda: change_issue_labels(engine, runner, repo, number, answer.get("add", ()), answer.get("remove", ()))]
+        if answer.get("comment"):
+            comment = lambda: comment_as(engine, runner, repo, number, answer["comment"], answer.get("author"))
+            steps = [comment] + steps if answer.get("comment_first") else steps + [comment]
+        for step in steps:
+            step()
+
+
+class ReportSendDelivery(decision_core.AnswerDelivery):
+    """The report path: a `send` to the worker that asked, which is what clears a report. The answer is {by, to, text,
+    ask, repo}; returns the send's outcome ({sent, reason, ...}) and raises what the send raises: the caller words
+    the refusal."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def deliver(self, decision, answer):
+        return self.engine.send(answer["by"], answer["to"], answer["text"], answer["ask"], answer.get("repo"))
+
+
+class HarnessReplyDelivery(decision_core.AnswerDelivery):
+    """The harness path: a reply to an agent's pending permission request (`allow` is `once`, `deny` is `reject`) or
+    question (the one field of its form), through v2. The answer is {value, note, by}. Returns the line the command
+    prints; raises DecisionError for a refusal."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def deliver(self, decision, answer):
+        engine, value, note, name = self.engine, answer["value"], answer.get("note"), answer.get("by")
+        kind, ident = decision["kind"], decision["id"]
+        session, request = decision.get("session"), decision.get("request")
+        if not session or not request:
+            raise DecisionError("%s names no request to reply to" % ident)
+        subject = "request:%s:%s" % (session, request)
+        detail = {"decision": ident, "kind": kind, "agent": decision.get("agent"), "by": name,
+                  "note": _one_line(note or "", 200)}
+        if kind == "permission":
+            choice = value.strip().lower()
+            if choice not in ("allow", "deny"):
+                raise DecisionError("%s is a permission request: answer `allow` or `deny`" % ident)
+            with engine._external("decisions.answer", subject, dict(detail, answer=choice)):
+                engine.v2.permission_reply(session, request, "once" if choice == "allow" else "reject", note)
+            return "answered %s: %s" % (ident, choice)
+        forms = engine.v2.form_list(session)
+        form = next((f for f in forms if isinstance(f, dict) and f.get("id") == request), None) \
+            if isinstance(forms, list) else None
+        if form is None:
+            raise DecisionError("%s is no longer pending: the agent's form is gone" % ident)
+        answer = _form_answer(form.get("fields") or [], value)
+        with engine._external("decisions.answer", subject, dict(detail, answer=_one_line(value, 200))):
+            engine.v2.form_reply(session, request, answer)
+        return "answered %s" % ident
+
+
 def decision_by_id(decisions, ident):
     for wanted in (ident, "#" + ident.lstrip("#")):
         for decision in decisions:
@@ -12497,10 +12565,10 @@ def escalate_decision(engine, runner, decision, reason, name):
                                     "the owner in chat" % ident)
             raise DecisionError("%s: cannot tell which repo its issue is in" % ident)
         repo, number = target
-        change_issue_labels(engine, runner, repo, number, [awaiting_label(engine.config)],
-                            [awaiting_cos_label(engine.config)])
-        if reason:
-            comment_as(engine, runner, repo, number, "Escalated to the owner: %s" % reason, name)
+        IssueDelivery(engine, runner).deliver(decision, {
+            "repo": repo, "number": number, "add": [awaiting_label(engine.config)],
+            "remove": [awaiting_cos_label(engine.config)], "author": name,
+            "comment": "Escalated to the owner: %s" % reason if reason else None})
         engine._note("decisions.escalate", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
                                                   "reason": _one_line(reason or "", 200)})
         return "escalated %s to you: %s on %s#%d" % (ident, awaiting_label(engine.config), repo, number)
@@ -12510,7 +12578,7 @@ def escalate_decision(engine, runner, decision, reason, name):
     with engine._external("decisions.escalate", "request:%s" % key, {"decision": ident, "kind": kind,
                                                                       "agent": decision.get("agent"), "by": name,
                                                                       "reason": _one_line(reason or "", 200)}):
-        mark_escalated(engine.state_dir, key, engine.now())
+        decision_store(engine).mark_escalated(key, engine.now())
     return "escalated %s to you: the %s %s is waiting on you" % (ident, decision.get("agent") or "agent", kind)
 
 
@@ -12533,10 +12601,10 @@ def resolve_decision(engine, runner, decision, note, name):
         raise DecisionError("%s is a report that names no issue: answer the worker with `%s send`, which resolves it"
                             % (ident, PROG))
     repo, number = target
-    change_issue_labels(engine, runner, repo, number, (),
-                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
-    if note:
-        comment_as(engine, runner, repo, number, "Resolved by the Chief of Staff: %s" % note, name)
+    IssueDelivery(engine, runner).deliver(decision, {
+        "repo": repo, "number": number, "add": (),
+        "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)], "author": name,
+        "comment": "Resolved by the Chief of Staff: %s" % note if note else None})
     engine._note("decisions.resolve", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
                                              "note": _one_line(note or "", 200)})
     return "resolved %s: %s and %s are off %s#%d" % (ident, awaiting_cos_label(engine.config),
@@ -12578,28 +12646,7 @@ def answer_decision(engine, decision, value, note, name):
         raise DecisionError("%s is %s: `decisions answer` is for a permission request or a question. Answer a report "
                             "with `%s send`; an issue with a comment, then `decisions resolve`"
                             % (ident, "an issue" if kind == "issue" else "a report", PROG))
-    session, request = decision.get("session"), decision.get("request")
-    if not session or not request:
-        raise DecisionError("%s names no request to reply to" % ident)
-    subject = "request:%s:%s" % (session, request)
-    detail = {"decision": ident, "kind": kind, "agent": decision.get("agent"), "by": name,
-              "note": _one_line(note or "", 200)}
-    if kind == "permission":
-        choice = value.strip().lower()
-        if choice not in ("allow", "deny"):
-            raise DecisionError("%s is a permission request: answer `allow` or `deny`" % ident)
-        with engine._external("decisions.answer", subject, dict(detail, answer=choice)):
-            engine.v2.permission_reply(session, request, "once" if choice == "allow" else "reject", note)
-        return "answered %s: %s" % (ident, choice)
-    forms = engine.v2.form_list(session)
-    form = next((f for f in forms if isinstance(f, dict) and f.get("id") == request), None) \
-        if isinstance(forms, list) else None
-    if form is None:
-        raise DecisionError("%s is no longer pending: the agent's form is gone" % ident)
-    answer = _form_answer(form.get("fields") or [], value)
-    with engine._external("decisions.answer", subject, dict(detail, answer=_one_line(value, 200))):
-        engine.v2.form_reply(session, request, answer)
-    return "answered %s" % ident
+    return HarnessReplyDelivery(engine).deliver(decision, {"value": value, "note": note, "by": name})
 
 
 def read_batch_rows(args):
@@ -12723,7 +12770,8 @@ def answer_batch(engine, runner, decision, args, name):
         text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
         try:
-            outcome = engine.send(name, raised, text, number, repo)
+            outcome = ReportSendDelivery(engine).deliver(decision, {"by": name, "to": raised, "text": text,
+                                                                    "ask": number, "repo": repo})
         except Exception as err:
             raise DecisionError("%s was not answered: the note to %s could not be delivered (%s); its labels stay, the "
                                 "batch stays with the Chief of Staff, nothing was commented. Run the same answer again "
@@ -12733,9 +12781,9 @@ def answer_batch(engine, runner, decision, args, name):
                                 "stays with the Chief of Staff, nothing was commented. Run the same answer again once "
                                 "%s can be reached" % (ident, raised, outcome.get("reason") or outcome.get("action"), raised))
         told = "; told %s" % raised
-    comment_as(engine, runner, repo, number, "\n".join(lines), name)
-    change_issue_labels(engine, runner, repo, number, (),
-                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    IssueDelivery(engine, runner).deliver(decision, {
+        "repo": repo, "number": number, "add": (), "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)],
+        "author": name, "comment": "\n".join(lines), "comment_first": True})
     engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
                                             "rows": len(outcomes), "changed": changed,
                                             "note": _one_line(args.note or "", 200)})
@@ -12777,8 +12825,8 @@ def supersede_decision(engine, runner, decision, shown, note, name):
         if target is None or target[0] is None:
             raise DecisionError("cannot tell which repo its issue is in")
         repo, number = target
-        comment_as(engine, runner, repo, number, said, name)
-        change_issue_labels(engine, runner, repo, number, (), both)
+        IssueDelivery(engine, runner).deliver(decision, {"repo": repo, "number": number, "add": (), "remove": both,
+                                                         "author": name, "comment": said, "comment_first": True})
         engine._note("decisions.supersede", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
                                                    "superseded_by": shown})
         return "done: comment and both labels off %s#%d" % (repo, number)
@@ -12787,8 +12835,9 @@ def supersede_decision(engine, runner, decision, shown, note, name):
     if not decision.get("ask") or not decision.get("agent"):
         raise DecisionError("is a report that names no issue: a send would clear every question of its worker. "
                             "Answer it with `%s send`" % PROG)
-    outcome = engine.send(name, decision["agent"], "%s. Your question on this ask is covered there; carry on with "
-                                                   "that." % said, decision["ask"], decision.get("repo"))
+    outcome = ReportSendDelivery(engine).deliver(decision, {
+        "by": name, "to": decision["agent"], "ask": decision["ask"], "repo": decision.get("repo"),
+        "text": "%s. Your question on this ask is covered there; carry on with that." % said})
     if not outcome.get("sent"):
         raise DecisionError("%s was not sent to %s (%s): the report stays open" % (
             "the note", decision["agent"], outcome.get("reason") or outcome.get("action")))
@@ -12796,7 +12845,8 @@ def supersede_decision(engine, runner, decision, shown, note, name):
                                                "superseded_by": shown})
     if target is not None and target[0] is not None:
         try:
-            change_issue_labels(engine, runner, target[0], target[1], (), both)
+            IssueDelivery(engine, runner).deliver(decision, {"repo": target[0], "number": target[1], "add": (),
+                                                             "remove": both, "author": name})
         except IntentError as err:
             raise DecisionError("sent to %s, but its issue's labels were not removed: %s" % (decision["agent"], err)) from None
         return "done: sent to %s, both labels off %s#%d" % (decision["agent"], target[0], target[1])
