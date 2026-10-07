@@ -168,6 +168,29 @@ message. A `send` from another agent skips the batch.
   and start a turn of its own.
 - **Otherwise → wake.** `session.synthetic` with `resume: true` and
   `delivery: "queue"`. It never cuts into a running turn.
+- **A boss's `send` to a working agent → steer.** A wake that carries a `send`
+  from the agent's own `reports_to` boss, to an agent herdr shows as working
+  (read again just before the write), goes in as `delivery: "steer"` with
+  `resume: true` instead of `queue`. Measured on v2 2.0.24 in a throwaway
+  profile with a mock model: a steer waits in the inbox while a tool call
+  runs, and enters the transcript when it returns, before the next model
+  request, so the call is not cut; `queue` waits for the whole turn. `resume:
+  true` also makes the race harmless: a steer that arrives after the turn has
+  ended starts a turn at once instead of sitting unread. The audit line of
+  that `v2.synthetic` carries `"busy": true`. Reports, worker events, GitHub
+  events, reminders and orders keep the rules above, and so does a `send`
+  from anyone but the boss. The config key `send_to_working` (`"steer"`, the
+  default, or `"queue"` for the old behaviour) is the one switch.
+- **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
+  is for stop and hold orders only, from a boss to its own worker, and is
+  never automatic. It calls `session.interrupt` with `resume=false` (the
+  in-flight tool call is cut and the turn ends; a steering message still
+  waiting stays in the inbox rather than running), then delivers the message
+  as a wake, so the agent starts a turn that reads it and carries anything
+  that waited. It is refused (exit 2, `interrupt.refused` in the audit) when
+  the sender is not the recipient's boss, and holds like `send` (nothing
+  interrupted) when the recipient is blocked or gone. The audit has its own
+  `v2.interrupt` event, before the `v2.synthetic` of the message.
 - **The message is the delivery.** It contains the items themselves, grouped
   by issue, each group headed by that issue's Intent and Done-when lines (PR 6).
   There is nothing to fetch and nothing to acknowledge: once the message is in
@@ -210,7 +233,7 @@ flowchart TD
   lapse -- "yes" --> steer["Convert to a wake<br/>turn starts"]
   lapse -- "no: your next message carried it" --> done(["Delivered"])
   wake --> busy{"A busy?"}
-  busy -- "yes" --> after["Runs after the current turn"]
+  busy -- "yes" --> after["Runs after the current turn<br/>a boss send: steered in, next safe point"]
   busy -- "no" --> now["Turn starts now"]
   steer --> done
   after --> done
@@ -452,7 +475,7 @@ fleet metadata), so `--from` is never typed.
 
 | Command | Who | Effect |
 |---|---|---|
-| `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
+| `fleet-switchboard send [--interrupt] <name> --issue <n> <text>` | Any agent; `--interrupt` only a boss to its own worker | Delivers to another agent by the delivery rule, without batching (a boss's send to a working agent is steered into its turn). `--interrupt` aborts the recipient's running turn first (stop and hold orders). `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working`, `paused` and `withdrawn` are riders: kept until a message carries them, never waking. `withdrawn` takes back your open `question` or `blocked` report on the ask (`--all`: on every ask) once it is superseded, and the Decisions list drops it at the next daemon pass; plain `working`, `paused` and `blocked` do not answer a question. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
 | `fleet-switchboard decisions [list] [--repo OWNER/REPO] [--tier cos\|human\|orchestrator\|all] [--json] [--fresh] [--watch]` | You, or any agent (PR 14; views PR 18) | The open decisions in the caller's view, one line each, the first line saying which view it is: `#2a  waiting 12m  platform  Close #2? and a second deploy run?` (a view that mixes tiers adds each row's `[tier]`). The Chief of Staff sees every repo and tier by default, an orchestrator its own repo, anyone else the human tier; the flags override. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `view`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty human view prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
