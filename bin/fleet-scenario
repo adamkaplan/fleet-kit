@@ -65,6 +65,10 @@ REPORT_STATE_NAMES = tuple(_load_switchboard().REPORT_STATES)
 # PR 17: what `fleet-switchboard orders` does, and the states v2 gives a compaction message
 ORDERS_ACTIONS = ("add", "remove")
 COMPACTION_STATUSES = ("running", "completed", "failed")
+# PR 18: what `fleet-switchboard decisions` does, the tiers a view filters by, the two labels, and who looks
+DECISION_ACTIONS = ("escalate", "resolve", "answer")
+TIER_NAMES = ("cos", "human", "orchestrator", "all")
+LABEL_KINDS = ("user", "cos")
 
 # One vocabulary for every runner: each action and each oracle with its
 # fields, name -> {field: (required, check)}. A step or expectation may carry
@@ -116,7 +120,7 @@ STEP_FIELDS = {
     "report": {"state": (True, "report_state"), "text": (True, "line"), "issue": (False, "issue")},
     # PR 14: Decisions. A label put on or taken off an issue; a boss's message to a worker; the projection deleted
     "awaiting": {"issue": (True, "issue"), "on": (True, "bool"), "title": (False, "text"),
-                 "repo": (False, "repo")},  # repo: PR 15, the repo of the issue
+                 "repo": (False, "repo"), "label": (False, "label_kind")},  # repo: PR 15; label: PR 18, user or cos
     "send": {"to": (True, _CAST), "text": (True, "line"), "issue": (False, "issue")},
     "delete-decisions": {},
     # PR 16: you run a command that needs the daemon (it starts one if none runs); `bootstrap` opens the Chief of
@@ -132,6 +136,12 @@ STEP_FIELDS = {
                "number": (False, "count1")},
     "edit-orders": {"charter": (True, "issue"), "text": (True, "line")},
     "compact": {"agent": (True, _CAST), "status": (True, "compaction_status")},
+    # PR 18: a cast member's `fleet-switchboard decisions escalate|resolve|answer` on the decision whose id or title
+    # holds `ref` (resolve and answer go through the policy judge first, as a shell call does); the owner's edit of
+    # the Chief of Staff's orders file (adds a line)
+    "decide": {"action": (True, "decision_action"), "ref": (True, "text"), "value": (False, "line"),
+               "note": (False, "line"), "reason": (False, "line")},
+    "edit-cos-orders": {"text": (True, "line")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -156,6 +166,8 @@ STEP_ACTORS = {
     "orders": ("cast",),  # PR 17
     "edit-orders": ("you", "world"),
     "compact": ("world",),
+    "decide": ("cast",),  # PR 18
+    "edit-cos-orders": ("you", "world"),
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -196,7 +208,9 @@ EXPECT_FIELDS = {
     "lists_asks": {"agent": (True, _CAST), "issue": (True, "issue")},
     # PR 14: the list `fleet-switchboard decisions` shows at a time: how many decisions (whose title holds
     # `text`, if given), and what the command says
-    "decisions": {"at": (True, "duration"), "count": (True, "count0"), "text": (False, "text")},
+    # PR 18: `as` is who looks (a cast member, whose role and repo pick the view, or `you`), `tier` the --tier flag
+    "decisions": {"at": (True, "duration"), "count": (True, "count0"), "text": (False, "text"),
+                  "as": (False, "viewer"), "tier": (False, "tier_name")},
     "decisions_say": {"at": (True, "duration"), "text": (True, "text")},
     # PR 16: the first line `fleet-switchboard status` prints; what the bootstrap step printed; how many v2 sessions
     # carry that cast member's fleet name
@@ -209,6 +223,10 @@ EXPECT_FIELDS = {
     # by that agent were refused
     "orders_on_github": {"charter": (True, "issue"), "count": (True, "count0"), "text": (False, "text")},
     "orders_refused": {"agent": (True, _CAST), "count": (True, "count0")},
+    # PR 18: the labels an issue carries on the fake GitHub, by kind; the replies made to an agent's pending
+    # permission requests (those with `decision`, if given)
+    "issue_labels": {"issue": (True, "issue"), "has": (False, "label_kinds"), "lacks": (False, "label_kinds")},
+    "permission_answered": {"agent": (True, _CAST), "count": (True, "count0"), "decision": (False, "decision")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")
@@ -313,6 +331,16 @@ def _field_ok(check, value, cast, steps=0):
         return value in ORDERS_ACTIONS
     if check == "compaction_status":
         return value in COMPACTION_STATUSES
+    if check == "decision_action":  # PR 18
+        return value in DECISION_ACTIONS
+    if check == "tier_name":
+        return value in TIER_NAMES
+    if check == "label_kind":
+        return value in LABEL_KINDS
+    if check == "label_kinds":
+        return isinstance(value, list) and bool(value) and all(v in LABEL_KINDS for v in value)
+    if check == "viewer":
+        return value == "you" or (isinstance(value, str) and value in cast)
     raise AssertionError("no such check: %s" % check)
 
 
@@ -333,7 +361,12 @@ _CHECK_TEXT.update({"policy_tool": "one of " + ", ".join(POLICY_TOOL_NAMES),  # 
                     "policy_result": "one of " + ", ".join(POLICY_RESULTS),
                     "report_state": "one of " + ", ".join(REPORT_STATE_NAMES),  # PR 13
                     "orders_action": "one of " + ", ".join(ORDERS_ACTIONS),  # PR 17
-                    "compaction_status": "one of " + ", ".join(COMPACTION_STATUSES)})
+                    "compaction_status": "one of " + ", ".join(COMPACTION_STATUSES),
+                    "decision_action": "one of " + ", ".join(DECISION_ACTIONS),  # PR 18
+                    "tier_name": "one of " + ", ".join(TIER_NAMES),
+                    "label_kind": " or ".join(LABEL_KINDS),
+                    "label_kinds": "a non-empty list of " + ", ".join(LABEL_KINDS),
+                    "viewer": "you, or a cast name"})
 
 
 def _validate_fields(where, item, kind, table, common, cast, errors, steps=0):

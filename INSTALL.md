@@ -142,17 +142,21 @@ PROVES:  two lines, the repo from STEP 5 and the prefix from STEP 1.
 
 ```
 CHECK:   gh label list --repo "$FLEET_REPO" --limit 200 \
-           | grep -E "^$(whoami):(orchestrator|awaiting-user)"
-         Both present?  -> skip to STEP 8.
+           | grep -E "^$(whoami):(orchestrator|awaiting-cos|awaiting-user)"
+         All three present?  -> skip to STEP 8.
 DO:      gh label create "$(whoami):orchestrator" --repo "$FLEET_REPO" \
            --color B60205 --description "Charter issue. One per orchestrator."
+         gh label create "$(whoami):awaiting-cos" --repo "$FLEET_REPO" \
+           --color FBCA04 --description "Waiting on the Chief of Staff: it resolves or escalates."
          gh label create "$(whoami):awaiting-user" --repo "$FLEET_REPO" \
-           --color FBCA04 --description "Blocked on a decision only the owner can make."
+           --color D93F0B --description "Blocked on a decision only the owner can make."
 VERIFY:  gh label list --repo "$FLEET_REPO" --limit 200 | grep "^$(whoami):"
-PROVES:  both labels listed, both carrying the prefix.
+PROVES:  all three labels listed, all carrying the prefix.
 ```
 
-Create only these two. Project labels come later, as work arrives.
+Create only these three. Project labels come later, as work arrives. (Once the
+switchboard is installed, `fleet-switchboard labels ensure` creates the same three
+in every watched repo, each with that repo's own account; it is how a repo joins.)
 
 **Every label carries the prefix, including these.** Labels are repo-wide. If two
 people share a repo and both create an unprefixed structural label, each one's
@@ -464,6 +468,13 @@ The daemon reloads `config.json` by itself a few seconds after it changes (an
 invalid file is reported in the first lines of `status` and the daemon keeps
 running on what it had). Never `kill` the daemon by hand: `fleet-switchboard
 restart` stops it by its recorded pid and starts it again.
+
+`install` also makes the Chief of Staff's standing orders file if there is none,
+`standing-orders.md` beside `config.json`: a template whose comment header
+explains it. It is the person's own file, edited in an editor, and what lets the
+Chief of Staff answer for them; `install` never overwrites it and `--uninstall`
+leaves it. Tell the person where it is (`fleet-switchboard orders --cos` prints
+it); do not write it for them.
 
 `install` also puts the CLI on PATH: a symlink `fleet-switchboard` in
 `~/.local/bin` (or another directory of the person's PATH under their home),

@@ -1,0 +1,110 @@
+{
+  "id": "T4",
+  "title": "The owner edits the Chief of Staff's orders file: a new note arrives, and the judge reads the change at the next call",
+  "problem": null,
+  "since_pr": 18,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "cos": {
+      "role": "chief-of-staff"
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "edit-cos-orders",
+      "text": "Answer permission prompts for read-only commands.",
+      "why": "The first orders: the note arrives at the Chief of Staff's start"
+    },
+    {
+      "at": "30s",
+      "actor": "cos",
+      "do": "tool-call",
+      "tool": "shell",
+      "arguments": "gh pr merge 12",
+      "why": "A merge speaks for the owner and no order names it: ask"
+    },
+    {
+      "at": "40s",
+      "actor": "you",
+      "do": "permission",
+      "to": "cos",
+      "decision": "once",
+      "why": "You answer the ask: until then a blocked agent is not told anything"
+    },
+    {
+      "at": "60s",
+      "actor": "you",
+      "do": "edit-cos-orders",
+      "text": "The Chief of Staff may merge green pull requests.",
+      "why": "The owner edits the file"
+    },
+    {
+      "at": "70s",
+      "actor": "cos",
+      "do": "turn",
+      "lasts": "5s",
+      "why": "Its next turn: the waiting note reaches it"
+    },
+    {
+      "at": "90s",
+      "actor": "cos",
+      "do": "tool-call",
+      "tool": "shell",
+      "arguments": "gh pr merge 12",
+      "why": "The same call: the judge's question now sees the new order"
+    },
+    {
+      "at": "120s",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "two-notes",
+      "that": "delivered",
+      "to": "cos",
+      "key": "orders:cos:*",
+      "mode": "note",
+      "count": 2,
+      "keys": 2
+    },
+    {
+      "name": "second-names-the-edit",
+      "that": "delivered",
+      "to": "cos",
+      "key": "orders:cos:*",
+      "mode": "note",
+      "count": 1,
+      "text": "may merge green pull requests"
+    },
+    {
+      "name": "before-the-edit",
+      "that": "policy_outcome",
+      "agent": "cos",
+      "step": 1,
+      "outcome": "ask",
+      "judged": true
+    },
+    {
+      "name": "after-the-edit",
+      "that": "policy_outcome",
+      "agent": "cos",
+      "step": 5,
+      "outcome": "allow",
+      "judged": true,
+      "jev_calls": 1
+    }
+  ],
+  "control": {
+    "fault": "cos-orders-unfed",
+    "fails": [
+      "after-the-edit"
+    ]
+  }
+}

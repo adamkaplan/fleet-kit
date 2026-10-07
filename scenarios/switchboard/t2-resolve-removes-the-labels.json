@@ -1,0 +1,99 @@
+{
+  "id": "T2",
+  "title": "Resolving a decision takes both awaiting labels off its issue, and it leaves every list",
+  "problem": null,
+  "since_pr": 18,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "cos": {
+      "role": "chief-of-staff"
+    },
+    "platform": {
+      "role": "orchestrator",
+      "reports_to": "cos",
+      "charter": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "10s",
+      "actor": "platform",
+      "do": "awaiting",
+      "issue": 5,
+      "on": true,
+      "label": "cos",
+      "title": "Pick the database",
+      "why": "The orchestrator raises it to the Chief of Staff"
+    },
+    {
+      "at": "15s",
+      "actor": "you",
+      "do": "awaiting",
+      "issue": 5,
+      "on": true,
+      "label": "user",
+      "why": "It was escalated and is yours now: both labels are on"
+    },
+    {
+      "at": "45s",
+      "actor": "world",
+      "do": "wait"
+    },
+    {
+      "at": "60s",
+      "actor": "cos",
+      "do": "decide",
+      "action": "resolve",
+      "ref": "#5",
+      "note": "Order 2 covers it",
+      "why": "The Chief of Staff resolves it (the judge reads the command first)"
+    },
+    {
+      "at": "90s",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "listed",
+      "that": "decisions",
+      "at": "45s",
+      "as": "you",
+      "count": 1,
+      "text": "Pick the database"
+    },
+    {
+      "name": "labels-gone",
+      "that": "issue_labels",
+      "issue": 5,
+      "lacks": [
+        "user",
+        "cos"
+      ]
+    },
+    {
+      "name": "list-empty",
+      "that": "decisions",
+      "at": "90s",
+      "as": "cos",
+      "count": 0
+    }
+  ],
+  "control": {
+    "variant": {
+      "steps": {
+        "3": {
+          "action": "escalate"
+        }
+      }
+    },
+    "fails": [
+      "labels-gone",
+      "list-empty"
+    ]
+  }
+}

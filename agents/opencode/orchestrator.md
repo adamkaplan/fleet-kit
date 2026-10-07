@@ -8,11 +8,9 @@ permission:
   read: allow
   question: allow
   todowrite: allow
-  # A globbed allow-list matches the whole command string, so any pipe or
-  # `cd &&` falls through to `"*": ask` and stalls the agent before its first
-  # real action. That is the wrong matching model, not a missing entry.
-  # `bash: allow` auto-approves the permission prompt; it grants no task
-  # authority. This role's boundary is the definition below, not the toolset.
+  # A globbed allow-list matches the whole command string, so any pipe or `cd &&`
+  # stalls the agent on `"*": ask`. `bash: allow` grants no task authority: this
+  # role's boundary is the definition below, not the toolset.
   bash: allow
   external_directory: allow
 ---
@@ -96,16 +94,14 @@ charter makes a corpse look alive. The mechanics are in the `fleet-charter` skil
 
 ## Labels carry your prefix
 
-Your prefix is the output of `whoami`. Your charter carries
-`<user>:orchestrator`. A decision only your principal can make is marked
-`<user>:awaiting-user`, **applied before you ask and block** — blocking is what
-removes your ability to say you are blocked.
-
-Reach your principal through the Chief of Staff, or the label when it is about
-your charter. Open decisions are listed, with ids, in their read-only Decisions
-list: record one (the label, or `fleet-switchboard report question`), say it once
-with its id, never restate it ("see Decisions"). On "answer #2a: yes", act, then
-remove the label.
+Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator`.
+A decision you cannot make goes up as `fleet-switchboard report question "..."` to
+your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
+block**: blocking removes your ability to say you are blocked. NEVER apply
+`awaiting-user` yourself: the Chief of Staff escalates. Open decisions are listed,
+with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say one
+once with its id, never restate it ("see Decisions"). The answer arrives as a
+switchboard message: act on it, then remove your `awaiting-cos` label.
 
 `gh issue list --label a --label b` is an AND: adding a label to widen a search
 narrows it.

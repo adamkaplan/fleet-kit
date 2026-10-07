@@ -5,16 +5,17 @@
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, For } from "solid-js"
 import { watch } from "node:fs"
-import { ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf } from "./decisions.mjs"
+import { ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
   setup(api: any) {
     const dir = stateDirOf(process.env)
+    const who = viewOf(process.env) // PR 18: from the pane's environment, set by `launch` and `bootstrap`
     const read = () => {
       const now = Date.now()
       const snapshot = loadSnapshot(dir, now)
-      return { view: buildView(snapshot, now), next: msUntilStale(snapshot) }
+      return { view: buildView(snapshot, now, ROW_WIDTH, who), next: msUntilStale(snapshot) }
     }
     const first = read()
     const [view, setView] = createSignal(first.view)

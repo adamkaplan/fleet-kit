@@ -64,7 +64,7 @@ is how many.
 | `import-v1` | world | `agent`, `fixture` | `fleet-switchboard import-v1` for that cast member, from a hand-made v1 export under `scenarios/` (`scenarios/v1-fixtures/`), with the cast's role, `reports_to`, issue and charter as its `metadata.fleet`. The member has no session until the step runs. Then the runner opens a pane on the imported session, the step a person does (PR 10) |
 | `report` | a cast member | `state` (`done`, `failed`, `blocked`, `question`, `working`, `paused`), `text` (one line), [`issue`] | `fleet-switchboard report` as that member (PR 13). Offline only |
 | `send` | a cast member | `to`, `text` (one line), [`issue`] | `fleet-switchboard send` as that member (PR 14). Offline only |
-| `awaiting` | you, world, a cast member | `issue`, `on` (true puts your awaiting-user label on the issue, false takes it off), [`title`] | The label changes on the fake GitHub and its `issues` webhook event reaches the hub (PR 14). Offline only |
+| `awaiting` | you, world, a cast member | `issue`, `on` (true puts the label on the issue, false takes it off), [`title`], [`label`: `user` (default, your awaiting-user label) or `cos` (the Chief of Staff's awaiting-cos label, PR 18)] | The label changes on the fake GitHub and its `issues` webhook event reaches the hub (PR 14). Offline only |
 | `delete-decisions` | world | none | `decisions.json` is deleted, as in D4; the next pass writes it again (PR 14). Offline only |
 | `use` | you | `command` (one that ensures the daemon, such as `decisions`) | You run a command that needs the daemon: ensure-on-use runs first, with a start that is this runner's daemon (PR 16). Offline only |
 | `bootstrap` | world | none | `fleet-switchboard bootstrap` on the fakes: opens the Chief of Staff (`cos`, which the cast names but the play does not create), or resumes it, or is refused (PR 16). Offline only |
@@ -73,6 +73,8 @@ is how many.
 | `orders` | a cast member | `charter`, `action` (`add`, `remove`), [`text` (one line)], [`number`] | `fleet-switchboard orders add\|remove --charter N` as that member (PR 17): the role check, the PATCH of the fake charter issue and the audit all run. Offline only |
 | `edit-orders` | you, world | `charter`, `text` (one line) | You add an order to the charter issue on GitHub yourself, and the cached read of it is dropped, as the webhook handler does (PR 17). Offline only |
 | `compact` | world | `agent`, `status` (`running`, `completed`, `failed`) | A compaction message of that status in the agent's transcript, in the shape v2 2.0.22 returns (PR 17). Offline only |
+| `decide` | a cast member | `action` (`escalate`, `resolve`, `answer`), `ref`, [`value`], [`note`], [`reason`] | PR 18. `fleet-switchboard decisions escalate\|resolve\|answer` as that member, on the one decision whose id is `ref` or whose title holds it. A `resolve` or `answer` goes through the policy judge first, as the shell call it is (an `ask` blocks the agent and nothing is done); an `escalate` is plain. `value` is `allow`, `deny` or the text of an answer; `reason` and `note` become a signed comment on the issue. Offline only |
+| `edit-cos-orders` | you, world | `text` (one line) | PR 18. You add a line to the Chief of Staff's orders file, in an editor. Offline only |
 | `wait` | world | none | Marks the end of the play |
 
 ### Expectations
@@ -104,7 +106,9 @@ is how many.
 | `judged` | `agent`, `question`, [`threshold`] | Jev answers yes about the agent's message (lab-model) |
 | `imported_messages` | `agent`, [`count`] | v2 holds the imported session with one message per v1 message (`count`, default: all of them), in v1's order, with v1's timestamps and the text that was typed (PR 10) |
 | `lists_asks` | `agent`, `issue` | `fleet-switchboard intents`, run in the pane that shows the agent's session, lists the ask `issue`: the agent is found by its `metadata.fleet` (PR 10) |
-| `decisions` | `at`, `count`, [`text`] | At the time `at`, the list `fleet-switchboard decisions` reads from `decisions.json` has `count` decisions (those whose title holds `text`, if given); a file the command calls stale lists none (PR 14). Offline only |
+| `decisions` | `at`, `count`, [`text`], [`as`], [`tier`] | At the time `at`, the list `fleet-switchboard decisions` reads from `decisions.json` has `count` decisions (those whose title holds `text`, if given); a file the command calls stale lists none (PR 14). With `as` (a cast member, whose role and repo pick its view, or `you`) or `tier` (`cos`, `human`, `orchestrator`, `all`, the `--tier` flag), only what that caller's view shows (PR 18). Offline only |
+| `issue_labels` | `issue`, [`has`], [`lacks`] | The issue on the fake GitHub carries the labels of every kind in `has` and none of the kinds in `lacks` (`user`: your awaiting-user label; `cos`: the Chief of Staff's awaiting-cos label) (PR 18). Offline only |
+| `permission_answered` | `agent`, `count`, [`decision`] | `count` replies (those of `decision`: `once`, `always`, `reject`, if given) were made through v2 to that agent's pending permission requests (PR 18). Offline only |
 | `orders_on_github` | `charter`, `count`, [`text`] | The charter issue on the fake GitHub holds `count` standing orders (those holding `text`, if given), the legacy `Standing authority:` line counted (PR 17). Offline only |
 | `orders_refused` | `agent`, `count` | `count` `orders add` or `orders remove` by that agent were refused and audited (PR 17). Offline only |
 | `decisions_say` | `at`, `text` | At the time `at`, the command's output contains `text` (PR 14). The Lab reads it only when the play ends, so `at` must be the time of the last step there |

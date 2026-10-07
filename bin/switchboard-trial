@@ -133,6 +133,7 @@ class Trial:
         prefix = self.label_prefix()
         env = dict(os.environ, GH_CONFIG_DIR=self.gh_config_dir, GH_TOKEN=self.gh_token() or "")
         wanted = ((prefix + ":orchestrator", "5319e7", "A charter: an orchestrator's standing job"),
+                  (prefix + ":awaiting-cos", "fbca04", "Waiting on the Chief of Staff: it resolves or escalates"),
                   (prefix + ":awaiting-user", "d93f0b", "Blocked on the user: the fleet's only blocking channel"))
         steps = [["label", "create", name, "--repo", repo, "--color", color, "--description", text, "--force"]
                  for name, color, text in wanted]

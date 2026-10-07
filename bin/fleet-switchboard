@@ -107,6 +107,9 @@ DEFAULTS = {
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
     "awaiting_label": None,         # PR 14: the label that marks a decision for you; None means `<OS user>:awaiting-user`
     "decisions_lookback_hours": 72,  # PR 14: how far back a boss's transcript is read for open report questions
+    "awaiting_cos_label": None,     # PR 18: the label that marks a decision for the Chief of Staff; None means `<OS user>:awaiting-cos`
+    "decisions_cos_grace_seconds": 300,  # PR 18: a pending request or question is the Chief of Staff's this long, then yours (0: at once)
+    "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
@@ -271,6 +274,10 @@ KNOWN_FAULTS = (
     "orders-wake",
     "anyone-can-order",
     "orders-never-judged",
+    "tier-flat",               # PR 18: every decision is shown to you, whatever its tier
+    "cos-orders-unfed",        # PR 18: the judge ignores the Chief of Staff's orders file
+    "anyone-edits-cos-orders",  # PR 18: no agent is stopped from writing the Chief of Staff's orders file
+    "answer-unjudged",         # PR 18: `decisions answer` and `decisions resolve` skip the judge
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -590,9 +597,26 @@ class V2Client:
         return self._call("session.permission.list", {"sessionID": session_id})
 
     def form_list(self, session_id):
-        """The session's pending forms (questions). UNVERIFIED: the operation name is
-        a guess from `form.list` in the design; no spike has run it."""
+        """The session's pending forms (questions): `session.form.list`, an array of {id, sessionID, title,
+        fields: [{key, type, title, ...}]} (VERIFIED in a throwaway v2 2.0.24, PR 18)."""
         return self._call("session.form.list", {"sessionID": session_id})
+
+    def permission_reply(self, session_id, request_id, decision, message=None):
+        """PR 18: answer a pending permission request: `decision` is `once`, `always` or `reject`, `message` a
+        reason (VERIFIED in a throwaway v2 2.0.24: POST /api/session/{sessionID}/permission/{requestID}/reply,
+        body {"decision", "message"}; an empty answer; 404 PermissionNotFoundError once answered)."""
+        if decision not in ("once", "always", "reject"):
+            raise ValueError("decision must be once, always or reject")
+        data = {"decision": decision}
+        if message:
+            data["message"] = message
+        return self._call("session.permission.reply", {"sessionID": session_id, "requestID": request_id}, data)
+
+    def form_reply(self, session_id, form_id, answer):
+        """PR 18: answer a pending form (a question): `answer` maps each field's key to its value (VERIFIED in a
+        throwaway v2 2.0.24: POST /api/session/{sessionID}/form/{formID}/reply, body {"answer": {key: value}};
+        an empty answer; the form then reads `state.status` answered)."""
+        return self._call("session.form.reply", {"sessionID": session_id, "formID": form_id}, {"answer": dict(answer)})
 
     def inbox_update(self, session_id, inbox_id, delivery):
         if delivery not in self.DELIVERIES:
@@ -1143,10 +1167,16 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
 
 ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "
                   "again, within their words. They cover nothing they do not name.")
+COS_ORDERS_CLOSING = ("These are the owner's standing orders to you. Answer for the owner only within their words; "
+                      "anything they do not name goes to the owner.")
 
 
 def orders_note(recipient, fact, repos=None):
-    """The standing-orders note: each order on its own line, then the closing line. Never cut."""
+    """The standing-orders note: each order on its own line, then the closing line. Never cut. PR 18: the Chief of
+    Staff's own orders (key `orders:cos:...`) are the file's text as the owner wrote it."""
+    if fact.key.startswith("%s:cos:" % ORDERS_KIND):
+        return "\n".join(["[switchboard] standing orders for %s (the owner's, to you):" % recipient,
+                          fact.summary.strip(), COS_ORDERS_CLOSING])
     lines = ["[switchboard] standing orders for %s (charter %s):" % (recipient, issue_tag(fact.repo, fact.issue, repos))]
     lines.extend("- %s" % order for order in fact.summary.splitlines() if order.strip())
     lines.append(ORDERS_CLOSING)
@@ -1286,6 +1316,7 @@ class Switchboard:
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
+        self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.synthetic_cache = {}       # PR 14: session -> (newest synthetic id, since, lines), a cache for the decisions
         self.intents = intents  # an IntentReader (PR 6), or None when no ask repo is configured
         self.sources, self.now, self.actor = list(sources), now, actor
@@ -2340,9 +2371,9 @@ def policy_questions():
             for name, (text, yes, no) in POLICY_QUESTIONS.items()}
 
 
-def policy_state(role, intent, done_when, authority, tool, arguments):
+def policy_state(role, intent, done_when, authority, tool, arguments, authority_clip=None):
     return {"role": role, "intent": _clip(intent, 600), "done_when": _clip(done_when, 400),
-            "standing_authority": _clip(authority, ORDERS_STATE_CLIP), "tool": tool,
+            "standing_authority": _clip(authority, authority_clip or ORDERS_STATE_CLIP), "tool": tool,
             "arguments": _clip(_canonical(arguments) if not isinstance(arguments, str) else arguments, 1500)}
 
 
@@ -2784,6 +2815,21 @@ def brief_in_transcript(engine, session_id):
     return bool(more)
 
 
+VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to pick its Decisions view
+VIEW_REPO_ENV = "FLEET_SWITCHBOARD_REPO"
+
+
+def view_env(role, repo):
+    """The pane's environment that tells its TUI who it is (not secrets): the Decisions panel shows every tier and
+    repo to the Chief of Staff, one repo to a pane that names it, the human tier to any other."""
+    env = {}
+    if isinstance(role, str) and role:
+        env[VIEW_ROLE_ENV] = role
+    if isinstance(repo, str) and repo:
+        env[VIEW_REPO_ENV] = repo
+    return env
+
+
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
                  brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
@@ -2802,6 +2848,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
     fleet = fleet_record(name, role, reports_to, issue, charter, repo)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -2857,6 +2904,8 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s: close it first" % (name, taken.pane))
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env.update(view_env(fleet.get("role"), fleet.get("repo") or (engine.config.get("intent_repo")
+                                                               if fleet.get("charter") else None)))  # PR 18
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
@@ -3854,6 +3903,21 @@ def validate_decisions_config(config, source):
     hours = config["decisions_lookback_hours"]
     if not _is_number(hours) or hours <= 0:
         raise ConfigError("%s: 'decisions_lookback_hours' must be a positive number, got %r" % (source, hours))
+    cos_label = config["awaiting_cos_label"]
+    if cos_label is not None and (not isinstance(cos_label, str) or not cos_label.strip() or "\n" in cos_label
+                                  or "," in cos_label):
+        raise ConfigError("%s: 'awaiting_cos_label' must be a label name without a comma or a newline, or null (the "
+                          "default, `<OS user>:awaiting-cos`), got %r" % (source, cos_label))
+    if cos_label is not None and cos_label == label:
+        raise ConfigError("%s: 'awaiting_cos_label' and 'awaiting_label' must differ, both are %r" % (source, label))
+    grace = config["decisions_cos_grace_seconds"]
+    if not _is_number(grace) or grace < 0:
+        raise ConfigError("%s: 'decisions_cos_grace_seconds' must be a number of seconds, 0 or more, got %r"
+                          % (source, grace))
+    orders = config["cos_orders_file"]
+    if orders is not None and (not isinstance(orders, str) or not os.path.isabs(orders)):
+        raise ConfigError("%s: 'cos_orders_file' must be an absolute path, or null (the default, standing-orders.md "
+                          "beside config.json), got %r" % (source, orders))
 
 
 def _decision_number(seed):
@@ -3918,16 +3982,22 @@ def decisions_from_github(engine, now):
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
                       "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
-                      "bare": True, "repo": record["repo"]})
+                      "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human"})
     return items, problems
 
 
 def decisions_from_requests(engine, now):
-    """(items, problems): the pending permission requests and questions of every fleet agent, as WorkerFacts read them."""
+    """(items, problems): the pending permission requests and questions of every fleet agent, as WorkerFacts read them.
+
+    PR 18: a request is the Chief of Staff's (`cos`) until it has been pending `decisions_cos_grace_seconds`, or
+    until the Chief of Staff escalated it (`decisions escalate`, escalated-requests.json); then it is yours. An
+    agent blocked on a prompt is never hidden from you for good."""
     source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
     if source is None:
         return [], []
     items, seen = [], {}
+    grace = engine.config["decisions_cos_grace_seconds"]
+    escalated = read_escalated(engine.state_dir) if engine.state_dir is not None else {}
     for observation, kind, request in source.requests:
         key = (observation.session_id, request["id"])
         what = " ".join(str(part) for part in [request.get("action") or request.get("title") or kind]
@@ -3935,12 +4005,79 @@ def decisions_from_requests(engine, now):
         asked = _created(request)
         seen[key] = asked if asked is not None else engine.decision_seen.get(key, now)
         ask = _issue_of(observation.fleet)
+        human = "%s:%s" % key in escalated or now - seen[key] >= grace
         items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": ask,
-                      "repo": _fleet_repo(observation.fleet, engine.config) if ask else None,
+                      "repo": _fleet_repo(observation.fleet, engine.config),
                       "agent": observation.name, "since": seen[key],
-                      "seed": "request:%s:%s" % key, "bare": False})
+                      "seed": "request:%s:%s" % key, "bare": False, "tier": "human" if human else "cos",
+                      "session": observation.session_id, "request": request["id"]})
     engine.decision_seen = seen  # memory only: a request with no time of its own keeps the first time it was seen
+    engine.request_keys = {"%s:%s" % key for key in seen}
     return items, []
+
+
+# ---- PR 18: a request the Chief of Staff escalated to you
+
+ESCALATED_FILE = "escalated-requests.json"
+ESCALATED_LOCK = "escalated-requests.lock"
+
+
+@contextmanager
+def escalated_lock(state_dir):
+    fd = os.open(str(Path(state_dir) / ESCALATED_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_escalated(state_dir):
+    """{"<session>:<request id>": iso time} of the permission requests and questions the Chief of Staff escalated.
+    A DISPOSABLE file, not a second source of truth: it only moves a request that is still pending from `cos` to
+    `human` a little before the grace period would, and it is pruned to the requests pending now. Missing,
+    unreadable or malformed reads as empty: the request is then yours when the grace period has run out."""
+    try:
+        raw = json.loads((Path(state_dir) / ESCALATED_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    found = raw.get("requests") if isinstance(raw, dict) else None
+    return {k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(found, dict) else {}
+
+
+def write_escalated(state_dir, requests):
+    path = Path(state_dir) / ESCALATED_FILE
+    temp = path.with_name("%s.%d.tmp" % (ESCALATED_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"requests": requests}, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+
+
+def mark_escalated(state_dir, key, when):
+    with escalated_lock(state_dir):
+        found = read_escalated(state_dir)
+        found[key] = iso(when)
+        write_escalated(state_dir, found)
+
+
+def prune_escalated(state_dir, pending):
+    """Forget every escalation of a request that is no longer pending (the daemon's, once a pass)."""
+    if pending is None or not (Path(state_dir) / ESCALATED_FILE).exists():
+        return
+    with escalated_lock(state_dir):
+        found = read_escalated(state_dir)
+        kept = {k: v for k, v in found.items() if k in pending}
+        if kept != found:
+            write_escalated(state_dir, kept)
 
 
 def synthetic_lines(engine, session_id, since):
@@ -4008,8 +4145,9 @@ def decisions_from_reports(engine, now):
             if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
                 continue
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
+            above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
-                          "repo": report["repo"],
+                          "repo": report["repo"], "tier": "orchestrator" if above else "cos",
                           "since": report["at"][0], "bare": False,
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1])})
     return items, problems
@@ -4039,7 +4177,8 @@ def report_answered(engine, report, reports, since, sends):
 def derive_decisions(engine, now):
     """(decisions, errors): every open decision, oldest first, and what could not be read.
 
-    Each decision is {id, title, ask, repo, agent, kind, since}. A source that fails is an error entry and the
+    Each decision is {id, title, ask, repo, agent, kind, since, tier} (PR 18: `cos`, `human` or `orchestrator`; a
+    permission request or question also names its `session` and `request`). A source that fails is an error entry and the
     others are still listed (audited once per change). Call after `engine.discover` and a fact collection."""
     items, errors = [], []
     sources = (("github", decisions_from_github), ("v2", decisions_from_requests),
@@ -4054,10 +4193,21 @@ def derive_decisions(engine, now):
             errors.append({"source": name, "error": _one_line(problem, 200)})
             engine._note("decisions.error", name, {"error": _one_line(problem, 200)})
     ids = assign_decision_ids(items, decision_repos(engine))
-    decisions = [{"id": ident, "title": _line_of(item["title"], DECISION_REPORT_TITLE_MAX if item["kind"] == "report"
-                                                else DECISION_TITLE_MAX), "ask": item["ask"],
-                  "repo": item.get("repo"), "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"])}
-                 for ident, item in zip(ids, items)]
+    watched = decision_repos(engine)
+    home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
+    yours = {(item["repo"] or home, item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
+    decisions = []
+    for ident, item in zip(ids, items):
+        tier = item["tier"]
+        if item["kind"] == "report" and item["ask"] and (item["repo"] or home, item["ask"]) in yours:
+            tier = "human"  # the Chief of Staff escalated its issue: the report that raised it is yours too
+        decision = {"id": ident, "title": _line_of(item["title"], DECISION_REPORT_TITLE_MAX if item["kind"] == "report"
+                                                  else DECISION_TITLE_MAX), "ask": item["ask"],
+                    "repo": item.get("repo"), "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"]),
+                    "tier": "human" if fault("tier-flat") else tier}
+        if item.get("request"):
+            decision.update(session=item["session"], request=item["request"])
+        decisions.append(decision)
     decisions.sort(key=lambda d: (d["since"], d["id"]))
     return decisions, errors
 
@@ -4080,6 +4230,10 @@ def publish_decisions(engine):
         return False
     now = engine.now()
     decisions, errors = derive_decisions(engine, now)
+    try:
+        prune_escalated(state, engine.request_keys)
+    except OSError:
+        pass  # a disposable file: a failed prune is tried again next pass
     path = state / DECISIONS_FILE
     current = read_decisions_file(path)
     if current is not None and current["decisions"] == decisions and current["errors"] == errors:
@@ -4146,32 +4300,70 @@ def format_age(seconds):
     return "%dd" % (seconds // 86400)
 
 
-def format_decisions(report, now):
-    """The human text: one line per decision, `<id>  waiting <age>  <agent>  <title>`, columns aligned."""
+DECISION_TIERS = ("cos", "human", "orchestrator")
+
+
+def decisions_view(fleet, config, repo=None, tier=None):
+    """PR 18: which decisions a caller sees. {"role", "repo", "tiers", "text"}: `repo` None is every repo, `tiers`
+    None is every tier.
+
+    With no flag: the Chief of Staff sees every repo and tier; an orchestrator its own repo (the repo in its fleet
+    metadata), every tier; anyone else (a plain shell, a TUI that is not a fleet agent) the `human` tier, every repo.
+    A flag overrides its own part and leaves the other at the caller's default."""
+    role = (fleet or {}).get("role")
+    if role == "chief-of-staff":
+        shown, tiers = None, None
+    elif role == "orchestrator":
+        shown, tiers = _fleet_repo(fleet, config), None
+    else:
+        shown, tiers = None, ["human"]
+    if repo is not None:
+        shown = repo
+    if tier is not None:
+        tiers = None if tier == "all" else [tier]
+    who = role if role in ("chief-of-staff", "orchestrator") else "you"
+    text = "%s, %s (for %s)" % ("repo %s" % shown if shown else "all repos",
+                                "tier %s" % ", ".join(tiers) if tiers else "all tiers", who)
+    return {"role": role, "repo": shown, "tiers": tiers, "text": text}
+
+
+def select_decisions(decisions, view):
+    """The decisions in `view`. One with no tier (a file an older daemon wrote) is the human's."""
+    return [d for d in decisions if (view["repo"] is None or d.get("repo") == view["repo"])
+            and (view["tiers"] is None or d.get("tier", "human") in view["tiers"])]
+
+
+def format_decisions(report, now, view=None):
+    """The human text: one line per decision, `<id>  waiting <age>  <agent>  <title>`, columns aligned.
+    With a `view` (PR 18) the first line says which view this is, and a view that mixes tiers shows each one."""
     if report["stale"]:
         return "Decisions unavailable: %s. Start it with `%s ensure`, or read the facts now with `%s decisions --fresh`." % (
             report["message"], PROG, PROG)
     decisions = report["decisions"]
+    human_only = view is None or view["tiers"] == ["human"]
     if not decisions:
-        lines = ["No decisions are waiting on you."]
+        lines = ["No decisions are waiting on you." if human_only else "No decisions in this view."]
     else:
         agents = [d.get("agent") or "-" for d in decisions]
         width_id, width_agent = max(len(d["id"]) for d in decisions), max(len(a) for a in agents)
         lines = []
         for decision, agent in zip(decisions, agents):
             since = parse_iso(decision.get("since"))
-            lines.append("%s  waiting %s  %s  %s" % (decision["id"].ljust(width_id),
-                                                     format_age(now - since) if since is not None else "?",
-                                                     agent.ljust(width_agent), decision["title"]))
+            tier = "" if human_only else "[%s]  " % decision.get("tier", "human")
+            lines.append("%s  waiting %s  %s%s  %s" % (decision["id"].ljust(width_id),
+                                                      format_age(now - since) if since is not None else "?",
+                                                      tier, agent.ljust(width_agent), decision["title"]))
         lines = [line.rstrip() for line in lines]
     lines.extend("(could not read %s: %s)" % (e.get("source"), e.get("error")) for e in report["errors"])
+    if view is not None:
+        lines.insert(0, "Decisions: %s" % view["text"])
     return "\n".join(lines)
 
 
-def fresh_decisions(runner, now):
-    """`decisions --fresh`: derive the list in this process, read-only, and write nothing. GitHub is read once,
-    here, because this process has no hub kept current by webhook events."""
-    engine, state, config = build_engine(runner, now, "cli", writable=False)
+def fresh_engine_decisions(runner, now, writable=False):
+    """(engine, decisions, errors) derived now in this process: GitHub is read here, once per repo and label,
+    because this process has no hub kept current by webhook events."""
+    engine, state, config = build_engine(runner, now, "cli", writable=writable)
     engine.discover(now())
     engine.collect_facts()
     repos = decision_repos(engine)
@@ -4181,18 +4373,27 @@ def fresh_decisions(runner, now):
         for repo in repos:  # every watched repo, each read with its own account (the hub's gh_api picks it)
             hub.read_awaiting(repo, now())
     decisions, errors = derive_decisions(engine, now())
+    return engine, decisions, errors
+
+
+def fresh_decisions(runner, now):
+    """`decisions --fresh`: derive the list in this process, read-only, and write nothing."""
+    _, decisions, errors = fresh_engine_decisions(runner, now)
     return {"stale": False, "message": None, "age_seconds": 0, "written_at": iso(now()), "generation": None,
             "decisions": decisions, "errors": errors}
 
 
-def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clear=False):
+def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clear=False, view=None):
     """`decisions --watch`: draw the list, then every second look again and draw it when it differs. Stdlib
     only, for a terminal that has no TUI plugin (a herdr side pane). Ends on Ctrl-C."""
     write = write or sys.stdout.write
     last = None
     try:
         while True:
-            text = format_decisions(decisions_report(state_dir, now()), now())
+            report = decisions_report(state_dir, now())
+            if view is not None:
+                report = dict(report, decisions=select_decisions(report["decisions"], view))
+            text = format_decisions(report, now(), view)
             if text != last:
                 write(("\x1b[2J\x1b[H" if clear else "") + text + "\n")
                 last = text
@@ -4201,40 +4402,87 @@ def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clea
         return EXIT_OK
 
 
+def decisions_caller(args, runner, now):
+    """The caller's fleet metadata for a read: its pane's fleet agent, `--from` in the Lab, or {} for anyone who
+    is not a fleet agent (a plain shell, a TUI): the human's view."""
+    if getattr(args, "sender", None) is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            raise CallerError("--from is only for the Lab (%s=1); an agent is identified by its pane" % LAB_ENV)
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        found = engine.discover(engine.now()).agents.get(args.sender)
+        if found is None:
+            raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
+        return found.fleet or {}
+    if not os.environ.get("HERDR_PANE_ID"):
+        return {}
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        return caller_fleet(engine.herdr, engine.v2, os.environ)
+    except (CallerError, ConfigError, V2Error, HerdrError):
+        return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
+
+
 def cmd_decisions(args, runner, now):
+    action = getattr(args, "decisions_action", None) or "list"
+    if action != "list":
+        return cmd_decision_write(args, action, runner, now)
     if args.watch and args.fresh:
         sys.stderr.write("%s: --watch reads the file the daemon writes; it cannot be combined with --fresh\n" % PROG)
         return EXIT_USAGE
+    if args.repo is not None and not REPO_RE.match(args.repo):
+        sys.stderr.write("%s: --repo must be OWNER/REPO, got %r\n" % (PROG, args.repo))
+        return EXIT_USAGE
+    try:
+        fleet = decisions_caller(args, runner, now)
+    except CallerError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    try:
+        config = load_config()
+    except ConfigError:
+        config = {}
+    view = decisions_view(fleet, config, args.repo, args.tier)
     state = state_dir_path()
     if args.watch:
-        return watch_decisions(state, now, clear=sys.stdout.isatty())
+        return watch_decisions(state, now, clear=sys.stdout.isatty(), view=view)
     report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
+    shown = dict(report, decisions=select_decisions(report["decisions"], view))
     if args.json:
-        print(json.dumps(dict(report, message=report["message"] or None), indent=2, sort_keys=True))
+        print(json.dumps(dict(shown, message=report["message"] or None, view=view), indent=2, sort_keys=True))
     else:
-        print(format_decisions(report, now()))
+        print(format_decisions(shown, now(), view))
     return EXIT_ERROR if report["stale"] else EXIT_OK
 
 
 def decisions_summary(state_dir, now):
-    """For `status`: how many decisions the file lists, and whether the daemon keeps it current."""
+    """For `status`: how many decisions the file lists (and how many of them are yours, the Chief of Staff's, an
+    orchestrator's), and whether the daemon keeps it current."""
     report = decisions_report(state_dir, now())
-    by_repo = {}
+    by_repo, by_tier = {}, {}
     for decision in report["decisions"]:
-        if decision.get("repo"):
+        tier = decision.get("tier", "human")
+        by_tier[tier] = by_tier.get(tier, 0) + 1
+        if decision.get("repo") and tier == "human":
             by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(report["decisions"]), "stale": report["stale"], "message": report["message"],
-            "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo}
+            "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo,
+            "by_tier": by_tier}
 
 
 def format_decisions_status(summary):
     if summary["stale"]:
         return ["      decisions  %s" % summary["message"]]
-    line = "      decisions  %d waiting on you (`%s decisions`)" % (summary["count"], PROG)
+    tiers = summary.get("by_tier") or {}
+    yours = tiers.get("human", 0) if tiers else summary["count"]
+    line = "      decisions  %d waiting on you (`%s decisions`)" % (yours, PROG)
     by_repo = summary.get("by_repo") or {}
     if len(by_repo) > 1:  # with one repo there is nothing to tell apart
         line = "      decisions  %d waiting on you (%s; `%s decisions`)" % (
-            summary["count"], ", ".join("%s %d" % (repo, count) for repo, count in sorted(by_repo.items())), PROG)
+            yours, ", ".join("%s %d" % (repo, count) for repo, count in sorted(by_repo.items())), PROG)
+    elsewhere = {tier: count for tier, count in tiers.items() if tier != "human"}
+    if elsewhere:
+        line += "; also open: %s" % ", ".join("%d with %s" % (count, "the Chief of Staff" if tier == "cos" else
+                                                                "an orchestrator") for tier, count in sorted(elsewhere.items()))
     return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
 
 
@@ -4630,6 +4878,17 @@ def signed_by_fleet(body):
 def _url_number(url):
     match = re.search(r"/(?:issues|pulls)/([0-9]+)$", url) if isinstance(url, str) else None
     return int(match.group(1)) if match else None
+
+
+def awaiting_cos_label(config):
+    """PR 18: the label that marks an issue as waiting on the Chief of Staff: the config's, or
+    `<user>:awaiting-cos`. The Chief of Staff either resolves it or escalates it to `awaiting_label`."""
+    return config.get("awaiting_cos_label") or "%s:awaiting-cos" % getpass.getuser()
+
+
+def orchestrator_label(config=None):
+    """PR 18: the label that marks a charter, `<user>:orchestrator` (skills/fleet-charter)."""
+    return "%s:orchestrator" % getpass.getuser()
 
 
 def awaiting_label(config):
@@ -5382,21 +5641,24 @@ class GitHubHub:
     # -- the issues that wait on you (PR 14): events keep the picture, the catch-up read makes it right
 
     def note_awaiting_issue(self, repo, issue, when=None):
-        """One issue as a webhook payload or a read shows it: listed when it is open and carries the label,
+        """One issue as a webhook payload or a read shows it: listed when it is open and carries a label,
         forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
-        when (the issue's `updated_at`), and a read can only say when the issue last changed."""
+        when (the issue's `updated_at`), and a read can only say when the issue last changed. PR 18: the tier
+        is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only."""
         number = _number(issue)
         if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
             return
         names = {(label.get("name") if isinstance(label, dict) else label) for label in issue["labels"]}
         key = (repo, number)
+        tier = "human" if awaiting_label(self.config) in names \
+            else "cos" if awaiting_cos_label(self.config) in names else None
         with self.lock:
-            if awaiting_label(self.config) in names and issue.get("state", "open") == "open":
+            if tier is not None and issue.get("state", "open") == "open":
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
                 since = known["since"] if known else (stamp if stamp is not None else when or self.now())
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
-                                      "parent": parent_of(issue)}
+                                      "parent": parent_of(issue), "tier": tier}
             else:
                 self.awaiting.pop(key, None)
 
@@ -5407,28 +5669,32 @@ class GitHubHub:
             self.note_awaiting_issue(repo, issue)
 
     def read_awaiting(self, repo, now=None):
-        """The catch-up's read of the open issues with the label: authoritative for `repo`, so an issue that
-        lost the label while no forwarder ran is dropped. Returns None, or one line saying why it failed."""
-        path = "repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, quote(awaiting_label(self.config), safe=""))
-        try:
-            found, truncated = self.read_pages(path)
-            records = [r for r in found if not _is_pr(r) and _number(r) is not None]
+        """The catch-up's read of the open issues with either label: authoritative for `repo`, so an issue that
+        lost its label while no forwarder ran is dropped. Two bounded reads per repo (one per label), never one
+        per issue. Returns None, or one line saying why it failed."""
+        wanted = (("awaiting-user", awaiting_label(self.config)), ("awaiting-cos", awaiting_cos_label(self.config)))
+        found = {}
+        for name, label in wanted:
+            path = "repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, quote(label, safe=""))
+            try:
+                records, truncated = self.read_pages(path)
+            except GitHubUnavailable as err:
+                with self.lock:
+                    self.awaiting_read[repo] = _one_line(str(err), 200)
+                return "%s issues: %s" % (name, self.awaiting_read[repo])
+            found[name] = [r for r in records if not _is_pr(r) and _number(r) is not None]
             if truncated:
-                self.last_truncated.setdefault("capped_reads", []).append("awaiting-user issues")
-        except GitHubUnavailable as err:
-            with self.lock:
-                self.awaiting_read[repo] = _one_line(str(err), 200)
-            return "awaiting-user issues: %s" % self.awaiting_read[repo]
+                self.last_truncated.setdefault("capped_reads", []).append("%s issues" % name)
         with self.lock:
             old = {key: value for key, value in self.awaiting.items() if key[0] == repo}
             self.awaiting = {key: value for key, value in self.awaiting.items() if key[0] != repo}
-        for record in records:
-            self.note_awaiting_issue(repo, dict(record, state="open", labels=[{"name": awaiting_label(self.config)}]),
-                                     now)
-            known = old.get((repo, _number(record)))
-            if known:
-                with self.lock:
-                    self.awaiting[(repo, _number(record))]["since"] = known["since"]
+        for name, label in reversed(wanted):  # your label last: an issue with both is yours
+            for record in found[name]:
+                self.note_awaiting_issue(repo, dict(record, state="open", labels=[{"name": label}]), now)
+                known = old.get((repo, _number(record)))
+                if known:
+                    with self.lock:
+                        self.awaiting[(repo, _number(record))]["since"] = known["since"]
         with self.lock:
             self.awaiting_read[repo] = None
         return None
@@ -5437,7 +5703,8 @@ class GitHubHub:
         """(records, errors) for the decisions: what the hub knows, and what it could not read."""
         with self.lock:
             records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
-                        "parent": entry["parent"]} for (repo, number), entry in sorted(self.awaiting.items())]
+                        "parent": entry["parent"], "tier": entry["tier"]}
+                       for (repo, number), entry in sorted(self.awaiting.items())]
             errors = []
             for repo in sorted(self.watches):
                 if repo not in self.awaiting_read:
@@ -5956,6 +6223,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+    report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
@@ -6039,6 +6307,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18
     lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
 
@@ -7254,12 +7523,11 @@ _SECRET_PATTERNS = (
 POLICY_MESSAGE_COMMANDS = ("send", "intent", "intents", "pending", "status", "remind")
 
 
-def plain_switchboard_message(text):
-    """True only for ONE simple `fleet-switchboard <send|intent|...> ...` command whose arguments cannot run
-    anything: no substitution, no operator, no redirect outside quotes, no unbalanced quote. Anything this
-    is unsure about is judged like any other shell command."""
+def _plain_words(text):
+    """The words of ONE simple command whose arguments cannot run anything: no substitution, no operator, no
+    redirect outside quotes, no unbalanced quote. None for anything this is unsure about."""
     if not isinstance(text, str) or not text.strip():
-        return False
+        return None
     quote, words, word, any_word = None, [], [], False
     for ch in text.strip():
         if quote == "'":
@@ -7269,7 +7537,7 @@ def plain_switchboard_message(text):
                 word.append(ch)
         elif quote == '"':
             if ch in "`$\\":
-                return False  # substitution or an escape inside double quotes
+                return None  # substitution or an escape inside double quotes
             if ch == '"':
                 quote = None
             else:
@@ -7277,7 +7545,7 @@ def plain_switchboard_message(text):
         elif ch in "'\"":
             quote, any_word = ch, True
         elif ch in "`$\\;&|<>(){}*?[]~#!\n\r":
-            return False  # an operator, expansion, glob, comment or a second line outside any quote
+            return None  # an operator, expansion, glob, comment or a second line outside any quote
         elif ch in " \t":
             if word or any_word:
                 words.append("".join(word))
@@ -7285,10 +7553,59 @@ def plain_switchboard_message(text):
         else:
             word.append(ch)
     if quote is not None:
-        return False
+        return None
     if word or any_word:
         words.append("".join(word))
-    return (len(words) >= 2 and os.path.basename(words[0]) == PROG and words[1] in POLICY_MESSAGE_COMMANDS)
+    return words
+
+
+def _decisions_subcommand(rest):
+    """The subcommand word of `decisions ...` (after its flags), or None for a plain list."""
+    skip = False
+    for word in rest:
+        if skip:
+            skip = False
+        elif word in ("--repo", "--tier", "--from"):
+            skip = True
+        elif not word.startswith("-"):
+            return word
+    return None
+
+
+def plain_switchboard_message(text):
+    """True only for ONE simple `fleet-switchboard <send|intent|...> ...` command whose arguments cannot run
+    anything (see _plain_words). Anything this is unsure about is judged like any other shell command.
+
+    PR 18: `decisions` (a read, `list`, or `escalate`) and `orders --cos` (a read) are plain too. `decisions
+    resolve` and `decisions answer` are NOT: they act for the owner, so the judge reads them against the Chief of
+    Staff's standing orders (the `answer-unjudged` fault lets them through)."""
+    words = _plain_words(text)
+    if not words or len(words) < 2 or os.path.basename(words[0]) != PROG:
+        return False
+    if words[1] in POLICY_MESSAGE_COMMANDS:
+        return True
+    if words[1] == "decisions":
+        return _decisions_subcommand(words[2:]) not in ("resolve", "answer") or fault("answer-unjudged")
+    return words[1] == "orders" and words[2:] == ["--cos"]
+
+
+def decision_gloss(state_dir, command):
+    """For a judged `decisions answer|resolve <id>`: one line saying what that decision is, read from the file the
+    daemon keeps, so the judge's question sees the request and not just its id. Empty when it cannot say."""
+    words = _plain_words(command)
+    if not words or len(words) < 4 or os.path.basename(words[0]) != PROG or words[1] != "decisions":
+        return ""
+    rest = words[2:]
+    sub = _decisions_subcommand(rest)
+    if sub not in ("resolve", "answer") or rest.index(sub) + 1 >= len(rest):
+        return ""
+    ident = rest[rest.index(sub) + 1]
+    body = read_decisions_file(Path(state_dir) / DECISIONS_FILE)
+    for decision in (body or {}).get("decisions", []):
+        if isinstance(decision, dict) and decision.get("id") in (ident, "#" + ident.lstrip("#")):
+            return " [the decision it acts on: %s by %s, %s tier: %s]" % (
+                decision.get("kind"), decision.get("agent"), decision.get("tier"), _one_line(decision.get("title"), 300))
+    return ""
 
 
 def redact_command_text(text, extra=()):
@@ -7769,10 +8086,14 @@ class PolicyJudge:
             else repo_commissioning_rule(request["arguments"])
         if rule:  # PR 15: no model and no GitHub read stands between this call and an ask
             return self.rule_reply(request, fleet, rule, box)
+        if not fault("anyone-edits-cos-orders") and writes_cos_orders(request["tool"], request["arguments"], self.config):
+            return self.orders_guard_reply(request, fleet, box)  # PR 18: no model, no GitHub read
         box["stage"] = "resolving the ask"
         context = self.context_of(fleet)
         box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
         request = dict(request, arguments=self.redacted(request["arguments"]))  # from here on, nothing sees a credential
+        if request["tool"] == "shell":  # PR 18: the judge's question sees what `decisions answer|resolve` acts on
+            request["arguments"] += decision_gloss(self.verdicts.path.parent, request["arguments"])
         key = policy_verdict_key(request, fleet["name"], context, fleet.get("role"))
         thresholds = dict(self.settings["thresholds"])
         if context["issue"] is None:
@@ -7821,6 +8142,26 @@ class PolicyJudge:
         reply["reason"] = _one_line("%s [rule: %s is hard to reverse whatever the thresholds say]" % (reply["reason"], rule), 600)
         return reply
 
+    def orders_guard_reply(self, request, fleet, box):
+        """PR 18: a shell command that writes the Chief of Staff's orders file is `speaks_for_you` and
+        `hard_to_reverse`, decided by the code: an agent must not grant itself authority. Never looser than
+        configured, like every judgement."""
+        thresholds = dict(self.settings["thresholds"])
+        answers = dict.fromkeys(POLICY_QUESTIONS)
+        answers.update(hard_to_reverse=1.0, speaks_for_you=1.0)
+        combined = combine_policy(answers, thresholds, request["configured"])
+        combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=None, combined=combined, cached=False,
+                             thresholds=thresholds, guard="cos-orders-edit")
+        shown = dict(request, arguments=self.redacted(request["arguments"]))
+        reply = self.reply_of(combined, False, fleet, {"issue": None}, shown)
+        if combined["outcome"] != "allow":
+            reply["reason"] = _one_line(
+                "Needs your yes: this writes the Chief of Staff's standing orders, which are the owner's alone, and "
+                "an agent must not grant itself authority. The owner edits that file in an editor (%s)."
+                % _what_text(shown), 600)
+        return reply
+
     # -- the pieces
 
     @staticmethod
@@ -7855,6 +8196,19 @@ class PolicyJudge:
         return fleet
 
     def context_of(self, fleet, refresh=False):
+        context = self.ask_context_of(fleet, refresh)
+        if fleet.get("role") != "chief-of-staff" or fault("cos-orders-unfed"):
+            return context
+        # PR 18: the Chief of Staff has no charter; what it may decide for the owner is its own orders file. One
+        # `stat` per call; the file is read again only when its mtime or size changes, and the verdict key
+        # holds the text, so an edit is seen at the next call.
+        try:
+            text = read_cos_orders(self.config)["text"]
+        except CosOrdersError:
+            text = None  # a file that cannot be used is no authority at all
+        return dict(context, authority=text) if text else context
+
+    def ask_context_of(self, fleet, refresh=False):
         if self.reader is None:
             return {"issue": None, "intent": None, "done_when": None, "authority": None, "charter": None,
                     "charter_repo": None, "orders": []}
@@ -7872,7 +8226,8 @@ class PolicyJudge:
     def state_of(self, request, fleet, context):
         return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
                             context["done_when"] or "not stated", context["authority"] or NO_STANDING_AUTHORITY,
-                            request["tool"], request["arguments"])
+                            request["tool"], request["arguments"],
+                            COS_ORDERS_STATE_CLIP if fleet.get("role") == "chief-of-staff" else None)
 
     def reply_of(self, combined, cached, fleet, context, request):
         outcome = combined["outcome"]
@@ -9085,17 +9440,6 @@ def build_parser():
     report.add_argument("text", nargs="+", help="One line: what happened (at most %d characters)" % REPORT_MAX)
     report.add_argument("--issue", type=issue_arg, help="The issue the report is about (default: your own)")
     report.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
-    decisions = sub.add_parser(
-        "decisions", help="What waits on you: the open decisions, one line each, from the file the daemon keeps",
-        description="Print the decisions waiting on you: the issues with your awaiting-user label, the permission "
-                    "requests and questions of every fleet agent, and the questions and blocks workers reported "
-                    "that nobody has answered. Read-only: refer to one by its id in chat. By default it reads "
-                    "decisions.json, which the daemon rewrites when the list changes; a file older than %d s is "
-                    "said to be stale, never shown as current." % DECISIONS_STALE_SECONDS)
-    decisions.add_argument("--json", action="store_true", help="Emit the file's list as JSON (with `stale`)")
-    decisions.add_argument("--fresh", action="store_true", help="Derive the list now instead of reading the file")
-    decisions.add_argument("--watch", action="store_true", help="Redraw when the list changes, until Ctrl-C (a "
-                                                               "fallback for a terminal without the TUI plugin)")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
     launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
@@ -9130,6 +9474,7 @@ def build_parser():
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
     add_orders_parsers(sub)  # PR 17
+    add_decision_parsers(sub)  # PR 18
     sub.add_parser("version", help="Print the version")
     return parser
 
@@ -9188,6 +9533,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return V1_MOVE_COMMANDS[args.action](args, runner, now)
         if args.action == "orders":  # PR 17
             return cmd_orders(args, runner, now)
+        if args.action == "labels":  # PR 18
+            return cmd_labels(args, runner, now)
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
@@ -10075,6 +10422,14 @@ class Installer:
             changes.append("updated %s" % ", ".join("%s (was %s)" % (key, raw[key]) for key in stale))
         return self.result("config", True, "%s: %s" % (path, "; ".join(changes)))
 
+    # -- 2b: the Chief of Staff's standing orders file (PR 18)
+    def step_cos_orders(self, config):
+        """A template when there is no file; never overwritten, never removed."""
+        path = cos_orders_path(config)
+        made = install_cos_orders_template(config, self.dry)
+        self.result("standing orders", made, "%s (a template: yours to edit; install never overwrites it)" % path,
+                    "%s (exists: left as it is)" % path)
+
     # -- 3: what goes into the profile
     def gh_config_dir(self):
         """Where gh keeps its accounts: read now, because the wrapper's private XDG_CONFIG_HOME would hide it."""
@@ -10376,6 +10731,7 @@ class Installer:
                     "%s (v%s)" % (binary, version))
         self.step_config(binary)
         config = self.read_config()
+        self.step_cos_orders(config)
         self.step_profile(config)
         self.step_pieces(binary, config)
         if with_link:
@@ -10444,7 +10800,8 @@ class Installer:
             wrapper.unlink()
         self.result("wrapper", had, "removed %s" % wrapper, "nothing to remove")
         self.uninstall_cli_link()
-        self.out.write("config, state and sessions are left alone; a running daemon keeps running until it exits\n")
+        self.out.write("config, state, sessions and your standing orders file are left alone; a running daemon keeps "
+                       "running until it exits\n")
 
     def uninstall_cli_link(self):
         """Remove the links `install` makes: only a symlink that points at this checkout's CLI."""
@@ -10783,6 +11140,12 @@ class OrdersFacts:
             return []
         facts = []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
+            if (observation.fleet or {}).get("role") == "chief-of-staff":  # PR 18: found by role, not by charter
+                if not observation.conflict and not observation.problem:
+                    found = self.cos_fact(observation)
+                    if found is not None:
+                        facts.append(found)
+                continue
             charter = (observation.fleet or {}).get("charter")
             repo = engine.charter_repo(observation)
             if not _is_issue_number(charter) or not repo or observation.conflict or observation.problem:
@@ -10802,6 +11165,26 @@ class OrdersFacts:
                               max(observation.created or 0.0, when or 0.0), issue=charter, batch=False,
                               orders=True, repo=repo))
         return facts
+
+    def cos_fact(self, observation):
+        """PR 18: the Chief of Staff's own orders as a fact: `orders:cos:<hash8 of the text>:<compaction id|start>`,
+        derived and stored nowhere, pending exactly when no such key is in its transcript or inbox: at its start, after
+        each completed compaction and when the file changes. None when there are no orders, or the file cannot be
+        used (said once in the audit)."""
+        engine = self.engine
+        try:
+            found = read_cos_orders(engine.config)
+            compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
+                engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+        except (CosOrdersError, V2Error) as err:  # nothing is guessed; a file too large is refused, not cut
+            engine._note("orders.unreadable", observation.name, {"cos": True, "error": _one_line(str(err), 200)})
+            return None
+        if not found["text"]:
+            return None
+        digest = hashlib.sha256(found["text"].encode("utf-8")).hexdigest()[:8]
+        return Fact("%s:cos:%s:%s" % (ORDERS_KIND, digest, compaction or "start"), observation.name, ORDERS_KIND,
+                    found["text"], max(observation.created or 0.0, when or 0.0, found["mtime"] or 0.0), batch=False,
+                    orders=True)
 
 
 def write_issue_body(reader, repo, number, body):
@@ -10880,6 +11263,12 @@ def _orders_charter(config, charter, fleet, watched):
 
 
 def cmd_orders(args, runner, now):
+    if getattr(args, "cos", False):
+        return cmd_orders_cos(args)
+    if args.orders_action is None:
+        sys.stderr.write("%s: orders needs list, add or remove (a charter's orders), or --cos (the Chief of Staff's "
+                         "own)\n" % PROG)
+        return EXIT_USAGE
     if args.orders_action == "list":
         reader = _intent_reader(runner, now)
         fleet, watched = soft_caller(runner, now)
@@ -10957,8 +11346,12 @@ def add_orders_parsers(sub):
                     "every agent of the charter at its start, after each compaction and when they change, and "
                     "the policy judge reads them at every tool call. `list` is open to anyone. `add` and `remove` "
                     "are for the chief-of-staff only (you are identified by your pane); they edit only that "
-                    "section of the issue body." % ORDERS_HEADING)
-    kinds = orders.add_subparsers(dest="orders_action", required=True)
+                    "section of the issue body. `--cos` prints the Chief of Staff's OWN standing orders: one "
+                    "local markdown file the owner edits (nothing here writes it)." % ORDERS_HEADING)
+    orders.add_argument("--cos", action="store_true",
+                        help="PR 18: print the Chief of Staff's own standing orders file and its path (read-only: "
+                             "the owner edits that file in an editor; there is no write command)")
+    kinds = orders.add_subparsers(dest="orders_action", required=False)
     listing = kinds.add_parser("list", help="The charter's standing orders, numbered")
     listing.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
     listing.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -10971,6 +11364,507 @@ def add_orders_parsers(sub):
     remove.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
     remove.add_argument("number", type=int, help="The order's number in `orders list`")
     remove.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+
+
+# ============================================================================
+# PR 18: decision tiers, the Chief of Staff's own standing orders, per-repo views
+#
+# docs/switchboard.md, "Decision tiers and the Chief of Staff's orders (PR 18)". The faults added here:
+# tier-flat, cos-orders-unfed, anyone-edits-cos-orders, answer-unjudged. Registered elsewhere:
+#   DEFAULTS            awaiting_cos_label, decisions_cos_grace_seconds, cos_orders_file
+#   GitHubHub           read_awaiting reads both labels; a record carries its tier
+#   derive_decisions    `tier` on every decision
+#   OrdersFacts         the Chief of Staff's orders, found by role, from the file
+#   PolicyJudge         context_of feeds the file as `authority`; the guard on the file
+#   launch_agent        FLEET_SWITCHBOARD_ROLE and FLEET_SWITCHBOARD_REPO in the pane's environment
+# ============================================================================
+
+COS_ORDERS_NAME = "standing-orders.md"
+COS_ORDERS_MAX_BYTES = 8192
+COS_ORDERS_STATE_CLIP = 1200  # characters of the Chief of Staff's orders the judge's model sees (a charter's: 600)
+COS_ORDERS_TEMPLATE = """<!--
+The Chief of Staff's standing orders: what it may decide for you, in your own words.
+
+This ONE file is read by the switchboard. It is yours: edit it in an editor; no fleet command writes it (the
+policy judge stops an agent that tries). It is free-form markdown, at most 8 KB; this comment is not shown to
+anyone. Write short, plain rules, for example:
+
+  - Answer permission prompts for read-only commands (ls, cat, git status, gh ... view) with allow.
+  - Merging a pull request that is green and reviewed: allowed in acme/api; never in acme/web.
+  - Anything about money, a release, a deploy, or deleting something: ask me.
+
+The Chief of Staff is told these orders at its start, after each compaction and whenever you change this file,
+and the policy judge reads them at each of its tool calls. They can only stop a question that is not worth
+asking: they never loosen a configured deny. Anything they do not name goes to you.
+-->
+"""
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+class CosOrdersError(Exception):
+    """The Chief of Staff's orders file cannot be used as it is, and why."""
+
+
+def cos_orders_path(config=None):
+    """The one file: config `cos_orders_file`, else `standing-orders.md` beside config.json."""
+    named = (config or {}).get("cos_orders_file")
+    return Path(named) if named else config_path().parent / COS_ORDERS_NAME
+
+
+def cos_orders_text_of(raw):
+    """The orders in a file's text: HTML comments (the template's header) are not orders; None when nothing is left."""
+    text = _HTML_COMMENT.sub("", raw or "").strip()
+    return text or None
+
+
+_COS_ORDERS_CACHE = {}  # path -> ((mtime_ns, size), result): one stat per call, a re-read only when either changes
+
+
+def read_cos_orders(config=None, path=None):
+    """{"path", "exists", "size", "mtime", "text", "raw"} of the Chief of Staff's orders file. `text` is the
+    orders with the template's comment taken out (None when there are none). Raises CosOrdersError when the file is
+    larger than COS_ORDERS_MAX_BYTES or cannot be read: a file that is too big is refused, never cut."""
+    path = Path(path) if path else cos_orders_path(config)
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return {"path": str(path), "exists": False, "size": 0, "mtime": None, "text": None, "raw": ""}
+    except OSError as err:
+        raise CosOrdersError("cannot read %s: %s" % (path, err.strerror or err)) from None
+    signature = (info.st_mtime_ns, info.st_size)
+    cached = _COS_ORDERS_CACHE.get(str(path))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    if info.st_size > COS_ORDERS_MAX_BYTES:
+        raise CosOrdersError("%s is %d bytes: the limit is %d (8 KB). Trim it; nothing is fed to the judge or told "
+                             "to the Chief of Staff from a file this large" % (path, info.st_size, COS_ORDERS_MAX_BYTES))
+    try:
+        raw = path.read_text()
+    except (OSError, UnicodeDecodeError) as err:
+        raise CosOrdersError("cannot read %s: %s" % (path, getattr(err, "strerror", None) or err)) from None
+    result = {"path": str(path), "exists": True, "size": info.st_size, "mtime": info.st_mtime,
+              "text": cos_orders_text_of(raw), "raw": raw}
+    if len(_COS_ORDERS_CACHE) > 20:
+        _COS_ORDERS_CACHE.clear()
+    _COS_ORDERS_CACHE[str(path)] = (signature, result)
+    return result
+
+
+def cos_orders_summary(config):
+    """For `status`: {"path", "exists", "size", "mtime", "error"}: the file's path, size and mtime, or none."""
+    try:
+        found = read_cos_orders(config)
+    except CosOrdersError as err:
+        return {"path": str(cos_orders_path(config)), "exists": True, "size": None, "mtime": None,
+                "error": _one_line(str(err), 200)}
+    return {"path": found["path"], "exists": found["exists"], "size": found["size"] if found["exists"] else None,
+            "mtime": iso(found["mtime"]) if found["mtime"] else None, "error": None}
+
+
+def format_cos_orders_status(summary):
+    if summary["error"]:
+        return ["      cos orders %s" % summary["error"]]
+    if not summary["exists"]:
+        return ["      cos orders none (%s; `%s install` makes a template)" % (summary["path"], PROG)]
+    return ["      cos orders %s (%d bytes, modified %s)" % (summary["path"], summary["size"], summary["mtime"])]
+
+
+def install_cos_orders_template(config, dry=False):
+    """Create the orders file's template when there is none. NEVER overwrites a file that exists. True when made."""
+    path = cos_orders_path(config)
+    if os.path.lexists(str(path)):
+        return False
+    if not dry:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(COS_ORDERS_TEMPLATE)
+    return True
+
+
+# An agent must not grant itself authority by writing the owner's orders for the Chief of Staff. Like the charter
+# rule, this is a guard on the words of a command, not a proof: a shell can build the call out of pieces this text
+# never shows (a variable, a script, another tool). It looks for the file's path or its file name.
+_COS_WRITE_VERBS = re.compile(
+    r"(?:\btee\b|\bsed\b[^;&|\n]*\s(?:-[A-Za-z]*i|--in-place)|\b(?:mv|cp|rm|ln|dd|truncate|install|rsync|touch|unlink|shred)\b"
+    r"|\b(?:vi|vim|nvim|nano|emacs|ed|ex|pico|micro|joe|code|subl|mate)\b"
+    r"|\b(?:python[0-9.]*|perl|ruby|node|bun|deno|php|lua|osascript|awk|gawk)\b[^;&|\n]*\s-[A-Za-z]*[cepE])", re.IGNORECASE)
+
+
+def writes_cos_orders(tool, arguments, config):
+    """True when a tool call writes the Chief of Staff's orders file: a shell command naming the file's path or its
+    file name with a redirect into it, `tee`, `sed -i`, `mv`, `cp`, `rm`, an editor or an interpreter one-liner; or
+    the `edit` tool on it."""
+    text = arguments if isinstance(arguments, str) else ""
+    path = cos_orders_path(config)
+    names = {str(path), path.name}
+    named = [n for n in names if n and n in text]
+    if not named:
+        return False
+    if tool == "edit":
+        return True
+    if tool != "shell":
+        return False
+    for n in named:
+        if re.search(r">>?\s*[\"']?[^\s;&|\"']*%s" % re.escape(n), text):
+            return True
+    return bool(_COS_WRITE_VERBS.search(text))
+
+
+# ---- the decisions that write: escalate, resolve, answer
+
+class DecisionError(Exception):
+    """A decision command that is refused, and why. Nothing was changed."""
+
+
+def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=False):
+    """One write through gh with the repo's own account, its token only in the child's environment. The
+    configured `gh`, `gh api <path> --method M [--input -]`. IntentError when it fails (a 404 is quiet when
+    `tolerate_missing`, for removing a label that is not there)."""
+    argv = [engine.config["gh"], "api", path, "--method", method] + (["--input", "-"] if data is not None else [])
+    accounts = getattr(engine, "accounts", None)
+    try:
+        env = accounts.env_for(repo) if accounts is not None else None
+    except AccountError as err:
+        raise IntentError("gh", str(err)) from None
+    extra = {"input": json.dumps(data)} if data is not None else {}
+    if env is not None:
+        extra["env"] = env
+    try:
+        done = runner(argv, capture_output=True, text=True, timeout=engine.config["call_timeout_seconds"], **extra)
+    except subprocess.TimeoutExpired:
+        raise IntentError("unavailable", "gh did not answer within %ss" % engine.config["call_timeout_seconds"]) from None
+    except OSError as err:
+        raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
+    if done.returncode != 0:
+        detail = _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode
+        if tolerate_missing and ("404" in detail or "Not Found" in detail):
+            return done
+        raise IntentError("gh", accounts.scrub(detail) if accounts is not None else detail)
+    return done
+
+
+def change_issue_labels(engine, runner, repo, number, add=(), remove=()):
+    """Add and remove labels on one issue, the added ones first. Audited before and after."""
+    subject = "issue:%s#%d" % (repo, number)
+    with engine._external("decisions.labels", subject, {"repo": repo, "issue": number, "add": list(add),
+                                                         "remove": list(remove)}):
+        base = "repos/%s/issues/%d/labels" % (repo, number)
+        if add:
+            _gh_write(engine, runner, repo, base, "POST", {"labels": list(add)})
+        for label in remove:
+            _gh_write(engine, runner, repo, "%s/%s" % (base, quote(label, safe="")), "DELETE", tolerate_missing=True)
+
+
+def comment_as(engine, runner, repo, number, text, author):
+    """A comment on the issue, signed as `author` (a fleet name) so it never comes back as an event."""
+    body = text.rstrip("\n") + ("\n\n" + fleet_mark(author) if author else "")
+    with engine._external("github.comment", "issue:%s#%d" % (repo, number), {"repo": repo, "issue": number,
+                                                                          "chars": len(body)}):
+        _gh_write(engine, runner, repo, "repos/%s/issues/%d/comments" % (repo, number), "POST", {"body": body})
+
+
+def decision_by_id(decisions, ident):
+    for wanted in (ident, "#" + ident.lstrip("#")):
+        for decision in decisions:
+            if decision["id"] == wanted:
+                return decision
+    return None
+
+
+def decision_actor(engine, args):
+    """(name, role) of who runs a decision write: a fleet agent by its pane (`--from` in the Lab), else (None, None):
+    you, in a plain shell. Only the Chief of Staff or you may write; any other fleet agent is refused."""
+    if getattr(args, "sender", None) is not None:
+        name, role, _ = orders_caller(engine, args)
+        return name, role
+    try:
+        name, role, _ = orders_caller(engine, args)
+    except CallerError:
+        return None, None
+    return name, role
+
+
+def _issue_target(engine, decision):
+    """(repo, number) of the issue a decision is about, or None."""
+    if not decision.get("ask"):
+        return None
+    repo = decision.get("repo") or (engine.intents.repo if engine.intents is not None else None) \
+        or engine.config.get("intent_repo")
+    watched = decision_repos(engine)
+    return (repo or (watched[0] if len(watched) == 1 else None)), decision["ask"]
+
+
+def escalate_decision(engine, runner, decision, reason, name):
+    """Move a decision to you. An issue (or the issue a report is about): your label on, the Chief of Staff's off. A
+    permission request or question: marked yours at once, in escalated-requests.json (disposable; the pass reads it)
+    and in the audit log. Returns one line saying what was done."""
+    kind, ident = decision["kind"], decision["id"]
+    if decision.get("tier") == "human":
+        return "%s is already yours: nothing changed" % ident
+    if kind in ("issue", "report"):
+        target = _issue_target(engine, decision)
+        if target is None or target[0] is None:
+            if kind == "report":
+                raise DecisionError("%s is a report that names no issue, so there is nothing to label: put it to "
+                                    "the owner in chat" % ident)
+            raise DecisionError("%s: cannot tell which repo its issue is in" % ident)
+        repo, number = target
+        change_issue_labels(engine, runner, repo, number, [awaiting_label(engine.config)],
+                            [awaiting_cos_label(engine.config)])
+        if reason:
+            comment_as(engine, runner, repo, number, "Escalated to the owner: %s" % reason, name)
+        engine._note("decisions.escalate", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
+                                                  "reason": _one_line(reason or "", 200)})
+        return "escalated %s to you: %s on %s#%d" % (ident, awaiting_label(engine.config), repo, number)
+    if engine.state_dir is None or not decision.get("session") or not decision.get("request"):
+        raise DecisionError("%s cannot be escalated: it names no request" % ident)
+    key = "%s:%s" % (decision["session"], decision["request"])
+    with engine._external("decisions.escalate", "request:%s" % key, {"decision": ident, "kind": kind,
+                                                                      "agent": decision.get("agent"), "by": name,
+                                                                      "reason": _one_line(reason or "", 200)}):
+        mark_escalated(engine.state_dir, key, engine.now())
+    return "escalated %s to you: the %s %s is waiting on you" % (ident, decision.get("agent") or "agent", kind)
+
+
+def resolve_decision(engine, runner, decision, note, name):
+    """Take both awaiting labels off the issue. A report is resolved by answering its worker with `send`; its issue's
+    labels are the only thing this removes."""
+    kind, ident = decision["kind"], decision["id"]
+    if kind in ("permission", "question"):
+        raise DecisionError("%s is a %s: answer it with `%s decisions answer %s ...`" % (ident, kind, PROG, ident))
+    target = _issue_target(engine, decision)
+    if target is None or target[0] is None:
+        raise DecisionError("%s is a report that names no issue: answer the worker with `%s send`, which resolves it"
+                            % (ident, PROG))
+    repo, number = target
+    change_issue_labels(engine, runner, repo, number, (),
+                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    if note:
+        comment_as(engine, runner, repo, number, "Resolved by the Chief of Staff: %s" % note, name)
+    engine._note("decisions.resolve", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
+                                             "note": _one_line(note or "", 200)})
+    return "resolved %s: %s and %s are off %s#%d" % (ident, awaiting_cos_label(engine.config),
+                                                      awaiting_label(engine.config), repo, number)
+
+
+def _form_answer(fields, value):
+    """{key: value} for the one visible field of a form, or DecisionError when the form is more than a question."""
+    visible = [f for f in fields if isinstance(f, dict) and not f.get("hidden") and isinstance(f.get("key"), str)]
+    if len(visible) != 1:
+        raise DecisionError("this form has %d visible fields (%s): answer it in its own pane, or tell the owner"
+                            % (len(visible), ", ".join(f.get("key", "?") for f in visible) or "none"))
+    field = visible[0]
+    kind = field.get("type")
+    if kind == "string":
+        return {field["key"]: value}
+    if kind == "boolean":
+        word = value.strip().lower()
+        if word in ("yes", "y", "true", "allow"):
+            return {field["key"]: True}
+        if word in ("no", "n", "false", "deny"):
+            return {field["key"]: False}
+        raise DecisionError("this question is yes or no: answer yes or no")
+    if kind in ("number", "integer"):
+        try:
+            return {field["key"]: int(value) if kind == "integer" else float(value)}
+        except ValueError:
+            raise DecisionError("this question wants a number") from None
+    raise DecisionError("this question's field is a %s, which `decisions answer` does not fill: answer it in its "
+                        "own pane, or tell the owner" % kind)
+
+
+def answer_decision(engine, decision, value, note, name):
+    """Reply to an agent's pending permission request (`allow` is `once`, `deny` is `reject`) or question (the one
+    field of its form), through v2. Audited before and after."""
+    kind, ident = decision["kind"], decision["id"]
+    if kind not in ("permission", "question"):
+        raise DecisionError("%s is %s: `decisions answer` is for a permission request or a question. Answer a report "
+                            "with `%s send`; an issue with a comment, then `decisions resolve`"
+                            % (ident, "an issue" if kind == "issue" else "a report", PROG))
+    session, request = decision.get("session"), decision.get("request")
+    if not session or not request:
+        raise DecisionError("%s names no request to reply to" % ident)
+    subject = "request:%s:%s" % (session, request)
+    detail = {"decision": ident, "kind": kind, "agent": decision.get("agent"), "by": name,
+              "note": _one_line(note or "", 200)}
+    if kind == "permission":
+        choice = value.strip().lower()
+        if choice not in ("allow", "deny"):
+            raise DecisionError("%s is a permission request: answer `allow` or `deny`" % ident)
+        with engine._external("decisions.answer", subject, dict(detail, answer=choice)):
+            engine.v2.permission_reply(session, request, "once" if choice == "allow" else "reject", note)
+        return "answered %s: %s" % (ident, choice)
+    forms = engine.v2.form_list(session)
+    form = next((f for f in forms if isinstance(f, dict) and f.get("id") == request), None) \
+        if isinstance(forms, list) else None
+    if form is None:
+        raise DecisionError("%s is no longer pending: the agent's form is gone" % ident)
+    answer = _form_answer(form.get("fields") or [], value)
+    with engine._external("decisions.answer", subject, dict(detail, answer=_one_line(value, 200))):
+        engine.v2.form_reply(session, request, answer)
+    return "answered %s" % ident
+
+
+def cmd_decision_write(args, action, runner, now):
+    """`decisions escalate|resolve|answer`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
+    try:
+        engine, decisions, _ = fresh_engine_decisions(runner, now, writable=True)
+        name, role = decision_actor(engine, args)
+        if name is not None and role != "chief-of-staff":
+            engine.audit.append(engine.actor, "decisions.refused", args.id,
+                                {"caller": name, "role": role, "action": action})
+            sys.stderr.write("%s: only the Chief of Staff, or you in a plain shell, may %s a decision; %s is %s. "
+                             "Raise it with `%s report question \"...\"` and your awaiting-cos label\n"
+                             % (PROG, action, name, "a %s" % role if role else "not given a role", PROG))
+            return EXIT_USAGE
+        decision = decision_by_id(decisions, args.id)
+        if decision is None:
+            raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
+        if action == "escalate":
+            line = escalate_decision(engine, runner, decision, args.reason, name)
+        elif action == "resolve":
+            line = resolve_decision(engine, runner, decision, args.note, name)
+        else:
+            line = answer_decision(engine, decision, args.value, args.note, name)
+    except (DecisionError, CallerError) as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    print(line)
+    try:
+        send_poke(state_dir_path())  # the daemon looks again now; a miss is harmless
+    except Exception:
+        pass
+    return EXIT_OK
+
+
+# ---- labels ensure
+
+LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing job"),
+               ("awaiting-cos", "fbca04", "Waiting on the Chief of Staff: it resolves or escalates"),
+               ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"))
+
+
+def label_names(config):
+    return {"orchestrator": orchestrator_label(config), "awaiting-cos": awaiting_cos_label(config),
+            "awaiting-user": awaiting_label(config)}
+
+
+def ensure_labels(engine, runner, repo):
+    """Create the three labels the fleet uses in `repo`, each with the repo's own gh account, unless they exist.
+    Returns {label: "created" | "already there"}. Idempotent."""
+    names = label_names(engine.config)
+    made = {}
+    for key, color, text in LABEL_SPECS:
+        label = names[key]
+        existing = _gh_write(engine, runner, repo, "repos/%s/labels/%s" % (repo, quote(label, safe="")), "GET",
+                             tolerate_missing=True)
+        if existing.returncode == 0:
+            made[label] = "already there"
+            continue
+        with engine._external("labels.create", "label:%s:%s" % (repo, label), {"repo": repo, "label": label}):
+            _gh_write(engine, runner, repo, "repos/%s/labels" % repo, "POST",
+                      {"name": label, "color": color, "description": text})
+        made[label] = "created"
+    return made
+
+
+def cmd_labels(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli")
+    if args.repo is not None and not REPO_RE.match(args.repo):
+        sys.stderr.write("%s: --repo must be OWNER/REPO, got %r\n" % (PROG, args.repo))
+        return EXIT_USAGE
+    repos = [args.repo] if args.repo else decision_repos(engine)
+    if not repos:
+        sys.stderr.write("%s: no repo is watched: name one with --repo OWNER/REPO, or add it to github_repos\n" % PROG)
+        return EXIT_USAGE
+    failed = False
+    for repo in repos:
+        try:
+            made = ensure_labels(engine, runner, repo)
+        except IntentError as err:
+            sys.stderr.write("%s: %s: %s\n" % (PROG, repo, _one_line(str(err), 300)))
+            failed = True
+            continue
+        for label, what in made.items():
+            print("%s  %s  %s" % (repo, label, what))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+# ---- orders --cos
+
+def cmd_orders_cos(args):
+    try:
+        found = read_cos_orders(load_config())
+    except CosOrdersError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_ERROR
+    if not found["exists"]:
+        print("none: there is no standing-orders file at %s (`%s install` makes a template; edit it in an editor)"
+              % (found["path"], PROG))
+        return EXIT_OK
+    print("The Chief of Staff's standing orders: %s (%d bytes, modified %s)" % (
+        found["path"], found["size"], iso(found["mtime"])))
+    print()
+    print(found["raw"].rstrip("\n"))
+    return EXIT_OK
+
+
+def add_decision_parsers(sub):
+    """`decisions [list]`, `decisions escalate|resolve|answer`, and `labels ensure`."""
+    decisions = sub.add_parser(
+        "decisions", help="What waits on a decision: list it by view, or escalate, resolve or answer one",
+        description="Decisions have tiers. An orchestrator never goes straight to you: it raises a decision to the "
+                    "Chief of Staff (`report question` and the awaiting-cos label), which resolves it with your "
+                    "standing orders or escalates it (the awaiting-user label). `decisions [list]` prints the "
+                    "open ones: the issues with either label, the permission requests and questions of every "
+                    "fleet agent, and the questions and blocks workers reported that nobody has answered. The "
+                    "view depends on who asks (you are identified by your pane): the Chief of Staff sees every "
+                    "repo and tier; an orchestrator its own repo, every tier; anyone else only the human tier. "
+                    "--repo and --tier override. It says which view it printed. By default it reads "
+                    "decisions.json, which the daemon rewrites when the list changes; a file older than %d s is "
+                    "said to be stale, never shown as current. `escalate`, `resolve` and `answer` are for the "
+                    "Chief of Staff (or you, in a plain shell)." % DECISIONS_STALE_SECONDS)
+    add_decision_list_flags(decisions)
+    kinds = decisions.add_subparsers(dest="decisions_action", required=False)
+    listing = kinds.add_parser("list", help="The open decisions in your view (the default)")
+    add_decision_list_flags(listing, suppress=True)
+    escalate = kinds.add_parser("escalate", help="Move a decision to the owner (the awaiting-user label, or at once "
+                                                 "for a permission request or question). Not judged")
+    escalate.add_argument("id", help="The decision's id")
+    escalate.add_argument("--reason", help="One line, posted as a comment on the issue, signed as you")
+    escalate.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    resolve = kinds.add_parser("resolve", help="Take both awaiting labels off a decision's issue: it is settled. "
+                                               "Judged against the Chief of Staff's standing orders")
+    resolve.add_argument("id", help="The decision's id")
+    resolve.add_argument("--note", help="One line, posted as a comment on the issue, signed as you")
+    resolve.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    answer = kinds.add_parser("answer", help="Answer an agent's pending permission request (allow|deny) or question "
+                                             "(the answer's text) through v2. Judged against the Chief of Staff's "
+                                             "standing orders")
+    answer.add_argument("id", help="The decision's id")
+    answer.add_argument("value", help="`allow` or `deny` for a permission request; the text for a question")
+    answer.add_argument("--note", help="One line: the order that covers it")
+    answer.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    labels = sub.add_parser("labels", help="Create the fleet's labels in the watched repos",
+                            description="`labels ensure` creates the labels the fleet uses, each with the repo's own "
+                                        "gh account, unless they exist: <user>:orchestrator, <user>:awaiting-cos and "
+                                        "<user>:awaiting-user. Idempotent. Run it when a repo joins.")
+    actions = labels.add_subparsers(dest="labels_action", required=True)
+    ensure = actions.add_parser("ensure", help="Create the missing labels (every watched repo by default)")
+    ensure.add_argument("--repo", metavar="OWNER/REPO", help="Only this repo")
+
+
+def add_decision_list_flags(parser, suppress=False):
+    given = {"default": argparse.SUPPRESS} if suppress else {}
+    parser.add_argument("--repo", metavar="OWNER/REPO", help="Only this repo's decisions", **given)
+    parser.add_argument("--tier", choices=DECISION_TIERS + ("all",), help="Only this tier: cos, human or "
+                                                                          "orchestrator; all for every tier", **given)
+    parser.add_argument("--json", action="store_true", help="Emit the list as JSON (with `stale` and `view`)", **given)
+    parser.add_argument("--fresh", action="store_true", help="Derive the list now instead of reading the file", **given)
+    parser.add_argument("--watch", action="store_true", help="Redraw when the list changes, until Ctrl-C (a "
+                                                            "fallback for a terminal without the TUI plugin)", **given)
+    parser.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name", **given)
 
 
 if __name__ == "__main__":

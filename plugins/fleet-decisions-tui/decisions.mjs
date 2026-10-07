@@ -12,6 +12,26 @@ export const SAFETY_MS = 60_000       // one slow re-read in case a file event w
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
 export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
+export const ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  // PR 18: set by `launch` and `bootstrap` in the pane's environment
+export const REPO_ENV = "FLEET_SWITCHBOARD_REPO"
+export const HUMAN_VIEW = { kind: "human", repo: null, label: "for you" }
+
+// Whose panel this is. The Chief of Staff's shows every tier and repo; a pane that names a repo shows that repo
+// only (every tier); any other, a TUI that is not a fleet agent, shows the human tier.
+export function viewOf(env) {
+  const role = env && env[ROLE_ENV]
+  const repo = env && env[REPO_ENV]
+  if (role === "chief-of-staff") return { kind: "all", repo: null, label: "all" }
+  if (typeof repo === "string" && repo.trim()) return { kind: "repo", repo: repo.trim(), label: repo.trim() }
+  return HUMAN_VIEW
+}
+
+// The decisions a view shows. A decision with no tier (a file an older daemon wrote) is the human's.
+export function selectFor(decisions, view) {
+  if (view.kind === "all") return decisions
+  if (view.kind === "repo") return decisions.filter((d) => d.repo === view.repo)
+  return decisions.filter((d) => (d.tier ?? "human") === "human")
+}
 
 // The state directory: FLEET_SWITCHBOARD_STATE when it is set, else the one the daemon writes to by default,
 // $XDG_STATE_HOME/fleet-switchboard or $HOME/.local/state/fleet-switchboard (a relative XDG_STATE_HOME is
@@ -109,13 +129,14 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
 // The section: a title, decisions grouped by repo (repos by name, oldest decision first within one), and
 // `rows` for the states that are not decisions. Never empty, never absent: an empty list says "none", and
 // a list the daemon does not keep current says so instead of showing as current.
-export function buildView(snapshot, nowMs, width = ROW_WIDTH) {
+export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW) {
   if (snapshot.status !== "ok") {
     return { title: "Decisions (?)", groups: [], rows: [{ key: "state", text: NOT_UPDATING }] }
   }
   const sinceOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? Infinity : t }
+  const shown = selectFor(snapshot.decisions, view)
   const byRepo = new Map()
-  for (const d of snapshot.decisions) {
+  for (const d of shown) {
     const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
     if (!byRepo.has(repo)) byRepo.set(repo, [])
     byRepo.get(repo).push(d)
@@ -132,7 +153,7 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH) {
   if (snapshot.errors.length) {
     rows.push({ key: "errors", text: oneLine(`${snapshot.errors.length} source(s) unreadable`, width) })
   }
-  return { title: `Decisions (${snapshot.decisions.length})`, groups, rows }
+  return { title: `Decisions (${shown.length}) ${view.label}`, groups, rows }
 }
 
 // The view as plain text lines (a rule between repos): what the sidebar shows, for tests and captures.

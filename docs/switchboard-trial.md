@@ -65,7 +65,7 @@ leaves the workspace for you to close.
 
 ## What you do each time
 
-Once ever: `init` (it also creates the charter labels in the repo and labels the charter, and pins the `gh` account the agents run as: `--gh-user NAME`, default the one active then), then `login`. After that, one command per session:
+Once ever: `init` (it also creates the three labels in the repo, `<user>:orchestrator`, `<user>:awaiting-cos` and `<user>:awaiting-user`, and labels the charter, and pins the `gh` account the agents run as: `--gh-user NAME`, default the one active then), then `login`. After that, one command per session:
 
 | When | You run | It does |
 |---|---|---|
@@ -125,6 +125,21 @@ Each of these is something the stack claims; watch whether it holds.
    `decisions --watch` keeps it on screen in a herdr side pane. Agents should say
    a decision once, with its id, and not repeat it: ask `cos` "what is waiting on
    me?" and it should answer "see Decisions".
+
+9. **Tiers.** Your list shows only what the Chief of Staff escalated to you. Put
+   `<user>:awaiting-cos` on an issue, or have `platform` run
+   `fleet-switchboard report question "<one line>"`: it is **not** in your panel,
+   and the `cos` pane's panel (title `Decisions (N) all`) shows it. `cos` works its
+   list on its wake: it resolves what your orders cover and escalates the rest
+   (`decisions escalate <id> --reason ...`), and the row then appears in yours.
+   A permission prompt of an agent shows in `cos`'s view at once and in yours
+   after five minutes (`decisions_cos_grace_seconds`). Your orders for `cos` are
+   one file, `standing-orders.md` beside the trial's `config.json`
+   (`<trial dir>/profile/config/fleet-switchboard/`): `install` makes a template, you
+   edit it, and `fleet-switchboard orders --cos` prints it. A panel gets its view
+   from the `FLEET_SWITCHBOARD_ROLE` and `FLEET_SWITCHBOARD_REPO` that `launch` puts
+   in the pane's environment, so a TUI that was running before this version needs a
+   restart (`switchboard-trial restart <name>`).
 
 The sidebar badge (`unread`) is only shown if your herdr sidebar config uses
 the `$unread` token; that setting is yours.

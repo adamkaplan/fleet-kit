@@ -164,6 +164,7 @@ class TestConfig(Base):
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
+            "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "intent_repo": None, "intent_required": True,
             "gh_users": {}, "github_poll_seconds": 60,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
@@ -768,7 +769,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "key-env-only-unseen",  # PR 16, the first real install
               "config-read-once", "catch-up-blocks-pass",  # PR 16, reload and the slow catch-up
               "catch-up-on-fresh-start", "full-window-every-time",  # PR 16, forward only
-              "orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged")  # PR 17
+              "orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged",  # PR 17
+              "tier-flat", "cos-orders-unfed", "anyone-edits-cos-orders", "answer-unjudged")  # PR 18
 
 
 class TestFaults(Base):
@@ -3502,7 +3504,8 @@ class TestLaunch(Base):
         self.assertEqual(method, "layout.apply")
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
-        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
+                                                     "FLEET_SWITCHBOARD_ROLE": "coder"})  # PR 18: who this pane is
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
@@ -3537,7 +3540,8 @@ class TestLaunch(Base):
                                    ("herdr.layout.apply", "intent"), ("herdr.layout.apply", "result"),
                                    ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
         layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
-        self.assertEqual(layout[0]["detail"]["env_names"], ["FLEET_SWITCHBOARD_LAB_PANE", "XDG_CONFIG_HOME"])
+        self.assertEqual(layout[0]["detail"]["env_names"],
+                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE", "XDG_CONFIG_HOME"])
         self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
         self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
 
@@ -3657,7 +3661,8 @@ class TestLaunch(Base):
         method, params = self.world.herdr.socket_calls[-1]
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
-        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1"})
+        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
+                                                 "FLEET_SWITCHBOARD_ROLE": "coder"})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -3774,8 +3779,10 @@ class OfflineRun:
         self.baseline = baseline
         self.work = test.home / "scenario-repo"
         self.work.mkdir(exist_ok=True)
+        self.cos_orders_path = str(test.home / "scenario-runs" / scenario["id"] / label / "standing-orders.md")  # PR 18
         self.world = World(test, agents=(), state=test.home / "scenario-runs" / scenario["id"] / label,
-                           config=dict(JEV_SCENARIO_CONFIG, **(scenario.get("config") or {})))
+                           config=dict(JEV_SCENARIO_CONFIG, cos_orders_file=self.cos_orders_path,
+                                       **(scenario.get("config") or {})))
         launched = {step["agent"] for step in scenario["steps"] if step["do"] in ("launch", "import-v1")}
         if any(step["do"] == "bootstrap" for step in scenario["steps"]):
             launched.add(sb.COS_NAME)  # PR 16: `bootstrap` makes the Chief of Staff
@@ -4578,7 +4585,8 @@ def _github_extend_offline_run():
         original_init(self, test, scenario, label, faults, baseline)
         self.hub = None
         if uses_github(scenario):
-            raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO], "gh": GH_BIN}
+            raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "github_repos": [GH_REPO], "gh": GH_BIN,
+                   "cos_orders_file": self.cos_orders_path}  # PR 18: each run has its own orders file
             self.world.config = sb.validate_config(raw)
             build_hub(self)
             make_engine = self.world.new_engine
@@ -4597,7 +4605,8 @@ def _github_extend_offline_run():
         elif do == "occupy-hook":
             self.gh.occupied = True
         elif do == "awaiting":  # PR 14
-            self.gh.set_label(int(step["issue"]), sb.awaiting_label(self.world.config), step["on"], step.get("title"))
+            name = (sb.awaiting_cos_label if step.get("label") == "cos" else sb.awaiting_label)(self.world.config)  # PR 18
+            self.gh.set_label(int(step["issue"]), name, step["on"], step.get("title"))
         else:
             original_apply(self, step)
         if self.hub is not None and do == "kill-daemon":
@@ -5871,7 +5880,8 @@ def apply_worker_step(run, step):
         return  # you simply prompt nothing more
     if do == "permission" and step["actor"] != "you":
         name = step["actor"]  # a turn that cannot finish until you answer
-        world.v2.start_turn(world.sessions[name], "fleet task", fleet=True, lasts=86400)
+        if not world.v2.busy(world.sessions[name]):  # PR 18: an agent already blocked asks again, in the same turn
+            world.v2.start_turn(world.sessions[name], "fleet task", fleet=True, lasts=86400)
         world.v2.ask_permission(world.sessions[name])
         world.herdr.panes[world.panes[name]]["status"] = "blocked"
     elif do == "permission":
@@ -9182,7 +9192,8 @@ class TestHandoff(HandoffCase):
         self.assertEqual(len(writes), 1)
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
         source = SWITCHBOARD.read_text()
-        self.assertEqual(source.count('"--method"'), 2)  # the handoff comment, and (PR 17) `write_issue_body`
+        # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
+        self.assertEqual(source.count('"--method"'), 3)
 
 
 class TestForegroundScenarios(Base):
@@ -9410,6 +9421,7 @@ class PolicyRig:
     def __init__(self, run):
         world = run.world
         self.config = policy_raw_config()
+        self.config["cos_orders_file"] = run.cos_orders_path  # PR 18: the file this run's Chief of Staff has
         self.jev = PolicyCountingJev(sb.build_jev(self.config))
         self.judge = sb.PolicyJudge(self.config, world.engine.v2, getattr(world, "intents", None), self.jev,
                                     sb.AuditLog(world.audit_path), world.state, world.clock.now)
@@ -9421,7 +9433,7 @@ def _policy_stricter(reply_outcome, configured):
     return order(reply_outcome) > order(configured)
 
 
-def apply_tool_call(run, step):
+def apply_tool_call(run, step, index=None):
     """`tool-call`: the plugin's JSON through `judge-tool`'s own path (parse, judge_request), against the fakes.
 
     An ask then blocks the agent as v2 would after the hook sets `ask`, with the
@@ -9429,7 +9441,8 @@ def apply_tool_call(run, step):
     """
     world, name = run.world, step["actor"]
     rig = run.policy = getattr(run, "policy", None) or PolicyRig(run)
-    index = next(i for i, s in enumerate(run.scenario["steps"]) if s is step)
+    if index is None:
+        index = next(i for i, s in enumerate(run.scenario["steps"]) if s is step)
     configured = step.get("configured", "allow")
     request = sb.parse_policy_request(json.dumps({"sessionID": world.sessions[name], "tool": step["tool"],
                                                   "arguments": step["arguments"], "outcome": configured}))
@@ -12249,14 +12262,15 @@ class TestTrialDriver(Base):
         trial.gh_user = "the-pinned-one"
         with mock.patch.object(TRIAL.getpass, "getuser", return_value="osuser"):
             names = trial.ensure_repo_labels("o/r", 7)
-        self.assertEqual(names, ["osuser:orchestrator", "osuser:awaiting-user"])
+        self.assertEqual(names, ["osuser:orchestrator", "osuser:awaiting-cos", "osuser:awaiting-user"])
         calls = [line.split("|", 1)[1].split() for line in log.read_text().splitlines() if "auth token" not in line]
         self.assertEqual([c[:3] for c in calls], [["label", "create", "osuser:orchestrator"],
+                                                   ["label", "create", "osuser:awaiting-cos"],
                                                    ["label", "create", "osuser:awaiting-user"],
                                                    ["issue", "edit", "7"]])
-        for call in calls[:2]:
+        for call in calls[:3]:
             self.assertIn("--force", call, "idempotent: an existing label is updated, not an error")
-        self.assertIn("osuser:orchestrator", calls[2])
+        self.assertIn("osuser:orchestrator", calls[3])
 
     def test_a_label_failure_stops_init_and_says_which_call_failed(self):
         trial = self.trial()
@@ -13175,7 +13189,9 @@ class TestDecisionDerivation(DecisionsBase):
         self.assertRegex(found["id"], r"^#2[a-z]{2}$")
         self.assertIn("shell echo hi", found["title"])
         self.assertEqual(found["since"], sb.iso(EPOCH))
-        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "repo", "since", "title"])
+        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "repo", "request", "session", "since", "tier",
+                                         "title"])
+        self.assertEqual(found["tier"], "cos")  # PR 18: a prompt is the Chief of Staff's until the grace has run out
 
     def test_an_agent_with_no_boss_is_listed_too(self):
         self.world.v2.start_turn(self.world.sessions["platform"], "fleet task", fleet=True, lasts=86400)
@@ -13510,16 +13526,18 @@ class TestDecisionsCommand(DecisionsBase):
     def test_an_empty_list_says_so_and_never_prints_nothing(self):
         self.pass_()
         code, out, err = self.cli("decisions")
-        self.assertEqual((code, out), (0, "No decisions are waiting on you.\n"), err)
+        self.assertEqual((code, out), (0, "Decisions: all repos, tier human (for you)\n"
+                                          "No decisions are waiting on you.\n"), err)
 
     def test_each_decision_is_one_line_with_id_age_agent_and_title(self):
         self.ask_the_boss("Close #2? and a second deploy run?")
         self.pass_(5)
         self.world.tick(11 * 60)
         os.utime(str(self.world.state / sb.DECISIONS_FILE), (self.world.clock.now(),) * 2)
-        code, out, err = self.cli("decisions")
-        (line,) = out.splitlines()
-        self.assertRegex(line, r"^#2[a-z]{2}  waiting 11m  coder  Close #2\? and a second deploy run\?$")
+        code, out, err = self.cli("decisions", "--tier", "all")
+        head, line = out.splitlines()
+        self.assertEqual(head, "Decisions: all repos, all tiers (for you)")
+        self.assertRegex(line, r"^#2[a-z]{2}  waiting 11m  \[cos\]  coder  Close #2\? and a second deploy run\?$")
 
     def test_columns_line_up_when_ids_differ_in_width(self):
         self.ask_the_boss("first")
@@ -13527,14 +13545,14 @@ class TestDecisionsCommand(DecisionsBase):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
         self.pass_(1)
-        code, out, err = self.cli("decisions")
-        first, second = out.splitlines()
+        code, out, err = self.cli("decisions", "--tier", "all")
+        _, first, second = out.splitlines()
         self.assertEqual(first.index("waiting"), second.index("waiting"))
 
     def test_json_prints_the_files_list(self):
         self.ask_the_boss("Which database?")
         self.pass_()
-        code, out, err = self.cli("decisions", "--json")
+        code, out, err = self.cli("decisions", "--json", "--tier", "all")
         body = json.loads(out)
         self.assertEqual((code, body["stale"], [d["title"] for d in body["decisions"]]), (0, False, ["Which database?"]))
 
@@ -13569,21 +13587,21 @@ class TestDecisionsCommand(DecisionsBase):
         self.ask_the_boss("Which database?")
         self.pass_()
         self.world.tick(600)
-        code, out, err = self.cli("decisions", **{sb.FAULT_ENV: "stale-as-fresh"})
+        code, out, err = self.cli("decisions", "--tier", "all", **{sb.FAULT_ENV: "stale-as-fresh"})
         self.assertEqual(code, 0)
         self.assertIn("Which database?", out)
         self.assertNotIn("not updating", out)
 
     def test_fresh_recomputes_without_the_file(self):
         self.ask_the_boss("Which database?")
-        code, out, err = self.cli("decisions", "--fresh")
+        code, out, err = self.cli("decisions", "--fresh", "--tier", "all")
         self.assertEqual(code, 0, err)
         self.assertIn("Which database?", out)
         self.assertFalse((self.world.state / sb.DECISIONS_FILE).exists(), "--fresh writes nothing")
 
     def test_fresh_json_has_the_list_and_the_errors(self):
         self.ask_the_boss("Which database?")
-        code, out, err = self.cli("decisions", "--fresh", "--json")
+        code, out, err = self.cli("decisions", "--fresh", "--json", "--tier", "all")
         body = json.loads(out)
         self.assertEqual((code, body["stale"], body["errors"], len(body["decisions"])), (0, False, [], 1))
 
@@ -13634,10 +13652,15 @@ def oracle_decisions(self, e):
     """PR 14: the list the command shows at `at`: `count` decisions, those whose title holds `text` when given.
     A file the command calls stale shows no list at all."""
     seen = self.snapshots[sc.duration_seconds(e["at"])]["report"]
-    shown = [] if seen["stale"] else [d for d in seen["decisions"] if e.get("text", "") in d["title"]]
+    decisions = [] if seen["stale"] else seen["decisions"]
+    if "as" in e or "tier" in e:  # PR 18: what that caller's view of the list holds
+        who = e.get("as", "you")
+        fleet = {} if who == "you" else self.fleet_of(self.scenario["cast"][who])
+        decisions = sb.select_decisions(decisions, sb.decisions_view(fleet, self.world.config, None, e.get("tier")))
+    shown = [d for d in decisions if e.get("text", "") in d["title"]]
     return len(shown) == e["count"], "at %s the command %s; %d matching decision(s): %s" % (
-        e["at"], "calls the list stale" if seen["stale"] else "shows %d" % len(seen["decisions"]), len(shown),
-        [d["id"] for d in shown])
+        e["at"], "calls the list stale" if seen["stale"] else "shows %d" % len(decisions), len(shown),
+        [(d["id"], d.get("tier")) for d in shown])
 
 
 @adds_to(OfflineRun)
@@ -13800,7 +13823,7 @@ class TestDecisionsPlugin(Base):
     def test_a_current_file_is_listed_by_repo_with_id_and_age_then_the_whole_wrapped_title(self):
         self.assertEqual(self.r["ok"], {"status": "ok", "n": 2})
         view = self.r["view"]
-        self.assertEqual(view["title"], "Decisions (2)")
+        self.assertEqual(view["title"], "Decisions (2) for you")
         self.assertEqual(view["rows"], [])
         (group,) = view["groups"]  # these two carry no repo: one group
         first, second = group["entries"]
@@ -13829,7 +13852,7 @@ class TestDecisionsPlugin(Base):
         self.assertEqual([x["repo"] for x in g], ["acme/api", "acme/web"])
         self.assertEqual([e["key"] for e in g[1]["entries"]], ["web#2", "web#9"])
         lines = self.r["groupedLines"]
-        self.assertEqual(lines[0], "Decisions (3)")
+        self.assertEqual(lines[0], "Decisions (3) for you")
         self.assertEqual(lines.count("\u2500" * 34), 1)
         self.assertEqual(lines[1:5], ["acme/api", "api#1 3m", "api only", "\u2500" * 34])
         self.assertEqual(lines[5:10], ["acme/web", "web#2 50m", "older web", "q" * 34, "q" * 6])
@@ -13839,7 +13862,7 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "groups": [], "rows": [{"key": "state", "text": "daemon not updating"}]})
 
     def test_an_empty_list_shows_none_and_the_section_is_never_empty(self):
-        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0)", "groups": [], "rows": [{"key": "none", "text": "none"}]})
+        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0) for you", "groups": [], "rows": [{"key": "none", "text": "none"}]})
         for key in ("view", "staleView", "emptyView", "errorsView", "junkView"):
             self.assertTrue(self.r[key]["rows"] or self.r[key]["groups"], key)
 
@@ -14009,7 +14032,8 @@ class TestDecisionsRoleText(unittest.TestCase):
                 self.assertIn("read-only Decisions", text)
                 self.assertIn('"see Decisions"', text)
                 self.assertIn("with its id", text)
-                self.assertIn("remove the label", text)
+                self.assertIn("remove your `awaiting-cos` label" if role_of(path) == "orchestrator"  # PR 18: the tiers
+                              else "decisions resolve", text)
                 self.assertEqual("fleet-switchboard report question" in text, role_of(path) == "orchestrator")
 
     def test_the_workers_are_not_given_the_boss_text(self):
@@ -14088,10 +14112,10 @@ class TestDecisionsScenarios(Base):
                 self.assertTrue(sb.fault(name))
 
     def test_the_vocabulary_has_the_decision_steps_and_oracles(self):
-        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "repo", "title"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "label", "on", "repo", "title"])  # PR 18: label
         self.assertEqual(sorted(sc.STEP_FIELDS["send"]), ["issue", "text", "to"])
         self.assertEqual(sc.STEP_FIELDS["delete-decisions"], {})
-        self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions"]), ["at", "count", "text"])
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions"]), ["as", "at", "count", "text", "tier"])  # PR 18
         self.assertEqual(sorted(sc.EXPECT_FIELDS["decisions_say"]), ["at", "text"])
 
 
@@ -15441,7 +15465,7 @@ class TestD6Scenario(Base):
         self.assertEqual([s["repo"] for s in d6["steps"] if s["do"] == "awaiting"], [ACME_API, ACME_WEB])
 
     def test_the_awaiting_step_may_name_a_repo(self):
-        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "on", "repo", "title"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["awaiting"]), ["issue", "label", "on", "repo", "title"])  # PR 18: label
 # ======================================================================
 # PR 16: install, a service that keeps the daemon alive, the decision-model
 # key as a file, the daemon started on use, and `bootstrap`.
@@ -17724,7 +17748,7 @@ class TestGithubReadsMoveForwardOnly(Base):
         rig = self.rig()
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         reads = self.calls(rig, "labels=")
-        self.assertEqual(len(reads), 1)
+        self.assertEqual(len(reads), 2, "PR 18: one read per label (yours, the Chief of Staff's), never one per issue")
         self.assertIn("page=1", reads[0])
         self.assertNotIn("--paginate", " ".join(map(str, reads)))
 
@@ -18871,6 +18895,1697 @@ class TestOrdersScenarios(Base):
         self.assertEqual(sorted(sc.STEP_FIELDS["compact"]), ["agent", "status"])
         self.assertEqual(sorted(sc.EXPECT_FIELDS["orders_on_github"]), ["charter", "count", "text"])
         self.assertEqual(sorted(sc.EXPECT_FIELDS["orders_refused"]), ["agent", "count"])
+
+
+# ======================================================================
+# PR 18: decision tiers, the Chief of Staff's own standing orders, per-repo views
+#
+# docs/switchboard.md, "Decision tiers and the Chief of Staff's orders (PR 18)". The faults added here:
+# tier-flat, cos-orders-unfed, anyone-edits-cos-orders, answer-unjudged.
+# ======================================================================
+TIER_USER = "me"
+TIER_LABELS = {"awaiting_label": "me:awaiting-user", "awaiting_cos_label": "me:awaiting-cos"}
+API, WEB = "acme/api", "acme/web"
+
+
+@adds_to(FakeV2)
+def op_session_permission_reply(self, params, body):
+    """`session.permission.reply`, in the shape a throwaway v2 2.0.24 answered (docs/switchboard.md, PR 18): a body
+    of exactly {decision: once|always|reject, message?}; an empty answer; 404 once the request is answered."""
+    self._session(params)
+    if not isinstance(body, dict) or set(body) - {"decision", "message"} or body.get("decision") not in ("once", "always", "reject"):
+        raise FakeHTTP(400, "InvalidRequestError", "Expected Permission.Reply")
+    asks = self.__dict__.setdefault("asks", {}).get(params["sessionID"], [])
+    found = next((a for a in asks if a["id"] == params["requestID"]), None)
+    if found is None:
+        raise FakeHTTP(404, "PermissionNotFoundError", "Permission request not found: %s" % params["requestID"])
+    asks.remove(found)
+    self.__dict__.setdefault("permission_replies", []).append(
+        {"session": params["sessionID"], "request": found["id"], "decision": body["decision"], "message": body.get("message")})
+    return None
+
+
+@adds_to(FakeV2)
+def ask_form(self, sid, fields=None, title="Which database?"):
+    """A pending form (a question), as `session.form.list` shows it."""
+    forms = self.__dict__.setdefault("forms", {})
+    form = {"id": "frm_" + self._id("x")[4:], "sessionID": sid, "title": title,
+            "fields": fields if fields is not None else [{"key": "db", "title": "Which database?", "type": "string"}]}
+    form["time"] = {"created": self.clock.ms()}
+    forms.setdefault(sid, []).append(form)
+    return form
+
+
+@adds_to(FakeV2)
+def op_session_form_reply(self, params, body):
+    """`session.form.reply`: a body of exactly {answer: {key: value}}; the form is then answered."""
+    self._session(params)
+    if not isinstance(body, dict) or set(body) != {"answer"} or not isinstance(body["answer"], dict):
+        raise FakeHTTP(400, "InvalidRequestError", "Expected Form.Reply")
+    forms = self.__dict__.setdefault("forms", {}).get(params["sessionID"], [])
+    found = next((f for f in forms if f["id"] == params["formID"]), None)
+    if found is None:
+        raise FakeHTTP(404, "FormNotFoundError", "Form not found")
+    forms.remove(found)
+    self.__dict__.setdefault("form_replies", []).append(
+        {"session": params["sessionID"], "form": found["id"], "answer": body["answer"]})
+    return None
+
+
+class LabelGh:
+    """`gh api` over issues with labels, in any number of repos: the reads the daemon makes (a list of the open
+    issues with one label) and the writes `decisions` and `labels ensure` make (labels, comments). A runner.
+    A write checks its shape, and records the account's token it ran with."""
+
+    def __init__(self, clock):
+        self.clock, self.issues, self.labels, self.comments = clock, {}, {}, []
+        self.calls, self.envs, self.down, self.fail = [], [], False, set()
+
+    def issue(self, repo, number, title="an issue", labels=()):
+        self.issues[(repo, number)] = {"number": number, "title": title, "state": "open", "labels": list(labels),
+                                       "updated_at": sb.iso(self.clock.now() - 60)}
+
+    def names(self, repo, number):
+        return sorted(self.issues[(repo, number)]["labels"])
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+        self.envs.append(kwargs.get("env"))
+        if argv[:2] != [FAKE_GH, "api"]:
+            raise AssertionError("fake gh serves `gh api` only, got %r" % argv)
+        if self.down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
+        path = argv[2]
+        if any(repo in path for repo in self.fail):
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
+        method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
+        data = json.loads(kwargs["input"]) if "input" in kwargs else None
+        if method != "GET" and "--input" in argv and data is None:
+            raise AssertionError("a write passes its body as input")
+        missing = subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        found = re.match(r"^repos/([^/]+/[^/?]+)/issues\?(.*)$", path)
+        if found and method == "GET":
+            query = dict(pair.partition("=")[::2] for pair in found.group(2).split("&"))
+            label = urllib.parse.unquote(query["labels"])
+            rows = [dict(i, labels=[{"name": n} for n in i["labels"]]) for (repo, _), i in sorted(self.issues.items())
+                    if repo == found.group(1) and label in i["labels"] and i["state"] == "open"]
+            page = int(query.get("page", "1"))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(rows if page == 1 else []), "")
+        found = re.match(r"^repos/([^/]+/[^/]+)/issues/(\d+)/(labels|comments)(?:/(.+))?$", path)
+        if found:
+            key = (found.group(1), int(found.group(2)))
+            if key not in self.issues:
+                return missing
+            issue = self.issues[key]
+            if found.group(3) == "labels" and method == "POST":
+                issue["labels"] = sorted(set(issue["labels"]) | set(data["labels"]))
+            elif found.group(3) == "labels" and method == "DELETE":
+                name = urllib.parse.unquote(found.group(4))
+                if name not in issue["labels"]:
+                    return missing
+                issue["labels"].remove(name)
+            elif found.group(3) == "comments" and method == "POST":
+                self.comments.append({"repo": key[0], "issue": key[1], "body": data["body"]})
+            else:
+                raise AssertionError("fake gh: no such write %r" % argv)
+            issue["updated_at"] = sb.iso(self.clock.now())
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True}), "")
+        found = re.match(r"^repos/([^/]+/[^/]+)/labels(?:/(.+))?$", path)
+        if found:
+            repo = found.group(1)
+            have = self.labels.setdefault(repo, {})
+            if method == "GET":
+                name = urllib.parse.unquote(found.group(2))
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"name": name}), "") if name in have else missing
+            if method == "POST" and not found.group(2):
+                have[data["name"]] = data
+                return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
+        raise AssertionError("fake gh: no route for %r" % (argv,))
+
+
+class TestTierConfig(Base):
+    def test_the_new_keys_have_documented_defaults(self):
+        config = sb.validate_config({})
+        self.assertEqual((config["awaiting_cos_label"], config["decisions_cos_grace_seconds"], config["cos_orders_file"]),
+                         (None, 300, None))
+
+    def test_the_cos_label_defaults_to_the_os_users_awaiting_cos(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_cos_label({"awaiting_cos_label": None}), "osuser:awaiting-cos")
+        self.assertEqual(sb.awaiting_cos_label({"awaiting_cos_label": "x:cos"}), "x:cos")
+
+    def test_good_values(self):
+        config = sb.validate_config({"awaiting_cos_label": "x:cos", "decisions_cos_grace_seconds": 0,
+                                     "cos_orders_file": "/etc/orders.md"})
+        self.assertEqual((config["awaiting_cos_label"], config["decisions_cos_grace_seconds"], config["cos_orders_file"]),
+                         ("x:cos", 0, "/etc/orders.md"))
+        self.assertEqual(sb.validate_config({"decisions_cos_grace_seconds": 12.5})["decisions_cos_grace_seconds"], 12.5)
+
+    def test_bad_values_are_refused_by_name(self):
+        for key, value in (("awaiting_cos_label", ""), ("awaiting_cos_label", "a,b"), ("awaiting_cos_label", 3),
+                           ("awaiting_cos_label", "x\ny"), ("decisions_cos_grace_seconds", -1),
+                           ("decisions_cos_grace_seconds", "5"), ("decisions_cos_grace_seconds", True),
+                           ("cos_orders_file", "orders.md"), ("cos_orders_file", 7), ("cos_orders_file", "")):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config({key: value})
+                self.assertIn(key, str(caught.exception))
+
+    def test_the_two_labels_must_differ(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"awaiting_label": "x:wait", "awaiting_cos_label": "x:wait"})
+
+
+class TestHubTiers(Base):
+    """The daemon's read of both labels: two reads per repo, a tier on every record."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, config=dict(TIER_LABELS))
+        self.world, self.gh, self.hub = self.rig.world, self.rig.gh, self.rig.hub
+
+    def derive(self):
+        self.world.engine.discover(self.world.clock.now())
+        return sb.derive_decisions(self.world.engine, self.world.clock.now())[0]
+
+    def tiers(self):
+        return {d["ask"]: d["tier"] for d in self.derive()}
+
+    def test_your_label_is_human_the_chief_of_staffs_is_cos_and_both_is_human(self):
+        self.gh.issue(5, labels=["me:awaiting-user"])
+        self.gh.issue(6, labels=["me:awaiting-cos"])
+        self.gh.issue(7, labels=["me:awaiting-cos", "me:awaiting-user"])
+        self.gh.issue(8, labels=["bug"])
+        self.rig.pump(15)
+        self.assertEqual(self.tiers(), {5: "human", 6: "cos", 7: "human"})
+
+    def test_a_catch_up_makes_two_reads_per_repo_one_per_label_never_one_per_issue(self):
+        for number in range(5, 25):
+            self.gh.issue(number, labels=["me:awaiting-cos"])
+        self.rig.pump(15)
+        before = len([c for c in self.gh.api_calls if "labels=" in c])
+        self.hub.catch_up(self.rig.watch(), self.world.clock.now())
+        reads = [c for c in self.gh.api_calls if "labels=" in c][before:]
+        self.assertEqual(len(reads), 2, reads)
+        self.assertEqual(sorted(urllib.parse.unquote(re.search(r"labels=([^&]+)", c).group(1)) for c in reads),
+                         ["me:awaiting-cos", "me:awaiting-user"])
+        self.assertTrue(all("page=1" in c and "--paginate" not in c for c in reads))
+        self.assertEqual(len(self.tiers()), 20)
+
+    def test_a_capped_read_says_so_and_does_not_move_the_picture_forward_silently(self):
+        for number in range(5, 5 + sb.GITHUB_PAGE_SIZE * sb.GITHUB_PAGE_CAP + 3):
+            self.gh.issue(number, labels=["me:awaiting-cos"])
+        self.rig.pump(15)
+        capped = [e for e in self.world.audit() if e["event"] == "github.catch_up.truncated"]
+        self.assertTrue(capped)
+        self.assertIn("awaiting-cos issues", capped[-1]["detail"]["capped_reads"])
+
+    def test_a_webhook_moves_an_issue_between_tiers_with_no_gh_call(self):
+        issue = self.gh.issue(7, labels=["me:awaiting-cos"], age=0)
+        self.rig.pump(15)
+        self.assertEqual(self.tiers(), {7: "cos"})
+        calls = len(self.gh.api_calls)
+        issue["labels"] = [{"name": "me:awaiting-user"}]
+        self.gh.send("issues", {"action": "labeled", "issue": dict(issue), "label": {"name": "me:awaiting-user"}})
+        self.assertEqual(self.tiers(), {7: "human"})
+        issue["labels"] = []
+        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": "me:awaiting-user"}})
+        self.assertEqual(self.derive(), [])
+        self.assertEqual(len(self.gh.api_calls), calls)
+
+    def test_the_time_waited_survives_an_escalation(self):
+        issue = self.gh.issue(7, labels=["me:awaiting-cos"], age=0)
+        self.rig.pump(15)
+        first = self.derive()[0]["since"]
+        self.world.tick(120)
+        issue["labels"] = [{"name": "me:awaiting-user"}]
+        self.hub.read_awaiting(GH_REPO, self.world.clock.now())
+        self.assertEqual((self.derive()[0]["tier"], self.derive()[0]["since"]), ("human", first))
+
+    def test_the_tier_flat_fault_shows_everything_to_you(self):
+        self.gh.issue(6, labels=["me:awaiting-cos"])
+        self.rig.pump(15)
+        self.assertEqual(self.tiers(), {6: "cos"})
+        os.environ[sb.FAULT_ENV] = "tier-flat"
+        self.assertEqual(self.tiers(), {6: "human"})
+
+
+class TierWorld(DecisionsBase):
+    """A Chief of Staff, two orchestrators (api, web) that report to it, and a coder of each that reports to its own."""
+
+    def make_world(self, **kwargs):
+        world = World(self, agents=(), config={"jev": {"replay": write_report_replay(self.home)}}, **kwargs)
+        world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        world.add_agent("api-orch", fleet={"role": "orchestrator", "reports_to": "cos", "repo": API, "charter": 1})
+        world.add_agent("web-orch", fleet={"role": "orchestrator", "reports_to": "cos", "repo": WEB, "charter": 1})
+        world.add_agent("api-coder", fleet={"role": "coder", "reports_to": "api-orch", "repo": API, "issue": 2})
+        world.add_agent("web-coder", fleet={"role": "coder", "reports_to": "web-orch", "repo": WEB, "issue": 2})
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "web-orch", "repo": WEB, "issue": 3})  # a spare
+        return world
+
+    def pass_(self, seconds=5):
+        self.world.tick(seconds)
+        self.world.engine.run_pass()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def view_of(self, who, *flags):
+        if who == "you":
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            self.as_agent(who)
+        code, out, err = self.cli("decisions", "--json", *flags)
+        self.assertEqual(code, 0, err)
+        body = json.loads(out)
+        return sorted((d["agent"], d["tier"], d["repo"]) for d in body["decisions"]), body["view"]
+
+
+class TestReportTiers(TierWorld):
+    def test_a_report_to_a_boss_with_no_boss_is_the_chief_of_staffs(self):
+        self.ask_the_boss("Which database?", sender="api-orch")
+        (found,) = self.listed()
+        self.assertEqual((found["tier"], found["agent"], found["repo"]), ("cos", "api-orch", API))
+
+    def test_a_report_to_a_boss_that_is_itself_a_worker_is_the_orchestrators(self):
+        self.ask_the_boss("Which table?", sender="api-coder")
+        (found,) = self.listed()
+        self.assertEqual((found["tier"], found["agent"], found["repo"]), ("orchestrator", "api-coder", API))
+
+    def test_a_blocked_report_is_a_decision_of_the_same_tier(self):
+        self.ask_the_boss("cannot build", state="blocked", sender="web-orch")
+        self.assertEqual([(d["tier"], d["repo"]) for d in self.listed()], [("cos", WEB)])
+
+    def test_a_report_with_no_issue_still_names_its_repo_from_the_sender(self):
+        self.ask_the_boss("x", sender="web-coder")
+        self.assertEqual(self.listed()[0]["repo"], WEB)
+
+    def test_the_tier_is_in_decisions_json_and_nowhere_else_is_stored(self):
+        self.ask_the_boss("Which database?", sender="api-orch")
+        self.pass_()
+        self.assertEqual([d["tier"] for d in self.file()["decisions"]], ["cos"])
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if "tier" in p.name or "escalat" in p.name), [])
+
+    def test_an_issue_labelled_for_you_makes_the_report_that_raised_it_yours_too(self):
+        self.ask_the_boss("Which database?", sender="api-orch", issue=2)
+        reports = [d for d in self.listed() if d["kind"] == "report"]
+        self.assertEqual(reports[0]["tier"], "cos")
+        items = [{"kind": "issue", "title": "x", "ask": 2, "agent": "api-orch", "since": EPOCH, "seed": "issue:acme/api#2",
+                  "bare": True, "repo": API, "tier": "human"}]
+        with mock.patch.object(sb, "decisions_from_github", return_value=(items, [])):
+            found = self.listed()
+        self.assertEqual(sorted((d["kind"], d["tier"]) for d in found), [("issue", "human"), ("report", "human")])
+
+    def test_the_tier_flat_fault_shows_a_cos_report_to_you(self):
+        self.ask_the_boss("Which database?", sender="api-orch")
+        os.environ[sb.FAULT_ENV] = "tier-flat"
+        os.environ[sb.LAB_ENV] = "1"
+        self.assertEqual([d["tier"] for d in self.listed()], ["human"])
+
+
+class TestRequestTiers(TierWorld):
+    def block_(self, name="api-coder", **kwargs):
+        return self.block(name, **kwargs)
+
+    def test_a_pending_prompt_is_cos_then_human_after_the_grace(self):
+        self.block_(timed=True)
+        self.assertEqual([d["tier"] for d in self.listed()], ["cos"])
+        self.world.tick(299)
+        self.assertEqual([d["tier"] for d in self.listed()], ["cos"])
+        self.world.tick(1)
+        self.assertEqual([d["tier"] for d in self.listed()], ["human"], "300 s is the edge: yours")
+
+    def test_a_question_is_a_decision_with_the_same_rule(self):
+        self.world.v2.start_turn(self.world.sessions["api-coder"], "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_form(self.world.sessions["api-coder"])
+        (found,) = self.listed()
+        self.assertEqual((found["kind"], found["tier"]), ("question", "cos"))
+        self.world.tick(300)
+        self.assertEqual(self.listed()[0]["tier"], "human")
+
+    def test_the_grace_is_a_config_and_zero_is_at_once(self):
+        self.world.config = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+                                                "decisions_cos_grace_seconds": 0})
+        self.world.engine = self.world.new_engine()
+        self.block_(timed=True)
+        self.assertEqual([d["tier"] for d in self.listed()], ["human"])
+
+    def test_a_request_with_no_time_of_its_own_keeps_the_first_time_it_was_seen(self):
+        self.block_()
+        self.assertEqual(self.listed()[0]["tier"], "cos")
+        self.world.tick(301)
+        self.assertEqual(self.listed()[0]["tier"], "human")
+
+    def test_a_request_names_its_session_and_request_for_the_write_commands(self):
+        ask = self.block_(timed=True)
+        (found,) = self.listed()
+        self.assertEqual((found["session"], found["request"]), (self.world.sessions["api-coder"], ask["id"]))
+
+    def test_an_agent_blocked_forever_is_never_hidden_from_you(self):
+        self.block_(timed=True)
+        for _ in range(3):
+            self.world.tick(3600)
+        self.assertEqual([d["tier"] for d in self.listed()], ["human"])
+
+    def test_an_escalated_request_is_yours_at_once_and_the_marker_is_disposable(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.assertEqual([d["tier"] for d in self.listed()], ["human"])
+        (self.world.state / sb.ESCALATED_FILE).unlink()
+        self.assertEqual([d["tier"] for d in self.listed()], ["cos"], "losing it loses only the head start")
+        (self.world.state / sb.ESCALATED_FILE).write_text("{nope")
+        self.assertEqual([d["tier"] for d in self.listed()], ["cos"], "an unreadable one reads as empty")
+
+    def test_the_daemon_forgets_an_escalation_once_the_request_is_gone(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.pass_()
+        self.assertIn(key, sb.read_escalated(self.world.state))
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])
+        self.pass_()
+        self.assertEqual(sb.read_escalated(self.world.state), {})
+
+    def test_the_audit_log_is_never_read_by_the_derivation(self):
+        self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
+        self.assertNotIn("audit.jsonl", class_source_fn("derive_decisions"))
+
+
+def class_source_fn(name):
+    """The source of a module-level function of bin/fleet-switchboard."""
+    source = SWITCHBOARD.read_text()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(source, node)
+    raise LookupError(name)
+
+
+class TestDecisionViews(TierWorld):
+    def setUp(self):
+        super().setUp()
+        self.ask_the_boss("api orch asks", sender="api-orch")
+        self.ask_the_boss("web orch asks", sender="web-orch")
+        self.ask_the_boss("api coder asks", sender="api-coder")
+        self.pass_()
+
+    def test_the_chief_of_staff_sees_every_repo_and_tier(self):
+        rows, view = self.view_of("cos")
+        self.assertEqual(rows, [("api-coder", "orchestrator", API), ("api-orch", "cos", API), ("web-orch", "cos", WEB)])
+        self.assertEqual((view["repo"], view["tiers"], view["role"]), (None, None, "chief-of-staff"))
+
+    def test_an_orchestrator_sees_its_own_repo_in_every_tier(self):
+        rows, view = self.view_of("api-orch")
+        self.assertEqual(rows, [("api-coder", "orchestrator", API), ("api-orch", "cos", API)])
+        self.assertEqual((view["repo"], view["tiers"]), (API, None))
+        rows, _ = self.view_of("web-orch")
+        self.assertEqual(rows, [("web-orch", "cos", WEB)])
+
+    def test_anyone_else_sees_the_human_tier_only_and_never_the_orchestrator_tier(self):
+        rows, view = self.view_of("you")
+        self.assertEqual(rows, [])
+        self.assertEqual((view["repo"], view["tiers"], view["role"]), (None, ["human"], None))
+        rows, view = self.view_of("api-coder")
+        self.assertEqual((rows, view["tiers"]), ([], ["human"]), "a coder is not an orchestrator")
+
+    def test_a_pane_that_is_not_a_fleet_agent_is_you(self):
+        os.environ["HERDR_PANE_ID"] = "w9:p9"
+        code, out, err = self.cli("decisions", "--json")
+        self.assertEqual((code, json.loads(out)["view"]["tiers"]), (0, ["human"]), err)
+
+    def test_flags_override_and_each_leaves_the_other_part_at_the_callers_default(self):
+        rows, view = self.view_of("cos", "--repo", WEB)
+        self.assertEqual((rows, view["repo"]), ([("web-orch", "cos", WEB)], WEB))
+        rows, _ = self.view_of("cos", "--tier", "orchestrator")
+        self.assertEqual(rows, [("api-coder", "orchestrator", API)])
+        rows, _ = self.view_of("api-orch", "--tier", "cos")
+        self.assertEqual(rows, [("api-orch", "cos", API)])
+        rows, _ = self.view_of("you", "--tier", "all")
+        self.assertEqual(len(rows), 3)
+        rows, _ = self.view_of("you", "--tier", "cos", "--repo", API)
+        self.assertEqual(rows, [("api-orch", "cos", API)])
+
+    def test_the_output_says_plainly_which_view_it_printed(self):
+        self.as_agent("cos")
+        code, out, err = self.cli("decisions")
+        self.assertEqual(out.splitlines()[0], "Decisions: all repos, all tiers (for chief-of-staff)")
+        self.assertIn("[cos]", out)
+        self.assertIn("[orchestrator]", out)
+        self.as_agent("api-orch")
+        self.assertEqual(self.cli("decisions")[1].splitlines()[0], "Decisions: repo acme/api, all tiers (for orchestrator)")
+        os.environ.pop("HERDR_PANE_ID")
+        self.assertEqual(self.cli("decisions")[1].splitlines()[0], "Decisions: all repos, tier human (for you)")
+
+    def test_a_bad_repo_flag_is_a_usage_error(self):
+        code, out, err = self.cli("decisions", "--repo", "api")
+        self.assertEqual(code, 2)
+        self.assertIn("OWNER/REPO", err)
+
+    def test_from_is_for_the_lab_only(self):
+        os.environ.pop(sb.LAB_ENV, None)
+        code, out, err = self.cli("decisions", "--from", "cos")
+        self.assertEqual(code, 2)
+        self.assertIn("Lab", err)
+        code, out, err = self.cli("decisions", "--from", "cos", **{sb.LAB_ENV: "1"})
+        self.assertEqual(code, 0, err)
+        self.assertIn("all repos, all tiers", out)
+
+    def test_watch_draws_the_same_view(self):
+        view = sb.decisions_view({"role": "chief-of-staff"}, {})
+        steps = iter([lambda: (_ for _ in ()).throw(KeyboardInterrupt)])
+        with captured() as (out, err):
+            sb.watch_decisions(self.world.state, self.world.clock.now, lambda s: next(steps)(), out.write, view=view)
+            text = out.getvalue()
+        self.assertIn("Decisions: all repos, all tiers", text)
+        self.assertIn("api orch asks", text)
+
+    def test_status_counts_what_is_yours_and_says_what_else_is_open(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertEqual(report["decisions"]["by_tier"], {"cos": 2, "orchestrator": 1})
+        text = sb.format_status(report)
+        self.assertIn("0 waiting on you", text)
+        self.assertIn("also open: 2 with the Chief of Staff, 1 with an orchestrator", text)
+
+    def test_the_view_function_alone(self):
+        config = {}
+        self.assertEqual(sb.decisions_view({"role": "chief-of-staff"}, config)["tiers"], None)
+        self.assertEqual(sb.decisions_view({"role": "orchestrator", "repo": API}, config)["repo"], API)
+        self.assertEqual(sb.decisions_view({"role": "coder", "repo": API}, config)["tiers"], ["human"])
+        self.assertEqual(sb.decisions_view({}, config)["tiers"], ["human"])
+        decisions = [{"id": "a", "repo": API, "tier": "cos"}, {"id": "b", "repo": WEB}, {"id": "c", "repo": None, "tier": "human"}]
+        shown = sb.select_decisions(decisions, sb.decisions_view({}, config))
+        self.assertEqual([d["id"] for d in shown], ["b", "c"], "no tier (an older file) is yours")
+
+
+class WriteWorld(TierWorld):
+    """TierWorld with a fake GitHub that has labels, and the write commands run as `main` does."""
+
+    ACCOUNTS = {}
+
+    def setUp(self):
+        super().setUp()
+        self.gh = LabelGh(self.world.clock)
+        raw = dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "github_repos": [API, WEB],
+                    "jev": {"replay": write_report_replay(self.home)}}, **TIER_LABELS)
+        if self.ACCOUNTS:
+            raw["gh_users"] = self.ACCOUNTS
+        self.write_config(raw)
+        self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
+        self.world.engine = self.world.new_engine()
+        self.gh.tokens = {"bot-a": "tok-aaaaaaaa", "bot-b": "tok-bbbbbbbb"}
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH:
+            if argv[1:3] == ["auth", "token"]:
+                return subprocess.CompletedProcess(argv, 0, self.gh.tokens[argv[4]] + "\n", "")
+            return self.gh(argv, **kwargs)
+        return self.world.route(argv, **kwargs)
+
+    def main(self, *argv, **env):
+        for name, value in env.items():
+            os.environ[name] = value
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.route, now=self.world.clock.now, wait=lambda sock, s: False,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def id_of(self, text):
+        code, out, err = self.main("decisions", "--fresh", "--json", "--tier", "all")
+        self.assertEqual(code, 0, err)
+        found = [d["id"] for d in json.loads(out)["decisions"] if text in d["title"]]
+        self.assertEqual(len(found), 1, "%r in %s" % (text, out))
+        return found[0]
+
+    def audit_events(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+
+class TestEscalateAndResolve(WriteWorld):
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos", "bug"])
+        self.gh.issue(WEB, 2, "Other repo", labels=["me:awaiting-cos"])
+        self.as_agent("cos")
+
+    def test_escalating_an_issue_puts_your_label_on_and_takes_the_cos_label_off(self):
+        code, out, err = self.main("decisions", "escalate", self.id_of("Which database?"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 2), ["bug", "me:awaiting-user"])
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-cos"], "no other issue is touched")
+        self.assertIn("escalated", out)
+        self.assertEqual([c[3:] for c in self.gh.calls if "--method" in c and c[2].endswith("/labels")],
+                         [["--method", "POST", "--input", "-"]])
+
+    def test_the_reason_is_a_comment_signed_as_the_agent(self):
+        code, out, err = self.main("decisions", "escalate", self.id_of("Which database?"), "--reason",
+                                   "the owner must pick: it costs money")
+        self.assertEqual(code, 0, err)
+        (comment,) = self.gh.comments
+        self.assertEqual((comment["repo"], comment["issue"]), (API, 2))
+        self.assertIn("the owner must pick: it costs money", comment["body"])
+        self.assertEqual(sb.signed_by_fleet(comment["body"]), "cos")
+
+    def test_without_a_reason_there_is_no_comment(self):
+        self.main("decisions", "escalate", self.id_of("Which database?"))
+        self.assertEqual(self.gh.comments, [])
+
+    def test_the_decision_is_then_in_the_human_tier(self):
+        self.main("decisions", "escalate", self.id_of("Which database?"))
+        os.environ.pop("HERDR_PANE_ID")
+        code, out, err = self.main("decisions", "--fresh", "--json")
+        self.assertEqual([(d["title"], d["tier"]) for d in json.loads(out)["decisions"]], [("Which database?", "human")])
+
+    def test_it_is_audited_before_and_after_and_not_judged(self):
+        self.main("decisions", "escalate", self.id_of("Which database?"))
+        phases = [(e["phase"]) for e in self.audit_events("decisions.labels")]
+        self.assertEqual(phases, ["intent", "result"])
+        self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481 --reason 'costs money'"))
+        self.assertTrue(sb.plain_switchboard_message('fleet-switchboard decisions escalate "#2"'))
+
+    def test_a_decision_already_yours_is_left_alone(self):
+        self.gh.issue(API, 3, "Yours already", labels=["me:awaiting-user"])
+        before = len(self.gh.calls)
+        code, out, err = self.main("decisions", "escalate", self.id_of("Yours already"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("already yours", out)
+        self.assertEqual([c for c in self.gh.calls[before:] if "--method" in c], [])
+
+    def test_an_unknown_id_is_refused_and_nothing_is_written(self):
+        code, out, err = self.main("decisions", "escalate", "nope-123")
+        self.assertEqual(code, 2)
+        self.assertIn("no decision nope-123", err)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+
+    def test_resolving_takes_both_labels_off(self):
+        self.gh.issue(API, 3, "Both labels", labels=["me:awaiting-cos", "me:awaiting-user", "bug"])
+        code, out, err = self.main("decisions", "resolve", self.id_of("Both labels"), "--note", "the order says ship it")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 3), ["bug"])
+        self.assertEqual(self.gh.names(API, 2), ["bug", "me:awaiting-cos"], "no other issue is touched")
+        self.assertEqual(sb.signed_by_fleet(self.gh.comments[0]["body"]), "cos")
+        self.assertIn("the order says ship it", self.gh.comments[0]["body"])
+
+    def test_resolving_an_issue_that_lost_one_label_already_still_works(self):
+        code, out, err = self.main("decisions", "resolve", self.id_of("Which database?"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 2), ["bug"])
+
+    def test_the_decision_disappears_once_resolved(self):
+        self.main("decisions", "resolve", self.id_of("Which database?"))
+        code, out, err = self.main("decisions", "--fresh", "--json", "--tier", "all")
+        self.assertEqual([d["title"] for d in json.loads(out)["decisions"]], ["Other repo"])
+
+    def test_resolve_is_judged_not_plain(self):
+        self.assertFalse(sb.plain_switchboard_message("fleet-switchboard decisions resolve api-481 --note 'x'"))
+        self.assertFalse(sb.plain_switchboard_message("fleet-switchboard decisions answer api-481 allow"))
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "answer-unjudged"
+        self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions resolve api-481"))
+        self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions answer api-481 allow"))
+
+    def test_a_decision_read_is_plain_and_so_is_orders_cos_but_not_the_rest(self):
+        for command in ("fleet-switchboard decisions", "fleet-switchboard decisions --json", "fleet-switchboard decisions list",
+                        "fleet-switchboard decisions --tier all --repo acme/api", "fleet-switchboard orders --cos"):
+            with self.subTest(command=command):
+                self.assertTrue(sb.plain_switchboard_message(command))
+        for command in ("fleet-switchboard decisions answer x allow; rm -rf /", "fleet-switchboard orders add --charter 1 x",
+                        "fleet-switchboard labels ensure", "fleet-switchboard decisions resolve x",
+                        "fleet-switchboard decisions --tier all resolve x"):
+            with self.subTest(command=command):
+                self.assertFalse(sb.plain_switchboard_message(command))
+
+
+class TestWriteRoles(WriteWorld):
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+
+    def test_an_orchestrator_may_not_escalate_resolve_or_answer(self):
+        self.as_agent("api-orch")
+        ident = self.id_of("Which database?")
+        for argv in (("escalate", ident), ("resolve", ident), ("answer", ident, "allow")):
+            with self.subTest(argv=argv):
+                code, out, err = self.main("decisions", *argv)
+                self.assertEqual(code, 2)
+                self.assertIn("only the Chief of Staff", err)
+                self.assertIn("awaiting-cos", err)
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-cos"])
+        self.assertEqual(len(self.audit_events("decisions.refused")), 3)
+
+    def test_you_in_a_plain_shell_may(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        ident = self.id_of("Which database?")
+        self.assertEqual(self.main("decisions", "resolve", ident)[0], 0)
+        self.assertEqual(self.gh.names(API, 2), [])
+
+    def test_a_pane_herdr_cannot_place_is_refused_and_nothing_is_written(self):
+        ident = self.id_of("Which database?")
+        os.environ["HERDR_PANE_ID"] = "w9:p9"
+        code, out, err = self.main("decisions", "resolve", ident)
+        self.assertEqual(code, 1, "a caller who cannot be told apart from an agent is not you")
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-cos"])
+
+    def test_from_names_the_caller_in_the_lab_only(self):
+        ident = self.id_of("Which database?")
+        os.environ.pop(sb.LAB_ENV, None)
+        code, out, err = self.main("decisions", "escalate", ident, "--from", "cos")
+        self.assertEqual(code, 2)
+        self.assertIn("Lab", err)
+        code, out, err = self.main("decisions", "escalate", ident, "--from", "cos", **{sb.LAB_ENV: "1"})
+        self.assertEqual(code, 0, err)
+        code, out, err = self.main("decisions", "resolve", ident, "--from", "api-orch", **{sb.LAB_ENV: "1"})
+        self.assertEqual(code, 2)
+
+
+class TestWritesUseTheReposOwnAccount(WriteWorld):
+    ACCOUNTS = {API: "bot-a", WEB: "bot-b"}
+
+    def test_each_write_runs_as_its_repos_account_with_the_token_only_in_the_childs_environment(self):
+        self.gh.issue(API, 2, "api one", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "web one", labels=["me:awaiting-cos"])
+        self.as_agent("cos")
+        self.main("decisions", "escalate", self.id_of("api one"), "--reason", "r")
+        self.main("decisions", "resolve", self.id_of("web one"), "--note", "n")
+        writes = [(c, e) for c, e in zip(self.gh.calls, self.gh.envs) if "--method" in c]
+        self.assertTrue(writes)
+        for argv, env in writes:
+            repo = re.match(r"^repos/([^/]+/[^/]+)/", argv[2]).group(1)
+            self.assertEqual(env["GH_TOKEN"], self.gh.tokens[self.ACCOUNTS[repo]], argv)
+        everything = json.dumps(self.gh.calls) + (self.world.audit_path.read_text() if self.world.audit_path.exists() else "")
+        for token in self.gh.tokens.values():
+            self.assertNotIn(token, everything, "a token is never in text")
+
+
+class TestAnswerARequest(WriteWorld):
+    def setUp(self):
+        super().setUp()
+        self.as_agent("cos")
+        self.sid = self.world.sessions["api-coder"]
+
+    def blocked(self, **kwargs):
+        self.world.v2.start_turn(self.sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        return self.world.v2.ask_permission(self.sid, timed=True, **kwargs)
+
+    def test_allow_replies_once_through_v2_and_deny_replies_reject_with_the_note(self):
+        first = self.blocked(resources=["ls"])
+        code, out, err = self.main("decisions", "answer", self.id_of("shell ls"), "allow", "--note", "order 2: read-only")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.permission_replies, [
+            {"session": self.sid, "request": first["id"], "decision": "once", "message": "order 2: read-only"}])
+        second = self.world.v2.ask_permission(self.sid, resources=["rm -rf build"], timed=True)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        code, out, err = self.main("decisions", "answer", self.id_of("rm -rf build"), "deny")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.permission_replies[-1],
+                         {"session": self.sid, "request": second["id"], "decision": "reject", "message": None})
+
+    def test_it_is_audited_before_and_after(self):
+        self.blocked()
+        self.main("decisions", "answer", self.id_of("shell"), "allow")
+        self.assertEqual([e["phase"] for e in self.audit_events("decisions.answer")], ["intent", "result"])
+
+    def test_a_permission_request_is_answered_allow_or_deny_only(self):
+        self.blocked()
+        code, out, err = self.main("decisions", "answer", self.id_of("shell"), "sure")
+        self.assertEqual(code, 2)
+        self.assertIn("allow", err)
+        self.assertEqual(self.world.v2.permission_replies if hasattr(self.world.v2, "permission_replies") else [], [])
+
+    def test_a_question_is_answered_with_the_one_field_of_its_form(self):
+        self.world.v2.start_turn(self.sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        form = self.world.v2.ask_form(self.sid)
+        code, out, err = self.main("decisions", "answer", self.id_of("question:"), "postgres")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.form_replies, [{"session": self.sid, "form": form["id"], "answer": {"db": "postgres"}}])
+
+    def test_a_form_that_is_more_than_one_question_is_refused_and_says_so(self):
+        self.world.v2.start_turn(self.sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_form(self.sid, fields=[{"key": "a", "type": "string"}, {"key": "b", "type": "string"}])
+        code, out, err = self.main("decisions", "answer", self.id_of("question:"), "x")
+        self.assertEqual(code, 2)
+        self.assertIn("2 visible fields", err)
+        self.assertFalse(getattr(self.world.v2, "form_replies", []))
+
+    def test_the_field_types_a_single_question_can_have(self):
+        for fields, value, wanted in (([{"key": "ok", "type": "boolean"}], "yes", {"ok": True}),
+                                      ([{"key": "ok", "type": "boolean"}], "no", {"ok": False}),
+                                      ([{"key": "n", "type": "integer"}], "3", {"n": 3}),
+                                      ([{"key": "n", "type": "number"}], "2.5", {"n": 2.5}),
+                                      ([{"key": "a", "type": "string"}, {"key": "h", "type": "string", "hidden": True}], "t",
+                                       {"a": "t"})):
+            with self.subTest(fields=fields):
+                self.assertEqual(sb._form_answer(fields, value), wanted)
+        for fields, value in (([{"key": "ok", "type": "boolean"}], "maybe"), ([{"key": "n", "type": "integer"}], "x"),
+                              ([{"key": "m", "type": "multiselect"}], "a"), ([], "x")):
+            with self.subTest(fields=fields, value=value):
+                with self.assertRaises(sb.DecisionError):
+                    sb._form_answer(fields, value)
+
+    def test_an_issue_or_a_report_is_not_answered_this_way(self):
+        self.gh.issue(API, 2, "An issue", labels=["me:awaiting-cos"])
+        code, out, err = self.main("decisions", "answer", self.id_of("An issue"), "allow")
+        self.assertEqual(code, 2)
+        self.assertIn("send", err)
+
+    def test_a_request_that_is_gone_is_no_longer_a_decision(self):
+        self.blocked()
+        ident = self.id_of("shell")
+        self.world.v2.answer_permissions(self.sid)
+        code, out, err = self.main("decisions", "answer", ident, "allow")
+        self.assertEqual(code, 2)
+        self.assertIn("no decision", err)
+
+    def test_the_client_methods_have_the_shapes_a_real_v2_accepted(self):
+        client = sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5)
+        ask = self.blocked()
+        client.permission_reply(self.sid, ask["id"], "reject", "no")
+        call = [c for c in self.world.v2.calls if "session.permission.reply" in c][-1]
+        self.assertEqual(call[3:], ["--param", "sessionID=" + self.sid, "--param", "requestID=" + ask["id"],
+                                    "-d", '{"decision":"reject","message":"no"}'])
+        with self.assertRaises(ValueError):
+            client.permission_reply(self.sid, ask["id"], "allow")
+        form = self.world.v2.ask_form(self.sid)
+        client.form_reply(self.sid, form["id"], {"db": "x"})
+        call = [c for c in self.world.v2.calls if "session.form.reply" in c][-1]
+        self.assertEqual(call[3:], ["--param", "sessionID=" + self.sid, "--param", "formID=" + form["id"],
+                                    "-d", '{"answer":{"db":"x"}}'])
+
+
+class TestEscalateARequestOrAReport(WriteWorld):
+    def setUp(self):
+        super().setUp()
+        self.as_agent("cos")
+        self.sid = self.world.sessions["api-coder"]
+
+    def test_a_request_is_marked_yours_at_once_in_the_one_disposable_file_and_the_audit(self):
+        self.world.v2.start_turn(self.sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        ask = self.world.v2.ask_permission(self.sid, timed=True)
+        code, out, err = self.main("decisions", "escalate", self.id_of("shell"), "--reason", "needs the owner")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(list(sb.read_escalated(self.world.state)), ["%s:%s" % (self.sid, ask["id"])])
+        events = self.audit_events("decisions.escalate")
+        self.assertEqual([e["phase"] for e in events], ["intent", "result"])
+        self.assertEqual(events[0]["detail"]["reason"], "needs the owner")
+        os.environ.pop("HERDR_PANE_ID")
+        code, out, err = self.main("decisions", "--fresh", "--json")
+        self.assertEqual([d["tier"] for d in json.loads(out)["decisions"]], ["human"])
+
+    def test_a_report_with_an_issue_labels_that_issue(self):
+        self.gh.issue(API, 2, "the issue", labels=["me:awaiting-cos"])
+        self.world.new_engine("cli").report("api-orch", "question", "Which database?", 2)
+        self.world.tick(1)
+        ident = self.id_of("Which database?")
+        code, out, err = self.main("decisions", "escalate", ident)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-user"])
+
+    def test_a_report_with_no_issue_cannot_be_escalated_and_says_to_put_it_in_chat(self):
+        self.world.new_engine("cli").report("api-orch", "question", "Which database?")
+        self.world.tick(1)
+        code, out, err = self.main("decisions", "escalate", self.id_of("Which database?"))
+        self.assertEqual(code, 2)
+        self.assertIn("in chat", err)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+
+    def test_a_report_is_not_resolved_by_this_command_without_an_issue(self):
+        self.world.new_engine("cli").report("api-orch", "question", "Which database?")
+        self.world.tick(1)
+        code, out, err = self.main("decisions", "resolve", self.id_of("Which database?"))
+        self.assertEqual(code, 2)
+        self.assertIn("send", err)
+
+
+class TestLabelsEnsure(WriteWorld):
+    WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()])
+
+    def test_it_creates_the_three_labels_in_every_watched_repo_and_is_idempotent(self):
+        code, out, err = self.main("labels", "ensure")
+        self.assertEqual(code, 0, err)
+        for repo in (API, WEB):
+            self.assertEqual(sorted(self.gh.labels[repo]), self.WANT)
+        self.assertEqual(out.count("created"), 6)
+        creates = len([c for c in self.gh.calls if "POST" in c])
+        code, out, err = self.main("labels", "ensure")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("already there"), 6)
+        self.assertEqual(len([c for c in self.gh.calls if "POST" in c]), creates, "nothing is written twice")
+
+    def test_one_repo_only_with_the_flag(self):
+        self.main("labels", "ensure", "--repo", API)
+        self.assertEqual(sorted(self.gh.labels[API]), self.WANT)
+        self.assertNotIn(WEB, self.gh.labels)
+
+    def test_a_missing_one_is_made_and_the_others_left(self):
+        self.main("labels", "ensure", "--repo", API)
+        del self.gh.labels[API]["me:awaiting-cos"]
+        code, out, err = self.main("labels", "ensure", "--repo", API)
+        self.assertEqual((out.count("created"), out.count("already there")), (1, 2))
+
+    def test_a_bad_repo_flag_and_no_repo_at_all_are_refused(self):
+        self.assertEqual(self.main("labels", "ensure", "--repo", "x")[0], 2)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH})
+        code, out, err = self.main("labels", "ensure")
+        self.assertEqual(code, 2)
+        self.assertIn("no repo is watched", err)
+
+    def test_a_failure_in_one_repo_is_said_and_the_others_still_run(self):
+        self.gh.fail = {WEB}
+        code, out, err = self.main("labels", "ensure")
+        self.assertEqual(code, 1)
+        self.assertIn(WEB, err)
+        self.assertEqual(sorted(self.gh.labels[API]), self.WANT)
+
+    def test_help_shows_the_feature(self):
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["labels", "--help"])
+        for word in ("ensure", "awaiting-cos", "awaiting-user", "orchestrator"):
+            self.assertIn(word, out.getvalue())
+
+
+class TestLabelsEnsureUsesEachReposAccount(WriteWorld):
+    ACCOUNTS = {API: "bot-a", WEB: "bot-b"}
+
+    def test_each_repo_is_written_as_its_own_account(self):
+        self.main("labels", "ensure")
+        for argv, env in zip(self.gh.calls, self.gh.envs):
+            repo = re.match(r"^repos/([^/]+/[^/]+)/", argv[2]).group(1)
+            self.assertEqual(env["GH_TOKEN"], self.gh.tokens[self.ACCOUNTS[repo]], argv)
+        self.assertNotIn("tok-", json.dumps(self.gh.calls))
+
+
+# ---- the Chief of Staff's orders file
+
+def cos_orders_file(test):
+    return test.config_file.parent / "standing-orders.md"
+
+
+def put_cos_orders(test, text, mtime=None):
+    path = cos_orders_file(test)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mtime is not None:
+        os.utime(str(path), (mtime, mtime))
+    return path
+
+
+class TestCosOrdersFile(Base):
+    def test_the_path_is_beside_the_config_unless_the_config_names_one(self):
+        self.assertEqual(sb.cos_orders_path({}), self.home / "xdg-config" / "fleet-switchboard" / "standing-orders.md")
+        self.assertEqual(sb.cos_orders_path({"cos_orders_file": "/x/y.md"}), Path("/x/y.md"))
+
+    def test_a_missing_file_is_none_stated_and_not_an_error(self):
+        found = sb.read_cos_orders({})
+        self.assertEqual((found["exists"], found["text"], found["size"]), (False, None, 0))
+
+    def test_the_text_is_the_file_with_the_templates_comment_taken_out(self):
+        put_cos_orders(self, sb.COS_ORDERS_TEMPLATE)
+        self.assertIsNone(sb.read_cos_orders({})["text"], "the template alone states no order")
+        put_cos_orders(self, sb.COS_ORDERS_TEMPLATE + "\n- Approve read-only prompts.\n")
+        self.assertEqual(sb.read_cos_orders({})["text"], "- Approve read-only prompts.")
+
+    def test_eight_kilobytes_is_the_limit_and_a_larger_file_is_refused_and_says_so(self):
+        put_cos_orders(self, "x" * 8192)
+        self.assertEqual(sb.read_cos_orders({})["size"], 8192)
+        put_cos_orders(self, "x" * 8193)
+        with self.assertRaises(sb.CosOrdersError) as caught:
+            sb.read_cos_orders({})
+        self.assertIn("8193 bytes", str(caught.exception))
+        self.assertIn("8 KB", str(caught.exception))
+
+    def test_it_is_read_again_only_when_the_mtime_or_size_changes(self):
+        path = put_cos_orders(self, "- one", mtime=1000)
+        self.assertEqual(sb.read_cos_orders({})["text"], "- one")
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("read again")):
+            self.assertEqual(sb.read_cos_orders({})["text"], "- one", "a cached read: one stat per call")
+        put_cos_orders(self, "- two", mtime=2000)
+        self.assertEqual(sb.read_cos_orders({})["text"], "- two")
+        path.write_text("- thr")
+        os.utime(str(path), (2000, 2000))
+        self.assertEqual(sb.read_cos_orders({})["text"], "- two", "the same mtime and size: nothing to re-read")
+
+    def test_status_shows_the_path_size_and_mtime_or_none(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        text = sb.format_status(sb.collect_status(FakeRunner(), time.time))
+        self.assertIn("cos orders none", text)
+        self.assertIn("standing-orders.md", text)
+        put_cos_orders(self, "- one", mtime=1791000000)
+        report = sb.collect_status(FakeRunner(), time.time)
+        self.assertEqual((report["cos_orders"]["size"], report["cos_orders"]["exists"]), (5, True))
+        self.assertIn("(5 bytes, modified 2026-", sb.format_status(report))
+        put_cos_orders(self, "x" * 9000)
+        self.assertIn("is 9000 bytes", sb.format_status(sb.collect_status(FakeRunner(), time.time)))
+
+
+class TestOrdersCosCommand(Base):
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=FakeRunner(), now=time.time)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_it_prints_the_path_and_the_file_read_only(self):
+        path = put_cos_orders(self, "- Answer read-only prompts.\n")
+        code, out, err = self.main("orders", "--cos")
+        self.assertEqual(code, 0, err)
+        self.assertIn(str(path), out)
+        self.assertIn("- Answer read-only prompts.", out)
+        self.assertEqual(path.read_text(), "- Answer read-only prompts.\n")
+
+    def test_no_file_says_none_and_where_it_would_be(self):
+        code, out, err = self.main("orders", "--cos")
+        self.assertEqual(code, 0, err)
+        self.assertIn("none", out)
+        self.assertIn("standing-orders.md", out)
+
+    def test_a_file_that_is_too_large_is_refused_with_a_nonzero_exit(self):
+        put_cos_orders(self, "x" * 9000)
+        code, out, err = self.main("orders", "--cos")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("9000 bytes", err)
+
+    def test_there_is_no_command_that_writes_it(self):
+        for argv in (("orders", "--cos", "add", "x"), ("orders", "--cos", "--write", "x")):
+            with self.subTest(argv=argv):
+                self.assertNotEqual(self.main(*argv)[0], 0)
+        self.assertFalse(cos_orders_file(self).exists())
+        self.assertNotIn("write_text", class_source_fn("cmd_orders_cos"))
+
+    def test_orders_with_no_action_and_no_flag_is_a_usage_error(self):
+        code, out, err = self.main("orders")
+        self.assertEqual(code, 2)
+        self.assertIn("--cos", err)
+
+    def test_help_shows_the_feature_and_the_charter_orders_are_as_they_were(self):
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["orders", "--help"])
+        for word in ("--cos", "list", "add", "remove", "chief-of-staff", "local markdown file"):
+            self.assertIn(word, out.getvalue())
+
+
+class TestInstallMakesTheOrdersTemplate(InstallCase):
+    def full(self, *flags):
+        return self.install("--opencode", self.machine.binary, *flags)
+
+    def path(self):
+        return self.home / "xdg-config" / "fleet-switchboard" / "standing-orders.md"
+
+    def test_it_makes_a_template_with_a_comment_header_and_says_so(self):
+        out, error = self.full()
+        self.assertIsNone(error)
+        self.assertEqual(self.statuses(out)["standing orders"], ["done"])
+        text = self.path().read_text()
+        self.assertTrue(text.startswith("<!--"))
+        self.assertIn("standing orders", text)
+        self.assertIn("never loosen a configured deny", text)
+        self.assertIsNone(sb.cos_orders_text_of(text), "the template states no order")
+        self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+
+    def test_it_never_overwrites_a_file_that_is_there(self):
+        self.path().parent.mkdir(parents=True, exist_ok=True)
+        self.path().write_text("- mine\n")
+        out, error = self.full()
+        self.assertEqual(self.statuses(out)["standing orders"], ["already done"])
+        self.assertEqual(self.path().read_text(), "- mine\n")
+        self.full()
+        self.assertEqual(self.path().read_text(), "- mine\n")
+
+    def test_a_second_run_leaves_the_template_as_the_owner_edited_it(self):
+        self.full()
+        self.path().write_text(sb.COS_ORDERS_TEMPLATE + "\n- edited\n")
+        self.full()
+        self.assertTrue(self.path().read_text().endswith("- edited\n"))
+
+    def test_a_dry_run_makes_nothing(self):
+        out, error = self.full("--dry-run")
+        self.assertEqual(self.statuses(out)["standing orders"], ["would be done"])
+        self.assertFalse(self.path().exists())
+
+    def test_uninstall_leaves_it(self):
+        self.full()
+        self.path().write_text("- keep me\n")
+        out, error = self.install("--uninstall")
+        self.assertIsNone(error)
+        self.assertEqual(self.path().read_text(), "- keep me\n")
+        self.assertIn("your standing orders file", out)
+
+    def test_the_config_can_move_the_file(self):
+        target = self.home / "elsewhere" / "orders.md"
+        self.write_config({"cos_orders_file": str(target)})
+        self.full()
+        self.assertTrue(target.is_file())
+        self.assertFalse(self.path().exists())
+
+
+class TestJudgeCosOrders(PolicyCase):
+    ORDER = "- Answer permission prompts for echo commands with allow."
+
+    def test_the_context_of_a_chief_of_staff_is_the_file(self):
+        judge = self.direct_judge(None)
+        self.assertIsNone(judge.context_of({"name": "cos", "role": "chief-of-staff"})["authority"])
+        put_cos_orders(self, sb.COS_ORDERS_TEMPLATE)
+        self.assertIsNone(judge.context_of({"name": "cos", "role": "chief-of-staff"})["authority"])
+        put_cos_orders(self, self.ORDER)
+        context = judge.context_of({"name": "cos", "role": "chief-of-staff"})
+        self.assertEqual(context["authority"], self.ORDER)
+        self.assertIsNone(context["issue"], "it has no ask: outside_intent and outside_scope stay off")
+
+    def test_an_orchestrators_authority_is_still_its_charters_and_never_the_file(self):
+        put_cos_orders(self, self.ORDER)
+        context = self.direct_judge(None).context_of({"name": "orch", "role": "orchestrator", "charter": 1, "issue": 2})
+        self.assertEqual(context["authority"], "may merge green PRs")
+
+    def test_the_state_the_model_sees_clips_the_chief_of_staffs_orders_to_1200_and_a_charters_to_600(self):
+        self.assertEqual(len(sb.policy_state("chief-of-staff", "i", "d", "o" * 2000, "shell", "ls",
+                                             sb.COS_ORDERS_STATE_CLIP)["standing_authority"]), 1200)
+        self.assertEqual(len(sb.policy_state("orchestrator", "i", "d", "o" * 2000, "shell", "ls")["standing_authority"]), 600)
+        seen = []
+
+        class Spy:
+            def decide(self, state, questions):
+                seen.append(state)
+                raise sb.JevError("unreachable", "spy")
+
+        put_cos_orders(self, "o" * 2000)
+        self.direct_judge(Spy()).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        self.assertEqual(len(seen[0]["standing_authority"]), 1200)
+
+    def test_the_judge_reads_the_file_for_speaks_for_you_and_sees_an_edit_at_the_next_call(self):
+        self.configure([{"contains": "echo commands", "noul": LOW},
+                        {"contains": "gh pr merge", "noul": dict(LOW, speaks_for_you=0.9)}, {"noul": LOW}])
+        command = "gh pr merge 12"
+        self.assertEqual(self.judge_tool(self.cos, "shell", command)["outcome"], "ask", "no orders: the owner decides")
+        put_cos_orders(self, self.ORDER)
+        self.assertEqual(self.judge_tool(self.cos, "shell", command)["outcome"], "allow", "an order covers it")
+        put_cos_orders(self, "- Something else entirely.")
+        self.assertEqual(self.judge_tool(self.cos, "shell", command)["outcome"], "ask", "the edit is seen")
+
+    def test_orders_can_only_stop_a_pointless_question_never_loosen_a_deny(self):
+        self.configure([{"contains": "echo commands", "noul": LOW}, {"noul": dict(LOW, speaks_for_you=0.9)}])
+        put_cos_orders(self, self.ORDER)
+        self.assertEqual(self.judge_tool(self.cos, "shell", "gh pr merge 12", "deny")["outcome"], "deny")
+        self.assertEqual(self.judge_tool(self.cos, "shell", "gh pr merge 12", "ask")["outcome"], "ask")
+
+    def test_outside_intent_and_outside_scope_stay_off_for_an_agent_with_no_ask(self):
+        self.configure([{"noul": dict(LOW, outside_intent=1.0, outside_scope=1.0)}])
+        self.assertEqual(self.judge_tool(self.cos, "shell", "ls")["outcome"], "allow")
+
+    def test_a_file_that_is_too_large_is_no_authority_at_all(self):
+        put_cos_orders(self, "x" * 9000)
+        self.assertIsNone(self.direct_judge(None).context_of({"name": "cos", "role": "chief-of-staff"})["authority"])
+
+    def test_the_cos_orders_unfed_fault_ignores_the_file(self):
+        put_cos_orders(self, self.ORDER)
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "cos-orders-unfed"
+        self.assertIsNone(self.direct_judge(None).context_of({"name": "cos", "role": "chief-of-staff"})["authority"])
+
+    def test_the_question_for_a_decision_the_cos_acts_on_names_the_decision(self):
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [
+            {"id": "worker-481", "kind": "permission", "agent": "worker", "tier": "cos", "title": "permission: shell rm -rf build"}],
+            "errors": []}))
+        seen = []
+
+        class Spy:
+            def decide(self, state, questions):
+                seen.append(json.dumps(state))
+                raise sb.JevError("unreachable", "spy")
+
+        self.direct_judge(Spy()).decide({"session": self.cos, "tool": "shell", "configured": "allow",
+                                         "arguments": "fleet-switchboard decisions answer worker-481 allow"})
+        self.assertIn("permission: shell rm -rf build", seen[0])
+        self.assertEqual(sb.decision_gloss(self.world.state, "ls -la"), "")
+        self.assertEqual(sb.decision_gloss(self.world.state, "fleet-switchboard decisions answer nope allow"), "")
+
+    def test_answer_and_resolve_are_judged_and_escalate_and_reads_are_not(self):
+        self.configure([{"noul": LOW}])
+        for command, judged in (("fleet-switchboard decisions answer worker-481 allow", True),
+                                ("fleet-switchboard decisions resolve api#2", True),
+                                ("fleet-switchboard decisions escalate worker-481 --reason 'costs money'", False),
+                                ("fleet-switchboard decisions --tier all", False)):
+            with self.subTest(command=command):
+                self.assertEqual(self.judge_tool(self.cos, "shell", command)["judged"], judged)
+
+    def test_the_answer_unjudged_fault_lets_them_through(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "answer-unjudged"
+        reply = self.judge_tool(self.cos, "shell", "fleet-switchboard decisions answer worker-481 allow")
+        self.assertFalse(reply["judged"])
+        self.assertIn("agents' own channel", reply["reason"])
+
+
+class TestGuardOnTheOrdersFile(PolicyCase):
+    def setUp(self):
+        super().setUp()
+        self.config = sb.validate_config(json.loads(self.config_file.read_text()))
+        self.path = str(sb.cos_orders_path(self.config))
+
+    def writes(self, command, tool="shell"):
+        return sb.writes_cos_orders(tool, command.replace("{path}", self.path), self.config)
+
+    def test_what_writes_it(self):
+        for command in ("echo '- allow all' > {path}", "echo x >> {path}", "echo x > ~/.config/fleet-switchboard/standing-orders.md",
+                        "cat notes | tee {path}", "tee -a {path} < notes", "sed -i '' 's/a/b/' {path}", "sed -i.bak s/a/b/ {path}",
+                        "sed --in-place s/a/b/ {path}", "mv new.md {path}", "cp new.md {path}", "rm {path}", "rm -f standing-orders.md",
+                        "vim {path}", "nano standing-orders.md", "code {path}", "emacs {path}", "ed {path}",
+                        "python3 -c \"open('{path}','w').write('x')\"", "perl -pi -e 's/a/b/' standing-orders.md",
+                        "node -e \"fs.writeFileSync('standing-orders.md','x')\"", "ruby -e 'File.write(%q{standing-orders.md}, 1)'",
+                        "sh -c 'echo x > standing-orders.md'", "ln -sf other.md {path}", "truncate -s 0 {path}",
+                        "dd of={path} if=/dev/null", "touch {path}"):
+            with self.subTest(command=command):
+                self.assertTrue(self.writes(command))
+
+    def test_what_does_not(self):
+        for command in ("cat {path}", "less standing-orders.md", "grep -n deploy {path}", "ls ~/.config/fleet-switchboard",
+                        "fleet-switchboard orders --cos", "echo hello > notes.md", "wc -l {path}",
+                        "git status", "fleet-switchboard send cos 'standing orders'", "python3 -c 'print(1)'", "diff {path} other.md"):
+            with self.subTest(command=command):
+                self.assertFalse(self.writes(command))
+
+    def test_the_edit_tool_on_it_is_a_write(self):
+        self.assertTrue(self.writes("{path}", tool="edit"))
+        self.assertFalse(sb.writes_cos_orders("edit", "notes.md", self.config))
+        self.assertFalse(self.writes("{path}", tool="read"))
+
+    def test_a_config_that_moves_the_file_moves_the_guard(self):
+        config = dict(self.config, cos_orders_file="/somewhere/else/my-orders.md")
+        self.assertTrue(sb.writes_cos_orders("shell", "echo x > /somewhere/else/my-orders.md", config))
+        self.assertTrue(sb.writes_cos_orders("shell", "rm my-orders.md", config))
+        self.assertFalse(sb.writes_cos_orders("shell", "echo x > standing-orders.md", config))
+
+    def test_any_fleet_agent_including_the_chief_of_staff_is_stopped_with_no_model(self):
+        self.configure(rules=[{"error": "unreachable"}])
+        for session in (self.cos, self.orch, self.coder):
+            for command in ("echo '- merge anything' > %s" % self.path, "sed -i '' 's/no/yes/' standing-orders.md"):
+                with self.subTest(session=session, command=command):
+                    reply = self.judge_tool(session, "shell", command)
+                    self.assertEqual((reply["outcome"], reply["judged"]), ("ask", True), reply)
+                    self.assertIn("standing orders", reply["reason"])
+                    self.assertIn("must not grant itself authority", reply["reason"])
+        event = self.audit_events()[-1]
+        self.assertEqual(sorted(event["detail"]["fired"]), ["hard_to_reverse", "speaks_for_you"])
+
+    def test_the_edit_tool_is_stopped_too(self):
+        self.assertEqual(self.judge_tool(self.orch, "edit", self.path)["outcome"], "ask")
+
+    def test_it_never_loosens_a_configured_deny(self):
+        self.assertEqual(self.judge_tool(self.cos, "shell", "rm %s" % self.path, "deny")["outcome"], "deny")
+
+    def test_the_anyone_edits_cos_orders_fault_takes_the_guard_off(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "anyone-edits-cos-orders"
+        self.assertEqual(self.judge_tool(self.orch, "shell", "echo x > %s" % self.path)["outcome"], "allow")
+
+    def test_the_limits_are_in_the_doc(self):
+        text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        self.assertIn("a guard, not a proof", text)
+        self.assertIn("obfuscate", text)
+
+
+class TestCosOrdersFact(OrdersDeliveryCase):
+    """The Chief of Staff's own orders reach it as a note that never wakes."""
+
+    ORDERS = "- Answer permission prompts for read-only commands.\n- Anything about money goes to the owner.\n"
+
+    def setUp(self):
+        super().setUp()
+        self.cos = "chief-of-staff"  # OrdersCase made it: a Chief of Staff with no charter
+
+    def facts(self):
+        self.world.engine.discover(self.world.clock.now())
+        return [f for f in self.world.engine.collect_facts()[0] if f.kind == "orders" and f.key.startswith("orders:cos:")]
+
+    def messages(self):
+        return self.order_messages(self.cos)
+
+    def test_it_is_found_by_role_and_the_chief_of_staff_has_no_charter(self):
+        put_cos_orders(self, self.ORDERS)
+        (found,) = self.facts()
+        self.assertEqual((found.recipient, found.issue, found.repo, found.orders, found.batch),
+                         (self.cos, None, None, True, False))
+        self.assertEqual(found.summary, self.ORDERS.strip())
+        digest = hashlib.sha256(self.ORDERS.strip().encode("utf-8")).hexdigest()[:8]
+        self.assertEqual(found.key, "orders:cos:%s:start" % digest)
+
+    def test_nobody_else_gets_it_and_the_charter_orders_are_as_they_were(self):
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        self.assertEqual(len(self.order_messages("orch")), 1)
+        self.assertIn("approve deploys here", self.order_messages("orch")[0]["text"])
+        self.assertNotIn("read-only", self.order_messages("orch")[0]["text"])
+        self.assertEqual(self.order_messages("worker")[0]["keys"][0].split(":")[1], FAKE_REPO + "#1")
+
+    def test_no_file_a_template_or_a_file_too_large_gives_no_note(self):
+        self.assertEqual(self.facts(), [])
+        put_cos_orders(self, sb.COS_ORDERS_TEMPLATE)
+        self.assertEqual(self.facts(), [])
+        put_cos_orders(self, "x" * 9000)
+        self.assertEqual(self.facts(), [])
+        self.run_pass()
+        self.assertEqual(self.messages(), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "orders.unreadable" and e["detail"].get("cos")])
+
+    def test_it_arrives_once_at_start_as_a_note_with_the_owners_wording_and_wakes_nobody(self):
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        (note,) = self.messages()
+        self.assertEqual((note["resume"], note["delivery"]), (False, "steer"))
+        self.assertEqual(note["text"].splitlines(), [
+            "[switchboard] standing orders for chief-of-staff (the owner's, to you):",
+            "- Answer permission prompts for read-only commands.", "- Anything about money goes to the owner.",
+            "These are the owner's standing orders to you. Answer for the owner only within their words; anything "
+            "they do not name goes to the owner."])
+        self.assertEqual(note["description"], "switchboard: standing orders for chief-of-staff")
+        self.assertEqual(self.world.model_calls(self.cos), [])
+        for _ in range(3):
+            self.world.tick(10)
+            self.run_pass()
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_a_restart_repeats_nothing(self):
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        self.world.engine = self.world.new_engine()
+        self.world.tick(20)
+        self.run_pass()
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_a_completed_compaction_sends_them_again_once(self):
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        self.world.v2.compact(self.world.sessions[self.cos])
+        for _ in range(3):
+            self.world.tick(5)
+            self.run_pass()
+        self.assertEqual(len(self.messages()), 2)
+
+    def test_an_edit_of_the_file_sends_the_new_text_once_and_only_when_it_changed(self):
+        put_cos_orders(self, self.ORDERS, mtime=1000)
+        self.run_pass()
+        put_cos_orders(self, self.ORDERS + "- Never merge in acme/web.\n", mtime=2000)
+        self.world.tick(5)
+        self.run_pass()
+        self.world.tick(5)
+        self.run_pass()
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        self.assertIn("- Never merge in acme/web.", messages[1]["text"])
+        put_cos_orders(self, self.ORDERS + "- Never merge in acme/web.\n", mtime=3000)  # touched, not changed
+        self.world.tick(5)
+        self.run_pass()
+        self.assertEqual(len(self.messages()), 2, "the key is the text's hash, not the mtime")
+
+    def test_the_start_only_fault_does_not_resend_after_a_compaction(self):
+        os.environ[sb.FAULT_ENV] = "orders-start-only"
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        self.world.v2.compact(self.world.sessions[self.cos])
+        self.world.tick(5)
+        self.run_pass()
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_the_orders_note_never_becomes_a_wake_when_unread(self):
+        put_cos_orders(self, self.ORDERS)
+        self.run_pass()
+        self.world.tick(sb.DEFAULTS["engaged_minutes"] * 60 + 60)
+        self.assertEqual(self.run_pass()["converted"], [])
+        self.assertEqual(self.world.model_calls(self.cos), [])
+
+    def test_there_is_one_delivery_path_for_both_kinds_of_orders(self):
+        self.assertIn("orders_note", class_source_fn("compose"))
+        self.assertEqual(len(re.findall(r"def orders_note", SWITCHBOARD.read_text())), 1)
+
+
+@adds_to(TestLaunch)
+def test_a_pane_is_told_its_role_and_its_repo_for_its_decisions_panel(self):
+    done = self.launch(name="api-orch", role="orchestrator", charter=1, repo="acme/api", issue=None)
+    method, params = self.world.herdr.socket_calls[0]
+    self.assertEqual(params["root"]["env"]["FLEET_SWITCHBOARD_ROLE"], "orchestrator")
+    self.assertEqual(params["root"]["env"]["FLEET_SWITCHBOARD_REPO"], "acme/api")
+    self.assertEqual(self.new_session(done)["metadata"]["fleet"]["repo"], "acme/api")
+
+
+@adds_to(TestLaunch)
+def test_a_charter_holder_with_no_repo_gets_the_intent_repo_and_a_coder_none(self):
+    self.engine.config = dict(self.engine.config, intent_repo="acme/fleet")
+    self.launch(name="orch", role="orchestrator", charter=1, issue=None)
+    self.assertEqual(self.world.herdr.socket_calls[-1][1]["root"]["env"]["FLEET_SWITCHBOARD_REPO"], "acme/fleet")
+    self.launch(name="coder2", role="coder")
+    env = self.world.herdr.socket_calls[-1][1]["root"]["env"]
+    self.assertEqual(env["FLEET_SWITCHBOARD_ROLE"], "coder")
+    self.assertNotIn("FLEET_SWITCHBOARD_REPO", env)
+
+
+@adds_to(TestLaunch)
+def test_the_chief_of_staff_is_told_its_role_by_bootstrap_and_a_resume_keeps_it(self):
+    world = World(self, agents=())
+    done = sb.bootstrap_cos(world.new_engine("cli"), directory=str(self.work), patience=5,
+                            sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+    env = [p for m, p in world.herdr.socket_calls if m == "layout.apply"][-1]["root"]["env"]
+    self.assertEqual(env["FLEET_SWITCHBOARD_ROLE"], "chief-of-staff")
+    self.assertNotIn("FLEET_SWITCHBOARD_REPO", env)
+    del world.herdr.panes[done["pane"]]
+    sb.bootstrap_cos(world.new_engine("cli"), directory=str(self.work), patience=5,
+                     sleep=lambda seconds: setattr(world.clock, "t", world.clock.t + seconds))
+    env = [p for m, p in world.herdr.socket_calls if m == "layout.apply"][-1]["root"]["env"]
+    self.assertEqual(env["FLEET_SWITCHBOARD_ROLE"], "chief-of-staff")
+
+
+@adds_to(TestLaunch)
+def test_the_view_variables_are_not_secrets_and_are_only_names_in_the_audit(self):
+    self.launch(role="orchestrator", charter=1, repo="acme/api", issue=None)
+    layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"][0]
+    self.assertIn("FLEET_SWITCHBOARD_REPO", layout["detail"]["env_names"])
+    self.assertNotIn("acme/api", json.dumps(layout["detail"].get("env_names")))
+
+
+# ---- the panel in the TUI: whose view it is
+
+VIEW_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.now();
+const iso = (ms) => new Date(ms).toISOString();
+const list = [
+  { id: "a", title: "cos one", repo: "acme/api", tier: "cos", since: iso(now - 60000) },
+  { id: "b", title: "orch one", repo: "acme/api", tier: "orchestrator", since: iso(now - 60000) },
+  { id: "c", title: "web cos", repo: "acme/web", tier: "cos", since: iso(now - 60000) },
+  { id: "d", title: "yours", repo: "acme/web", tier: "human", since: iso(now - 60000) },
+  { id: "e", title: "old file, no tier", repo: null, since: iso(now - 60000) },
+];
+const snap = (decisions, errors = []) => ({ status: "ok", decisions, errors, ageMs: 0 });
+const ids = (view) => d.selectFor(list, view).map((x) => x.id).join("");
+const results = {
+  cos: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }),
+  cosWithRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff", FLEET_SWITCHBOARD_REPO: "acme/api" }),
+  orch: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "orchestrator", FLEET_SWITCHBOARD_REPO: "acme/api" }),
+  coderWithRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "coder", FLEET_SWITCHBOARD_REPO: " acme/web " }),
+  orchNoRepo: d.viewOf({ FLEET_SWITCHBOARD_ROLE: "orchestrator" }),
+  plain: d.viewOf({}),
+  nothing: [d.viewOf(undefined), d.viewOf(null), d.viewOf({ FLEET_SWITCHBOARD_REPO: "" })],
+  picked: { cos: ids(d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })), orch: ids(d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })),
+            web: ids(d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/web" })), plain: ids(d.viewOf({})) },
+  titles: [
+    d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })).title,
+    d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })).title,
+    d.buildView(snap(list), now, 34, d.viewOf({})).title,
+    d.buildView(snap(list), now).title,
+  ],
+  empty: d.buildView(snap(list.slice(0, 3)), now, 34, d.viewOf({})),
+  emptyRepo: d.buildView(snap([]), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })),
+  stale: d.buildView({ status: "stale", decisions: list, errors: [], ageMs: 999999 }, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })),
+  unset: d.buildView({ status: "unset", decisions: [], errors: [], ageMs: null }, now, 34, d.viewOf({})),
+  errors: d.buildView(snap(list, [{ source: "github", error: "x" }]), now, 34, d.viewOf({})).rows.map((r) => r.key),
+  envNames: [d.ROLE_ENV, d.REPO_ENV],
+  cosGroups: d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" })).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
+  orchGroups: d.buildView(snap(list), now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/api" })).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
+  humanGroups: d.buildView(snap(list), now, 34, d.viewOf({})).groups.map((g) => [g.repo, g.entries.map((e) => e.key)]),
+};
+console.log(JSON.stringify(results));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPanelViews(Base):
+    def setUp(self):
+        super().setUp()
+        script = self.home / "view-harness.mjs"
+        script.write_text(VIEW_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_variables_are_the_ones_launch_sets(self):
+        self.assertEqual(self.r["envNames"], [sb.VIEW_ROLE_ENV, sb.VIEW_REPO_ENV])
+
+    def test_the_chief_of_staff_sees_everything_a_pane_with_a_repo_its_repo_anyone_else_the_human_tier(self):
+        self.assertEqual(self.r["cos"]["kind"], "all")
+        self.assertEqual(self.r["cosWithRepo"]["kind"], "all", "the role wins")
+        self.assertEqual((self.r["orch"]["kind"], self.r["orch"]["repo"]), ("repo", "acme/api"))
+        self.assertEqual(self.r["coderWithRepo"]["repo"], "acme/web", "trimmed")
+        self.assertEqual(self.r["orchNoRepo"]["kind"], "human")
+        self.assertEqual([self.r["plain"]["kind"]] + [v["kind"] for v in self.r["nothing"]], ["human"] * 4)
+
+    def test_which_decisions_each_view_picks(self):
+        self.assertEqual(self.r["picked"], {"cos": "abcde", "orch": "ab", "web": "cd", "plain": "de"})
+
+    def test_the_title_says_which_view(self):
+        self.assertEqual(self.r["titles"], ["Decisions (5) all", "Decisions (2) acme/api", "Decisions (2) for you",
+                                            "Decisions (2) for you"])
+
+    def test_never_empty_never_absent_and_a_stale_list_is_still_said_to_be(self):
+        self.assertEqual(self.r["empty"]["title"], "Decisions (0) for you")
+        self.assertEqual(self.r["empty"]["rows"], [{"key": "none", "text": "none"}])
+        self.assertEqual(self.r["emptyRepo"]["title"], "Decisions (0) acme/api")
+        self.assertEqual(self.r["stale"], {"title": "Decisions (?)", "groups": [],
+                                         "rows": [{"key": "state", "text": "daemon not updating"}]})
+        self.assertEqual(self.r["unset"]["rows"][0]["text"], "daemon not updating")
+        self.assertEqual(self.r["errors"][-1], "errors")
+
+    def test_a_view_filter_and_the_repo_grouping_work_together(self):
+        self.assertEqual(self.r["cosGroups"], [["(no repo)", ["e"]], ["acme/api", ["a", "b"]], ["acme/web", ["c", "d"]]])
+        self.assertEqual(self.r["orchGroups"], [["acme/api", ["a", "b"]]], "only its own repo's group")
+        self.assertEqual(self.r["humanGroups"], [["(no repo)", ["e"]], ["acme/web", ["d"]]])
+
+    def test_the_tui_reads_the_view_from_the_environment_once(self):
+        source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
+        self.assertIn("viewOf(process.env)", source)
+        self.assertIn("buildView(snapshot, now, ROW_WIDTH, who)", source)
+
+    def test_the_readme_says_a_running_tui_needs_a_restart(self):
+        text = " ".join((DECISIONS_PLUGIN / "README.md").read_text().split())
+        self.assertIn("restart it", text)
+        self.assertIn("FLEET_SWITCHBOARD_ROLE", text)
+
+
+class TestTierRoleText(unittest.TestCase):
+    def text(self, *parts):
+        return " ".join((REPO.joinpath(*parts)).read_text().split())
+
+    def test_orchestrator_and_coder_raise_a_decision_to_the_chief_of_staff_and_never_apply_awaiting_user(self):
+        for role in ("orchestrator", "coder"):
+            for tree in ("opencode", "copilot"):
+                name = role + (".md" if tree == "opencode" else ".agent.md")
+                with self.subTest(role=role, tree=tree):
+                    text = self.text("agents", tree, name)
+                    self.assertIn('fleet-switchboard report question "..."', text)
+                    self.assertIn("awaiting-cos", text)
+                    self.assertIn("NEVER apply `awaiting-user` yourself", text)
+                    self.assertIn("switchboard message", text)
+                    self.assertIn("remove your `awaiting-cos` label", text)
+
+    def test_the_chief_of_staff_works_its_list_each_wake_and_never_edits_its_orders(self):
+        for tree, name in (("opencode", "chief-of-staff.md"), ("copilot", "chief-of-staff.agent.md")):
+            with self.subTest(tree=tree):
+                text = " ".join(self.text("agents", tree, name).replace("`", "").lower().split())
+                for needle in ("fleet-switchboard decisions", "decisions answer <id> allow|deny", "decisions resolve <id>",
+                               "quoting the order in one line", "never both", "never invent or widen an order",
+                               "never edit", "orders file", "if unsure, escalate", "restate what is unchanged",
+                               "decisions escalate <id> --reason"):
+                    self.assertIn(needle, text)
+
+    def test_the_skills_say_the_same_briefly_and_setup_runs_labels_ensure(self):
+        charter = self.text("skills", "fleet-charter", "SKILL.md")
+        self.assertIn("awaiting-cos", charter)
+        self.assertIn("NEVER apply `awaiting-user` yourself", charter)
+        coordination = self.text("skills", "fleet-coordination", "SKILL.md")
+        self.assertIn("awaiting-cos", coordination)
+        self.assertIn("standing-orders.md", coordination)
+        setup = self.text("skills", "fleet-setup", "SKILL.md")
+        self.assertIn("fleet-switchboard labels ensure", setup)
+        self.assertIn("standing-orders.md", setup)
+
+
+
+
+# ---- the offline runner learns the PR 18 steps and oracles
+
+STEP_EXAMPLES.update({"decide": {"action": "answer", "ref": "echo hi", "value": "allow", "note": "order 1",
+                                 "reason": "costs money"},
+                      "edit-cos-orders": {"text": "Answer read-only prompts with allow."}})
+STEP_EXAMPLES["awaiting"] = {"issue": 5, "on": True, "title": "Pick the database", "label": "cos"}
+EXPECT_EXAMPLES.update({"issue_labels": {"issue": 2, "has": ["user"], "lacks": ["cos"]},
+                        "permission_answered": {"agent": "coder", "count": 1, "decision": "once"}})
+EXPECT_EXAMPLES["decisions"] = {"at": "30s", "count": 1, "text": "Which database?", "as": "you", "tier": "cos"}
+
+
+@adds_to(FakeGitHub)
+def write(self, argv, kwargs):
+    """PR 18: the writes `decisions` makes: a label added (POST .../labels) or removed (DELETE .../labels/NAME), and a
+    comment. A label change sends the `issues` event GitHub would. Any other write raises."""
+    path, method = argv[2], argv[argv.index("--method") + 1]
+    found = re.match(r"^repos/%s/issues/(\d+)/(labels|comments)(?:/(.+))?$" % re.escape(self.repo), path)
+    if argv[:2] != [GH_BIN, "api"] or not found:
+        raise AssertionError("fake gh writes only labels and comments on %s; got %r" % (self.repo, argv))
+    number, data = int(found.group(1)), json.loads(kwargs["input"]) if "input" in kwargs else None
+    if found.group(2) == "labels" and method == "POST":
+        for name in data["labels"]:
+            self.set_label(number, name, True)
+    elif found.group(2) == "labels" and method == "DELETE":
+        name = urllib.parse.unquote(found.group(3))
+        if name not in [label["name"] for label in self.issues.get(number, {}).get("labels", [])]:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        self.set_label(number, name, False)
+    elif found.group(2) == "comments" and method == "POST":
+        self.__dict__.setdefault("written_comments", []).append({"issue": number, "body": data["body"]})
+    else:
+        raise AssertionError("fake gh: no such write %r" % (argv,))
+    return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True}), "")
+
+
+_original_github_runner = FakeGitHub.runner
+
+
+def _runner_with_writes(self, argv, **kwargs):
+    if "--method" in argv:
+        self.api_calls.append(argv[2])
+        return self.write(argv, kwargs)
+    return _original_github_runner(self, argv, **kwargs)
+
+
+FakeGitHub.runner = _runner_with_writes
+
+
+def apply_decide(run, step):
+    """`decide`: the cast member runs `fleet-switchboard decisions escalate|resolve|answer`. A resolve or an answer goes
+    through the policy judge first, as the shell call it is (an `ask` blocks the agent and nothing is done); an
+    escalate is plain. What it printed, or why it was refused, is kept for the oracles."""
+    world, name = run.world, step["actor"]
+    index = next(i for i, s in enumerate(run.scenario["steps"]) if s is step)
+    saved = os.environ.get(sb.FAULT_ENV)
+    os.environ[sb.FAULT_ENV] = ",".join(run.faults)
+    try:
+        engine = world.new_engine("cli")
+        engine.discover(world.clock.now())
+        engine.collect_facts()
+        decisions, _ = sb.derive_decisions(engine, world.clock.now())
+        found = [d for d in decisions if d["id"] == step["ref"]] or [d for d in decisions if step["ref"] in d["title"]]
+        if len(found) != 1:
+            run.said[index] = "no one decision holds %r: %d do" % (step["ref"], len(found))
+            return
+        decision = found[0]
+        if step["action"] in ("resolve", "answer"):
+            command = 'fleet-switchboard decisions %s "%s"%s' % (
+                step["action"], decision["id"], ' "%s"' % step["value"] if step["action"] == "answer" else "")
+            apply_tool_call(run, {"actor": name, "tool": "shell", "arguments": command}, index)
+            reply = run.policy.results[index]["reply"]
+            if reply["outcome"] != "allow":
+                run.said[index] = "the judge answered %s: not run" % reply["outcome"]
+                return
+        gh = getattr(run, "gh", None)
+        runner = gh.runner if gh is not None else (lambda *a, **k: (_ for _ in ()).throw(AssertionError("no GitHub")))
+        try:
+            if step["action"] == "escalate":
+                run.said[index] = sb.escalate_decision(engine, runner, decision, step.get("reason"), name)
+            elif step["action"] == "resolve":
+                run.said[index] = sb.resolve_decision(engine, runner, decision, step.get("note"), name)
+            else:
+                run.said[index] = sb.answer_decision(engine, decision, step["value"], step.get("note"), name)
+        except sb.DecisionError as err:
+            run.said[index] = "refused: %s" % err
+    finally:
+        os.environ[sb.FAULT_ENV] = saved or ""
+
+
+def apply_edit_cos_orders(run, step):
+    """`edit-cos-orders`: you add a line to the Chief of Staff's orders file, in an editor."""
+    path = Path(run.cos_orders_path)
+    old = path.read_text() if path.exists() else ""
+    path.write_text(old + ("\n" if old and not old.endswith("\n") else "") + "- %s\n" % step["text"])
+    stamp = run.world.clock.now()
+    os.utime(str(path), (stamp, stamp))
+
+
+def oracle_issue_labels(self, e):
+    gh = getattr(self, "gh", None)
+    issue = gh.issues.get(e["issue"]) if gh is not None else None
+    if issue is None:
+        return False, "the fake GitHub has no issue %d" % e["issue"]
+    names = sorted(label["name"] for label in issue["labels"])
+    wanted = {"user": sb.awaiting_label(self.world.config), "cos": sb.awaiting_cos_label(self.world.config)}
+    ok = all(wanted[k] in names for k in e.get("has", [])) and not any(wanted[k] in names for k in e.get("lacks", []))
+    return ok, "issue %d carries %s" % (e["issue"], names)
+
+
+def oracle_permission_answered(self, e):
+    sid = self.world.sessions[e["agent"]]
+    replies = [r for r in getattr(self.world.v2, "permission_replies", []) if r["session"] == sid
+               and (e.get("decision") is None or r["decision"] == e["decision"])]
+    return len(replies) == e["count"], "%d reply(ies) made to %s's requests: %s" % (
+        len(replies), e["agent"], [r["decision"] for r in replies])
+
+
+def _tiers_extend_offline_run():
+    original_apply = OfflineRun.apply
+
+    def apply(self, step):
+        if step["do"] == "decide":
+            apply_decide(self, step)
+        elif step["do"] == "edit-cos-orders":
+            apply_edit_cos_orders(self, step)
+        else:
+            original_apply(self, step)
+
+    OfflineRun.apply = apply
+    OfflineRun.oracle_issue_labels = oracle_issue_labels
+    OfflineRun.oracle_permission_answered = oracle_permission_answered
+
+
+_tiers_extend_offline_run()
+
+
+class TestTierScenarios(Base):
+    def test_the_pr18_catalog_is_present_with_a_control_each(self):
+        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
+        for sid, control in (("T1", ("fault", "tier-flat")), ("T2", ("variant", None)), ("T3", ("fault", "answer-unjudged")),
+                             ("T4", ("fault", "cos-orders-unfed")), ("T5", ("variant", None)),
+                             ("T6", ("fault", "anyone-edits-cos-orders"))):
+            with self.subTest(scenario=sid):
+                self.assertIn(sid, found)
+                self.assertEqual(found[sid]["since_pr"], 18)
+                self.assertEqual(found[sid]["tiers"], ["offline"])
+                kind, name = control
+                self.assertIn(kind, found[sid]["control"])
+                if name:
+                    self.assertEqual(found[sid]["control"][kind], name)
+
+    def test_every_new_fault_is_known_and_off_outside_the_lab(self):
+        for name in ("tier-flat", "cos-orders-unfed", "anyone-edits-cos-orders", "answer-unjudged"):
+            with self.subTest(fault=name):
+                self.assertIn(name, sb.KNOWN_FAULTS)
+                os.environ[sb.FAULT_ENV] = name
+                os.environ.pop(sb.LAB_ENV, None)
+                self.assertFalse(sb.fault(name))
+                os.environ[sb.LAB_ENV] = "1"
+                self.assertTrue(sb.fault(name))
+
+    def test_the_vocabulary_has_the_new_steps_and_oracles(self):
+        self.assertEqual(sorted(sc.STEP_FIELDS["decide"]), ["action", "note", "reason", "ref", "value"])
+        self.assertEqual(sorted(sc.STEP_FIELDS["edit-cos-orders"]), ["text"])
+        self.assertIn("label", sc.STEP_FIELDS["awaiting"])
+        self.assertEqual(sc.STEP_ACTORS["decide"], ("cast",))
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["issue_labels"]), ["has", "issue", "lacks"])
+        self.assertEqual(sorted(sc.EXPECT_FIELDS["permission_answered"]), ["agent", "count", "decision"])
+        self.assertIn("as", sc.EXPECT_FIELDS["decisions"])
+        self.assertIn("tier", sc.EXPECT_FIELDS["decisions"])
+
+    def test_the_vocabulary_checks_the_new_values(self):
+        base = mutate(_set(["steps", 0], {"at": "0s", "actor": "coder", "do": "decide", "action": "answer", "ref": "x"}))
+        self.assertEqual(sc.validate(base), [])
+        for field, bad in (("action", "approve"), ("value", "a\nb")):
+            step = {"at": "0s", "actor": "coder", "do": "decide", "action": "answer", "ref": "x", field: bad}
+            self.assertTrue(sc.validate(mutate(_set(["steps", 0], step))), field)
+        item = {"that": "decisions", "at": "30s", "count": 0, "as": "nobody"}
+        self.assertTrue([e for e in sc.validate(mutate(_set(["expect", 2], item))) if "as" in e])
+        item = {"that": "decisions", "at": "30s", "count": 0, "tier": "everyone"}
+        self.assertTrue([e for e in sc.validate(mutate(_set(["expect", 2], item))) if "tier" in e])
+
+    def test_the_readme_documents_the_new_vocabulary(self):
+        readme = (REPO / "scenarios" / "switchboard" / "README.md").read_text()
+        for word in ("`decide`", "`edit-cos-orders`", "`issue_labels`", "`permission_answered`", "`label`"):
+            self.assertIn(word, readme)
 
 
 def main(argv):

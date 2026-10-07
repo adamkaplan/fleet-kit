@@ -6,6 +6,13 @@ sidebar, below the session's own sections, listing what waits on you (docs/switc
 between repos; repos by name, oldest decision first). Each shows its id and how long it has waited on
 one line, then its whole title word-wrapped to 34 characters on the lines below. You read it and refer to a decision by its id in chat.
 
+- **Whose panel it is (PR 18).** The title says which view: `Decisions (3) all`, `Decisions (2) acme/api`,
+  `Decisions (1) for you`. A pane whose role is `chief-of-staff` shows every tier and repo; a pane that names a
+  repo shows that repo's decisions (every tier); any other pane, such as a TUI that is not a fleet agent,
+  shows the `human` tier only. The role and repo come from `FLEET_SWITCHBOARD_ROLE` and
+  `FLEET_SWITCHBOARD_REPO`, which `fleet-switchboard launch` and `bootstrap` put in the pane's environment
+  (not secrets). A TUI that was already running has neither the variables nor this version of the plugin:
+  restart it.
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
   changes and touches on every pass. It never derives anything itself.
 - An empty list shows a row `none`. A file that is missing, unreadable, older than 120 s,

@@ -48,7 +48,9 @@ changes nothing for you, do not report and do not answer at length.
 A `question` or `blocked` report is also what a decision waiting on someone looks like: the
 person you report to sees open ones in a read-only Decisions list, each with an id. Say it once, in
 the report, and do not repeat "I am still waiting" in later replies; the boss's `send` on that ask
-answers it.
+answers it. A decision goes up a tier at a time: a worker's to its orchestrator, an orchestrator's to
+the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
+orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
@@ -274,4 +276,7 @@ order): act on it without asking again, within its words. It covers nothing it
 does not name, and nobody but the Chief of Staff, through `fleet-switchboard orders
 add|remove --charter <n>`, or the owner records or changes one. When your
 principal gives the Chief of Staff a standing order, it records it and asks nothing
-the order already answers.
+the order already answers. The Chief of Staff's own orders are one local file,
+`standing-orders.md` beside the switchboard config: only the owner edits it
+(`fleet-switchboard orders --cos` prints it), and it is told them at its start, after each
+compaction and when the file changes.

@@ -93,7 +93,8 @@ DO:      Launch the orchestrator into a new workspace, with a brief on stdin:
            1. Create <owner>/<repo> as a private repo, as the account you were given
               (gh repo create <owner>/<repo> --private). The judge will ask the person
               once about that command: that is expected; wait for the answer.
-           2. Create the labels <user>:orchestrator and <user>:awaiting-user in it.
+           2. Create the labels in it: `fleet-switchboard labels ensure --repo <owner>/<repo>`
+              (<user>:orchestrator, <user>:awaiting-cos, <user>:awaiting-user).
            3. Open the charter issue (the fleet-charter skill), with `workspace: <label>`
               exactly as above, and label it <user>:orchestrator.
            4. Report: fleet-switchboard report done "repo, labels and charter are up: <charter url>".
@@ -130,4 +131,7 @@ Say plainly what the line says:
 - **not yet** — the daemon has not made its next pass. Wait one pass, look again.
 
 A repo that is not listed at all is not watched: say so, and do not call the
-project commissioned.
+project commissioned. When a repo that already exists joins, run
+`fleet-switchboard labels ensure --repo <owner>/<repo>` yourself. Your standing orders
+are the owner's one file, `standing-orders.md` beside the switchboard config
+(`fleet-switchboard orders --cos`): with none, say once that nothing is answered for them.

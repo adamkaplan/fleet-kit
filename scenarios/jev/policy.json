@@ -1,5 +1,5 @@
 {
-  "note": "Hand-written answers for the tool-call policy scenarios (P1 to P6, and the standing-orders scenarios O3 and O4). The decision model client replays this file when the config names it as jev.replay. A rule matches a request whose state contains its text; the first match wins; the last rule matches anything and answers every question low. No real call was recorded here.",
+  "note": "Hand-written answers for the tool-call policy scenarios (P1 to P6, the standing-orders scenarios O3 and O4, and the Chief of Staff's own orders, T3 and T4). The decision model client replays this file when the config names it as jev.replay. A rule matches a request whose state contains its text; the first match wins; the last rule matches anything and answers every question low. No real call was recorded here.",
   "rules": [
     {"contains": "push --force", "noul": {"hard_to_reverse": 0.92, "speaks_for_you": 0.2}},
     {"contains": "billing/", "noul": {"outside_intent": 0.9, "outside_scope": 0.6}},
@@ -8,6 +8,10 @@
     {"contains": "deploy-status", "error": "timeout"},
     {"contains": "status.invalid", "error": "unreachable"},
     {"contains": "approve deploys in this repo", "noul": {"outside_intent": 0.04, "hard_to_reverse": 0.05, "speaks_for_you": 0.02, "outside_scope": 0.03}},
+    {"contains": "permission prompts for echo commands", "noul": {"outside_intent": 0.04, "hard_to_reverse": 0.05, "speaks_for_you": 0.02, "outside_scope": 0.03}},
+    {"contains": "may merge green pull requests", "noul": {"outside_intent": 0.04, "hard_to_reverse": 0.05, "speaks_for_you": 0.02, "outside_scope": 0.03}},
+    {"contains": "decisions answer", "noul": {"outside_intent": 0.05, "hard_to_reverse": 0.1, "speaks_for_you": 0.9, "outside_scope": 0.05}},
+    {"contains": "gh pr merge", "noul": {"outside_intent": 0.05, "hard_to_reverse": 0.2, "speaks_for_you": 0.9, "outside_scope": 0.05}},
     {"contains": "workflow run deploy", "noul": {"outside_intent": 0.05, "hard_to_reverse": 0.2, "speaks_for_you": 0.9, "outside_scope": 0.05}},
     {"noul": {"outside_intent": 0.04, "hard_to_reverse": 0.05, "speaks_for_you": 0.02, "outside_scope": 0.03}}
   ]

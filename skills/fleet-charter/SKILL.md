@@ -1,6 +1,6 @@
 ---
 name: fleet-charter
-description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing asks and work items as native sub-issues (charter -> ask -> work item, with Intent and Done when), applying or removing the `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
+description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing asks and work items as native sub-issues (charter -> ask -> work item, with Intent and Done when), applying or removing the `<user>:awaiting-cos` or `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
 ---
 
 # Fleet Charter Convention
@@ -111,10 +111,17 @@ and check.
 Milestones group *programs* that span several orchestrators. They are never your
 per-orchestrator container.
 
-## 3. `<user>:awaiting-user` is the fleet's only blocking channel
+## 3. `<user>:awaiting-cos` and `<user>:awaiting-user` are the fleet's blocking channel
 
-Apply `<user>:awaiting-user` **the moment** you need a decision only the person
-you report to can make.
+Decisions have tiers. You never go straight to the person: a decision you cannot
+make goes up as `fleet-switchboard report question "..."` to your boss, and on the
+issue as `<user>:awaiting-cos`. NEVER apply `awaiting-user` yourself: the Chief of
+Staff either resolves it with the owner's standing orders, or escalates it
+(`awaiting-user` on, `awaiting-cos` off). Its answer arrives as a switchboard
+message: act on it, then remove your `awaiting-cos` label. The rules below hold
+for either label.
+
+Apply `<user>:awaiting-cos` **the moment** you need a decision you cannot make.
 
 **Order matters, and it is not optional: label first, ask second.** Apply the
 label and write the `## Decision required` section *before* you ask the question
@@ -173,7 +180,9 @@ the block visible in time, and it does not restore your ability to have asked th
 question properly. Label first.
 
 Never answer an `<user>:awaiting-user` question on their behalf, and never let a
-coder answer one for them.
+coder answer one for them. The Chief of Staff's own standing orders are one local
+file (`standing-orders.md` beside the switchboard config) that only the owner
+edits: no agent writes it.
 
 ## 4. Keep the pane field current — this is how death is detected
 

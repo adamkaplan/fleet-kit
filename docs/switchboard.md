@@ -1,7 +1,7 @@
 # Switchboard: tracking
 
 > Event-driven delivery for Fleet Kit on OpenCode v2 that never interrupts.
-> This plan is updated as each PR lands. Last updated 2026-10-06.
+> This plan is updated as each PR lands. Last updated 2026-10-07.
 >
 > It lives at `docs/switchboard.md` on the stack. After PR 1 it is edited only
 > on the current top branch, so status updates never rebase lower PRs.
@@ -27,6 +27,7 @@
 | 15 | `switchboard/multi-repo` | One Chief of Staff, many independent projects: the watched repos are derived, `owner/repo#N` issue references, a `gh` account per repo, `launch --new-workspace`, repo creation is a decision and always hard to reverse, per-repo status | ready for review |
 | 16 | `switchboard/install` | `fleet-switchboard install`: config, the kit's pieces in OpenCode's profile, the herdr plugin and a service that keeps the daemon alive; the decision-model key as a private file; the daemon started on use; `bootstrap` opens the Chief of Staff | ready for review |
 | 17 | `switchboard/orders` | Standing orders an agent does not forget: kept on the charter issue, recorded by the Chief of Staff with `fleet-switchboard orders`, re-supplied to every agent of the charter at its start, after each compaction and when they change, and read by the judge at every tool call | ready for review |
+| 18 | `switchboard/tiers` | Decision tiers (`cos`, `human`, `orchestrator`) on every decision, so an orchestrator never goes straight to you and the Chief of Staff resolves or escalates; the Chief of Staff's own standing orders, one local file fed to the judge and told to it; `decisions escalate`, `resolve` and `answer`; `labels ensure`; per-repo and per-role views in the TUI panel | ready for review |
 
 Each PR is opened as soon as it is ready. The whole stack merges to `main` in
 one atomic `gh stack merge`, and only once the system is complete.
@@ -454,7 +455,12 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working` and `paused` are riders: kept until a message carries them, never waking. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
-| `fleet-switchboard decisions [--json] [--fresh] [--watch]` | You, or any agent (PR 14) | The open decisions waiting on you, one line each: `#2a  waiting 12m  platform  Close #2? and a second deploy run?`. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `errors`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty list prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
+| `fleet-switchboard decisions [list] [--repo OWNER/REPO] [--tier cos\|human\|orchestrator\|all] [--json] [--fresh] [--watch]` | You, or any agent (PR 14; views PR 18) | The open decisions in the caller's view, one line each, the first line saying which view it is: `#2a  waiting 12m  platform  Close #2? and a second deploy run?` (a view that mixes tiers adds each row's `[tier]`). The Chief of Staff sees every repo and tier by default, an orchestrator its own repo, anyone else the human tier; the flags override. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `view`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty human view prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
+| `fleet-switchboard decisions escalate <id> [--reason "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Moves a decision to you: your label on and the Chief of Staff's off, on the issue (with the repo's own account), or at once for a prompt or question. Not judged. A report with no issue is refused: put it in chat |
+| `fleet-switchboard decisions resolve <id> [--note "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Takes both awaiting labels off the issue. Judged against the Chief of Staff's standing orders |
+| `fleet-switchboard decisions answer <id> allow\|deny` / `answer <id> "<text>"` | Chief of Staff, or you in a plain shell (PR 18) | Replies to an agent's pending permission request or question through v2. Judged against the Chief of Staff's standing orders |
+| `fleet-switchboard labels ensure [--repo OWNER/REPO]` | Anyone (PR 18) | Creates `<user>:orchestrator`, `<user>:awaiting-cos` and `<user>:awaiting-user` where missing (every watched repo by default), each with the repo's own account; idempotent |
+| `fleet-switchboard orders --cos` | Anyone (PR 18) | Prints the Chief of Staff's own standing orders file and its path. Read-only: you edit the file in an editor |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
 | `fleet-switchboard intents` | Any agent (PR 6) | The caller's open asks, one line each with its Done-when |
 | `fleet-switchboard handoff --issue <n> --brief-file <f>` | Chief of Staff (PR 8) | Fills in the Goal from the ask, checks the brief, posts it on the ask, and launches a background subagent with it |
@@ -1645,6 +1651,210 @@ name) are gone; the Lab itself was only read. Not measured: an automatic
 compaction (`reason` `auto`), which should look the same, and the herdr agent
 state during a compaction.
 
+### Decision tiers and the Chief of Staff's orders (PR 18)
+
+Before this PR a decision went straight to you: every `report question`, every
+`awaiting-user` label, every pending prompt of every agent landed in your
+Decisions list, however small. The owner decided the model: there is **one Chief
+of Staff over many orchestrators**, each orchestrator owns one workspace and one
+repo, and a decision has a **tier**. An orchestrator never goes straight to you.
+It raises a decision to the Chief of Staff (a `report question` or `blocked` to
+its boss, and the label `<user>:awaiting-cos` on the issue). The Chief of Staff
+then either **resolves** it, using your standing orders, or **escalates** it to
+you with `<user>:awaiting-user`. Your panel shows only what is escalated to you.
+No hard limit was added: a second orchestrator for a repo is not refused, because
+the Chief of Staff is the one who manages that.
+
+**Tiers.** Every decision (`decisions.json`, `--json`, `status`) carries a `tier`:
+
+| Source | Tier |
+|---|---|
+| An open issue with `<user>:awaiting-user` (`awaiting_label`) | `human` |
+| An open issue with `<user>:awaiting-cos` (`awaiting_cos_label`, new) | `cos` |
+| An issue with both | `human`: it was escalated |
+| A `report question` or `blocked` whose boss has no boss (the Chief of Staff) | `cos` |
+| The same report whose boss is itself a worker of someone (a coder reporting to its orchestrator) | `orchestrator` |
+| A report about an issue that now carries your label | `human`: the Chief of Staff escalated its issue, so the report that raised it is yours too |
+| A pending permission request or question of a fleet agent | `cos`, and `human` once it has waited `decisions_cos_grace_seconds` (default 300; 0 is at once), or at once when the Chief of Staff escalated it |
+
+An agent blocked on a prompt is never hidden from you for good: the grace is a
+head start for the Chief of Staff, not a place to lose it. The `orchestrator` tier
+shows in the Chief of Staff's view and in that repo's own view, never in yours.
+Resolved and answered decisions disappear exactly as before. Under the `tier-flat`
+fault every decision is `human`.
+
+**Two reads per repo.** The daemon's awaiting read now covers both labels: one
+bounded, paged read per label per repo (never one per issue), under the same
+forward-only and cap rules as PR 16 (a capped read says so once in
+`github.catch_up.truncated`, naming `awaiting-cos issues` or `awaiting-user
+issues`). A webhook event keeps the picture current with no call, as before; the
+time a decision has waited survives an escalation. The label names default to the
+operating-system user's prefix, like `awaiting_label`; the two must differ.
+
+**Who sees what (views).** `fleet-switchboard decisions [list] [--repo OWNER/REPO]
+[--tier cos|human|orchestrator|all] [--json] [--fresh] [--watch]` identifies the
+caller by its pane, as `send` does (`--from` is Lab only), and picks a default:
+
+| Caller | Repo | Tier |
+|---|---|---|
+| The Chief of Staff (role `chief-of-staff`) | every repo | every tier |
+| An orchestrator | its own repo (fleet metadata `repo`; `intent_repo` for a charter holder with none) | every tier |
+| Anyone else: a plain shell, a TUI that is not a fleet agent, a pane herdr cannot place | every repo | `human` |
+
+A flag overrides its own part and leaves the other at the caller's default. The
+first line of the output says plainly which view it printed, for example
+`Decisions: repo acme/api, all tiers (for orchestrator)`; a view that mixes tiers
+shows each row's tier. `decisions.json` itself holds every tier: the view is
+applied by the reader (the command, the panel, the scenario oracle), and `status`
+counts `waiting on you` as the human tier and says what else is open (`also open: 2
+with the Chief of Staff, 1 with an orchestrator`).
+
+**Escalate, resolve, answer.** Three subcommands for the Chief of Staff (or you in
+a plain shell; any other fleet agent is refused and audited as `decisions.refused`,
+and is told to raise the decision with `report question` and its awaiting-cos
+label). Each derives the list in its own process first (`--fresh`), so an id is
+the one the command just saw.
+
+| Command | Does | Judged |
+|---|---|---|
+| `decisions escalate <id> [--reason "one line"]` | An issue decision, or a report about an issue: your label on, the Chief of Staff's off, on that issue (with the repo's own `gh` account, the token only in the child's environment). A permission request or question: marked yours at once. A report with no issue cannot be escalated: it is refused and says to put it in chat. `--reason` is a comment on the issue signed with the agent's name, so it does not come back as an event | No: it only surfaces something to you |
+| `decisions resolve <id> [--note "one line"]` | Both awaiting labels off the issue (a missing one is not an error). The Chief of Staff answers the worker with `send`, which already resolves a report decision; this removes the labels. A permission request or question is refused: use `answer` | Yes |
+| `decisions answer <id> allow\|deny [--note "..."]` / `decisions answer <id> "<text>"` | Replies to an agent's pending permission request (`allow` is `once`, `deny` is `reject`, `--note` is the reason) or question (the text fills the form's one visible field: a string, a yes or no, or a number; a form of several fields is refused and says so) through v2 | Yes |
+
+"Judged" means what it means for every shell command: the policy judge reads the
+command before it runs, against the Chief of Staff's orders (below). The skip
+list of PR 11 (a plain `send`, `intent`, ... is the agents' own channel, not
+judged) does **not** cover `resolve` and `answer`; it does cover `decisions` with
+no subcommand, `decisions list`, `decisions escalate` and `orders --cos`. The
+judge's question would be blind to a bare id, so for a judged `answer` or
+`resolve` it is given one more line, read from `decisions.json`: what the
+decision is (`permission by api-coder, cos tier: permission: shell rm -rf
+build`). An id that starts with `#` must be quoted to count as a plain command.
+Under the `answer-unjudged` fault they skip the judge.
+
+*Where an escalated request is kept.* An escalation of an issue is the label on
+GitHub, which is already the truth. An escalated prompt or question has no issue
+to carry it, and the invariant that the audit log is never read by a decision
+holds, so the one place is a **small disposable file**, `escalated-requests.json`
+in the state directory (`{"<session>:<request id>": "<time>"}`, mode 0600,
+written with a lock): the daemon's decisions pass reads it, the daemon prunes it
+to the requests pending now, and the escalation is also audited
+(`decisions.escalate`, before and after). Deleting it loses only the head start:
+the request is yours anyway once the grace has run out. It is the one new file;
+it is a second copy of nothing that a derivation could rebuild for a request.
+
+**`labels ensure [--repo OWNER/REPO]`.** Creates `<user>:orchestrator`,
+`<user>:awaiting-cos` and `<user>:awaiting-user` where they are missing (every
+watched repo by default), each with the repo's own account, never twice
+(a label that exists is read, not rewritten). `skills/fleet-setup` runs it when a
+repo joins, `bin/switchboard-trial init` creates the new label too, and a
+create is audited before and after.
+
+**The Chief of Staff's own standing orders.** PR 17's orders belong to a charter and
+are for its orchestrator. These are different: they are what lets the Chief of
+Staff answer for you. They are **one local markdown file**, because there is no
+good place for them on GitHub yet:
+
+| What | Where |
+|---|---|
+| Path | `$XDG_CONFIG_HOME/fleet-switchboard/standing-orders.md`, beside `config.json`; config `cos_orders_file` (an absolute path) overrides |
+| Content | Free-form markdown, at most 8 KB. A larger file is refused, never cut: `orders --cos` and `status` say so, and nothing is fed to the judge or told to the Chief of Staff from it. HTML comments are not orders: the template's header is a comment |
+| Who writes it | You, in an editor. No fleet command writes it, and the judge stops an agent that tries (below) |
+| `install` | Makes a template with a comment header explaining the file, if there is none; **never overwrites** one; `--uninstall` leaves it. It is not in the repo, and no test touches a real path |
+| `fleet-switchboard orders --cos` | Prints the file and its path (read-only). `status` shows its path, size and mtime, or `none` |
+
+Two things read it:
+
+- **The judge.** For an agent whose role is `chief-of-staff`, `context_of` supplies
+  the file's text as the `authority` (it was `none stated`: the Chief of Staff has
+  no charter). It is read again only when the file's mtime or size changes (one
+  `stat` per call), and the verdict cache key holds the text, so an edit is seen
+  at the next call. The model's state clips it to 1200 characters (a charter's
+  orders: 600). With no ask, `outside_intent` and `outside_scope` stay off;
+  `hard_to_reverse` and `speaks_for_you` read the orders. Orders can only stop a
+  pointless question; they never loosen a deny (the judge only tightens,
+  invariant 9). Under `cos-orders-unfed` the file is ignored.
+- **The Chief of Staff itself.** PR 17's note path, with the file as its source and
+  no second path: `OrdersFacts` finds the Chief of Staff by **role**, not charter,
+  and makes a fact keyed `orders:cos:<hash8 of the text>:<compaction id|start>`,
+  delivered as a note that never wakes, at its start, after each completed
+  compaction and when the file's text changes. `orders_note` renders it as the
+  file's own text under `[switchboard] standing orders for <name> (the owner's, to
+  you):` and the closing line "These are the owner's standing orders to you.
+  Answer for the owner only within their words; anything they do not name goes to
+  the owner." A touched file with the same text sends nothing.
+
+**The guard.** An agent must not grant itself authority. A deterministic judge rule,
+beside the charter-edit rule, with no model and no GitHub read: any fleet agent
+(the Chief of Staff included) whose shell command writes the orders file is
+`speaks_for_you` and `hard_to_reverse` both. The command names the file's path or
+its file name, and is a redirect into it, `tee`, `sed -i`, `mv`, `cp`, `rm`,
+`ln`, `dd`, `touch`, an editor, or an interpreter one-liner (`python -c`, `perl -e`,
+`node -e`, ...); the `edit` tool on the path counts too. It is a guard, not a
+proof: a shell can obfuscate (build the path from pieces, a variable, a script, an
+alias, another tool, `rm -r` of the directory), and it sees only what the command
+says. The file's mode, your editor and the audit log are what stand behind it.
+Under `anyone-edits-cos-orders` the rule is off.
+
+**The panel.** `launch` and `bootstrap` put two variables in the pane's environment
+(the existing `launch_env` mechanism; not secrets): `FLEET_SWITCHBOARD_ROLE` and
+`FLEET_SWITCHBOARD_REPO` (the repo, or `intent_repo` for a charter holder given
+none). The Decisions plugin picks its view from them: a `chief-of-staff` pane
+shows every tier and repo, a pane with a repo shows that repo (every tier), anything
+else shows the `human` tier. The title says which (`Decisions (3) all`, `Decisions
+(2) acme/api`, `Decisions (1) for you`); the empty, stale and unset rows keep their
+rules and never disappear. The view is chosen first and the repo grouping applies to what it selects: the
+Chief of Staff's panel has a group for every repo, a pane with a repo has that repo's group alone, and each
+decision keeps its `<id> <age>` line and its whole wrapped title. **A TUI that was already running has neither the
+variables nor the new plugin: restart it.** The agent's own command line (`fleet-switchboard decisions`) uses the
+same defaults.
+
+**Roles and skills.** An orchestrator and a coder: a decision you cannot make goes
+up as `fleet-switchboard report question "..."` to your boss and, on the issue, as
+`<user>:awaiting-cos`; NEVER apply `awaiting-user` yourself; the answer arrives as a
+switchboard message, and you remove your `awaiting-cos` label when it is settled.
+The Chief of Staff: on each wake work your list (`fleet-switchboard decisions`);
+for each decision your orders cover, answer it (the orchestrator via `send`, a
+prompt via `decisions answer`) and `decisions resolve` it, quoting the order in one
+line; for each they do not cover, `decisions escalate <id> --reason ...`; never
+both; never invent or widen an order; never edit the orders file; if unsure,
+escalate. One short line per outcome; do not restate what is unchanged. The
+role-file size guards were not raised: older prose was shortened to make room.
+`fleet-charter`, `fleet-coordination` and `fleet-setup` say the same, briefly.
+
+**Lab proof (v2 2.0.24, throwaway profile).** `permission.reply` and the form reply
+were verified against a real v2 before any code relied on them, in a throwaway
+profile: its own XDG and `HOME` directories under a temporary directory, a v2 server
+started with `opencode serve` on its own port (49391, not the real service's
+49374; its own pid recorded and stopped by that pid, never by name), and
+`opencode api --server <url>` calls to it. `GET /openapi.json` names the operations
+(`session.permission.list|get|create|reply`, `session.form.list|create|get|cancel|reply`)
+and their shapes:
+
+| Operation | Request | Answer |
+|---|---|---|
+| `session.permission.reply` | `POST /api/session/{sessionID}/permission/{requestID}/reply`, body `{"decision": "once"\|"always"\|"reject", "message": <text or null>}` and nothing else | An empty reply. The request leaves `session.permission.list`; a second reply is `404 PermissionNotFoundError`; a bad `decision` is `400 InvalidRequestError` ("Expected Permission.Reply") |
+| `session.form.list` | `GET /api/session/{sessionID}/form` | `{"data": [{"id": "frm_...", "sessionID", "title", "fields": [{"key", "type", "title", ...}]}]}`: the operation PR 4 had only guessed at exists, and has this shape |
+| `session.form.reply` | `POST /api/session/{sessionID}/form/{formID}/reply`, body `{"answer": {<field key>: <string, number, boolean or list of strings>}}` | An empty reply. The form leaves the list; `session.form.get` then shows `state: {"status": "answered", "answer": {...}}` |
+
+A pending permission needed a session whose `permissions` rule says `ask` for the
+action (`{"action": "shell", "resource": "*", "effect": "ask"}`): with none, the
+default effect was `deny`, and `session.permission.create` answered at once with
+`deny`. The create then returned `ask` and the request showed in the list. Checked
+live: a permission answered `once` (gone from the list), one answered `reject`
+with a message (gone; the create call that was waiting returned), a repeat
+(`404`), a bad decision (`400`), a one-field string form answered with its
+`{"db": "postgres"}` (`answered`). The permission replies and the form reply are
+**verified**, and so are the switchboard's own `V2Client.permission_list`, `form_list`, `permission_reply` and `form_reply`, run against that server through a throwaway wrapper (they listed one prompt and one form, replied `reject` with a message and a one-field answer, left both lists empty, and a repeat reply was `http 404`); question replies for a form with more than one field, a multiselect or a
+file are not built, so they are refused with the field list. Every probe, the profile, its server and the probe
+sessions were removed; the live service, the owner's config and state and herdr
+were not touched.
+
+Faults (Lab only), one per behaviour: `tier-flat` (every decision is shown to you),
+`cos-orders-unfed` (the judge ignores the orders file), `anyone-edits-cos-orders`
+(the guard is off), `answer-unjudged` (`decisions answer` and `resolve` skip the
+judge). Scenarios T1 to T6 are new (O, S and SG ids are taken).
+
 ### Data
 
 The switchboard keeps almost nothing. Each fact lives in the system that owns
@@ -1664,7 +1874,8 @@ it, and is read from there each time it is needed.
 | Charters, sub-issues, PRs, checks, reviews | GitHub | Webhooks, plus a catch-up read after gaps |
 | Reminders not yet due | Switchboard file `reminders.json` | |
 | How far each repo was read | Switchboard file `github-read.json`: `{"owner/repo": "<iso>"}`. A disposable cursor, not truth: deleting it means a fresh start | `status` shows its age per repo |
-| What waits on you | Derived each pass; the projection is `decisions.json` | `fleet-switchboard decisions` |
+| What waits on you, and with whom | Derived each pass; the projection is `decisions.json`, every tier (PR 18). A prompt the Chief of Staff escalated: `escalated-requests.json`, a disposable head start | `fleet-switchboard decisions` |
+| The Chief of Staff's own standing orders | The owner's file `standing-orders.md` beside `config.json` (PR 18): not state, never written by the switchboard except the template `install` makes | `fleet-switchboard orders --cos` |
 | What the switchboard did and why | Switchboard file `audit.jsonl` | |
 
 ```mermaid
@@ -2099,6 +2310,12 @@ R1.
 | O3 | The owner adds an order on GitHub | 3 | A new note arrives, and the judge's next question sees the order | PR 17 | offline; control `orders-never-judged` |
 | O4 | An orchestrator tries to give itself an order | 1 | Only the Chief of Staff records one; `gh issue edit` of its own charter is stopped by the judge | PR 17 | offline; control `anyone-can-order` |
 | O5 | Two repos, two accounts, a charter each with different orders | 3 | Each orchestrator gets only its own repo's orders, in a note keyed with its repo | PR 17 | offline; control `one-account` |
+| T1 | An orchestrator's report and `awaiting-cos` label | — | In the Chief of Staff's view and not in yours; `escalate` moves both to yours | PR 18 | offline; control `tier-flat` |
+| T2 | The Chief of Staff resolves a decision | — | Both awaiting labels come off and it leaves every list | PR 18 | offline; the control is a variant that escalates instead |
+| T3 | An agent blocks on a permission prompt | — | Chief of Staff tier, yours after the 300 s grace; `answer allow` is judged: asked without an order, allowed with one | PR 18 | offline; control `answer-unjudged` |
+| T4 | The owner edits the Chief of Staff's orders file | — | A new note arrives, and the judge's next question sees the edit | PR 18 | offline; control `cos-orders-unfed` |
+| T5 | Two repos, two orchestrators, a coder | — | An orchestrator sees only its repo's decisions, the Chief of Staff all, you the human tier | PR 18 | offline; the control is a variant that gives the orchestrator the Chief of Staff's view |
+| T6 | An agent writes the Chief of Staff's orders file | — | The guard stops the orchestrator and the Chief of Staff alike, with no model call | PR 18 | offline; control `anyone-edits-cos-orders` |
 
 ## Repo and PR conventions
 
@@ -2716,3 +2933,39 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     `FLEET_SWITCHBOARD_STATE`, which the trial's wrapper exported and a real install does not. With nothing set
     it now looks in the directory the daemon writes to by default. A TUI loads plugins when it starts, so a
     running one needs a restart, and one that started before `install` has no panel at all.
+- 2026-10-07: PR 18, decision tiers, the Chief of Staff's own standing orders, per-repo views. The owner decided
+  the model (not reopened here): there is one Chief of Staff over many orchestrators, each owning one workspace
+  and one repo, and a decision has a tier. An orchestrator never goes straight to the human; it raises a decision to
+  the Chief of Staff (a `report question` or `blocked` to its boss, and the label `<user>:awaiting-cos`), which
+  resolves it with the owner's standing orders or escalates it with `<user>:awaiting-user`. The human's panel
+  shows only what is escalated to them. The Chief of Staff may also answer an agent's pending permission prompt or
+  question when its orders cover it. Its orders are one local markdown file, not a charter section, because there
+  is no good place for them on GitHub yet; PR 17's per-charter orders are untouched. No hard limit on orchestrators
+  per repo: the Chief of Staff manages that. Why: after PR 14 every `report question`, label and prompt of every
+  agent landed on the owner's list however small, the owner became the answer to routine prompts, and the Chief of
+  Staff, with no charter, had no authority text at all, so the judge treated every merge or deploy it ran as not
+  covered. Changed: `tier` on every decision; the daemon's awaiting read covers both labels with two bounded reads
+  per repo (PR 16's forward-only and cap rules hold); `fleet-switchboard decisions` takes `--repo`, `--tier` and a
+  view by caller (the Chief of Staff everything, an orchestrator its repo, anyone else the human tier) and says
+  which view it printed; `decisions escalate`, `resolve` and `answer`; `labels ensure` (and `bin/switchboard-trial
+  init` makes the new label); `orders --cos`; `install` makes the orders file's template and never overwrites it;
+  the judge feeds the file to the Chief of Staff's judgement as its authority (1200 characters to the model), a note
+  with the file's text reaches the Chief of Staff at its start, after each compaction and when the file changes
+  (PR 17's path, found by role), and a deterministic rule stops any agent that writes the file; `launch` and
+  `bootstrap` tell a pane its role and repo so the TUI panel can pick its view; role files and skills. Decisions
+  the work forced: (1) the audit log is never read by a decision (invariant), so an escalated prompt is kept in one
+  small disposable file, `escalated-requests.json`, pruned by the daemon, and it only brings forward what the grace
+  period would do anyway; (2) a report about an issue the Chief of Staff escalated becomes yours with its issue, so
+  one decision is not listed in two tiers; (3) only the Chief of Staff, or the owner in a plain shell, may escalate,
+  resolve or answer: an orchestrator that could would be granting itself authority; (4) the judge's question for an
+  `answer` or `resolve` is given the decision it acts on, read from `decisions.json`, because it would otherwise
+  see only an id; (5) `resolve` and `answer` are judged and `escalate` is not, because escalating only surfaces
+  something to the owner. The role files were already at their size guards; older prose was shortened, and the
+  guards stand. Verified live, in a throwaway v2 2.0.24 profile on its own port (details above): `permission.reply`
+  and the form reply (shapes, errors, the effect on the lists). Verified on fakes only: everything else, including
+  `labels ensure` and the label writes (no real GitHub was touched), the panel's views (the plugin's functions run
+  under node, not in a real TUI), and the judge with a replayed model. Not measured: herdr's reply for a pane that
+  is a person's shell and no agent (the reads treat any herdr or v2 error as the human's view; the writes refuse),
+  and `orders --cos` run from inside a pane of the private profile, whose `XDG_CONFIG_HOME` is the profile's: it
+  looks beside the config that process reads, while the daemon (which feeds the judge and the note) and `install`
+  use the daemon's own. Read the file from a plain shell, or with `cos_orders_file` set to one absolute path.

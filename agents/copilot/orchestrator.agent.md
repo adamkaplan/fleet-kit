@@ -44,7 +44,7 @@ Decide toward the ask's Intent. Reach your principal only when the step:
 - is ready for your principal's eyes: a review, findings;
 - or you are stuck after trying.
 
-Reach them through the Chief of Staff, or the `awaiting-user` label when it is
+Reach them through the Chief of Staff, or the `awaiting-cos` label when it is
 about your charter.
 
 ## Messages from the switchboard
@@ -85,16 +85,16 @@ are in the `fleet-charter` skill.
 
 ## Labels carry your prefix
 
-Your prefix is the output of `whoami`. Your charter carries
-`<user>:orchestrator`. A decision only your principal can make is marked
-`<user>:awaiting-user`, **applied before you ask and block** — blocking is what
-removes your ability to say you are blocked. Labels are repo-wide, and the prefix
-is what keeps your fleet from mixing with a colleague's.
+Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator`.
+Labels are repo-wide, and the prefix keeps your fleet from mixing with a colleague's.
 
-Open decisions are listed, with ids, in your principal's read-only Decisions
-list. Record one (the label, or `fleet-switchboard report question`), say it once
-with its id, and never restate open decisions in later replies: "see Decisions".
-On "answer #2a: yes", act, then remove the label.
+A decision you cannot make goes up as `fleet-switchboard report question "..."` to
+your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
+block**: blocking removes your ability to say you are blocked. NEVER apply
+`awaiting-user` yourself: the Chief of Staff escalates. Open decisions are listed,
+with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say one
+once with its id, never restate it ("see Decisions"). The answer arrives as a
+switchboard message: act on it, then remove your `awaiting-cos` label.
 
 Note that `gh issue list --label a --label b` is an AND. Adding a label to widen
 a search narrows it, usually to nothing, and it reads as though work vanished.
