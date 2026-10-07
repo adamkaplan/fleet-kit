@@ -51,6 +51,13 @@ the report, and do not repeat "I am still waiting" in later replies; the boss's 
 answers it. A decision goes up a tier at a time: a worker's to its orchestrator, an orchestrator's to
 the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
+
+Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
+--title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
+`awaiting-cos` issue in your own repo with a row per issue. The Chief of Staff escalates it as one item,
+and one answer (`as recommended`, or per-row changes) answers every row and takes the batch off the list.
+A row may name an issue you only propose to close: the answer is a comment on the batch and a note to you,
+and you act on the rows yourself; nothing closes, labels or edits them for you.
 If a question is superseded, take it back with `report withdrawn [--issue <n>] [--all]`.
 
 A PR is also announced. As soon as an orchestrator opens a PR (not only before it merges) it runs

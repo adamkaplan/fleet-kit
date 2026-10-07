@@ -10,7 +10,9 @@ export const DECISIONS_FILE = "decisions.json"
 export const STALE_MS = 120_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
+export const LONG_WAIT_SECONDS = 3600  // a decision waiting longer than this is "over 1h" (the CLI's status line counts the same way)
 export const HEADLINE_LINES = 2       // lines of one entry's headline
+export const ROW_LINES = 2            // lines of one row of a batch (`short-ref: recommendation`)
 export const FACTS_LINES = 3          // lines of a heads-up's facts line (it wraps at ROW_WIDTH)
 export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
@@ -160,6 +162,9 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title
   const entry = { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
+  const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
+  if (rows.length) entry.rows = rows.map((r) => wrapText(r.text, width, ROW_LINES))
   if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
   return entry
 }
@@ -208,8 +213,17 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
   }
   return {
     title: `Decisions (${shown.length}) ${view.label}`, groups, rows,
-    sections: sections.map((x) => ({ key: x.key, title: `${x.label} (${x.list.length})`, count: x.list.length, groups: groupsOf(x.list) })),
+    sections: sections.map((x) => ({
+      key: x.key, count: x.list.length, groups: groupsOf(x.list),
+      // what waits on cos shows how many have waited over an hour: the queue that must not pile up
+      title: x.key === "cos" ? `${x.label} (${x.list.length}, ${overLongWait(x.list, nowMs)} over 1h)` : `${x.label} (${x.list.length})`,
+    })),
   }
+}
+
+// How many of `list` have waited longer than LONG_WAIT_SECONDS at `nowMs`; one with no readable time is not counted.
+export function overLongWait(list, nowMs) {
+  return list.filter((d) => { const t = Date.parse(d.since); return !Number.isNaN(t) && (nowMs - t) / 1000 > LONG_WAIT_SECONDS }).length
 }
 
 // Whether the view has a Heads-up section (then an empty "Waits on you" says none, not nothing).
@@ -230,7 +244,7 @@ export function viewLines(view, width = ROW_WIDTH) {
       out.push(g.repo)
       g.entries.forEach((e, j) => {
         if (j) out.push(THIN(width))
-        out.push(...e.lines, ...(e.facts ?? []), e.head)
+        out.push(...e.lines, ...(e.rows ?? []).flat(), ...(e.facts ?? []), e.head)
       })
     })
   }

@@ -3988,6 +3988,90 @@ def decision_repos(engine):
     return watched_repos(engine.config, discovered_fleets(engine.discovery))
 
 
+# ---- a batch: related findings raised as ONE decision (one issue, one `decision-rows` block in its body)
+
+BATCH_FENCE = "decision-rows"
+BATCH_ROWS_MAX = 40            # rows one batch may carry (the panel draws one line or two per row)
+BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = 100, 200, 120
+BATCH_TITLE_MAX = 120
+_ROWS_BLOCK = re.compile(r"^```%s[ \t]*\r?\n(.*?)^```[ \t]*\r?$" % BATCH_FENCE, re.M | re.S)
+_ROW_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$")
+
+
+class BatchError(Exception):
+    """A batch that cannot be raised, and why. Nothing was created."""
+
+
+def short_ref_of(ref):
+    """`repo#N` for a row's ref given as `repo#N`, `owner/repo#N` or an issue or pull request URL."""
+    ref = short_refs(ref.strip())
+    return ref.split("/")[-1] if "/" in ref else ref
+
+
+def parse_batch_row(line):
+    """One row line `<ref> | <finding> | <recommendation>` as {ref, short, finding, recommendation, text}. Raises
+    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut."""
+    parts = [" ".join(part.split()) for part in line.split("|", 2)]
+    if len(parts) != 3 or not all(parts):
+        raise BatchError("a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: %r" % _one_line(line, 80))
+    ref, finding, rec = parts
+    if "```" in line:
+        raise BatchError("a row may not contain a code fence: %r" % _one_line(line, 80))
+    if len(ref) > BATCH_REF_MAX or not (_ROW_REF.match(ref) or _GITHUB_REF.match(ref)):
+        raise BatchError("%r is not an issue: write repo#N, owner/repo#N or the issue's URL" % _one_line(ref, 60))
+    return row_of(ref, finding, rec)
+
+
+def row_repo(ref):
+    """The `owner/repo` a row's ref names (`owner/repo#N` or an issue URL), or None for a short `name#N`."""
+    found = _GITHUB_REF.match(ref)
+    if found:
+        return "%s/%s" % (found.group(1), found.group(2))
+    return ref.split("#")[0] if "/" in ref.split("#")[0] else None
+
+
+def row_of(ref, finding, rec):
+    cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
+    finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
+    short = short_ref_of(ref)
+    return {"ref": ref, "short": short, "finding": finding, "recommendation": rec,
+            "text": "%s: %s" % (short, short_refs(rec))}
+
+
+def parse_decision_rows(body):
+    """The rows in an issue body's fenced `decision-rows` block, in order; [] for a body with none. Lenient: a line
+    that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
+    found = _ROWS_BLOCK.search(body) if isinstance(body, str) else None
+    rows = []
+    for line in (found.group(1).splitlines() if found else []):
+        if not line.strip():
+            continue
+        try:
+            rows.append(parse_batch_row(line))
+        except BatchError:
+            continue
+        if len(rows) >= BATCH_ROWS_MAX:
+            break
+    return rows
+
+
+def batch_headline(title, count):
+    """`<title> (n rows)`: the title is cut to leave the count whole."""
+    suffix = " (%d row%s)" % (count, "" if count == 1 else "s")
+    text = short_refs(" ".join(str(title).split()))
+    if _wrap_count((text + suffix).split(), HEADLINE_WIDTH) <= HEADLINE_LINES:
+        return text + suffix
+    return fit_lines(text, HEADLINE_WIDTH, 1) + suffix
+
+
+def batch_body(name, rows):
+    lines = "\n".join("%s | %s | %s" % (r["ref"], r["finding"], r["recommendation"]) for r in rows)
+    return ("Related findings raised as ONE decision (%d rows) by %s. Each row is `<issue> | <finding> | <recommendation>`; "
+            "one answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row "
+            "issues: the raising orchestrator acts on the answer.\n\n```%s\n%s\n```\n\n%s"
+            % (len(rows), name, BATCH_FENCE, lines, fleet_mark(name)))
+
+
 def decisions_from_github(engine, now):
     """(items, problems): the open issues with your label, from the hub's picture. No `gh` call is made here."""
     if not decision_repos(engine):
@@ -4004,7 +4088,8 @@ def decisions_from_github(engine, now):
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
                       "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
-                      "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human"})
+                      "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
+                      "rows": record.get("rows") or [], "raised_by": record.get("raised_by")})
     return items, problems
 
 
@@ -4102,9 +4187,37 @@ def prune_escalated(state_dir, pending):
             write_escalated(state_dir, kept)
 
 
-def synthetic_lines(engine, session_id, since):
+def synthetic_lines(engine, session_id, since, waiting=False):
     """The lines of a session's synthetic messages since `since`: [(created, message id, line number, line)],
-    newest message first. The one read of what a message said, shared by both report checks."""
+    newest message first. The one read of what a message said, shared by both report checks.
+
+    `waiting` (the worker's side: the sends that answer a report) adds the notes still in v2's inbox, first. A note
+    delivered to a session that is busy or engaged with a person waits there and is in no transcript until its
+    next turn: it counts as delivered, as everywhere else (`_fleet_keys`), or a report answered by such a send would
+    stay open. The inbox is read every time (one small read; it is not in the cache, because it changes without the
+    transcript's newest id changing). The boss's side (the reports) stays the transcript's: a report is listed once
+    the boss has it."""
+    found = transcript_lines(engine, session_id, since)
+    if not waiting:
+        return found
+    try:
+        inbox = engine.v2.inbox_list(session_id)
+    except V2Error:
+        return found  # an inbox that cannot be read leaves the transcript's lines, as before
+    have = {line[1] for line in found}
+    waiting = []
+    for item in inbox if isinstance(inbox, list) else []:
+        payload = item.get("payload") if isinstance(item, dict) and isinstance(item.get("payload"), dict) else {}
+        created = _created(item) if isinstance(item, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "synthetic" or item.get("id") in have \
+                or created is None or created < since or not isinstance(payload.get("text"), str):
+            continue
+        waiting.extend((created, item.get("id"), number, line) for number, line in enumerate(payload["text"].splitlines()))
+    return sorted(waiting, key=lambda line: -line[0]) + found
+
+
+def transcript_lines(engine, session_id, since):
+    """The transcript's synthetic lines since `since`, newest message first (cached by the newest synthetic id)."""
     newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
     newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
     cached = engine.synthetic_cache.get(session_id)
@@ -4175,12 +4288,43 @@ def decisions_from_reports(engine, now):
             if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
                 continue
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
+            considered = considered_send(engine, report, repos, since, sends)
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": "orchestrator" if above else "cos",
                           "since": report["at"][0], "bare": False,
-                          "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1])})
+                          "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
+                          "considered": considered})
     return items, problems
+
+
+def considered_send(engine, report, repos, since, sends):
+    """One line saying, for a report still open, the newest send from its boss to its worker that the check looked
+    at and why it did not answer, or that there was none (`decisions --fresh` prints it). Stable from pass to pass,
+    so it never rewrites decisions.json by itself."""
+    worker = engine.discovery.agents[report["sender"]]
+    if worker.name not in sends:
+        sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
+    newest = None
+    for created, message_id, _, line in sends[worker.name]:
+        match = SEND_LINE.match(line)
+        if match and match.group(1) == report["boss"] and (newest is None or created > newest[0]):
+            newest = (created, match, message_id)
+    who = "%s to %s" % (report["boss"], worker.name)
+    if newest is None:
+        return "no send from %s in the last %g hours" % (who, engine.config["decisions_lookback_hours"])
+    created, match, message_id = newest
+    admitted = message_id in {line[1] for line in transcript_lines(engine, worker.session_id, since)}
+    tag = "%s#%s" % (match.group(2) or "", match.group(3)) if match.group(3) else "no issue"
+    if created <= report["at"][0]:
+        why = "older than this report"
+    elif match.group(3) and (int(match.group(3)) != report["issue"]
+                             or repo_of_tag(match.group(2), repos) not in (None, report["repo"])):
+        why = "tagged %s, not this ask" % tag
+    else:
+        why = "should answer it"
+    return "newest send from %s: %s, %s, %s, %s" % (who, iso(created), tag,
+                                                    "admitted" if admitted else "queued in the inbox", why)
 
 
 def report_answered(engine, report, reports, since, sends):
@@ -4202,7 +4346,7 @@ def report_answered(engine, report, reports, since, sends):
     if worker.problem:
         raise RuntimeError("cannot read what %s was sent: %s" % (worker.name, worker.problem))
     if worker.name not in sends:
-        sends[worker.name] = synthetic_lines(engine, worker.session_id, since)
+        sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
     for created, _, _, line in sends[worker.name]:
         match = SEND_LINE.match(line)
         if match and match.group(1) == report["boss"] and created > report["at"][0] \
@@ -4644,8 +4788,15 @@ def derive_decisions(engine, now):
                     "tier": "human" if fault("tier-flat") else tier}
         about = cached_issue_title(engine, item["repo"] or home, item["ask"], listed) if item["kind"] == "report" and item["ask"] else None
         decision["headline"] = headline_of(item, about)
+        if item.get("rows"):  # a batch: one decision, one row each
+            decision["rows"] = item["rows"]
+            decision["headline"] = batch_headline(item["title"], len(item["rows"]))
+            if item.get("raised_by"):
+                decision["raised_by"] = item["raised_by"]
         if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
             decision["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
+        if item.get("considered"):
+            decision["considered"] = item["considered"]
         if item.get("request"):
             decision.update(session=item["session"], request=item["request"])
         decisions.append(decision)
@@ -4751,6 +4902,14 @@ def format_age(seconds):
 
 
 DECISION_TIERS = ("cos", "human", "orchestrator")
+DECISION_LONG_WAIT = 3600   # seconds: a decision waiting longer is "over 1h" (the panel's LONG_WAIT_SECONDS; a test keeps them equal)
+
+
+def count_over_an_hour(decisions, now):
+    """How many of `decisions` have waited longer than DECISION_LONG_WAIT at `now` (one with no readable time is
+    not counted). The one place that decides it: the status line uses it."""
+    waited = (parse_iso(d.get("since")) for d in decisions)
+    return sum(1 for since in waited if since is not None and now - since > DECISION_LONG_WAIT)
 
 
 def decisions_view(fleet, config, repo=None, tier=None):
@@ -4805,6 +4964,9 @@ def format_decisions(report, now, view=None):
                                                       format_age(now - since) if since is not None else "?",
                                                       tier, agent.ljust(width_agent), decision["title"]))
         lines = [line.rstrip() for line in lines]
+        if report.get("fresh"):  # --fresh says, for an open report, which send it looked at (or that there was none)
+            lines = [line for pair in zip(lines, [("      " + d["considered"]) if d.get("considered") else None
+                                                   for d in decisions]) for line in pair if line is not None]
     lines.extend("(could not read %s: %s)" % (e.get("source"), e.get("error")) for e in report["errors"])
     if view is not None:
         lines.insert(0, "Decisions: %s" % view["text"])
@@ -4831,7 +4993,7 @@ def fresh_decisions(runner, now):
     """`decisions --fresh`: derive the list in this process, read-only, and write nothing."""
     _, decisions, errors = fresh_engine_decisions(runner, now)
     return {"stale": False, "message": None, "age_seconds": 0, "written_at": iso(now()), "generation": None,
-            "decisions": decisions, "errors": errors}
+            "decisions": decisions, "errors": errors, "fresh": True}
 
 
 def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clear=False, view=None):
@@ -4911,6 +5073,7 @@ def decisions_summary(state_dir, now):
     report = decisions_report(state_dir, now())
     by_repo, by_tier = {}, {}
     listed = [d for d in report["decisions"] if d.get("kind") != "notice"]  # a PR notice is information, not a decision
+    over_cos = count_over_an_hour([d for d in listed if d.get("tier", "human") == "cos"], now())
     for decision in listed:
         tier = decision.get("tier", "human")
         by_tier[tier] = by_tier.get(tier, 0) + 1
@@ -4918,7 +5081,7 @@ def decisions_summary(state_dir, now):
             by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(listed), "stale": report["stale"], "message": report["message"],
             "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo,
-            "by_tier": by_tier}
+            "by_tier": by_tier, "cos_over_an_hour": over_cos}
 
 
 def format_decisions_status(summary):
@@ -4933,8 +5096,9 @@ def format_decisions_status(summary):
             yours, ", ".join("%s %d" % (repo, count) for repo, count in sorted(by_repo.items())), PROG)
     elsewhere = {tier: count for tier, count in tiers.items() if tier != "human"}
     if elsewhere:
-        line += "; also open: %s" % ", ".join("%d with %s" % (count, "the Chief of Staff" if tier == "cos" else
-                                                                "an orchestrator") for tier, count in sorted(elsewhere.items()))
+        line += "; also open: %s" % ", ".join(
+            "%d with the Chief of Staff (%d over 1h)" % (count, summary.get("cos_over_an_hour", 0)) if tier == "cos"
+            else "%d with an orchestrator" % count for tier, count in sorted(elsewhere.items()))
     return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
 
 
@@ -6109,8 +6273,12 @@ class GitHubHub:
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
                 since = known["since"] if known else (stamp if stamp is not None else when or self.now())
+                # a batch's rows come from the body this payload or listing already carries: no read of their own
+                rows = parse_decision_rows(issue["body"]) if "body" in issue else (known or {}).get("rows", [])
+                raised = signed_by_fleet(issue["body"]) if "body" in issue and rows else (known or {}).get("raised_by")
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
-                                      "parent": parent_of(issue), "tier": tier}
+                                      "parent": parent_of(issue), "tier": tier, "rows": rows,
+                                      "raised_by": raised if rows else None}
             else:
                 self.awaiting.pop(key, None)
 
@@ -6155,7 +6323,8 @@ class GitHubHub:
         """(records, errors) for the decisions: what the hub knows, and what it could not read."""
         with self.lock:
             records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
-                        "parent": entry["parent"], "tier": entry["tier"]}
+                        "parent": entry["parent"], "tier": entry["tier"], "rows": entry.get("rows", []),
+                        "raised_by": entry.get("raised_by")}
                        for (repo, number), entry in sorted(self.awaiting.items())]
             errors = []
             for repo in sorted(self.watches):
@@ -8060,7 +8229,7 @@ def plain_switchboard_message(text):
     anything (see _plain_words). Anything this is unsure about is judged like any other shell command.
 
     PR 18: `decisions` (a read, `list`, or `escalate`) and `orders --cos` (a read) are plain too. `decisions
-    resolve` and `decisions answer` are NOT: they act for the owner, so the judge reads them against the Chief of
+    resolve`, `decisions answer` and `decisions supersede` are NOT: they act for the owner, so the judge reads them against the Chief of
     Staff's standing orders (the `answer-unjudged` fault lets them through)."""
     words = _plain_words(text)
     if not words or len(words) < 2 or os.path.basename(words[0]) != PROG:
@@ -8068,7 +8237,7 @@ def plain_switchboard_message(text):
     if words[1] in POLICY_MESSAGE_COMMANDS:
         return True
     if words[1] == "decisions":
-        return _decisions_subcommand(words[2:]) not in ("resolve", "answer") or fault("answer-unjudged")
+        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede") or fault("answer-unjudged")
     return words[1] == "orders" and words[2:] == ["--cos"]
 
 
@@ -8080,7 +8249,7 @@ def decision_gloss(state_dir, command):
         return ""
     rest = words[2:]
     sub = _decisions_subcommand(rest)
-    if sub not in ("resolve", "answer") or rest.index(sub) + 1 >= len(rest):
+    if sub not in ("resolve", "answer", "supersede") or rest.index(sub) + 1 >= len(rest):
         return ""
     ident = rest[rest.index(sub) + 1]
     body = read_decisions_file(Path(state_dir) / DECISIONS_FILE)
@@ -12303,18 +12472,241 @@ def answer_decision(engine, decision, value, note, name):
     return "answered %s" % ident
 
 
+def read_batch_rows(args):
+    """The rows of a `decisions batch`: every --row, then the lines of --file (`-` is stdin), or stdin when neither
+    was given and it is piped. Raises BatchError."""
+    lines = list(args.row or [])           # an empty --row is refused below; blank lines of a file or stdin are skipped
+    more = []
+    if args.file is not None:
+        try:
+            more = (sys.stdin.read() if args.file == "-" else Path(args.file).read_text()).splitlines()
+        except OSError as err:
+            raise BatchError("cannot read %s: %s" % (args.file, err.strerror or err)) from None
+    elif not lines and not sys.stdin.isatty():
+        more = sys.stdin.read().splitlines()
+    lines.extend(line for line in more if line.strip())
+    if not lines:
+        raise BatchError("a batch needs rows: --row \"<repo#N> | <finding> | <recommendation>\" (repeat it), or --file")
+    if len(lines) > BATCH_ROWS_MAX:
+        raise BatchError("a batch is at most %d rows (this one is %d): raise the rest as a second batch"
+                         % (BATCH_ROWS_MAX, len(lines)))
+    return [parse_batch_row(line) for line in lines]
+
+
+def cmd_decision_batch(args, runner, now):
+    """`decisions batch`: an orchestrator raises related findings as ONE issue in ITS OWN repo, labelled for the
+    Chief of Staff, with the rows in a fenced `decision-rows` block. Creates nothing anywhere else."""
+    try:
+        engine, _, config = build_engine(runner, now, "cli")
+        name, role, fleet = orders_caller(engine, args)
+        if role != "orchestrator":
+            raise BatchError("only an orchestrator raises a batch (%s is %s): a worker reports to its orchestrator"
+                             % (name, "a %s" % role if role else "not given a role"))
+        repo = _fleet_repo(fleet, config)
+        if repo is None:
+            raise BatchError("%s has no repo in its fleet metadata: a batch is raised in your own repo" % name)
+        title = " ".join((args.title or "").split())
+        if not title or len(title) > BATCH_TITLE_MAX:
+            raise BatchError("--title is one line of 1 to %d characters" % BATCH_TITLE_MAX)
+        rows = read_batch_rows(args)
+        for row in rows:
+            named = row_repo(row["ref"])
+            if named is not None and named != repo or named is None and row["ref"].split("#")[0] != repo.split("/")[1]:
+                raise BatchError("row %r names an issue outside %s: a batch holds only issues of its own repo, so a "
+                                 "finding about a private repo can never land in a public one's batch. Raise it from "
+                                 "that repo's orchestrator" % (_one_line(row["ref"], 60), repo))
+        subject = "issue:%s" % repo
+        with engine._external("decisions.batch", subject, {"repo": repo, "rows": len(rows), "by": name}):
+            done = _gh_write(engine, runner, repo, "repos/%s/issues" % repo, "POST",
+                             {"title": title, "body": batch_body(name, rows),
+                              "labels": [awaiting_cos_label(config)]})
+        try:
+            made = json.loads(done.stdout or "")
+            number = int(made["number"])
+        except (ValueError, KeyError, TypeError):
+            raise BatchError("gh created the issue but answered something unreadable: look for it in %s" % repo) from None
+    except (BatchError, CallerError, IntentError) as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    print(issue_tag(repo, number, decision_repos(engine)))
+    sys.stderr.write("%s: batch of %d rows raised as %s#%d, waiting on the Chief of Staff\n"
+                     % (PROG, len(rows), repo, number))
+    try:
+        send_poke(state_dir_path())
+    except Exception:
+        pass
+    return EXIT_OK
+
+
+def batch_answer_rows(decision, args):
+    """[(row, outcome text, changed)] for `decisions answer <batch> --as-recommended | --row N=<choice> ...`: a row
+    not named keeps its recommendation. Raises DecisionError."""
+    rows, wanted = decision["rows"], {}
+    if args.as_recommended == bool(args.row):
+        raise DecisionError("%s is a batch of %d rows: answer it with --as-recommended, or --row N=<choice> for the "
+                            "rows that change (the rest keep their recommendation); not both, not neither"
+                            % (decision["id"], len(rows)))
+    for item in args.row or []:
+        found = re.match(r"^([0-9]+)=(.+)$", item.strip())
+        if not found or not " ".join(found.group(2).split()):
+            raise DecisionError("%r is not a row answer: write --row N=<choice>" % _one_line(item, 60))
+        number = int(found.group(1))
+        if not 1 <= number <= len(rows):
+            raise DecisionError("row %d does not exist: %s has rows 1 to %d" % (number, decision["id"], len(rows)))
+        if number in wanted:
+            raise DecisionError("row %d is answered twice" % number)
+        wanted[number] = _one_line(found.group(2), BATCH_REC_MAX * 2)
+    out = []
+    for number, row in enumerate(rows, 1):
+        choice = wanted.get(number)
+        if choice is None or choice.lower() == "as recommended":
+            out.append((row, "as recommended: %s" % row["recommendation"], False))
+        else:
+            out.append((row, "changed: %s (recommended: %s)" % (choice, row["recommendation"]), True))
+    return out
+
+
+def answer_batch(engine, runner, decision, args, name):
+    """ONE comment on the batch issue recording every row's outcome, then both awaiting labels off it, so the batch
+    and all its rows leave the list together; then, when it can, a note to the orchestrator that raised it. Never
+    touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
+    ident = decision["id"]
+    target = _issue_target(engine, decision)
+    if target is None or target[0] is None:
+        raise DecisionError("%s: cannot tell which repo its issue is in" % ident)
+    repo, number = target
+    outcomes = batch_answer_rows(decision, args)
+    changed = sum(1 for _, _, c in outcomes if c)
+    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
+                                                      "%d row%s changed, the rest as recommended"
+                                                      % (changed, "" if changed == 1 else "s"))]
+    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
+    if args.note:
+        lines.append("Note: %s" % _one_line(args.note, 300))
+    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    comment_as(engine, runner, repo, number, "\n".join(lines), name)
+    change_issue_labels(engine, runner, repo, number, (),
+                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
+                                            "rows": len(outcomes), "changed": changed,
+                                            "note": _one_line(args.note or "", 200)})
+    told = ""
+    raised = decision.get("raised_by")
+    if raised and name:
+        text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
+               "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
+        try:
+            outcome = engine.send(name, raised, text, number, repo)
+            told = "; told %s" % raised if outcome.get("sent") else "; could not tell %s (%s): the comment is the record" % (
+                raised, outcome.get("reason") or outcome.get("action"))
+        except Exception as err:
+            told = "; could not tell %s (%s): the comment is the record" % (raised, _one_line(str(err), 100))
+    return "answered %s: %d rows (%d as recommended, %d changed); %s and %s are off %s#%d%s" % (
+        ident, len(outcomes), len(outcomes) - changed, changed, awaiting_cos_label(engine.config),
+        awaiting_label(engine.config), repo, number, told)
+
+
+def parse_superseding(engine, text):
+    """`owner/repo#N`, `name#N` (a watched repo's name) or an issue or pull request URL -> (repo, number, as shown)."""
+    text = (text or "").strip()
+    found = _GITHUB_REF.match(text)
+    if found:
+        repo, number = "%s/%s" % (found.group(1), found.group(2)), int(found.group(3))
+    else:
+        short = _SHORT_REF.fullmatch(text)
+        repo = repo_of_tag(short.group(1), decision_repos(engine)) if short else None
+        if repo is None:
+            raise DecisionError("--by names the superseding issue as owner/repo#N, name#N for a watched repo, or its "
+                                "URL (got %r)" % _one_line(text, 60))
+        number = int(short.group(2))
+    if number < 1:
+        raise DecisionError("--by names no issue: %r" % _one_line(text, 60))
+    return repo, number, "%s#%d" % (repo, number)
+
+
+def supersede_decision(engine, runner, decision, shown, note, name):
+    """One decision made moot by another issue. An issue: a comment `Superseded by <ref>`, both awaiting labels off.
+    A report: the answerer's `send` to its worker naming the superseding issue (what clears a report), then its
+    issue's labels off if it has one. A permission request or question is refused. Returns what was done."""
+    kind, ident = decision["kind"], decision["id"]
+    _refuse_notice(decision)
+    if kind in ("permission", "question"):
+        raise DecisionError("is a %s: answer it with `%s decisions answer %s ...`" % (kind, PROG, ident))
+    said = "Superseded by %s%s" % (shown, ": %s" % _one_line(note, 300) if note else "")
+    target = _issue_target(engine, decision)
+    both = [awaiting_cos_label(engine.config), awaiting_label(engine.config)]
+    if kind == "issue":
+        if target is None or target[0] is None:
+            raise DecisionError("cannot tell which repo its issue is in")
+        repo, number = target
+        comment_as(engine, runner, repo, number, said, name)
+        change_issue_labels(engine, runner, repo, number, (), both)
+        engine._note("decisions.supersede", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
+                                                   "superseded_by": shown})
+        return "done: comment and both labels off %s#%d" % (repo, number)
+    if not name:
+        raise DecisionError("a report is cleared by a send from the boss: run this as the Chief of Staff")
+    if not decision.get("ask") or not decision.get("agent"):
+        raise DecisionError("is a report that names no issue: a send would clear every question of its worker. "
+                            "Answer it with `%s send`" % PROG)
+    outcome = engine.send(name, decision["agent"], "%s. Your question on this ask is covered there; carry on with "
+                                                   "that." % said, decision["ask"], decision.get("repo"))
+    if not outcome.get("sent"):
+        raise DecisionError("%s was not sent to %s (%s): the report stays open" % (
+            "the note", decision["agent"], outcome.get("reason") or outcome.get("action")))
+    engine._note("decisions.supersede", ident, {"kind": kind, "agent": decision["agent"], "by": name,
+                                               "superseded_by": shown})
+    if target is not None and target[0] is not None:
+        try:
+            change_issue_labels(engine, runner, target[0], target[1], (), both)
+        except IntentError as err:
+            raise DecisionError("sent to %s, but its issue's labels were not removed: %s" % (decision["agent"], err)) from None
+        return "done: sent to %s, both labels off %s#%d" % (decision["agent"], target[0], target[1])
+    return "done: sent to %s" % decision["agent"]
+
+
+def cmd_decision_supersede(args, engine, decisions, name, runner):
+    """`decisions supersede <id> ... --by <issue>`: per id one line, `done` or `refused: why`; it carries on past a
+    failure. Returns the exit code."""
+    repo, number, shown = parse_superseding(engine, args.by)
+    failed = 0
+    for ident in dict.fromkeys(args.ids):
+        try:
+            decision = decision_by_id(decisions, ident)
+            if decision is None:
+                raise DecisionError("no decision %s is waiting" % ident)
+            line = supersede_decision(engine, runner, decision, shown, args.note, name)
+            print("%s: %s" % (ident, line))
+        except (DecisionError, IntentError) as err:
+            failed += 1
+            print("%s: refused: %s" % (ident, _one_line(str(err), 300)))
+        except Exception as err:
+            failed += 1
+            print("%s: failed: %s" % (ident, _one_line("%s: %s" % (type(err).__name__, err), 300)))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
 def cmd_decision_write(args, action, runner, now):
-    """`decisions escalate|resolve|answer`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
+    """`decisions escalate|resolve|answer|supersede`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
+    if action == "batch":
+        return cmd_decision_batch(args, runner, now)
     try:
         engine, decisions, _ = fresh_engine_decisions(runner, now, writable=True)
         name, role = decision_actor(engine, args)
         if name is not None and role != "chief-of-staff":
-            engine.audit.append(engine.actor, "decisions.refused", args.id,
+            engine.audit.append(engine.actor, "decisions.refused", getattr(args, "id", None) or " ".join(args.ids),
                                 {"caller": name, "role": role, "action": action})
             sys.stderr.write("%s: only the Chief of Staff, or you in a plain shell, may %s a decision; %s is %s. "
                              "Raise it with `%s report question \"...\"` and your awaiting-cos label\n"
                              % (PROG, action, name, "a %s" % role if role else "not given a role", PROG))
             return EXIT_USAGE
+        if action == "supersede":
+            code = cmd_decision_supersede(args, engine, decisions, name, runner)
+            try:
+                send_poke(state_dir_path())
+            except Exception:
+                pass
+            return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
             raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
@@ -12322,6 +12714,14 @@ def cmd_decision_write(args, action, runner, now):
             line = escalate_decision(engine, runner, decision, args.reason, name)
         elif action == "resolve":
             line = resolve_decision(engine, runner, decision, args.note, name)
+        elif decision["kind"] == "issue" and decision.get("rows"):
+            line = answer_batch(engine, runner, decision, args, name)
+        elif args.as_recommended or args.row:
+            raise DecisionError("%s is not a batch: --as-recommended and --row answer a batch; answer this with its "
+                                "own value" % args.id)
+        elif args.value is None:
+            raise DecisionError("answer %s with a value: `allow` or `deny` for a permission request, the text for a "
+                                "question" % args.id)
         else:
             line = answer_decision(engine, decision, args.value, args.note, name)
     except (DecisionError, CallerError) as err:
@@ -12431,17 +12831,38 @@ def add_decision_parsers(sub):
     escalate.add_argument("id", help="The decision's id")
     escalate.add_argument("--reason", help="One line, posted as a comment on the issue, signed as you")
     escalate.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    batch = kinds.add_parser("batch", help="Raise related findings as ONE decision: one issue in your own repo, "
+                                           "labelled for the Chief of Staff, one row per finding")
+    batch.add_argument("--title", required=True, help="One line: what the batch is about")
+    batch.add_argument("--row", action="append", metavar="ROW", help="`<repo#N> | <finding> | <recommendation>`; "
+                                                                   "repeat it, at most %d rows" % BATCH_ROWS_MAX)
+    batch.add_argument("--file", help="Rows, one per line, from this file (`-` for stdin; with no --row and no "
+                                      "--file, piped stdin)")
+    batch.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    supersede = kinds.add_parser("supersede", help="Mark several open decisions superseded by one issue. An issue "
+                                                   "decision: a comment and both labels off; a report: your `send` "
+                                                   "to its worker. Judged like `resolve`")
+    supersede.add_argument("ids", nargs="+", metavar="id", help="The decisions' ids")
+    supersede.add_argument("--by", required=True, metavar="ISSUE", help="The superseding issue: owner/repo#N, name#N "
+                                                                       "for a watched repo, or its URL")
+    supersede.add_argument("--note", help="One line, added to each comment and send")
+    supersede.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     resolve = kinds.add_parser("resolve", help="Take both awaiting labels off a decision's issue: it is settled. "
                                                "Judged against the Chief of Staff's standing orders")
     resolve.add_argument("id", help="The decision's id")
     resolve.add_argument("--note", help="One line, posted as a comment on the issue, signed as you")
     resolve.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     answer = kinds.add_parser("answer", help="Answer an agent's pending permission request (allow|deny) or question "
-                                             "(the answer's text) through v2. Judged against the Chief of Staff's "
+                                             "(the answer's text) through v2, or a batch (--as-recommended, --row). Judged against the Chief of Staff's "
                                              "standing orders")
     answer.add_argument("id", help="The decision's id")
-    answer.add_argument("value", help="`allow` or `deny` for a permission request; the text for a question")
-    answer.add_argument("--note", help="One line: the order that covers it")
+    answer.add_argument("value", nargs="?", help="`allow` or `deny` for a permission request; the text for a question "
+                                                 "(a batch takes --as-recommended or --row instead)")
+    answer.add_argument("--as-recommended", action="store_true", help="A batch: every row as recommended")
+    answer.add_argument("--row", action="append", metavar="N=CHOICE", help="A batch: row N (from 1) answered CHOICE; "
+                                                                         "repeat it. Rows not named keep their "
+                                                                         "recommendation")
+    answer.add_argument("--note", help="One line: the order that covers it (a batch: part of the answer's comment)")
     answer.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     labels = sub.add_parser("labels", help="Create the fleet's labels in the watched repos",
                             description="`labels ensure` creates the labels the fleet uses, each with the repo's own "

@@ -13265,6 +13265,114 @@ class TestDecisionDerivation(DecisionsBase):
         self.world.tick(1)
         self.assertEqual(self.listed(), [])
 
+    def test_a_send_waiting_in_the_workers_inbox_already_resolves_the_report(self):
+        # The bug on #43: a send to a worker that a person is engaged with is `delivered` as a note and waits in
+        # v2's inbox; it is in no transcript until the worker's next turn, so the question stayed listed.
+        for n in range(2, 15):
+            self.ask_the_boss("question %d?" % n, issue=n)
+        self.assertEqual(len(self.listed()), 13)       # primes the synthetic cache, as the daemon's passes do
+        self.world.you("coder")
+        engine = self.world.new_engine("cli")
+        outcomes = [engine.send("platform", "coder", "answer %d" % n, n) for n in range(2, 15)]
+        self.assertEqual({(o["sent"], o["action"]) for o in outcomes}, {(True, "note")})
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["coder"]]["inbox"]), 13)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [])
+
+    def test_a_note_in_the_inbox_and_then_in_the_transcript_is_counted_once(self):
+        self.ask_the_boss("Which database?", issue=2)
+        self.world.you("coder")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [], "waiting in the inbox: answered")
+        self.world.v2.start_turn(self.world.sessions["coder"], "next", fleet=False)
+        self.world.tick(400)
+        self.assertEqual(self.listed(), [], "consumed into the transcript: still answered, and nothing listed twice")
+
+    def test_a_report_waiting_in_the_bosss_inbox_is_listed_once_the_boss_has_it_not_before(self):
+        self.world.add_agent("scout", fleet={"reports_to": "platform", "issue": 4})
+        self.world.you("platform")                      # the boss is engaged: a report to it is a note
+        self.ask_the_boss("is it fine?", sender="scout", issue=4)
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["platform"]]["inbox"]), 1)
+        self.assertEqual(self.listed(), [], "documented: a note still in the inbox is not yet delivered")
+        self.world.v2.start_turn(self.world.sessions["platform"], "next", fleet=False)
+        self.world.tick(400)
+        self.assertEqual([d["title"] for d in self.listed()], ["is it fine?"])
+
+    def test_a_queued_send_answers_while_mid_turn_is_older_one_does_not_and_admission_changes_nothing(self):
+        # the incident: the boss's sends were audited `queue` while the worker was mid-turn; the transcript got them 12 minutes later
+        self.world.v2.start_turn(self.world.sessions["coder"], "fleet task", fleet=True, lasts=600, steps=1)
+        self.world.new_engine("cli").send("platform", "coder", "early, before the question", 2)
+        self.world.tick(2)
+        self.ask_the_boss("Which database?", issue=2)
+        self.assertEqual(len(self.listed()), 1, "a send older than the report answers nothing")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        inbox = self.world.v2.sessions[self.world.sessions["coder"]]["inbox"]
+        self.assertTrue(inbox, "queued, not in the transcript")
+        self.assertEqual(self.listed(), [])
+        self.world.tick(700)
+        self.world.engine.run_pass()
+        self.assertEqual(self.listed(), [], "admitted into the transcript: still answered")
+
+    def test_the_real_tag_forms_of_a_send_match_and_name_the_same_repo(self):
+        repos = ["acme-org/acme-platform", "acme-org/other"]
+        for tag in ("acme-platform#294", "acme-org/acme-platform#294"):
+            line = "- send from cos (issue %s): use postgres" % tag
+            match = sb.SEND_LINE.match(line)
+            self.assertIsNotNone(match, line)
+            self.assertEqual((match.group(1), int(match.group(3))), ("cos", 294))
+            self.assertEqual(sb.repo_of_tag(match.group(2), repos), "acme-org/acme-platform", tag)
+        report = sb.REPORT_LINE.match("- report from acme-platform (issue acme-platform#294): question: which db?")
+        self.assertEqual(sb.repo_of_tag(report.group(2), repos), "acme-org/acme-platform")
+
+    def test_report_answered_takes_both_tag_forms_and_refuses_a_send_for_another_ask_or_repo(self):
+        repo = "acme-org/acme-platform"
+        worker = types.SimpleNamespace(name="worker", problem=None, session_id="ses_w")
+        engine = types.SimpleNamespace(discovery=types.SimpleNamespace(agents={"worker": worker}))
+        report = {"at": (100.0, 0), "sender": "worker", "boss": "cos", "issue": 294, "repo": repo, "state": "question",
+                  "text": "q"}
+        cases = (("- send from cos (issue acme-platform#294): a", True),
+                 ("- send from cos (issue acme-org/acme-platform#294): a", True),
+                 ("- send from cos: untagged counts for any ask", True),
+                 ("- send from cos (issue acme-platform#295): another ask", False),
+                 ("- send from cos (issue other#294): another repo", False),
+                 ("- send from someone (issue acme-platform#294): not the boss", False))
+        with mock.patch.object(sb, "decision_repos", return_value=[repo, "acme-org/other"]):
+            for line, answers in cases:
+                with self.subTest(line=line):
+                    sends = {"worker": [(200.0, "msg_1", 0, line)]}
+                    self.assertEqual(sb.report_answered(engine, report, [report], 0, sends), answers)
+            old = {"worker": [(50.0, "msg_1", 0, cases[0][0])]}
+            self.assertFalse(sb.report_answered(engine, report, [report], 0, old), "a send older than the report")
+
+    def test_the_synthetic_cache_follows_the_newest_message_so_a_new_send_is_seen_at_once(self):
+        self.ask_the_boss("Which database?", issue=7)
+        platform = self.world.sessions["platform"]
+        self.assertEqual(len(self.listed()), 1)
+        first = sb.synthetic_lines(self.world.engine, platform, 0)
+        pages = lambda: [a for a in self.world.v2.calls if a[2:3] == ["session.message.list"]]
+        before = len(pages())
+        self.assertEqual(sb.synthetic_lines(self.world.engine, platform, 0), first)
+        self.assertEqual(len(pages()) - before, 1, "nothing new: one small read of the newest id, then the cache")
+        self.ask_the_boss("And which region?", issue=8)
+        again = sb.synthetic_lines(self.world.engine, platform, 0)
+        self.assertTrue(any("And which region?" in line[3] for line in again), "a newer synthetic changes the newest id and is read")
+        self.assertFalse(any("And which region?" in line[3] for line in first))
+
+    def test_fresh_says_for_an_open_report_the_newest_send_it_looked_at_or_that_there_was_none(self):
+        self.ask_the_boss("Which database?", issue=2)
+        (found,) = self.listed()
+        self.assertRegex(found["considered"], r"^no send from platform to coder in the last [0-9.]+ hours$")
+        self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)
+        self.world.tick(1)
+        (found,) = self.listed()
+        self.assertRegex(found["considered"], r"^newest send from platform to coder: \S+, #9, admitted, tagged #9, not this ask$")
+        report = {"stale": False, "message": None, "decisions": [found], "errors": [], "fresh": True}
+        self.assertIn("      newest send from platform", sb.format_decisions(report, self.world.clock.now()))
+        report.pop("fresh")
+        self.assertNotIn("newest send", sb.format_decisions(report, self.world.clock.now()))
+
     def test_a_send_about_another_ask_does_not_resolve_it(self):
         self.ask_the_boss("Which database?")
         self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)
@@ -13984,6 +14092,14 @@ results.grouped = d.buildView({ status: "ok", errors: [], decisions: [
   two("web#9", "acme/web", "newer web", 5), two("api#1", "acme/api", "api only", 3),
   two("web#2", "acme/web", "older web " + "q".repeat(40), 50) ] }, now);
 results.groupedLines = d.viewLines(results.grouped);
+results.batchLines = d.viewLines(d.buildView({ status: "ok", errors: [], decisions: [
+  { id: "api#101", repo: "acme/api", title: "Cleanup", headline: "Cleanup of stale issues (2 rows)", since: iso(now - 7200000), tier: "cos",
+    rows: [{ text: "web#7: close it" }, { text: "web#9: close as duplicate of web#7 and also label the other issue" }] } ] }, now, 34,
+  { kind: "all", repo: null, label: "all" }));
+const cosAge = (id, mins) => ({ id, repo: "acme/api", title: id, tier: "cos", since: iso(now - mins * 60000) });
+results.overTitles = d.buildView({ status: "ok", errors: [], decisions: [cosAge("a#1", 59), cosAge("a#2", 60), cosAge("a#3", 61),
+  cosAge("a#4", 300), { id: "a#5", title: "x", tier: "cos", since: "junk" }] }, now, 34, { kind: "all", repo: null, label: "all" }).sections.map((x) => x.title);
+results.longWait = d.LONG_WAIT_SECONDS;
 results.oneLine = [d.oneLine("a\n b\t c", 20), d.oneLine("x".repeat(50), 10), d.oneLine(undefined, 5)];
 results.until = [d.msUntilStale({ status: "ok", ageMs: 100000 }), d.msUntilStale({ status: "ok", ageMs: 0 }), d.msUntilStale({ status: "stale", ageMs: 1 })];
 results.concerns = [d.concernsFile("decisions.json"), d.concernsFile("decisions.json.123.tmp"), d.concernsFile("audit.jsonl"), d.concernsFile(null), d.concernsFile(undefined)];
@@ -14039,6 +14155,19 @@ class TestDecisionsPlugin(Base):
         for entry in (first, second):
             for line in entry["lines"] + [entry["head"]]:
                 self.assertLessEqual(len(line), 34)
+
+    def test_the_cos_header_counts_what_has_waited_over_an_hour_and_the_threshold_is_the_clis(self):
+        self.assertEqual(self.r["overTitles"], ["Waits on you (0)", "Waits on cos (5, 2 over 1h)"])
+        self.assertEqual(self.r["longWait"], sb.DECISION_LONG_WAIT)
+        self.assertEqual(sb.DECISION_LONG_WAIT, 3600)
+
+    def test_a_batch_is_one_entry_the_headline_then_a_line_per_row_then_the_id_and_age(self):
+        lines = self.r["batchLines"]
+        start = lines.index("Cleanup of stale issues (2 rows)")
+        self.assertEqual(lines[start:start + 5], ["Cleanup of stale issues (2 rows)", "web#7: close it",
+                                                  "web#9: close as duplicate of web#7", "and also label the other issue",
+                                                  "api#101 2h"])
+        self.assertTrue(all(len(line) <= 34 for line in lines))
 
     def test_wrapping_keeps_every_word_and_breaks_an_over_long_word_hard(self):
         w = self.r["wrap"]
@@ -19241,10 +19370,13 @@ class LabelGh:
     def __init__(self, clock):
         self.clock, self.issues, self.labels, self.comments = clock, {}, {}, []
         self.calls, self.envs, self.down, self.fail = [], [], False, set()
+        self.fail_writes = set()   # repos whose writes (not reads) fail
 
-    def issue(self, repo, number, title="an issue", labels=()):
+    def issue(self, repo, number, title="an issue", labels=(), body=None):
         self.issues[(repo, number)] = {"number": number, "title": title, "state": "open", "labels": list(labels),
                                        "updated_at": sb.iso(self.clock.now() - 60)}
+        if body is not None:
+            self.issues[(repo, number)]["body"] = body
 
     def names(self, repo, number):
         return sorted(self.issues[(repo, number)]["labels"])
@@ -19261,6 +19393,8 @@ class LabelGh:
         if any(repo in path for repo in self.fail):
             return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
         method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
+        if method != "GET" and any(repo in path for repo in self.fail_writes):
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
         data = json.loads(kwargs["input"]) if "input" in kwargs else None
         if method != "GET" and "--input" in argv and data is None:
             raise AssertionError("a write passes its body as input")
@@ -19273,6 +19407,13 @@ class LabelGh:
                     if repo == found.group(1) and label in i["labels"] and i["state"] == "open"]
             page = int(query.get("page", "1"))
             return subprocess.CompletedProcess(argv, 0, json.dumps(rows if page == 1 else []), "")
+        found = re.match(r"^repos/([^/]+/[^/]+)/issues$", path)
+        if found and method == "POST":
+            repo = found.group(1)
+            number = max([n for (r, n) in self.issues if r == repo] + [100]) + 1
+            self.issue(repo, number, data["title"], data.get("labels", ()), data.get("body"))
+            self.issues[(repo, number)]["updated_at"] = sb.iso(self.clock.now())
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"number": number, "html_url": "https://github.com/%s/issues/%d" % (repo, number)}), "")
         found = re.match(r"^repos/([^/]+/[^/]+)/issues/(\d+)/(labels|comments)(?:/(.+))?$", path)
         if found:
             key = (found.group(1), int(found.group(2)))
@@ -19649,7 +19790,16 @@ class TestDecisionViews(TierWorld):
         self.assertEqual(report["decisions"]["by_tier"], {"cos": 2, "orchestrator": 1})
         text = sb.format_status(report)
         self.assertIn("0 waiting on you", text)
-        self.assertIn("also open: 2 with the Chief of Staff, 1 with an orchestrator", text)
+        self.assertIn("also open: 2 with the Chief of Staff (0 over 1h), 1 with an orchestrator", text)
+
+    def test_the_status_line_counts_the_cos_tier_over_an_hour_by_the_same_rule_as_the_panel(self):
+        now = self.world.clock.now()
+        waited = lambda minutes, tier="cos": {"id": "x", "tier": tier, "since": sb.iso(now - minutes * 60)}
+        decisions = [waited(59), waited(60), waited(61), waited(300), {"id": "j", "tier": "cos", "since": "junk"}]
+        self.assertEqual(sb.count_over_an_hour(decisions, now), 2, "longer than an hour: 60 minutes exactly is not")
+        text = sb.format_decisions_status({"stale": False, "count": 3, "by_tier": {"cos": 3}, "by_repo": {},
+                                           "errors": 0, "cos_over_an_hour": 2})
+        self.assertIn("also open: 3 with the Chief of Staff (2 over 1h)", "\n".join(text))
 
     def test_the_view_function_alone(self):
         config = {}
@@ -20001,6 +20151,409 @@ class TestEscalateARequestOrAReport(WriteWorld):
         code, out, err = self.main("decisions", "resolve", self.id_of("Which database?"))
         self.assertEqual(code, 2)
         self.assertIn("send", err)
+
+
+class BatchWorld(WriteWorld):
+    """Related findings raised as one decision: the batch issue, its rows, its entry, and what the commands do to it."""
+
+    ROWS = ("acme/api#7 | stale cache key | close it", "acme/api#9 | dup of 7 | close as duplicate of api#7",
+            "acme/api#3 | https://github.com/acme/api/issues/4 is done | label it done")
+
+    def raise_batch(self, who="api-orch", title="Cleanup of stale issues", rows=ROWS, *extra):
+        self.as_agent(who)
+        argv = ["decisions", "batch", "--title", title]
+        for row in rows:
+            argv += ["--row", row]
+        return self.main(*(argv + list(extra)))
+
+    def writes(self):
+        return [c for c in self.gh.calls if "--method" in c]
+
+    def batch_id(self):
+        code, out, err = self.raise_batch()
+        self.assertEqual(code, 0, err)
+        return out.strip()
+
+    def entry(self, ident):
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "--fresh", "--json", "--tier", "all")
+        self.assertEqual(code, 0, err)
+        (found,) = [d for d in json.loads(out)["decisions"] if d["id"] == ident]
+        return found
+
+
+class TestBatchRaise(BatchWorld):
+    def test_one_real_issue_in_the_raising_orchestrators_own_repo_with_the_cos_label_and_the_rows(self):
+        code, out, err = self.raise_batch()
+        self.assertEqual(code, 0, err)
+        creates = [c for c in self.writes() if c[2].endswith("/issues")]
+        self.assertEqual([c[2] for c in creates], ["repos/acme/api/issues"])
+        self.assertEqual(len(self.writes()), 1, "one write: the issue, nothing else, nowhere else")
+        (key,) = [k for k in self.gh.issues if k[1] > 100]
+        issue = self.gh.issues[key]
+        self.assertEqual((key[0], issue["title"], issue["labels"]), (API, "Cleanup of stale issues", ["me:awaiting-cos"]))
+        self.assertIn("```decision-rows\nacme/api#7 | stale cache key | close it\n", issue["body"])
+        self.assertEqual(sb.signed_by_fleet(issue["body"]), "api-orch")
+        self.assertEqual(out.strip(), "api#%d" % key[1])
+
+    def test_another_orchestrators_batch_lands_in_its_own_repo_never_the_other(self):
+        code, out, err = self.raise_batch("web-orch", rows=("acme/web#7 | one | do it", "web#8 | two | skip"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([k[0] for k in self.gh.issues if k[1] > 100], [WEB])
+
+    def test_a_row_naming_an_issue_outside_the_batchs_own_repo_is_refused_and_creates_nothing(self):
+        for ref in ("acme/web#7", "https://github.com/acme/web/issues/7", "web#7", "other/api#7"):
+            with self.subTest(ref=ref):
+                code, out, err = self.raise_batch(rows=("acme/api#1 | fine | ok", "%s | x | y" % ref))
+                self.assertEqual(code, 2, out)
+                self.assertIn("outside acme/api", err)
+        self.assertEqual(self.writes(), [])
+        for ref in ("api#7", "acme/api#7", "https://github.com/acme/api/issues/7"):  # own repo, every form
+            with self.subTest(own=ref):
+                self.assertEqual(self.raise_batch(rows=("%s | x | y" % ref,))[0], 0)
+
+    def test_it_is_audited_before_and_after(self):
+        self.raise_batch()
+        self.assertEqual([e["phase"] for e in self.audit_events("decisions.batch")], ["intent", "result"])
+
+    def test_rows_from_a_file_and_from_stdin(self):
+        path = self.home / "rows.txt"
+        path.write_text("acme/api#7 | one | do it\n\nacme/api#8 | two | skip\n")
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "batch", "--title", "From a file", "--file", str(path))
+        self.assertEqual(code, 0, err)
+        with mock.patch.object(sb.sys, "stdin", io.StringIO("acme/api#9 | three | do it\n")):
+            code, out, err = self.main("decisions", "batch", "--title", "From stdin")
+        self.assertEqual(code, 0, err)
+        bodies = [i["body"] for k, i in sorted(self.gh.issues.items()) if k[1] > 100]
+        self.assertEqual([len(sb.parse_decision_rows(b)) for b in bodies], [2, 1])
+
+    def test_refusals_create_nothing(self):
+        long_rows = ["acme/api#%d | f | r" % n for n in range(1, sb.BATCH_ROWS_MAX + 2)]
+        cases = (("an empty row", ["acme/api#7 | | close it"], "not empty"),
+                 ("a row with no recommendation", ["acme/api#7 | finding"], "not empty"),
+                 ("a blank row", [""], "not empty"),
+                 ("a ref that is no issue", ["the web one | finding | close"], "not an issue"),
+                 ("a fence in a row", ["acme/api#7 | ``` | close"], "fence"),
+                 ("too many rows", long_rows, "at most"))
+        for what, rows, why in cases:
+            with self.subTest(what):
+                code, out, err = self.raise_batch(rows=rows)
+                self.assertEqual(code, 2, out)
+                self.assertIn(why, err)
+        code, out, err = self.raise_batch(rows=[])
+        self.assertEqual(code, 2)
+        self.assertEqual(self.writes(), [])
+
+    def test_only_an_orchestrator_with_a_repo_raises_a_batch(self):
+        for who in ("cos", "api-coder"):
+            with self.subTest(who):
+                code, out, err = self.raise_batch(who)
+                self.assertEqual(code, 2)
+                self.assertIn("only an orchestrator", err)
+        self.assertEqual(self.writes(), [])
+
+    def test_long_parts_are_cut_to_their_caps(self):
+        row = sb.parse_batch_row("acme/api#7 | %s | %s" % ("f" * 500, "r" * 500))
+        self.assertEqual((len(row["finding"]), len(row["recommendation"])), (sb.BATCH_FINDING_MAX, sb.BATCH_REC_MAX))
+
+
+class TestBatchEntry(BatchWorld):
+    def test_the_entry_carries_the_rows_and_the_headline_counts_them(self):
+        ident = self.batch_id()
+        found = self.entry(ident)
+        self.assertEqual((found["kind"], found["tier"], found["headline"], found["raised_by"]),
+                         ("issue", "cos", "Cleanup of stale issues (3 rows)", "api-orch"))
+        self.assertEqual([r["text"] for r in found["rows"]],
+                         ["api#7: close it", "api#9: close as duplicate of api#7", "api#3: label it done"])
+        self.assertEqual(found["rows"][2]["ref"], "acme/api#3")
+
+    def test_an_issue_without_rows_is_unchanged(self):
+        self.gh.issue(API, 2, "plain", labels=["me:awaiting-cos"], body="no block here")
+        self.as_agent("cos")
+        (found,) = [d for d in json.loads(self.main("decisions", "--fresh", "--json", "--tier", "all")[1])["decisions"]
+                    if d["title"] == "plain"]
+        self.assertNotIn("rows", found)
+        self.assertNotIn("raised_by", found)
+        self.assertEqual(found["headline"], "plain")
+
+    def test_the_rows_cost_no_extra_read_of_the_issue(self):
+        self.batch_id()
+        self.gh.calls.clear()
+        self.entry("api#101")
+        reads = [c[2] for c in self.gh.calls]
+        self.assertTrue(all("/issues?labels=" in r for r in reads), reads)
+        self.assertEqual(len(reads), 4, "two reads (one per label) of each of the two repos, as before")
+
+    def test_the_hub_takes_the_rows_from_a_webhook_payload_and_keeps_them_when_a_later_one_has_no_body(self):
+        hub = self.world.engine.hub if getattr(self.world.engine, "hub", None) else None
+        if hub is None:
+            hub = sb.GitHubHub(self.world.config, self.world.state, None, self.route, sb.spawn_forwarder,
+                               self.world.clock.now, "cli")
+        issue = {"number": 5, "title": "t", "state": "open", "labels": [{"name": "me:awaiting-cos"}],
+                 "body": sb.batch_body("api-orch", [sb.parse_batch_row(r) for r in self.ROWS])}
+        hub.note_awaiting_issue(API, issue)
+        (record,) = hub.awaiting_listing()[0]
+        self.assertEqual((len(record["rows"]), record["raised_by"]), (3, "api-orch"))
+        hub.note_awaiting_issue(API, {k: v for k, v in issue.items() if k != "body"})
+        self.assertEqual(len(hub.awaiting_listing()[0][0]["rows"]), 3)
+        hub.note_awaiting_issue(API, dict(issue, body="edited: no rows now"))
+        self.assertEqual(hub.awaiting_listing()[0][0]["rows"], [])
+
+
+class TestBatchEscalate(BatchWorld):
+    def test_escalate_works_on_a_batch_as_it_does_on_any_issue(self):
+        ident = self.batch_id()
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "escalate", ident, "--reason", "the owner decides")
+        self.assertEqual(code, 0, err)
+        (key,) = [k for k in self.gh.issues if k[1] > 100]
+        self.assertEqual(self.gh.names(*key), ["me:awaiting-user"])
+        found = self.entry(ident)
+        self.assertEqual((found["tier"], len(found["rows"]), found["headline"]),
+                         ("human", 3, "Cleanup of stale issues (3 rows)"))
+        for row in ("acme/api#7", "acme/api#9", "acme/api#3"):  # the row issues are never labelled or commented
+            self.assertFalse([c for c in self.writes() if "/issues/%s/" % row.split("#")[1] in c[2]
+                              and row.split("#")[0] in c[2]], row)
+
+    def test_an_escalated_batch_is_one_item_for_the_owner_and_escalating_again_changes_nothing(self):
+        ident = self.batch_id()
+        self.as_agent("cos")
+        self.main("decisions", "escalate", ident)
+        self.gh.calls.clear()
+        code, out, err = self.main("decisions", "escalate", ident)
+        self.assertEqual(code, 0, err)
+        self.assertIn("already yours: nothing changed", out)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+        os.environ.pop("HERDR_PANE_ID")                       # the owner's view: the human tier, every repo
+        code, out, err = self.main("decisions", "--fresh", "--json")
+        (mine,) = json.loads(out)["decisions"]
+        self.assertEqual((mine["id"], mine["tier"], len(mine["rows"])), (ident, "human", 3))
+
+
+class TestBatchAnswer(BatchWorld):
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 7, "stale cache key", labels=["bug"])
+        self.gh.issue(API, 9, "dup of 7", labels=["bug", "me:awaiting-cos"])
+        self.gh.issue(API, 3, "an api one", labels=["bug"])
+        self.ident = self.batch_id()
+        self.batch = [k for k in self.gh.issues if k[1] > 100][0]
+        self.as_agent("cos")
+        self.gh.calls.clear()
+
+    def answer(self, *argv, **env):
+        self.as_agent("cos")
+        return self.main("decisions", "answer", self.ident, *argv, **env)
+
+    def row_issues_untouched(self):
+        self.assertEqual(self.gh.names(API, 7), ["bug"])
+        self.assertEqual(self.gh.names(API, 9), ["bug", "me:awaiting-cos"], "not even a label it already has is removed")
+        self.assertEqual(self.gh.names(API, 3), ["bug"])
+        self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
+        for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
+            if "/issues?" not in call[2]:
+                self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
+
+    def test_as_recommended_posts_one_comment_with_every_row_and_takes_both_labels_off(self):
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        (comment,) = self.gh.comments
+        self.assertEqual((comment["repo"], comment["issue"]), self.batch)
+        body = comment["body"]
+        self.assertIn("(3 rows): as recommended.", body)
+        self.assertIn("1. acme/api#7: as recommended: close it", body)
+        self.assertIn("2. acme/api#9: as recommended: close as duplicate of api#7", body)
+        self.assertIn("3. acme/api#3: as recommended: label it done", body)
+        self.assertEqual(sb.signed_by_fleet(body), "cos")
+        self.assertEqual(self.gh.names(*self.batch), [])
+        self.assertIn("answered %s: 3 rows (3 as recommended, 0 changed)" % self.ident, out)
+        self.assertEqual([d["id"] for d in self.entries()], ["api#9"], "the batch left the list; api#9 is its own decision")
+
+    def entries(self):
+        self.as_agent("cos")
+        return json.loads(self.main("decisions", "--fresh", "--json", "--tier", "all")[1])["decisions"]
+
+    def test_per_row_changes_keep_the_other_rows_as_recommended_and_the_note_is_in_the_comment(self):
+        code, out, err = self.answer("--row", "2=keep it open", "--row", "3=as recommended", "--note", "per the order")
+        self.assertEqual(code, 0, err)
+        body = self.gh.comments[0]["body"]
+        self.assertIn("1 row changed, the rest as recommended", body)
+        self.assertIn("1. acme/api#7: as recommended: close it", body)
+        self.assertIn("2. acme/api#9: changed: keep it open (recommended: close as duplicate of api#7)", body)
+        self.assertIn("3. acme/api#3: as recommended: label it done", body)
+        self.assertIn("Note: per the order", body)
+        self.assertIn("(2 as recommended, 1 changed)", out)
+
+    def test_no_row_issue_is_ever_touched(self):
+        for argv in (("--as-recommended",),):
+            self.answer(*argv)
+        self.row_issues_untouched()
+        self.assertEqual(len([c for c in self.gh.calls if "--method" in c]), 3, "comment, and two label removals")
+
+    def test_the_raising_orchestrator_is_told_by_a_note_from_the_answerer_naming_the_batch(self):
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIn("told api-orch", out)
+        text = " ".join(str(a) for a in self.world.admissions("api-orch"))
+        self.assertIn("from cos", text)
+        self.assertIn("Batch %s (acme/api#%d) is answered" % (self.ident, self.batch[1]), text)
+        self.assertIn("you act on it", text)
+        self.assertEqual(self.world.admissions("web-orch"), [])
+
+    def test_a_note_that_cannot_be_delivered_does_not_undo_the_answer(self):
+        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent")):
+            code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not tell api-orch", out)
+        self.assertEqual(self.gh.names(*self.batch), [])
+
+    def test_bad_answers_are_refused_and_write_nothing(self):
+        for argv, why in ((("--row", "4=x"), "does not exist"), (("--row", "0=x"), "does not exist"),
+                          (("--row", "1=a", "--row", "1=b"), "twice"), (("--row", "x"), "not a row answer"),
+                          (("--row", "1="), "not a row answer"), (("--as-recommended", "--row", "1=a"), "not both"),
+                          ((), "not both, not neither"), (("allow",), "not both, not neither")):
+            with self.subTest(argv=argv):
+                code, out, err = self.answer(*argv)
+                self.assertEqual(code, 2, out)
+                self.assertIn(why, err)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+        self.assertEqual(self.gh.comments, [])
+
+    def test_the_flags_are_for_a_batch_and_an_ordinary_answer_keeps_its_meaning(self):
+        self.gh.issue(API, 2, "plain", labels=["me:awaiting-cos"])
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"), "--as-recommended")
+        self.assertEqual(code, 2)
+        self.assertIn("not a batch", err)
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"), "allow")
+        self.assertEqual(code, 2)
+        self.assertIn("is an issue", err)  # the existing refusal, unchanged
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"))
+        self.assertEqual(code, 2)
+        self.assertIn("with a value", err)
+
+    def test_answering_a_batch_is_judged_like_any_answer(self):
+        for command in ("fleet-switchboard decisions answer api#101 --as-recommended",
+                        "fleet-switchboard decisions answer api#101 --row 2=keep"):
+            self.assertFalse(sb.plain_switchboard_message(command), command)
+
+    def test_an_agent_that_is_not_the_chief_of_staff_cannot_answer_it(self):
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "answer", self.ident, "--as-recommended")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.comments, [])
+
+    def test_from_a_plain_shell_the_comment_is_unsigned_and_nobody_is_sent_a_note(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.main("decisions", "answer", self.ident, "--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(sb.signed_by_fleet(self.gh.comments[0]["body"]))
+        self.assertNotIn("told", out)
+        self.assertEqual(self.world.admissions("api-orch"), [])
+
+
+class TestSupersede(WriteWorld):
+    """`decisions supersede`: several open decisions made moot by one issue."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos", "bug"])
+        self.gh.issue(WEB, 2, "one web", labels=["me:awaiting-user"])
+        self.gh.issue(API, 50, "the superseding issue")
+        self.as_agent("cos")
+
+    def supersede(self, *ids, by="acme/api#50", extra=()):
+        self.as_agent("cos")
+        return self.main("decisions", "supersede", *ids, "--by", by, *extra)
+
+    def test_issue_decisions_get_a_comment_and_both_labels_off_each_in_one_command(self):
+        code, out, err = self.supersede(self.id_of("one api"), self.id_of("one web"), extra=("--note", "folded in"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 2), ["bug"])
+        self.assertEqual(self.gh.names(WEB, 2), [])
+        self.assertEqual(sorted((c["repo"], c["issue"], c["body"].split("\n")[0]) for c in self.gh.comments),
+                         [(API, 2, "Superseded by acme/api#50: folded in"), (WEB, 2, "Superseded by acme/api#50: folded in")])
+        self.assertEqual(sb.signed_by_fleet(self.gh.comments[0]["body"]), "cos")
+        self.assertEqual(len(out.strip().splitlines()), 2)
+        self.assertTrue(all(": done" in line for line in out.splitlines()), out)
+        self.assertEqual(self.gh.names(API, 50), [], "the superseding issue is not touched")
+
+    def test_the_superseding_issue_may_be_a_url_or_a_short_ref(self):
+        for by in ("https://github.com/acme/api/issues/50", "api#50"):
+            self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos"])
+            self.gh.comments.clear()
+            code, out, err = self.supersede(self.id_of("one api"), by=by)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.gh.comments[0]["body"].split("\n")[0], "Superseded by acme/api#50")
+        for bad in ("50", "nowhere#1", "https://example.com/x"):
+            self.assertEqual(self.supersede("anything", by=bad)[0], 2)
+
+    def test_a_report_is_cleared_by_a_send_from_the_answerer_tagged_with_its_issue(self):
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?", 5)
+        self.world.tick(1)
+        ident = self.id_of("merge or wait?")
+        code, out, err = self.supersede(ident)
+        self.assertEqual(code, 0, err)
+        self.assertIn("done: sent to api-orch", out)
+        text = " ".join(str(a) for a in self.world.admissions("api-orch"))
+        self.assertIn("Superseded by acme/api#50", text)
+        self.assertNotIn("merge or wait?", self.main("decisions", "--fresh", "--tier", "all")[1], "the send cleared it")
+
+    def test_a_report_with_an_issue_that_has_labels_also_loses_them(self):
+        self.gh.issue(API, 5, "five", labels=["bug"])  # carries no awaiting label: removal is quiet
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?", 5)
+        self.world.tick(1)
+        code, out, err = self.supersede(self.id_of("merge or wait?"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("both labels off acme/api#5", out)
+        self.assertEqual(self.gh.names(API, 5), ["bug"])
+
+    def test_a_report_with_no_issue_is_refused_because_a_send_would_clear_every_question(self):
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?")
+        self.world.tick(1)
+        code, out, err = self.supersede(self.id_of("merge or wait?"))
+        self.assertEqual(code, 1)
+        self.assertIn("refused: is a report that names no issue", out)
+        self.assertEqual(self.world.admissions("api-orch"), [])
+
+    def test_a_permission_request_and_a_question_are_refused_with_a_pointer_to_answer(self):
+        sid = self.world.sessions["api-coder"]
+        self.world.v2.start_turn(sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_permission(sid, timed=True)
+        code, out, err = self.supersede(self.id_of("shell"))
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"refused: is a permission: answer it with `fleet-switchboard decisions answer ")
+        self.assertEqual(self.world.v2.permission_replies if hasattr(self.world.v2, "permission_replies") else [], [])
+
+    def test_it_carries_on_past_a_failure_reports_each_id_and_exits_non_zero(self):
+        ids = self.id_of("one api"), self.id_of("one web")
+        self.gh.fail_writes = {WEB}  # every write to the web repo fails
+        code, out, err = self.supersede(ids[0], "nope-1", ids[1])
+        lines = out.strip().splitlines()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 3, out)
+        self.assertIn("done", lines[0])
+        self.assertIn("nope-1: refused: no decision nope-1 is waiting", lines[1])
+        self.assertIn("refused", lines[2])
+        self.assertIn("403", lines[2])
+        self.assertEqual(self.gh.names(API, 2), ["bug"], "the first one was done before the others failed")
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+
+    def test_the_same_id_twice_is_done_once(self):
+        ident = self.id_of("one api")
+        code, out, err = self.supersede(ident, ident)
+        self.assertEqual((code, len(out.strip().splitlines()), len(self.gh.comments)), (0, 1, 1))
+
+    def test_only_the_chief_of_staff_or_a_person_may_and_it_is_judged_like_resolve(self):
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "supersede", self.id_of("one api"), "--by", "acme/api#50")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(sb.plain_switchboard_message("fleet-switchboard decisions supersede api-481 web-482 --by api-50"))
+        self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481"))
 
 
 class TestLabelsEnsure(WriteWorld):
@@ -20684,7 +21237,7 @@ class TestDecisionsPanelLayout(Base):
         self.r = json.loads(done.stdout.strip().splitlines()[-1])
 
     def test_what_waits_on_you_comes_first_then_what_waits_on_cos_each_grouped_by_repo(self):
-        self.assertEqual(self.r["cosTitles"], ["Waits on you (4)", "Waits on cos (1)", "Waits on orchestrator (1)"])
+        self.assertEqual(self.r["cosTitles"], ["Waits on you (4)", "Waits on cos (1, 0 over 1h)", "Waits on orchestrator (1)"])
         you, cos, orch = self.r["cosKeys"]
         self.assertEqual(you, [["acme/api", ["api#2"]], ["acme/old", ["old#1"]], ["acme/web", ["web#7", "web#8"]]])
         self.assertEqual(cos, [["acme/web", ["web#5"]]])
@@ -20712,7 +21265,7 @@ class TestDecisionsPanelLayout(Base):
         self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
         at = lines.index(thin)
         self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
-        self.assertEqual(lines.index("Waits on cos (1)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("web#8 5m")))
         self.assertTrue(all(len(x) <= 34 for x in lines))
 
     def test_the_tui_draws_the_sections_and_the_rules(self):
@@ -21112,7 +21665,7 @@ class TestHeadsUpPanelLayout(Base):
         self.r = json.loads(done.stdout.strip().splitlines()[-1])
 
     def test_heads_up_follows_waits_on_you_and_comes_before_waits_on_cos(self):
-        self.assertEqual([t for t, _ in self.r["cos"]], ["Waits on you (1)", "Heads-up (3)", "Waits on cos (1)"])
+        self.assertEqual([t for t, _ in self.r["cos"]], ["Waits on you (1)", "Heads-up (3)", "Waits on cos (1, 0 over 1h)"])
         self.assertEqual([t for t, _ in self.r["human"]], ["Waits on you (1)", "Heads-up (3)"])
 
     def test_notices_are_never_in_the_decisions_count_or_under_waits_on_you(self):
