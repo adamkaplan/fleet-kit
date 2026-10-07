@@ -2530,6 +2530,33 @@ a refactor changes no test and no file, only the code. Where only an internal fu
 baseline green; a change to a file there is a change of behaviour and is reviewed as one. Record the files
 again, after a change that was meant, with `DECISIONS_BASELINE_UPDATE=1 bin/test-switchboard TestDecisionBaseline`.
 
+### The Decision core
+
+The pure rules of the Decision subsystem live in `bin/decision_core.py`, beside the script. The extraction
+changed no behaviour: the Decision baseline above passes unchanged, with no expected file and no test touched
+(the `baseline_*` adapters still call the old function names, which are now thin wrappers).
+
+| The module owns (pure: plain data in, plain data out)                            | Stays in `bin/fleet-switchboard`                                       |
+|----------------------------------------------------------------------------------|------------------------------------------------------------------------|
+| the vocabulary: kinds, tiers, statuses, report states, the entry (`Decision`)    | discovery, GitHub, the harness and transcripts, the audit, state files |
+| display ids (`assign_ids`, `issue_tag`)                                          | the three source readers and the notice reader                         |
+| tier rules: `issue_tier`, `request_tier` (the grace rule), `report_tier`         | delivering an answer to an agent; `escalate`, `resolve`, `answer`      |
+| answered-ness: `answered_by_later_report`, `answered_by_send`, `report_answered` | the daemon, the projection file, the CLI, the plugin transport         |
+| folding and dedupe (`build_entries`), the notice entry, the list order           | the Lab's fault gate (a fault is passed to the module as an argument)  |
+| headline cutting, batch row parsing, the view filters, the over-1h count         | the clock (the caller passes `now`)                                    |
+
+The module reads no file, calls no `gh` or v2, reads no clock and no environment, and does not touch the audit.
+It ends with three ports, abstract classes with no implementation yet: `DecisionSource` (reads the open
+decisions of one kind from some store), `AnswerDelivery` (delivers an answer to the asker) and `DecisionStore`
+(the hook point of an adapter that holds decisions elsewhere). They are used when the sources are put behind
+them.
+
+The script loads the module by path from beside its own real path (`load_decision_core`), not by `import`, so it
+works the same through a symlink (`~/.local/bin`), from the service units (`python3 -B <kit>/bin/fleet-switchboard`),
+from tests that load it with `SourceFileLoader`, and from any directory. Nothing is installed or packaged: the
+file is part of the checkout. Python 3.9, standard library only. The old function names (`assign_decision_ids`,
+`headline_of`, `report_answered`, `decisions_view`, `parse_decision_rows` and the rest) remain in the script.
+
 ## Repo and PR conventions
 
 - Work happens in a git worktree of the existing checkout; no second clone.
