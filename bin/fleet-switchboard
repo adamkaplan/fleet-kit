@@ -1114,6 +1114,11 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     return text[:cap - len(marker)] + marker, facts[:1]
 
 
+def is_withdrawal(summary):
+    """A `withdrawn` report rider never ages out: only a message carrying it (or its worker going) drops it."""
+    return (summary or "").startswith("withdrawn: ")
+
+
 def collapse_riders(facts, now, max_age):
     """PR 13: riders cut to what is still worth carrying. A rider older than `max_age` seconds is
     dropped, and only the newest `worker.idle` of each sender stays. Facts that are not riders pass."""
@@ -1127,7 +1132,7 @@ def collapse_riders(facts, now, max_age):
     for fact in facts:
         if not fact.rider:
             kept.append(fact)
-        elif now - fact.created > max_age:
+        elif now - fact.created > max_age and not is_withdrawal(fact.summary):
             continue
         elif fact.kind == WORKER_IDLE and newest.get(fact.sender) is not fact:
             continue
@@ -3737,7 +3742,8 @@ def prune_report_riders(engine, discovery):
     by_recipient = {}
     for item in items:
         by_recipient.setdefault(item["to"], []).append(item)
-    gone = {item["key"] for item in items if engine.now() - item["created"] > engine.config["rider_max_age_seconds"]}
+    gone = {item["key"] for item in items if engine.now() - item["created"] > engine.config["rider_max_age_seconds"]
+            and not is_withdrawal(item["summary"])}
     for name, mine in sorted(by_recipient.items()):
         observation = discovery.agents.get(name)
         if observation is None:

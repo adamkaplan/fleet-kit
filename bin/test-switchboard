@@ -13275,6 +13275,23 @@ class TestDecisionDerivation(DecisionsBase):
         self.ask_the_boss("both superseded", state="withdrawn", sender="loner")
         self.assertEqual(self.listed(), [])
 
+    def test_a_withdrawal_older_than_the_rider_age_still_hides_its_question_and_is_still_carried(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.world.tick(sb.validate_config({})["rider_max_age_seconds"] * 2)
+        self.assertEqual(self.listed(), [])
+        engine = self.world.new_engine("cli")
+        self.assertEqual(sb.prune_report_riders(engine, engine.discover(engine.now())), [])
+        riders = engine.pending("platform")["riders"]
+        self.assertEqual([r["summary"] for r in riders], ["withdrawn: superseded"])
+
+    def test_an_old_working_rider_is_still_pruned(self):
+        self.ask_the_boss("still going", state="working")
+        self.world.tick(sb.validate_config({})["rider_max_age_seconds"] * 2)
+        engine = self.world.new_engine("cli")
+        self.assertEqual(len(sb.prune_report_riders(engine, engine.discover(engine.now()))), 1)
+        self.assertEqual(engine.pending("platform")["riders"], [])
+
     def test_all_is_refused_for_any_other_state(self):
         with self.assertRaises(sb.ReportError):
             self.world.new_engine("cli").report("coder", "question", "x?", everything=True)
