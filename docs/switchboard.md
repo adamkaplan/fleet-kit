@@ -1779,8 +1779,7 @@ fleet-switchboard decisions batch --title "Stale issues to close" \
   --row "acme/web#9 | duplicate of web#7 | close as duplicate"
 ```
 
-It creates ONE real GitHub issue in the caller's own repo (its configured repo, never another: a batch about a
-private repo cannot land in a public one), labelled `<user>:awaiting-cos`, signed with the caller's name, whose body
+It creates ONE real GitHub issue in the caller's own repo (its configured repo, never another), labelled `<user>:awaiting-cos`, signed with the caller's name, whose body
 holds a fenced block, one line per row:
 
 ````text
@@ -1790,7 +1789,9 @@ acme/web#9 | duplicate of web#7 | close as duplicate
 ```
 ````
 
-A row is `<ref> | <finding> | <recommendation>`: the ref is `repo#N`, `owner/repo#N` or an issue URL; the finding is cut
+A row is `<ref> | <finding> | <recommendation>`: the ref is `repo#N`, `owner/repo#N` or an issue URL, and must name an issue
+of the batch's own repo (anything else is refused, and nothing is created: the batch is public exactly as that repo
+is, so a finding about another, possibly private, repo belongs in a batch raised from that repo); the finding is cut
 at 200 characters and the recommendation at 120; an empty part, a ref that names no issue and a code fence are refused,
 and so are more than 40 rows (raise the rest as a second batch). Only an orchestrator with a repo may raise one.
 The batch's id is the issue's id like any issue decision (`#12`, `api#12`), so existing ids do not change.

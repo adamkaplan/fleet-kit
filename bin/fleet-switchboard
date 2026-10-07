@@ -4022,6 +4022,14 @@ def parse_batch_row(line):
     return row_of(ref, finding, rec)
 
 
+def row_repo(ref):
+    """The `owner/repo` a row's ref names (`owner/repo#N` or an issue URL), or None for a short `name#N`."""
+    found = _GITHUB_REF.match(ref)
+    if found:
+        return "%s/%s" % (found.group(1), found.group(2))
+    return ref.split("#")[0] if "/" in ref.split("#")[0] else None
+
+
 def row_of(ref, finding, rec):
     cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
     finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
@@ -12501,6 +12509,12 @@ def cmd_decision_batch(args, runner, now):
         if not title or len(title) > BATCH_TITLE_MAX:
             raise BatchError("--title is one line of 1 to %d characters" % BATCH_TITLE_MAX)
         rows = read_batch_rows(args)
+        for row in rows:
+            named = row_repo(row["ref"])
+            if named is not None and named != repo or named is None and row["ref"].split("#")[0] != repo.split("/")[1]:
+                raise BatchError("row %r names an issue outside %s: a batch holds only issues of its own repo, so a "
+                                 "finding about a private repo can never land in a public one's batch. Raise it from "
+                                 "that repo's orchestrator" % (_one_line(row["ref"], 60), repo))
         subject = "issue:%s" % repo
         with engine._external("decisions.batch", subject, {"repo": repo, "rows": len(rows), "by": name}):
             done = _gh_write(engine, runner, repo, "repos/%s/issues" % repo, "POST",

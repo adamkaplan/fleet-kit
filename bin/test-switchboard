@@ -20156,7 +20156,7 @@ class TestEscalateARequestOrAReport(WriteWorld):
 class BatchWorld(WriteWorld):
     """Related findings raised as one decision: the batch issue, its rows, its entry, and what the commands do to it."""
 
-    ROWS = ("acme/web#7 | stale cache key | close it", "acme/web#9 | dup of 7 | close as duplicate of web#7",
+    ROWS = ("acme/api#7 | stale cache key | close it", "acme/api#9 | dup of 7 | close as duplicate of api#7",
             "acme/api#3 | https://github.com/acme/api/issues/4 is done | label it done")
 
     def raise_batch(self, who="api-orch", title="Cleanup of stale issues", rows=ROWS, *extra):
@@ -20192,14 +20192,25 @@ class TestBatchRaise(BatchWorld):
         (key,) = [k for k in self.gh.issues if k[1] > 100]
         issue = self.gh.issues[key]
         self.assertEqual((key[0], issue["title"], issue["labels"]), (API, "Cleanup of stale issues", ["me:awaiting-cos"]))
-        self.assertIn("```decision-rows\nacme/web#7 | stale cache key | close it\n", issue["body"])
+        self.assertIn("```decision-rows\nacme/api#7 | stale cache key | close it\n", issue["body"])
         self.assertEqual(sb.signed_by_fleet(issue["body"]), "api-orch")
         self.assertEqual(out.strip(), "api#%d" % key[1])
 
     def test_another_orchestrators_batch_lands_in_its_own_repo_never_the_other(self):
-        code, out, err = self.raise_batch("web-orch")
+        code, out, err = self.raise_batch("web-orch", rows=("acme/web#7 | one | do it", "web#8 | two | skip"))
         self.assertEqual(code, 0, err)
         self.assertEqual([k[0] for k in self.gh.issues if k[1] > 100], [WEB])
+
+    def test_a_row_naming_an_issue_outside_the_batchs_own_repo_is_refused_and_creates_nothing(self):
+        for ref in ("acme/web#7", "https://github.com/acme/web/issues/7", "web#7", "other/api#7"):
+            with self.subTest(ref=ref):
+                code, out, err = self.raise_batch(rows=("acme/api#1 | fine | ok", "%s | x | y" % ref))
+                self.assertEqual(code, 2, out)
+                self.assertIn("outside acme/api", err)
+        self.assertEqual(self.writes(), [])
+        for ref in ("api#7", "acme/api#7", "https://github.com/acme/api/issues/7"):  # own repo, every form
+            with self.subTest(own=ref):
+                self.assertEqual(self.raise_batch(rows=("%s | x | y" % ref,))[0], 0)
 
     def test_it_is_audited_before_and_after(self):
         self.raise_batch()
@@ -20207,23 +20218,23 @@ class TestBatchRaise(BatchWorld):
 
     def test_rows_from_a_file_and_from_stdin(self):
         path = self.home / "rows.txt"
-        path.write_text("acme/web#7 | one | do it\n\nacme/web#8 | two | skip\n")
+        path.write_text("acme/api#7 | one | do it\n\nacme/api#8 | two | skip\n")
         self.as_agent("api-orch")
         code, out, err = self.main("decisions", "batch", "--title", "From a file", "--file", str(path))
         self.assertEqual(code, 0, err)
-        with mock.patch.object(sb.sys, "stdin", io.StringIO("acme/web#9 | three | do it\n")):
+        with mock.patch.object(sb.sys, "stdin", io.StringIO("acme/api#9 | three | do it\n")):
             code, out, err = self.main("decisions", "batch", "--title", "From stdin")
         self.assertEqual(code, 0, err)
         bodies = [i["body"] for k, i in sorted(self.gh.issues.items()) if k[1] > 100]
         self.assertEqual([len(sb.parse_decision_rows(b)) for b in bodies], [2, 1])
 
     def test_refusals_create_nothing(self):
-        long_rows = ["acme/web#%d | f | r" % n for n in range(1, sb.BATCH_ROWS_MAX + 2)]
-        cases = (("an empty row", ["acme/web#7 | | close it"], "not empty"),
-                 ("a row with no recommendation", ["acme/web#7 | finding"], "not empty"),
+        long_rows = ["acme/api#%d | f | r" % n for n in range(1, sb.BATCH_ROWS_MAX + 2)]
+        cases = (("an empty row", ["acme/api#7 | | close it"], "not empty"),
+                 ("a row with no recommendation", ["acme/api#7 | finding"], "not empty"),
                  ("a blank row", [""], "not empty"),
                  ("a ref that is no issue", ["the web one | finding | close"], "not an issue"),
-                 ("a fence in a row", ["acme/web#7 | ``` | close"], "fence"),
+                 ("a fence in a row", ["acme/api#7 | ``` | close"], "fence"),
                  ("too many rows", long_rows, "at most"))
         for what, rows, why in cases:
             with self.subTest(what):
@@ -20243,7 +20254,7 @@ class TestBatchRaise(BatchWorld):
         self.assertEqual(self.writes(), [])
 
     def test_long_parts_are_cut_to_their_caps(self):
-        row = sb.parse_batch_row("acme/web#7 | %s | %s" % ("f" * 500, "r" * 500))
+        row = sb.parse_batch_row("acme/api#7 | %s | %s" % ("f" * 500, "r" * 500))
         self.assertEqual((len(row["finding"]), len(row["recommendation"])), (sb.BATCH_FINDING_MAX, sb.BATCH_REC_MAX))
 
 
@@ -20254,7 +20265,7 @@ class TestBatchEntry(BatchWorld):
         self.assertEqual((found["kind"], found["tier"], found["headline"], found["raised_by"]),
                          ("issue", "cos", "Cleanup of stale issues (3 rows)", "api-orch"))
         self.assertEqual([r["text"] for r in found["rows"]],
-                         ["web#7: close it", "web#9: close as duplicate of web#7", "api#3: label it done"])
+                         ["api#7: close it", "api#9: close as duplicate of api#7", "api#3: label it done"])
         self.assertEqual(found["rows"][2]["ref"], "acme/api#3")
 
     def test_an_issue_without_rows_is_unchanged(self):
@@ -20301,7 +20312,7 @@ class TestBatchEscalate(BatchWorld):
         found = self.entry(ident)
         self.assertEqual((found["tier"], len(found["rows"]), found["headline"]),
                          ("human", 3, "Cleanup of stale issues (3 rows)"))
-        for row in ("acme/web#7", "acme/web#9", "acme/api#3"):  # the row issues are never labelled or commented
+        for row in ("acme/api#7", "acme/api#9", "acme/api#3"):  # the row issues are never labelled or commented
             self.assertFalse([c for c in self.writes() if "/issues/%s/" % row.split("#")[1] in c[2]
                               and row.split("#")[0] in c[2]], row)
 
@@ -20323,8 +20334,8 @@ class TestBatchEscalate(BatchWorld):
 class TestBatchAnswer(BatchWorld):
     def setUp(self):
         super().setUp()
-        self.gh.issue(WEB, 7, "stale cache key", labels=["bug"])
-        self.gh.issue(WEB, 9, "dup of 7", labels=["bug", "me:awaiting-cos"])
+        self.gh.issue(API, 7, "stale cache key", labels=["bug"])
+        self.gh.issue(API, 9, "dup of 7", labels=["bug", "me:awaiting-cos"])
         self.gh.issue(API, 3, "an api one", labels=["bug"])
         self.ident = self.batch_id()
         self.batch = [k for k in self.gh.issues if k[1] > 100][0]
@@ -20336,8 +20347,8 @@ class TestBatchAnswer(BatchWorld):
         return self.main("decisions", "answer", self.ident, *argv, **env)
 
     def row_issues_untouched(self):
-        self.assertEqual(self.gh.names(WEB, 7), ["bug"])
-        self.assertEqual(self.gh.names(WEB, 9), ["bug", "me:awaiting-cos"], "not even a label it already has is removed")
+        self.assertEqual(self.gh.names(API, 7), ["bug"])
+        self.assertEqual(self.gh.names(API, 9), ["bug", "me:awaiting-cos"], "not even a label it already has is removed")
         self.assertEqual(self.gh.names(API, 3), ["bug"])
         self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
         for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
@@ -20351,13 +20362,13 @@ class TestBatchAnswer(BatchWorld):
         self.assertEqual((comment["repo"], comment["issue"]), self.batch)
         body = comment["body"]
         self.assertIn("(3 rows): as recommended.", body)
-        self.assertIn("1. acme/web#7: as recommended: close it", body)
-        self.assertIn("2. acme/web#9: as recommended: close as duplicate of web#7", body)
+        self.assertIn("1. acme/api#7: as recommended: close it", body)
+        self.assertIn("2. acme/api#9: as recommended: close as duplicate of api#7", body)
         self.assertIn("3. acme/api#3: as recommended: label it done", body)
         self.assertEqual(sb.signed_by_fleet(body), "cos")
         self.assertEqual(self.gh.names(*self.batch), [])
         self.assertIn("answered %s: 3 rows (3 as recommended, 0 changed)" % self.ident, out)
-        self.assertEqual([d["id"] for d in self.entries()], ["web#9"], "the batch left the list; web#9 is its own decision")
+        self.assertEqual([d["id"] for d in self.entries()], ["api#9"], "the batch left the list; api#9 is its own decision")
 
     def entries(self):
         self.as_agent("cos")
@@ -20368,8 +20379,8 @@ class TestBatchAnswer(BatchWorld):
         self.assertEqual(code, 0, err)
         body = self.gh.comments[0]["body"]
         self.assertIn("1 row changed, the rest as recommended", body)
-        self.assertIn("1. acme/web#7: as recommended: close it", body)
-        self.assertIn("2. acme/web#9: changed: keep it open (recommended: close as duplicate of web#7)", body)
+        self.assertIn("1. acme/api#7: as recommended: close it", body)
+        self.assertIn("2. acme/api#9: changed: keep it open (recommended: close as duplicate of api#7)", body)
         self.assertIn("3. acme/api#3: as recommended: label it done", body)
         self.assertIn("Note: per the order", body)
         self.assertIn("(2 as recommended, 1 changed)", out)
