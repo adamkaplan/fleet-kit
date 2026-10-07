@@ -1,0 +1,66 @@
+{
+ "derived": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Escalated to you",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "reported_by": [
+     "api-orch"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "human",
+    "title": "Escalated to you"
+   },
+   {
+    "agent": null,
+    "ask": 3,
+    "headline": "Still with the cos",
+    "id": "api#3",
+    "kind": "issue",
+    "repo": "acme/api",
+    "reported_by": [
+     "api-coder"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "Still with the cos"
+   },
+   {
+    "agent": null,
+    "ask": 4,
+    "headline": "Both labels",
+    "id": "api#4",
+    "kind": "issue",
+    "repo": "acme/api",
+    "reported_by": [
+     "api-orch"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "human",
+    "title": "Both labels"
+   }
+  ],
+  "errors": []
+ },
+ "tiers": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ]
+ ]
+}

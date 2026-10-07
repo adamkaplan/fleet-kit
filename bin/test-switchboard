@@ -23480,6 +23480,80 @@ class TestDecisionBaselineNotices(BaselineWorld):
         baseline_golden(self, "notices-hold", out)
 
 
+class TestDecisionBaselineSeams(BaselineWorld):
+    """Added after step 2: behaviour the first cases did not pin and that now lives in the pure core. Each case was
+    recorded against the code before the extraction (main 726caae) and passes unchanged on the extracted code."""
+
+    def decided(self):
+        found = self.derived()
+        return {"decisions": found["decisions"], "errors": found["errors"]}
+
+    def test_a_report_about_an_escalated_issue_is_not_a_second_decision(self):
+        self.gh.issue(API, 2, "Escalated to you", labels=["me:awaiting-user"])
+        self.gh.issue(API, 3, "Still with the cos", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 4, "Both labels", labels=["me:awaiting-cos", "me:awaiting-user"])
+        self.say("api-orch", "question", "which engine, on the escalated issue?", 2)
+        self.say("api-coder", "blocked", "waiting on the cos issue", 3)
+        self.say("api-orch", "question", "and on the issue with both labels?", 4)
+        found = self.decided()
+        baseline_golden(self, "seams-report-on-escalated-issue",
+                        {"derived": found, "tiers": sorted((d["id"], d["kind"], d["tier"]) for d in found["decisions"])})
+
+    def test_the_hold_window_in_the_derived_notice_entry(self):
+        self.set_config(pr_notice_hold_minutes=30)
+        self.prs[7] = pr_view_json()
+        self.prs[8] = pr_view_json(title="Other")
+        self.cmd("api-coder", "notice", "pr", "acme/api#7")
+        self.world.tick(5)
+        self.cmd("web-coder", "notice", "pr", "acme/web#8", "needs", "a", "look")
+        self.world.tick(5)
+        found = self.decided()
+        baseline_golden(self, "seams-notice-hold", [d for d in found["decisions"] if d["kind"] == "notice"])
+
+    def test_a_reports_headline_uses_the_issue_title_the_daemon_already_holds(self):
+        self.say("api-orch", "question", "which engine should the totals use?", 5)
+        self.say("web-orch", "question", "which region for the cache?", 6)
+        reader = types.SimpleNamespace(_cache={("issue", API, 5): (self.world.clock.now() + 600,
+                                                                 types.SimpleNamespace(title="Totals storage choice"))})
+        self.world.engine.intents = reader
+        found = self.decided()
+        baseline_golden(self, "seams-headline-known-issue-title",
+                        [{"id": d["id"], "ask": d["ask"], "repo": d["repo"], "headline": d["headline"]}
+                         for d in found["decisions"]])
+
+    def test_the_tier_of_an_issue_payload_with_both_labels(self):
+        """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
+        hands it one label at a time): both labels is yours, the cos label alone is the cos's, neither is no decision."""
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        cases = {10: ["me:awaiting-cos", "me:awaiting-user"], 11: ["me:awaiting-user"], 12: ["me:awaiting-cos"],
+                 13: ["bug"], 14: ["me:awaiting-user", "me:awaiting-cos"]}
+        for number, names in cases.items():
+            hub.note_awaiting_issue(API, {"number": number, "title": "issue %d" % number, "state": "open",
+                                          "labels": [{"name": n} for n in names], "updated_at": "2027-01-15T07:00:00Z"})
+        hub.note_awaiting_issue(API, {"number": 15, "title": "closed", "state": "closed",
+                                      "labels": [{"name": "me:awaiting-user"}]})
+        records, errors = hub.awaiting_listing()
+        baseline_golden(self, "seams-issue-payload-tiers",
+                        {"tiers": {r["number"]: r["tier"] for r in records},
+                         "errors": [e for e in errors if "not read yet" not in e]})
+
+    def test_the_lab_faults_tier_flat_and_bare_issue_number(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])
+        self.say("api-coder", "question", "a worker's question on an issue that is not a decision", 7)
+        self.say("api-orch", "blocked", "an orchestrator's block")
+        steps = {}
+        for name in ("none", "tier-flat", "bare-issue-number"):
+            env = {sb.LAB_ENV: "1", sb.FAULT_ENV: name} if name != "none" else {}
+            with mock.patch.dict(os.environ, env):
+                found = self.decided()
+            steps[name] = [{"id": d["id"], "kind": d["kind"], "tier": d["tier"]} for d in found["decisions"]]
+        self.assertNotEqual(steps["none"], steps["tier-flat"])
+        self.assertNotEqual(steps["none"], steps["bare-issue-number"])
+        baseline_golden(self, "seams-lab-faults", steps)
+
+
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin baseline needs it (skipped, not passed)")
 class TestDecisionBaselinePlugin(BaselineWorld):
     """The node plugin's view of the list the daemon wrote: its pure functions, over the real file content."""
