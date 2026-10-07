@@ -8460,14 +8460,15 @@ def plain_switchboard_message(text):
 
     PR 18: `decisions` (a read, `list`, or `escalate`) and `orders --cos` (a read) are plain too. `decisions
     resolve`, `decisions answer` and `decisions supersede` are NOT: they act for the owner, so the judge reads them against the Chief of
-    Staff's standing orders (the `answer-unjudged` fault lets them through)."""
+    Staff's standing orders (the `answer-unjudged` fault lets them through). `decisions batch` writes an issue to GitHub,
+    so it is judged too, however its quoted rows are written (it was plain: a quoted pipe is text)."""
     words = _plain_words(text)
     if not words or len(words) < 2 or os.path.basename(words[0]) != PROG:
         return False
     if words[1] in POLICY_MESSAGE_COMMANDS:
         return True
     if words[1] == "decisions":
-        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede") or fault("answer-unjudged")
+        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede", "batch") or fault("answer-unjudged")
     return words[1] == "orders" and words[2:] == ["--cos"]
 
 
