@@ -11,6 +11,7 @@ export const STALE_MS = 120_000       // older than this (by mtime, which every 
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
 export const HEADLINE_LINES = 2       // lines of one entry's headline
+export const FACTS_LINES = 3          // lines of a heads-up's facts line (it wraps at ROW_WIDTH)
 export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
 export const ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  // PR 18: set by `launch` and `bootstrap` in the pane's environment
@@ -27,11 +28,42 @@ export function viewOf(env) {
   return HUMAN_VIEW
 }
 
+// A PR notice (kind "notice") is information, not a decision: it is never counted or listed with decisions.
+export const isNotice = (d) => d.kind === "notice"
+
 // The decisions a view shows. A decision with no tier (a file an older daemon wrote) is the human's.
 export function selectFor(decisions, view) {
-  if (view.kind === "all") return decisions
-  if (view.kind === "repo") return decisions.filter((d) => d.repo === view.repo)
-  return decisions.filter((d) => (d.tier ?? "human") === "human")
+  const real = decisions.filter((d) => !isNotice(d))
+  if (view.kind === "all") return real
+  if (view.kind === "repo") return real.filter((d) => d.repo === view.repo)
+  return real.filter((d) => (d.tier ?? "human") === "human")
+}
+
+// The heads-ups a view shows: every notice for the Chief of Staff and for a human, those of its repo for a repo's pane.
+export function noticesFor(decisions, view) {
+  const all = decisions.filter(isNotice)
+  return view.kind === "repo" ? all.filter((d) => d.repo === view.repo) : all
+}
+
+// "14:05 UTC" from an ISO time: UTC, like every time the daemon writes, so the panel and the file agree.
+export function clockOf(iso) {
+  const t = Date.parse(iso)
+  return Number.isNaN(t) ? null : new Date(t).toISOString().slice(11, 16) + " UTC"
+}
+
+// The facts of a heads-up as one line: `+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC`
+// when the daemon set a hold window, and `(stale)` when the last read of the PR failed.
+export function factsOf(d) {
+  const parts = []
+  if (Number.isInteger(d.additions) && Number.isInteger(d.deletions)) parts.push(`+${d.additions}/-${d.deletions}`)
+  if (Number.isInteger(d.files)) parts.push(`${d.files} file${d.files === 1 ? "" : "s"}`)
+  if (d.ci) parts.push(d.ci === "none" ? "no CI" : `CI ${d.ci}`)
+  if (d.review) parts.push(d.review === "none" ? "no review" : d.review)
+  let text = parts.join(", ")
+  const after = d.merge_after ? clockOf(d.merge_after) : null
+  if (after) text += `${text ? ", " : ""}merges after ${after}`
+  if (d.stale) text += `${text ? " " : ""}(stale)`
+  return text || "facts not read yet"
 }
 
 // The state directory: FLEET_SWITCHBOARD_STATE when it is set, else the one the daemon writes to by default,
@@ -127,7 +159,9 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title
-  return { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  const entry = { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
+  return entry
 }
 
 // The section: a title, decisions grouped by repo (repos by name, oldest decision first within one), and
@@ -164,8 +198,11 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
     const other = shown.filter((d) => !["human", "cos"].includes(tierOf(d)))
     if (other.length) sections.push({ key: "orchestrator", label: "Waits on orchestrator", list: other })
   }
+  // Heads-up (PR notices) follows Waits on you, before Waits on cos; it is information and is never in a decision count.
+  const notices = noticesFor(snapshot.decisions, view)
+  if (notices.length) sections.splice(1, 0, { key: "notice", label: "Heads-up", list: notices })
   const rows = []
-  if (!groups.length) rows.push({ key: "none", text: "none" })
+  if (!groups.length && !notices.length) rows.push({ key: "none", text: "none" })
   if (snapshot.errors.length) {
     rows.push({ key: "errors", text: oneLine(`${snapshot.errors.length} source(s) unreadable`, width) })
   }
@@ -174,6 +211,9 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
     sections: sections.map((x) => ({ key: x.key, title: `${x.label} (${x.list.length})`, count: x.list.length, groups: groupsOf(x.list) })),
   }
 }
+
+// Whether the view has a Heads-up section (then an empty "Waits on you" says none, not nothing).
+export const hasNotices = (view) => (view.sections ?? []).some((x) => x.key === "notice")
 
 // The rules of the layout: a thin one between entries, a heavy one between repos and above a section.
 export const THIN = (width) => "\u2504".repeat(width)
@@ -184,13 +224,13 @@ export function viewLines(view, width = ROW_WIDTH) {
   const out = [view.title]
   for (const section of view.sections ?? []) {
     out.push(HEAVY(width), section.title)
-    if (!section.groups.length && view.groups.length) out.push("none")
+    if (!section.groups.length && (view.groups.length || hasNotices(view))) out.push("none")
     section.groups.forEach((g, i) => {
       if (i) out.push(HEAVY(width))
       out.push(g.repo)
       g.entries.forEach((e, j) => {
         if (j) out.push(THIN(width))
-        out.push(...e.lines, e.head)
+        out.push(...e.lines, ...(e.facts ?? []), e.head)
       })
     })
   }

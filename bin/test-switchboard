@@ -21033,6 +21033,107 @@ class TestPrNotices(DecisionsBase):
         self.assertEqual(sorted(d["id"] for d in self.notices()), ["pr:acme/api#7", "pr:other/api#8"])
 
 
+NOTICE_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.parse("2026-03-04T12:00:00Z");
+const iso = (ms) => new Date(ms).toISOString();
+const mk = (id, repo, tier, headline, mins, extra = {}) =>
+  ({ id, repo, tier, kind: "issue", title: "RAW " + headline, headline, since: iso(now - mins * 60000), ...extra });
+const note = (id, repo, headline, mins, extra = {}) =>
+  ({ id, repo, tier: "human", kind: "notice", title: headline, headline, since: iso(now - mins * 60000), state: "open",
+     additions: 120, deletions: 14, files: 5, ci: "green", review: "approved", stale: false, merge_after: null, ...extra });
+const list = [
+  mk("web#5", "acme/web", "cos", "web cos question", 40),
+  mk("api#2", "acme/api", "human", "api needs your decision", 90),
+  note("pr:web#9", "acme/web", "web#9 Add the retry budget to the client", 12, { ci: "failing", review: "none" }),
+  note("pr:api#12", "acme/api", "api#12 Parser rewrite " + "long ".repeat(30), 3, { merge_after: "2026-03-04T12:10:00Z" }),
+  note("pr:api#11", "acme/api", "api#11 Docs", 30, { files: 1, ci: "pending", review: "changes requested", stale: true }),
+];
+const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
+const cos = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
+const human = d.buildView(snap, now, 34, d.viewOf({}));
+const repo = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_REPO: "acme/web" }));
+const onlyNotice = d.buildView({ status: "ok", decisions: [list[2]], errors: [], ageMs: 0 }, now, 34, d.viewOf({}));
+const keys = (v) => v.sections.map((s) => [s.title, s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])]);
+console.log(JSON.stringify({
+  cosTitle: cos.title, humanTitle: human.title, cos: keys(cos), human: keys(human), repo: keys(repo), repoTitle: repo.title,
+  onlyNotice: d.viewLines(onlyNotice), humanLines: d.viewLines(human), cosLines: d.viewLines(cos),
+  entries: Object.fromEntries(human.sections[1].groups.flatMap((g) => g.entries.map((e) => [e.key, e]))),
+  noFacts: d.entryOf(note("pr:x#1", "a/x", "x#1 T", 1, { additions: null, deletions: null, files: null, ci: null, review: null }), now),
+}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestHeadsUpPanelLayout(Base):
+    def setUp(self):
+        super().setUp()
+        script = self.home / "notice-harness.mjs"
+        script.write_text(NOTICE_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_heads_up_follows_waits_on_you_and_comes_before_waits_on_cos(self):
+        self.assertEqual([t for t, _ in self.r["cos"]], ["Waits on you (1)", "Heads-up (3)", "Waits on cos (1)"])
+        self.assertEqual([t for t, _ in self.r["human"]], ["Waits on you (1)", "Heads-up (3)"])
+
+    def test_notices_are_never_in_the_decisions_count_or_under_waits_on_you(self):
+        self.assertEqual(self.r["cosTitle"], "Decisions (2) all")
+        self.assertEqual(self.r["humanTitle"], "Decisions (1) for you")
+        for views in ("cos", "human"):
+            self.assertEqual(self.r[views][0][1], [["acme/api", ["api#2"]]])
+
+    def test_heads_up_is_grouped_by_repo_oldest_first(self):
+        _, groups = self.r["human"][1]
+        self.assertEqual(groups, [["acme/api", ["pr:api#11", "pr:api#12"]], ["acme/web", ["pr:web#9"]]])
+
+    def test_a_repos_pane_shows_only_its_own_notices(self):
+        self.assertEqual(self.r["repo"][1], ["Heads-up (1)", [["acme/web", ["pr:web#9"]]]])
+        self.assertEqual(self.r["repoTitle"], "Decisions (1) acme/web")
+
+    def test_an_entry_is_headline_then_facts_then_id_and_age(self):
+        e = self.r["entries"]["pr:web#9"]
+        self.assertEqual(e["lines"], ["web#9 Add the retry budget to the", "client"])
+        self.assertEqual(e["facts"], ["+120/-14, 5 files, CI failing, no", "review"])
+        self.assertEqual(e["head"], "pr:web#9 12m")
+        lines = self.r["humanLines"]
+        at = lines.index("pr:web#9 12m")
+        self.assertEqual(lines[at - 4:at + 1], ["web#9 Add the retry budget to the", "client",
+                                               "+120/-14, 5 files, CI failing, no", "review", "pr:web#9 12m"])
+
+    def test_the_headline_is_cut_at_two_lines_and_a_hold_shows_when_it_merges_after_in_utc(self):
+        e = self.r["entries"]["pr:api#12"]
+        self.assertEqual(len(e["lines"]), 2)
+        self.assertTrue(e["lines"][1].endswith("\u2026"))
+        self.assertEqual(" ".join(e["facts"]), "+120/-14, 5 files, CI green, approved, merges after 12:10 UTC")
+        self.assertFalse(any("merges after" in " ".join(x["facts"]) for k, x in self.r["entries"].items() if k != "pr:api#12"))
+
+    def test_a_stale_read_and_a_singular_file_are_said_plainly(self):
+        self.assertEqual(" ".join(self.r["entries"]["pr:api#11"]["facts"]),
+                         "+120/-14, 1 file, CI pending, changes requested (stale)")
+        self.assertEqual(self.r["noFacts"]["facts"], ["facts not read yet"])
+
+    def test_notices_are_separated_like_the_other_entries_and_fit_the_width(self):
+        lines = self.r["humanLines"]
+        heavy, thin = "\u2501" * 34, "\u2504" * 34
+        at = lines.index("Heads-up (3)")
+        self.assertEqual(lines[at - 1], heavy)
+        self.assertIn(thin, lines[at:])
+        self.assertTrue(all(len(x) <= 34 for x in lines + self.r["cosLines"]), [x for x in lines if len(x) > 34])
+
+    def test_a_panel_with_only_a_notice_says_none_under_waits_on_you(self):
+        lines = self.r["onlyNotice"]
+        self.assertEqual(lines[:4], ["Decisions (0) for you", "\u2501" * 34, "Waits on you (0)", "none"])
+        self.assertIn("Heads-up (1)", lines)
+        self.assertEqual(lines.count("none"), 1)
+
+    def test_the_tui_draws_the_facts_line_and_knows_the_notice_section(self):
+        source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
+        for needle in ("entry.facts", "hasNotices"):
+            self.assertIn(needle, source)
+
+
 class TestTierRoleText(unittest.TestCase):
     def text(self, *parts):
         return " ".join((REPO.joinpath(*parts)).read_text().split())

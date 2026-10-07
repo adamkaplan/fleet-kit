@@ -1,11 +1,11 @@
 /** @jsxImportSource @opentui/solid */
-// The Decisions section of the TUI sidebar: what waits on you, read-only. It reads decisions.json, which the
+// The Decisions section of the TUI sidebar: what waits on you, read-only, and the Heads-up section (PR notices). It reads decisions.json, which the
 // switchboard daemon keeps (docs/switchboard.md, "Decisions (PR 14)"), and draws it. It holds no credential,
 // makes no network call and never spawns a process. The file is replaced by rename, so the DIRECTORY is
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, For } from "solid-js"
 import { watch } from "node:fs"
-import { HEAVY, THIN, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
+import { HEAVY, THIN, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
@@ -53,7 +53,7 @@ export default {
                 <text>
                   <b>{section.title}</b>
                 </text>
-                {section.groups.length === 0 && view().groups.length > 0 ? <text>none</text> : null}
+                {section.groups.length === 0 && (view().groups.length > 0 || hasNotices(view())) ? <text>none</text> : null}
                 <For each={section.groups}>
                   {(group, i) => (
                     <box flexDirection="column">
@@ -66,6 +66,7 @@ export default {
                           <box flexDirection="column">
                             {j() > 0 ? <text>{THIN(ROW_WIDTH)}</text> : null}
                             <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
+                            <For each={entry.facts ?? []}>{(line) => <text>{line}</text>}</For>
                             <text>{entry.head}</text>
                           </box>
                         )}
