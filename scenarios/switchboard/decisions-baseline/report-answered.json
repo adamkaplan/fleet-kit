@@ -61,7 +61,7 @@
    "open": [
     {
      "ask": 11,
-     "considered": "newest send from api-orch to w08: 2027-01-15T12:01:04Z, #99, admitted, tagged #99, not this ask",
+     "considered": "newest send from api-orch to w08: 2027-01-15T08:00:16Z, #99, queued in the inbox, tagged #99, not this ask",
      "tier": "orchestrator",
      "title": "which one?"
     }

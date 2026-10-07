@@ -2475,6 +2475,25 @@ R1.
 | T5 | Two repos, two orchestrators, a coder | — | An orchestrator sees only its repo's decisions, the Chief of Staff all, you the human tier | PR 18 | offline; the control is a variant that gives the orchestrator the Chief of Staff's view |
 | T6 | An agent writes the Chief of Staff's orders file | — | The guard stops the orchestrator and the Chief of Staff alike, with no model call | PR 18 | offline; control `anyone-edits-cos-orders` |
 
+### The Decision baseline
+
+`TestDecisionBaseline*` in `bin/test-switchboard` is a characterisation suite: it pins what the Decision
+subsystem does today, so that a refactor of it (extracting a module, putting the sources behind a port) can
+prove it changed no behaviour. It runs offline against the fake `gh` and the fake v2, and observes only through
+seams that outlive a refactor: the derived list (`decisions --fresh`, and the derivation itself for the notices
+the CLI never lists), `decisions.json`, the output of `decisions`, `decisions --json` and the decisions line of
+`status`, what `escalate`, `resolve`, `answer`, `supersede` and `batch` do to the fake `gh` and the fake v2, and
+the node plugin's view of the same list. It covers every source kind and tier (the grace timer and
+escalation), id assignment and collisions, folding a report into its issue, headline cutting, every case of
+`report_answered` (a send in the transcript or queued in the inbox, newer reports, withdrawals and their
+riders), the per-id results of `supersede`, a batch raised, listed, escalated and answered, the over-1h count,
+a `decisions.json` that is not rewritten when nothing changed, the view of each role and the error entries.
+The expected outputs are plain files in `scenarios/switchboard/decisions-baseline/` (synthetic names only), so
+a refactor changes no test and no file, only the code. Where only an internal function can be called, one
+`baseline_*` adapter function in the test file is the single place to repoint. The extraction must keep the
+baseline green; a change to a file there is a change of behaviour and is reviewed as one. Record the files
+again, after a change that was meant, with `DECISIONS_BASELINE_UPDATE=1 bin/test-switchboard TestDecisionBaseline`.
+
 ## Repo and PR conventions
 
 - Work happens in a git worktree of the existing checkout; no second clone.

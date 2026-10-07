@@ -22667,7 +22667,7 @@ class TestDecisionBaselineAnswered(BaselineWorld):
             ("an untagged question and an untagged blocked: both stay",
              [("say", Q, "first thing?"), ("say", "blocked", "stuck")]),
             ("a withdrawal is a rider: it hides the question before any message carries it",
-             [("say", Q, "which one?", 11), ("say", W, "superseded", 11), ("tick", 7200 * 2), ("pass",)]),
+             [("say", Q, "which one?", 11), ("say", W, "superseded", 11)]),
         ]
 
     def run_case(self, label, steps):
@@ -22702,6 +22702,19 @@ class TestDecisionBaselineAnswered(BaselineWorld):
                     for d in found["decisions"] if d["agent"] == label]
             out.append({"case": "%s: %s" % (label, what), "open": mine})
         baseline_golden(self, "report-answered", {"cases": out, "errors": found["errors"]})
+
+    def test_a_withdrawal_older_than_the_rider_age_still_hides_its_question(self):
+        self.add_worker("w")
+        self.add_worker("w2")
+        self.run_case("w", [("say", "question", "which one?", 11)])
+        self.run_case("w2", [("say", "question", "and this one?", 12), ("say", "working", "going", 12)])
+        self.run_case("w", [("say", "withdrawn", "superseded", 11)])  # both are riders now: no message has carried them
+        out = {"before": self.titles()}
+        self.world.tick(sb.validate_config({})["rider_max_age_seconds"] * 2)
+        self.world.engine.run_pass()  # the daemon's pass prunes the old progress riders, never a withdrawal
+        out["two rider ages later"] = self.titles()
+        out["the riders left"] = [r["summary"] for r in self.world.new_engine("cli").pending("api-orch")["riders"]]
+        baseline_golden(self, "report-withdrawn-rider-age", out)
 
     def test_a_worker_that_no_longer_runs_has_nobody_waiting(self):
         self.add_worker("gone")
