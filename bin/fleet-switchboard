@@ -12450,6 +12450,74 @@ def cmd_decision_batch(args, runner, now):
     return EXIT_OK
 
 
+def batch_answer_rows(decision, args):
+    """[(row, outcome text, changed)] for `decisions answer <batch> --as-recommended | --row N=<choice> ...`: a row
+    not named keeps its recommendation. Raises DecisionError."""
+    rows, wanted = decision["rows"], {}
+    if args.as_recommended == bool(args.row):
+        raise DecisionError("%s is a batch of %d rows: answer it with --as-recommended, or --row N=<choice> for the "
+                            "rows that change (the rest keep their recommendation); not both, not neither"
+                            % (decision["id"], len(rows)))
+    for item in args.row or []:
+        found = re.match(r"^([0-9]+)=(.+)$", item.strip())
+        if not found or not " ".join(found.group(2).split()):
+            raise DecisionError("%r is not a row answer: write --row N=<choice>" % _one_line(item, 60))
+        number = int(found.group(1))
+        if not 1 <= number <= len(rows):
+            raise DecisionError("row %d does not exist: %s has rows 1 to %d" % (number, decision["id"], len(rows)))
+        if number in wanted:
+            raise DecisionError("row %d is answered twice" % number)
+        wanted[number] = _one_line(found.group(2), BATCH_REC_MAX * 2)
+    out = []
+    for number, row in enumerate(rows, 1):
+        choice = wanted.get(number)
+        if choice is None or choice.lower() == "as recommended":
+            out.append((row, "as recommended: %s" % row["recommendation"], False))
+        else:
+            out.append((row, "changed: %s (recommended: %s)" % (choice, row["recommendation"]), True))
+    return out
+
+
+def answer_batch(engine, runner, decision, args, name):
+    """ONE comment on the batch issue recording every row's outcome, then both awaiting labels off it, so the batch
+    and all its rows leave the list together; then, when it can, a note to the orchestrator that raised it. Never
+    touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
+    ident = decision["id"]
+    target = _issue_target(engine, decision)
+    if target is None or target[0] is None:
+        raise DecisionError("%s: cannot tell which repo its issue is in" % ident)
+    repo, number = target
+    outcomes = batch_answer_rows(decision, args)
+    changed = sum(1 for _, _, c in outcomes if c)
+    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
+                                                      "%d row%s changed, the rest as recommended"
+                                                      % (changed, "" if changed == 1 else "s"))]
+    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
+    if args.note:
+        lines.append("Note: %s" % _one_line(args.note, 300))
+    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    comment_as(engine, runner, repo, number, "\n".join(lines), name)
+    change_issue_labels(engine, runner, repo, number, (),
+                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
+                                            "rows": len(outcomes), "changed": changed,
+                                            "note": _one_line(args.note or "", 200)})
+    told = ""
+    raised = decision.get("raised_by")
+    if raised and name:
+        text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
+               "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
+        try:
+            outcome = engine.send(name, raised, text, number, repo)
+            told = "; told %s" % raised if outcome.get("sent") else "; could not tell %s (%s): the comment is the record" % (
+                raised, outcome.get("reason") or outcome.get("action"))
+        except Exception as err:
+            told = "; could not tell %s (%s): the comment is the record" % (raised, _one_line(str(err), 100))
+    return "answered %s: %d rows (%d as recommended, %d changed); %s and %s are off %s#%d%s" % (
+        ident, len(outcomes), len(outcomes) - changed, changed, awaiting_cos_label(engine.config),
+        awaiting_label(engine.config), repo, number, told)
+
+
 def cmd_decision_write(args, action, runner, now):
     """`decisions escalate|resolve|answer`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
     if action == "batch":
@@ -12471,6 +12539,14 @@ def cmd_decision_write(args, action, runner, now):
             line = escalate_decision(engine, runner, decision, args.reason, name)
         elif action == "resolve":
             line = resolve_decision(engine, runner, decision, args.note, name)
+        elif decision["kind"] == "issue" and decision.get("rows"):
+            line = answer_batch(engine, runner, decision, args, name)
+        elif args.as_recommended or args.row:
+            raise DecisionError("%s is not a batch: --as-recommended and --row answer a batch; answer this with its "
+                                "own value" % args.id)
+        elif args.value is None:
+            raise DecisionError("answer %s with a value: `allow` or `deny` for a permission request, the text for a "
+                                "question" % args.id)
         else:
             line = answer_decision(engine, decision, args.value, args.note, name)
     except (DecisionError, CallerError) as err:
@@ -12594,11 +12670,16 @@ def add_decision_parsers(sub):
     resolve.add_argument("--note", help="One line, posted as a comment on the issue, signed as you")
     resolve.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     answer = kinds.add_parser("answer", help="Answer an agent's pending permission request (allow|deny) or question "
-                                             "(the answer's text) through v2. Judged against the Chief of Staff's "
+                                             "(the answer's text) through v2, or a batch (--as-recommended, --row). Judged against the Chief of Staff's "
                                              "standing orders")
     answer.add_argument("id", help="The decision's id")
-    answer.add_argument("value", help="`allow` or `deny` for a permission request; the text for a question")
-    answer.add_argument("--note", help="One line: the order that covers it")
+    answer.add_argument("value", nargs="?", help="`allow` or `deny` for a permission request; the text for a question "
+                                                 "(a batch takes --as-recommended or --row instead)")
+    answer.add_argument("--as-recommended", action="store_true", help="A batch: every row as recommended")
+    answer.add_argument("--row", action="append", metavar="N=CHOICE", help="A batch: row N (from 1) answered CHOICE; "
+                                                                         "repeat it. Rows not named keep their "
+                                                                         "recommendation")
+    answer.add_argument("--note", help="One line: the order that covers it (a batch: part of the answer's comment)")
     answer.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     labels = sub.add_parser("labels", help="Create the fleet's labels in the watched repos",
                             description="`labels ensure` creates the labels the fleet uses, each with the repo's own "

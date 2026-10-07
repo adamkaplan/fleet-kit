@@ -20177,6 +20177,128 @@ class TestBatchEscalate(BatchWorld):
                               and row.split("#")[0] in c[2]], row)
 
 
+class TestBatchAnswer(BatchWorld):
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(WEB, 7, "stale cache key", labels=["bug"])
+        self.gh.issue(WEB, 9, "dup of 7", labels=["bug", "me:awaiting-cos"])
+        self.gh.issue(API, 3, "an api one", labels=["bug"])
+        self.ident = self.batch_id()
+        self.batch = [k for k in self.gh.issues if k[1] > 100][0]
+        self.as_agent("cos")
+        self.gh.calls.clear()
+
+    def answer(self, *argv, **env):
+        self.as_agent("cos")
+        return self.main("decisions", "answer", self.ident, *argv, **env)
+
+    def row_issues_untouched(self):
+        self.assertEqual(self.gh.names(WEB, 7), ["bug"])
+        self.assertEqual(self.gh.names(WEB, 9), ["bug", "me:awaiting-cos"], "not even a label it already has is removed")
+        self.assertEqual(self.gh.names(API, 3), ["bug"])
+        self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
+        for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
+            if "/issues?" not in call[2]:
+                self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
+
+    def test_as_recommended_posts_one_comment_with_every_row_and_takes_both_labels_off(self):
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        (comment,) = self.gh.comments
+        self.assertEqual((comment["repo"], comment["issue"]), self.batch)
+        body = comment["body"]
+        self.assertIn("(3 rows): as recommended.", body)
+        self.assertIn("1. acme/web#7: as recommended: close it", body)
+        self.assertIn("2. acme/web#9: as recommended: close as duplicate of web#7", body)
+        self.assertIn("3. acme/api#3: as recommended: label it done", body)
+        self.assertEqual(sb.signed_by_fleet(body), "cos")
+        self.assertEqual(self.gh.names(*self.batch), [])
+        self.assertIn("answered %s: 3 rows (3 as recommended, 0 changed)" % self.ident, out)
+        self.assertEqual([d["id"] for d in self.entries()], ["web#9"], "the batch left the list; web#9 is its own decision")
+
+    def entries(self):
+        self.as_agent("cos")
+        return json.loads(self.main("decisions", "--fresh", "--json", "--tier", "all")[1])["decisions"]
+
+    def test_per_row_changes_keep_the_other_rows_as_recommended_and_the_note_is_in_the_comment(self):
+        code, out, err = self.answer("--row", "2=keep it open", "--row", "3=as recommended", "--note", "per the order")
+        self.assertEqual(code, 0, err)
+        body = self.gh.comments[0]["body"]
+        self.assertIn("1 row changed, the rest as recommended", body)
+        self.assertIn("1. acme/web#7: as recommended: close it", body)
+        self.assertIn("2. acme/web#9: changed: keep it open (recommended: close as duplicate of web#7)", body)
+        self.assertIn("3. acme/api#3: as recommended: label it done", body)
+        self.assertIn("Note: per the order", body)
+        self.assertIn("(2 as recommended, 1 changed)", out)
+
+    def test_no_row_issue_is_ever_touched(self):
+        for argv in (("--as-recommended",),):
+            self.answer(*argv)
+        self.row_issues_untouched()
+        self.assertEqual(len([c for c in self.gh.calls if "--method" in c]), 3, "comment, and two label removals")
+
+    def test_the_raising_orchestrator_is_told_by_a_note_from_the_answerer_naming_the_batch(self):
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIn("told api-orch", out)
+        text = " ".join(str(a) for a in self.world.admissions("api-orch"))
+        self.assertIn("from cos", text)
+        self.assertIn("Batch %s (acme/api#%d) is answered" % (self.ident, self.batch[1]), text)
+        self.assertIn("you act on it", text)
+        self.assertEqual(self.world.admissions("web-orch"), [])
+
+    def test_a_note_that_cannot_be_delivered_does_not_undo_the_answer(self):
+        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent")):
+            code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not tell api-orch", out)
+        self.assertEqual(self.gh.names(*self.batch), [])
+
+    def test_bad_answers_are_refused_and_write_nothing(self):
+        for argv, why in ((("--row", "4=x"), "does not exist"), (("--row", "0=x"), "does not exist"),
+                          (("--row", "1=a", "--row", "1=b"), "twice"), (("--row", "x"), "not a row answer"),
+                          (("--row", "1="), "not a row answer"), (("--as-recommended", "--row", "1=a"), "not both"),
+                          ((), "not both, not neither"), (("allow",), "not both, not neither")):
+            with self.subTest(argv=argv):
+                code, out, err = self.answer(*argv)
+                self.assertEqual(code, 2, out)
+                self.assertIn(why, err)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+        self.assertEqual(self.gh.comments, [])
+
+    def test_the_flags_are_for_a_batch_and_an_ordinary_answer_keeps_its_meaning(self):
+        self.gh.issue(API, 2, "plain", labels=["me:awaiting-cos"])
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"), "--as-recommended")
+        self.assertEqual(code, 2)
+        self.assertIn("not a batch", err)
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"), "allow")
+        self.assertEqual(code, 2)
+        self.assertIn("is an issue", err)  # the existing refusal, unchanged
+        code, out, err = self.main("decisions", "answer", self.id_of("plain"))
+        self.assertEqual(code, 2)
+        self.assertIn("with a value", err)
+
+    def test_answering_a_batch_is_judged_like_any_answer(self):
+        for command in ("fleet-switchboard decisions answer api#101 --as-recommended",
+                        "fleet-switchboard decisions answer api#101 --row 2=keep"):
+            self.assertFalse(sb.plain_switchboard_message(command), command)
+
+    def test_an_agent_that_is_not_the_chief_of_staff_cannot_answer_it(self):
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "answer", self.ident, "--as-recommended")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.comments, [])
+
+    def test_from_a_plain_shell_the_comment_is_unsigned_and_nobody_is_sent_a_note(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.main("decisions", "answer", self.ident, "--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(sb.signed_by_fleet(self.gh.comments[0]["body"]))
+        self.assertNotIn("told", out)
+        self.assertEqual(self.world.admissions("api-orch"), [])
+
+
 class TestLabelsEnsure(WriteWorld):
     WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()])
 
