@@ -2551,6 +2551,24 @@ decisions of one kind from some store), `AnswerDelivery` (delivers an answer to 
 (the hook point of an adapter that holds decisions elsewhere). They are used when the sources are put behind
 them.
 
+Step 3 put what is I/O behind those ports, still in `bin/fleet-switchboard`, with no change of behaviour (the
+baseline is the proof):
+
+| Port                      | Implementations (today's behaviour)                                              |
+|---------------------------|----------------------------------------------------------------------------------|
+| `DecisionSource`          | `GitHubIssuesSource`, `HarnessRequestsSource`, `ReportsSource`, `PrNoticesSource` |
+| `AnswerDelivery`          | `IssueDelivery`, `ReportSendDelivery`, `HarnessReplyDelivery`                    |
+| `DecisionStore`           | `LocalStore` (decisions.json and escalated-requests.json)                        |
+| `ExternalDecisionAdapter` | `NullExternal` (does nothing: nothing leaves the machine)                        |
+
+Each source wraps the reader it always called. `derive_decisions` walks `DECISION_SOURCE_REGISTRY` in order: the
+sources of items (folded and numbered), then the sources of finished entries (`entries = True`, the notices). A source
+that raises is one error entry and the others are still listed, audited once per change, as before. A later adapter
+registers with `register_decision_source(factory)`, where `factory(engine)` returns a `DecisionSource`. The callers
+of an answer (`escalate`, `resolve`, `answer`, `supersede`, a batch answer) keep their refusals and wording and hand
+the delivery to the class for its path. `decision_external(engine)` is where an adapter would be found; with none
+set it is `NullExternal`. No configuration key was added.
+
 The script loads the module by path from beside its own real path (`load_decision_core`), not by `import`, so it
 works the same through a symlink (`~/.local/bin`), from the service units (`python3 -B <kit>/bin/fleet-switchboard`),
 from tests that load it with `SourceFileLoader`, and from any directory. Nothing is installed or packaged: the
