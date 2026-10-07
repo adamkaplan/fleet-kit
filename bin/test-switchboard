@@ -158,7 +158,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
-            "worker_lookback_hours": 24,
+            "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
