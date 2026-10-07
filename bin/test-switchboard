@@ -16054,6 +16054,73 @@ class InstallCase(Base):
         return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-switchboard.service"
 
 
+class TestTodolistPlugin(Base):
+    """The vendored todo plugin: src/ copied beside a one-line loader in plugins/, temp config dirs only."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.home / "cfg"
+        self.src = REPO / "plugins" / "opencode-todolist" / "src"
+        self.loader = self.config / "plugins" / "opencode-todolist.ts"
+
+    def test_a_fresh_install_copies_every_src_file_byte_for_byte_and_writes_the_loader(self):
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        files = [p for p in self.src.rglob("*") if p.is_file()]
+        self.assertTrue(files)
+        for path in files:
+            self.assertEqual((self.config / "opencode-todolist" / path.relative_to(self.src)).read_bytes(), path.read_bytes())
+        self.assertEqual(self.loader.read_text(), 'export { default } from "../opencode-todolist/src/index.ts"\n')
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_a_second_run_changes_nothing(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        before = tree_of(self.config)
+        self.assertFalse(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(tree_of(self.config), before)
+
+    def test_a_loader_the_kit_did_not_write_is_not_overwritten(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_a_src_file_the_kit_did_not_write_is_not_overwritten(self):
+        (self.config / "opencode-todolist").mkdir(parents=True)
+        (self.config / "opencode-todolist" / "index.ts").write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual((self.config / "opencode-todolist" / "index.ts").read_text(), "// mine\n")
+        self.assertFalse(self.loader.exists())
+
+    def test_status_says_differs_from_the_kit_after_an_edit_and_a_rerun_restores_it(self):
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "not installed")
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "differs from the kit")
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_uninstall_removes_only_what_the_kit_wrote(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        (self.config / "plugins" / "other.js").write_text("x")
+        self.assertTrue(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse(self.loader.exists())
+        self.assertEqual(sorted(p.name for p in (self.config / "opencode-todolist").iterdir()), ["todos.ts"])
+        self.assertTrue((self.config / "plugins" / "other.js").exists())
+        (self.config / "opencode-todolist" / "todos.ts").unlink()
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_uninstall_of_a_foreign_loader_leaves_it(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+
+
 class TestInstall(InstallCase):
     def full(self, *flags, **kw):
         return self.install("--opencode", self.machine.binary, *flags, **kw)
@@ -16063,7 +16130,7 @@ class TestInstall(InstallCase):
         self.assertIsNone(error)
         steps = self.statuses(out)
         for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "herdr plugin", "service", "daemon"):
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service", "daemon"):
             self.assertIn(name, steps, "%s: no line in\n%s" % (name, out))
         self.assertEqual(steps["config"], ["done"])
         self.assertIn("STATUS", out, "the last step prints status")
@@ -16121,8 +16188,10 @@ class TestInstall(InstallCase):
         self.assertEqual(tree_of(self.home), before)
         steps = self.statuses(out)
         for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "herdr plugin", "service"):
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service"):
             self.assertIn(name, steps, name)
+        self.assertEqual(steps["todolist plugin"], ["would be done"])
+        self.assertFalse((self.profile / "opencode-todolist").exists())
         self.assertEqual(steps["config"], ["would be done"])
         run = [c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"] or c[0] in ("launchctl",) and c[1] != "print"]
         self.assertEqual(run, [], "a dry run starts and loads nothing")
@@ -16168,7 +16237,7 @@ class TestInstall(InstallCase):
         self.assertEqual([c for c in self.machine.calls[calls:] if c[:3] == ["herdr", "plugin", "unlink"]
                           or c[:2] == ["launchctl", "bootout"]], [])
         steps = self.statuses(out)
-        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "wrapper", "service"):
+        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "todolist plugin", "wrapper", "service"):
             self.assertEqual(steps[name][-1], "would be done", name)
 
     def test_uninstall_keeps_what_the_user_added_or_edited(self):

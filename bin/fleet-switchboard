@@ -8941,6 +8941,9 @@ KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
 DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
 DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
 HOOKS_PLUGIN_FILE = "fleet-hooks.js"
+TODOLIST_PLUGIN_NAME = "opencode-todolist"  # the directory (the vendored src/) in the profile's opencode config
+TODOLIST_LOADER_FILE = "opencode-todolist.ts"  # plugins/<this>: the one line OpenCode loads
+TODOLIST_LOADER_TEXT = 'export { default } from "../opencode-todolist/src/index.ts"\n'
 WRAPPER_NAME = "fleet-opencode"  # beside the profile, never named `opencode`: the person's own OpenCode keeps that name
 # Names a wrapper strips from a v2 process by shape, before it adds the one `gh` token agents are given. The same
 # pattern bin/switchboard-trial strips with: a test keeps the two equal.
@@ -9452,6 +9455,88 @@ def decisions_plugin_status(config_dir, kit_root=KIT_ROOT):
     return "installed" if same else "out of date"
 
 
+def _todolist_files(kit_root):
+    """{path relative to src/: bytes} for every file under the vendored plugin's src/."""
+    src = Path(kit_root) / "plugins" / "opencode-todolist" / "src"
+    return {str(p.relative_to(src)): p.read_bytes() for p in sorted(src.rglob("*")) if p.is_file()}
+
+
+def _todolist_paths(config_dir):
+    config = Path(config_dir)
+    return config / TODOLIST_PLUGIN_NAME, config / "plugins" / TODOLIST_LOADER_FILE
+
+
+def _same_bytes(path, content):
+    try:
+        return Path(path).read_bytes() == content
+    except OSError:
+        return False
+
+
+def install_todolist_plugin(config_dir, kit_root=KIT_ROOT):
+    """Copy the vendored todo plugin's src/ into <config>/opencode-todolist/ and write the loader
+    <config>/plugins/opencode-todolist.ts that re-exports it (a `plugins` entry naming the directory does not
+    load: its package.json exports an unbuilt ./dist). A loader this code did not write is refused, never
+    overwritten; so is a differing src file when there is no loader of ours to say the directory is ours.
+    Idempotent; True when anything changed."""
+    files = _todolist_files(kit_root)
+    target, loader = _todolist_paths(config_dir)
+    loader_bytes = TODOLIST_LOADER_TEXT.encode()
+    if loader.exists() and not _same_bytes(loader, loader_bytes):
+        raise InstallError("%s exists and the kit did not write it: move it aside, then run again" % loader)
+    ours = loader.exists()
+    if not ours:
+        for name, body in files.items():
+            if (target / name).exists() and not _same_bytes(target / name, body):
+                raise InstallError("%s exists and the kit did not write it: move it aside, then run again"
+                                   % (target / name))
+    changed = False
+    for name, body in files.items():
+        if not _same_bytes(target / name, body):
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            (target / name).write_bytes(body)
+            changed = True
+    if not ours:
+        loader.parent.mkdir(parents=True, exist_ok=True)
+        loader.write_bytes(loader_bytes)
+        changed = True
+    return changed
+
+
+def todolist_plugin_status(config_dir, kit_root=KIT_ROOT):
+    """`not installed`, `already installed`, or `differs from the kit`."""
+    files = _todolist_files(kit_root)
+    target, loader = _todolist_paths(config_dir)
+    if not loader.exists() and not any((target / name).exists() for name in files):
+        return "not installed"
+    same = _same_bytes(loader, TODOLIST_LOADER_TEXT.encode()) and all(
+        _same_bytes(target / name, body) for name, body in files.items())
+    return "already installed" if same else "differs from the kit"
+
+
+def uninstall_todolist_plugin(config_dir, kit_root=KIT_ROOT):
+    """Remove the files install wrote and only those: a file edited since stays, and so does its directory."""
+    target, loader = _todolist_paths(config_dir)
+    removed = False
+    if _same_bytes(loader, TODOLIST_LOADER_TEXT.encode()):
+        loader.unlink()
+        removed = True
+    for name, body in _todolist_files(kit_root).items():
+        if _same_bytes(target / name, body):
+            (target / name).unlink()
+            removed = True
+    for path in sorted((p for p in target.rglob("*") if p.is_dir()), reverse=True) if target.is_dir() else []:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    try:
+        target.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
 def remove_if_same(path, content):
     """Delete `path` when it still holds exactly `content` (what the kit wrote). False when absent or edited."""
     path = Path(path)
@@ -9856,7 +9941,9 @@ class Installer:
                  ("fleet-hooks plugin", lambda: install_hooks_plugin(profile, self.kit_root),
                   "%s/plugins/%s" % (profile, HOOKS_PLUGIN_FILE)),
                  ("decisions plugin", lambda: install_decisions_plugin(profile, self.kit_root),
-                  "%s/%s and cli.json" % (profile, DECISIONS_PLUGIN_NAME)))
+                  "%s/%s and cli.json" % (profile, DECISIONS_PLUGIN_NAME)),
+                 ("todolist plugin", lambda: install_todolist_plugin(profile, self.kit_root),
+                  "%s/%s and plugins/%s" % (profile, TODOLIST_PLUGIN_NAME, TODOLIST_LOADER_FILE)))
         for step, action, detail in steps:
             if self.dry:
                 self.dry_piece(step, profile)
@@ -9876,7 +9963,8 @@ class Installer:
                        "skills": lambda: install_skills(skills, self.kit_root),
                        "skills path": lambda: ensure_skills_path(shadow, self.skills_dir(), STANDARD_MODEL),
                        "fleet-hooks plugin": lambda: install_hooks_plugin(shadow, self.kit_root),
-                       "decisions plugin": lambda: install_decisions_plugin(shadow, self.kit_root)}
+                       "decisions plugin": lambda: install_decisions_plugin(shadow, self.kit_root),
+                       "todolist plugin": lambda: install_todolist_plugin(shadow, self.kit_root)}
             self.result(step, actions[step](), "in %s" % profile)
 
     # -- 3b: herdr's OpenCode integration, in the private profile
@@ -10153,7 +10241,8 @@ class Installer:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         wrapper = self.wrapper_path()
         self.uninstall_integration(config, profile, with_link)
-        for step, action in (("decisions plugin", lambda: uninstall_decisions_plugin(profile, self.kit_root)),
+        for step, action in (("todolist plugin", lambda: uninstall_todolist_plugin(profile, self.kit_root)),
+                             ("decisions plugin", lambda: uninstall_decisions_plugin(profile, self.kit_root)),
                              ("fleet-hooks plugin", lambda: uninstall_hooks_plugin(profile, self.kit_root)),
                              ("skills path", lambda: uninstall_skills_path(profile, self.skills_dir())),
                              ("skills", lambda: uninstall_skills(self.skills_dir(), self.kit_root)),
@@ -10209,7 +10298,8 @@ class Installer:
                 shutil.copytree(str(profile), str(shadow), symlinks=True)
             if self.skills_dir().exists():
                 shutil.copytree(str(self.skills_dir()), str(skills))
-            actions = {"decisions plugin": lambda: uninstall_decisions_plugin(shadow, self.kit_root),
+            actions = {"todolist plugin": lambda: uninstall_todolist_plugin(shadow, self.kit_root),
+                       "decisions plugin": lambda: uninstall_decisions_plugin(shadow, self.kit_root),
                        "fleet-hooks plugin": lambda: uninstall_hooks_plugin(shadow, self.kit_root),
                        "skills path": lambda: uninstall_skills_path(shadow, self.skills_dir()),
                        "skills": lambda: uninstall_skills(skills, self.kit_root),
