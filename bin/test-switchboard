@@ -13315,6 +13315,34 @@ class TestDecisionDerivation(DecisionsBase):
         self.world.engine.run_pass()
         self.assertEqual(self.listed(), [], "admitted into the transcript: still answered")
 
+    def test_one_workers_unreadable_inbox_lists_its_report_with_the_error_and_spares_the_others(self):
+        self.world.add_agent("scout", fleet={"reports_to": "platform", "issue": 4})
+        self.ask_the_boss("Which database?", issue=2)
+        self.ask_the_boss("is it fine?", sender="scout", issue=4)
+        self.world.engine.discover(self.world.clock.now())
+        self.world.engine.collect_facts()
+        # a send answers the scout's question; the coder's inbox cannot be read
+        self.world.new_engine("cli").send("platform", "scout", "yes", 4)
+        self.world.tick(1)
+        bad = self.world.sessions["coder"]
+        real = self.world.engine.v2.inbox_list
+
+        for error in (RuntimeError("inbox read failed"), sb.V2Error("v2 says 500")):
+            with self.subTest(error=type(error).__name__):
+                def fail(session_id, *a, _e=error, **k):
+                    if session_id == bad:
+                        raise _e
+                    return real(session_id, *a, **k)
+                with mock.patch.object(self.world.engine.v2, "inbox_list", side_effect=fail):
+                    self.world.engine.discover(self.world.clock.now())
+                    self.world.engine.collect_facts()
+                    items, errors = sb.derive_decisions(self.world.engine, self.world.clock.now())
+                self.assertEqual([(d["agent"], d["title"]) for d in items], [("coder", "Which database?")],
+                                 "the coder's report stays listed; the scout's is answered and unaffected")
+                (problem,) = [e for e in errors if e["source"] == "reports"]
+                self.assertIn("coder", problem["error"])
+                self.assertIn(str(error), problem["error"])
+
     def test_the_real_tag_forms_of_a_send_match_and_name_the_same_repo(self):
         repos = ["acme-org/acme-platform", "acme-org/other"]
         for tag in ("acme-platform#294", "acme-org/acme-platform#294"):

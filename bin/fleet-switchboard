@@ -4200,10 +4200,7 @@ def synthetic_lines(engine, session_id, since, waiting=False):
     found = transcript_lines(engine, session_id, since)
     if not waiting:
         return found
-    try:
-        inbox = engine.v2.inbox_list(session_id)
-    except V2Error:
-        return found  # an inbox that cannot be read leaves the transcript's lines, as before
+    inbox = engine.v2.inbox_list(session_id)  # an inbox that cannot be read raises: the caller says so, it is not guessed
     have = {line[1] for line in found}
     waiting = []
     for item in inbox if isinstance(inbox, list) else []:
@@ -4255,7 +4252,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({_boss_of(o) for o in discovery.agents.values()} - {None})
     repos = decision_repos(engine)
-    items, problems, sends = [], [], {}
+    items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
         if observation is None or observation.problem:
@@ -4285,10 +4282,22 @@ def decisions_from_reports(engine, now):
         for report in reports:
             if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
                 continue  # not a decision, or the worker that asked no longer runs: no one is waiting
-            if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
-                continue
+            worker = report["sender"]
+            if worker not in unread:
+                try:
+                    if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
+                        continue
+                except (V2Error, RuntimeError) as err:
+                    # one worker's unreadable inbox or transcript: its reports stay listed (not answered), the error is
+                    # shown once, and every other worker is unaffected
+                    unread[worker] = _one_line(str(err), 150)
+                    problems.append(unread[worker] if unread[worker].startswith("cannot read what %s" % worker)
+                                    else "cannot read what %s was sent: %s" % (worker, unread[worker]))
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
-            considered = considered_send(engine, report, repos, since, sends)
+            if worker in unread:
+                considered = "could not read what %s was sent (%s): listed as not answered" % (worker, unread[worker])
+            else:
+                considered = considered_send(engine, report, repos, since, sends)
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": "orchestrator" if above else "cos",
