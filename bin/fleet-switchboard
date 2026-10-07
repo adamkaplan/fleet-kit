@@ -8147,7 +8147,7 @@ def plain_switchboard_message(text):
     anything (see _plain_words). Anything this is unsure about is judged like any other shell command.
 
     PR 18: `decisions` (a read, `list`, or `escalate`) and `orders --cos` (a read) are plain too. `decisions
-    resolve` and `decisions answer` are NOT: they act for the owner, so the judge reads them against the Chief of
+    resolve`, `decisions answer` and `decisions supersede` are NOT: they act for the owner, so the judge reads them against the Chief of
     Staff's standing orders (the `answer-unjudged` fault lets them through)."""
     words = _plain_words(text)
     if not words or len(words) < 2 or os.path.basename(words[0]) != PROG:
@@ -8155,7 +8155,7 @@ def plain_switchboard_message(text):
     if words[1] in POLICY_MESSAGE_COMMANDS:
         return True
     if words[1] == "decisions":
-        return _decisions_subcommand(words[2:]) not in ("resolve", "answer") or fault("answer-unjudged")
+        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede") or fault("answer-unjudged")
     return words[1] == "orders" and words[2:] == ["--cos"]
 
 
@@ -8167,7 +8167,7 @@ def decision_gloss(state_dir, command):
         return ""
     rest = words[2:]
     sub = _decisions_subcommand(rest)
-    if sub not in ("resolve", "answer") or rest.index(sub) + 1 >= len(rest):
+    if sub not in ("resolve", "answer", "supersede") or rest.index(sub) + 1 >= len(rest):
         return ""
     ident = rest[rest.index(sub) + 1]
     body = read_decisions_file(Path(state_dir) / DECISIONS_FILE)
@@ -12518,20 +12518,107 @@ def answer_batch(engine, runner, decision, args, name):
         awaiting_label(engine.config), repo, number, told)
 
 
+def parse_superseding(engine, text):
+    """`owner/repo#N`, `name#N` (a watched repo's name) or an issue or pull request URL -> (repo, number, as shown)."""
+    text = (text or "").strip()
+    found = _GITHUB_REF.match(text)
+    if found:
+        repo, number = "%s/%s" % (found.group(1), found.group(2)), int(found.group(3))
+    else:
+        short = _SHORT_REF.fullmatch(text)
+        repo = repo_of_tag(short.group(1), decision_repos(engine)) if short else None
+        if repo is None:
+            raise DecisionError("--by names the superseding issue as owner/repo#N, name#N for a watched repo, or its "
+                                "URL (got %r)" % _one_line(text, 60))
+        number = int(short.group(2))
+    if number < 1:
+        raise DecisionError("--by names no issue: %r" % _one_line(text, 60))
+    return repo, number, "%s#%d" % (repo, number)
+
+
+def supersede_decision(engine, runner, decision, shown, note, name):
+    """One decision made moot by another issue. An issue: a comment `Superseded by <ref>`, both awaiting labels off.
+    A report: the answerer's `send` to its worker naming the superseding issue (what clears a report), then its
+    issue's labels off if it has one. A permission request or question is refused. Returns what was done."""
+    kind, ident = decision["kind"], decision["id"]
+    _refuse_notice(decision)
+    if kind in ("permission", "question"):
+        raise DecisionError("is a %s: answer it with `%s decisions answer %s ...`" % (kind, PROG, ident))
+    said = "Superseded by %s%s" % (shown, ": %s" % _one_line(note, 300) if note else "")
+    target = _issue_target(engine, decision)
+    both = [awaiting_cos_label(engine.config), awaiting_label(engine.config)]
+    if kind == "issue":
+        if target is None or target[0] is None:
+            raise DecisionError("cannot tell which repo its issue is in")
+        repo, number = target
+        comment_as(engine, runner, repo, number, said, name)
+        change_issue_labels(engine, runner, repo, number, (), both)
+        engine._note("decisions.supersede", ident, {"kind": kind, "repo": repo, "issue": number, "by": name,
+                                                   "superseded_by": shown})
+        return "done: comment and both labels off %s#%d" % (repo, number)
+    if not name:
+        raise DecisionError("a report is cleared by a send from the boss: run this as the Chief of Staff")
+    if not decision.get("ask") or not decision.get("agent"):
+        raise DecisionError("is a report that names no issue: a send would clear every question of its worker. "
+                            "Answer it with `%s send`" % PROG)
+    outcome = engine.send(name, decision["agent"], "%s. Your question on this ask is covered there; carry on with "
+                                                   "that." % said, decision["ask"], decision.get("repo"))
+    if not outcome.get("sent"):
+        raise DecisionError("%s was not sent to %s (%s): the report stays open" % (
+            "the note", decision["agent"], outcome.get("reason") or outcome.get("action")))
+    engine._note("decisions.supersede", ident, {"kind": kind, "agent": decision["agent"], "by": name,
+                                               "superseded_by": shown})
+    if target is not None and target[0] is not None:
+        try:
+            change_issue_labels(engine, runner, target[0], target[1], (), both)
+        except IntentError as err:
+            raise DecisionError("sent to %s, but its issue's labels were not removed: %s" % (decision["agent"], err)) from None
+        return "done: sent to %s, both labels off %s#%d" % (decision["agent"], target[0], target[1])
+    return "done: sent to %s" % decision["agent"]
+
+
+def cmd_decision_supersede(args, engine, decisions, name, runner):
+    """`decisions supersede <id> ... --by <issue>`: per id one line, `done` or `refused: why`; it carries on past a
+    failure. Returns the exit code."""
+    repo, number, shown = parse_superseding(engine, args.by)
+    failed = 0
+    for ident in dict.fromkeys(args.ids):
+        try:
+            decision = decision_by_id(decisions, ident)
+            if decision is None:
+                raise DecisionError("no decision %s is waiting" % ident)
+            line = supersede_decision(engine, runner, decision, shown, args.note, name)
+            print("%s: %s" % (ident, line))
+        except (DecisionError, IntentError) as err:
+            failed += 1
+            print("%s: refused: %s" % (ident, _one_line(str(err), 300)))
+        except Exception as err:
+            failed += 1
+            print("%s: failed: %s" % (ident, _one_line("%s: %s" % (type(err).__name__, err), 300)))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
 def cmd_decision_write(args, action, runner, now):
-    """`decisions escalate|resolve|answer`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
+    """`decisions escalate|resolve|answer|supersede`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
     if action == "batch":
         return cmd_decision_batch(args, runner, now)
     try:
         engine, decisions, _ = fresh_engine_decisions(runner, now, writable=True)
         name, role = decision_actor(engine, args)
         if name is not None and role != "chief-of-staff":
-            engine.audit.append(engine.actor, "decisions.refused", args.id,
+            engine.audit.append(engine.actor, "decisions.refused", getattr(args, "id", None) or " ".join(args.ids),
                                 {"caller": name, "role": role, "action": action})
             sys.stderr.write("%s: only the Chief of Staff, or you in a plain shell, may %s a decision; %s is %s. "
                              "Raise it with `%s report question \"...\"` and your awaiting-cos label\n"
                              % (PROG, action, name, "a %s" % role if role else "not given a role", PROG))
             return EXIT_USAGE
+        if action == "supersede":
+            code = cmd_decision_supersede(args, engine, decisions, name, runner)
+            try:
+                send_poke(state_dir_path())
+            except Exception:
+                pass
+            return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
             raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
@@ -12664,6 +12751,14 @@ def add_decision_parsers(sub):
     batch.add_argument("--file", help="Rows, one per line, from this file (`-` for stdin; with no --row and no "
                                       "--file, piped stdin)")
     batch.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    supersede = kinds.add_parser("supersede", help="Mark several open decisions superseded by one issue. An issue "
+                                                   "decision: a comment and both labels off; a report: your `send` "
+                                                   "to its worker. Judged like `resolve`")
+    supersede.add_argument("ids", nargs="+", metavar="id", help="The decisions' ids")
+    supersede.add_argument("--by", required=True, metavar="ISSUE", help="The superseding issue: owner/repo#N, name#N "
+                                                                       "for a watched repo, or its URL")
+    supersede.add_argument("--note", help="One line, added to each comment and send")
+    supersede.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     resolve = kinds.add_parser("resolve", help="Take both awaiting labels off a decision's issue: it is settled. "
                                                "Judged against the Chief of Staff's standing orders")
     resolve.add_argument("id", help="The decision's id")

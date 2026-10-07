@@ -19253,6 +19253,7 @@ class LabelGh:
     def __init__(self, clock):
         self.clock, self.issues, self.labels, self.comments = clock, {}, {}, []
         self.calls, self.envs, self.down, self.fail = [], [], False, set()
+        self.fail_writes = set()   # repos whose writes (not reads) fail
 
     def issue(self, repo, number, title="an issue", labels=(), body=None):
         self.issues[(repo, number)] = {"number": number, "title": title, "state": "open", "labels": list(labels),
@@ -19275,6 +19276,8 @@ class LabelGh:
         if any(repo in path for repo in self.fail):
             return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
         method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
+        if method != "GET" and any(repo in path for repo in self.fail_writes):
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 403\n")
         data = json.loads(kwargs["input"]) if "input" in kwargs else None
         if method != "GET" and "--input" in argv and data is None:
             raise AssertionError("a write passes its body as input")
@@ -20297,6 +20300,109 @@ class TestBatchAnswer(BatchWorld):
         self.assertIsNone(sb.signed_by_fleet(self.gh.comments[0]["body"]))
         self.assertNotIn("told", out)
         self.assertEqual(self.world.admissions("api-orch"), [])
+
+
+class TestSupersede(WriteWorld):
+    """`decisions supersede`: several open decisions made moot by one issue."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos", "bug"])
+        self.gh.issue(WEB, 2, "one web", labels=["me:awaiting-user"])
+        self.gh.issue(API, 50, "the superseding issue")
+        self.as_agent("cos")
+
+    def supersede(self, *ids, by="acme/api#50", extra=()):
+        self.as_agent("cos")
+        return self.main("decisions", "supersede", *ids, "--by", by, *extra)
+
+    def test_issue_decisions_get_a_comment_and_both_labels_off_each_in_one_command(self):
+        code, out, err = self.supersede(self.id_of("one api"), self.id_of("one web"), extra=("--note", "folded in"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(API, 2), ["bug"])
+        self.assertEqual(self.gh.names(WEB, 2), [])
+        self.assertEqual(sorted((c["repo"], c["issue"], c["body"].split("\n")[0]) for c in self.gh.comments),
+                         [(API, 2, "Superseded by acme/api#50: folded in"), (WEB, 2, "Superseded by acme/api#50: folded in")])
+        self.assertEqual(sb.signed_by_fleet(self.gh.comments[0]["body"]), "cos")
+        self.assertEqual(len(out.strip().splitlines()), 2)
+        self.assertTrue(all(": done" in line for line in out.splitlines()), out)
+        self.assertEqual(self.gh.names(API, 50), [], "the superseding issue is not touched")
+
+    def test_the_superseding_issue_may_be_a_url_or_a_short_ref(self):
+        for by in ("https://github.com/acme/api/issues/50", "api#50"):
+            self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos"])
+            self.gh.comments.clear()
+            code, out, err = self.supersede(self.id_of("one api"), by=by)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.gh.comments[0]["body"].split("\n")[0], "Superseded by acme/api#50")
+        for bad in ("50", "nowhere#1", "https://example.com/x"):
+            self.assertEqual(self.supersede("anything", by=bad)[0], 2)
+
+    def test_a_report_is_cleared_by_a_send_from_the_answerer_tagged_with_its_issue(self):
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?", 5)
+        self.world.tick(1)
+        ident = self.id_of("merge or wait?")
+        code, out, err = self.supersede(ident)
+        self.assertEqual(code, 0, err)
+        self.assertIn("done: sent to api-orch", out)
+        text = " ".join(str(a) for a in self.world.admissions("api-orch"))
+        self.assertIn("Superseded by acme/api#50", text)
+        self.assertNotIn("merge or wait?", self.main("decisions", "--fresh", "--tier", "all")[1], "the send cleared it")
+
+    def test_a_report_with_an_issue_that_has_labels_also_loses_them(self):
+        self.gh.issue(API, 5, "five", labels=["bug"])  # carries no awaiting label: removal is quiet
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?", 5)
+        self.world.tick(1)
+        code, out, err = self.supersede(self.id_of("merge or wait?"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("both labels off acme/api#5", out)
+        self.assertEqual(self.gh.names(API, 5), ["bug"])
+
+    def test_a_report_with_no_issue_is_refused_because_a_send_would_clear_every_question(self):
+        self.world.new_engine("cli").report("api-orch", "question", "merge or wait?")
+        self.world.tick(1)
+        code, out, err = self.supersede(self.id_of("merge or wait?"))
+        self.assertEqual(code, 1)
+        self.assertIn("refused: is a report that names no issue", out)
+        self.assertEqual(self.world.admissions("api-orch"), [])
+
+    def test_a_permission_request_and_a_question_are_refused_with_a_pointer_to_answer(self):
+        sid = self.world.sessions["api-coder"]
+        self.world.v2.start_turn(sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_permission(sid, timed=True)
+        code, out, err = self.supersede(self.id_of("shell"))
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"refused: is a permission: answer it with `fleet-switchboard decisions answer ")
+        self.assertEqual(self.world.v2.permission_replies if hasattr(self.world.v2, "permission_replies") else [], [])
+
+    def test_it_carries_on_past_a_failure_reports_each_id_and_exits_non_zero(self):
+        ids = self.id_of("one api"), self.id_of("one web")
+        self.gh.fail_writes = {WEB}  # every write to the web repo fails
+        code, out, err = self.supersede(ids[0], "nope-1", ids[1])
+        lines = out.strip().splitlines()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 3, out)
+        self.assertIn("done", lines[0])
+        self.assertIn("nope-1: refused: no decision nope-1 is waiting", lines[1])
+        self.assertIn("refused", lines[2])
+        self.assertIn("403", lines[2])
+        self.assertEqual(self.gh.names(API, 2), ["bug"], "the first one was done before the others failed")
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+
+    def test_the_same_id_twice_is_done_once(self):
+        ident = self.id_of("one api")
+        code, out, err = self.supersede(ident, ident)
+        self.assertEqual((code, len(out.strip().splitlines()), len(self.gh.comments)), (0, 1, 1))
+
+    def test_only_the_chief_of_staff_or_a_person_may_and_it_is_judged_like_resolve(self):
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "supersede", self.id_of("one api"), "--by", "acme/api#50")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(sb.plain_switchboard_message("fleet-switchboard decisions supersede api-481 web-482 --by api-50"))
+        self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481"))
 
 
 class TestLabelsEnsure(WriteWorld):
