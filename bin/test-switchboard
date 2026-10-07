@@ -20101,11 +20101,39 @@ class TestEscalateAndResolve(WriteWorld):
         self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481 --reason 'costs money'"))
         self.assertTrue(sb.plain_switchboard_message('fleet-switchboard decisions escalate "#2"'))
 
-    def test_a_batch_whose_row_text_has_a_quoted_pipe_is_a_plain_message(self):
-        row = 'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale | close it"'
-        self.assertTrue(sb.plain_switchboard_message(row), "a pipe inside quotes is text: a batch is a plain message")
-        self.assertFalse(sb.plain_switchboard_message(row.replace('"acme/api#7 | stale | close it"', "x | sh")),
-                         "a pipe outside quotes is an operator: judged")
+    def test_a_batch_is_judged_whatever_its_quoting(self):
+        # `decisions batch` writes an issue to GitHub: judged like any write, quoted operators or not.
+        rows = ('fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale | close it"',
+                'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 ; stale ; close it"',
+                "fleet-switchboard decisions batch --title 'Stale' --row 'acme/api#7 | stale | close it'",
+                "fleet-switchboard decisions batch --title 'Stale' --row 'a | b' --row 'c; d'",
+                'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale\n| close it"',
+                "fleet-switchboard decisions --repo acme/api batch --title t --row 'a | b'",
+                "fleet-switchboard decisions batch --title t --file -",
+                "fleet-switchboard decisions batch --title t --file - <<'EOF'\nacme/api#7 | a | b\nEOF",
+                "cat rows | fleet-switchboard decisions batch --title t",
+                'fleet-switchboard decisions batch --title "Stale" --row x | sh')
+        for command in rows:
+            with self.subTest(command=command):
+                self.assertFalse(sb.plain_switchboard_message(command))
+
+    def test_supersede_and_answer_with_quoted_operators_are_judged(self):
+        for command in ('fleet-switchboard decisions supersede api-1 --by "acme/api#7 | x" --note "a; b"',
+                        "fleet-switchboard decisions supersede api-1 --by acme/api#7 --note 'a | b'",
+                        'fleet-switchboard decisions answer api-1 "yes | no; maybe"',
+                        "fleet-switchboard decisions answer api-1 'a | b' --note 'c; d'",
+                        "fleet-switchboard decisions answer api-1 allow --note 'x\ny'"):
+            with self.subTest(command=command):
+                self.assertFalse(sb.plain_switchboard_message(command))
+
+    def test_ordinary_messages_with_quoted_operators_stay_plain(self):
+        for command in ('fleet-switchboard send cos --issue 5 "a | b; c"',
+                        "fleet-switchboard report done 'ran a | b; c'",
+                        "fleet-switchboard comment 5 'x | y'",
+                        'fleet-switchboard decisions escalate api-1 --reason "a | b"'):
+            with self.subTest(command=command):
+                expected = command.split()[1] in sb.POLICY_MESSAGE_COMMANDS or "escalate" in command
+                self.assertEqual(sb.plain_switchboard_message(command), expected)
 
     def test_a_decision_already_yours_is_left_alone(self):
         self.gh.issue(API, 3, "Yours already", labels=["me:awaiting-user"])
