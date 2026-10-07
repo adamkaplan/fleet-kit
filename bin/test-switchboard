@@ -21050,6 +21050,19 @@ class TestPrNotices(DecisionsBase):
         self.notices()
         self.assertEqual([c[0][3] for c in runner.calls[reads:]], ["3", "4"])
 
+    def test_resolve_and_answer_on_a_pr_notice_say_it_is_information(self):
+        self.notify()
+        (entry,) = self.notices()
+        for call in (lambda: sb.resolve_decision(self.world.engine, None, entry, "", None),
+                     lambda: sb.answer_decision(self.world.engine, entry, "yes", "", None)):
+            with self.assertRaises(sb.DecisionError) as ctx:
+                call()
+            text = str(ctx.exception)
+            self.assertIn("PR notice", text)
+            self.assertIn("information", text)
+            self.assertIn("merges or closes", text)
+            self.assertNotIn("report", text)
+
     def test_two_repos_with_one_name_get_distinct_ids(self):
         self.gh.answers[8] = (0, pr_view_json(), "")
         self.notify(repo="acme/api")

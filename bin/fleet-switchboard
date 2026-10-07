@@ -12215,10 +12215,18 @@ def escalate_decision(engine, runner, decision, reason, name):
     return "escalated %s to you: the %s %s is waiting on you" % (ident, decision.get("agent") or "agent", kind)
 
 
+def _refuse_notice(decision):
+    """A PR notice is information: there is nothing to resolve or answer, and it ends when its PR merges or closes."""
+    if decision["kind"] == "notice":
+        raise DecisionError("%s is a PR notice: information, so there is nothing to resolve or answer. It ends when "
+                            "the PR merges or closes" % decision["id"])
+
+
 def resolve_decision(engine, runner, decision, note, name):
     """Take both awaiting labels off the issue. A report is resolved by answering its worker with `send`; its issue's
     labels are the only thing this removes."""
     kind, ident = decision["kind"], decision["id"]
+    _refuse_notice(decision)
     if kind in ("permission", "question"):
         raise DecisionError("%s is a %s: answer it with `%s decisions answer %s ...`" % (ident, kind, PROG, ident))
     target = _issue_target(engine, decision)
@@ -12266,6 +12274,7 @@ def answer_decision(engine, decision, value, note, name):
     """Reply to an agent's pending permission request (`allow` is `once`, `deny` is `reject`) or question (the one
     field of its form), through v2. Audited before and after."""
     kind, ident = decision["kind"], decision["id"]
+    _refuse_notice(decision)
     if kind not in ("permission", "question"):
         raise DecisionError("%s is %s: `decisions answer` is for a permission request or a question. Answer a report "
                             "with `%s send`; an issue with a comment, then `decisions resolve`"
