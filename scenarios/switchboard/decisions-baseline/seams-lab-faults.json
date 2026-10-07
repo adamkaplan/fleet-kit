@@ -1,0 +1,68 @@
+{
+ "bare-issue-number": [
+  {
+   "id": "#2",
+   "kind": "issue",
+   "tier": "cos"
+  },
+  {
+   "id": "#4",
+   "kind": "issue",
+   "tier": "human"
+  },
+  {
+   "id": "#7fa",
+   "kind": "report",
+   "tier": "orchestrator"
+  },
+  {
+   "id": "api-orch-698",
+   "kind": "report",
+   "tier": "cos"
+  }
+ ],
+ "none": [
+  {
+   "id": "api#2",
+   "kind": "issue",
+   "tier": "cos"
+  },
+  {
+   "id": "web#4",
+   "kind": "issue",
+   "tier": "human"
+  },
+  {
+   "id": "api#7fa",
+   "kind": "report",
+   "tier": "orchestrator"
+  },
+  {
+   "id": "api-orch-698",
+   "kind": "report",
+   "tier": "cos"
+  }
+ ],
+ "tier-flat": [
+  {
+   "id": "api#2",
+   "kind": "issue",
+   "tier": "human"
+  },
+  {
+   "id": "web#4",
+   "kind": "issue",
+   "tier": "human"
+  },
+  {
+   "id": "api#7fa",
+   "kind": "report",
+   "tier": "human"
+  },
+  {
+   "id": "api-orch-698",
+   "kind": "report",
+   "tier": "human"
+  }
+ ]
+}
