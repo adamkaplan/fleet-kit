@@ -1128,6 +1128,15 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
+def steers_into_turn(config, observation, carried):
+    """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
+    the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
+    message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
+    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
+    return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
+            and any(fact.kind == "send" and fact.sender and fact.sender == _boss_of(observation) for fact in carried))
+
+
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     """One message for `facts`, oldest first. Returns (text, the facts it carries).
 
@@ -1632,8 +1641,13 @@ class Switchboard:
         message_id = derive_message_id(observation.session_id, keys)
         resume = plan.action == "wake"
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
+        busy = resume and steers_into_turn(self.config, observation, carried)
+        if busy:
+            delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        if busy:
+            detail["busy"] = True
         description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
         detail["description"] = description
         with self._external("v2.synthetic", plan.recipient, detail) as result:
