@@ -12722,7 +12722,7 @@ class TestReportCommand(ReportBase):
 
     def test_every_state_is_known_and_nothing_else_is(self):
         self.assertEqual(sb.REPORT_ATTENTION, ("done", "failed", "blocked", "question"))
-        self.assertEqual(sb.REPORT_PROGRESS, ("working", "paused"))
+        self.assertEqual(sb.REPORT_PROGRESS, ("working", "paused", "withdrawn"))
         code, _, err = self.cli("report", "finished", "--from", "coder", "x")
         self.assertEqual(code, 2)
         self.assertEqual(self.world.admissions("platform"), [])
@@ -13294,6 +13294,94 @@ class TestDecisionDerivation(DecisionsBase):
         (found,) = self.listed()
         self.assertEqual(found["title"], "And which region?")
 
+    def test_a_working_report_leaves_the_question_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("still going", state="working")
+        self.world.add_agent("other", fleet={"reports_to": "platform", "issue": 4})
+        self.ask_the_boss("a different matter?", sender="other")  # a message to the boss carries the rider into its transcript
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["Which database?", "a different matter?"])
+
+    def test_a_blocked_report_leaves_a_question_listed_and_is_itself_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("waiting on the key", state="blocked")
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["Which database?", "blocked: waiting on the key"])
+
+    def test_a_newer_tagged_question_replaces_the_older_one_on_the_same_issue(self):
+        self.ask_the_boss("Which database?", issue=7)
+        self.ask_the_boss("And which region?", issue=7)
+        self.assertEqual([d["title"] for d in self.listed()], ["And which region?"])
+
+    def test_two_untagged_questions_both_stay_listed(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("first thing?", sender="loner")
+        self.ask_the_boss("second thing?", sender="loner")
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["first thing?", "second thing?"])
+
+    def test_an_untagged_done_clears_an_untagged_question(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("first thing?", sender="loner")
+        self.ask_the_boss("finished", state="done", sender="loner")
+        self.assertEqual(self.listed(), [])
+
+    def test_withdrawn_clears_the_question_on_the_same_ask_by_the_next_pass(self):
+        self.ask_the_boss("Which database?")
+        self.assertEqual(len(self.listed()), 1)
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.assertEqual(self.listed(), [])
+
+    def test_withdrawn_is_a_rider_that_never_wakes_the_boss(self):
+        self.ask_the_boss("Which database?")
+        out = self.world.new_engine("cli").report("coder", "withdrawn", "superseded")
+        self.assertEqual(out["action"], "rider")
+
+    def test_a_withdrawn_on_another_ask_leaves_the_question_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn", issue=9)
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_withdrawn_all_clears_every_open_question_of_the_worker_only(self):
+        self.world.add_agent("other", fleet={"reports_to": "platform", "issue": 4})
+        self.ask_the_boss("Which database?", issue=7)
+        self.ask_the_boss("blocked here", state="blocked", issue=8)
+        self.ask_the_boss("not mine", sender="other")
+        self.world.new_engine("cli").report("coder", "withdrawn", "all superseded", everything=True)
+        self.world.tick(1)
+        self.assertEqual([d["agent"] for d in self.listed()], ["other"])
+
+    def test_a_question_after_the_withdrawal_is_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.ask_the_boss("Which region?")
+        self.assertEqual([d["title"] for d in self.listed()], ["Which region?"])
+
+    def test_an_untagged_withdrawn_clears_the_workers_untagged_questions(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("one?", sender="loner")
+        self.ask_the_boss("two?", sender="loner")
+        self.ask_the_boss("both superseded", state="withdrawn", sender="loner")
+        self.assertEqual(self.listed(), [])
+
+    def test_a_withdrawal_older_than_the_rider_age_still_hides_its_question_and_is_still_carried(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.world.tick(sb.validate_config({})["rider_max_age_seconds"] * 2)
+        self.assertEqual(self.listed(), [])
+        engine = self.world.new_engine("cli")
+        self.assertEqual(sb.prune_report_riders(engine, engine.discover(engine.now())), [])
+        riders = engine.pending("platform")["riders"]
+        self.assertEqual([r["summary"] for r in riders], ["withdrawn: superseded"])
+
+    def test_an_old_working_rider_is_still_pruned(self):
+        self.ask_the_boss("still going", state="working")
+        self.world.tick(sb.validate_config({})["rider_max_age_seconds"] * 2)
+        engine = self.world.new_engine("cli")
+        self.assertEqual(len(sb.prune_report_riders(engine, engine.discover(engine.now()))), 1)
+        self.assertEqual(engine.pending("platform")["riders"], [])
+
+    def test_all_is_refused_for_any_other_state(self):
+        with self.assertRaises(sb.ReportError):
+            self.world.new_engine("cli").report("coder", "question", "x?", everything=True)
+
     def test_a_report_on_another_ask_does_not_resolve_a_question(self):
         self.ask_the_boss("Which database?")
         self.ask_the_boss("done with the other one", state="done", issue=9)
@@ -13440,6 +13528,14 @@ class TestDecisionsFile(DecisionsBase):
         self.assertEqual([d["title"] for d in body["decisions"]], ["Which database?"])
 
     def test_an_empty_list_is_still_written(self):
+        self.pass_()
+        self.assertEqual(self.file()["decisions"], [])
+
+    def test_a_withdrawn_question_is_gone_from_the_file_at_the_next_pass(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+        self.ask_the_boss("superseded", state="withdrawn")
         self.pass_()
         self.assertEqual(self.file()["decisions"], [])
 
@@ -16064,6 +16160,73 @@ class InstallCase(Base):
         return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-switchboard.service"
 
 
+class TestTodolistPlugin(Base):
+    """The vendored todo plugin: src/ copied beside a one-line loader in plugins/, temp config dirs only."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.home / "cfg"
+        self.src = REPO / "plugins" / "opencode-todolist" / "src"
+        self.loader = self.config / "plugins" / "opencode-todolist.ts"
+
+    def test_a_fresh_install_copies_every_src_file_byte_for_byte_and_writes_the_loader(self):
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        files = [p for p in self.src.rglob("*") if p.is_file()]
+        self.assertTrue(files)
+        for path in files:
+            self.assertEqual((self.config / "opencode-todolist" / path.relative_to(self.src)).read_bytes(), path.read_bytes())
+        self.assertEqual(self.loader.read_text(), 'export { default } from "../opencode-todolist/src/index.ts"\n')
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_a_second_run_changes_nothing(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        before = tree_of(self.config)
+        self.assertFalse(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(tree_of(self.config), before)
+
+    def test_a_loader_the_kit_did_not_write_is_not_overwritten(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_a_src_file_the_kit_did_not_write_is_not_overwritten(self):
+        (self.config / "opencode-todolist").mkdir(parents=True)
+        (self.config / "opencode-todolist" / "index.ts").write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual((self.config / "opencode-todolist" / "index.ts").read_text(), "// mine\n")
+        self.assertFalse(self.loader.exists())
+
+    def test_status_says_differs_from_the_kit_after_an_edit_and_a_rerun_restores_it(self):
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "not installed")
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "differs from the kit")
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_uninstall_removes_only_what_the_kit_wrote(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        (self.config / "plugins" / "other.js").write_text("x")
+        self.assertTrue(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse(self.loader.exists())
+        self.assertEqual(sorted(p.name for p in (self.config / "opencode-todolist").iterdir()), ["todos.ts"])
+        self.assertTrue((self.config / "plugins" / "other.js").exists())
+        (self.config / "opencode-todolist" / "todos.ts").unlink()
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_uninstall_of_a_foreign_loader_leaves_it(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+
+
 class TestInstall(InstallCase):
     def full(self, *flags, **kw):
         return self.install("--opencode", self.machine.binary, *flags, **kw)
@@ -16073,7 +16236,7 @@ class TestInstall(InstallCase):
         self.assertIsNone(error)
         steps = self.statuses(out)
         for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "herdr plugin", "service", "daemon"):
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service", "daemon"):
             self.assertIn(name, steps, "%s: no line in\n%s" % (name, out))
         self.assertEqual(steps["config"], ["done"])
         self.assertIn("STATUS", out, "the last step prints status")
@@ -16131,8 +16294,10 @@ class TestInstall(InstallCase):
         self.assertEqual(tree_of(self.home), before)
         steps = self.statuses(out)
         for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "herdr plugin", "service"):
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service"):
             self.assertIn(name, steps, name)
+        self.assertEqual(steps["todolist plugin"], ["would be done"])
+        self.assertFalse((self.profile / "opencode-todolist").exists())
         self.assertEqual(steps["config"], ["would be done"])
         run = [c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"] or c[0] in ("launchctl",) and c[1] != "print"]
         self.assertEqual(run, [], "a dry run starts and loads nothing")
@@ -16178,7 +16343,7 @@ class TestInstall(InstallCase):
         self.assertEqual([c for c in self.machine.calls[calls:] if c[:3] == ["herdr", "plugin", "unlink"]
                           or c[:2] == ["launchctl", "bootout"]], [])
         steps = self.statuses(out)
-        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "wrapper", "service"):
+        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "todolist plugin", "wrapper", "service"):
             self.assertEqual(steps[name][-1], "would be done", name)
 
     def test_uninstall_keeps_what_the_user_added_or_edited(self):

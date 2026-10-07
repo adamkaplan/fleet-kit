@@ -38,7 +38,7 @@ charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to th
 assignment; they never widen it, and a report is held to the ask's Done when as
 well as to `DONE`. Messages to the orchestrator go with
 `fleet-switchboard send <name> --issue <n> "<text>"`, never by typing into a pane; reports
-go with `fleet-switchboard report <done|failed|blocked|question|working|paused> [--issue <n>]
+go with `fleet-switchboard report <done|failed|blocked|question|working|paused|withdrawn> [--issue <n>]
 "one line"` (at most 300 characters; detail goes on GitHub). Report at real deliverables, state
 changes and failures; the final report names the result and its evidence link, then stop. After
 `blocked` or `question`, end the turn at once. A worker that stops without reporting is nudged
@@ -51,6 +51,7 @@ the report, and do not repeat "I am still waiting" in later replies; the boss's 
 answers it. A decision goes up a tier at a time: a worker's to its orchestrator, an orchestrator's to
 the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
+If a question is superseded, take it back with `report withdrawn [--issue <n>] [--all]`.
 
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
