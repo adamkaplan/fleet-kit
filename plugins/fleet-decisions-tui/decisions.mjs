@@ -10,6 +10,7 @@ export const DECISIONS_FILE = "decisions.json"
 export const STALE_MS = 120_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
+export const LONG_WAIT_SECONDS = 3600  // a decision waiting longer than this is "over 1h" (the CLI's status line counts the same way)
 export const HEADLINE_LINES = 2       // lines of one entry's headline
 export const ROW_LINES = 2            // lines of one row of a batch (`short-ref: recommendation`)
 export const FACTS_LINES = 3          // lines of a heads-up's facts line (it wraps at ROW_WIDTH)
@@ -212,8 +213,17 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
   }
   return {
     title: `Decisions (${shown.length}) ${view.label}`, groups, rows,
-    sections: sections.map((x) => ({ key: x.key, title: `${x.label} (${x.list.length})`, count: x.list.length, groups: groupsOf(x.list) })),
+    sections: sections.map((x) => ({
+      key: x.key, count: x.list.length, groups: groupsOf(x.list),
+      // what waits on cos shows how many have waited over an hour: the queue that must not pile up
+      title: x.key === "cos" ? `${x.label} (${x.list.length}, ${overLongWait(x.list, nowMs)} over 1h)` : `${x.label} (${x.list.length})`,
+    })),
   }
+}
+
+// How many of `list` have waited longer than LONG_WAIT_SECONDS at `nowMs`; one with no readable time is not counted.
+export function overLongWait(list, nowMs) {
+  return list.filter((d) => { const t = Date.parse(d.since); return !Number.isNaN(t) && (nowMs - t) / 1000 > LONG_WAIT_SECONDS }).length
 }
 
 // Whether the view has a Heads-up section (then an empty "Waits on you" says none, not nothing).

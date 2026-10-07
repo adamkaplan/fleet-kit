@@ -4833,6 +4833,14 @@ def format_age(seconds):
 
 
 DECISION_TIERS = ("cos", "human", "orchestrator")
+DECISION_LONG_WAIT = 3600   # seconds: a decision waiting longer is "over 1h" (the panel's LONG_WAIT_SECONDS; a test keeps them equal)
+
+
+def count_over_an_hour(decisions, now):
+    """How many of `decisions` have waited longer than DECISION_LONG_WAIT at `now` (one with no readable time is
+    not counted). The one place that decides it: the status line uses it."""
+    waited = (parse_iso(d.get("since")) for d in decisions)
+    return sum(1 for since in waited if since is not None and now - since > DECISION_LONG_WAIT)
 
 
 def decisions_view(fleet, config, repo=None, tier=None):
@@ -4993,6 +5001,7 @@ def decisions_summary(state_dir, now):
     report = decisions_report(state_dir, now())
     by_repo, by_tier = {}, {}
     listed = [d for d in report["decisions"] if d.get("kind") != "notice"]  # a PR notice is information, not a decision
+    over_cos = count_over_an_hour([d for d in listed if d.get("tier", "human") == "cos"], now())
     for decision in listed:
         tier = decision.get("tier", "human")
         by_tier[tier] = by_tier.get(tier, 0) + 1
@@ -5000,7 +5009,7 @@ def decisions_summary(state_dir, now):
             by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(listed), "stale": report["stale"], "message": report["message"],
             "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo,
-            "by_tier": by_tier}
+            "by_tier": by_tier, "cos_over_an_hour": over_cos}
 
 
 def format_decisions_status(summary):
@@ -5015,8 +5024,9 @@ def format_decisions_status(summary):
             yours, ", ".join("%s %d" % (repo, count) for repo, count in sorted(by_repo.items())), PROG)
     elsewhere = {tier: count for tier, count in tiers.items() if tier != "human"}
     if elsewhere:
-        line += "; also open: %s" % ", ".join("%d with %s" % (count, "the Chief of Staff" if tier == "cos" else
-                                                                "an orchestrator") for tier, count in sorted(elsewhere.items()))
+        line += "; also open: %s" % ", ".join(
+            "%d with the Chief of Staff (%d over 1h)" % (count, summary.get("cos_over_an_hour", 0)) if tier == "cos"
+            else "%d with an orchestrator" % count for tier, count in sorted(elsewhere.items()))
     return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
 
 

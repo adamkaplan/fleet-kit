@@ -13988,6 +13988,10 @@ results.batchLines = d.viewLines(d.buildView({ status: "ok", errors: [], decisio
   { id: "api#101", repo: "acme/api", title: "Cleanup", headline: "Cleanup of stale issues (2 rows)", since: iso(now - 7200000), tier: "cos",
     rows: [{ text: "web#7: close it" }, { text: "web#9: close as duplicate of web#7 and also label the other issue" }] } ] }, now, 34,
   { kind: "all", repo: null, label: "all" }));
+const cosAge = (id, mins) => ({ id, repo: "acme/api", title: id, tier: "cos", since: iso(now - mins * 60000) });
+results.overTitles = d.buildView({ status: "ok", errors: [], decisions: [cosAge("a#1", 59), cosAge("a#2", 60), cosAge("a#3", 61),
+  cosAge("a#4", 300), { id: "a#5", title: "x", tier: "cos", since: "junk" }] }, now, 34, { kind: "all", repo: null, label: "all" }).sections.map((x) => x.title);
+results.longWait = d.LONG_WAIT_SECONDS;
 results.oneLine = [d.oneLine("a\n b\t c", 20), d.oneLine("x".repeat(50), 10), d.oneLine(undefined, 5)];
 results.until = [d.msUntilStale({ status: "ok", ageMs: 100000 }), d.msUntilStale({ status: "ok", ageMs: 0 }), d.msUntilStale({ status: "stale", ageMs: 1 })];
 results.concerns = [d.concernsFile("decisions.json"), d.concernsFile("decisions.json.123.tmp"), d.concernsFile("audit.jsonl"), d.concernsFile(null), d.concernsFile(undefined)];
@@ -14043,6 +14047,11 @@ class TestDecisionsPlugin(Base):
         for entry in (first, second):
             for line in entry["lines"] + [entry["head"]]:
                 self.assertLessEqual(len(line), 34)
+
+    def test_the_cos_header_counts_what_has_waited_over_an_hour_and_the_threshold_is_the_clis(self):
+        self.assertEqual(self.r["overTitles"], ["Waits on you (0)", "Waits on cos (5, 2 over 1h)"])
+        self.assertEqual(self.r["longWait"], sb.DECISION_LONG_WAIT)
+        self.assertEqual(sb.DECISION_LONG_WAIT, 3600)
 
     def test_a_batch_is_one_entry_the_headline_then_a_line_per_row_then_the_id_and_age(self):
         lines = self.r["batchLines"]
@@ -19673,7 +19682,16 @@ class TestDecisionViews(TierWorld):
         self.assertEqual(report["decisions"]["by_tier"], {"cos": 2, "orchestrator": 1})
         text = sb.format_status(report)
         self.assertIn("0 waiting on you", text)
-        self.assertIn("also open: 2 with the Chief of Staff, 1 with an orchestrator", text)
+        self.assertIn("also open: 2 with the Chief of Staff (0 over 1h), 1 with an orchestrator", text)
+
+    def test_the_status_line_counts_the_cos_tier_over_an_hour_by_the_same_rule_as_the_panel(self):
+        now = self.world.clock.now()
+        waited = lambda minutes, tier="cos": {"id": "x", "tier": tier, "since": sb.iso(now - minutes * 60)}
+        decisions = [waited(59), waited(60), waited(61), waited(300), {"id": "j", "tier": "cos", "since": "junk"}]
+        self.assertEqual(sb.count_over_an_hour(decisions, now), 2, "longer than an hour: 60 minutes exactly is not")
+        text = sb.format_decisions_status({"stale": False, "count": 3, "by_tier": {"cos": 3}, "by_repo": {},
+                                           "errors": 0, "cos_over_an_hour": 2})
+        self.assertIn("also open: 3 with the Chief of Staff (2 over 1h)", "\n".join(text))
 
     def test_the_view_function_alone(self):
         config = {}
@@ -21086,7 +21104,7 @@ class TestDecisionsPanelLayout(Base):
         self.r = json.loads(done.stdout.strip().splitlines()[-1])
 
     def test_what_waits_on_you_comes_first_then_what_waits_on_cos_each_grouped_by_repo(self):
-        self.assertEqual(self.r["cosTitles"], ["Waits on you (4)", "Waits on cos (1)", "Waits on orchestrator (1)"])
+        self.assertEqual(self.r["cosTitles"], ["Waits on you (4)", "Waits on cos (1, 0 over 1h)", "Waits on orchestrator (1)"])
         you, cos, orch = self.r["cosKeys"]
         self.assertEqual(you, [["acme/api", ["api#2"]], ["acme/old", ["old#1"]], ["acme/web", ["web#7", "web#8"]]])
         self.assertEqual(cos, [["acme/web", ["web#5"]]])
@@ -21114,7 +21132,7 @@ class TestDecisionsPanelLayout(Base):
         self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
         at = lines.index(thin)
         self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
-        self.assertEqual(lines.index("Waits on cos (1)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("web#8 5m")))
         self.assertTrue(all(len(x) <= 34 for x in lines))
 
     def test_the_tui_draws_the_sections_and_the_rules(self):
@@ -21514,7 +21532,7 @@ class TestHeadsUpPanelLayout(Base):
         self.r = json.loads(done.stdout.strip().splitlines()[-1])
 
     def test_heads_up_follows_waits_on_you_and_comes_before_waits_on_cos(self):
-        self.assertEqual([t for t, _ in self.r["cos"]], ["Waits on you (1)", "Heads-up (3)", "Waits on cos (1)"])
+        self.assertEqual([t for t, _ in self.r["cos"]], ["Waits on you (1)", "Heads-up (3)", "Waits on cos (1, 0 over 1h)"])
         self.assertEqual([t for t, _ in self.r["human"]], ["Waits on you (1)", "Heads-up (3)"])
 
     def test_notices_are_never_in_the_decisions_count_or_under_waits_on_you(self):
