@@ -13265,6 +13265,98 @@ class TestDecisionDerivation(DecisionsBase):
         self.world.tick(1)
         self.assertEqual(self.listed(), [])
 
+    def test_a_send_waiting_in_the_workers_inbox_already_resolves_the_report(self):
+        # The bug on #43: a send to a worker that a person is engaged with is `delivered` as a note and waits in
+        # v2's inbox; it is in no transcript until the worker's next turn, so the question stayed listed.
+        for n in range(2, 15):
+            self.ask_the_boss("question %d?" % n, issue=n)
+        self.assertEqual(len(self.listed()), 13)       # primes the synthetic cache, as the daemon's passes do
+        self.world.you("coder")
+        engine = self.world.new_engine("cli")
+        outcomes = [engine.send("platform", "coder", "answer %d" % n, n) for n in range(2, 15)]
+        self.assertEqual({(o["sent"], o["action"]) for o in outcomes}, {(True, "note")})
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["coder"]]["inbox"]), 13)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [])
+
+    def test_a_note_in_the_inbox_and_then_in_the_transcript_is_counted_once(self):
+        self.ask_the_boss("Which database?", issue=2)
+        self.world.you("coder")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [], "waiting in the inbox: answered")
+        self.world.v2.start_turn(self.world.sessions["coder"], "next", fleet=False)
+        self.world.tick(400)
+        self.assertEqual(self.listed(), [], "consumed into the transcript: still answered, and nothing listed twice")
+
+    def test_a_report_waiting_in_the_bosss_inbox_is_listed_once_the_boss_has_it_not_before(self):
+        self.world.add_agent("scout", fleet={"reports_to": "platform", "issue": 4})
+        self.world.you("platform")                      # the boss is engaged: a report to it is a note
+        self.ask_the_boss("is it fine?", sender="scout", issue=4)
+        self.assertEqual(len(self.world.v2.sessions[self.world.sessions["platform"]]["inbox"]), 1)
+        self.assertEqual(self.listed(), [], "documented: a note still in the inbox is not yet delivered")
+        self.world.v2.start_turn(self.world.sessions["platform"], "next", fleet=False)
+        self.world.tick(400)
+        self.assertEqual([d["title"] for d in self.listed()], ["is it fine?"])
+
+    def test_the_real_tag_forms_of_a_send_match_and_name_the_same_repo(self):
+        repos = ["acme-org/acme-platform", "acme-org/other"]
+        for tag in ("acme-platform#294", "acme-org/acme-platform#294"):
+            line = "- send from cos (issue %s): use postgres" % tag
+            match = sb.SEND_LINE.match(line)
+            self.assertIsNotNone(match, line)
+            self.assertEqual((match.group(1), int(match.group(3))), ("cos", 294))
+            self.assertEqual(sb.repo_of_tag(match.group(2), repos), "acme-org/acme-platform", tag)
+        report = sb.REPORT_LINE.match("- report from acme-platform (issue acme-platform#294): question: which db?")
+        self.assertEqual(sb.repo_of_tag(report.group(2), repos), "acme-org/acme-platform")
+
+    def test_report_answered_takes_both_tag_forms_and_refuses_a_send_for_another_ask_or_repo(self):
+        repo = "acme-org/acme-platform"
+        worker = types.SimpleNamespace(name="worker", problem=None, session_id="ses_w")
+        engine = types.SimpleNamespace(discovery=types.SimpleNamespace(agents={"worker": worker}))
+        report = {"at": (100.0, 0), "sender": "worker", "boss": "cos", "issue": 294, "repo": repo, "state": "question",
+                  "text": "q"}
+        cases = (("- send from cos (issue acme-platform#294): a", True),
+                 ("- send from cos (issue acme-org/acme-platform#294): a", True),
+                 ("- send from cos: untagged counts for any ask", True),
+                 ("- send from cos (issue acme-platform#295): another ask", False),
+                 ("- send from cos (issue other#294): another repo", False),
+                 ("- send from someone (issue acme-platform#294): not the boss", False))
+        with mock.patch.object(sb, "decision_repos", return_value=[repo, "acme-org/other"]):
+            for line, answers in cases:
+                with self.subTest(line=line):
+                    sends = {"worker": [(200.0, "msg_1", 0, line)]}
+                    self.assertEqual(sb.report_answered(engine, report, [report], 0, sends), answers)
+            old = {"worker": [(50.0, "msg_1", 0, cases[0][0])]}
+            self.assertFalse(sb.report_answered(engine, report, [report], 0, old), "a send older than the report")
+
+    def test_the_synthetic_cache_follows_the_newest_message_so_a_new_send_is_seen_at_once(self):
+        self.ask_the_boss("Which database?", issue=7)
+        platform = self.world.sessions["platform"]
+        self.assertEqual(len(self.listed()), 1)
+        first = sb.synthetic_lines(self.world.engine, platform, 0)
+        pages = lambda: [a for a in self.world.v2.calls if a[2:3] == ["session.message.list"]]
+        before = len(pages())
+        self.assertEqual(sb.synthetic_lines(self.world.engine, platform, 0), first)
+        self.assertEqual(len(pages()) - before, 1, "nothing new: one small read of the newest id, then the cache")
+        self.ask_the_boss("And which region?", issue=8)
+        again = sb.synthetic_lines(self.world.engine, platform, 0)
+        self.assertTrue(any("And which region?" in line[3] for line in again), "a newer synthetic changes the newest id and is read")
+        self.assertFalse(any("And which region?" in line[3] for line in first))
+
+    def test_fresh_says_for_an_open_report_the_newest_send_it_looked_at_or_that_there_was_none(self):
+        self.ask_the_boss("Which database?", issue=2)
+        (found,) = self.listed()
+        self.assertRegex(found["considered"], r"^no send from platform to coder in the last [0-9.]+ hours$")
+        self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)
+        self.world.tick(1)
+        (found,) = self.listed()
+        self.assertRegex(found["considered"], r"^newest send from platform to coder: \S+, #9, tagged #9, not this ask$")
+        report = {"stale": False, "message": None, "decisions": [found], "errors": [], "fresh": True}
+        self.assertIn("      newest send from platform", sb.format_decisions(report, self.world.clock.now()))
+        report.pop("fresh")
+        self.assertNotIn("newest send", sb.format_decisions(report, self.world.clock.now()))
+
     def test_a_send_about_another_ask_does_not_resolve_it(self):
         self.ask_the_boss("Which database?")
         self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)

@@ -4179,9 +4179,37 @@ def prune_escalated(state_dir, pending):
             write_escalated(state_dir, kept)
 
 
-def synthetic_lines(engine, session_id, since):
+def synthetic_lines(engine, session_id, since, waiting=False):
     """The lines of a session's synthetic messages since `since`: [(created, message id, line number, line)],
-    newest message first. The one read of what a message said, shared by both report checks."""
+    newest message first. The one read of what a message said, shared by both report checks.
+
+    `waiting` (the worker's side: the sends that answer a report) adds the notes still in v2's inbox, first. A note
+    delivered to a session that is busy or engaged with a person waits there and is in no transcript until its
+    next turn: it counts as delivered, as everywhere else (`_fleet_keys`), or a report answered by such a send would
+    stay open. The inbox is read every time (one small read; it is not in the cache, because it changes without the
+    transcript's newest id changing). The boss's side (the reports) stays the transcript's: a report is listed once
+    the boss has it."""
+    found = transcript_lines(engine, session_id, since)
+    if not waiting:
+        return found
+    try:
+        inbox = engine.v2.inbox_list(session_id)
+    except V2Error:
+        return found  # an inbox that cannot be read leaves the transcript's lines, as before
+    have = {line[1] for line in found}
+    waiting = []
+    for item in inbox if isinstance(inbox, list) else []:
+        payload = item.get("payload") if isinstance(item, dict) and isinstance(item.get("payload"), dict) else {}
+        created = _created(item) if isinstance(item, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "synthetic" or item.get("id") in have \
+                or created is None or created < since or not isinstance(payload.get("text"), str):
+            continue
+        waiting.extend((created, item.get("id"), number, line) for number, line in enumerate(payload["text"].splitlines()))
+    return sorted(waiting, key=lambda line: -line[0]) + found
+
+
+def transcript_lines(engine, session_id, since):
+    """The transcript's synthetic lines since `since`, newest message first (cached by the newest synthetic id)."""
     newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
     newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
     cached = engine.synthetic_cache.get(session_id)
@@ -4252,12 +4280,41 @@ def decisions_from_reports(engine, now):
             if not fault("decision-resolves-never") and report_answered(engine, report, reports, since, sends):
                 continue
             title = report["text"] if report["state"] == "question" else "%s: %s" % (report["state"], report["text"])
+            considered = considered_send(engine, report, repos, since, sends)
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": "orchestrator" if above else "cos",
                           "since": report["at"][0], "bare": False,
-                          "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1])})
+                          "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
+                          "considered": considered})
     return items, problems
+
+
+def considered_send(engine, report, repos, since, sends):
+    """One line saying, for a report still open, the newest send from its boss to its worker that the check looked
+    at and why it did not answer, or that there was none (`decisions --fresh` prints it). Stable from pass to pass,
+    so it never rewrites decisions.json by itself."""
+    worker = engine.discovery.agents[report["sender"]]
+    if worker.name not in sends:
+        sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
+    newest = None
+    for created, _, _, line in sends[worker.name]:
+        match = SEND_LINE.match(line)
+        if match and match.group(1) == report["boss"] and (newest is None or created > newest[0]):
+            newest = (created, match)
+    who = "%s to %s" % (report["boss"], worker.name)
+    if newest is None:
+        return "no send from %s in the last %g hours" % (who, engine.config["decisions_lookback_hours"])
+    created, match = newest
+    tag = "%s#%s" % (match.group(2) or "", match.group(3)) if match.group(3) else "no issue"
+    if created <= report["at"][0]:
+        why = "older than this report"
+    elif match.group(3) and (int(match.group(3)) != report["issue"]
+                             or repo_of_tag(match.group(2), repos) not in (None, report["repo"])):
+        why = "tagged %s, not this ask" % tag
+    else:
+        why = "should answer it"
+    return "newest send from %s: %s, %s, %s" % (who, iso(created), tag, why)
 
 
 def report_answered(engine, report, reports, since, sends):
@@ -4279,7 +4336,7 @@ def report_answered(engine, report, reports, since, sends):
     if worker.problem:
         raise RuntimeError("cannot read what %s was sent: %s" % (worker.name, worker.problem))
     if worker.name not in sends:
-        sends[worker.name] = synthetic_lines(engine, worker.session_id, since)
+        sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
     for created, _, _, line in sends[worker.name]:
         match = SEND_LINE.match(line)
         if match and match.group(1) == report["boss"] and created > report["at"][0] \
@@ -4728,6 +4785,8 @@ def derive_decisions(engine, now):
                 decision["raised_by"] = item["raised_by"]
         if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
             decision["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
+        if item.get("considered"):
+            decision["considered"] = item["considered"]
         if item.get("request"):
             decision.update(session=item["session"], request=item["request"])
         decisions.append(decision)
@@ -4895,6 +4954,9 @@ def format_decisions(report, now, view=None):
                                                       format_age(now - since) if since is not None else "?",
                                                       tier, agent.ljust(width_agent), decision["title"]))
         lines = [line.rstrip() for line in lines]
+        if report.get("fresh"):  # --fresh says, for an open report, which send it looked at (or that there was none)
+            lines = [line for pair in zip(lines, [("      " + d["considered"]) if d.get("considered") else None
+                                                   for d in decisions]) for line in pair if line is not None]
     lines.extend("(could not read %s: %s)" % (e.get("source"), e.get("error")) for e in report["errors"])
     if view is not None:
         lines.insert(0, "Decisions: %s" % view["text"])
@@ -4921,7 +4983,7 @@ def fresh_decisions(runner, now):
     """`decisions --fresh`: derive the list in this process, read-only, and write nothing."""
     _, decisions, errors = fresh_engine_decisions(runner, now)
     return {"stale": False, "message": None, "age_seconds": 0, "written_at": iso(now()), "generation": None,
-            "decisions": decisions, "errors": errors}
+            "decisions": decisions, "errors": errors, "fresh": True}
 
 
 def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clear=False, view=None):
