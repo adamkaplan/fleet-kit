@@ -1785,7 +1785,8 @@ the one the command just saw.
 "Judged" means what it means for every shell command: the policy judge reads the
 command before it runs, against the Chief of Staff's orders (below). The skip
 list of PR 11 (a plain `send`, `intent`, ... is the agents' own channel, not
-judged) does **not** cover `resolve`, `answer` and `supersede`; it does cover `decisions` with
+judged) does **not** cover `resolve`, `answer`, `supersede` and `batch` (a batch writes an issue to GitHub, so it is judged
+however its quoted rows are written, a quoted pipe or semicolon included); it does cover `decisions` with
 no subcommand, `decisions list`, `decisions escalate` and `orders --cos`. The
 judge's question would be blind to a bare id, so for a judged `answer`,
 `resolve` or `supersede` it is given one more line, read from `decisions.json`: what the
