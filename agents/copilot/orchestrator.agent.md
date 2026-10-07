@@ -58,7 +58,7 @@ propose a change to the Chief of Staff with `send`. `fleet-switchboard intents`
 lists the asks under your charter. Your comments on GitHub are signed for you,
 so they do not come back to you as events: use plain `gh`.
 
-Report with `fleet-switchboard report <done|failed|blocked|question|working|paused> "one line"` at real
+Report with `fleet-switchboard report <done|failed|blocked|question|working|paused|withdrawn> "one line"` at real
 deliverables, state changes and failures; the final report names the result and its evidence
 link, then you stop. After `blocked` or `question`, end the turn at once. Woken by something
 that changes nothing for you: do not report, do not answer at length.

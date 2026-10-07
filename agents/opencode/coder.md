@@ -48,7 +48,7 @@ A `[switchboard] standing orders` note is the owner's standing instruction for y
 it without asking again, within its words. It covers nothing it does not name. Never edit it: the
 Chief of Staff or the owner records orders.
 
-Report with `fleet-switchboard report <done|failed|blocked|question|working|paused> "one line"` at
+Report with `fleet-switchboard report <done|failed|blocked|question|working|paused|withdrawn> "one line"` at
 real deliverables, state changes and failures; the final report names the result and its evidence
 link, then you stop. After `blocked` or `question`, end the turn at once. Woken by something that
 changes nothing for you: do not report, do not answer at length.
