@@ -534,8 +534,14 @@ class V2Client:
         for number in range(max_pages):
             page, found = self.message_page(session_id, limit, type, cursor)
             ids = [m.get("id") for m in page if isinstance(m, dict)]
-            if number and (not page or any(i in seen for i in ids)):
-                raise V2Error("bad_json", None, "session.message.list: the next page was empty or repeated "
+            if number and not page:
+                # v2 names a `next` cursor even when the page it just gave held the whole listing (measured:
+                # 104 messages at limit 200); following it answers an empty page. That is the end, not a
+                # cursor that fails to walk older.
+                yield [], False
+                return
+            if number and any(i in seen for i in ids):
+                raise V2Error("bad_json", None, "session.message.list: the next page repeated "
                                                 "a message; the cursor does not walk older as assumed")
             seen.update(ids)
             cursor = found.get("next") if found else None

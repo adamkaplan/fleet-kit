@@ -6344,6 +6344,28 @@ class TestV2ClientBigReply(Base):
         client = sb.V2Client("/opt/lab/bin/opencode", {}, PipeTruncatingRunner(payload), 7)
         self.assertEqual(client.message_list(SES), [{"id": "msg_001"}])
 
+    def test_an_empty_continuation_is_the_end_of_the_listing_not_an_error(self):
+        # Measured on a real 104-message transcript read with limit 200: v2 names a `next` cursor even
+        # though that page held everything, and following it answers an empty page. That is the end.
+        # It used to raise bad_json ("the cursor does not walk older as assumed"), so the decisions
+        # list could never read the reports that wait on you.
+        def route(argv):
+            if "cursor=c1" in argv:
+                return (0, json.dumps({"data": [], "cursor": {"next": None, "previous": None}}), "")
+            return (0, json.dumps({"data": [{"id": "msg_001"}, {"id": "msg_002"}],
+                                   "cursor": {"next": "c1", "previous": None}}), "")
+        client = sb.V2Client("/opt/lab/bin/opencode", {}, FakeRunner(route=route), 7)
+        pages = list(client.message_pages(SES, 200, "synthetic", max_pages=6))
+        self.assertEqual([[m["id"] for m in page] for page, _ in pages], [["msg_001", "msg_002"], []])
+        self.assertIs(pages[-1][1], False)  # the walk says it is over, so no caller holds on "more"
+
+    def test_a_continuation_that_repeats_a_message_is_still_an_error(self):
+        def route(argv):
+            return (0, json.dumps({"data": [{"id": "msg_001"}], "cursor": {"next": "c1", "previous": None}}), "")
+        client = sb.V2Client("/opt/lab/bin/opencode", {}, FakeRunner(route=route), 7)
+        with self.assertRaises(sb.V2Error):
+            list(client.message_pages(SES, 200, "synthetic", max_pages=6))
+
 
 class TestUnreachableToast(PR4Base):
     def close_before_the_recheck(self):
