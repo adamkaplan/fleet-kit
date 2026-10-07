@@ -478,10 +478,13 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard send [--interrupt] <name> --issue <n> <text>` | Any agent; `--interrupt` only a boss to its own worker | Delivers to another agent by the delivery rule, without batching (a boss's send to a working agent is steered into its turn). `--interrupt` aborts the recipient's running turn first (stop and hold orders). `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working`, `paused` and `withdrawn` are riders: kept until a message carries them, never waking. `withdrawn` takes back your open `question` or `blocked` report on the ask (`--all`: on every ask) once it is superseded, and the Decisions list drops it at the next daemon pass; plain `working`, `paused` and `blocked` do not answer a question. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
-| `fleet-switchboard decisions [list] [--repo OWNER/REPO] [--tier cos\|human\|orchestrator\|all] [--json] [--fresh] [--watch]` | You, or any agent (PR 14; views PR 18) | The open decisions in the caller's view, one line each, the first line saying which view it is: `#2a  waiting 12m  platform  Close #2? and a second deploy run?` (a view that mixes tiers adds each row's `[tier]`). The Chief of Staff sees every repo and tier by default, an orchestrator its own repo, anyone else the human tier; the flags override. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `view`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty human view prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
+| `fleet-switchboard decisions [list] [--repo OWNER/REPO] [--tier cos\|human\|orchestrator\|all] [--json] [--fresh] [--watch]` | You, or any agent (PR 14; views PR 18) | The open decisions in the caller's view, one line each, the first line saying which view it is: `#2a  waiting 12m  platform  Close #2? and a second deploy run?` (a view that mixes tiers adds each row's `[tier]`). The Chief of Staff sees every repo and tier by default, an orchestrator its own repo, anyone else the human tier; the flags override. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing, and prints under each open report the newest send from its boss to its worker that the check considered and why it did not answer (`considered` in `--json`), or that there was none; `--json` prints the list with `stale` and `view`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty human view prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
 | `fleet-switchboard decisions escalate <id> [--reason "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Moves a decision to you: your label on and the Chief of Staff's off, on the issue (with the repo's own account), or at once for a prompt or question. Not judged. A report with no issue is refused: put it in chat |
 | `fleet-switchboard decisions resolve <id> [--note "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Takes both awaiting labels off the issue. Judged against the Chief of Staff's standing orders |
 | `fleet-switchboard decisions answer <id> allow\|deny` / `answer <id> "<text>"` | Chief of Staff, or you in a plain shell (PR 18) | Replies to an agent's pending permission request or question through v2. Judged against the Chief of Staff's standing orders |
+| `fleet-switchboard decisions answer <batch id> --as-recommended` / `--row N=<choice> ...` `[--note "..."]` | Chief of Staff, or you in a plain shell | Answers a batch (below): one comment on the batch issue records every row's outcome, then both awaiting labels come off, so the batch and all its rows leave the list together. Rows not named by `--row` keep their recommendation. Judged like any `answer` |
+| `fleet-switchboard decisions batch --title "<title>" --row "<repo#N> \| <finding> \| <recommendation>" ... [--file F]` | An orchestrator | Raises related findings as ONE decision: one issue in the caller's own repo with the awaiting-cos label and a fenced `decision-rows` block. Prints the issue's decision id. Rows come from `--row`, `--file` (`-` is stdin), or piped stdin |
+| `fleet-switchboard decisions supersede <id> [<id> ...] --by <repo#N \| URL> [--note "..."]` | Chief of Staff, or you in a plain shell | Several open decisions made moot by one issue: an issue decision gets a comment `Superseded by <ref>` and both labels off; a report gets your `send` to its worker naming the issue (which clears it) and its issue's labels off; a permission request or question is refused (use `answer`). One result line per id, `done` or `refused: <why>`; it carries on past a failure and exits non-zero if any failed. Judged like `resolve` |
 | `fleet-switchboard labels ensure [--repo OWNER/REPO]` | Anyone (PR 18) | Creates `<user>:orchestrator`, `<user>:awaiting-cos` and `<user>:awaiting-user` where missing (every watched repo by default), each with the repo's own account; idempotent |
 | `fleet-switchboard orders --cos` | Anyone (PR 18) | Prints the Chief of Staff's own standing orders file and its path. Read-only: you edit the file in an editor |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
@@ -1049,7 +1052,9 @@ To take a question back once it is superseded, the worker runs
 `fleet-switchboard report withdrawn [--issue <n>] "why"`: it clears that ask's
 open questions and blocked reports (with no issue, this worker's untagged
 ones); `--all` clears every open question or blocked report of the worker, on
-any ask. The list drops it at the daemon's next pass. A worker that no
+any ask. The list drops it at the daemon's next pass. A send that is
+only *waiting* in the worker's v2 inbox (delivered as a note to a worker that is busy or engaged with a person,
+in no transcript until its next turn) already answers: it is delivered, as everywhere else. A worker that no
 longer runs is not waited on. A report is listed once it is in the boss's
 transcript, not before: a note still in the inbox is not yet delivered.
 
@@ -1100,8 +1105,8 @@ shows it), and the plugin shows a row `daemon not updating` (scenario D5).
 `decisions.mjs`, whose pure functions (read the file, staleness, rows) are tested
 with node. v2 loads it from the profile's `cli.json` (`{"plugins":
 ["./fleet-decisions"]}`, a directory holding `tui.tsx`), into the `sidebar.content`
-slot, as a section titled **Decisions (N)**, in two tiered sections, **Waits on you (n)** first and **Waits on cos (n)**
-second (a third, **Waits on orchestrator (n)**, only when one exists), each grouped by repo (repos by name,
+slot, as a section titled **Decisions (N)**, in two tiered sections, **Waits on you (n)** first and **Waits on cos (n, k over 1h)**
+second (k decisions have waited longer than an hour: the queue that must not pile up; a third, **Waits on orchestrator (n)**, only when one exists), each grouped by repo (repos by name,
 oldest decision first). An entry is its headline in at most two lines of 34 characters, then `<id> <age>` (with
 the reporting agent after it when a report was folded in); a thin rule separates entries and a heavy one
 separates repos and sections. A file an older daemon wrote has no headline: the title is used, cut the same way.
@@ -1762,7 +1767,8 @@ first line of the output says plainly which view it printed, for example
 shows each row's tier. `decisions.json` itself holds every tier: the view is
 applied by the reader (the command, the panel, the scenario oracle), and `status`
 counts `waiting on you` as the human tier and says what else is open (`also open: 2
-with the Chief of Staff, 1 with an orchestrator`).
+with the Chief of Staff (1 over 1h), 1 with an orchestrator`; the count is `count_over_an_hour`, decisions that
+have waited longer than `DECISION_LONG_WAIT`, 3600 s, the panel's `LONG_WAIT_SECONDS`).
 
 **Escalate, resolve, answer.** Three subcommands for the Chief of Staff (or you in
 a plain shell; any other fleet agent is refused and audited as `decisions.refused`,
@@ -1779,13 +1785,53 @@ the one the command just saw.
 "Judged" means what it means for every shell command: the policy judge reads the
 command before it runs, against the Chief of Staff's orders (below). The skip
 list of PR 11 (a plain `send`, `intent`, ... is the agents' own channel, not
-judged) does **not** cover `resolve` and `answer`; it does cover `decisions` with
+judged) does **not** cover `resolve`, `answer` and `supersede`; it does cover `decisions` with
 no subcommand, `decisions list`, `decisions escalate` and `orders --cos`. The
-judge's question would be blind to a bare id, so for a judged `answer` or
-`resolve` it is given one more line, read from `decisions.json`: what the
+judge's question would be blind to a bare id, so for a judged `answer`,
+`resolve` or `supersede` it is given one more line, read from `decisions.json`: what the
 decision is (`permission by api-coder, cos tier: permission: shell rm -rf
 build`). An id that starts with `#` must be quoted to count as a plain command.
 Under the `answer-unjudged` fault they skip the judge.
+
+**A batch: related findings as one decision.** Twenty-five findings used to be twenty-five rows to
+escalate, answer and clear. An orchestrator raises related findings as one:
+
+```text
+fleet-switchboard decisions batch --title "Stale issues to close" \
+  --row "acme/web#7 | stale cache key, fixed in web#12 | close it" \
+  --row "acme/web#9 | duplicate of web#7 | close as duplicate"
+```
+
+It creates ONE real GitHub issue in the caller's own repo (its configured repo, never another), labelled `<user>:awaiting-cos`, signed with the caller's name, whose body
+holds a fenced block, one line per row:
+
+````text
+```decision-rows
+acme/web#7 | stale cache key, fixed in web#12 | close it
+acme/web#9 | duplicate of web#7 | close as duplicate
+```
+````
+
+A row is `<ref> | <finding> | <recommendation>`: the ref is `repo#N`, `owner/repo#N` or an issue URL, and must name an issue
+of the batch's own repo (anything else is refused, and nothing is created: the batch is public exactly as that repo
+is, so a finding about another, possibly private, repo belongs in a batch raised from that repo); the finding is cut
+at 200 characters and the recommendation at 120; an empty part, a ref that names no issue and a code fence are refused,
+and so are more than 40 rows (raise the rest as a second batch). Only an orchestrator with a repo may raise one.
+The batch's id is the issue's id like any issue decision (`#12`, `api#12`), so existing ids do not change.
+
+The daemon reads the rows from the issue body the hub already holds (the paged listing and the webhook payload
+carry it): no read of its own, one parse per change. The decision entry gains `rows` (`ref`, `short`, `finding`,
+`recommendation`, `text`) and `raised_by` (the signing agent), and its headline is `<title> (n rows)`. The panel draws
+one entry: the headline, one line per row (`web#7: close it`, URLs as short refs, two lines at most), then
+`<id> <age>`.
+
+`decisions escalate <id>` works on a batch unchanged: it is one issue, so the owner sees one item. `decisions answer
+<id> --as-recommended` (or `--row 2=keep it open`, rows not named keep their recommendation; `--note` is added) posts
+ONE comment on the batch issue recording each row's outcome, takes both awaiting labels off it, and, when it can, sends
+the raising orchestrator a note from the answerer naming the batch. A row may name an issue that is only being
+*proposed* for closing: the code never closes, labels or edits a row's issue. The answer is the record, and the
+orchestrator acts on the rows. `answer` keeps its meaning for permission requests and questions, and goes through the
+same judge as before. `decisions supersede` (command table) clears several open decisions made moot by one issue.
 
 *Where an escalated request is kept.* An escalation of an issue is the label on
 GitHub, which is already the truth. An escalated prompt or question has no issue
@@ -3057,7 +3103,7 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   covered. Changed: `tier` on every decision; the daemon's awaiting read covers both labels with two bounded reads
   per repo (PR 16's forward-only and cap rules hold); `fleet-switchboard decisions` takes `--repo`, `--tier` and a
   view by caller (the Chief of Staff everything, an orchestrator its repo, anyone else the human tier) and says
-  which view it printed; `decisions escalate`, `resolve` and `answer`; `labels ensure` (and `bin/switchboard-trial
+  which view it printed; `decisions escalate`, `resolve`, `answer`, `batch` and `supersede`; `labels ensure` (and `bin/switchboard-trial
   init` makes the new label); `orders --cos`; `install` makes the orders file's template and never overwrites it;
   the judge feeds the file to the Chief of Staff's judgement as its authority (1200 characters to the model), a note
   with the file's text reaches the Chief of Staff at its start, after each compaction and when the file changes

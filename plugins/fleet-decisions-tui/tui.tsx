@@ -66,6 +66,7 @@ export default {
                           <box flexDirection="column">
                             {j() > 0 ? <text>{THIN(ROW_WIDTH)}</text> : null}
                             <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
+                            <For each={(entry.rows ?? []).flat()}>{(line) => <text>{line}</text>}</For>
                             <For each={entry.facts ?? []}>{(line) => <text>{line}</text>}</For>
                             <text>{entry.head}</text>
                           </box>
