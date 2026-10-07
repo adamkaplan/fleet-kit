@@ -426,6 +426,41 @@ polled on a timer.
   charter and its sub-issues. PR events match through the issues the PR
   closes. Check and workflow events match through the PRs listed in their
   payload.
+
+  **Events on a PR the fleet opened (PR 52).** A PR needs no closing keyword to reach its agent. The links are
+  tried in this order, and the first that finds an agent that is running wins:
+
+  1. `closing`: the routing above, unchanged: closing keywords, the payload's linked issues, parents. It comes
+     first so that nothing that routes today moves; a PR that has both a closing keyword and a notice goes where
+     the keyword sends it.
+  2. `notice`: a `notice pr` recorded for the PR (repo and number) names its sender; the event goes to that agent
+     when it is running, else to the boss recorded with the notice (`notice pr` stores the sender's `reports_to`
+     when it records). A notice recorded before this field existed has no boss: a gone sender then leaves the PR
+     unrouted.
+  3. `reference`: for a PR that names no closing issue, a plain `#N` in its title or body, or, when there is
+     none, the number in its head branch name (`drift2137`). Accepted only when the PR names exactly one such
+     number and that issue has an owner in the fleet (parents are climbed as for any issue); two or more stay
+     unrouted. The PR's own number and `owner/repo#N` references do not count.
+  4. `branch`: reserved. The launch metadata (`metadata.fleet`: name, role, reports_to, issue, charter, repo)
+     does not record an agent's branch, so a head branch is not linked to an agent.
+
+  Nothing found: the item is dropped and `github.unrouted` names the repo, the `prs` and the first 20 keys. An
+  item that was routed is audited in `github.routed` with `routed_by` (`closing`, `notice`, `reference`), the
+  recipient and the keys.
+
+  **Which events reach the agent.** Everything routed by `closing` is delivered as before (a passing check
+  included). For an agent found by `notice` or `reference` only these are delivered: a check or workflow run
+  that failed, was cancelled or timed out; a review that requests changes; a merge conflict; a comment written
+  by a person (not a login ending `[bot]`, not a user of type Bot, not signed with the fleet mark, not an author
+  in `github_ignore_authors`; a person's comment is usually an instruction). Passing and skipped checks,
+  approvals, PR state events and bots' comments are counted in one `github.not_delivered` line per repo and link
+  per pass and are not sent.
+
+  **Merge conflicts.** `gh pr view` for a notice (one read per open notice about a minute, within the hub timeout
+  and the per-pass budget) also asks for `mergeable` and `headRefOid`; a PR that is `CONFLICTING` and open is
+  one `github.conflict:<repo>#N:<head>` item, so one per head commit however many times it is read, routed by the
+  links above. Only PRs with a notice are read for this. A PR without a notice gets a conflict only when a PR
+  event carries `mergeable_state` dirty or `mergeable` false (GitHub's events usually do not).
 - **Catching up after a gap:** the forwarder never replays what it missed. It
   reconnects 3 times, 5 s apart, then exits, and anything that happens while it
   is down is lost. So each time a forwarder starts, the daemon makes one
