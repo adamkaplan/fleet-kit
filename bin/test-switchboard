@@ -23521,6 +23521,23 @@ class TestDecisionBaselineSeams(BaselineWorld):
                         [{"id": d["id"], "ask": d["ask"], "repo": d["repo"], "headline": d["headline"]}
                          for d in found["decisions"]])
 
+    def test_the_tier_of_an_issue_payload_with_both_labels(self):
+        """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
+        hands it one label at a time): both labels is yours, the cos label alone is the cos's, neither is no decision."""
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        cases = {10: ["me:awaiting-cos", "me:awaiting-user"], 11: ["me:awaiting-user"], 12: ["me:awaiting-cos"],
+                 13: ["bug"], 14: ["me:awaiting-user", "me:awaiting-cos"]}
+        for number, names in cases.items():
+            hub.note_awaiting_issue(API, {"number": number, "title": "issue %d" % number, "state": "open",
+                                          "labels": [{"name": n} for n in names], "updated_at": "2027-01-15T07:00:00Z"})
+        hub.note_awaiting_issue(API, {"number": 15, "title": "closed", "state": "closed",
+                                      "labels": [{"name": "me:awaiting-user"}]})
+        records, errors = hub.awaiting_listing()
+        baseline_golden(self, "seams-issue-payload-tiers",
+                        {"tiers": {r["number"]: r["tier"] for r in records},
+                         "errors": [e for e in errors if "not read yet" not in e]})
+
     def test_the_lab_faults_tier_flat_and_bare_issue_number(self):
         self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
         self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])
