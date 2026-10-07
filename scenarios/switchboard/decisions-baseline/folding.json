@@ -1,0 +1,112 @@
+{
+ "derived": {
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Which database?",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "reported_by": [
+     "api-coder",
+     "api-orch"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "Which database?"
+   },
+   {
+    "agent": null,
+    "ask": 3,
+    "headline": "Second api issue",
+    "id": "api#3",
+    "kind": "issue",
+    "repo": "acme/api",
+    "reported_by": [
+     "loner",
+     "loner2"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "cos",
+    "title": "Second api issue"
+   },
+   {
+    "agent": "web-coder",
+    "ask": 2,
+    "headline": "Same number, other repo",
+    "id": "web#2",
+    "kind": "issue",
+    "repo": "acme/web",
+    "reported_by": [
+     "web-orch"
+    ],
+    "since": "2027-01-15T07:59:00Z",
+    "tier": "human",
+    "title": "Same number, other repo"
+   },
+   {
+    "agent": "other-repo",
+    "ask": 2,
+    "considered": "no send from api-orch to other-repo in the last 72 hours",
+    "headline": "a third repo, the same number 2",
+    "id": "other#2wk",
+    "kind": "report",
+    "repo": "acme/other",
+    "since": "2027-01-15T08:00:05Z",
+    "tier": "orchestrator",
+    "title": "a third repo, the same number 2"
+   },
+   {
+    "agent": "loner3",
+    "ask": null,
+    "considered": "no send from api-orch to loner3 in the last 72 hours",
+    "headline": "which of api#2 or api#3?",
+    "id": "loner3-233",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:06Z",
+    "tier": "orchestrator",
+    "title": "which of api#2 or api#3?"
+   },
+   {
+    "agent": "loner4",
+    "ask": null,
+    "considered": "no send from api-orch to loner4 in the last 72 hours",
+    "headline": "nothing named here, or api#99",
+    "id": "loner4-925",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:07Z",
+    "tier": "orchestrator",
+    "title": "nothing named here, or api#99"
+   },
+   {
+    "agent": "loner5",
+    "ask": null,
+    "considered": "no send from api-orch to loner5 in the last 72 hours",
+    "headline": "web#2 is another repo's issue",
+    "id": "loner5-308",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:08Z",
+    "tier": "orchestrator",
+    "title": "web#2 is another repo's issue"
+   }
+  ],
+  "errors": []
+ },
+ "folded_into": {
+  "api#2": [
+   "api-coder",
+   "api-orch"
+  ],
+  "api#3": [
+   "loner",
+   "loner2"
+  ],
+  "web#2": [
+   "web-orch"
+  ]
+ }
+}

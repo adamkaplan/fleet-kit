@@ -1,0 +1,52 @@
+[
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#101 was not answered: the note to api-orch was not delivered (held); its labels stay, the batch stays with the Chief of Staff, nothing was commented. Run the same answer again once api-orch can be reached\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#101 was not answered: the note to api-orch could not be delivered (no such agent); its labels stay, the batch stays with the Chief of Staff, nothing was commented. Run the same answer again once api-orch can be reached\n",
+  "out": ""
+ },
+ {
+  "still listed": [
+   "api#32",
+   "api#101"
+  ]
+ },
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "cos",
+  "code": 0,
+  "comments": [
+   "Answer to this batch (3 rows): as recommended.\n1. acme/api#31: as recommended: close it\n2. acme/api#32: as recommended: close as duplicate of api#31\n3. acme/api#33: as recommended: label it done\nThe row issues were not changed by this answer: the orchestrator that raised the batch acts on it.\n\n<!-- fleet-switchboard:from=cos -->"
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/101/comments",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-user"
+  ],
+  "labels_changed": {
+   "acme/api#101": []
+  },
+  "notes": {
+   "api-orch": [
+    "[switchboard] 1 for api-orch: Batch api#101 (acme/api#101) is answered: as recommended. The record is the comment on it; you act on it, nothing was done to the row issues.\n- send from cos (issue api#101): Batch api#101 (acme/api#101) is answered: as recommended. The record is the comment on it; you act on it, nothing was done to the row issues."
+   ]
+  },
+  "out": "answered api#101: 3 rows (3 as recommended, 0 changed); me:awaiting-cos and me:awaiting-user are off acme/api#101; told api-orch\n"
+ },
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: no decision api#101 is waiting (see `fleet-switchboard decisions --tier all`)\n",
+  "out": ""
+ }
+]

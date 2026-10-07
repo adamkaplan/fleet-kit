@@ -1,0 +1,20 @@
+[
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "you",
+  "code": 0,
+  "comments": [
+   "Answer to this batch (3 rows): as recommended.\n1. acme/api#31: as recommended: close it\n2. acme/api#32: as recommended: close as duplicate of api#31\n3. acme/api#33: as recommended: label it done\nThe row issues were not changed by this answer: the orchestrator that raised the batch acts on it."
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/101/comments",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-user"
+  ],
+  "labels_changed": {
+   "acme/api#101": []
+  },
+  "out": "answered api#101: 3 rows (3 as recommended, 0 changed); me:awaiting-cos and me:awaiting-user are off acme/api#101\n"
+ }
+]

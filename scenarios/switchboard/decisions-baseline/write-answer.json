@@ -1,0 +1,201 @@
+[
+ {
+  "argv": "decisions answer api#2df allow --note per the standing order",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "out": "answered api#2df: allow\n",
+  "permission_replies": [
+   {
+    "decision": "once",
+    "message": "per the standing order",
+    "request": "per_fake000008",
+    "session": "ses_fake000004"
+   }
+  ]
+ },
+ {
+  "argv": "decisions answer api#2op deny",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "out": "answered api#2op: deny\n",
+  "permission_replies": [
+   {
+    "decision": "reject",
+    "message": null,
+    "request": "per_fake000009",
+    "session": "ses_fake000004"
+   }
+  ]
+ },
+ {
+  "argv": "decisions answer api#2op deny",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: no decision api#2op is waiting (see `fleet-switchboard decisions --tier all`)\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2wb use postgres",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "form_replies": [
+   {
+    "answer": {
+     "k": "use postgres"
+    },
+    "form": "frm_ke000010",
+    "session": "ses_fake000004"
+   }
+  ],
+  "out": "answered api#2wb\n"
+ },
+ {
+  "argv": "decisions answer api#2wc yes",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "form_replies": [
+   {
+    "answer": {
+     "k": true
+    },
+    "form": "frm_ke000011",
+    "session": "ses_fake000004"
+   }
+  ],
+  "out": "answered api#2wc\n"
+ },
+ {
+  "argv": "decisions answer api#2wk 7",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "form_replies": [
+   {
+    "answer": {
+     "k": 7
+    },
+    "form": "frm_ke000012",
+    "session": "ses_fake000004"
+   }
+  ],
+  "out": "answered api#2wk\n"
+ },
+ {
+  "argv": "decisions answer api#2ez 2.5",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "form_replies": [
+   {
+    "answer": {
+     "k": 2.5
+    },
+    "form": "frm_ke000013",
+    "session": "ses_fake000004"
+   }
+  ],
+  "out": "answered api#2ez\n"
+ },
+ {
+  "argv": "decisions answer api#2nl a",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: this question's field is a select, which `decisions answer` does not fill: answer it in its own pane, or tell the owner\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2wm a",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: this form has 2 visible fields (k, j): answer it in its own pane, or tell the owner\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2 allow",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#2 is an issue: `decisions answer` is for a permission request or a question. Answer a report with `fleet-switchboard send`; an issue with a comment, then `decisions resolve`\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer web-orch-410 allow",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: web-orch-410 is a report: `decisions answer` is for a permission request or a question. Answer a report with `fleet-switchboard send`; an issue with a comment, then `decisions resolve`\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer nope-123 allow",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: no decision nope-123 is waiting (see `fleet-switchboard decisions --tier all`)\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2 allow",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: only the Chief of Staff, or you in a plain shell, may answer a decision; api-orch is a orchestrator. Raise it with `fleet-switchboard report question \"...\"` and your awaiting-cos label\n",
+  "out": ""
+ },
+ {
+  "derived_after": {
+   "decisions": [
+    {
+     "agent": "api-coder",
+     "ask": 2,
+     "headline": "An issue",
+     "id": "api#2",
+     "kind": "issue",
+     "repo": "acme/api",
+     "since": "2027-01-15T07:59:00Z",
+     "tier": "cos",
+     "title": "An issue"
+    },
+    {
+     "agent": "api-coder",
+     "ask": 2,
+     "headline": "question: choice question",
+     "id": "api#2nl",
+     "kind": "question",
+     "repo": "acme/api",
+     "request": "frm_ke000014",
+     "session": "ses_fake000004",
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "question: choice question"
+    },
+    {
+     "agent": "api-coder",
+     "ask": 2,
+     "headline": "question: two field question",
+     "id": "api#2wm",
+     "kind": "question",
+     "repo": "acme/api",
+     "request": "frm_ke000015",
+     "session": "ses_fake000004",
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "question: two field question"
+    },
+    {
+     "agent": "web-orch",
+     "ask": null,
+     "considered": "no send from cos to web-orch in the last 72 hours",
+     "headline": "a report",
+     "id": "web-orch-410",
+     "kind": "report",
+     "repo": "acme/web",
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "a report"
+    }
+   ],
+   "errors": []
+  }
+ }
+]

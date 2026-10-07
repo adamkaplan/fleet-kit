@@ -1,0 +1,50 @@
+{
+ "after the escalation": [
+  {
+   "agent": null,
+   "ask": 12,
+   "headline": "The labelled issue",
+   "id": "api#12",
+   "kind": "issue",
+   "repo": "acme/api",
+   "reported_by": [
+    "api-orch"
+   ],
+   "since": "2027-01-15T08:00:01Z",
+   "tier": "human",
+   "title": "The labelled issue"
+  }
+ ],
+ "cos label": [
+  {
+   "agent": null,
+   "ask": 12,
+   "headline": "The labelled issue",
+   "id": "api#12",
+   "kind": "issue",
+   "repo": "acme/api",
+   "reported_by": [
+    "api-orch"
+   ],
+   "since": "2027-01-15T07:59:00Z",
+   "tier": "cos",
+   "title": "The labelled issue"
+  }
+ ],
+ "escalate": {
+  "argv": "decisions escalate api#12",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/12/labels",
+   "DELETE repos/acme/api/issues/12/labels/me%3Aawaiting-cos"
+  ],
+  "labels_changed": {
+   "acme/api#12": [
+    "me:awaiting-user"
+   ]
+  },
+  "out": "escalated api#12 to you: me:awaiting-user on acme/api#12\n"
+ }
+}

@@ -1,0 +1,28 @@
+[
+ {
+  "argv": "decisions supersede api#5kj --by api#50",
+  "as": "cos",
+  "code": 1,
+  "err": "",
+  "out": "api#5kj: refused: the note was not sent to api-orch (held): the report stays open\n"
+ },
+ {
+  "derived_after": {
+   "decisions": [
+    {
+     "agent": "api-orch",
+     "ask": 5,
+     "considered": "no send from cos to api-orch in the last 72 hours",
+     "headline": "merge or wait?",
+     "id": "api#5kj",
+     "kind": "report",
+     "repo": "acme/api",
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "merge or wait?"
+    }
+   ],
+   "errors": []
+  }
+ }
+]

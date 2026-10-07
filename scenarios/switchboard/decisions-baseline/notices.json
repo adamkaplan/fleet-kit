@@ -1,0 +1,82 @@
+{
+ "entry": [
+  {
+   "additions": 120,
+   "agent": "api-coder",
+   "ask": null,
+   "ci": "green",
+   "deletions": 14,
+   "files": 5,
+   "headline": "acme/api#7 Add the parser",
+   "id": "pr:acme/api#7",
+   "kind": "notice",
+   "merge_after": null,
+   "note": "again",
+   "number": 7,
+   "repo": "acme/api",
+   "review": "approved",
+   "since": "2027-01-15T08:00:00Z",
+   "stale": false,
+   "state": "open",
+   "tier": "human",
+   "title": "acme/api#7 Add the parser",
+   "url": "https://github.com/acme/api/pull/7"
+  }
+ ],
+ "merged: dropped": [],
+ "merged: its record is forgotten": {
+  "notices": []
+ },
+ "not a pr": {
+  "argv": "notice pr https://github.com/acme/api/issues/7",
+  "as": "api-coder",
+  "code": 2,
+  "err": "fleet-switchboard: https://github.com/acme/api/issues/7 is an issue, not a pull request: `notice pr` takes a PR\n",
+  "out": ""
+ },
+ "record": {
+  "argv": "notice pr acme/api#7 ready for review",
+  "as": "api-coder",
+  "code": 0,
+  "err": "fleet-switchboard: notice of acme/api#7 recorded; it shows in the person's panel until the PR is merged or closed (nobody was messaged)\n",
+  "out": "acme/api#7\n"
+ },
+ "resend": {
+  "argv": "notice pr https://github.com/acme/api/pull/7/files again",
+  "as": "api-coder",
+  "code": 0,
+  "err": "fleet-switchboard: notice of acme/api#7 refreshed; it shows in the person's panel until the PR is merged or closed (nobody was messaged)\n",
+  "out": "acme/api#7\n"
+ },
+ "stale": [
+  {
+   "additions": 120,
+   "agent": "api-coder",
+   "ask": null,
+   "ci": "green",
+   "deletions": 14,
+   "files": 5,
+   "headline": "acme/api#7 Add the parser",
+   "id": "pr:acme/api#7",
+   "kind": "notice",
+   "merge_after": null,
+   "note": "again",
+   "number": 7,
+   "repo": "acme/api",
+   "review": "approved",
+   "since": "2027-01-15T08:00:00Z",
+   "stale": true,
+   "state": "open",
+   "tier": "human",
+   "title": "acme/api#7 Add the parser",
+   "url": "https://github.com/acme/api/pull/7"
+  }
+ ],
+ "status line": [
+  "      decisions  0 waiting on you (`fleet-switchboard decisions`); also open: 1 with the Chief of Staff (0 over 1h)"
+ ],
+ "the cos list holds the question and not the notice": "Decisions: all repos, all tiers (for chief-of-staff)\napi-orch-297  waiting 6s  [cos]  api-orch  Which database?\n",
+ "the status line counts the question only": [
+  "      decisions  0 waiting on you (`fleet-switchboard decisions`); also open: 1 with the Chief of Staff (0 over 1h)"
+ ]
+}
