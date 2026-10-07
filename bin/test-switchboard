@@ -5607,6 +5607,240 @@ class TestGithubRouting(Base):
         self.assertEqual(fact_.summary, "@octocat commented on #12: please look at this")
 
 
+class TestGithubPrRouting(Base):
+    """PR 52: events on a PR the fleet opened reach the agent responsible for it, without a closing reference."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents = {"platform": {"role": "orchestrator", "charter": 1},
+                       "coder": {"role": "coder", "issue": 12, "reports_to": "platform"}}
+        self.start()
+
+    def start(self, config=None):
+        self.rig = GithubRig(self, agents=self.agents, config=config)
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.gh.issue(1)
+        self.gh.issue(12, parent=1)
+        self.gh.issue(13, parent=1)
+        self.gh.issue(20)
+        self.hub.tick()
+
+    def pr(self, number, title="a change", body="", ref="a-branch"):
+        pull = self.gh.pull(number, title=title)
+        pull["body"], pull["head"]["ref"] = body, ref
+        return pull
+
+    def notice(self, number, sender="coder", boss="platform"):
+        return sb.record_pr_notice(self.world.state, GH_REPO, number, sender, "ready", self.world.clock.now(), boss)
+
+    def check(self, number, conclusion="failure", cid=8001, event="check_suite"):
+        self.gh.send(event, {"action": "completed", event: {"id": cid, "conclusion": conclusion, "name": "ci",
+                                                           "pull_requests": [{"number": number}]}})
+
+    def routed(self):
+        return {f.key: f.recipient for f in self.hub.facts()}
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def routed_by(self):
+        return {k: e["detail"]["routed_by"] for e in self.audit("github.routed") for k in e["detail"]["keys"]}
+
+    # -- the links
+
+    def test_a_pr_with_a_notice_goes_to_its_sender(self):
+        self.pr(40)
+        self.notice(40)
+        self.check(40)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "coder"})
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "notice"})
+
+    def test_a_notice_whose_sender_is_gone_goes_to_the_senders_boss(self):
+        self.pr(40)
+        self.notice(40, sender="ghost", boss="platform")
+        self.check(40)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "notice"})
+
+    def test_a_notice_whose_sender_and_boss_are_gone_is_unrouted_and_the_audit_names_the_pr(self):
+        self.pr(40)
+        self.notice(40, sender="ghost", boss="ghost-boss")
+        self.check(40)
+        self.assertEqual(self.routed(), {})
+        (line,) = self.audit("github.unrouted")
+        self.assertEqual((line["subject"], line["detail"]["prs"], line["detail"]["count"]), (GH_REPO, [40], 1))
+
+    def test_the_notice_records_the_senders_boss_and_a_resend_keeps_it(self):
+        item, _ = self.notice(40)
+        self.assertEqual(item["boss"], "platform")
+        item, refreshed = sb.record_pr_notice(self.world.state, GH_REPO, 40, "coder", "again", 1.0)
+        self.assertEqual((refreshed, item["boss"]), (True, "platform"))
+
+    def test_a_pr_with_one_plain_reference_goes_to_the_owner_of_that_issue(self):
+        self.pr(41, body="This is the work for #12, no keyword.")
+        self.check(41)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "reference"})
+
+    def test_a_pr_with_two_plain_references_stays_unrouted(self):
+        self.pr(41, title="for #12", body="and also #13")
+        self.check(41)
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.audit("github.unrouted")[0]["detail"]["prs"], [41])
+
+    def test_a_reference_to_an_issue_nobody_owns_stays_unrouted(self):
+        self.pr(41, body="about #20")
+        self.check(41)
+        self.assertEqual(self.routed(), {})
+
+    def test_an_issue_number_in_the_head_branch_name_is_a_reference(self):
+        self.pr(42, ref="drift12")
+        self.check(42)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "reference"})
+
+    def test_a_closing_keyword_still_wins_over_a_notice(self):
+        self.gh.pull(30, closes=(12,))
+        self.notice(30, sender="coder")
+        self.check(30)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"})
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "closing"})
+
+    def test_a_pr_that_closes_something_is_not_given_a_weak_reference(self):
+        self.pr(43, body="Closes #20. Related to #12.")
+        self.check(43)
+        self.assertEqual(self.routed(), {})
+
+    # -- which events are delivered
+
+    def test_success_checks_and_workflow_runs_are_not_delivered_on_the_new_links(self):
+        self.pr(40)
+        self.notice(40)
+        self.check(40, "success", 8001)
+        self.check(40, "success", 8002, event="workflow_run")
+        self.check(40, "skipped", 8003)
+        self.assertEqual(self.routed(), {})
+        self.assertEqual(self.audit("github.unrouted"), [])
+        (line,) = self.audit("github.not_delivered")
+        self.assertEqual((line["detail"]["routed_by"], line["detail"]["count"]), ("notice", 3))
+
+    def test_a_success_on_a_pr_that_routes_by_a_closing_keyword_is_still_delivered(self):
+        self.gh.pull(30, closes=(12,))
+        self.check(30, "success")
+        self.assertEqual(self.routed(), {"github.check:8001:success": "platform"})
+
+    def test_failed_cancelled_and_timed_out_checks_and_runs_are_delivered(self):
+        self.pr(40)
+        self.notice(40)
+        self.check(40, "failure", 8001)
+        self.check(40, "cancelled", 8002)
+        self.check(40, "timed_out", 8003, event="workflow_run")
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "coder", "github.check:8002:cancelled": "coder",
+                                         "github.check:run-8003:timed_out": "coder"})
+
+    def review(self, number, state, rid):
+        pull = self.gh.pulls[number]
+        self.gh.send("pull_request_review", {"action": "submitted", "pull_request": pull, "review": {
+            "id": rid, "state": state, "body": "see the notes", "user": {"login": "rev"}}})
+
+    def test_a_review_that_asks_for_changes_is_delivered_and_an_approval_is_not(self):
+        self.pr(40)
+        self.notice(40)
+        self.review(40, "approved", 6001)
+        self.review(40, "changes_requested", 6002)
+        self.assertEqual(self.routed(), {"github.review:6002": "coder"})
+
+    def pr_comment(self, number, body, cid, login="alice", user_type="User"):
+        issue = dict(self.gh.pulls[number], pull_request={"url": "x"})
+        self.gh.send("issue_comment", {"action": "created", "issue": issue, "comment": {
+            "id": cid, "body": body, "user": {"login": login, "type": user_type}}})
+
+    def test_a_persons_comment_is_delivered_and_a_bots_and_the_fleets_are_not(self):
+        self.pr(40)
+        self.notice(40)
+        self.pr_comment(40, "please rename this", 5001)
+        self.pr_comment(40, "coverage 90%", 5002, login="codecov[bot]", user_type="Bot")
+        self.pr_comment(40, "preview ready", 5003, login="deploy-helper", user_type="Bot")
+        self.pr_comment(40, "%s\nmy own words" % sb.fleet_mark("coder"), 5004)
+        self.assertEqual(self.routed(), {"github.comment:5001": "coder"})
+
+    def test_an_author_in_the_ignore_list_is_not_delivered(self):
+        self.start({"github_ignore_authors": ["shared-account"]})
+        self.pr(40)
+        self.notice(40)
+        self.pr_comment(40, "from the agents' own account", 5001, login="shared-account")
+        self.assertEqual(self.routed(), {})
+
+    def test_a_bot_comment_on_a_closing_routed_pr_is_delivered_as_before(self):
+        self.gh.pull(30, closes=(12,))
+        self.pr_comment(30, "coverage 90%", 5002, login="codecov[bot]", user_type="Bot")
+        self.assertEqual(self.routed(), {"github.comment:5002": "platform"})
+
+    def test_a_redelivered_event_is_one_item(self):
+        self.pr(40)
+        self.notice(40)
+        for delivery in ("d-1", "d-2"):
+            self.check(40)
+            self.gh.send("check_suite", {"action": "completed", "check_suite": {
+                "id": 8001, "conclusion": "failure", "pull_requests": [{"number": 40}]}}, delivery)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "coder"})
+        self.assertEqual(len(self.hub.queue), 1)
+
+    # -- merge conflicts
+
+    def held(self, number, head, mergeable="CONFLICTING", state="open"):
+        key = "%s#%d" % (GH_REPO, number)
+        self.world.engine.notice_facts[key] = {"at": self.world.clock.now(), "stale": False, "error": None,
+                                               "facts": {"state": state, "mergeable": mergeable, "head": head}}
+
+    def test_the_notice_read_asks_for_the_merge_state_and_keeps_it(self):
+        self.assertIn("mergeable", sb.PR_VIEW_FIELDS)
+        self.assertIn("headRefOid", sb.PR_VIEW_FIELDS)
+        facts = sb.pr_facts_from(dict(json.loads(pr_view_json()), mergeable="conflicting", headRefOid="abc123"))
+        self.assertEqual((facts["mergeable"], facts["head"]), ("CONFLICTING", "abc123"))
+
+    def test_a_conflict_on_a_pr_with_a_notice_is_routed_once_per_head_commit(self):
+        self.pr(40)
+        self.notice(40)
+        self.held(40, "aaa1111")
+        self.assertEqual(self.routed(), {"github.conflict:%s#40:aaa1111" % GH_REPO: "coder"})
+        self.assertEqual(self.routed_by(), {"github.conflict:%s#40:aaa1111" % GH_REPO: "notice"})
+        self.hub.acknowledge(["github.conflict:%s#40:aaa1111" % GH_REPO])
+        self.assertEqual(self.routed(), {}, "read again, delivered, and not queued a second time")
+        self.held(40, "bbb2222")
+        self.assertEqual(list(self.routed()), ["github.conflict:%s#40:bbb2222" % GH_REPO])
+
+    def test_a_pr_that_merges_cleanly_or_is_unknown_or_closed_is_no_conflict(self):
+        self.pr(40)
+        self.notice(40)
+        for mergeable, state in (("MERGEABLE", "open"), ("UNKNOWN", "open"), ("CONFLICTING", "merged")):
+            self.held(40, "aaa1111", mergeable, state)
+            self.assertEqual(self.routed(), {})
+
+    def test_a_pr_event_that_carries_the_state_gives_a_conflict_without_a_notice(self):
+        self.pr(41, body="for #12")
+        self.gh.pulls[41]["mergeable_state"] = "dirty"
+        self.gh.send("pull_request", {"action": "opened", "pull_request": self.gh.pulls[41]})
+        self.assertIn("github.conflict:%s#41:sha41" % GH_REPO, self.routed())
+        self.gh.send("pull_request", {"action": "reopened", "pull_request": self.gh.pulls[41]}, "d-2")
+        self.assertEqual([k for k in self.hub.queue if k.startswith("github.conflict")],
+                         ["github.conflict:%s#41:sha41" % GH_REPO], "the same head is the same item")
+        self.gh.pulls[41]["mergeable_state"] = "clean"
+        self.gh.send("pull_request", {"action": "reopened", "pull_request": self.gh.pulls[41]}, "d-3")
+        self.assertEqual(len([k for k in self.hub.queue if k.startswith("github.conflict")]), 1)
+
+    # -- the audit
+
+    def test_the_unrouted_audit_line_names_the_prs_and_the_repo(self):
+        self.pr(50)
+        self.pr(51)
+        self.check(50, cid=8001)
+        self.check(51, cid=8002)
+        self.routed()
+        (line,) = self.audit("github.unrouted")
+        self.assertEqual((line["subject"], line["detail"]["prs"], line["detail"]["count"]), (GH_REPO, [50, 51], 2))
+
+
 class TestGithubDelivery(Base):
     """The queue holds an item until the engine has delivered it; nothing else is stored."""
 
@@ -20102,11 +20336,39 @@ class TestEscalateAndResolve(WriteWorld):
         self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481 --reason 'costs money'"))
         self.assertTrue(sb.plain_switchboard_message('fleet-switchboard decisions escalate "#2"'))
 
-    def test_a_batch_whose_row_text_has_a_quoted_pipe_is_a_plain_message(self):
-        row = 'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale | close it"'
-        self.assertTrue(sb.plain_switchboard_message(row), "a pipe inside quotes is text: a batch is a plain message")
-        self.assertFalse(sb.plain_switchboard_message(row.replace('"acme/api#7 | stale | close it"', "x | sh")),
-                         "a pipe outside quotes is an operator: judged")
+    def test_a_batch_is_judged_whatever_its_quoting(self):
+        # `decisions batch` writes an issue to GitHub: judged like any write, quoted operators or not.
+        rows = ('fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale | close it"',
+                'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 ; stale ; close it"',
+                "fleet-switchboard decisions batch --title 'Stale' --row 'acme/api#7 | stale | close it'",
+                "fleet-switchboard decisions batch --title 'Stale' --row 'a | b' --row 'c; d'",
+                'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale\n| close it"',
+                "fleet-switchboard decisions --repo acme/api batch --title t --row 'a | b'",
+                "fleet-switchboard decisions batch --title t --file -",
+                "fleet-switchboard decisions batch --title t --file - <<'EOF'\nacme/api#7 | a | b\nEOF",
+                "cat rows | fleet-switchboard decisions batch --title t",
+                'fleet-switchboard decisions batch --title "Stale" --row x | sh')
+        for command in rows:
+            with self.subTest(command=command):
+                self.assertFalse(sb.plain_switchboard_message(command))
+
+    def test_supersede_and_answer_with_quoted_operators_are_judged(self):
+        for command in ('fleet-switchboard decisions supersede api-1 --by "acme/api#7 | x" --note "a; b"',
+                        "fleet-switchboard decisions supersede api-1 --by acme/api#7 --note 'a | b'",
+                        'fleet-switchboard decisions answer api-1 "yes | no; maybe"',
+                        "fleet-switchboard decisions answer api-1 'a | b' --note 'c; d'",
+                        "fleet-switchboard decisions answer api-1 allow --note 'x\ny'"):
+            with self.subTest(command=command):
+                self.assertFalse(sb.plain_switchboard_message(command))
+
+    def test_ordinary_messages_with_quoted_operators_stay_plain(self):
+        for command in ('fleet-switchboard send cos --issue 5 "a | b; c"',
+                        "fleet-switchboard report done 'ran a | b; c'",
+                        "fleet-switchboard comment 5 'x | y'",
+                        'fleet-switchboard decisions escalate api-1 --reason "a | b"'):
+            with self.subTest(command=command):
+                expected = command.split()[1] in sb.POLICY_MESSAGE_COMMANDS or "escalate" in command
+                self.assertEqual(sb.plain_switchboard_message(command), expected)
 
     def test_a_decision_already_yours_is_left_alone(self):
         self.gh.issue(API, 3, "Yours already", labels=["me:awaiting-user"])

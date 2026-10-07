@@ -4519,7 +4519,7 @@ PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
 PR_NOTICE_UNREADABLE_DAYS = 7     # a notice whose PR cannot be read this long is dropped
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
 
@@ -4590,7 +4590,7 @@ def write_pr_notices(state_dir, items):
         raise
 
 
-def record_pr_notice(state_dir, repo, number, sender, note, now):
+def record_pr_notice(state_dir, repo, number, sender, note, now, boss=None):
     """Record (or refresh) the notice of `repo#number`. A re-send keeps the first time (the hold window runs from
     it) and replaces the note and the sender. Returns (item, refreshed)."""
     with pr_notices_lock(state_dir):
@@ -4598,6 +4598,9 @@ def record_pr_notice(state_dir, repo, number, sender, note, now):
         old = next((i for i in items if i["repo"] == repo and i["number"] == number), None)
         item = {"repo": repo, "number": number, "from": sender, "note": note,
                 "created": old["created"] if old else now, "refreshed": now}
+        boss = boss or (old or {}).get("boss")
+        if boss:  # PR 52: who the sender reports to, so a PR whose sender is gone still reaches someone
+            item["boss"] = boss
         if old and old.get("unreadable_since") is not None:
             item["unreadable_since"] = old["unreadable_since"]
         write_pr_notices(state_dir, [i for i in items if i is not old] + [item])
@@ -4662,7 +4665,11 @@ def pr_facts_from(data):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
-            "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review}
+            "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
+            # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
+            # commit is what makes it one event per push
+            "mergeable": str(data.get("mergeable") or "").upper() or None,
+            "head": data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else None}
 
 
 def read_pr_facts(engine, repo, number):
@@ -5493,10 +5500,14 @@ class GitHubItem:
     owner. `recipient` is set once an owner is found.
     """
 
-    def __init__(self, key, kind, summary, repo, issues, lookups, sender, created):
+    def __init__(self, key, kind, summary, repo, issues, lookups, sender, created, numbers=(), actionable=True):
         self.key, self.kind, self.summary, self.repo = key, kind, summary, repo
         self.issues, self.lookups, self.sender, self.created = list(issues), list(lookups), sender, created
         self.recipient = None
+        # PR 52: `numbers` are the issue or PR numbers the item sits on (a notice is looked up by them);
+        # `actionable` is false for news that is not worth an agent's turn (a passing check, a bot's comment) and
+        # is delivered only to an owner the old links found; `routed_by` says which link found the owner.
+        self.numbers, self.actionable, self.routed_by = list(numbers), actionable, None
 
     @property
     def issue(self):
@@ -5504,6 +5515,28 @@ class GitHubItem:
 
 
 CLOSES_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+(?:[\w.-]+/[\w.-]+)?#(\d+)", re.I)
+
+
+PLAIN_REF_RE = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
+
+
+def reference_numbers(pr, own):
+    """PR 52: the issue numbers a PR that closes nothing points at, for the weak link: the plain `#N` in its title
+    and body, else the numbers in its head branch name (`drift2137`). Empty when the PR names a closing issue; the
+    PR's own number is never a candidate. The caller accepts only exactly one."""
+    if not isinstance(pr, dict) or closing_numbers(pr.get("body")) or pr.get("linked_issues"):
+        return []
+    text = " ".join(str(pr.get(field) or "") for field in ("title", "body"))
+    found = []
+    for match in PLAIN_REF_RE.finditer(text):
+        if int(match.group(1)) not in found and int(match.group(1)) != own:
+            found.append(int(match.group(1)))
+    if not found:
+        ref = (pr.get("head") or {}).get("ref")
+        for match in re.finditer(r"(?<!\d)(\d{1,7})(?!\d)", ref if isinstance(ref, str) else ""):
+            if int(match.group(1)) not in found and int(match.group(1)) != own and int(match.group(1)) > 0:
+                found.append(int(match.group(1)))
+    return found
 
 
 def closing_numbers(text):
@@ -5523,6 +5556,18 @@ def _id(obj):
 def _number(obj):
     value = obj.get("number") if isinstance(obj, dict) else None
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else None
+
+
+ACTIONABLE_CONCLUSIONS = ("failure", "cancelled", "timed_out")  # PR 52: the checks an agent is told about
+
+
+def _is_bot(obj):
+    """A comment or review written by a bot: a login ending `[bot]` or a user of type Bot."""
+    user = obj.get("user") if isinstance(obj, dict) else None
+    if not isinstance(user, dict):
+        return False
+    login = user.get("login")
+    return (isinstance(login, str) and login.lower().endswith("[bot]")) or str(user.get("type") or "").lower() == "bot"
 
 
 def _login(obj):
@@ -5630,7 +5675,8 @@ def _comment_item(repo, comment, issue, now):
         return None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
-    return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now)
+    return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
+                      [number], not _is_bot(comment))
 
 
 def _issue_item(repo, issue, now, what=None):
@@ -5654,7 +5700,26 @@ def _pr_item(repo, pr, now):
     state = _pr_state(pr)
     known, lookups = _pr_refs(pr, number)
     summary = "PR #%d is %s: %s" % (number, state, _one_line(pr.get("title") or "", 200))
-    return GitHubItem("github.pr:%d:%s" % (pid, state), "github.pr", summary, repo, known, lookups, _login(pr), now)
+    return GitHubItem("github.pr:%d:%s" % (pid, state), "github.pr", summary, repo, known, lookups, _login(pr), now,
+                      [number], False)
+
+
+def _conflict_item(repo, number, sha, now):
+    """PR 52: one item per PR head commit that cannot be merged; its key makes a redelivery one item."""
+    if not isinstance(sha, str) or not sha or not isinstance(number, int):
+        return None
+    return GitHubItem("github.conflict:%s#%d:%s" % (repo, number, sha), "github.conflict",
+                      "PR #%d has a merge conflict with its base (head %s)" % (number, sha[:7]), repo, [],
+                      [("pr", number)], None, now, [number], True)
+
+
+def _pr_conflict(repo, pr, now):
+    """The conflict item of a PR object that says so (`mergeable_state` dirty, or `mergeable` false), or None."""
+    if not isinstance(pr, dict) or _pr_state(pr) != "open":
+        return None
+    if str(pr.get("mergeable_state") or "").lower() != "dirty" and pr.get("mergeable") is not False:
+        return None
+    return _conflict_item(repo, _number(pr), (pr.get("head") or {}).get("sha"), now)
 
 
 def _review_item(repo, review, pr, now):
@@ -5665,7 +5730,8 @@ def _review_item(repo, review, pr, now):
     state = str(review.get("state") or "reviewed").lower()
     summary = "@%s reviewed PR #%d (%s): %s" % (_login(review) or "someone", number, state,
                                                 _one_line(review.get("body") or "", 300))
-    return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now)
+    return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now,
+                      [number], state == "changes_requested")
 
 
 def _check_item(repo, obj, now, prefix, label):
@@ -5675,7 +5741,7 @@ def _check_item(repo, obj, now, prefix, label):
         return None
     summary = "%s %s on PR %s" % (label, conclusion, ", ".join("#%d" % n for n in numbers))
     return GitHubItem("github.check:%s%d:%s" % (prefix, oid, conclusion), "github.check", summary, repo, [],
-                      [("pr", n) for n in numbers], None, now)
+                      [("pr", n) for n in numbers], None, now, numbers, conclusion.lower() in ACTIONABLE_CONCLUSIONS)
 
 
 def _wh_issues(repo, payload, now):
@@ -5700,8 +5766,8 @@ def _wh_issue_comment(repo, payload, now):
 def _wh_pull_request(repo, payload, now):
     if payload.get("action") not in ("opened", "reopened", "closed", "ready_for_review"):
         return []
-    item = _pr_item(repo, payload.get("pull_request") or {}, now)
-    return [item] if item else []
+    pr = payload.get("pull_request") or {}
+    return [item for item in (_pr_item(repo, pr, now), _pr_conflict(repo, pr, now)) if item]
 
 
 def _wh_review(repo, payload, now):
@@ -5924,6 +5990,8 @@ class GitHubHub:
         self._cache, self._retry, self._rejects, self._suppressed = {}, {}, [], 0
         self._unrouted, self._snapshot = set(), None
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
+        self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
+        self._routed_batch, self._conflicts = [], set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self.engine = None
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
@@ -6207,8 +6275,11 @@ class GitHubHub:
         with self.lock:
             for key in [k for k, i in self.queue.items() if i.created < now - self.lookback]:
                 del self.queue[key]
+        self.note_conflicts(now)
+        with self.lock:
             waiting = [item for item in self.queue.values() if item.recipient is None]
         if waiting:
+            self._notices = self._load_notices()
             discovery = self.discover()
             self._route_until = None if fault("catch-up-blocks-pass") else now + GITHUB_ROUTE_SECONDS
             try:
@@ -6219,6 +6290,7 @@ class GitHubHub:
             finally:
                 self._route_until = None
             self._audit_unrouted()
+            self._audit_routed()
         with self.lock:
             found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
                           repo=i.repo)
@@ -6234,12 +6306,22 @@ class GitHubHub:
         if discovery is None or discovery.problems:
             return  # the fleet cannot be read: keep it, ask again next pass
         try:
-            owner = self.owner_of(item, discovery.agents, now)
+            owner, routed_by = self.route_of(item, discovery.agents, now)
         except GitHubUnavailable:
             return
         with self.lock:
-            if owner:
-                item.recipient = owner
+            if owner and not item.actionable and routed_by != "closing":
+                # PR 52: an owner found by a new link is told what needs it, not every passing check
+                if item.key in self.queue:
+                    del self.queue[item.key]
+                    if item.key not in self._filtered:
+                        if len(self._filtered) > 20000:
+                            self._filtered.clear()
+                        self._filtered.add(item.key)
+                        self._filtered_batch.append((item, routed_by))
+            elif owner:
+                item.recipient, item.routed_by = owner, routed_by
+                self._routed_batch.append(item)
             elif item.key in self.queue:
                 del self.queue[item.key]
                 if item.key not in self._unrouted:
@@ -6257,15 +6339,89 @@ class GitHubHub:
             by_repo.setdefault(item.repo, []).append(item)
         for repo, items in sorted(by_repo.items(), key=lambda pair: str(pair[0])):
             issues = sorted({n for item in items for n in item.issues})
+            prs = sorted({n for item in items for n in item.numbers})
             self._audit("github.unrouted", repo, {"keys": [i.key for i in items[:GITHUB_AUDIT_KEYS]], "count": len(items),
-                                                   "issues": issues[:GITHUB_AUDIT_KEYS]})
+                                                   "issues": issues[:GITHUB_AUDIT_KEYS],
+                                                   "prs": prs[:GITHUB_AUDIT_KEYS]})
+
+    def _audit_routed(self):
+        """PR 52: one line per repo, link and recipient per pass for what was routed, and one for what a new link
+        found an owner for but was not worth delivering (a passing check): the field `routed_by` is how a route is read."""
+        with self.lock:
+            routed, self._routed_batch = self._routed_batch, []
+            filtered, self._filtered_batch = self._filtered_batch, []
+        groups = {}
+        for item in routed:
+            groups.setdefault((item.repo, item.routed_by, item.recipient), []).append(item)
+        for (repo, by, recipient), items in sorted(groups.items(), key=lambda pair: tuple(str(x) for x in pair[0])):
+            self._audit("github.routed", repo, {"routed_by": by, "to": recipient, "count": len(items),
+                                                "keys": [i.key for i in items[:GITHUB_AUDIT_KEYS]]})
+        skipped = {}
+        for item, by in filtered:
+            skipped.setdefault((item.repo, by), []).append(item)
+        for (repo, by), items in sorted(skipped.items()):
+            self._audit("github.not_delivered", repo, {"routed_by": by, "count": len(items), "why": "not actionable",
+                                                       "keys": [i.key for i in items[:GITHUB_AUDIT_KEYS]]})
+
+    def note_conflicts(self, now):
+        """PR 52: a conflict item for each open PR with a notice whose last read says it cannot be merged, once per
+        head commit (the key names it; the set keeps it from being queued again after delivery). No read of its own:
+        it uses what the notice reads (`notice_facts`) already hold, about one per PR per PR_FACTS_TTL."""
+        held = getattr(self.engine, "notice_facts", None) or {}
+        for key, entry in sorted(held.items()):
+            facts = entry.get("facts") if isinstance(entry, dict) else None
+            if not facts or facts.get("state") != "open" or facts.get("mergeable") != "CONFLICTING":
+                continue
+            repo, _, number = key.rpartition("#")
+            item = _conflict_item(repo, int(number), facts.get("head"), now) if number.isdigit() else None
+            with self.lock:
+                if item is None or item.key in self._conflicts:
+                    continue
+                if len(self._conflicts) > 20000:
+                    self._conflicts.clear()
+                self._conflicts.add(item.key)
+                self.queue.setdefault(item.key, item)
+
+    def _load_notices(self):
+        """{(repo, number): notice record}: the PR notices on file, or {} when the file cannot be read."""
+        try:
+            return {(n["repo"], n["number"]): n for n in read_pr_notices(self.state_dir)}
+        except NoticeError:
+            return {}
 
     def owner_of(self, item, agents, now):
-        """The owner of an item: known issues first, then reads that climb to parents
-        and to the issues a PR closes. Raises GitHubUnavailable when a read fails."""
-        known, pending, done = list(item.issues), list(item.lookups), set()
+        """The owner of an item (see `route_of`, which also says by which link)."""
+        return self.route_of(item, agents, now)[0]
+
+    def route_of(self, item, agents, now):
+        """(owner, routed_by) of an item, or (None, None). PR 52: the links in order: (closing) the issues the item
+        or its PR names, the existing routing, unchanged and first so that nothing that routes today moves;
+        (notice) the agent that recorded a `notice pr` for the PR, or its boss when it is gone; (reference) the one
+        issue a PR that closes nothing mentions as a plain #N (or in its head branch name). Raises GitHubUnavailable."""
+        seen = {}
+        owner = self._resolve(item.repo, list(item.issues), list(item.lookups), agents, now, seen)
+        if owner:
+            return owner, "closing"
+        for number in item.numbers:
+            notice = self._notices.get((item.repo, number))
+            if notice:
+                for name in (notice.get("from"), notice.get("boss")):
+                    if isinstance(name, str) and name in agents:
+                        return name, "notice"
+        for number in item.numbers:
+            pr = seen.get(number)
+            candidates = reference_numbers(pr, number) if pr is not None else []
+            if len(candidates) == 1:
+                owner = self._resolve(item.repo, candidates[:], [("issue", candidates[0])], agents, now, seen)
+                if owner:
+                    return owner, "reference"
+        return None, None
+
+    def _resolve(self, repo, known, pending, agents, now, seen):
+        """The existing walk: known issues first, then reads that climb to parents and to the issues a PR closes."""
+        done = set()
         while True:
-            owner = pick_owner(agents, known, item.repo,
+            owner = pick_owner(agents, known, repo,
                                self.config.get("intent_repo") if len(self.watches) > 1 else None)
             if owner and _is_orchestrator(agents[owner]):
                 return owner
@@ -6275,13 +6431,15 @@ class GitHubHub:
             if lookup in done:
                 continue
             done.add(lookup)
-            more_known, more_lookups = self._expand(item.repo, lookup, now)
+            more_known, more_lookups = self._expand(repo, lookup, now, seen)
             known += [n for n in more_known if n not in known]
             pending += more_lookups
 
-    def _expand(self, repo, lookup, now):
+    def _expand(self, repo, lookup, now, seen=None):
         kind, number = lookup
         data = self._read_one(repo, "%s/%d" % ("pulls" if kind == "pr" else "issues", number), now)
+        if kind == "pr" and seen is not None:
+            seen[number] = data
         if kind == "pr":
             return _pr_refs(data, number)[0], [("issue", n) for n in _pr_refs(data, number)[0]]
         if _is_pr(data):
@@ -6524,6 +6682,7 @@ class GitHubHub:
             if fresh(pr):
                 pulls.append(pr)
                 items.append(_pr_item(repo, pr, now))
+                items.append(_pr_conflict(repo, pr, now))
         for pr in pulls:
             number = _number(pr)
             for review in read("reviews", base + "pulls/%d/reviews?per_page=100" % number):
@@ -7250,6 +7409,16 @@ def cmd_report(args, runner, now):
     return EXIT_OK
 
 
+def notice_boss(engine, sender):
+    """The agent `sender` reports to, as the fleet shows it now, or None (not found, or the fleet cannot be read)."""
+    try:
+        seen = engine.discover(engine.now()).agents.get(sender)
+    except Exception:
+        return None
+    boss = (seen.fleet or {}).get("reports_to") if seen is not None else None
+    return boss if isinstance(boss, str) and boss.strip() else None
+
+
 def cmd_notice(args, runner, now):
     """PR notices: tell the person about a PR you opened or mean to merge. Recorded for the daemon to show in the
     panel; sends no message and wakes nobody."""
@@ -7267,7 +7436,7 @@ def cmd_notice(args, runner, now):
         repo, number = parse_pr_ref(args.pr)
         if len(note) > REPORT_MAX:
             raise NoticeError("a note is one line of at most %d characters (this one is %d)" % (REPORT_MAX, len(note)))
-        item, refreshed = record_pr_notice(state, repo, number, sender, note, now())
+        item, refreshed = record_pr_notice(state, repo, number, sender, note, now(), notice_boss(engine, sender))
     except NoticeError as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
@@ -8291,14 +8460,15 @@ def plain_switchboard_message(text):
 
     PR 18: `decisions` (a read, `list`, or `escalate`) and `orders --cos` (a read) are plain too. `decisions
     resolve`, `decisions answer` and `decisions supersede` are NOT: they act for the owner, so the judge reads them against the Chief of
-    Staff's standing orders (the `answer-unjudged` fault lets them through)."""
+    Staff's standing orders (the `answer-unjudged` fault lets them through). `decisions batch` writes an issue to GitHub,
+    so it is judged too, however its quoted rows are written (it was plain: a quoted pipe is text)."""
     words = _plain_words(text)
     if not words or len(words) < 2 or os.path.basename(words[0]) != PROG:
         return False
     if words[1] in POLICY_MESSAGE_COMMANDS:
         return True
     if words[1] == "decisions":
-        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede") or fault("answer-unjudged")
+        return _decisions_subcommand(words[2:]) not in ("resolve", "answer", "supersede", "batch") or fault("answer-unjudged")
     return words[1] == "orders" and words[2:] == ["--cos"]
 
 
