@@ -3763,6 +3763,9 @@ def prune_report_riders(engine, discovery):
 DECISIONS_FILE = "decisions.json"
 DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
 DECISION_TITLE_MAX = 200
+# a report line may be REPORT_MAX characters and a `blocked` one gets a "blocked: " lead, so a report decision
+# keeps its whole line (only reports: the other sources keep DECISION_TITLE_MAX)
+DECISION_REPORT_TITLE_MAX = 300 + len("blocked: ")
 DECISION_SOURCES = ("github", "v2", "reports")
 # `(issue #2)` with one repo in play, `(issue api#2)` or `(issue owner/api#2)` with several (issue_tag)
 REPORT_LINE = re.compile(r"^- report from (\S+?)(?: \(issue (?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?))?#(\d+)\))?: ([a-z]+): (.*)$")
@@ -3931,7 +3934,7 @@ def decisions_from_reports(engine, now):
                 reports.append({"at": (created, number), "message": message_id, "sender": match.group(1),
                                 "issue": issue, "state": match.group(4), "text": match.group(5), "boss": boss,
                                 "repo": (repo_of_tag(match.group(2), repos)
-                                         or (_fleet_repo(sender.fleet, engine.config) if sender else None)) if issue else None,
+                                         or (_fleet_repo(sender.fleet, engine.config) if sender else None)),
                                 "session": observation.session_id})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
@@ -3986,7 +3989,8 @@ def derive_decisions(engine, now):
             errors.append({"source": name, "error": _one_line(problem, 200)})
             engine._note("decisions.error", name, {"error": _one_line(problem, 200)})
     ids = assign_decision_ids(items, decision_repos(engine))
-    decisions = [{"id": ident, "title": _line_of(item["title"], DECISION_TITLE_MAX), "ask": item["ask"],
+    decisions = [{"id": ident, "title": _line_of(item["title"], DECISION_REPORT_TITLE_MAX if item["kind"] == "report"
+                                                else DECISION_TITLE_MAX), "ask": item["ask"],
                   "repo": item.get("repo"), "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"])}
                  for ident, item in zip(ids, items)]
     decisions.sort(key=lambda d: (d["since"], d["id"]))

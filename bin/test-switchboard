@@ -13147,6 +13147,25 @@ class TestDecisionDerivation(DecisionsBase):
         (found,) = self.listed()
         self.assertEqual(found["title"], "blocked: waiting on the key")
 
+    def test_a_report_keeps_its_whole_line_up_to_the_report_limit_and_other_kinds_keep_their_clip(self):
+        text = ("word " * 60).strip()  # 299 characters: a legal report
+        self.assertLessEqual(len(text), sb.REPORT_MAX)
+        self.world.add_agent("second", fleet={"reports_to": "platform", "issue": 3})
+        self.ask_the_boss(text)
+        self.ask_the_boss("y" * sb.REPORT_MAX, state="blocked", sender="second")
+        found = {d["title"] for d in self.listed()}
+        self.assertIn(text, found)
+        self.assertIn("blocked: " + "y" * sb.REPORT_MAX, found)
+        self.assertEqual(sb.DECISION_TITLE_MAX, 200)  # the GitHub and v2 sources are still clipped there
+
+    def test_a_report_takes_its_repo_from_the_reporting_agents_fleet_metadata(self):
+        self.world.add_agent("scout", fleet={"reports_to": "platform", "repo": ACME_API})
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("which db?", sender="scout")        # no issue tag at all
+        self.ask_the_boss("what now?", sender="loner")        # an agent with no repo
+        found = {d["agent"]: d["repo"] for d in self.listed()}
+        self.assertEqual((found["scout"], found["loner"]), (ACME_API, None))
+
     def test_done_failed_and_progress_reports_are_not_decisions(self):
         for state in ("done", "failed", "working", "paused"):
             self.ask_the_boss("something", state=state)
