@@ -40,8 +40,8 @@ CHECK:   fleet-switchboard status --json
 DO:      Decide the account for <owner>/<repo>:
            - an entry for the repo or its owner exists  -> that is the account;
            - none exists and the person named one       -> use it, and tell them the exact
-             line to add to gh_users (the daemon reads its config when it starts, so it
-             takes effect after the daemon restarts);
+             line to add to gh_users (the daemon reloads its config on its own a few
+             seconds after the edit);
            - none exists and none was named             -> ask which account, in STEP 2.
          Do not edit the config yourself, and never switch the active gh account.
 VERIFY:  The account name is a login that `gh auth status` lists.

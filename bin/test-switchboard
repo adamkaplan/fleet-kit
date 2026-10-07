@@ -763,7 +763,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "no-decisions-file", "stale-as-fresh", "decision-resolves-never",  # PR 14
               "static-repos", "bare-issue-number", "one-account", "repo-create-allowed",  # PR 15
               "key-missing-silent", "no-ensure-on-use", "shared-profile-default",  # PR 16
-              "key-env-only-unseen")  # PR 16, the first real install
+              "key-env-only-unseen",  # PR 16, the first real install
+              "config-read-once", "catch-up-blocks-pass")  # PR 16, reload and the slow catch-up
 
 
 class TestFaults(Base):
@@ -1038,6 +1039,7 @@ STEP_EXAMPLES = {
     "use": {"command": "decisions"},  # PR 16
     "bootstrap": {},
     "close-agent": {"agent": "coder"},
+    "edit-config": {"add_repo": "acme/web", "broken": False},  # PR 16
 }
 EXPECT_EXAMPLES = {
     "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
@@ -1053,6 +1055,7 @@ EXPECT_EXAMPLES = {
     "repo_watch": {"repo": "acme/web", "how": "polling"},  # PR 15
     "repo_membership": {"repo": "acme/web", "joined": True, "left": False},
     "status_says": {"text": "polling every"},
+    "config_says": {"at": "90s", "text": "INVALID"},  # PR 16
     "launch_refused": {"agent": "coder", "text": "Acme Web"},
     "tool_outcome": {"agent": "coder", "tool": "shell", "outcome": "completed"},
     "judged": {"agent": "cos", "question": "Does it say plainly that the work failed?", "threshold": 0.8},
@@ -14200,6 +14203,77 @@ def _repos_extend_offline_run():
 _repos_extend_offline_run()
 
 
+def _config_extend_offline_run():
+    """PR 16: give a play of `repos` a daemon that reloads its config file. The `edit-config` step writes the file
+    (a watched repo added, or left broken); each pass the daemon's own ConfigWatch looks at it; a valid change goes
+    through `reload_in_place` (the real function, with the exec replaced by a rebuild of the hub and engine, which is
+    what the new process does); `config_says` reads what `status` would say of the daemon's config at that time."""
+    original_init, original_apply, original_pass = OfflineRun.__init__, OfflineRun.apply, OfflineRun.one_pass
+
+    def uses_config(scenario):
+        return "repos" in scenario and any(step["do"] == "edit-config" for step in scenario["steps"])
+
+    def start_watch(self):
+        path = self.test.config_file
+        self.test.write_config(self.raw_config)
+        self.record = {"config_loaded_at": sb.iso(self.world.clock.now()), "config_invalid": None}
+        self.cfgwatch = sb.ConfigWatch(path, sb.load_runnable_config(), self.world.clock.now,
+                                       sb.AuditLog(self.world.audit_path), "daemon",
+                                       lambda **fields: self.record.update(fields))
+
+    def init(self, test, scenario, label, faults=(), baseline=None):
+        original_init(self, test, scenario, label, faults, baseline)
+        self.cfgwatch, self.config_lines, self.cfg_repos = None, {}, []
+        if uses_config(scenario):
+            start_watch(self)
+
+    def rebuild(self, config):
+        """What the new process does: the config is the file's, and everything built from it is built again."""
+        world = self.world
+        world.config = config
+        self.hub = sb.GitHubHub(config, world.state, sb.AuditLog(world.audit_path), self.farm.runner,
+                                self.farm.spawn, world.clock.now)
+        self.hub.autostart, self.hub.port = False, 4711
+        self.farm.attach(self.hub)
+        world.engine = world.new_engine()
+        self.record = {"config_loaded_at": sb.iso(world.clock.now()), "config_invalid": None}
+        self.cfgwatch = sb.ConfigWatch(self.test.config_file, config, world.clock.now,
+                                       sb.AuditLog(world.audit_path), "daemon",
+                                       lambda **fields: self.record.update(fields))
+
+    def apply(self, step):
+        if step["do"] != "edit-config":
+            return original_apply(self, step)
+        if step.get("broken"):
+            self.test.write_config("{ \"github_repos\": [")
+        else:
+            if step.get("add_repo"):
+                self.cfg_repos.append(step["add_repo"])
+            self.test.write_config(dict(self.raw_config, github_repos=list(self.cfg_repos)))
+
+    def one_pass(self, step_faults):
+        if self.cfgwatch is not None and self.daemon:
+            os.environ[sb.FAULT_ENV] = ",".join(self.faults)
+            if self.cfgwatch.check() == "reload":
+                watch, argv = self.cfgwatch, ["/exec/never-runs"]
+                sb.reload_in_place(self.world.engine, self.hub, None, watch, argv, lambda argv: None)
+                rebuild(self, watch.new_config)
+            self.config_lines[int(self.world.clock.now() - EPOCH)] = "\n".join(sb.format_config_lines(self.record))
+        original_pass(self, step_faults)
+
+    def oracle_config_says(self, e):
+        at = sc.duration_seconds(e["at"])
+        seen = [line for second, line in sorted(self.config_lines.items()) if second <= at]
+        text = seen[-1] if seen else ""
+        return e["text"] in text, "at %ds the daemon's config line is: %s" % (at, text or "(none)")
+
+    OfflineRun.__init__, OfflineRun.apply, OfflineRun.one_pass = init, apply, one_pass
+    OfflineRun.oracle_config_says = oracle_config_says
+
+
+_config_extend_offline_run()
+
+
 class TestWatchedReposAreDerived(Base):
     def test_a_repo_joins_when_an_agent_naming_it_appears_and_leaves_when_the_agent_goes(self):
         rig = FarmRig(self, baseline=[ACME_API])
@@ -16837,7 +16911,7 @@ class TestTheDaemonKnowsItsKey(StatusCase):
         with mock.patch.object(sb, "run_daemon", lambda *a, **k: seen.append(k)), \
                 mock.patch.object(sb, "start_judge_server", lambda *a, **k: None), captured():
             sb.main(["run"], runner=world.route, now=world.clock.now)
-        self.assertEqual(seen[0]["record"], {"key_source": "environment"})
+        self.assertEqual(seen[0]["record"]["key_source"], "environment")
 
     def test_a_shell_with_the_key_and_a_daemon_without_it_is_the_first_line_in_plain_words(self):
         self.daemon_started_with("none")
@@ -16929,6 +17003,435 @@ class TestTheDaemonKnowsItsKey(StatusCase):
         self.assertEqual(out.getvalue(), "environment\n")
 
 
+class TestASlowCatchUpDoesNotFreezeThePass(Base):
+    """Found on a real machine: a first catch-up of a busy repo (thousands of items nobody owns, and a workflow
+    read that timed out) kept the pass busy for minutes, and `decisions` said the daemon was not updating."""
+
+    ITEMS = 1200
+
+    def rig(self):
+        rig = GithubRig(self)
+        self.calls = 0
+        original = rig.gh.runner
+
+        def slow(argv, **kwargs):
+            self.calls += 1
+            rig.world.clock.t += 1  # a gh call that takes a second
+            if "actions/runs" in argv[-1]:
+                rig.world.clock.t += 19
+                raise subprocess.TimeoutExpired(argv, 20)
+            return original(argv, **kwargs)
+        rig.hub.runner = slow
+        for number in range(100, 100 + self.ITEMS):
+            rig.gh.comment(number, "nobody owns this", 6000 + number, forward=False)
+        return rig
+
+    def pass_seconds(self, rig):
+        before = rig.world.clock.now()
+        rig.world.engine.run_pass()
+        return rig.world.clock.now() - before
+
+    def test_the_pass_stays_inside_its_budget_whatever_is_waiting(self):
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_CATCHUP_ITEMS)
+        took = self.pass_seconds(rig)
+        self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT, took)
+        self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
+
+    def test_the_decisions_file_is_never_stale_because_of_it(self):
+        rig = self.rig()
+        rig.world.engine.run_pass()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        for _ in range(3):
+            self.pass_seconds(rig)
+            self.assertFalse(sb.decisions_report(rig.world.state, rig.world.clock.now())["stale"])
+
+    def test_it_drains_over_passes_and_audits_the_unowned_in_counts_not_one_line_each(self):
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        kept = len(rig.hub.queue)
+        for _ in range(kept):
+            if not rig.hub.queue:
+                break
+            rig.world.engine.run_pass()
+        self.assertEqual(len(rig.hub.queue), 0)
+        lines = [e for e in rig.world.audit() if e["event"] == "github.unrouted"]
+        self.assertEqual(sum(e["detail"]["count"] for e in lines), kept)
+        self.assertLess(len(lines), kept // 4)
+        for e in lines:
+            self.assertLessEqual(len(e["detail"]["keys"]), sb.GITHUB_AUDIT_KEYS)
+
+    def test_one_catch_up_keeps_the_newest_items_only_and_says_so(self):
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertIn("items: kept the newest", rig.watch().catch_up_error)
+        [line] = [e for e in rig.world.audit() if e["event"] == "github.catch_up"][-1:]
+        self.assertEqual(line["detail"]["count"], sb.GITHUB_CATCHUP_ITEMS)
+        self.assertLessEqual(len(line["detail"]["keys"]), sb.GITHUB_AUDIT_KEYS)
+
+    def test_a_read_that_times_out_is_reported_once_and_not_tried_every_pass(self):
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        runs = lambda: len([c for c in rig.gh.api_calls if "actions/runs" in c])
+        self.assertEqual(runs(), 0, "the fake never saw it: the slow runner raised first")
+        tried = [0]
+        base = rig.hub.runner
+
+        def count(argv, **kwargs):
+            if "actions/runs" in argv[-1]:
+                tried[0] += 1
+            return base(argv, **kwargs)
+        rig.hub.runner = count
+        for _ in range(5):
+            rig.world.clock.t += sb.GITHUB_LOOKUP_RETRY + 5
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual(tried[0], 0, "inside its backoff it is not tried again")
+        self.assertGreaterEqual(rig.watch().catchup_at - rig.world.clock.now(), 0)
+        rig.world.clock.t += sb.GITHUB_READ_BACKOFF
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual(tried[0], 1, "after it, once")
+
+    def test_a_catch_up_stops_reading_when_its_time_is_spent(self):
+        rig = GithubRig(self)
+        original = rig.gh.runner
+
+        def slow(argv, **kwargs):
+            rig.world.clock.t += 60
+            return original(argv, **kwargs)
+        rig.hub.runner = slow
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertIn("left to the next catch-up", rig.watch().catch_up_error)
+
+    def test_the_fault_removes_every_bound_and_the_control_fails(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "catch-up-blocks-pass"
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertGreater(len(rig.hub.queue), sb.GITHUB_CATCHUP_ITEMS)
+        took = self.pass_seconds(rig)
+        self.assertGreater(took, sb.DECISIONS_STALE_SECONDS, "with the bounds off the pass is the minutes the owner saw")
+        self.assertIn("catch-up-blocks-pass", sb.KNOWN_FAULTS)
+
+
+class TestTheConfigIsReloadedWhenTheFileChanges(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 5})
+        self.clock = SimClock()
+        self.records = []
+        self.world = World(self, agents=())
+        os.environ.pop(sb.LAB_ENV, None)
+        self.watch = sb.ConfigWatch(self.config_file, sb.load_runnable_config(), self.clock.now,
+                                    sb.AuditLog(self.world.audit_path), "daemon",
+                                    lambda **fields: self.records.append(fields))
+
+    def edit(self, obj):
+        self.write_config(obj)
+        info = self.config_file.stat()
+        os.utime(str(self.config_file), (info.st_atime, info.st_mtime + len(self.records) + 1 + self.clock.t % 7))
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def settle(self):
+        """The file has stayed as it is for longer than the stability window."""
+        self.assertIsNone(self.watch.check())
+        self.clock.t += sb.CONFIG_STABLE_SECONDS + 0.5
+        return self.watch.check()
+
+    def test_an_unchanged_file_is_never_read_again(self):
+        for _ in range(3):
+            self.clock.t += 5
+            self.assertIsNone(self.watch.check())
+        self.assertFalse(self.watch.pending)
+
+    def test_a_valid_change_is_applied_once_it_has_been_still_for_a_second(self):
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 9, "github_repos": ["a/b"]})
+        self.assertIsNone(self.watch.check())
+        self.clock.t += 0.5
+        self.assertIsNone(self.watch.check(), "not mid-write")
+        self.clock.t += 1
+        self.assertEqual(self.watch.check(), "reload")
+        self.assertEqual(self.watch.changed, ["github_repos", "poll_seconds"], "names, never values")
+        self.assertEqual(self.watch.new_config["github_repos"], ["a/b"])
+
+    def test_two_quick_edits_are_one_reload(self):
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 6})
+        self.assertIsNone(self.watch.check())
+        self.clock.t += 0.8
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 7})
+        self.assertIsNone(self.watch.check(), "it changed again: the window starts over")
+        self.clock.t += 0.8
+        self.assertIsNone(self.watch.check())
+        self.clock.t += 0.5
+        self.assertEqual(self.watch.check(), "reload")
+        self.assertEqual(self.watch.new_config["poll_seconds"], 7)
+
+    def test_a_touch_with_the_same_content_reloads_nothing(self):
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 5})
+        self.assertIsNone(self.settle())
+        self.assertEqual(self.audit("config.invalid"), [])
+
+    def test_a_broken_file_never_stops_it_is_audited_once_and_recorded(self):
+        self.edit("{ not json \"sk-secret-canary\" ")
+        self.assertIsNone(self.settle())
+        for _ in range(3):
+            self.clock.t += 5
+            self.assertIsNone(self.watch.check())
+        [event] = self.audit("config.invalid")
+        self.assertIn("not valid JSON", event["detail"]["reason"])
+        self.assertNotIn("sk-secret-canary", json.dumps(event))
+        self.assertEqual(self.records[-1]["config_invalid"]["reason"], event["detail"]["reason"])
+        self.assertEqual(self.watch.config["poll_seconds"], 5, "still the config it loaded")
+
+    def test_a_file_that_parses_but_is_not_a_valid_config_is_invalid_too(self):
+        for bad in ({"opencode": FAKE_OPENCODE, "github_repos": "not-a-list"}, {"poll_seconds": 5}):
+            with self.subTest(bad=bad):
+                self.edit(bad)
+                self.assertIsNone(self.settle())
+                self.assertIsNotNone(self.watch.invalid)
+
+    def test_fixing_it_recovers_and_a_different_fix_reloads(self):
+        self.edit("{")
+        self.settle()
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 5})
+        self.assertIsNone(self.settle(), "back to what it already runs: nothing to rebuild")
+        self.assertIsNone(self.watch.invalid)
+        self.assertEqual(self.records[-1], {"config_invalid": None})
+        self.assertEqual(len(self.audit("config.recovered")), 1)
+        self.edit("{")
+        self.settle()
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 8})
+        self.assertEqual(self.settle(), "reload")
+
+    def test_the_fault_ignores_every_change_and_only_in_the_lab(self):
+        os.environ[sb.FAULT_ENV] = "config-read-once"
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 9})
+        self.assertEqual(self.settle(), "reload", "outside the Lab a fault does nothing")
+        os.environ[sb.LAB_ENV] = "1"
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 11})
+        self.assertIsNone(self.settle(), "the control: the change is ignored")
+        self.assertIn("config-read-once", sb.KNOWN_FAULTS)
+
+    def test_the_start_path_and_a_reload_use_one_validator(self):
+        self.assertIn("load_runnable_config(", inspect.getsource(sb.build_engine))
+        self.assertIn("load_runnable_config(", inspect.getsource(sb.ConfigWatch.check))
+
+    def test_run_daemon_checks_every_pass_and_waits_a_second_while_a_change_settles(self):
+        waits, reloads = [], []
+        self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 9})
+        self.watch.check()
+
+        def wait(sock, timeout):
+            waits.append(timeout)
+            self.clock.t += 1.5
+        sb.run_daemon(self.world.engine, self.world.state, 5, wait=wait, passes=2, watch=self.watch,
+                      on_reload=reloads.append)
+        self.assertEqual(waits[0], sb.CONFIG_STABLE_SECONDS)
+        self.assertEqual(reloads, [self.watch])
+
+
+class TestReloadInPlace(Base):
+    def test_it_stops_the_forwarders_and_the_judge_says_so_and_starts_over(self):
+        rig = GithubRig(self)
+        rig.pump(10)
+        proc = rig.gh.forwarder()
+        self.assertIsNotNone(proc)
+        stopped = []
+
+        class Judge:
+            def stop(self):
+                stopped.append("judge")
+        watch = mock.Mock(changed=["github_repos"])
+        executed = []
+        sb.reload_in_place(rig.world.engine, rig.hub, Judge(), watch, ["/py", "/bin/fleet-switchboard", "run"],
+                           executed.append)
+        self.assertEqual(executed, [["/py", "/bin/fleet-switchboard", "run"]])
+        self.assertIsNotNone(proc.poll(), "its forwarder was stopped before the exec")
+        self.assertEqual(stopped, ["judge"])
+        [event] = [e for e in rig.world.audit() if e["event"] == "config.reloaded"]
+        self.assertEqual(event["detail"]["changed"], ["github_repos"])
+        self.assertEqual(event["detail"]["forwarders_stopped"], [GH_REPO])
+
+    def test_an_exec_that_fails_leaves_the_daemon_running_on_what_it_had(self):
+        rig = GithubRig(self)
+        rig.pump(10)
+        rig.hub.autostart = False
+        started = []
+        rig.hub.start = lambda: started.append("hub")
+
+        def broken(argv):
+            raise OSError("no such interpreter")
+        sb.reload_in_place(rig.world.engine, rig.hub, None, mock.Mock(changed=["x"]), ["/nope"], broken)
+        self.assertEqual(started, ["hub"])
+        self.assertEqual(len([e for e in rig.world.audit() if e["event"] == "config.reload_failed"]), 1)
+
+    def test_cmd_run_wires_the_watch_and_a_re_exec_without_standby(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        seen = []
+        world = World(self, agents=())
+        with mock.patch.object(sb, "run_daemon", lambda *a, **k: seen.append(k)), \
+                mock.patch.object(sb, "start_judge_server", lambda *a, **k: None), captured():
+            sb.main(["run", "--standby", "--poll", "7"], runner=world.route, now=world.clock.now)
+        self.assertIsInstance(seen[0]["watch"], sb.ConfigWatch)
+        self.assertIn("config_loaded_at", seen[0]["record"])
+        with mock.patch.object(sb, "reload_in_place") as reload:
+            seen[0]["on_reload"](seen[0]["watch"])
+        argv = reload.call_args[0][4]
+        self.assertEqual(argv[2:], ["run", "--poll", "7"])
+        self.assertNotIn("--standby", argv)
+
+
+EXEC_CHILD = r"""
+import importlib.machinery, importlib.util, os, sys, time
+loader = importlib.machinery.SourceFileLoader("sbx", sys.argv[1])
+spec = importlib.util.spec_from_loader("sbx", loader)
+sbx = importlib.util.module_from_spec(spec)
+loader.exec_module(sbx)
+state, phase = sys.argv[2], sys.argv[3]
+with sbx.single_instance(state):
+    if phase == "first":
+        open(os.path.join(state, "first.pid"), "w").write(str(os.getpid()))
+        sbx.reexec_in_place([sys.executable, __file__, sys.argv[1], state, "second"])
+        sys.exit(9)
+    open(os.path.join(state, "second.pid"), "w").write(str(os.getpid()))
+    deadline = time.time() + 20
+    while not os.path.exists(os.path.join(state, "stop")) and time.time() < deadline:
+        time.sleep(0.05)
+"""
+
+
+class TestTheLockSurvivesAReExec(Base):
+    def test_the_same_pid_keeps_the_lock_through_a_real_exec_and_nobody_else_can_take_it(self):
+        state = sb.ensure_state_dir()
+        script = self.home / "child.py"
+        script.write_text(EXEC_CHILD)
+        child = subprocess.Popen([sys.executable, str(script), str(BIN / "fleet-switchboard"), str(state), "first"],
+                                 env=dict(os.environ))
+        try:
+            deadline, gaps, seen_held, rivals = time.time() + 20, 0, False, 0
+            while time.time() < deadline and not (state / "second.pid").exists():
+                held = sb.run_lock_held(state)
+                seen_held = seen_held or held
+                if seen_held and not held:
+                    gaps += 1
+                if held:
+                    try:
+                        with sb.single_instance(state):
+                            rivals += 1
+                    except sb.LockError:
+                        pass
+            self.assertTrue((state / "second.pid").exists(), "the re-executed process started")
+            self.assertTrue(seen_held)
+            self.assertEqual(gaps, 0, "the lock was never free: no `ensure` could start a second daemon")
+            self.assertEqual(rivals, 0)
+            self.assertEqual((state / "first.pid").read_text(), (state / "second.pid").read_text(), "exec keeps the pid")
+            self.assertEqual(int((state / "run.lock").read_text()), child.pid)
+            self.assertTrue(sb.run_lock_held(state))
+        finally:
+            (state / "stop").write_text("x")
+            child.wait(timeout=30)
+        self.assertEqual(child.returncode, 0)
+        self.assertFalse(sb.run_lock_held(state), "it lets go when the daemon ends")
+
+    def test_an_inherited_descriptor_that_is_not_the_lock_file_is_not_adopted(self):
+        state = sb.ensure_state_dir()
+        other = os.open(str(self.home / "other"), os.O_RDWR | os.O_CREAT)
+        os.environ[sb.LOCK_FD_ENV] = str(other)
+        with sb.single_instance(state):
+            self.assertTrue(sb.run_lock_held(state))
+        self.assertNotIn(sb.LOCK_FD_ENV, os.environ)
+
+
+class TestStatusShowsTheDaemonsConfig(TestTheDaemonKnowsItsKey):
+    def test_the_daemon_records_when_it_loaded_and_status_shows_it(self):
+        self.daemon_started_with("none")
+        record = sb.ensure_state_dir() / "daemon.json"
+        body = json.loads(record.read_text())
+        body["config_loaded_at"] = "2026-10-06T10:00:00Z"
+        record.write_text(json.dumps(body))
+        self.assertIn("config     loaded 2026-10-06T10:00:00Z", self.status()[1])
+
+    def test_an_invalid_file_is_a_first_class_line_with_both_times(self):
+        self.daemon_started_with("none")
+        record = sb.ensure_state_dir() / "daemon.json"
+        body = json.loads(record.read_text())
+        body.update(config_loaded_at="2026-10-06T10:00:00Z",
+                    config_invalid={"since": "2026-10-06T10:05:00Z", "reason": "bad json", "loaded_at": "2026-10-06T10:00:00Z"})
+        record.write_text(json.dumps(body))
+        text = self.status()[1]
+        self.assertIn("config     INVALID since 2026-10-06T10:05:00Z: bad json; still running on the config loaded at "
+                      "2026-10-06T10:00:00Z", text)
+        self.assertEqual(json.loads(self.status("--json")[1])["daemon"]["config_invalid"]["reason"], "bad json")
+
+    def test_a_running_daemon_updates_its_record_and_a_restart_clears_the_invalid_mark(self):
+        state = sb.ensure_state_dir()
+        sb.update_daemon_record(state, config_invalid={"since": "t", "reason": "r", "loaded_at": "l"})
+        self.assertEqual(json.loads((state / "daemon.json").read_text())["config_invalid"]["reason"], "r")
+        world = World(self, agents=())
+        sb.run_daemon(world.engine, state, 5, wait=lambda s, t: None, passes=1, record={"key_source": "none"})
+        self.assertNotIn("config_invalid", json.loads((state / "daemon.json").read_text()))
+
+
+class TestRestartCommand(Base):
+    def setUp(self):
+        super().setUp()
+        self.held = []
+        self.addCleanup(lambda: [os.close(fd) for fd in self.held])
+        self.state = sb.ensure_state_dir()
+
+    def hold(self, pid):
+        fd = os.open(str(self.state / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, ("%d\n" % pid).encode())
+        self.held.append(fd)
+        return fd
+
+    def run_restart(self, command, kill):
+        runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, command + "\n", "")
+        with captured() as (out, err):
+            code = sb.cmd_restart(mock.Mock(), runner, spawn=mock.Mock(), kill=kill, sleep=lambda s: None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_it_refuses_a_pid_that_is_not_a_switchboard_daemon_and_signals_nothing(self):
+        self.hold(4242)
+        signalled = []
+        code, out, err = self.run_restart("/usr/bin/vim notes.txt", lambda pid, sig: signalled.append((pid, sig)))
+        self.assertEqual((code, signalled), (1, []))
+        self.assertIn("not a fleet-switchboard daemon", err)
+
+    def test_it_stops_a_daemon_gracefully_by_its_pid_and_then_ensures(self):
+        fd = self.hold(4242)
+        signalled = []
+
+        def kill(pid, sig):
+            signalled.append((pid, sig))
+            fcntl.flock(fd, fcntl.LOCK_UN)  # the daemon let go of its lock
+            os.close(fd)
+            self.held.remove(fd)
+        spawned = []
+        with mock.patch.object(sb, "ensure_daemon", lambda state, spawn: spawned.append(1) or "started"):
+            code, out, err = self.run_restart("/usr/bin/python3 /kit/bin/fleet-switchboard run", kill)
+        self.assertEqual((code, signalled, out.strip()), (0, [(4242, signal.SIGTERM)], "daemon started"))
+        self.assertEqual(spawned, [1])
+
+    def test_a_daemon_that_does_not_stop_is_not_killed_harder(self):
+        self.hold(4242)
+        signalled = []
+        code, out, err = self.run_restart("python3 fleet-switchboard run", lambda pid, sig: signalled.append(sig))
+        self.assertEqual((code, signalled), (1, [signal.SIGTERM]))
+        self.assertIn("nothing stronger", err)
+
+    def test_with_no_daemon_it_just_ensures(self):
+        with mock.patch.object(sb, "ensure_daemon", lambda state, spawn: "started"):
+            code, out, err = self.run_restart("", lambda pid, sig: self.fail("nothing to signal"))
+        self.assertEqual((code, out.strip()), (0, "daemon started"))
+
+    def test_the_command_exists_and_never_ensures_on_use(self):
+        self.assertIn("restart", sb.build_parser()._subparsers._group_actions[0].choices)
+        self.assertNotIn("restart", sb.ENSURE_ON_USE_COMMANDS)
+
+
 class TestInstallDocs(unittest.TestCase):
     def setUp(self):
         self.install = (REPO / "INSTALL.md").read_text()
@@ -16990,7 +17493,8 @@ class TestInstallDocs(unittest.TestCase):
                        "systemctl --user enable --now", "key set", "ensure_daemon", "Lab proof", "Not verified live",
                        "--standby", "`jev.key_file`", "what the first real install found", "`cli link`", "daemon.json",
                        "key-env-only-unseen", "environment (only this shell)", "owns exactly two keys", "`send_brief`",
-                       "realpath"):
+                       "realpath", "`ConfigWatch`", "config-read-once", "catch-up-blocks-pass", "FLEET_SWITCHBOARD_LOCK_FD",
+                       "`fleet-switchboard restart`", "| C2 |"):
             self.assertIn(needle, self.design)
         section = self.design[self.design.index("### Install (PR 16)"):self.design.index("### Data")]
         for number, line in enumerate(section.splitlines(), 1):

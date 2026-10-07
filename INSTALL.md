@@ -460,6 +460,11 @@ on Linux), starts the daemon, and prints `status`. `install --uninstall` reverse
 all of it except the config, the state and the sessions. Add `--no-service` or
 `--no-herdr-link` to skip either one, and say so in your report.
 
+The daemon reloads `config.json` by itself a few seconds after it changes (an
+invalid file is reported in the first lines of `status` and the daemon keeps
+running on what it had). Never `kill` the daemon by hand: `fleet-switchboard
+restart` stops it by its recorded pid and starts it again.
+
 `install` also puts the CLI on PATH: a symlink `fleet-switchboard` in
 `~/.local/bin` (or another directory of the person's PATH under their home),
 pointing at this checkout's `bin/fleet-switchboard`. It says which, and prints

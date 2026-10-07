@@ -1314,6 +1314,70 @@ nothing. Two things follow: the key is never text, and its absence is loud.
 from), `plugin` (whether `herdr plugin list` names `fleet-switchboard`) and `service` (whether the file
 is installed; it never runs `launchctl` or `systemctl`).
 
+#### The config is reloaded when the file changes
+
+The daemon built its engine once, so an edit to `github_repos`, `gh_users`, `intent_repo`, `poll_seconds`,
+`jev`, `policy` or the herdr and OpenCode paths did nothing until someone restarted it, and nothing said so.
+Now each pass the daemon compares the config file's mtime and size with what it loaded (`ConfigWatch`).
+
+- **Stable first.** A changed file is read only after it has stayed the same for a second, so an editor that
+  writes twice is one reload, and a half-written file is only ever read as the invalid file it is. While a
+  change settles the daemon waits one second, not a whole poll, between passes.
+- **One validator.** The file is read with the validator the start path uses (`load_runnable_config`). A
+  valid file that says the same as the loaded one (a touch) reloads nothing.
+- **A valid change starts the daemon over in place** (`os.execve` of the same interpreter and script, `run`
+  without `--standby`), so the engine, the watch set, the forwarders, the judge server, the accounts and every
+  client are rebuilt together and nothing is half applied. Before the exec the forwarders are stopped and the
+  judge socket is closed, and the audit line `config.reloaded` says which (`forwarders_stopped`) and names the
+  keys that changed, never their values. A `config.reload_failed` line and a hub that starts again are the
+  answer if the exec itself cannot run.
+- **The lock and the pid survive.** `exec` keeps the pid. `run.lock` is held by an open file description, and
+  the daemon marks its descriptor inheritable and names it in `FLEET_SWITCHBOARD_LOCK_FD`; the new process
+  adopts that descriptor (after checking it is the lock file) instead of opening a second one, which would
+  conflict. The lock is therefore never free: no `ensure` can start a second daemon in the gap, and a test
+  runs a real child through a real `exec` while the parent polls the lock for a gap and tries to take it.
+  What is briefly absent is the judge socket (milliseconds: `judge-tool` fails open for that moment, as
+  it does whenever the daemon is down) and the poke socket (pokes are silent and the next pass derives
+  everything).
+- **An invalid file never stops the daemon.** It keeps running on the config it has. The audit gets
+  `config.invalid` once, with the reason (never a secret: the reasons are the validator's own, which carry no
+  file content), and `status` shows `config      INVALID since <time>: <reason>; still running on the config
+  loaded at <time>` until the file is fixed; a fix that says what the daemon already runs is
+  `config.recovered`, one that says something new reloads. `status` also shows `config loaded <time>`, from
+  the daemon's own record in `daemon.json`, like its pid.
+- **Faults.** `config-read-once` ignores a change; its control is the unit tests and scenario C2 (an edit adds a
+  watched repo and the forwarder starts without a restart; a broken edit leaves the daemon watching and says so;
+  the fix is applied).
+- **`fleet-switchboard restart`** stops the daemon by its recorded pid (SIGTERM, and nothing stronger) and runs
+  `ensure`, so nobody has to `kill` a pid by hand. It looks at the process first and refuses a pid that is not a
+  switchboard `run`. Under a service, the service starts the new daemon and `ensure` says it runs.
+
+The one thing a reload cannot do is recover from a file that was valid when it was checked and is invalid when
+the new process reads it a moment later (two checks, milliseconds apart): the new daemon then exits like any
+start with a bad config, and the service starts it again once the file is fixed.
+
+#### A slow GitHub catch-up cannot freeze the pass
+
+Found on a real machine: the first catch-up of a busy repo (2135 items, nearly all of them for no agent, and a
+`workflow runs` read that timed out) kept the daemon busy for about two and a half minutes, and `decisions`
+said the daemon was not updating (the list is stale after 120 s). What was measured, with a fake `gh` that
+takes a second a call and a repo of 1200 comments nobody owns: the catch-up reads themselves are a handful of
+calls and run in the hub's own thread (5 calls); the pass was blocked by routing, which in the main pass made
+one `gh api` lookup per unowned item (1200 calls, 1200 s, the audit gaining a `github.unrouted` line each).
+Changed:
+
+- Routing has a time budget per pass (`GITHUB_ROUTE_SECONDS`, 5 s; each lookup has its own 8 s timeout). What
+  does not fit stays queued and is routed on the next pass; the same pass then took 5 s and 5 calls.
+- Items that belong to nobody are audited as one `github.unrouted` line per repo per pass, with a count and the
+  first 20 keys, not one line each. `github.catch_up` likewise names at most 20 keys and gives the count.
+- One catch-up keeps the newest 500 items (`GITHUB_CATCHUP_ITEMS`) and says so, and stops reading after 90 s
+  (`GITHUB_CATCHUP_SECONDS`), leaving the rest to the next one.
+- A secondary read (reviews, check suites, workflow runs) has a 10 s timeout and, once it fails, is not tried
+  again for 10 minutes; it is reported when it fails, not every pass, and the catch-up that includes it is
+  retried when the backoff ends, not every minute.
+- Fault `catch-up-blocks-pass` removes every bound; the test that a slow catch-up leaves the pass inside its
+  budget (and the decisions file fresh) fails under it: the same pass takes 1200 s.
+
 #### The daemon is alive when it is needed
 
 `send`, `report`, `launch`, `handoff`, `comment`, `remind`, `decisions`, `intent` and `bootstrap` call
@@ -1357,6 +1421,7 @@ has no brief to send (it does not know one), so a second code path there would b
 | `install [--opencode PATH] [--profile DIR] [--shared-profile] [--gh-user NAME] [--no-service] [--no-herdr-link] [--dry-run] [--uninstall]` | Above. Exit 0, or 1 with one line saying why it stopped |
 | `key set` / `key status` | Above. `set` exits 2 for an empty or spaced key and 1 if it cannot write the file; `status` exits 1 only when a key file is refused |
 | `bootstrap [--workspace LABEL] [--dir DIR] [--no-focus]` | Above. Prints one JSON line: `action` (`created` or `resumed`), `brief` (`sent` or `kept`), `workspace`, `pane`, `session`, `tab`. Exits 1 when a Chief of Staff already runs |
+| `restart` | Above: stop the daemon by its recorded pid (only a switchboard `run`), then `ensure`. Exit 1 when it refuses or the daemon does not stop in 15 s |
 | `run [--once] [--poll S] [--standby]` | `--standby` is new: wait for the lock instead of exiting |
 | `status [--json]` | Gains the key notice and the `daemon`, `key`, `plugin` and `service` lines |
 
@@ -1842,6 +1907,7 @@ R1.
 | E1 | A command that needs the daemon runs while it is dead | — | Ensure on use: the daemon is started first and the fact that waited is delivered | PR 16 | offline; control `no-ensure-on-use` |
 | E2 | `bootstrap` is run three times | — | One Chief of Staff: opened once, a second refused naming the one that runs, resumed in a workspace when its pane is gone | PR 16 | offline; the control is a variant that expects a second one |
 | E3 | The decision-model key is missing | — | `status` says so in its first line, in plain words | PR 16 | offline; control `key-missing-silent` |
+| C2 | An edit to the config file is applied without a restart; a broken edit leaves the daemon running and says so; a fix recovers | — | The daemon reloads its config when the file changes, and never stops on an invalid one | PR 16 | offline; control `config-read-once` |
 
 ## Repo and PR conventions
 
@@ -2390,3 +2456,13 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   unless it is set, so a private install needs it (only the name is the Lab's) and a shared one, which has no
   wrapper, never gets it. And a shared-profile install wrote a `fleet-opencode` wrapper that nothing used,
   since the config then names the binary: it is no longer written, and `--uninstall` still removes one.
+- 2026-10-06: PR 16, the daemon reloads its config, and a slow catch-up cannot freeze it. Found on the first
+  real use: the daemon built its engine once, so an edit to the config did nothing until a restart and nothing
+  said so (the Chief of Staff noticed, and restarted the daemon by hand), and the first catch-up of a busy
+  repo kept the pass busy for about two and a half minutes. Added `ConfigWatch` (mtime and size each pass, read
+  after a second of stillness, one validator), a re-exec in place that keeps the pid and the lock, the audit
+  events `config.reloaded`, `config.invalid` and `config.recovered`, the `INVALID` and `loaded` lines in
+  `status`, `fleet-switchboard restart`, faults `config-read-once` and `catch-up-blocks-pass`, and scenario C2.
+  Measured with a fake `gh` at a second a call and 1200 comments nobody owns: the catch-up reads were not the
+  blocker (5 calls, in the hub's own thread); routing in the main pass made one lookup per item (1200 calls,
+  1200 s) and now takes 5 s and 5 calls a pass.

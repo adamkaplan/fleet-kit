@@ -121,6 +121,8 @@ STEP_FIELDS = {
     "use": {"command": (True, "name")},
     "bootstrap": {},
     "close-agent": {"agent": (True, _CAST)},
+    # PR 16: the person edits the daemon's config file: a watched repo is added, or the file is left broken
+    "edit-config": {"add_repo": (False, "repo"), "broken": (False, "bool")},
 }
 ACTIONS = tuple(STEP_FIELDS)
 # Who may take each action: "you", "world", or "cast" (any cast member).
@@ -141,6 +143,7 @@ STEP_ACTORS = {
     "use": ("you",),  # PR 16
     "bootstrap": ("world",),
     "close-agent": ("world",),
+    "edit-config": ("world",),  # PR 16
 }
 EXPECT_FIELDS = {
     "delivered": {"to": (True, _CAST), "key": (True, "name"), "mode": (False, "mode"),
@@ -188,6 +191,8 @@ EXPECT_FIELDS = {
     "status_first_line": {"text": (True, "text")},
     "bootstrap_says": {"step": (True, _STEP), "text": (True, "text")},
     "fleet_sessions": {"agent": (True, _CAST), "count": (True, "count0")},
+    # PR 16: the daemon's own account of its config in `status`, at that time: it holds `text`
+    "config_says": {"at": (True, "duration"), "text": (True, "text")},
 }
 EXPECTATIONS = tuple(EXPECT_FIELDS)
 STEP_COMMON = ("at", "actor", "do", "why")

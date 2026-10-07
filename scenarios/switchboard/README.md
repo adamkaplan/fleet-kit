@@ -68,6 +68,7 @@ is how many.
 | `delete-decisions` | world | none | `decisions.json` is deleted, as in D4; the next pass writes it again (PR 14). Offline only |
 | `use` | you | `command` (one that ensures the daemon, such as `decisions`) | You run a command that needs the daemon: ensure-on-use runs first, with a start that is this runner's daemon (PR 16). Offline only |
 | `bootstrap` | world | none | `fleet-switchboard bootstrap` on the fakes: opens the Chief of Staff (`cos`, which the cast names but the play does not create), or resumes it, or is refused (PR 16). Offline only |
+| `edit-config` | world | [`add_repo`], [`broken`] | PR 16, offline, with `repos`. The person edits the daemon's config file: `add_repo` adds a watched repo to `github_repos`; `broken` leaves the file half written. The daemon's own config watch looks at it every pass and reloads through `reload_in_place` |
 | `close-agent` | world | `agent` | The agent's pane is closed, as you would close it (PR 16). Offline only |
 | `wait` | world | none | Marks the end of the play |
 
@@ -104,6 +105,7 @@ is how many.
 | `decisions_say` | `at`, `text` | At the time `at`, the command's output contains `text` (PR 14). The Lab reads it only when the play ends, so `at` must be the time of the last step there |
 | `status_says` | `text` | The first line `fleet-switchboard status` prints, for a machine whose config asks for the decision model and which has no key, contains `text` (PR 16). Offline only |
 | `bootstrap_says` | `step`, `text` | What the `bootstrap` step with that index printed contains `text` (PR 16). Offline only |
+| `config_says` | `at`, `text` | PR 16, offline. What `status` says of the daemon's own config at that time (`loaded <time>`, or `INVALID since ...`) holds `text` |
 | `fleet_sessions` | `agent`, `count` | `count` v2 sessions carry that cast member's fleet name, so a second Chief of Staff was not made (PR 16). Offline only |
 
 **Mode.** Whether a message was a note or a wake is read from what it did,

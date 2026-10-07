@@ -263,6 +263,8 @@ KNOWN_FAULTS = (
     "no-ensure-on-use",     # PR 16: a command that needs the daemon does not start it
     "shared-profile-default",  # PR 16: `install` writes into the directory the ordinary OpenCode reads, by default
     "key-env-only-unseen",  # PR 16: `status` does not warn that the key is in the shell's environment only
+    "config-read-once",     # PR 16: the daemon ignores an edit to its config file until it is restarted
+    "catch-up-blocks-pass",  # PR 16: GitHub reads have no time budget or cap, so a big catch-up holds the pass
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -1155,7 +1157,10 @@ class LockError(Exception):
 def single_instance(state_dir):
     """Hold $STATE/run.lock for the life of the block, or raise LockError at once."""
     path = Path(state_dir) / "run.lock"
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = adopt_inherited_lock(path)
+    if fd is None:
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    _HELD_LOCK["fd"] = fd
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1163,10 +1168,34 @@ def single_instance(state_dir):
             holder = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
             raise LockError("another %s run holds %s (pid %s)" % (PROG, path, holder)) from None
         os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)  # an adopted descriptor is not at the start
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
         yield path
     finally:
+        _HELD_LOCK["fd"] = None
         os.close(fd)  # closing the descriptor releases the lock
+
+
+LOCK_FD_ENV = "FLEET_SWITCHBOARD_LOCK_FD"  # set across a re-exec: the descriptor that still holds run.lock
+_HELD_LOCK = {"fd": None}
+
+
+def adopt_inherited_lock(path):
+    """The descriptor a daemon passed across `exec` to itself, when it is the lock file of `path`; else None.
+    The flock belongs to the open file description, so it was never released: there was no gap."""
+    raw = os.environ.pop(LOCK_FD_ENV, None)
+    try:
+        fd = int(raw) if raw else None
+        if fd is None:
+            return None
+        held, here = os.fstat(fd), os.stat(str(path))
+        if (held.st_dev, held.st_ino) != (here.st_dev, here.st_ino):
+            os.close(fd)
+            return None
+        os.set_inheritable(fd, False)
+        return fd
+    except (OSError, ValueError):
+        return None
 
 
 class KeyTimes(set):
@@ -2461,7 +2490,7 @@ def wait_for_poke(sock, timeout):
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
-def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None):
+def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None):
     """`run`: a pass on every poke, and at least every `poll` seconds, under the
     single-instance lock.
 
@@ -2486,6 +2515,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None):
             done = 0
             while True:
                 drain_pokes(sock)
+                if watch is not None and on_reload is not None and watch.check() == "reload":
+                    on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
                     engine.run_pass()
                 except Exception as err:
@@ -2493,7 +2524,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None):
                 done += 1
                 if passes is not None and done >= passes:
                     return done
-                wait(sock, next_poll(engine, poll))
+                timeout = next_poll(engine, poll)
+                wait(sock, min(timeout, CONFIG_STABLE_SECONDS) if watch is not None and watch.pending else timeout)
         finally:
             if sock is not None:
                 sock.close()
@@ -4360,6 +4392,14 @@ GITHUB_LOOKUP_TTL = 600
 GITHUB_LOOKUP_RETRY = 60
 GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
+GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
+GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
+GITHUB_CATCHUP_SECONDS = 90    # per catch-up: after this the remaining reads are left to the next one
+GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
+GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
+GITHUB_READ_BACKOFF = 600      # a secondary read that failed is not tried again for this long
+GITHUB_AUDIT_KEYS = 20         # keys named in one audit line; the rest are only counted
+SECONDARY_READS = ("reviews", "check suites", "workflow runs", "items")
 GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
 CONFLICT_TEXT = "Hook already exists"
 WATCH_FILE = "github-watch.json"
@@ -4862,6 +4902,7 @@ class GitHubHub:
         self.port, self.server, self.threads, self.stopping = config["github_port"] or 0, None, [], threading.Event()
         self._cache, self._retry, self._rejects, self._suppressed = {}, {}, [], 0
         self._unrouted, self._snapshot = set(), None
+        self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
         self.engine = None
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
@@ -5141,8 +5182,15 @@ class GitHubHub:
             waiting = [item for item in self.queue.values() if item.recipient is None]
         if waiting:
             discovery = self.discover()
-            for item in waiting:
-                self._route(item, discovery, now)
+            self._route_until = None if fault("catch-up-blocks-pass") else now + GITHUB_ROUTE_SECONDS
+            try:
+                for item in waiting:
+                    if self._route_until is not None and self.now() >= self._route_until:
+                        break  # the rest is routed on the next pass: the pass itself must stay on schedule
+                    self._route(item, discovery, now)
+            finally:
+                self._route_until = None
+            self._audit_unrouted()
         with self.lock:
             found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
                           repo=i.repo)
@@ -5167,8 +5215,22 @@ class GitHubHub:
             elif item.key in self.queue:
                 del self.queue[item.key]
                 if item.key not in self._unrouted:
+                    if len(self._unrouted) > 20000:
+                        self._unrouted.clear()
                     self._unrouted.add(item.key)
-                    self._audit("github.unrouted", item.repo, {"keys": [item.key], "issues": item.issues})
+                    self._unrouted_batch.append(item)
+
+    def _audit_unrouted(self):
+        """One audit line per repo per pass for the items that belong to nobody, not one line each."""
+        with self.lock:
+            batch, self._unrouted_batch = self._unrouted_batch, []
+        by_repo = {}
+        for item in batch:
+            by_repo.setdefault(item.repo, []).append(item)
+        for repo, items in sorted(by_repo.items(), key=lambda pair: str(pair[0])):
+            issues = sorted({n for item in items for n in item.issues})
+            self._audit("github.unrouted", repo, {"keys": [i.key for i in items[:GITHUB_AUDIT_KEYS]], "count": len(items),
+                                                   "issues": issues[:GITHUB_AUDIT_KEYS]})
 
     def owner_of(self, item, agents, now):
         """The owner of an item: known issues first, then reads that climb to parents
@@ -5207,8 +5269,11 @@ class GitHubHub:
                 return cached[1]
             if now < self._retry.get(key, 0):
                 raise GitHubUnavailable("read of %s failed recently; trying again later" % path)
+        if self._route_until is not None and self.now() >= self._route_until:
+            raise GitHubUnavailable("this pass's time for reading GitHub is spent")
         try:
-            pages = self.gh_api("repos/%s/%s" % (repo, path), paginate=False)
+            pages = self.gh_api("repos/%s/%s" % (repo, path), paginate=False,
+                                timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
             data = pages[0] if pages and isinstance(pages[0], dict) else {}
         except GitHubUnavailable:
             with self.lock:
@@ -5292,14 +5357,14 @@ class GitHubHub:
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
 
-    def gh_api(self, path, paginate=True):
+    def gh_api(self, path, paginate=True, timeout=None):
         argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
         named = re.match(r"^repos/([^/]+/[^/]+)/", path)
         env = self.child_env(named.group(1)) if named else None
         extra = {"env": env} if env is not None else {}
         try:
-            done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"],
-                               **extra)
+            done = self.runner(argv, capture_output=True, text=True,
+                               timeout=timeout or self.config["call_timeout_seconds"], **extra)
         except (OSError, subprocess.SubprocessError) as err:
             raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0],
                                                        self.accounts.scrub(_one_line(str(err))))) from None
@@ -5316,12 +5381,22 @@ class GitHubHub:
         time, for a poll that asks only for what is new), keyed exactly as the webhooks are. Returns
         (items, errors): one read failing does not stop the others."""
         since, items, errors, pulls = iso(since_epoch if since_epoch is not None else now - self.lookback), [], [], []
+        started, bounded = self.now(), not fault("catch-up-blocks-pass")
 
         def read(name, path, key=None):
+            secondary = name in SECONDARY_READS
+            until = self._read_backoff.get((repo, name))
+            if bounded and until is not None and self.now() < until:
+                return []  # it was reported when it failed; it is not tried, or reported, again until the backoff ends
+            if bounded and self.now() - started >= GITHUB_CATCHUP_SECONDS:
+                errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, GITHUB_CATCHUP_SECONDS))
+                return []
             try:
-                return _records(self.gh_api(path), key)
+                return _records(self.gh_api(path, timeout=GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None), key)
             except GitHubUnavailable as err:
                 errors.append("%s: %s" % (name, err))
+                if secondary and bounded:
+                    self._read_backoff[(repo, name)] = self.now() + GITHUB_READ_BACKOFF
                 return []
 
         def fresh(record, field="updated_at"):
@@ -5358,7 +5433,11 @@ class GitHubHub:
         for run in read("workflow runs", base + "actions/runs?per_page=50", "workflow_runs"):
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
-        return [item for item in items if item is not None], errors
+        items = [item for item in items if item is not None]
+        if bounded and len(items) > GITHUB_CATCHUP_ITEMS:
+            errors.append("items: kept the newest %d of %d" % (GITHUB_CATCHUP_ITEMS, len(items)))
+            items = sorted(items, key=lambda item: item.created)[-GITHUB_CATCHUP_ITEMS:]
+        return items, errors
 
     def catch_up(self, watch, now, polled=False):
         """The catch-up read. `polled`: this is the poll of a repo with no forwarder, which asks only for what
@@ -5376,10 +5455,14 @@ class GitHubHub:
             changed = items or said != watch.catch_up_error or watch.last_catch_up is None
             watch.last_catch_up = now
             watch.catch_up_error = said
-            watch.catchup_at = now + GITHUB_LOOKUP_RETRY if errors and not polled else None  # a failed read is read again
+            retry = now + GITHUB_LOOKUP_RETRY
+            if errors and all(e.split(":")[0] in SECONDARY_READS for e in errors):  # a secondary read has its own backoff
+                due = [u for (r, _), u in self._read_backoff.items() if r == watch.repo and u > now]
+                retry = min(due) if due else retry
+            watch.catchup_at = retry if errors and not polled else None  # a failed read is read again
         if not polled or changed:  # a quiet poll every minute is not worth an audit line
-            self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items], "errors": errors,
-                                                        "polled": polled})
+            self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items[:GITHUB_AUDIT_KEYS]],
+                                                        "count": len(items), "errors": errors, "polled": polled})
 
     # -- the supervisor
 
@@ -5745,6 +5828,7 @@ def format_status(report):
                         config["poll_seconds"]))
     else:
         lines.append("%s config     %s" % (mark(config), config["error"]))
+    lines.extend(format_config_lines(report.get("daemon")))  # PR 16: the daemon's own account of its config
     state = report["state_dir"]
     lines.append("%s state      %s" % (mark(state), state["path"] if state["ok"] else state["error"]))
     lab = report["lab"]
@@ -5802,10 +5886,7 @@ def identify_caller(herdr, v2, environ):
 
 def build_engine(runner, now, actor, writable=True, socket_call=None):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
-    config = load_config()
-    if config["opencode"] is None:
-        raise ConfigError("'opencode' is not configured in %s: set it to the absolute path of the "
-                          "OpenCode v2 binary" % config_path())
+    config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
@@ -5818,6 +5899,7 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
 
 
 def cmd_run(args, runner, now, wait):
+    signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
     if args.once:
         with single_instance(state):
@@ -5836,8 +5918,14 @@ def cmd_run(args, runner, now, wait):
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
     if judge_server is not None:
         engine.judge_warm = make_judge_warmer(config, runner, now)
+    watch = ConfigWatch(config_path(), config, now, engine.audit, engine.actor,
+                        lambda **fields: update_daemon_record(state, **fields), signature)
+    argv = [sys.executable, os.path.realpath(__file__), "run"] + (["--poll", "%g" % args.poll] if args.poll else [])
+    # `--standby` is left out of a re-exec: the new process already holds the lock
     try:
-        run_daemon(engine, state, args.poll or config["poll_seconds"], wait, record=daemon_record(config))
+        run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
+                   record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
+                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv))
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -8638,6 +8726,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_install(args, runner, now, spawn)
         if args.action == "key":
             return cmd_key(args)
+        if args.action == "restart":
+            return cmd_restart(args, runner, spawn)
         if args.action == "bootstrap":
             return cmd_bootstrap(args, runner, now, socket_call)
         if args.action == "launch":
@@ -8774,7 +8864,7 @@ def daemon_record(config, environ=None):
 
 KEY_UNSEEN_BY_DAEMON = ("The decision-model key is only in this shell's environment, and the running daemon was started "
                         "without it: messages are not classified and tool calls are not judged. Run `%s key set` to "
-                        "save it, then restart the daemon." % PROG)
+                        "save it as a file; the daemon reads the file when it needs the key." % PROG)
 KEY_UNSEEN_BY_SERVICE = ("The decision-model key is only in an environment variable, not in a file, and the service will "
                          "not have it: launchd and systemd start the daemon without your shell's variables, so after a "
                          "restart messages are not classified and tool calls are not judged. Run `%s key set` to save "
@@ -8824,25 +8914,45 @@ def format_key_line(key):
 
 def daemon_report(state_dir):
     if not run_lock_held(state_dir):
-        return {"running": False, "pid": None, "key_source": None}
+        return {"running": False, "pid": None, "key_source": None, "config_loaded_at": None, "config_invalid": None}
     try:
         pid = int((Path(state_dir) / "run.lock").read_text().strip())
     except (OSError, ValueError):
         pid = None
-    return {"running": True, "pid": pid, "key_source": daemon_key_source(state_dir, pid)}
+    record = daemon_record_of(state_dir, pid)
+    source = record.get("key_source")
+    return {"running": True, "pid": pid, "key_source": source if isinstance(source, str) else None,
+            "config_loaded_at": record.get("config_loaded_at"), "config_invalid": record.get("config_invalid")}
 
 
-def daemon_key_source(state_dir, pid):
-    """The key source the running daemon recorded, or None: no record, an unreadable one, or one a different process
+def daemon_record_of(state_dir, pid):
+    """What the running daemon wrote about itself, or {}: no record, an unreadable one, or one a different process
     wrote (a daemon that died leaves its record behind)."""
     try:
         record = json.loads((Path(state_dir) / DAEMON_RECORD).read_text())
     except (OSError, ValueError):
-        return None
+        return {}
     if not isinstance(record, dict) or pid is None or record.get("pid") != pid:
-        return None
-    source = record.get("key_source")
+        return {}
+    return record
+
+
+def daemon_key_source(state_dir, pid):
+    source = daemon_record_of(state_dir, pid).get("key_source")
     return source if isinstance(source, str) else None
+
+
+def update_daemon_record(state_dir, **fields):
+    """Merge `fields` into daemon.json, for this process only (the record is the daemon's own)."""
+    path = Path(state_dir) / DAEMON_RECORD
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        record = {}
+    if not isinstance(record, dict) or record.get("pid") not in (None, os.getpid()):
+        record = {}
+    record.update(fields, pid=os.getpid())
+    _write_private(path, json.dumps(record, sort_keys=True) + "\n")
 
 
 def plugin_report(config, runner):
@@ -9994,11 +10104,194 @@ def add_install_parsers(sub):
     keys = key.add_subparsers(dest="key_action", required=True)
     keys.add_parser("set", help="Read the key from standard input (hidden at a terminal) into a private file")
     keys.add_parser("status", help="Say where the key comes from: file, environment or none")
+    sub.add_parser("restart", help="Stop the daemon by its recorded pid (only if it is a switchboard daemon), then "
+                                   "start it again")
     boot = sub.add_parser("bootstrap", help="Open the Chief of Staff in its own herdr workspace, or resume it")
     boot.add_argument("--workspace", metavar="LABEL", help="The workspace's label (default: %s)" % COS_WORKSPACE_LABEL)
     boot.add_argument("--dir", help="The Chief of Staff's working directory (default: here)")
     boot.add_argument("--no-focus", dest="stay_put", action="store_true",
                       help="Open the workspace without taking focus (for scripts and trials)")
+
+
+# ------------------------------------------------ the config is reloaded when the file changes
+
+CONFIG_STABLE_SECONDS = 1.0  # a changed file must stay as it is this long before it is read (an editor writes twice)
+
+
+def load_runnable_config(path=None):
+    """The config as the daemon needs it: valid, and with the OpenCode v2 binary named. The one validator the start
+    path and a reload both use."""
+    config = load_config(path)
+    if config["opencode"] is None:
+        raise ConfigError("'opencode' is not configured in %s: set it to the absolute path of the "
+                          "OpenCode v2 binary" % (path or config_path()))
+    return config
+
+
+def config_signature(path):
+    """(mtime, size) of the file, None when there is none (every default applies), or an `unreadable` marker."""
+    try:
+        info = os.stat(str(path))
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return ("unreadable", err.errno)
+    return (info.st_mtime_ns, info.st_size)
+
+
+class ConfigWatch:
+    """Compares the config file's mtime and size with what the daemon last loaded, once a pass.
+
+    A changed file is read only after it has stayed the same for CONFIG_STABLE_SECONDS, so an editor's two writes
+    are one reload and a half-written file is only ever read as the invalid file it is. `check()` answers `reload`
+    when the file is valid and says something different (`changed` names the keys, never their values, and `config`
+    is the new one). An invalid file never stops anything: it is audited once (`config.invalid`, with the reason)
+    and recorded in daemon.json, and the daemon goes on with the config it has.
+    """
+
+    def __init__(self, path, config, now, audit=None, actor="daemon", record=None, signature=None):
+        self.path, self.config, self.now, self.audit, self.actor = path, config, now, audit, actor
+        self.record = record or (lambda **fields: None)
+        self.evaluated = signature if signature is not None else config_signature(path)
+        self.loaded_at, self.pending_since = now(), None
+        self.seen = None
+        self.invalid, self.changed, self.new_config = None, [], None
+
+    @property
+    def pending(self):
+        return self.seen is not None
+
+    def _audit(self, event, detail):
+        if self.audit is not None:
+            self.audit.append(self.actor, event, None, detail)
+
+    def check(self):
+        if fault("config-read-once"):
+            return None
+        signature, moment = config_signature(self.path), self.now()
+        if signature == self.evaluated:
+            self.seen = None
+            return None
+        if signature != self.seen:
+            self.seen, self.pending_since = signature, moment
+            return None
+        if moment - self.pending_since < CONFIG_STABLE_SECONDS:
+            return None
+        try:
+            new = load_runnable_config(self.path)
+        except ConfigError as err:
+            self.evaluated, self.seen = signature, None
+            reason = _one_line(str(err), 300)
+            since = (self.invalid or {}).get("since") or iso(moment)
+            self.invalid = {"since": since, "reason": reason, "loaded_at": iso(self.loaded_at)}
+            self._audit("config.invalid", {"reason": reason, "still_running_on_the_config_loaded_at": iso(self.loaded_at)})
+            self.record(config_invalid=self.invalid)
+            return None
+        if config_signature(self.path) != signature:
+            return None  # it changed while it was read: look again once it is still
+        self.evaluated, self.seen = signature, None
+        recovered, self.invalid = self.invalid, None
+        if recovered:
+            self.record(config_invalid=None)
+        self.changed = sorted(name for name in set(new) | set(self.config) if new.get(name) != self.config.get(name))
+        if not self.changed:
+            if recovered:
+                self._audit("config.recovered", {"was_invalid_since": recovered["since"]})
+            return None
+        self.new_config = new
+        return "reload"
+
+
+def reexec_in_place(argv):
+    """Replace this process with `argv`, keeping the pid and the run.lock descriptor (so the lock is never released
+    and `ensure` never sees a gap). Returns only when it could not."""
+    fd, env = _HELD_LOCK["fd"], dict(os.environ)
+    if fd is not None:
+        os.set_inheritable(fd, True)
+        env[LOCK_FD_ENV] = str(fd)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(argv[0], argv, env)
+    except OSError:
+        if fd is not None:
+            os.set_inheritable(fd, False)
+        raise
+
+
+def reload_in_place(engine, hub, judge_server, watch, argv, execute=reexec_in_place):
+    """Apply a valid config change by starting the daemon over: everything built from the config (engine, watch set,
+    forwarders, judge server, accounts, clients) is rebuilt together, so nothing is half applied. The forwarders and
+    the judge socket are stopped first, the audit line says which, and the new process holds the same lock."""
+    forwarders = sorted(repo for repo, w in hub.watches.items() if w.proc is not None) if hub is not None else []
+    if hub is not None:
+        hub.stop()
+    if judge_server is not None:
+        judge_server.stop()
+    engine.audit.append(engine.actor, "config.reloaded", None, {
+        "changed": watch.changed, "forwarders_stopped": forwarders,
+        "judge_socket": "closed here, bound again by the new process"})
+    try:
+        execute(argv)
+    except OSError as err:  # it could not start over: carry on, with the old config and what was stopped started again
+        engine.audit.append(engine.actor, "config.reload_failed", None, {"error": _one_line(str(err), 200)})
+        if hub is not None:
+            hub.start()
+        if judge_server is not None:
+            judge_server.start()
+
+
+def format_config_lines(daemon):
+    """The daemon's own account of its config, for `status`: when it loaded, or that the file is invalid now."""
+    lines = []
+    invalid = (daemon or {}).get("config_invalid")
+    if invalid:
+        lines.append("ERROR config     INVALID since %s: %s; still running on the config loaded at %s"
+                     % (invalid.get("since"), invalid.get("reason"), invalid.get("loaded_at")))
+    elif (daemon or {}).get("config_loaded_at"):
+        lines.append("      config     loaded %s (the daemon's own record)" % daemon["config_loaded_at"])
+    return lines
+
+
+RESTART_PATIENCE = 15  # seconds a stopping daemon has to let go of its lock
+
+
+def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.sleep):
+    """Stop the daemon by its recorded pid, then `ensure`. It signals only a process that is a switchboard daemon."""
+    state = ensure_state_dir()
+    report = daemon_report(state)
+    if report["running"]:
+        pid = report["pid"]
+        if pid is None:
+            sys.stderr.write("%s: restart refused: the lock says a daemon runs but not which pid\n" % PROG)
+            return EXIT_ERROR
+        try:
+            done = runner(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10,
+                          stdin=subprocess.DEVNULL)
+            command = (done.stdout or "").strip()
+        except (OSError, subprocess.SubprocessError):
+            command = ""
+        if PROG not in command or not re.search(r"\brun\b", command):
+            sys.stderr.write("%s: restart refused: pid %d is not a %s daemon (it is: %s); nothing was signalled\n"
+                             % (PROG, pid, PROG, _one_line(command, 80) or "not running or unreadable"))
+            return EXIT_ERROR
+        try:
+            kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            sys.stderr.write("%s: could not signal pid %d: %s\n" % (PROG, pid, err.strerror or err))
+            return EXIT_ERROR
+        waited = 0.0
+        while run_lock_held(state):
+            if waited >= RESTART_PATIENCE:
+                sys.stderr.write("%s: pid %d did not stop within %ds; it was asked to, and nothing stronger was "
+                                 "sent\n" % (PROG, pid, RESTART_PATIENCE))
+                return EXIT_ERROR
+            sleep(0.1)
+            waited += 0.1
+    print("daemon %s" % ensure_daemon(state, spawn))
+    return EXIT_OK
 
 
 INSTALL_COMMANDS = {"key": cmd_key}
