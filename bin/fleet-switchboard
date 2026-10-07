@@ -91,6 +91,7 @@ DEFAULTS = {
     "launch_env": {},
     "herdr": "herdr",
     "batch_seconds": 90,
+    "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
     "poll_seconds": 5,
@@ -163,6 +164,9 @@ def validate_config(raw, source="config"):
     if not isinstance(config["herdr"], str) or not config["herdr"].strip():
         raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["herdr"]))
+    if config["send_to_working"] not in ("steer", "queue"):
+        raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
+                          % (source, config["send_to_working"]))
     executable = config["opencode_executable"]
     if executable is not None and (not isinstance(executable, str) or not os.path.isabs(executable)):
         raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
@@ -579,6 +583,12 @@ class V2Client:
         if description is not None:
             body["description"] = description
         return self._call("session.synthetic", {"sessionID": session_id}, body)
+
+    def interrupt(self, session_id, resume=False):
+        """`session.interrupt`: abort the active execution (the Escape key). VERIFIED in a throwaway v2 2.0.24:
+        the in-flight tool call is cut (state error, aborted), the answer is {"interrupted": true} (false when
+        idle), and with `resume` false nothing runs after it: a steering input waiting stays in the inbox."""
+        return self._call("session.interrupt", {"sessionID": session_id, "resume": "true" if resume else "false"})
 
     def prompt(self, session_id, text, metadata=None, delivery=None, resume=None):
         if delivery is not None and delivery not in self.DELIVERIES:
@@ -1060,6 +1070,10 @@ class Discovery:
 
 # ------------------------------------------------------------ the decision
 
+class InterruptRefused(Exception):
+    """`send --interrupt` from anyone but the recipient's boss."""
+
+
 class Plan:
     """What the delivery rule says for one recipient now.
 
@@ -1126,6 +1140,15 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
         return Plan(recipient, "note", "you prompted %s at %s" % (recipient, iso(observation.last_human_prompt)),
                     pending, observation)
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
+
+
+def steers_into_turn(config, observation, carried):
+    """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
+    the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
+    message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
+    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
+    return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
+            and any(fact.kind == "send" and fact.sender and fact.sender == _boss_of(observation) for fact in carried))
 
 
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
@@ -1602,11 +1625,13 @@ class Switchboard:
 
     # -- deliver
 
-    def deliver(self, plan):
+    def deliver(self, plan, interrupt=False):
         """Write one note or wake for `plan`, after observing the agent again.
 
         Returns {"sent": bool, ...}. When the fresh look no longer supports the
-        plan, nothing is sent; the next pass decides again.
+        plan, nothing is sent; the next pass decides again. `interrupt` (`send --interrupt`, only
+        from a boss to its own worker) first aborts the agent's running turn and then sends the message
+        as a wake, whatever the plan said (a note to an engaged agent included).
         """
         if plan.action not in ("note", "wake"):
             raise ValueError("nothing to deliver for action %r" % plan.action)
@@ -1615,7 +1640,7 @@ class Switchboard:
             fresh, why = self.reobserve(observation, self.now())
             again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
                            self.engaged_seconds, why)
-            if again.action != plan.action:
+            if again.action != plan.action and not (interrupt and again.action in ("note", "wake")):
                 detail = {"was": plan.action, "now": again.action, "reason": again.reason,
                           "keys": [fact.key for fact in plan.pending]}
                 if self.audit is not None:
@@ -1630,12 +1655,25 @@ class Switchboard:
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
         message_id = derive_message_id(observation.session_id, keys)
-        resume = plan.action == "wake"
+        resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
+        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried)
+        if busy:
+            delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
+        if busy:
+            detail["busy"] = True
         description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
         detail["description"] = description
+        if interrupt:
+            # resume false: nothing else runs; the wake below is what the agent acts on (and it carries any
+            # steering input the interrupt left waiting)
+            with self._external("v2.interrupt", plan.recipient, {
+                    "session": observation.session_id, "resume": False, "keys": keys, "was": observation.status}) as result:
+                reply = self.v2.interrupt(observation.session_id, False)
+                result["interrupted"] = reply.get("interrupted") if isinstance(reply, dict) else None
+            detail["interrupted"] = True
         with self._external("v2.synthetic", plan.recipient, detail) as result:
             record = self.v2.synthetic(observation.session_id, text,
                                        {"fleet": {"keys": keys, "from": "switchboard"}},
@@ -1827,13 +1865,23 @@ class Switchboard:
 
     # -- the CLI's entry points
 
-    def send(self, sender, recipient, text, issue=None, repo=None):
-        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing."""
+    def send(self, sender, recipient, text, issue=None, repo=None, interrupt=False):
+        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing. `interrupt`: only a
+        boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
+        discovery = self.discover(now)
+        if interrupt:
+            target = discovery.agents.get(recipient)
+            if target is None or _boss_of(target) != sender:
+                reason = ("%s is not an agent of this fleet that reports to you" % recipient if target is None
+                          else "only a boss may interrupt, and %s does not report to %s" % (recipient, sender))
+                if self.audit is not None:
+                    self.audit.append(self.actor, "interrupt.refused", recipient, {"from": sender, "reason": reason})
+                raise InterruptRefused(reason)
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        return self.send_fact(fact, self.discover(now), now)
+        return self.send_fact(fact, discovery, now, interrupt=interrupt)
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -1841,7 +1889,7 @@ class Switchboard:
         discovery = getattr(self, "discovery", None)
         return watched_repos(self.config, discovered_fleets(discovery))
 
-    def send_fact(self, fact, discovery, now, carried=()):
+    def send_fact(self, fact, discovery, now, carried=(), interrupt=False):
         """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule."""
         recipient = fact.recipient
         plan = self.plan(recipient, [fact] + list(carried), discovery, now)
@@ -1849,7 +1897,7 @@ class Switchboard:
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
             return {"sent": False, "action": "hold", "reason": plan.reason}
-        return self.deliver(plan)
+        return self.deliver(plan, interrupt=interrupt)
 
     def report(self, sender, state, text, issue=None, everything=False):
         """PR 13: `sender` tells the one it reports to what happened. An attention report (done, failed, blocked,
@@ -7160,7 +7208,11 @@ def cmd_send(args, runner, now):
     except IssueRefError as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
-    outcome = engine.send(sender, args.name, text, number, repo)
+    try:
+        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
+    except InterruptRefused as err:
+        sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
+        return EXIT_USAGE
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
@@ -10089,6 +10141,9 @@ def build_parser():
     send.add_argument("name", help="The recipient's fleet name")
     send.add_argument("text", nargs="+", help="The message")
     send.add_argument("--issue", type=issue_arg, help="The issue the message is about")
+    send.add_argument("--interrupt", action="store_true",
+                      help="Stop and hold orders only: abort the recipient's running turn (its in-flight tool call "
+                           "is cut), then deliver the message as a wake. Only a boss to its own worker.")
     send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     report = sub.add_parser(
         "report", help="Tell the one you report to what happened: done, failed, blocked, question (they wake it) "
