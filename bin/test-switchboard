@@ -23904,6 +23904,8 @@ class TestExternalDecisionSync(ExternalWorld):
         self.run_pass()
         sent = [t for t in self.notes_to("api-coder") if "Answered outside by the project agent" in t]
         self.assertEqual(len(sent), 1, "applied once, the duplicate ignored")
+        self.assertFalse([t for t in self.notes_to("api-coder") if "answer changed" in t], "the duplicate is not a reversal")
+        self.assertEqual(self.audit_events("external.reversed"), [])
         self.assertIn("use the totals table", sent[0])
         self.assertEqual(self.labels()["acme/api#2"], [], "the issue's labels are off")
         comments = [c["body"] for c in self.gh.comments[before["comments"]:]]
