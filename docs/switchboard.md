@@ -988,7 +988,8 @@ decision by its id in chat ("answer #2a: yes"). It is **derived, never the sourc
 of truth** (invariant 1): every row comes from a fact that already lives
 somewhere else, and deleting the file loses nothing.
 
-**What is a decision.** Each is `{id, title, ask, repo, agent, kind, since}`, oldest
+**What is a decision.** Each is `{id, title, headline, ask, repo, agent, kind, since, tier}` (and, on an issue
+that a report was folded into, `reported_by`), oldest
 first, from three sources, one function (`derive_decisions`) that reuses the
 readers the pass already has:
 
@@ -997,6 +998,21 @@ readers the pass already has:
 | An open issue with your label (`awaiting_label`, default `<OS user>:awaiting-user`, as in `skills/fleet-charter`) | `issue` | The issue title; agent is the orchestrator that owns the issue | The hub's picture of every watched repo (PR 15): `issues` and `issue_comment` webhook events keep it, and the catch-up read (one `gh api` call per repo per forwarder start, never per pass, with that repo's own account) makes it right |
 | A pending permission request or question of any fleet agent, a boss with no boss included | `permission`, `question` | `permission: shell echo hi`, the agent that asked | What `WorkerFacts` already reads for a blocked agent |
 | A `question` or `blocked` report delivered to a boss and not answered | `report` | The report's line, the worker that sent it | The boss's transcript (`decisions_lookback_hours`, default 72) |
+
+**The headline** is what the panel shows; `title` stays as it was, for older readers and for the CLI.
+The daemon computes it once per pass in `derive_decisions`, so every reader agrees: an issue's is its title; a
+report's is the title of the issue it is about (when its repo and issue are known) and then its gist, else the
+report line. Every URL is shortened (a GitHub issue or pull request URL `https://github.com/o/r/issues/N` becomes
+`r#N`, any other URL its host), and the text is cut at a word boundary to what fits two panel lines (34
+characters each), with an ellipsis only past that. The issue title comes from what the daemon already holds,
+never from a new `gh` read: the open decision's own title (the hub's picture), else the intent reader's cached
+issue; a report whose issue is in neither keeps its report line.
+
+**One question, shown once.** A report and an issue decision with the same repo and issue number are one question:
+the report is folded into the issue's decision, which keeps the issue's id and gains `reported_by` (the reporting
+agents). A report with no issue number is folded in only when its text names exactly one open decision's issue
+(a short ref `repo#N` or an issue URL) in its own repo; naming none, two or another repo's issue leaves it a
+decision of its own. Ids are assigned before folding and never change.
 
 A report is **answered** only when the boss has sent that worker something on
 the same ask (a `send` with no `--issue` counts for any ask: the worker has
@@ -1061,9 +1077,13 @@ shows it), and the plugin shows a row `daemon not updating` (scenario D5).
 `decisions.mjs`, whose pure functions (read the file, staleness, rows) are tested
 with node. v2 loads it from the profile's `cli.json` (`{"plugins":
 ["./fleet-decisions"]}`, a directory holding `tui.tsx`), into the `sidebar.content`
-slot, as a section titled **Decisions (N)**, grouped by repo (a header and a rule
-between repos; repos by name, oldest decision first), each decision a line
-`<id> <age>` and then its whole title word-wrapped to 34 characters. The section never
+slot, as a section titled **Decisions (N)**, in two tiered sections, **Waits on you (n)** first and **Waits on cos (n)**
+second (a third, **Waits on orchestrator (n)**, only when one exists), each grouped by repo (repos by name,
+oldest decision first). An entry is its headline in at most two lines of 34 characters, then `<id> <age>` (with
+the reporting agent after it when a report was folded in); a thin rule separates entries and a heavy one
+separates repos and sections. A file an older daemon wrote has no headline: the title is used, cut the same way.
+**Waits on you** is the human tier only, in every panel: the Chief of Staff's own panel lists the other tiers
+under the sections after it, and a human's panel has the one section. The section never
 disappears (design law: no disappearing UI): an empty list is a row `none`, and a
 missing, unreadable or stale file, or a state directory it cannot place, is a row
 `daemon not updating`. It watches the **directory** of `decisions.json` with
@@ -1817,7 +1837,7 @@ else shows the `human` tier. The title says which (`Decisions (3) all`, `Decisio
 (2) acme/api`, `Decisions (1) for you`); the empty, stale and unset rows keep their
 rules and never disappear. The view is chosen first and the repo grouping applies to what it selects: the
 Chief of Staff's panel has a group for every repo, a pane with a repo has that repo's group alone, and each
-decision keeps its `<id> <age>` line and its whole wrapped title. **A TUI that was already running has neither the
+decision keeps its headline and its `<id> <age>` line. **A TUI that was already running has neither the
 variables nor the new plugin: restart it.** The agent's own command line (`fleet-switchboard decisions`) uses the
 same defaults.
 
