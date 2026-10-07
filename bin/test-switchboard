@@ -13627,6 +13627,13 @@ const list = [
 ];
 
 results.unset = [d.stateDirOf({}), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "" }), d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "/s" })];
+results.stateDefaults = [
+  d.stateDirOf({ XDG_STATE_HOME: "/x" }),
+  d.stateDirOf({ HOME: "/h" }),
+  d.stateDirOf({ FLEET_SWITCHBOARD_STATE: "/s", HOME: "/h" }),
+  d.stateDirOf({ XDG_STATE_HOME: "rel", HOME: "/h" }),
+  d.stateDirOf({ XDG_STATE_HOME: "rel" }),
+];
 results.noDir = d.loadSnapshot(null, now).status;
 results.missing = d.loadSnapshot(dir, now).status;
 put("{not json");
@@ -13672,6 +13679,18 @@ class TestDecisionsPlugin(Base):
     def test_the_state_directory_comes_from_the_environment_alone(self):
         self.assertEqual(self.r["unset"], [None, None, "/s"])
         self.assertEqual(self.r["noDir"], "unset")
+
+    def test_with_nothing_set_the_state_directory_is_the_one_the_daemon_writes_to(self):
+        # The first real install: nothing exports FLEET_SWITCHBOARD_STATE to a TUI, so the panel could only
+        # ever say "daemon not updating". The daemon writes to the XDG state directory (a relative
+        # XDG_STATE_HOME is ignored, as the CLI ignores it), and the plugin now looks there too.
+        self.assertEqual(self.r["stateDefaults"], [
+            "/x/fleet-switchboard",                    # XDG_STATE_HOME
+            "/h/.local/state/fleet-switchboard",       # HOME only
+            "/s",                                      # an explicit variable still wins
+            "/h/.local/state/fleet-switchboard",       # a relative XDG_STATE_HOME is ignored
+            None,                                      # no HOME either: honestly unset
+        ])
 
     def test_a_missing_or_unreadable_file_is_never_a_list(self):
         self.assertEqual((self.r["missing"], self.r["garbage"], self.r["wrongShape"]),

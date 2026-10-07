@@ -1044,12 +1044,14 @@ with node. v2 loads it from the profile's `cli.json` (`{"plugins":
 slot, as a section titled **Decisions (N)** with a row `<id> <age> <title>` for
 each decision, cut to 34 characters so a row never wraps. The section never
 disappears (design law: no disappearing UI): an empty list is a row `none`, and a
-missing, unreadable or stale file, or an unset `FLEET_SWITCHBOARD_STATE`, is a row
+missing, unreadable or stale file, or a state directory it cannot place, is a row
 `daemon not updating`. It watches the **directory** of `decisions.json` with
 `fs.watch`, because the file is replaced by rename, with one slow re-read every 60
 s and one timer for the moment a list would turn stale. It spawns no process, holds
-no credential and makes no network call; it reads only the file named by
-`FLEET_SWITCHBOARD_STATE`, which the trial's wrapper exports. `switchboard-trial
+no credential and makes no network call; it reads only `decisions.json` in the state
+directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
+daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or
+`$HOME/.local/state/fleet-switchboard`. `switchboard-trial
 up` installs it and `status` says whether it is installed; a TUI picks it up when
 it is restarted (`switchboard-trial restart`), and `up` never restarts v2. The
 sidebar exists on the session screen only, and only in a terminal wide enough to
@@ -2513,3 +2515,18 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   slow-catch-up tests now start from a marker an hour old (a fresh start reads nothing); a restart test leaves
   a marker file behind; and G3's first comment moved. After deleting the state, a test shows nothing is
   replayed and nothing is delivered twice.
+- 2026-10-07: three more things the first real use found, fixed on PR 16.
+  - **A large reply was cut short.** OpenCode v2's `api` command loses the end of a large reply when it
+    writes to a pipe and exits: a real 500 KB transcript arrived cut at 293 KB inside a string, so every read
+    of the Chief of Staff's transcript failed with `bad_json`, a worker's `done` report was held, and the
+    decisions list could not read its reports. The same error had shown in the trial's classifier. The v2
+    client now has the command write to a file and reads that back; a runner that truncates a pipe the way v2
+    does reproduces the failure in a test.
+  - **The end of a listing was an error.** v2 names a `next` cursor even when the page just returned held the
+    whole listing, and following it answers an empty page. `message_pages` raised on that, so a read that
+    paged past one page could never finish. An empty continuation now ends the walk; one that repeats a
+    message is still an error.
+  - **The Decisions panel could only say "daemon not updating".** The plugin found its file only through
+    `FLEET_SWITCHBOARD_STATE`, which the trial's wrapper exported and a real install does not. With nothing set
+    it now looks in the directory the daemon writes to by default. A TUI loads plugins when it starts, so a
+    running one needs a restart, and one that started before `install` has no panel at all.

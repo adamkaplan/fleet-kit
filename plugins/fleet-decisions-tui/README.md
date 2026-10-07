@@ -8,13 +8,15 @@ line of its title. You read it and refer to a decision by its id in chat.
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
   changes and touches on every pass. It never derives anything itself.
 - An empty list shows a row `none`. A file that is missing, unreadable, older than 120 s,
-  or a plugin with no `FLEET_SWITCHBOARD_STATE` shows `daemon not updating`. The section is
-  never absent.
+  or a plugin that cannot tell where the state directory is shows `daemon not updating`. The
+  section is never absent.
 - It watches the **directory** of the file (the daemon replaces it by rename) with
   `fs.watch`, with one slow re-read every 60 s and one check for the moment a list would turn
   stale. It spawns no process, holds no credential and makes no network call.
-- It finds the file through `FLEET_SWITCHBOARD_STATE`, the switchboard's state directory.
-  `bin/switchboard-trial` sets it in the wrapper that starts v2.
+- It finds the file in the switchboard's state directory: `FLEET_SWITCHBOARD_STATE` when it
+  is set (`bin/switchboard-trial` sets it in the wrapper that starts v2), otherwise the
+  directory the daemon writes to by default, `$XDG_STATE_HOME/fleet-switchboard` or
+  `$HOME/.local/state/fleet-switchboard`. A real install sets nothing, so the default is what runs.
 
 ## Using it
 

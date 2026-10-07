@@ -1,8 +1,9 @@
 // The pure part of the Decisions plugin: read the file the switchboard daemon keeps, say how old it is, and
 // turn it into the rows the sidebar draws. No process is spawned and nothing leaves this machine; the file
-// is read from a state directory named by FLEET_SWITCHBOARD_STATE. See docs/switchboard.md, "Decisions (PR 14)".
+// is read from the switchboard's state directory (FLEET_SWITCHBOARD_STATE, else the daemon's default one).
+// See docs/switchboard.md, "Decisions (PR 14)".
 import { readFileSync, statSync } from "node:fs"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 
 export const STATE_ENV = "FLEET_SWITCHBOARD_STATE"
 export const DECISIONS_FILE = "decisions.json"
@@ -11,10 +12,18 @@ export const SAFETY_MS = 60_000       // one slow re-read in case a file event w
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); a row never wraps
 export const NOT_UPDATING = "daemon not updating"
 
-// The state directory from the environment, or null when it is unset or empty.
+// The state directory: FLEET_SWITCHBOARD_STATE when it is set, else the one the daemon writes to by default,
+// $XDG_STATE_HOME/fleet-switchboard or $HOME/.local/state/fleet-switchboard (a relative XDG_STATE_HOME is
+// ignored, as the CLI ignores it). Null only when nothing says where it is. A TUI on a real install has
+// no FLEET_SWITCHBOARD_STATE, which only the trial's wrapper exported.
 export function stateDirOf(env) {
-  const value = env && env[STATE_ENV]
-  return typeof value === "string" && value.trim() ? value : null
+  const given = env && env[STATE_ENV]
+  if (typeof given === "string" && given.trim()) return given
+  const xdg = env && env.XDG_STATE_HOME
+  if (typeof xdg === "string" && isAbsolute(xdg)) return join(xdg, "fleet-switchboard")
+  const home = env && env.HOME
+  if (typeof home === "string" && isAbsolute(home)) return join(home, ".local", "state", "fleet-switchboard")
+  return null
 }
 
 // What the file says now: {status, decisions, errors, ageMs}.
