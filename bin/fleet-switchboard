@@ -163,8 +163,6 @@ DEFAULTS = {
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
-    # External decision systems: OFF by default. See EXTERNAL_DEFAULTS and docs/switchboard.md.
-    "external_decisions": None,
 }
 
 EXTERNAL_DEFAULTS = {
@@ -211,7 +209,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS))
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -264,6 +262,8 @@ def validate_config(raw, source="config"):
 
 def validate_external_config(config, source):
     """`external_decisions`: None or {} is off. Checked like every other key; filled with EXTERNAL_DEFAULTS."""
+    if "external_decisions" not in config:
+        return   # off: the key is absent from a config that never named it, so nothing about it exists
     raw = config["external_decisions"]
     if raw is None:
         raw = {}

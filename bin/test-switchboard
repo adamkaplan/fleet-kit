@@ -23712,7 +23712,8 @@ class TestExternalDecisionConfig(unittest.TestCase):
         return sb.validate_config({"external_decisions": section})["external_decisions"]
 
     def test_off_by_default_and_filled_when_absent(self):
-        for raw in ({}, {"external_decisions": None}, {"external_decisions": {}}):
+        self.assertNotIn("external_decisions", sb.validate_config({}), "a config that never names it has no such key")
+        for raw in ({"external_decisions": None}, {"external_decisions": {}}):
             found = sb.validate_config(raw)["external_decisions"]
             self.assertIs(found["enabled"], False)
             self.assertEqual((found["repos"], found["kinds"]), ([], ["issue", "report"]))
