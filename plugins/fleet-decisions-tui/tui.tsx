@@ -5,7 +5,7 @@
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, For } from "solid-js"
 import { watch } from "node:fs"
-import { ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
+import { HEAVY, THIN, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
@@ -46,18 +46,30 @@ export default {
           <text>
             <b>{view().title}</b>
           </text>
-          <For each={view().groups}>
-            {(group, i) => (
+          <For each={view().sections ?? []}>
+            {(section) => (
               <box flexDirection="column">
-                {i() > 0 ? <text>{"\u2500".repeat(ROW_WIDTH)}</text> : null}
+                <text>{HEAVY(ROW_WIDTH)}</text>
                 <text>
-                  <b>{group.repo}</b>
+                  <b>{section.title}</b>
                 </text>
-                <For each={group.entries}>
-                  {(entry) => (
+                {section.groups.length === 0 && view().groups.length > 0 ? <text>none</text> : null}
+                <For each={section.groups}>
+                  {(group, i) => (
                     <box flexDirection="column">
-                      <text>{entry.head}</text>
-                      <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
+                      {i() > 0 ? <text>{HEAVY(ROW_WIDTH)}</text> : null}
+                      <text>
+                        <b>{group.repo}</b>
+                      </text>
+                      <For each={group.entries}>
+                        {(entry, j) => (
+                          <box flexDirection="column">
+                            {j() > 0 ? <text>{THIN(ROW_WIDTH)}</text> : null}
+                            <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
+                            <text>{entry.head}</text>
+                          </box>
+                        )}
+                      </For>
                     </box>
                   )}
                 </For>

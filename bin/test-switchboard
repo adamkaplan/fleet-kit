@@ -13189,8 +13189,8 @@ class TestDecisionDerivation(DecisionsBase):
         self.assertRegex(found["id"], r"^#2[a-z]{2}$")
         self.assertIn("shell echo hi", found["title"])
         self.assertEqual(found["since"], sb.iso(EPOCH))
-        self.assertEqual(sorted(found), ["agent", "ask", "id", "kind", "repo", "request", "session", "since", "tier",
-                                         "title"])
+        self.assertEqual(sorted(found), ["agent", "ask", "headline", "id", "kind", "repo", "request", "session", "since",
+                                         "tier", "title"])
         self.assertEqual(found["tier"], "cos")  # PR 18: a prompt is the Chief of Staff's until the grace has run out
 
     def test_an_agent_with_no_boss_is_listed_too(self):
@@ -13431,6 +13431,113 @@ class TestDecisionDerivation(DecisionsBase):
         self.assertEqual([d["kind"] for d in found], ["report"])
         self.assertEqual([(e["source"], "v2 is broken" in e["error"]) for e in errors], [("v2", True)])
         self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.error"])
+
+
+class TestDecisionHeadlines(unittest.TestCase):
+    """The readable headline and the folding of a report into the issue it is about (no process, no network)."""
+
+    HOME = "acme/web"
+
+    def derive(self, items, cached=None, repos=("acme/web", "acme/api")):
+        engine = types.SimpleNamespace(
+            config={"intent_repo": self.HOME}, discovery=None, _note=lambda *a, **k: None,
+            intents=types.SimpleNamespace(_cache={("issue", r, n): (0, types.SimpleNamespace(title=t))
+                                                  for (r, n), t in (cached or {}).items()}))
+        found = list(items)
+        with mock.patch.object(sb, "decision_repos", return_value=list(repos)), \
+                mock.patch.object(sb, "decisions_from_github", lambda e, n: ([x for x in found if x["kind"] == "issue"], [])), \
+                mock.patch.object(sb, "decisions_from_requests", lambda e, n: ([], [])), \
+                mock.patch.object(sb, "decisions_from_reports", lambda e, n: ([x for x in found if x["kind"] == "report"], [])):
+            decisions, errors = sb.derive_decisions(engine, EPOCH + 60)
+        self.assertEqual(errors, [])
+        return decisions
+
+    @staticmethod
+    def issue(ask, title, repo=HOME, tier="human"):
+        return {"kind": "issue", "title": title, "ask": ask, "agent": "orch", "since": EPOCH, "seed": "i%s%s" % (repo, ask),
+                "bare": True, "repo": repo, "tier": tier}
+
+    @staticmethod
+    def report(text, ask=None, repo=HOME, agent="coder", tier="cos", since=EPOCH):
+        return {"kind": "report", "title": text, "ask": ask, "agent": agent, "since": since, "seed": "r%s%s%s" % (agent, ask, text),
+                "bare": False, "repo": repo, "tier": tier}
+
+    def test_the_panel_width_is_the_one_the_plugin_draws(self):
+        source = (DECISIONS_PLUGIN / "decisions.mjs").read_text()
+        self.assertIn("ROW_WIDTH = %d " % sb.HEADLINE_WIDTH, source)
+        self.assertIn("HEADLINE_LINES = %d " % sb.HEADLINE_LINES, source)
+
+    def test_urls_become_short_refs_and_other_urls_their_host(self):
+        self.assertEqual(sb.short_refs("see https://github.com/acme/spire-venue/issues/2109, and "
+                                       "https://github.com/acme/web/pull/7. Also https://docs.example.org/a/b?c=1 ok"),
+                         "see spire-venue#2109, and web#7. Also docs.example.org ok")
+
+    def test_an_issue_decision_headline_is_its_title(self):
+        (found,) = self.derive([self.issue(2, "Pick the database for https://github.com/acme/web/issues/9")])
+        self.assertEqual(found["headline"], "Pick the database for web#9")
+        self.assertEqual(found["title"], "Pick the database for https://github.com/acme/web/issues/9")
+
+    def test_a_report_headline_names_the_issue_it_is_about_from_the_cache_then_the_gist(self):
+        (found,) = self.derive([self.report("Which database should it use?", ask=5)], cached={(self.HOME, 5): "Storage choice"})
+        self.assertEqual(found["headline"], "Storage choice: Which database should it use?")
+
+    def test_a_report_with_no_cached_issue_keeps_its_report_line_and_reads_nothing_new(self):
+        reads = []
+        engine = types.SimpleNamespace(intents=types.SimpleNamespace(
+            _cache={}, issue=lambda *a: reads.append(a)))
+        self.assertIsNone(sb.cached_issue_title(engine, self.HOME, 5, {}))
+        self.assertEqual(reads, [])
+        (found,) = self.derive([self.report("Which database should it use?", ask=5)])
+        self.assertEqual(found["headline"], "Which database should it use?")
+
+    def test_a_long_report_starting_with_a_url_fits_two_lines_and_ends_in_an_ellipsis(self):
+        text = "https://github.com/acme/spire-venue/issues/2109 " + "needs a decision on the schema " * 12
+        (found,) = self.derive([self.report(text)])
+        self.assertTrue(found["headline"].startswith("spire-venue#2109 needs"))
+        self.assertTrue(found["headline"].endswith("\u2026"))
+        self.assertLessEqual(sb._wrap_count(found["headline"].split(), sb.HEADLINE_WIDTH), 2)
+        self.assertNotIn("http", found["headline"])
+        self.assertTrue(found["title"].startswith("https://github.com/acme/spire-venue/issues/2109 needs"))  # title unchanged
+
+    def test_a_headline_that_fits_is_never_cut(self):
+        self.assertEqual(sb.fit_lines("two short words"), "two short words")
+        self.assertEqual(sb.fit_lines("x" * 200)[-1], "\u2026")
+        self.assertEqual(sb.fit_lines("aa bb cc dd ee", 5, 2), "aa bb cc\u2026")
+        self.assertEqual(sb.fit_lines("aa bb cc", 5, 2), "aa bb cc")
+
+    def test_a_long_issue_title_and_a_long_gist_both_stay_in_two_lines(self):
+        (found,) = self.derive([self.report("gist " * 40, ask=5)], cached={(self.HOME, 5): "title " * 30})
+        self.assertLessEqual(sb._wrap_count(found["headline"].split(), sb.HEADLINE_WIDTH), 2)
+        self.assertIn("gist", found["headline"])
+
+    def test_a_report_on_an_issue_that_is_a_decision_is_shown_once_under_the_issues_id(self):
+        found = self.derive([self.issue(5, "Storage choice"), self.report("Which database?", ask=5, agent="coder")])
+        (only,) = found
+        self.assertEqual((only["kind"], only["ask"], only["reported_by"]), ("issue", 5, ["coder"]))
+        self.assertIn("5", only["id"])
+
+    def test_the_same_number_in_another_repo_is_not_the_same_question(self):
+        found = self.derive([self.issue(5, "Storage choice"), self.report("Which database?", ask=5, repo="acme/api")])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "report"])
+        self.assertNotIn("reported_by", [k for d in found for k in d])
+
+    def test_an_untagged_report_naming_exactly_one_open_issue_is_folded_in(self):
+        found = self.derive([self.issue(5, "Storage choice"), self.issue(6, "Other"),
+                             self.report("blocked on web#5 until you pick", agent="c1"),
+                             self.report("see https://github.com/acme/web/issues/6", agent="c2")])
+        self.assertEqual(sorted((d["ask"], d.get("reported_by")) for d in found), [(5, ["c1"]), (6, ["c2"])])
+
+    def test_an_untagged_report_naming_none_or_two_stays_a_decision_of_its_own(self):
+        found = self.derive([self.issue(5, "A"), self.issue(6, "B"),
+                             self.report("which of web#5 or web#6?", agent="c1"),
+                             self.report("nothing here, or web#99", agent="c2"),
+                             self.report("api#5 is a different repo", agent="c3")])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "issue", "report", "report", "report"])
+
+    def test_ids_are_the_ones_the_unfolded_list_assigns(self):
+        both = self.derive([self.issue(5, "Storage choice"), self.report("Which database?", ask=5)])
+        alone = self.derive([self.issue(5, "Storage choice")])
+        self.assertEqual(both[0]["id"], alone[0]["id"])
 
 
 class TestDecisionsFromGitHub(Base):
@@ -13925,7 +14032,9 @@ class TestDecisionsPlugin(Base):
         first, second = group["entries"]
         self.assertEqual((first["head"], first["lines"]), ("#2ab 12m", ["Close #2? and a second deploy run?"]))
         self.assertEqual(second["head"], "platform-481 45s")
-        self.assertEqual("".join(second["lines"]).replace(" ", ""), "permission:shell" + "x" * 200)
+        self.assertEqual(len(second["lines"]), 2)  # at most two lines, whatever the title
+        self.assertTrue(second["lines"][-1].endswith("\u2026"))
+        self.assertTrue("".join(second["lines"]).replace(" ", "").startswith("permission:shellxxxx"))
         for entry in (first, second):
             for line in entry["lines"] + [entry["head"]]:
                 self.assertLessEqual(len(line), 34)
@@ -13949,16 +14058,21 @@ class TestDecisionsPlugin(Base):
         self.assertEqual([e["key"] for e in g[1]["entries"]], ["web#2", "web#9"])
         lines = self.r["groupedLines"]
         self.assertEqual(lines[0], "Decisions (3) for you")
-        self.assertEqual(lines.count("\u2500" * 34), 1)
-        self.assertEqual(lines[1:5], ["acme/api", "api#1 3m", "api only", "\u2500" * 34])
-        self.assertEqual(lines[5:10], ["acme/web", "web#2 50m", "older web", "q" * 34, "q" * 6])
+        heavy = "\u2501" * 34
+        self.assertEqual(lines.count(heavy), 2)  # above the section and between the repos
+        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "api#1 3m", heavy])
+        self.assertEqual(lines[7:9], ["acme/web", "older web"])
+        self.assertEqual(lines[9], "q" * 33 + "\u2026")  # two lines, then an ellipsis
+        self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
+        self.assertEqual(lines[13], "web#9 5m")
 
     def test_a_file_older_than_two_minutes_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
         self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "groups": [], "rows": [{"key": "state", "text": "daemon not updating"}]})
 
     def test_an_empty_list_shows_none_and_the_section_is_never_empty(self):
-        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0) for you", "groups": [], "rows": [{"key": "none", "text": "none"}]})
+        self.assertEqual(self.r["emptyView"], {"title": "Decisions (0) for you", "groups": [], "rows": [{"key": "none", "text": "none"}],
+                                          "sections": [{"key": "human", "title": "Waits on you (0)", "count": 0, "groups": []}]})
         for key in ("view", "staleView", "emptyView", "errorsView", "junkView"):
             self.assertTrue(self.r[key]["rows"] or self.r[key]["groups"], key)
 
@@ -15534,7 +15648,8 @@ console.log(JSON.stringify([entryOf(d, now), entryOf({ ...d, id: "api#2", repo: 
         long_e, short_e = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(long_e["head"], "acme/site#2ab 1m")
         self.assertEqual(short_e["head"], "api#2 1m")
-        self.assertEqual("".join(long_e["lines"]), "x" * 80)
+        self.assertEqual(len(long_e["lines"]), 2)  # two lines at most, the second ending in an ellipsis
+        self.assertTrue(long_e["lines"][1].endswith("\u2026"))
         self.assertTrue(all(len(x) <= 34 for x in long_e["lines"]))
 
     def test_the_view_counts_decisions_and_keys_entries_by_the_tagged_id(self):
@@ -20523,6 +20638,85 @@ class TestDecisionsPanelViews(Base):
         text = " ".join((DECISIONS_PLUGIN / "README.md").read_text().split())
         self.assertIn("restart it", text)
         self.assertIn("FLEET_SWITCHBOARD_ROLE", text)
+
+
+LAYOUT_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.now();
+const iso = (ms) => new Date(ms).toISOString();
+const mk = (id, repo, tier, headline, mins, extra = {}) =>
+  ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(now - mins * 60000), ...extra });
+const list = [
+  mk("web#5", "acme/web", "cos", "web cos question", 40),
+  mk("api#2", "acme/api", "human", "api for you " + "long ".repeat(30), 90),
+  mk("web#7", "acme/web", "human", "web for you", 10, { reported_by: ["coder"] }),
+  mk("web#8", "acme/web", "human", "second for you", 5),
+  mk("site#1", "acme/site", "orchestrator", "orch one", 3),
+  { id: "old#1", repo: "acme/old", title: "only a title", since: iso(now - 60000) },
+];
+const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
+const cos = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
+const human = d.buildView(snap, now, 34, d.viewOf({}));
+console.log(JSON.stringify({
+  cosTitles: cos.sections.map((s) => s.title),
+  cosKeys: cos.sections.map((s) => s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])),
+  humanTitles: human.sections.map((s) => s.title),
+  humanKeys: human.sections.map((s) => s.groups.map((g) => [g.repo, g.entries.map((e) => e.key)])),
+  lines: d.viewLines(cos),
+  humanLines: d.viewLines(human),
+  entry: d.entryOf(list[1], now),
+  via: d.entryOf(list[2], now).head,
+  noHeadline: d.entryOf(list[5], now),
+}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPanelLayout(Base):
+    def setUp(self):
+        super().setUp()
+        script = self.home / "layout-harness.mjs"
+        script.write_text(LAYOUT_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_what_waits_on_you_comes_first_then_what_waits_on_cos_each_grouped_by_repo(self):
+        self.assertEqual(self.r["cosTitles"], ["Waits on you (4)", "Waits on cos (1)", "Waits on orchestrator (1)"])
+        you, cos, orch = self.r["cosKeys"]
+        self.assertEqual(you, [["acme/api", ["api#2"]], ["acme/old", ["old#1"]], ["acme/web", ["web#7", "web#8"]]])
+        self.assertEqual(cos, [["acme/web", ["web#5"]]])
+        self.assertEqual(orch, [["acme/site", ["site#1"]]])
+
+    def test_a_humans_own_panel_keeps_to_the_human_tier_and_has_one_section(self):
+        self.assertEqual(self.r["humanTitles"], ["Waits on you (4)"])
+        self.assertEqual([k for g in self.r["humanKeys"][0] for k in g[1]], ["api#2", "old#1", "web#7", "web#8"])
+
+    def test_an_entry_is_its_headline_in_two_lines_at_most_then_id_and_age(self):
+        entry = self.r["entry"]
+        self.assertEqual(entry["head"], "api#2 1h30m")
+        self.assertEqual(len(entry["lines"]), 2)
+        self.assertTrue(entry["lines"][1].endswith("\u2026"))
+        self.assertNotIn("RAW", " ".join(entry["lines"]))  # the headline, not the raw title
+        self.assertEqual(self.r["noHeadline"]["lines"], ["only a title"])  # an older daemon's file: the title
+
+    def test_a_folded_report_names_its_agent_on_the_id_line(self):
+        self.assertEqual(self.r["via"], "web#7 10m coder")
+
+    def test_entries_are_separated_thinly_and_repos_and_sections_heavily(self):
+        lines = self.r["lines"]
+        heavy, thin = "\u2501" * 34, "\u2504" * 34
+        self.assertEqual(lines[:3], ["Decisions (6) all", heavy, "Waits on you (4)"])
+        self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
+        at = lines.index(thin)
+        self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
+        self.assertEqual(lines.index("Waits on cos (1)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertTrue(all(len(x) <= 34 for x in lines))
+
+    def test_the_tui_draws_the_sections_and_the_rules(self):
+        source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
+        for needle in ("view().sections", "section.title", "THIN(ROW_WIDTH)", "HEAVY(ROW_WIDTH)"):
+            self.assertIn(needle, source)
 
 
 class TestTierRoleText(unittest.TestCase):

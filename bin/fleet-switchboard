@@ -4204,10 +4204,110 @@ def report_answered(engine, report, reports, since, sends):
     return False
 
 
+# ---- the readable headline of a decision (the panel shows this; `title` stays for older readers)
+
+HEADLINE_WIDTH = 34   # the Decisions panel's ROW_WIDTH (plugins/fleet-decisions-tui/decisions.mjs); a test keeps them equal
+HEADLINE_LINES = 2
+_URL = re.compile(r"https?://[^\s<>\"'`]+")
+_GITHUB_REF = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(?:issues|pull)/(\d+)(?:[/?#].*)?$")
+_ISSUE_URL = re.compile(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)(?![\w])")
+_SHORT_REF = re.compile(r"(?<![\w/.-])((?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)#(\d+)(?!\w)")
+
+
+def short_refs(text):
+    """`text` with every URL as a short ref: a GitHub issue or pull request URL is `repo#N`, any other URL its host."""
+    def one(match):
+        url = match.group(0)
+        tail = ""
+        while url and url[-1] in ".,;:!?)]}":
+            url, tail = url[:-1], url[-1] + tail
+        found = _GITHUB_REF.match(url)
+        if found:
+            return "%s#%s%s" % (found.group(2), found.group(3), tail)
+        host = re.match(r"^https?://([^/?#\s]+)", url)
+        return (host.group(1) if host else url) + tail
+    return _URL.sub(one, text)
+
+
+def _wrap_count(words, width):
+    """How many lines `words` take at `width`: the panel's word wrap (a word wider than a line is broken hard)."""
+    lines, line = 0, 0
+    for word in words:
+        while len(word) > width:
+            if line:
+                lines, line = lines + 1, 0
+            lines, word = lines + 1, word[width:]
+        if not line:
+            line = len(word)
+        elif line + 1 + len(word) <= width:
+            line += 1 + len(word)
+        else:
+            lines, line = lines + 1, len(word)
+    return lines + (1 if line else 0)
+
+
+def fit_lines(text, width=HEADLINE_WIDTH, lines=HEADLINE_LINES):
+    """`text` cut at a word boundary to what fits `lines` lines of `width`; an ellipsis only when something was cut."""
+    words = text.split()
+    if _wrap_count(words, width) <= lines:
+        return " ".join(words)
+    kept = []
+    for word in words:
+        if _wrap_count(kept + [word + "\u2026"], width) > lines:
+            break
+        kept.append(word)
+    if not kept:  # one word wider than the whole headline: break it hard
+        return words[0][:width * lines - 1] + "\u2026"
+    return " ".join(kept) + "\u2026"
+
+
+def headline_of(item, issue_title):
+    """One decision's headline: an issue its title; a report the title of the issue it is about (when known) and
+    its gist, else the report line. URLs are short refs; at most HEADLINE_LINES panel lines."""
+    text = short_refs(" ".join(str(item["title"]).split()))
+    if item["kind"] != "report" or not issue_title:
+        return fit_lines(text)
+    about = short_refs(" ".join(issue_title.split()))
+    if _wrap_count((about + ": " + text).split(), HEADLINE_WIDTH) <= HEADLINE_LINES:
+        return about + ": " + text
+    if _wrap_count(about.split(), HEADLINE_WIDTH) > 1:  # one line for the issue, the rest for the report
+        about = fit_lines(about, HEADLINE_WIDTH, 1)
+    first = about
+    room = HEADLINE_WIDTH * HEADLINE_LINES - len(first) - 2
+    return fit_lines(first + ": " + text, HEADLINE_WIDTH, HEADLINE_LINES) if room > 8 else fit_lines(text)
+
+
+def cached_issue_title(engine, repo, number, listed):
+    """The title of issue `repo#number` from what the daemon already holds, never a new `gh` read: an open decision's
+    own title (the hub's picture), else the intent reader's cached issue (any age). None when neither knows it."""
+    if (repo, number) in listed:
+        return listed[(repo, number)] or None
+    reader = getattr(engine, "intents", None)
+    hit = reader._cache.get(("issue", repo, number)) if reader is not None and repo else None
+    found = hit[1] if hit else None
+    return (getattr(found, "title", None) or None)
+
+
+def named_issues(text, repo, wanted):
+    """The issue numbers `text` names, as a short ref (`name#N`, or `owner/name#N`) or an issue URL, among `wanted`
+    (the open issue decisions of `repo`)."""
+    found = set()
+    for match in _ISSUE_URL.finditer(text):
+        if match.group(1) == repo and int(match.group(2)) in wanted:
+            found.add(int(match.group(2)))
+    bare = _URL.sub(" ", text)
+    for match in _SHORT_REF.finditer(bare):
+        name = match.group(1)
+        if repo and (name == repo or name == repo.split("/")[-1]) and int(match.group(2)) in wanted:
+            found.add(int(match.group(2)))
+    return found
+
+
 def derive_decisions(engine, now):
     """(decisions, errors): every open decision, oldest first, and what could not be read.
 
-    Each decision is {id, title, ask, repo, agent, kind, since, tier} (PR 18: `cos`, `human` or `orchestrator`; a
+    Each decision is {id, title, headline, ask, repo, agent, kind, since, tier} (`headline`: what the panel shows;
+    an issue's decision may add `reported_by`, the agents whose report on it was folded in; PR 18: `cos`, `human` or `orchestrator`; a
     permission request or question also names its `session` and `request`). A source that fails is an error entry and the
     others are still listed (audited once per change). Call after `engine.discover` and a fact collection."""
     items, errors = [], []
@@ -4226,15 +4326,43 @@ def derive_decisions(engine, now):
     watched = decision_repos(engine)
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
     yours = {(item["repo"] or home, item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
+    listed = {(item["repo"] or home, item["ask"]): item["title"] for item in items if item["kind"] == "issue"}
+    wanted = {}
+    for repo, number in listed:
+        wanted.setdefault(repo, set()).add(number)
+    ids = dict(zip((id(item) for item in items), ids))
+    # one question, shown once: a report on an issue that is itself a decision (same repo and number) is folded into
+    # the issue's decision; so is an untagged report whose text names exactly one such issue in its repo
+    folded = {}
+    for item in items:
+        if item["kind"] != "report":
+            continue
+        repo, number = item["repo"] or home, item["ask"]
+        if not number:
+            named = named_issues(str(item["title"]), repo, wanted.get(repo, set()))
+            number = named.pop() if len(named) == 1 else None
+        if number and (repo, number) in listed:
+            folded[id(item)] = (repo, number)
+    reporters = {}
+    for item in items:
+        if id(item) in folded:
+            reporters.setdefault(folded[id(item)], []).append(item["agent"])
     decisions = []
-    for ident, item in zip(ids, items):
-        tier = item["tier"]
+    for item in items:
+        if id(item) in folded:
+            continue
+        ident, tier = ids[id(item)], item["tier"]
         if item["kind"] == "report" and item["ask"] and (item["repo"] or home, item["ask"]) in yours:
             tier = "human"  # the Chief of Staff escalated its issue: the report that raised it is yours too
+        repo = item.get("repo")
         decision = {"id": ident, "title": _line_of(item["title"], DECISION_REPORT_TITLE_MAX if item["kind"] == "report"
                                                   else DECISION_TITLE_MAX), "ask": item["ask"],
-                    "repo": item.get("repo"), "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"]),
+                    "repo": repo, "agent": item["agent"], "kind": item["kind"], "since": iso(item["since"]),
                     "tier": "human" if fault("tier-flat") else tier}
+        about = cached_issue_title(engine, item["repo"] or home, item["ask"], listed) if item["kind"] == "report" and item["ask"] else None
+        decision["headline"] = headline_of(item, about)
+        if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
+            decision["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
         if item.get("request"):
             decision.update(session=item["session"], request=item["request"])
         decisions.append(decision)

@@ -10,6 +10,7 @@ export const DECISIONS_FILE = "decisions.json"
 export const STALE_MS = 120_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
+export const HEADLINE_LINES = 2       // lines of one entry's headline
 export const WRAP_MAX_LINES = 40     // safety cap on one title's lines; no real title comes near it
 export const NOT_UPDATING = "daemon not updating"
 export const ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  // PR 18: set by `launch` and `bootstrap` in the pane's environment
@@ -123,7 +124,10 @@ export function wrapText(text, width, maxLines = WRAP_MAX_LINES) {
 export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const since = Date.parse(decision.since)
   const age = Number.isNaN(since) ? "?" : formatAge((nowMs - since) / 1000)
-  return { key: decision.id, head: `${decision.id} ${age}`, lines: wrapText(decision.title, width) }
+  const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
+  // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
+  const text = typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title
+  return { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
 }
 
 // The section: a title, decisions grouped by repo (repos by name, oldest decision first within one), and
@@ -135,35 +139,61 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
   }
   const sinceOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? Infinity : t }
   const shown = selectFor(snapshot.decisions, view)
-  const byRepo = new Map()
-  for (const d of shown) {
-    const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
-    if (!byRepo.has(repo)) byRepo.set(repo, [])
-    byRepo.get(repo).push(d)
+  const groupsOf = (list) => {
+    const by = new Map()
+    for (const d of list) {
+      const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
+      if (!by.has(repo)) by.set(repo, [])
+      by.get(repo).push(d)
+    }
+    return [...by.keys()].sort().map((repo) => ({
+      repo,
+      entries: by.get(repo)
+        .map((d, i) => ({ d, i }))
+        .sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i)
+        .map(({ d }) => entryOf(d, nowMs, width)),
+    }))
   }
-  const groups = [...byRepo.keys()].sort().map((repo) => ({
-    repo,
-    entries: byRepo.get(repo)
-      .map((d, i) => ({ d, i }))
-      .sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i)
-      .map(({ d }) => entryOf(d, nowMs, width)),
-  }))
+  const groups = groupsOf(shown)
+  // Waits on you is the human tier (a decision with no tier is the human's), in every view; what waits on the
+  // Chief of Staff follows. A human's own view selects only the first, so it has one section.
+  const tierOf = (d) => d.tier ?? "human"
+  const sections = [{ key: "human", label: "Waits on you", list: shown.filter((d) => tierOf(d) === "human") }]
+  if (view.kind !== "human") {
+    sections.push({ key: "cos", label: "Waits on cos", list: shown.filter((d) => tierOf(d) === "cos") })
+    const other = shown.filter((d) => !["human", "cos"].includes(tierOf(d)))
+    if (other.length) sections.push({ key: "orchestrator", label: "Waits on orchestrator", list: other })
+  }
   const rows = []
   if (!groups.length) rows.push({ key: "none", text: "none" })
   if (snapshot.errors.length) {
     rows.push({ key: "errors", text: oneLine(`${snapshot.errors.length} source(s) unreadable`, width) })
   }
-  return { title: `Decisions (${shown.length}) ${view.label}`, groups, rows }
+  return {
+    title: `Decisions (${shown.length}) ${view.label}`, groups, rows,
+    sections: sections.map((x) => ({ key: x.key, title: `${x.label} (${x.list.length})`, count: x.list.length, groups: groupsOf(x.list) })),
+  }
 }
 
-// The view as plain text lines (a rule between repos): what the sidebar shows, for tests and captures.
+// The rules of the layout: a thin one between entries, a heavy one between repos and above a section.
+export const THIN = (width) => "\u2504".repeat(width)
+export const HEAVY = (width) => "\u2501".repeat(width)
+
+// The view as plain text lines: what the sidebar shows, for tests and captures.
 export function viewLines(view, width = ROW_WIDTH) {
   const out = [view.title]
-  view.groups.forEach((g, i) => {
-    if (i) out.push("\u2500".repeat(width))
-    out.push(g.repo)
-    for (const e of g.entries) out.push(e.head, ...e.lines)
-  })
+  for (const section of view.sections ?? []) {
+    out.push(HEAVY(width), section.title)
+    if (!section.groups.length && view.groups.length) out.push("none")
+    section.groups.forEach((g, i) => {
+      if (i) out.push(HEAVY(width))
+      out.push(g.repo)
+      g.entries.forEach((e, j) => {
+        if (j) out.push(THIN(width))
+        out.push(...e.lines, e.head)
+      })
+    })
+  }
   for (const r of view.rows) out.push(r.text)
   return out
 }
