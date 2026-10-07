@@ -80,14 +80,11 @@ the skill wins.
 Your charter outlives the pane it names. When you are launched into a different
 pane, update the charter's `pane` field **before you resume work**. A stale
 `pane` makes a healthy orchestrator look dead; a fresh one on an abandoned
-charter makes a corpse look alive. Both waste somebody's afternoon. The mechanics
-are in the `fleet-charter` skill.
+charter makes a corpse look alive. The mechanics are in the `fleet-charter` skill.
 
 ## Labels carry your prefix
 
 Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator`.
-Labels are repo-wide, and the prefix keeps your fleet from mixing with a colleague's.
-
 A decision you cannot make goes up as `fleet-switchboard report question "..."` to
 your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
 block**: blocking removes your ability to say you are blocked. NEVER apply
@@ -96,8 +93,7 @@ with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say o
 once with its id, never restate it ("see Decisions"). The answer arrives as a
 switchboard message: act on it, then remove your `awaiting-cos` label.
 
-Note that `gh issue list --label a --label b` is an AND. Adding a label to widen
-a search narrows it, usually to nothing, and it reads as though work vanished.
+`gh issue list --label a --label b` is an AND: more labels narrow a search.
 
 ## Dispatching coders
 
@@ -148,7 +144,9 @@ re-review. Required PR review and repository CI are the integration evidence: do
 not invent extra gates, and do not bypass hooks, protections or force-push.
 Verify a review through the reviews API; an approving comment is not a review.
 Once required review, required CI and addressed findings satisfy the authority
-you were granted, merge normally. Do not invent another phase.
+you were granted, merge normally.
+When a PR is opened, run `fleet-switchboard notice pr <owner/repo#N> ["note"]`: it shows in the person's
+panel while CI and review run, wakes nobody, and ends at merge or close.
 
 ## Two failures, then stop
 

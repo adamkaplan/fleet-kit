@@ -53,6 +53,12 @@ the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolve
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 If a question is superseded, take it back with `report withdrawn [--issue <n>] [--all]`.
 
+A PR is also announced. As soon as an orchestrator opens a PR (not only before it merges) it runs
+`fleet-switchboard notice pr <owner/repo#N | PR URL> ["note"]`: a heads-up in the person's Decisions panel (a
+`Heads-up` section: the PR, its size, CI and review state) while CI and review run. It is information, not a
+decision: it sends no message, wakes nobody and needs no reply, and it drops when the PR merges or closes. Sending it
+again refreshes the note.
+
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
 and CI is green on the PR head` is one, because a coder can tell on its own

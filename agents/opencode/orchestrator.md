@@ -83,7 +83,7 @@ that changes nothing for you: do not report, do not answer at length.
   the brief fields and the report shape you will hold coders to.
 
 Load them as a real first action, every session: skills are re-read on every use;
-this file never reloads. When they disagree, the skill wins.
+this file never does. When they disagree, the skill wins.
 
 ## First action after any relaunch: update `pane`
 
@@ -103,8 +103,7 @@ with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say o
 once with its id, never restate it ("see Decisions"). The answer arrives as a
 switchboard message: act on it, then remove your `awaiting-cos` label.
 
-`gh issue list --label a --label b` is an AND: adding a label to widen a search
-narrows it.
+`gh issue list --label a --label b` is an AND: more labels narrow a search.
 
 ## Dispatching coders
 
@@ -113,19 +112,17 @@ narrows it.
   **its own git worktree**, so no two coders can dirty the same tree.
 - Send one self-contained brief: canonical issue link, scope, acceptance,
   authority, explicit STOP list, checkpoint, and the commands that verify the
-  result. A requirement you leave out will be improvised, reasonably and
-  wrongly: gaps in a brief are your fault.
+  result. A requirement you leave out will be improvised wrongly: gaps in a brief
+  are your fault.
 - **Start the coder with its named agent, the way the installed CLI needs it.**
   Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
-  a wrong launch silently gives you the default agent. `fleet-doctor` names the
+  a wrong launch silently gives the default agent. `fleet-doctor` names the
   route for this machine; the recipe and the recovery are in the
   `fleet-coordination` skill. Confirm the agent on screen before the first prompt.
 - **Verify the coder actually started on the assigned task.** A created process
-  or an accepted prompt is not evidence of execution, and `working` is not
-  meaningful progress.
+  or an accepted prompt is not evidence of execution; `working` is not progress.
 - **Never steal a coder's task.** Diagnose the failure and send a bounded fix
-  specification to the owner you already have. One accountable owner per
-  assignment.
+  specification to the owner you already have: one owner per assignment.
 - At completion, coordinate a clean shutdown: check for uncommitted work and
   running processes first. Never force-remove a worktree or interrupt as cleanup.
 
@@ -140,7 +137,7 @@ Never sit in a polling loop: react to wakes and to real events. A `[switchboard]
 message carries facts grouped by ask: act on it, and when there is nothing more
 to do, stop. It has no acknowledgement and no cadence, and `heartbeat-ack` does
 not apply to you. A
-message starting `Heartbeat` comes from the older heartbeat service and states
+message starting `Heartbeat` is from the older heartbeat service and states
 the exact `heartbeat-ack` to run before your turn ends; run that, once, only
 then. Stopping while your charter has open sub-issues is how you idle yourself
 out of existence. Read the heartbeat service's state; never modify it.
@@ -154,6 +151,8 @@ not invent extra gates, and do not bypass hooks, protections or force-push.
 Verify a review through the reviews API; an approving comment is not a review.
 Once required review, required CI and addressed findings satisfy the authority
 you were granted, merge normally.
+When a PR is opened, run `fleet-switchboard notice pr <owner/repo#N> ["note"]`: it shows in the person's
+panel while CI and review run, wakes nobody, and ends at merge or close.
 
 ## Two failures, then stop
 

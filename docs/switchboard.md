@@ -1887,6 +1887,60 @@ Faults (Lab only), one per behaviour: `tier-flat` (every decision is shown to yo
 (the guard is off), `answer-unjudged` (`decisions answer` and `resolve` skip the
 judge). Scenarios T1 to T6 are new (O, S and SG ids are taken).
 
+### PR notices (a heads-up before a merge)
+
+You should hear about every PR before it merges without the Chief of Staff relaying each one. An
+orchestrator sends a **notice** when it opens a PR (not only before it merges), so the notice sits in your panel
+while CI and review run. A notice is information, not a decision: it has no tier you answer, is never counted
+in `Decisions (n)`, and wakes nobody.
+
+**Sending.** `fleet-switchboard notice pr <owner/repo#N | PR URL> ["note"]`. The caller is identified by its pane,
+as `report` does (`--from` is Lab only). A reference that is not a PR is refused: an issue URL, a bare number, or
+any other URL. The notice is recorded in the disposable state file `pr-notices.json` (mode 0600, replaced
+atomically, like `report-riders.json`); no message is sent and no agent is woken, so it costs the Chief of Staff no
+turn. Like `report` it makes sure the daemon runs. Sending it again for the same PR refreshes the note and keeps
+the first time. `fleet-switchboard decisions` does not list notices: they are not decisions.
+
+**Deriving.** `derive_decisions` has a fourth source (after the issues, the pending requests and the reports).
+Each notice becomes one entry in `decisions.json`:
+
+| Field | Value |
+|---|---|
+| `kind`, `tier` | `notice`, `human` |
+| `id` | `pr:<repo>#N` (the repo's name, `owner/name` only when two notices share a name); stable |
+| `headline` | `<repo>#N <title>`, at most two panel lines |
+| `additions`, `deletions`, `files` | the PR's size, drawn as `+120/-14, 5 files` |
+| `ci` | `green`, `failing`, `pending` or `none`, from the check rollup |
+| `review` | `approved`, `changes requested` or `none` |
+| `state`, `stale` | `open`, and whether the last read of the PR failed (the facts shown are then the last good ones) |
+| `agent`, `note`, `since` | who sent it, its note, when it was first sent |
+| `merge_after` | the notice time plus `pr_notice_hold_minutes`, or `null` (see below) |
+
+**The PR's facts.** The daemon's GitHub picture holds an issue's or PR's title, size and state (the hub's cached
+`pulls/N` read) but not the checks or the review, so it cannot answer on its own. The source runs ONE
+`gh pr view <N> --repo <repo> --json title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision`
+per open notice, read with the repo's configured account (`gh_users`, as every other read), and keeps the answer
+for 60 seconds in memory: passes every few seconds cost a handful of reads a minute, never one per pass per notice.
+A failed read (also kept for 60 seconds, so it is not retried every pass) leaves the last facts, marked stale; it
+never drops the notice.
+
+**Lifetime.** A notice stays until its PR is merged or closed (read from the same facts). It then drops at the
+next pass and its record in `pr-notices.json` is pruned by the daemon (a read-only `decisions --fresh` forgets
+nothing). A notice whose PR cannot be read for 7 days (the first failed read is recorded in the file) is dropped
+and logged once as `notice.dropped` in the audit log.
+
+**The hold window.** The config key `pr_notice_hold_minutes` (a number of minutes, 0 or more; default `0`, off)
+is validated like the other keys. When it is above 0 each entry carries `merge_after` (the notice time plus the
+window; a re-send does not move it) and the panel adds `merges after HH:MM UTC` to the facts line (UTC, as every
+time the daemon writes). When it is 0 nothing is shown. Nothing enforces it: the tool-call judge is unchanged, and
+the window is a time the person can see and answer ("hold") before an orchestrator merges.
+
+**The panel.** The `fleet-decisions-tui` plugin draws a `Heads-up (n)` section after `Waits on you` and before
+`Waits on cos`, grouped by repo like the others and visibly separated. Each entry is its headline (two lines at
+most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC` when set, and `(stale)`
+when the last read failed), then `<id> <age>`. Notices never appear under `Waits on you` or in its count. A pane
+for one repo shows that repo's notices; the Chief of Staff's and yours show all.
+
 ### Data
 
 The switchboard keeps almost nothing. Each fact lives in the system that owns
@@ -1907,6 +1961,7 @@ it, and is read from there each time it is needed.
 | Reminders not yet due | Switchboard file `reminders.json` | |
 | How far each repo was read | Switchboard file `github-read.json`: `{"owner/repo": "<iso>"}`. A disposable cursor, not truth: deleting it means a fresh start | `status` shows its age per repo |
 | What waits on you, and with whom | Derived each pass; the projection is `decisions.json`, every tier (PR 18). A prompt the Chief of Staff escalated: `escalated-requests.json`, a disposable head start | `fleet-switchboard decisions` |
+| The PRs an orchestrator sent a heads-up about | Switchboard file `pr-notices.json` (PR notices): a disposable record, pruned when the PR merges or closes; the PR's facts are read from GitHub, cached 60 s | `fleet-switchboard notice pr` |
 | The Chief of Staff's own standing orders | The owner's file `standing-orders.md` beside `config.json` (PR 18): not state, never written by the switchboard except the template `install` makes | `fleet-switchboard orders --cos` |
 | What the switchboard did and why | Switchboard file `audit.jsonl` | |
 
