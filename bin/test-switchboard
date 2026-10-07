@@ -20289,6 +20289,20 @@ class TestBatchEscalate(BatchWorld):
             self.assertFalse([c for c in self.writes() if "/issues/%s/" % row.split("#")[1] in c[2]
                               and row.split("#")[0] in c[2]], row)
 
+    def test_an_escalated_batch_is_one_item_for_the_owner_and_escalating_again_changes_nothing(self):
+        ident = self.batch_id()
+        self.as_agent("cos")
+        self.main("decisions", "escalate", ident)
+        self.gh.calls.clear()
+        code, out, err = self.main("decisions", "escalate", ident)
+        self.assertEqual(code, 0, err)
+        self.assertIn("already yours: nothing changed", out)
+        self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+        os.environ.pop("HERDR_PANE_ID")                       # the owner's view: the human tier, every repo
+        code, out, err = self.main("decisions", "--fresh", "--json")
+        (mine,) = json.loads(out)["decisions"]
+        self.assertEqual((mine["id"], mine["tier"], len(mine["rows"])), (ident, "human", 3))
+
 
 class TestBatchAnswer(BatchWorld):
     def setUp(self):
