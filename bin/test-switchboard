@@ -21026,6 +21026,30 @@ class TestPrNotices(DecisionsBase):
         self.assertIsNone(self.notices()[0]["merge_after"])
         self.assertIn("merge_after", self.notices()[0])
 
+    def test_a_notice_read_gets_the_hubs_read_timeout(self):
+        self.notify()
+        self.notices()
+        self.assertEqual(self.gh.calls[0][1]["timeout"], min(self.world.engine.config["call_timeout_seconds"],
+                                                              sb.GITHUB_ROUTE_READ_TIMEOUT))
+
+    def test_a_hanging_github_spends_the_pass_budget_then_the_rest_wait_for_the_next_pass(self):
+        hang = subprocess.TimeoutExpired(["gh"], 8)
+        runner = FakeGhPr({n: hang for n in range(1, 7)})
+        slow = lambda argv, **kw: (setattr(self.world.clock, "t", self.world.clock.t + 8), runner(argv, **kw))[1]
+        self.world.engine.gh_runner = slow
+        for n in range(1, 7):
+            self.notify(number=n, at=EPOCH + n)
+        entries = self.notices()
+        reads = len(runner.calls)
+        self.assertEqual(reads, 2)  # 8 s each: the 15 s budget is spent after the second
+        self.assertEqual(len(entries), 6)
+        self.assertTrue(all(e["stale"] for e in entries))
+        self.assertEqual(sb.PR_NOTICE_PASS_BUDGET, 15)
+        self.assertEqual(self.world.engine.notice_effects["unreadable"].keys(), {"acme/api#1", "acme/api#2"})
+        self.world.tick(61)  # the cached ones expire; the next pass reads the skipped ones first
+        self.notices()
+        self.assertEqual([c[0][3] for c in runner.calls[reads:]], ["3", "4"])
+
     def test_two_repos_with_one_name_get_distinct_ids(self):
         self.gh.answers[8] = (0, pr_view_json(), "")
         self.notify(repo="acme/api")

@@ -4316,6 +4316,7 @@ def named_issues(text, repo, wanted):
 PR_NOTICES = "pr-notices.json"
 PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
+PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
 PR_NOTICE_UNREADABLE_DAYS = 7     # a notice whose PR cannot be read this long is dropped
 PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
@@ -4476,7 +4477,8 @@ def read_pr_facts(engine, repo, number):
     argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json", PR_VIEW_FIELDS]
     try:
         done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
-                                                    timeout=config["call_timeout_seconds"],
+                                                    timeout=min(config["call_timeout_seconds"],
+                                                                GITHUB_ROUTE_READ_TIMEOUT),
                                                     stdin=subprocess.DEVNULL, **extra)
     except (OSError, subprocess.SubprocessError) as err:
         raise NoticeError("gh pr view %s#%d: %s" % (repo, number, accounts.scrub(_one_line(str(err), 120)))) from None
@@ -4489,17 +4491,24 @@ def read_pr_facts(engine, repo, number):
         raise NoticeError("gh pr view %s#%d answered something that is not JSON" % (repo, number)) from None
 
 
-def notice_facts(engine, repo, number, now):
+def notice_facts(engine, repo, number, now, budget=None):
     """{facts, stale, error} for one notice: read at most once per PR_FACTS_TTL seconds (a failed read too), the
-    last good facts kept and marked stale when a read fails."""
+    last good facts kept and marked stale when a read fails. `budget` is a one-item list of seconds this pass may
+    still spend reading; when it is spent the read is skipped (stale, "skipped": True, not cached) until next pass."""
     key = "%s#%d" % (repo, number)
     held = engine.notice_facts.get(key)
     if held is not None and now - held["at"] < PR_FACTS_TTL:
         return held
+    if budget is not None and budget[0] <= 0:
+        return {"at": 0, "facts": held["facts"] if held else None, "stale": True, "skipped": True,
+                "error": "not read this pass: the notice reads' time budget is spent"}
+    started = engine.now()
     try:
         held = {"at": now, "facts": read_pr_facts(engine, repo, number), "stale": False, "error": None}
     except NoticeError as err:
         held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200)}
+    if budget is not None:
+        budget[0] -= max(0, engine.now() - started)
     engine.notice_facts[key] = held
     return held
 
@@ -4535,16 +4544,22 @@ def decisions_from_notices(engine, now):
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     names = [r.split("/")[-1] for r in decision_repos(engine)] + [i["repo"].split("/")[-1] for i in items]
     entries = []
-    for item in sorted(items, key=lambda i: (i["created"], i["repo"], i["number"])):
+    budget = [PR_NOTICE_PASS_BUDGET]
+    order = lambda i: (i["created"], i["repo"], i["number"])
+    # the least recently read go first, so a PR that hangs cannot starve the others of the budget
+    seen = lambda i: engine.notice_facts.get("%s#%d" % (i["repo"], i["number"]), {"at": 0})["at"]
+    for item in sorted(items, key=lambda i: (seen(i),) + order(i)):
         repo, number = item["repo"], item["number"]
         key = "%s#%d" % (repo, number)
-        held = notice_facts(engine, repo, number, now)
+        held = notice_facts(engine, repo, number, now, budget)
         facts = held["facts"]
         if facts is not None and facts["state"] in ("merged", "closed"):
             engine.notice_effects["drop"].add(key)
             continue
         since = item.get("unreadable_since")
-        if held["stale"]:
+        if held.get("skipped"):
+            pass  # not read this pass: neither readable nor unreadable, so the unreadable clock is left alone
+        elif held["stale"]:
             if since is None:
                 engine.notice_effects["unreadable"][key] = iso(now)
             elif now - (parse_iso(since) or now) >= PR_NOTICE_UNREADABLE_DAYS * 86400:
@@ -4566,8 +4581,8 @@ def decisions_from_notices(engine, now):
                  "files": facts.get("files"), "ci": facts.get("ci"), "review": facts.get("review"),
                  "stale": held["stale"], "note": item.get("note") or None,
                  "merge_after": iso(item["created"] + hold * 60) if hold > 0 else None}
-        entries.append(entry)
-    return entries, []
+        entries.append((order(item), entry))
+    return [entry for _, entry in sorted(entries, key=lambda pair: pair[0])], []
 
 
 
