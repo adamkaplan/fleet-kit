@@ -75,7 +75,7 @@
       "at": "45s",
       "as": "cos",
       "tier": "cos",
-      "count": 2,
+      "count": 1,
       "text": "Which database?"
     },
     {
@@ -90,7 +90,7 @@
       "that": "decisions",
       "at": "90s",
       "as": "you",
-      "count": 2,
+      "count": 1,
       "text": "Which database?"
     },
     {

@@ -13468,9 +13468,9 @@ class TestDecisionHeadlines(unittest.TestCase):
         self.assertIn("HEADLINE_LINES = %d " % sb.HEADLINE_LINES, source)
 
     def test_urls_become_short_refs_and_other_urls_their_host(self):
-        self.assertEqual(sb.short_refs("see https://github.com/acme/spire-venue/issues/2109, and "
+        self.assertEqual(sb.short_refs("see https://github.com/acme/venue-api/issues/2109, and "
                                        "https://github.com/acme/web/pull/7. Also https://docs.example.org/a/b?c=1 ok"),
-                         "see spire-venue#2109, and web#7. Also docs.example.org ok")
+                         "see venue-api#2109, and web#7. Also docs.example.org ok")
 
     def test_an_issue_decision_headline_is_its_title(self):
         (found,) = self.derive([self.issue(2, "Pick the database for https://github.com/acme/web/issues/9")])
@@ -13491,13 +13491,13 @@ class TestDecisionHeadlines(unittest.TestCase):
         self.assertEqual(found["headline"], "Which database should it use?")
 
     def test_a_long_report_starting_with_a_url_fits_two_lines_and_ends_in_an_ellipsis(self):
-        text = "https://github.com/acme/spire-venue/issues/2109 " + "needs a decision on the schema " * 12
+        text = "https://github.com/acme/venue-api/issues/2109 " + "needs a decision on the schema " * 12
         (found,) = self.derive([self.report(text)])
-        self.assertTrue(found["headline"].startswith("spire-venue#2109 needs"))
+        self.assertTrue(found["headline"].startswith("venue-api#2109 needs"))
         self.assertTrue(found["headline"].endswith("\u2026"))
         self.assertLessEqual(sb._wrap_count(found["headline"].split(), sb.HEADLINE_WIDTH), 2)
         self.assertNotIn("http", found["headline"])
-        self.assertTrue(found["title"].startswith("https://github.com/acme/spire-venue/issues/2109 needs"))  # title unchanged
+        self.assertTrue(found["title"].startswith("https://github.com/acme/venue-api/issues/2109 needs"))  # title unchanged
 
     def test_a_headline_that_fits_is_never_cut(self):
         self.assertEqual(sb.fit_lines("two short words"), "two short words")
@@ -19475,7 +19475,8 @@ class TestReportTiers(TierWorld):
                   "bare": True, "repo": API, "tier": "human"}]
         with mock.patch.object(sb, "decisions_from_github", return_value=(items, [])):
             found = self.listed()
-        self.assertEqual(sorted((d["kind"], d["tier"]) for d in found), [("issue", "human"), ("report", "human")])
+        self.assertEqual(sorted((d["kind"], d["tier"]) for d in found), [("issue", "human")])  # one question: the report is folded into the issue
+        self.assertEqual(found[0]["reported_by"], ["api-orch"])
 
     def test_the_tier_flat_fault_shows_a_cos_report_to_you(self):
         self.ask_the_boss("Which database?", sender="api-orch")
@@ -19980,7 +19981,7 @@ class TestEscalateARequestOrAReport(WriteWorld):
         self.gh.issue(API, 2, "the issue", labels=["me:awaiting-cos"])
         self.world.new_engine("cli").report("api-orch", "question", "Which database?", 2)
         self.world.tick(1)
-        ident = self.id_of("Which database?")
+        ident = self.id_of("the issue")  # the report is folded into its issue: one id, the issue's
         code, out, err = self.main("decisions", "escalate", ident)
         self.assertEqual(code, 0, err)
         self.assertEqual(self.gh.names(API, 2), ["me:awaiting-user"])
