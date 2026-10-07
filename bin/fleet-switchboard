@@ -1153,6 +1153,11 @@ def orders_note(recipient, fact, repos=None):
     return "\n".join(lines)
 
 
+def is_withdrawal(summary):
+    """A `withdrawn` report rider never ages out: only a message carrying it (or its worker going) drops it."""
+    return (summary or "").startswith("withdrawn: ")
+
+
 def collapse_riders(facts, now, max_age):
     """PR 13: riders cut to what is still worth carrying. A rider older than `max_age` seconds is
     dropped, and only the newest `worker.idle` of each sender stays. Facts that are not riders pass."""
@@ -1166,7 +1171,7 @@ def collapse_riders(facts, now, max_age):
     for fact in facts:
         if not fact.rider:
             kept.append(fact)
-        elif now - fact.created > max_age:
+        elif now - fact.created > max_age and not is_withdrawal(fact.summary):
             continue
         elif fact.kind == WORKER_IDLE and newest.get(fact.sender) is not fact:
             continue
@@ -1811,10 +1816,10 @@ class Switchboard:
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan)
 
-    def report(self, sender, state, text, issue=None):
+    def report(self, sender, state, text, issue=None, everything=False):
         """PR 13: `sender` tells the one it reports to what happened. An attention report (done, failed, blocked,
         question) is delivered now, by `send`'s own path, with the progress reports waiting for that boss. A
-        progress report (working, paused) is a rider: recorded, and carried by the next message. Raises
+        progress report (working, paused, withdrawn) is a rider: recorded, and carried by the next message. Raises
         ReportError when it cannot be a report."""
         if state not in REPORT_STATES:
             raise ReportError("state must be one of %s, got %r" % (", ".join(REPORT_STATES), state))
@@ -1824,6 +1829,13 @@ class Switchboard:
         if len(text) > REPORT_MAX:
             raise ReportError("a report is one line of at most %d characters (this one is %d): put the detail on "
                               "GitHub and report its link" % (REPORT_MAX, len(text)))
+        if everything and state != "withdrawn":
+            raise ReportError("--all only goes with `withdrawn`")
+        if state == "withdrawn":
+            if everything:
+                text = WITHDRAW_ALL + text
+            elif text.startswith(WITHDRAW_ALL.strip()):
+                text = "- " + text  # a plain withdrawal never reads as --all
         now = self.now()
         discovery = self.discover(now)
         me = discovery.agents.get(sender)
@@ -3324,8 +3336,9 @@ WORKER_STOPPED = "worker.stopped"  # PR 13: a worker stopped without reporting a
 NUDGE = "nudge"                    # PR 13: the one reminder to a worker that stopped without reporting
 REPORT = "report"
 REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss when it is not engaged
-REPORT_PROGRESS = ("working", "paused")                       # riders: carried, never the reason for a message
+REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
+WITHDRAW_ALL = "[all] "  # leads a `withdrawn` report made with --all: it clears every open question of the worker
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
 LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
@@ -3794,7 +3807,8 @@ def prune_report_riders(engine, discovery):
     by_recipient = {}
     for item in items:
         by_recipient.setdefault(item["to"], []).append(item)
-    gone = {item["key"] for item in items if engine.now() - item["created"] > engine.config["rider_max_age_seconds"]}
+    gone = {item["key"] for item in items if engine.now() - item["created"] > engine.config["rider_max_age_seconds"]
+            and not is_withdrawal(item["summary"])}
     for name, mine in sorted(by_recipient.items()):
         observation = discovery.agents.get(name)
         if observation is None:
@@ -4001,6 +4015,14 @@ def decisions_from_reports(engine, now):
                                 "repo": (repo_of_tag(match.group(2), repos)
                                          or (_fleet_repo(sender.fleet, engine.config) if sender else None)),
                                 "session": observation.session_id})
+        # a withdrawal is a rider: no message has carried it into the transcript yet, but it already counts
+        for item in (source.entries() if (source := _report_rider_source(engine)) is not None else []):
+            state, _, text = item["summary"].partition(": ")
+            sender = discovery.agents.get(item.get("from"))
+            if item["to"] == boss and state == "withdrawn" and item["created"] >= since and sender is not None:
+                reports.append({"at": (item["created"], 1 << 60), "message": item["key"], "sender": sender.name,
+                                "issue": item.get("issue"), "state": state, "text": text, "boss": boss,
+                                "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
             if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
@@ -4016,11 +4038,19 @@ def decisions_from_reports(engine, now):
 
 
 def report_answered(engine, report, reports, since, sends):
-    """True when a newer report from the same worker on the same ask, or a newer `send` from the boss to the
-    worker on it, exists. `sends` caches one read of each worker's transcript per derivation."""
+    """True when the boss sent the worker something on the ask (or on none), or the same worker later reported on
+    the same ask and repo a newer `question`, a `done`, `failed` or `withdrawn` (`withdrawn --all` on any ask).
+    An untagged report is answered only by a later untagged `done`, `failed` or `withdrawn`. `sends` caches one read of each worker's transcript per derivation."""
     for other in reports:
-        if other is not report and other["sender"] == report["sender"] and other["issue"] == report["issue"] \
-                and other["repo"] == report["repo"] and other["at"] > report["at"]:
+        if other is report or other["sender"] != report["sender"] or other["at"] <= report["at"]:
+            continue
+        if other["state"] == "withdrawn" and other["text"].startswith(WITHDRAW_ALL):
+            return True  # `withdrawn --all`: every open question of the worker, on any ask
+        if other["issue"] != report["issue"] or other["repo"] != report["repo"]:
+            continue
+        # working, paused and blocked never answer; an untagged report answers only by finishing or withdrawing
+        if other["state"] in (("done", "failed", "withdrawn") if report["issue"] is None
+                              else ("question", "done", "failed", "withdrawn")):
             return True
     worker = engine.discovery.agents[report["sender"]]
     if worker.problem:
@@ -6281,7 +6311,7 @@ def cmd_report(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
-        outcome = engine.report(sender, args.state, " ".join(args.text), args.issue)
+        outcome = engine.report(sender, args.state, " ".join(args.text), args.issue, args.everything)
     except (ReportError, IssueRefError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
@@ -9076,14 +9106,17 @@ def build_parser():
     send.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     report = sub.add_parser(
         "report", help="Tell the one you report to what happened: done, failed, blocked, question (they wake it) "
-                       "or working, paused (progress: carried by the next message, never waking)",
+                       "or working, paused, withdrawn (progress: carried by the next message, never waking)",
         description="Tell the agent you report to what happened, in one line (at most %d characters; detail "
                     "goes on GitHub). `done`, `failed`, `blocked` and `question` are attention reports: delivered "
-                    "now, by the rule `send` uses. `working` and `paused` are progress reports: they ride in the "
-                    "next message to your boss and never wake it by themselves." % REPORT_MAX)
+                    "now, by the rule `send` uses. `working`, `paused` and `withdrawn` are progress reports: they ride in "
+                    "the next message to your boss and never wake it by themselves. `withdrawn` takes back your "
+                    "open question or blocked report on the ask (--all: on every ask) because it no longer stands." % REPORT_MAX)
     report.add_argument("state", choices=REPORT_STATES, help="What happened")
     report.add_argument("text", nargs="+", help="One line: what happened (at most %d characters)" % REPORT_MAX)
     report.add_argument("--issue", type=issue_arg, help="The issue the report is about (default: your own)")
+    report.add_argument("--all", dest="everything", action="store_true",
+                        help="With `withdrawn`: withdraw every open question or blocked report of yours, on any ask")
     report.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     decisions = sub.add_parser(
         "decisions", help="What waits on you: the open decisions, one line each, from the file the daemon keeps",
@@ -9221,6 +9254,9 @@ KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
 DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
 DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
 HOOKS_PLUGIN_FILE = "fleet-hooks.js"
+TODOLIST_PLUGIN_NAME = "opencode-todolist"  # the directory (the vendored src/) in the profile's opencode config
+TODOLIST_LOADER_FILE = "opencode-todolist.ts"  # plugins/<this>: the one line OpenCode loads
+TODOLIST_LOADER_TEXT = 'export { default } from "../opencode-todolist/src/index.ts"\n'
 WRAPPER_NAME = "fleet-opencode"  # beside the profile, never named `opencode`: the person's own OpenCode keeps that name
 # Names a wrapper strips from a v2 process by shape, before it adds the one `gh` token agents are given. The same
 # pattern bin/switchboard-trial strips with: a test keeps the two equal.
@@ -9732,6 +9768,88 @@ def decisions_plugin_status(config_dir, kit_root=KIT_ROOT):
     return "installed" if same else "out of date"
 
 
+def _todolist_files(kit_root):
+    """{path relative to src/: bytes} for every file under the vendored plugin's src/."""
+    src = Path(kit_root) / "plugins" / "opencode-todolist" / "src"
+    return {str(p.relative_to(src)): p.read_bytes() for p in sorted(src.rglob("*")) if p.is_file()}
+
+
+def _todolist_paths(config_dir):
+    config = Path(config_dir)
+    return config / TODOLIST_PLUGIN_NAME, config / "plugins" / TODOLIST_LOADER_FILE
+
+
+def _same_bytes(path, content):
+    try:
+        return Path(path).read_bytes() == content
+    except OSError:
+        return False
+
+
+def install_todolist_plugin(config_dir, kit_root=KIT_ROOT):
+    """Copy the vendored todo plugin's src/ into <config>/opencode-todolist/ and write the loader
+    <config>/plugins/opencode-todolist.ts that re-exports it (a `plugins` entry naming the directory does not
+    load: its package.json exports an unbuilt ./dist). A loader this code did not write is refused, never
+    overwritten; so is a differing src file when there is no loader of ours to say the directory is ours.
+    Idempotent; True when anything changed."""
+    files = _todolist_files(kit_root)
+    target, loader = _todolist_paths(config_dir)
+    loader_bytes = TODOLIST_LOADER_TEXT.encode()
+    if loader.exists() and not _same_bytes(loader, loader_bytes):
+        raise InstallError("%s exists and the kit did not write it: move it aside, then run again" % loader)
+    ours = loader.exists()
+    if not ours:
+        for name, body in files.items():
+            if (target / name).exists() and not _same_bytes(target / name, body):
+                raise InstallError("%s exists and the kit did not write it: move it aside, then run again"
+                                   % (target / name))
+    changed = False
+    for name, body in files.items():
+        if not _same_bytes(target / name, body):
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            (target / name).write_bytes(body)
+            changed = True
+    if not ours:
+        loader.parent.mkdir(parents=True, exist_ok=True)
+        loader.write_bytes(loader_bytes)
+        changed = True
+    return changed
+
+
+def todolist_plugin_status(config_dir, kit_root=KIT_ROOT):
+    """`not installed`, `already installed`, or `differs from the kit`."""
+    files = _todolist_files(kit_root)
+    target, loader = _todolist_paths(config_dir)
+    if not loader.exists() and not any((target / name).exists() for name in files):
+        return "not installed"
+    same = _same_bytes(loader, TODOLIST_LOADER_TEXT.encode()) and all(
+        _same_bytes(target / name, body) for name, body in files.items())
+    return "already installed" if same else "differs from the kit"
+
+
+def uninstall_todolist_plugin(config_dir, kit_root=KIT_ROOT):
+    """Remove the files install wrote and only those: a file edited since stays, and so does its directory."""
+    target, loader = _todolist_paths(config_dir)
+    removed = False
+    if _same_bytes(loader, TODOLIST_LOADER_TEXT.encode()):
+        loader.unlink()
+        removed = True
+    for name, body in _todolist_files(kit_root).items():
+        if _same_bytes(target / name, body):
+            (target / name).unlink()
+            removed = True
+    for path in sorted((p for p in target.rglob("*") if p.is_dir()), reverse=True) if target.is_dir() else []:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    try:
+        target.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
 def remove_if_same(path, content):
     """Delete `path` when it still holds exactly `content` (what the kit wrote). False when absent or edited."""
     path = Path(path)
@@ -10136,7 +10254,9 @@ class Installer:
                  ("fleet-hooks plugin", lambda: install_hooks_plugin(profile, self.kit_root),
                   "%s/plugins/%s" % (profile, HOOKS_PLUGIN_FILE)),
                  ("decisions plugin", lambda: install_decisions_plugin(profile, self.kit_root),
-                  "%s/%s and cli.json" % (profile, DECISIONS_PLUGIN_NAME)))
+                  "%s/%s and cli.json" % (profile, DECISIONS_PLUGIN_NAME)),
+                 ("todolist plugin", lambda: install_todolist_plugin(profile, self.kit_root),
+                  "%s/%s and plugins/%s" % (profile, TODOLIST_PLUGIN_NAME, TODOLIST_LOADER_FILE)))
         for step, action, detail in steps:
             if self.dry:
                 self.dry_piece(step, profile)
@@ -10156,7 +10276,8 @@ class Installer:
                        "skills": lambda: install_skills(skills, self.kit_root),
                        "skills path": lambda: ensure_skills_path(shadow, self.skills_dir(), STANDARD_MODEL),
                        "fleet-hooks plugin": lambda: install_hooks_plugin(shadow, self.kit_root),
-                       "decisions plugin": lambda: install_decisions_plugin(shadow, self.kit_root)}
+                       "decisions plugin": lambda: install_decisions_plugin(shadow, self.kit_root),
+                       "todolist plugin": lambda: install_todolist_plugin(shadow, self.kit_root)}
             self.result(step, actions[step](), "in %s" % profile)
 
     # -- 3b: herdr's OpenCode integration, in the private profile
@@ -10433,7 +10554,8 @@ class Installer:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         wrapper = self.wrapper_path()
         self.uninstall_integration(config, profile, with_link)
-        for step, action in (("decisions plugin", lambda: uninstall_decisions_plugin(profile, self.kit_root)),
+        for step, action in (("todolist plugin", lambda: uninstall_todolist_plugin(profile, self.kit_root)),
+                             ("decisions plugin", lambda: uninstall_decisions_plugin(profile, self.kit_root)),
                              ("fleet-hooks plugin", lambda: uninstall_hooks_plugin(profile, self.kit_root)),
                              ("skills path", lambda: uninstall_skills_path(profile, self.skills_dir())),
                              ("skills", lambda: uninstall_skills(self.skills_dir(), self.kit_root)),
@@ -10489,7 +10611,8 @@ class Installer:
                 shutil.copytree(str(profile), str(shadow), symlinks=True)
             if self.skills_dir().exists():
                 shutil.copytree(str(self.skills_dir()), str(skills))
-            actions = {"decisions plugin": lambda: uninstall_decisions_plugin(shadow, self.kit_root),
+            actions = {"todolist plugin": lambda: uninstall_todolist_plugin(shadow, self.kit_root),
+                       "decisions plugin": lambda: uninstall_decisions_plugin(shadow, self.kit_root),
                        "fleet-hooks plugin": lambda: uninstall_hooks_plugin(shadow, self.kit_root),
                        "skills path": lambda: uninstall_skills_path(shadow, self.skills_dir()),
                        "skills": lambda: uninstall_skills(skills, self.kit_root),
