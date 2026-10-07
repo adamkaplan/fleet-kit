@@ -22243,6 +22243,20 @@ def baseline_failing_send(reason):
     return mock.patch.object(sb.Switchboard, "send", return_value={"sent": False, "reason": reason})
 
 
+@contextlib.contextmanager
+def baseline_failing_source(name):
+    """ADAPTER: one source of the derivation raises (today the decisions_from_<name> function the derivation calls)."""
+    target = {"v2": "decisions_from_requests", "github": "decisions_from_github", "reports": "decisions_from_reports",
+              "notices": "decisions_from_notices"}[name]
+    with mock.patch.object(sb, target, side_effect=RuntimeError("%s is broken" % name)):
+        yield
+
+
+def baseline_failing_derivation():
+    """ADAPTER: the whole derivation raises (today sb.derive_decisions)."""
+    return mock.patch.object(sb, "derive_decisions", side_effect=RuntimeError("boom"))
+
+
 def baseline_derive(engine, now):
     """ADAPTER: what the derivation lists now and what it could not read, notices included: (decisions, errors)
     (today sb.derive_decisions, after a discovery and a fact collection)."""
@@ -23109,6 +23123,37 @@ class TestDecisionBaselineProjection(BaselineWorld):
         errors = [e for e in self.world.audit() if e["event"] == "decisions.error"]
         baseline_golden(self, "projection-errors", {"errors": body["errors"], "decisions": [d["title"] for d in body["decisions"]],
                                                     "audit": [(e["subject"], e["detail"]) for e in errors]})
+
+
+class TestDecisionBaselineSourceErrors(BaselineWorld):
+    """A source that fails is an error entry; the others are still listed; it is audited once per change."""
+
+    def test_a_source_that_raises_is_an_error_entry_and_the_others_still_list(self):
+        self.gh.issue(API, 2, "An issue", labels=["me:awaiting-cos"])
+        self.say("api-orch", "question", "a report")
+        self.ask_permission("api-coder")
+        self.prs[7] = pr_view_json()
+        self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")
+        out = {"none fails": self.derived()}
+        for name in ("github", "v2", "reports", "notices"):
+            with baseline_failing_source(name):
+                out["%s raises" % name] = self.derived()
+        baseline_golden(self, "source-raises", out)
+
+    def test_it_is_in_the_file_and_audited_once(self):
+        self.say("api-orch", "question", "a report")
+        with baseline_failing_source("v2"):
+            self.daemon_pass()
+            self.daemon_pass()
+        body = self.file_body()
+        errors = [e for e in self.world.audit() if e["event"] == "decisions.error" and e["detail"]["error"].startswith("RuntimeError")]
+        baseline_golden(self, "source-raises-file", {"errors": body["errors"], "titles": [d["title"] for d in body["decisions"]],
+                                                    "audited": len(errors)})
+
+    def test_a_pass_that_cannot_derive_still_finishes_and_says_so(self):
+        with baseline_failing_derivation():
+            report = self.world.engine.run_pass()
+        baseline_golden(self, "source-pass-cannot-derive", [(e["step"], "boom" in str(e)) for e in report["errors"]])
 
 
 class TestDecisionBaselineNotices(BaselineWorld):
