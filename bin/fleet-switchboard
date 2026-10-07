@@ -91,6 +91,7 @@ DEFAULTS = {
     "launch_env": {},
     "herdr": "herdr",
     "batch_seconds": 90,
+    "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
     "poll_seconds": 5,
@@ -163,6 +164,9 @@ def validate_config(raw, source="config"):
     if not isinstance(config["herdr"], str) or not config["herdr"].strip():
         raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["herdr"]))
+    if config["send_to_working"] not in ("steer", "queue"):
+        raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
+                          % (source, config["send_to_working"]))
     executable = config["opencode_executable"]
     if executable is not None and (not isinstance(executable, str) or not os.path.isabs(executable)):
         raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
