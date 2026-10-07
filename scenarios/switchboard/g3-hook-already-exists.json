@@ -26,12 +26,13 @@
       "why": "Another person's forwarder holds the repo's hook: ours is told Hook already exists"
     },
     {
-      "at": "10m",
+      "at": "1770s",
       "actor": "world",
       "do": "comment",
       "issue": 12,
       "id": 5001,
-      "body": "Nobody forwards this to us"
+      "body": "Nobody forwards this to us",
+      "why": "Just before the 30-minute read: the read after it starts one minute before the last read's marker, so it sees this comment again"
     },
     {
       "at": "40m",
@@ -40,7 +41,7 @@
       "issue": 12,
       "id": 5002,
       "body": "Also unseen by any webhook",
-      "why": "Read by the 60-minute fallback together with 5001: without the dedupe, 5001 rides along again"
+      "why": "Read by the 60-minute fallback, which also reads 5001 again inside its slack: without the dedupe, 5001 rides along again"
     },
     {
       "at": "65m",

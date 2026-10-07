@@ -265,6 +265,8 @@ KNOWN_FAULTS = (
     "key-env-only-unseen",  # PR 16: `status` does not warn that the key is in the shell's environment only
     "config-read-once",     # PR 16: the daemon ignores an edit to its config file until it is restarted
     "catch-up-blocks-pass",  # PR 16: GitHub reads have no time budget or cap, so a big catch-up holds the pass
+    "catch-up-on-fresh-start",  # PR 16: a repo with no read marker reads the whole look-back window
+    "full-window-every-time",   # PR 16: a forwarder repo reads the whole look-back window on every catch-up
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -4398,6 +4400,10 @@ GITHUB_CATCHUP_SECONDS = 90    # per catch-up: after this the remaining reads ar
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
 GITHUB_READ_BACKOFF = 600      # a secondary read that failed is not tried again for this long
+GITHUB_PAGE_SIZE = 100         # records per page of every list read
+GITHUB_PAGE_CAP = 5            # pages one list read follows; the rest is skipped, not chased
+GITHUB_MARKER_SLACK = 60       # seconds before the read marker a catch-up starts (a forwarder repo)
+READ_MARKER_FILE = "github-read.json"  # {"owner/repo": "<iso>"}: how far each repo was read; a disposable cursor
 GITHUB_AUDIT_KEYS = 20         # keys named in one audit line; the rest are only counted
 SECONDARY_READS = ("reviews", "check suites", "workflow runs", "items")
 GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
@@ -4903,6 +4909,7 @@ class GitHubHub:
         self._cache, self._retry, self._rejects, self._suppressed = {}, {}, [], 0
         self._unrouted, self._snapshot = set(), None
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
+        self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self.engine = None
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
@@ -4995,6 +5002,7 @@ class GitHubHub:
                 if watch.proc is not None:
                     _terminate(watch.proc)
                     watch.proc, watch.secret, watch.state = None, None, "backoff"
+            self._save_markers()
             self._write_snapshot(self.now(), stopped=True)
 
     # -- receiving
@@ -5049,6 +5057,11 @@ class GitHubHub:
             self._audit("github.rejected", repo, {"reason": "unreadable %s: %s" % (event, _one_line(str(err)))})
             return 400, "bad payload"
         self.enqueue(items)
+        with self.lock:  # live traffic moves the marker, unless a catch-up still has a gap to close
+            watch = self.watches.get(repo)
+            live = watch is not None and watch.catchup_at is None and repo in self.markers
+        if live:
+            self._set_marker(repo, self.now())
         self.note_issue_edit(event, repo, payload)
         self.note_awaiting_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
@@ -5315,7 +5328,10 @@ class GitHubHub:
         lost the label while no forwarder ran is dropped. Returns None, or one line saying why it failed."""
         path = "repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, quote(awaiting_label(self.config), safe=""))
         try:
-            records = [r for r in _records(self.gh_api(path)) if not _is_pr(r) and _number(r) is not None]
+            found, truncated = self.read_pages(path)
+            records = [r for r in found if not _is_pr(r) and _number(r) is not None]
+            if truncated:
+                self.last_truncated.setdefault("capped_reads", []).append("awaiting-user issues")
         except GitHubUnavailable as err:
             with self.lock:
                 self.awaiting_read[repo] = _one_line(str(err), 200)
@@ -5346,6 +5362,62 @@ class GitHubHub:
                 elif self.awaiting_read[repo]:
                     errors.append("issues of %s that wait on you could not be read: %s" % (repo, self.awaiting_read[repo]))
         return records, errors
+
+    # -- the read marker: how far each repo was read. Forward only; deleting the file means a fresh start.
+
+    def _load_markers(self):
+        try:
+            raw = json.loads((self.state_dir / READ_MARKER_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        now = self.now()
+        found = {}
+        for repo, stamp in (raw.items() if isinstance(raw, dict) else []):
+            moment = parse_iso(stamp) if isinstance(stamp, str) else None
+            if moment is not None:
+                found[repo] = min(moment, now)
+        return found
+
+    def _set_marker(self, repo, moment):
+        with self.lock:
+            if moment > self.markers.get(repo, 0):
+                self.markers[repo] = moment
+                self._markers_dirty = True
+
+    def _save_markers(self):
+        """At most once a pass, atomically."""
+        with self.lock:
+            if not self._markers_dirty:
+                return
+            body, self._markers_dirty = {repo: iso(moment) for repo, moment in sorted(self.markers.items())}, False
+        path = self.state_dir / READ_MARKER_FILE
+        tmp = path.with_name(READ_MARKER_FILE + ".tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(body, indent=1, sort_keys=True) + "\n")
+            os.replace(str(tmp), str(path))
+        except OSError:
+            with self.lock:
+                self._markers_dirty = True  # a cursor that could not be written is written next pass
+
+    def read_pages(self, path, key=None, timeout=None, older=None):
+        """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
+        is (field, since): a listing newest first stops at the first page that ends before `since`."""
+        joiner = "&" if "?" in path else "?"
+        records = []
+        bounded = not fault("catch-up-blocks-pass")
+        number = 0
+        while True:
+            number += 1
+            page = _records(self.gh_api("%s%spage=%d" % (path, joiner, number), paginate=False, timeout=timeout), key)
+            records.extend(page)
+            if len(page) < GITHUB_PAGE_SIZE:
+                return records, False
+            if older and isinstance(page[-1].get(older[0]), str) and page[-1][older[0]] < older[1]:
+                return records, False
+            if bounded and number >= GITHUB_PAGE_CAP:
+                return records, True
 
     # -- gh api, and the catch-up read
 
@@ -5381,9 +5453,9 @@ class GitHubHub:
         time, for a poll that asks only for what is new), keyed exactly as the webhooks are. Returns
         (items, errors): one read failing does not stop the others."""
         since, items, errors, pulls = iso(since_epoch if since_epoch is not None else now - self.lookback), [], [], []
-        started, bounded = self.now(), not fault("catch-up-blocks-pass")
+        started, bounded, capped = self.now(), not fault("catch-up-blocks-pass"), []
 
-        def read(name, path, key=None):
+        def read(name, path, key=None, older=None):
             secondary = name in SECONDARY_READS
             until = self._read_backoff.get((repo, name))
             if bounded and until is not None and self.now() < until:
@@ -5392,7 +5464,11 @@ class GitHubHub:
                 errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, GITHUB_CATCHUP_SECONDS))
                 return []
             try:
-                return _records(self.gh_api(path, timeout=GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None), key)
+                records, truncated = self.read_pages(path, key, GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None,
+                                                     older)
+                if truncated:
+                    capped.append(name)
+                return records
             except GitHubUnavailable as err:
                 errors.append("%s: %s" % (name, err))
                 if secondary and bounded:
@@ -5403,19 +5479,20 @@ class GitHubHub:
             return isinstance(record.get(field), str) and record[field] >= since
 
         base = "repos/%s/" % repo
-        comments = [c for c in read("comments", base + "issues/comments?since=%s&per_page=100" % since) if fresh(c)]
+        comments = [c for c in read("comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) if fresh(c)]
         commented = {}
         for comment in comments:
             number = _url_number(comment.get("issue_url"))
             commented[number] = max(commented.get(number, ""), comment["updated_at"])
             items.append(_comment_item(repo, comment, None, now))
-        for issue in read("issues", base + "issues?state=all&since=%s&per_page=100" % since):
+        for issue in read("issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)):
             if _is_pr(issue) or not fresh(issue):
                 continue
             if issue["updated_at"] <= commented.get(_number(issue), ""):
                 continue  # a comment bumped it; the comment is the news
             items.append(_issue_item(repo, issue, now))
-        for pr in read("pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=50"):
+        for pr in read("pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=%d" % GITHUB_PAGE_SIZE,
+                       older=("updated_at", since)):
             if fresh(pr):
                 pulls.append(pr)
                 items.append(_pr_item(repo, pr, now))
@@ -5430,25 +5507,44 @@ class GitHubHub:
                 if fresh(suite):
                     items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
                         {"number": number}]), now, "", "check suite"))
-        for run in read("workflow runs", base + "actions/runs?per_page=50", "workflow_runs"):
+        for run in read("workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs"):
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
         items = [item for item in items if item is not None]
+        skipped = 0
         if bounded and len(items) > GITHUB_CATCHUP_ITEMS:
+            skipped = len(items) - GITHUB_CATCHUP_ITEMS
             errors.append("items: kept the newest %d of %d" % (GITHUB_CATCHUP_ITEMS, len(items)))
             items = sorted(items, key=lambda item: item.created)[-GITHUB_CATCHUP_ITEMS:]
+        self.last_truncated = {"capped_reads": capped, "items_skipped": skipped} if capped or skipped else {}
         return items, errors
 
     def catch_up(self, watch, now, polled=False):
-        """The catch-up read. `polled`: this is the poll of a repo with no forwarder, which asks only for what
-        changed since the poll before (two polls' slack), so a poll costs a few calls, not a day's reading."""
-        since = None
-        if polled and watch.last_poll is not None:
-            since = max(now - self.lookback, watch.last_poll - 2 * self.config["github_poll_seconds"])
-        items, errors = self.catch_up_items(watch.repo, now, since)
-        problem = self.read_awaiting(watch.repo, now)  # PR 14: one more read, here and not on every pass
+        """The catch-up read, forward only. A repo with no read marker is not read at all (no history): its marker is
+        set to now and it moves on with live events. With a marker, only the gap is read: from the marker (minus a
+        little slack) to now, never further back than the look-back. The marker moves to the start of each catch-up
+        whose primary reads (comments, issues, pulls) all answered; secondary reads (reviews, check suites,
+        workflow runs) are best-effort and are not read again for a window they missed."""
+        repo = watch.repo
+        with self.lock:
+            marker = self.markers.get(repo)
+        items, errors, self.last_truncated = [], [], {}
+        fresh_start = marker is None and not fault("catch-up-on-fresh-start")
+        if not fresh_start:
+            floor, slack = now - self.lookback, (2 * self.config["github_poll_seconds"] if polled else GITHUB_MARKER_SLACK)
+            start = floor if marker is None or (fault("full-window-every-time") and not polled) else marker - slack
+            if start < floor:
+                start = floor
+                if marker is not None and marker < floor:
+                    self._audit("github.catch_up.skipped", repo, {"marker": iso(marker), "reads_from": iso(floor),
+                                                                   "why": "older than the look-back: older events were skipped"})
+            items, errors = self.catch_up_items(repo, now, start)
+        primary_failed = any(e.split(":")[0] not in SECONDARY_READS for e in errors)
+        problem = self.read_awaiting(repo, now)  # PR 14: current state, not events: read on a fresh start too
         if problem:
             errors.append(problem)
+        if not primary_failed:
+            self._set_marker(repo, now)
         self.enqueue(items)
         said = "; ".join(errors) if errors else None
         with self.lock:
@@ -5456,13 +5552,13 @@ class GitHubHub:
             watch.last_catch_up = now
             watch.catch_up_error = said
             retry = now + GITHUB_LOOKUP_RETRY
-            if errors and all(e.split(":")[0] in SECONDARY_READS for e in errors):  # a secondary read has its own backoff
-                due = [u for (r, _), u in self._read_backoff.items() if r == watch.repo and u > now]
-                retry = min(due) if due else retry
-            watch.catchup_at = retry if errors and not polled else None  # a failed read is read again
+            watch.catchup_at = retry if (primary_failed or problem) and not polled else None  # best-effort reads are not retried
+        if self.last_truncated:
+            self._audit("github.catch_up.truncated", repo, dict(self.last_truncated, marker_advanced=not primary_failed))
         if not polled or changed:  # a quiet poll every minute is not worth an audit line
-            self._audit("github.catch_up", watch.repo, {"keys": [item.key for item in items[:GITHUB_AUDIT_KEYS]],
-                                                        "count": len(items), "errors": errors, "polled": polled})
+            self._audit("github.catch_up", repo, {"keys": [item.key for item in items[:GITHUB_AUDIT_KEYS]],
+                                                  "count": len(items), "errors": errors, "polled": polled,
+                                                  "fresh_start": fresh_start})
 
     # -- the supervisor
 
@@ -5476,6 +5572,7 @@ class GitHubHub:
                 with self.lock:
                     watch.last_error = self.accounts.scrub(_scrub(_one_line(str(err)), watch.secret))
                 self._audit("github.error", watch.repo, {"error": watch.last_error})
+        self._save_markers()
         self._write_snapshot(now)
 
     def _tick_watch(self, watch, now):
@@ -5580,7 +5677,8 @@ class GitHubHub:
         with self.lock:
             return {"port": self.port, "lookback_hours": self.lookback / 3600.0,
                     "poll_seconds": self.config["github_poll_seconds"],
-                    "watches": [dict(w.to_json(), account=self.accounts.describe(w.repo))
+                    "watches": [dict(w.to_json(), account=self.accounts.describe(w.repo),
+                                     read_marker=iso(self.markers.get(w.repo)) if w.repo in self.markers else None)
                                 for _, w in sorted(self.watches.items())]}
 
     def _write_snapshot(self, now, stopped=False):
@@ -5619,7 +5717,7 @@ def attach_github(engine, config, state_dir, runner, now):
     return hub
 
 
-def github_status(config, state_dir, fleets=None):
+def github_status(config, state_dir, fleets=None, now=None):
     """What `status` says about GitHub: the repos watched (the config's and every live agent's, PR 15), how each
     is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
     agents in it."""
@@ -5660,8 +5758,10 @@ def github_status(config, state_dir, fleets=None):
         if watch:
             why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("last_error"),
                                         watch.get("catch_up_error")) if x) or None
+        marker = parse_iso(watch.get("read_marker")) if watch and watch.get("read_marker") else None
+        age = max(0, (time.time() if now is None else now) - marker) if marker is not None else None
         report["detail"].append({"repo": repo, "how": how, "account": accounts.describe(repo),
-                                 "agents": members.get(repo, []), "why": why})
+                                 "agents": members.get(repo, []), "why": why, "read_age": age})
     return report
 
 
@@ -5685,6 +5785,9 @@ def format_github(report):
         if watch and watch["failures"]:
             line += ", %d failure(s)" % watch["failures"]
         line += "  account %s" % entry["account"]
+        if watch:
+            line += "  read to %s ago" % format_age(entry["read_age"]) if entry.get("read_age") is not None \
+                else "  not read yet"
         line += "  agents: %s" % (", ".join(entry["agents"]) or "none")
         if entry["why"]:
             line += "  [%s]" % entry["why"]
@@ -5767,7 +5870,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if config_ok and state_ok:
         fleets = {entry["observation"]["name"]: entry["observation"].get("fleet") or {}
                   for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")}
-        report["github"] = github_status(config, state, fleets)
+        report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}

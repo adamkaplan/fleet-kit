@@ -114,7 +114,7 @@ Evidence from real use:
 | Tool calls | No fixed read-only roles. Consequential tool calls are judged in context by Jev against the role, the ask's Intent and the charter's standing authority. The judge only tightens: allow can become ask or deny, never the reverse (PR 9). |
 | Testing | Every promised behaviour is a scenario, run offline in CI against fakes and in the Lab against real v2 and herdr. Each scenario's control, with its safeguard switched off, must fail. See [Scenario testing](#scenario-testing). |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
-| GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one catch-up read after each gap, because the forwarder does not replay (PR 5). |
+| GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one bounded catch-up read of the gap after each forwarder start, from a read marker and forward only, because the forwarder does not replay (PR 5, and see "Reads move forward only"). |
 | Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
 | Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. The TUI does not show it (S3); the badge, `status` and the audit log do. |
 | Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
@@ -229,7 +229,7 @@ depends on it.
 | `fleet-switchboard <command>` | Short-lived CLI, run by you and by agents | `launch`, `send`, `remind`, `intent`, `pending`, `status`, `audit`, `poke`. `send` applies the delivery rule and delivers itself; it does not need the daemon |
 | Harness adapter | A class shared by the daemon and the CLI, one per harness kind | Everything harness-specific: launch, observe, note, wake |
 | herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon; turns herdr events into pokes |
-| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
+| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, `github-read.json` (a read marker per repo: a disposable cursor, below), the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
 | Decision model client (PR 7) | A class in `bin/fleet-switchboard`, stdlib `urllib`. The OpenRouter key comes from the switchboard's config and never enters an agent's environment | Jev calls for the classifier and the shadow judges |
 | `fleet-hooks` plugin (PR 8–9) | A v2 plugin of a few lines, loaded from the Lab's config | Forwards v2's `permission` hook, and `prompt` if needed, to `fleet-switchboard`; holds no logic |
 | GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon, which receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
@@ -404,8 +404,9 @@ polled on a timer.
 - **Catching up after a gap:** the forwarder never replays what it missed. It
   reconnects 3 times, 5 s apart, then exits, and anything that happens while it
   is down is lost. So each time a forwarder starts, the daemon makes one
-  catch-up read with `gh api` over a fixed look-back window (default 24 hours).
-  That read fills a gap; it is not a poll. Keys come from GitHub object ids,
+  catch-up read with `gh api` of the gap since that repo's read marker, never further back than the look-back
+  window (default 24 hours), and forward only (see "Reads move forward only"). That read fills a gap; it is
+  not a poll. Keys come from GitHub object ids,
   not delivery ids, so an event seen both ways is delivered once.
 - **Writes:** none.
 
@@ -418,7 +419,7 @@ sequenceDiagram
   participant O as Orchestrator
   SB->>F: start for one repo, pointing at 127.0.0.1 with a fresh secret
   F->>GH: create the repo's cli hook, connect, activate
-  SB->>GH: catch-up read over the look-back window
+  SB->>GH: catch-up read of the gap since the read marker (clamped to the look-back)
   GH-->>F: event, over the websocket
   F->>SB: POST /github with X-GitHub-Delivery and signature
   SB->>SB: verify, route to an issue owner, key by object id
@@ -1378,6 +1379,41 @@ Changed:
 - Fault `catch-up-blocks-pass` removes every bound; the test that a slow catch-up leaves the pass inside its
   budget (and the decisions file fresh) fails under it: the same pass takes 1200 s.
 
+#### Reads move forward only
+
+The owner's decision: there is no need to read unbounded history. The audit log of a real machine showed 13
+catch-ups in about an hour on two busy repos, 2,135 items per read, and a full look-back window read after
+every forwarder restart; what was measured above (the cost was reading history nobody owns and routing every
+item) says cut that root.
+
+- **A read marker per repo**, `$STATE/github-read.json` (`{"owner/repo": "<iso>"}`; the one new stored file,
+  beside `reminders.json`), written atomically (temp file, rename) at most once per pass. It moves to the start
+  of each catch-up whose primary reads answered, and to the time of a live webhook (but not while a catch-up
+  still has a gap to close, or the webhook would hide the gap). It is a disposable cursor: deleting it means a
+  fresh start.
+- **A fresh start reads nothing.** A repo with no marker (first run, a repo that just joined the watched set,
+  the state deleted) gets no catch-up read: its marker is set to now and it moves on with live events, zero
+  history calls. Nothing is replayed and nothing is delivered twice, because the transcript's keys still
+  stop a repeat. The awaiting-user read (open issues with the label: current state, not events) stays.
+- **With a marker, only the gap**: from the marker minus a minute (two poll intervals for a polled repo) to now,
+  clamped to `github_lookback_hours`; a marker older than that is clamped and one `github.catch_up.skipped`
+  line says older events were skipped. Comments and issues use the server's `since`; pulls, newest first, stop
+  paging at the first page older than the window; reviews and check suites are read only for pulls updated in the
+  window.
+- **Every list read is paged with a hard cap** (`GITHUB_PAGE_CAP`, 5 pages of 100), and one catch-up keeps at
+  most 500 items. A cap that is hit stops the read, audits one `github.catch_up.truncated` line (the capped
+  reads, the items skipped) and still advances the marker: forward only, no chasing the rest.
+- **Secondary reads are best-effort**: reviews, check suites and workflow runs that fail are reported once per
+  episode (the 10-minute back-off stays) and are not retried for the window they missed; live webhooks cover
+  them. A failed primary read (comments, issues, pulls) does not move the marker and retries after a minute with
+  the same bounded window.
+- **A forwarder restart in a daemon run** reads from the in-memory marker (the last read or webhook), a short gap.
+- **`status`** shows `read to <age> ago` per repo. Faults `catch-up-on-fresh-start` (a repo with no marker reads
+  the look-back window) and `full-window-every-time` (a forwarder repo reads the whole window on every
+  catch-up), each with a test whose control fails. Scenario G3 changed: its first comment moved to just before
+  the 30-minute read, because a read now starts a minute before the last marker, not at the start of the
+  window, so the dedupe control still has an item read twice to prove it.
+
 #### The daemon is alive when it is needed
 
 `send`, `report`, `launch`, `handoff`, `comment`, `remind`, `decisions`, `intent` and `bootstrap` call
@@ -1478,6 +1514,7 @@ it, and is read from there each time it is needed.
 | Intent and Done-when | GitHub issue body | `gh api`, cached in memory |
 | Charters, sub-issues, PRs, checks, reviews | GitHub | Webhooks, plus a catch-up read after gaps |
 | Reminders not yet due | Switchboard file `reminders.json` | |
+| How far each repo was read | Switchboard file `github-read.json`: `{"owner/repo": "<iso>"}`. A disposable cursor, not truth: deleting it means a fresh start | `status` shows its age per repo |
 | What waits on you | Derived each pass; the projection is `decisions.json` | `fleet-switchboard decisions` |
 | What the switchboard did and why | Switchboard file `audit.jsonl` | |
 
@@ -1538,7 +1575,7 @@ Delivered means in the recipient's transcript. Its keys are never sent again.
 1. **Derived, not stored.** Pending items are recomputed on every pass from
    herdr, v2, GitHub and the reminders file. Events only make a pass happen
    sooner; a missed event delays a delivery, it never loses one (except GitHub
-   events older than the look-back window).
+   events from before a repo's read marker, which is forward only, and older than the look-back window).
 2. **Delivered is a fact in the recipient's history.** A key found in the
    recipient's transcript or v2 inbox is never delivered again.
 3. **At most once (S2).** The message id is derived from the recipient's
@@ -2466,3 +2503,13 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   Measured with a fake `gh` at a second a call and 1200 comments nobody owns: the catch-up reads were not the
   blocker (5 calls, in the hub's own thread); routing in the main pass made one lookup per item (1200 calls,
   1200 s) and now takes 5 s and 5 calls a pass.
+- 2026-10-06: PR 16, GitHub reads move forward only. The owner's audit log showed 13 catch-ups in about an
+  hour on two busy repos, 2,135 items per read, and a full look-back window read after every forwarder
+  restart; my own measurement (above) had shown the cost was history nobody owns. The owner's decision: no
+  unbounded reads, a fresh start does not read, it moves forward. Added a read marker per repo
+  (`github-read.json`), a fresh start that reads nothing, gap-only reads clamped to the look-back, paged reads
+  with a cap of 5 pages of 100 and one `github.catch_up.truncated` line, best-effort secondary reads, `status`
+  showing the marker age, and faults `catch-up-on-fresh-start` and `full-window-every-time`. The existing
+  slow-catch-up tests now start from a marker an hour old (a fresh start reads nothing); a restart test leaves
+  a marker file behind; and G3's first comment moved. After deleting the state, a test shows nothing is
+  replayed and nothing is delivered twice.

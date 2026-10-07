@@ -764,7 +764,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "static-repos", "bare-issue-number", "one-account", "repo-create-allowed",  # PR 15
               "key-missing-silent", "no-ensure-on-use", "shared-profile-default",  # PR 16
               "key-env-only-unseen",  # PR 16, the first real install
-              "config-read-once", "catch-up-blocks-pass")  # PR 16, reload and the slow catch-up
+              "config-read-once", "catch-up-blocks-pass",  # PR 16, reload and the slow catch-up
+              "catch-up-on-fresh-start", "full-window-every-time")  # PR 16, forward only
 
 
 class TestFaults(Base):
@@ -4413,7 +4414,16 @@ class FakeGitHub:
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
             data = parent if which == "parent" else children
         else:
-            data = self.answer(bare, urllib_query(path))
+            query = urllib_query(path)
+            data = self.answer(bare, query)
+            if isinstance(data, list) and "page" in query and "--paginate" not in argv:  # GitHub's own paging
+                size = int(query.get("per_page", 30))
+                data = data[(int(query["page"]) - 1) * size:int(query["page"]) * size]
+            elif isinstance(data, dict) and "page" in query:
+                for field in ("workflow_runs", "check_suites"):
+                    if isinstance(data.get(field), list):
+                        size = int(query.get("per_page", 30))
+                        data = {field: data[field][(int(query["page"]) - 1) * size:int(query["page"]) * size]}
         pages = data if "--paginate" in argv and isinstance(data, list) else [data]
         if isinstance(data, list):
             pages = [[item] for item in data] if "--paginate" in argv else [data]
@@ -5431,7 +5441,8 @@ class TestGithubDelivery(Base):
         stored = [p for p in self.world.state.rglob("*") if p.is_file() and p.name != "audit.jsonl"]
         for path in stored:
             self.assertNotIn("github.comment:5001", path.read_text(errors="replace"), path.name)
-        restarted = GithubRig(self)  # a new process: nothing in memory
+        (self.world.state / sb.READ_MARKER_FILE).write_text(json.dumps({GH_REPO: sb.iso(self.world.clock.now() - 600)}))
+        restarted = GithubRig(self)  # a new process: nothing in memory but the marker it left
         self.assertEqual(restarted.keys(), [])
         restarted.gh.comments, restarted.gh.issues = self.gh.comments, self.gh.issues
         restarted.world.clock.t = self.world.clock.now()
@@ -17022,6 +17033,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
                 raise subprocess.TimeoutExpired(argv, 20)
             return original(argv, **kwargs)
         rig.hub.runner = slow
+        rig.hub.markers[GH_REPO] = rig.world.clock.now() - 3600  # a repo that was read an hour ago: only its gap is read
         for number in range(100, 100 + self.ITEMS):
             rig.gh.comment(number, "nobody owns this", 6000 + number, forward=False)
         return rig
@@ -17034,7 +17046,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
     def test_the_pass_stays_inside_its_budget_whatever_is_waiting(self):
         rig = self.rig()
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
-        self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_CATCHUP_ITEMS)
+        self.assertLessEqual(len(rig.hub.queue), sb.GITHUB_PAGE_CAP * sb.GITHUB_PAGE_SIZE)
         took = self.pass_seconds(rig)
         self.assertLessEqual(took, sb.GITHUB_ROUTE_SECONDS + sb.GITHUB_ROUTE_READ_TIMEOUT, took)
         self.assertGreater(len(rig.hub.queue), 0, "what did not fit waits for the next pass")
@@ -17064,11 +17076,14 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
 
     def test_one_catch_up_keeps_the_newest_items_only_and_says_so(self):
         rig = self.rig()
-        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        with mock.patch.object(sb, "GITHUB_CATCHUP_ITEMS", 30):
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertIn("items: kept the newest", rig.watch().catch_up_error)
         [line] = [e for e in rig.world.audit() if e["event"] == "github.catch_up"][-1:]
-        self.assertEqual(line["detail"]["count"], sb.GITHUB_CATCHUP_ITEMS)
+        self.assertEqual(line["detail"]["count"], 30)
         self.assertLessEqual(len(line["detail"]["keys"]), sb.GITHUB_AUDIT_KEYS)
+        [cut] = [e for e in rig.world.audit() if e["event"] == "github.catch_up.truncated"]
+        self.assertGreater(cut["detail"]["items_skipped"], 0)
 
     def test_a_read_that_times_out_is_reported_once_and_not_tried_every_pass(self):
         rig = self.rig()
@@ -17087,7 +17102,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
             rig.world.clock.t += sb.GITHUB_LOOKUP_RETRY + 5
             rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertEqual(tried[0], 0, "inside its backoff it is not tried again")
-        self.assertGreaterEqual(rig.watch().catchup_at - rig.world.clock.now(), 0)
+        self.assertIsNone(rig.watch().catchup_at, "a best-effort read is not retried for the window it missed")
         rig.world.clock.t += sb.GITHUB_READ_BACKOFF
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertEqual(tried[0], 1, "after it, once")
@@ -17100,6 +17115,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
             rig.world.clock.t += 60
             return original(argv, **kwargs)
         rig.hub.runner = slow
+        rig.hub.markers[GH_REPO] = rig.world.clock.now() - 3600
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         self.assertIn("left to the next catch-up", rig.watch().catch_up_error)
 
@@ -17309,7 +17325,9 @@ class TestTheLockSurvivesAReExec(Base):
         child = subprocess.Popen([sys.executable, str(script), str(BIN / "fleet-switchboard"), str(state), "first"],
                                  env=dict(os.environ))
         try:
-            deadline, gaps, seen_held, rivals = time.time() + 20, 0, False, 0
+            deadline, gaps, seen_held, rivals = time.time() + 60, 0, False, 0
+            while time.time() < deadline and not (state / "first.pid").exists():
+                time.sleep(0.01)  # the child holds the lock from here; before that, polling it would take it
             while time.time() < deadline and not (state / "second.pid").exists():
                 held = sb.run_lock_held(state)
                 seen_held = seen_held or held
@@ -17430,6 +17448,233 @@ class TestRestartCommand(Base):
     def test_the_command_exists_and_never_ensures_on_use(self):
         self.assertIn("restart", sb.build_parser()._subparsers._group_actions[0].choices)
         self.assertNotIn("restart", sb.ENSURE_ON_USE_COMMANDS)
+
+
+class TestGithubReadsMoveForwardOnly(Base):
+    """A read marker per repo: a fresh start reads no history, a restart reads only the gap, in bounded pages."""
+
+    def rig(self, **kwargs):
+        rig = GithubRig(self, **kwargs)
+        self.rig_ = rig
+        return rig
+
+    def calls(self, rig, fragment):
+        return [c for c in rig.gh.api_calls if fragment in c]
+
+    def stamp(self, rig, ago):
+        return sb.iso(rig.world.clock.now() - ago)
+
+    def test_a_repo_with_no_marker_is_not_read_at_all_and_its_marker_is_set_to_now(self):
+        rig = self.rig()
+        rig.gh.comment(12, "old news", 5001, forward=False)
+        rig.gh.pull(30)
+        now = rig.world.clock.now()
+        rig.hub.catch_up(rig.watch(), now)
+        self.assertEqual(self.calls(rig, "issues/comments") + self.calls(rig, "/pulls") + self.calls(rig, "actions/runs"), [])
+        self.assertEqual(rig.hub.markers[GH_REPO], now)
+        self.assertEqual(rig.keys(), [])
+        [line] = [e for e in rig.world.audit() if e["event"] == "github.catch_up"]
+        self.assertIs(line["detail"]["fresh_start"], True)
+
+    def test_the_awaiting_user_read_stays_on_a_fresh_start_and_is_paginated(self):
+        rig = self.rig()
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        reads = self.calls(rig, "labels=")
+        self.assertEqual(len(reads), 1)
+        self.assertIn("page=1", reads[0])
+        self.assertNotIn("--paginate", " ".join(map(str, reads)))
+
+    def test_with_a_marker_only_the_gap_is_read_from_a_little_before_it(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        rig.gh.comment(12, "in the gap", 5002, forward=False)
+        rig.hub.catch_up(rig.watch(), now)
+        [first] = self.calls(rig, "issues/comments")[:1]
+        self.assertIn("since=%s" % sb.iso(now - 600 - sb.GITHUB_MARKER_SLACK).replace(":", "%3A") if "%3A" in first
+                      else "since=%s" % sb.iso(now - 600 - sb.GITHUB_MARKER_SLACK), first)
+        self.assertEqual(rig.keys(), ["github.comment:5002"])
+        self.assertEqual(rig.hub.markers[GH_REPO], now, "the marker moves to the start of a successful catch-up")
+
+    def test_a_marker_older_than_the_look_back_is_clamped_and_says_so_once(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 5 * 86400
+        rig.hub.catch_up(rig.watch(), now)
+        [first] = self.calls(rig, "issues/comments")[:1]
+        self.assertIn(sb.iso(now - 86400), first)
+        [skipped] = [e for e in rig.world.audit() if e["event"] == "github.catch_up.skipped"]
+        self.assertIn("skipped", skipped["detail"]["why"])
+
+    def test_the_marker_is_a_private_file_written_once_a_pass_and_deleting_it_is_a_fresh_start(self):
+        rig = self.rig()
+        path = rig.world.state / sb.READ_MARKER_FILE
+        writes = []
+        original = os.replace
+        with mock.patch.object(sb.os, "replace", lambda a, b: writes.append(str(b)) or original(a, b)):
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now() + 1)
+            rig.hub.tick()
+            rig.hub.tick()
+        self.assertEqual([w for w in writes if w.endswith(sb.READ_MARKER_FILE)], [str(path)], "once, for the pass")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(list(json.loads(path.read_text())), [GH_REPO])
+        self.assertEqual(sorted(p.name for p in rig.world.state.iterdir() if p.name.startswith("github-read")),
+                         [sb.READ_MARKER_FILE])
+        self.assertTrue(sb.GitHubHub(rig.world.config, rig.world.state, now=rig.world.clock.now).markers)
+        path.unlink()
+        self.assertEqual(sb.GitHubHub(rig.world.config, rig.world.state, now=rig.world.clock.now).markers, {})
+
+    def test_a_marker_in_the_future_or_unreadable_is_not_trusted(self):
+        rig = self.rig()
+        path = rig.world.state / sb.READ_MARKER_FILE
+        path.write_text(json.dumps({GH_REPO: self.stamp(rig, -9999), "x/y": "nonsense"}))
+        hub = sb.GitHubHub(rig.world.config, rig.world.state, now=rig.world.clock.now)
+        self.assertEqual(hub.markers, {GH_REPO: rig.world.clock.now()})
+        path.write_text("{ not json")
+        self.assertEqual(sb.GitHubHub(rig.world.config, rig.world.state, now=rig.world.clock.now).markers, {})
+
+    def test_a_live_webhook_moves_the_marker_unless_a_catch_up_still_has_a_gap_to_close(self):
+        rig = self.rig()
+        rig.pump(20)
+        watch = rig.watch()
+        self.assertIsNotNone(rig.gh.forwarder())
+        rig.hub.markers[GH_REPO] = rig.world.clock.now() - 900
+        watch.catchup_at = None
+        rig.world.clock.t += 7
+        rig.gh.comment(12, "live", 5003)
+        self.assertEqual(rig.hub.markers[GH_REPO], rig.world.clock.now())
+        before = rig.hub.markers[GH_REPO]
+        watch.catchup_at = rig.world.clock.now() + 5
+        rig.world.clock.t += 7
+        rig.gh.comment(12, "live again", 5004)
+        self.assertEqual(rig.hub.markers[GH_REPO], before, "the gap a restart left is closed by its catch-up first")
+
+    def test_a_list_read_stops_at_its_page_cap_audits_one_truncated_line_and_still_moves_forward(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 3600
+        for number in range(300, 300 + 700):
+            rig.gh.comment(number, "x", 7000 + number, forward=False)
+        rig.hub.catch_up(rig.watch(), now)
+        pages = [c for c in self.calls(rig, "issues/comments")]
+        self.assertEqual(len(pages), sb.GITHUB_PAGE_CAP)
+        [cut] = [e for e in rig.world.audit() if e["event"] == "github.catch_up.truncated"]
+        self.assertIn("comments", cut["detail"]["capped_reads"])
+        self.assertIs(cut["detail"]["marker_advanced"], True)
+        self.assertEqual(rig.hub.markers[GH_REPO], now, "forward only: no chasing the rest")
+
+    def test_pulls_stop_paging_when_a_page_is_older_than_the_window_and_old_ones_cost_no_reads(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        for number in range(1000, 1250):
+            rig.gh.pull(number)
+            rig.gh.pulls[number]["updated_at"] = sb.iso(now - 7 * 86400 - number)
+        rig.gh.pull(2000)
+        rig.hub.catch_up(rig.watch(), now)
+        self.assertEqual(len(self.calls(rig, "/pulls?")), 1, "the first page already ends before the window")
+        reviews = self.calls(rig, "/reviews")
+        self.assertEqual([c for c in reviews if "pulls/2000/" not in c], [], "only a PR updated in the window is looked into")
+
+    def test_a_failed_primary_read_keeps_the_marker_and_retries_the_same_bounded_window(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        original = rig.hub.runner
+        down = [True]
+
+        def runner(argv, **kwargs):
+            if down[0] and "issues/comments" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            return original(argv, **kwargs)
+        rig.hub.runner = runner
+        rig.hub.catch_up(rig.watch(), now)
+        self.assertEqual(rig.hub.markers[GH_REPO], now - 600)
+        self.assertEqual(rig.watch().catchup_at, now + sb.GITHUB_LOOKUP_RETRY)
+        down[0] = False
+        rig.world.clock.t += sb.GITHUB_LOOKUP_RETRY
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        since = [c for c in self.calls(rig, "issues/comments")][-1]
+        self.assertIn(sb.iso(now - 600 - sb.GITHUB_MARKER_SLACK), since.replace("%3A", ":"), "the same window, never the full look-back")
+        self.assertEqual(rig.hub.markers[GH_REPO], rig.world.clock.now())
+
+    def test_a_failed_secondary_read_is_not_retried_for_the_window_it_missed_and_the_marker_moves(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        original = rig.hub.runner
+        rig.hub.runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502") \
+            if "actions/runs" in argv[-1] else original(argv, **kw)
+        rig.hub.catch_up(rig.watch(), now)
+        self.assertIn("workflow runs", rig.watch().catch_up_error)
+        self.assertIsNone(rig.watch().catchup_at)
+        self.assertEqual(rig.hub.markers[GH_REPO], now)
+
+    def test_a_forwarder_restart_reads_a_short_gap_from_the_in_memory_marker(self):
+        rig = self.rig()
+        rig.pump(30)
+        first = rig.world.clock.now()
+        self.assertEqual(rig.hub.markers[GH_REPO] <= first, True)
+        rig.gh.kill_forwarder()
+        rig.pump(120)
+        since = [c for c in self.calls(rig, "issues/comments")][-1].replace("%3A", ":")
+        self.assertNotIn(sb.iso(rig.world.clock.now() - 86400)[:13], since, "not a day")
+        stamp = since.split("since=")[1].split("&")[0]
+        self.assertLess(rig.world.clock.now() - sb.parse_iso(stamp), 400)
+
+    def test_the_fault_a_fresh_start_reads_the_whole_look_back_and_the_control_fails(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "catch-up-on-fresh-start"
+        rig = self.rig()
+        rig.gh.comment(12, "history", 5001, forward=False)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertNotEqual(self.calls(rig, "issues/comments"), [], "with the fault history is read")
+        self.assertEqual(rig.keys(), ["github.comment:5001"])
+        self.assertIn("catch-up-on-fresh-start", sb.KNOWN_FAULTS)
+
+    def test_the_fault_a_forwarder_repo_reads_the_whole_window_every_time_and_the_control_fails(self):
+        os.environ[sb.LAB_ENV], os.environ[sb.FAULT_ENV] = "1", "full-window-every-time"
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        rig.hub.catch_up(rig.watch(), now)
+        [first] = self.calls(rig, "issues/comments")[:1]
+        self.assertIn(sb.iso(now - 86400), first.replace("%3A", ":"))
+        self.assertIn("full-window-every-time", sb.KNOWN_FAULTS)
+
+    def test_after_the_state_is_deleted_nothing_is_replayed_and_nothing_is_delivered_twice(self):
+        rig = self.rig()
+        rig.gh.issue(12, parent=1)
+        rig.pump(30)
+        rig.gh.comment(12, "delivered once", 5001)
+        rig.pump(200)
+        self.assertEqual(rig.delivered(), ["github.comment:5001"])
+        (rig.world.state / sb.READ_MARKER_FILE).unlink()
+        fresh = sb.GitHubHub(rig.world.config, rig.world.state, sb.AuditLog(rig.world.audit_path), rig.gh.runner,
+                             rig.gh.spawn, rig.world.clock.now)
+        fresh.autostart, fresh.port, rig.gh.hub = False, 4711, fresh
+        rig.hub.stop()
+        rig.world.engine = fresh.attach(rig.world.new_engine())
+        rig.hub = fresh
+        rig.pump(400)
+        self.assertEqual(rig.keys(), [])
+        self.assertEqual(rig.delivered(), ["github.comment:5001"])
+
+    def test_status_shows_how_far_each_repo_was_read(self):
+        rig = self.rig()
+        now = rig.world.clock.now()
+        rig.hub.markers[GH_REPO] = now - 600
+        rig.hub._write_snapshot(now)
+        rig.world.engine.run_pass()
+        rig.world.clock.t += 5
+        report = sb.github_status(rig.world.config, rig.world.state, {}, rig.world.clock.now())
+        text = "\n".join(sb.format_github(report))
+        self.assertIn("read to 10m ago", text)
+
+    def test_the_marker_file_is_the_one_new_stored_file_and_the_design_doc_says_so(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("github-read.json", text)
+        self.assertIn("forward only", text.lower())
 
 
 class TestInstallDocs(unittest.TestCase):
