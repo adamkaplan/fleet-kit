@@ -1,0 +1,74 @@
+{
+ "empty, cos": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, all tiers (for chief-of-staff)\nNo decisions in this view.\n"
+ },
+ "empty, you": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, tier human (for you)\nNo decisions are waiting on you.\n"
+ },
+ "missing": {
+  "code": 1,
+  "err": "",
+  "out": "Decisions unavailable: the daemon is not updating this list: there is no decisions.json in <home>/xdg-state/fleet-switchboard. Start it with `fleet-switchboard ensure`, or read the facts now with `fleet-switchboard decisions --fresh`.\n"
+ },
+ "missing, json": {
+  "code": 1,
+  "err": "",
+  "out": {
+   "age_seconds": null,
+   "decisions": [],
+   "errors": [],
+   "generation": null,
+   "message": "the daemon is not updating this list: there is no decisions.json in <home>/xdg-state/fleet-switchboard",
+   "stale": true,
+   "view": {
+    "repo": null,
+    "role": null,
+    "text": "all repos, tier human (for you)",
+    "tiers": [
+     "human"
+    ]
+   },
+   "written_at": null
+  }
+ },
+ "not json": {
+  "code": 1,
+  "err": "",
+  "out": "Decisions unavailable: the daemon is not updating this list: <home>/xdg-state/fleet-switchboard/decisions.json cannot be read. Start it with `fleet-switchboard ensure`, or read the facts now with `fleet-switchboard decisions --fresh`.\n"
+ },
+ "stale": {
+  "code": 1,
+  "err": "",
+  "out": "Decisions unavailable: the daemon is not updating this list: decisions.json was last written 2m ago. Start it with `fleet-switchboard ensure`, or read the facts now with `fleet-switchboard decisions --fresh`.\n"
+ },
+ "stale, json": {
+  "code": 1,
+  "err": "",
+  "out": {
+   "age_seconds": 121,
+   "decisions": [],
+   "errors": [],
+   "generation": 1,
+   "message": "the daemon is not updating this list: decisions.json was last written 2m ago",
+   "stale": true,
+   "view": {
+    "repo": null,
+    "role": null,
+    "text": "all repos, tier human (for you)",
+    "tiers": [
+     "human"
+    ]
+   },
+   "written_at": "2027-01-15T08:00:05Z"
+  }
+ },
+ "two minutes is the edge": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, tier human (for you)\nNo decisions are waiting on you.\n"
+ }
+}

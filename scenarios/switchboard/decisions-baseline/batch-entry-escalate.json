@@ -1,0 +1,127 @@
+[
+ {
+  "raised_as": "api#101"
+ },
+ {
+  "derived": {
+   "decisions": [
+    {
+     "agent": null,
+     "ask": 32,
+     "headline": "dup of 31",
+     "id": "api#32",
+     "kind": "issue",
+     "repo": "acme/api",
+     "since": "2027-01-15T07:59:00Z",
+     "tier": "cos",
+     "title": "dup of 31"
+    },
+    {
+     "agent": null,
+     "ask": 101,
+     "headline": "Cleanup of stale issues (3 rows)",
+     "id": "api#101",
+     "kind": "issue",
+     "raised_by": "api-orch",
+     "repo": "acme/api",
+     "rows": [
+      {
+       "finding": "stale cache key",
+       "recommendation": "close it",
+       "ref": "acme/api#31",
+       "short": "api#31",
+       "text": "api#31: close it"
+      },
+      {
+       "finding": "duplicate of 31",
+       "recommendation": "close as duplicate of api#31",
+       "ref": "acme/api#32",
+       "short": "api#32",
+       "text": "api#32: close as duplicate of api#31"
+      },
+      {
+       "finding": "https://github.com/acme/api/issues/34 is done",
+       "recommendation": "label it done",
+       "ref": "acme/api#33",
+       "short": "api#33",
+       "text": "api#33: label it done"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "Cleanup of stale issues"
+    }
+   ],
+   "errors": []
+  }
+ },
+ {
+  "argv": "decisions escalate api#101 --reason the owner decides",
+  "as": "cos",
+  "code": 0,
+  "comments": [
+   "Escalated to the owner: the owner decides\n\n<!-- fleet-switchboard:from=cos -->"
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/101/labels",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-cos",
+   "POST repos/acme/api/issues/101/comments"
+  ],
+  "labels_changed": {
+   "acme/api#101": [
+    "me:awaiting-user"
+   ]
+  },
+  "out": "escalated api#101 to you: me:awaiting-user on acme/api#101\n"
+ },
+ {
+  "argv": "decisions escalate api#101",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "out": "api#101 is already yours: nothing changed\n"
+ },
+ {
+  "the owner's view": {
+   "decisions": [
+    {
+     "agent": null,
+     "ask": 101,
+     "headline": "Cleanup of stale issues (3 rows)",
+     "id": "api#101",
+     "kind": "issue",
+     "raised_by": "api-orch",
+     "repo": "acme/api",
+     "rows": [
+      {
+       "finding": "stale cache key",
+       "recommendation": "close it",
+       "ref": "acme/api#31",
+       "short": "api#31",
+       "text": "api#31: close it"
+      },
+      {
+       "finding": "duplicate of 31",
+       "recommendation": "close as duplicate of api#31",
+       "ref": "acme/api#32",
+       "short": "api#32",
+       "text": "api#32: close as duplicate of api#31"
+      },
+      {
+       "finding": "https://github.com/acme/api/issues/34 is done",
+       "recommendation": "label it done",
+       "ref": "acme/api#33",
+       "short": "api#33",
+       "text": "api#33: label it done"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "human",
+     "title": "Cleanup of stale issues"
+    }
+   ],
+   "errors": []
+  }
+ }
+]

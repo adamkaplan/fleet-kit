@@ -1,0 +1,649 @@
+{
+ "1 empty": {
+  "daemon_pid": "<pid>",
+  "decisions": [],
+  "errors": [],
+  "generation": 1,
+  "written_at": "2027-01-15T08:00:05Z"
+ },
+ "2 the full house": {
+  "daemon_pid": "<pid>",
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Which database?",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "cos",
+    "title": "Which database?"
+   },
+   {
+    "agent": null,
+    "ask": 9,
+    "headline": "Both labels on one issue",
+    "id": "api#9",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Both labels on one issue"
+   },
+   {
+    "agent": null,
+    "ask": 4,
+    "headline": "Pick the cache layer",
+    "id": "web#4",
+    "kind": "issue",
+    "repo": "acme/web",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Pick the cache layer"
+   },
+   {
+    "agent": null,
+    "ask": 101,
+    "headline": "Cleanup of stale issues (3 rows)",
+    "id": "api#101",
+    "kind": "issue",
+    "raised_by": "api-orch",
+    "repo": "acme/api",
+    "rows": [
+     {
+      "finding": "stale cache key",
+      "recommendation": "close it",
+      "ref": "acme/api#31",
+      "short": "api#31",
+      "text": "api#31: close it"
+     },
+     {
+      "finding": "duplicate of 31",
+      "recommendation": "close as duplicate of api#31",
+      "ref": "acme/api#32",
+      "short": "api#32",
+      "text": "api#32: close as duplicate of api#31"
+     },
+     {
+      "finding": "https://github.com/acme/api/issues/34 is done",
+      "recommendation": "label it done",
+      "ref": "acme/api#33",
+      "short": "api#33",
+      "text": "api#33: label it done"
+     }
+    ],
+    "since": "2027-01-15T08:00:10Z",
+    "tier": "cos",
+    "title": "Cleanup of stale issues"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2df",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000008",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "agent": "web-coder",
+    "ask": 2,
+    "headline": "question: Which database?",
+    "id": "web#2mv",
+    "kind": "question",
+    "repo": "acme/web",
+    "request": "frm_ke000010",
+    "session": "ses_fake000005",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "question: Which database?"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 6,
+    "considered": "no send from api-orch to api-coder in the last 72 hours",
+    "headline": "Which table should hold the totals?",
+    "id": "api#6cc",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:20Z",
+    "tier": "orchestrator",
+    "title": "Which table should hold the totals?"
+   },
+   {
+    "agent": "api-orch",
+    "ask": 7,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "blocked: cannot build until the key is rotated",
+    "id": "api#7hz",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:21Z",
+    "tier": "cos",
+    "title": "blocked: cannot build until the key is rotated"
+   },
+   {
+    "agent": "web-orch",
+    "ask": 8,
+    "considered": "no send from cos to web-orch in the last 72 hours",
+    "headline": "Which region for the cache?",
+    "id": "web#8gj",
+    "kind": "report",
+    "repo": "acme/web",
+    "since": "2027-01-15T08:00:22Z",
+    "tier": "cos",
+    "title": "Which region for the cache?"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "please look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:23Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   }
+  ],
+  "errors": [],
+  "generation": 2,
+  "written_at": "2027-01-15T08:00:33Z"
+ },
+ "3 a question changed: the generation moves": {
+  "daemon_pid": "<pid>",
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Which database?",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "cos",
+    "title": "Which database?"
+   },
+   {
+    "agent": null,
+    "ask": 9,
+    "headline": "Both labels on one issue",
+    "id": "api#9",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Both labels on one issue"
+   },
+   {
+    "agent": null,
+    "ask": 4,
+    "headline": "Pick the cache layer",
+    "id": "web#4",
+    "kind": "issue",
+    "repo": "acme/web",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Pick the cache layer"
+   },
+   {
+    "agent": null,
+    "ask": 101,
+    "headline": "Cleanup of stale issues (3 rows)",
+    "id": "api#101",
+    "kind": "issue",
+    "raised_by": "api-orch",
+    "repo": "acme/api",
+    "rows": [
+     {
+      "finding": "stale cache key",
+      "recommendation": "close it",
+      "ref": "acme/api#31",
+      "short": "api#31",
+      "text": "api#31: close it"
+     },
+     {
+      "finding": "duplicate of 31",
+      "recommendation": "close as duplicate of api#31",
+      "ref": "acme/api#32",
+      "short": "api#32",
+      "text": "api#32: close as duplicate of api#31"
+     },
+     {
+      "finding": "https://github.com/acme/api/issues/34 is done",
+      "recommendation": "label it done",
+      "ref": "acme/api#33",
+      "short": "api#33",
+      "text": "api#33: label it done"
+     }
+    ],
+    "since": "2027-01-15T08:00:10Z",
+    "tier": "cos",
+    "title": "Cleanup of stale issues"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2df",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000008",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "agent": "web-coder",
+    "ask": 2,
+    "headline": "question: Which database?",
+    "id": "web#2mv",
+    "kind": "question",
+    "repo": "acme/web",
+    "request": "frm_ke000010",
+    "session": "ses_fake000005",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "question: Which database?"
+   },
+   {
+    "agent": "api-orch",
+    "ask": 7,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "blocked: cannot build until the key is rotated",
+    "id": "api#7hz",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:21Z",
+    "tier": "cos",
+    "title": "blocked: cannot build until the key is rotated"
+   },
+   {
+    "agent": "web-orch",
+    "ask": 8,
+    "considered": "no send from cos to web-orch in the last 72 hours",
+    "headline": "Which region for the cache?",
+    "id": "web#8gj",
+    "kind": "report",
+    "repo": "acme/web",
+    "since": "2027-01-15T08:00:22Z",
+    "tier": "cos",
+    "title": "Which region for the cache?"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "please look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:23Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 6,
+    "considered": "no send from api-orch to api-coder in the last 72 hours",
+    "headline": "one more question",
+    "id": "api#6iw",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:01:03Z",
+    "tier": "orchestrator",
+    "title": "one more question"
+   }
+  ],
+  "errors": [],
+  "generation": 3,
+  "written_at": "2027-01-15T08:01:09Z"
+ },
+ "4 the file was deleted: written again, same list": {
+  "daemon_pid": "<pid>",
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Which database?",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "cos",
+    "title": "Which database?"
+   },
+   {
+    "agent": null,
+    "ask": 9,
+    "headline": "Both labels on one issue",
+    "id": "api#9",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Both labels on one issue"
+   },
+   {
+    "agent": null,
+    "ask": 4,
+    "headline": "Pick the cache layer",
+    "id": "web#4",
+    "kind": "issue",
+    "repo": "acme/web",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Pick the cache layer"
+   },
+   {
+    "agent": null,
+    "ask": 101,
+    "headline": "Cleanup of stale issues (3 rows)",
+    "id": "api#101",
+    "kind": "issue",
+    "raised_by": "api-orch",
+    "repo": "acme/api",
+    "rows": [
+     {
+      "finding": "stale cache key",
+      "recommendation": "close it",
+      "ref": "acme/api#31",
+      "short": "api#31",
+      "text": "api#31: close it"
+     },
+     {
+      "finding": "duplicate of 31",
+      "recommendation": "close as duplicate of api#31",
+      "ref": "acme/api#32",
+      "short": "api#32",
+      "text": "api#32: close as duplicate of api#31"
+     },
+     {
+      "finding": "https://github.com/acme/api/issues/34 is done",
+      "recommendation": "label it done",
+      "ref": "acme/api#33",
+      "short": "api#33",
+      "text": "api#33: label it done"
+     }
+    ],
+    "since": "2027-01-15T08:00:10Z",
+    "tier": "cos",
+    "title": "Cleanup of stale issues"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2df",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000008",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "agent": "web-coder",
+    "ask": 2,
+    "headline": "question: Which database?",
+    "id": "web#2mv",
+    "kind": "question",
+    "repo": "acme/web",
+    "request": "frm_ke000010",
+    "session": "ses_fake000005",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "question: Which database?"
+   },
+   {
+    "agent": "api-orch",
+    "ask": 7,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "blocked: cannot build until the key is rotated",
+    "id": "api#7hz",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:21Z",
+    "tier": "cos",
+    "title": "blocked: cannot build until the key is rotated"
+   },
+   {
+    "agent": "web-orch",
+    "ask": 8,
+    "considered": "no send from cos to web-orch in the last 72 hours",
+    "headline": "Which region for the cache?",
+    "id": "web#8gj",
+    "kind": "report",
+    "repo": "acme/web",
+    "since": "2027-01-15T08:00:22Z",
+    "tier": "cos",
+    "title": "Which region for the cache?"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "please look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:23Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 6,
+    "considered": "no send from api-orch to api-coder in the last 72 hours",
+    "headline": "one more question",
+    "id": "api#6iw",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:01:03Z",
+    "tier": "orchestrator",
+    "title": "one more question"
+   }
+  ],
+  "errors": [],
+  "generation": 4,
+  "written_at": "2027-01-15T08:01:14Z"
+ },
+ "5 the file was not json: replaced": {
+  "daemon_pid": "<pid>",
+  "decisions": [
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "Which database?",
+    "id": "api#2",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "cos",
+    "title": "Which database?"
+   },
+   {
+    "agent": null,
+    "ask": 9,
+    "headline": "Both labels on one issue",
+    "id": "api#9",
+    "kind": "issue",
+    "repo": "acme/api",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Both labels on one issue"
+   },
+   {
+    "agent": null,
+    "ask": 4,
+    "headline": "Pick the cache layer",
+    "id": "web#4",
+    "kind": "issue",
+    "repo": "acme/web",
+    "since": "2027-01-15T07:59:05Z",
+    "tier": "human",
+    "title": "Pick the cache layer"
+   },
+   {
+    "agent": null,
+    "ask": 101,
+    "headline": "Cleanup of stale issues (3 rows)",
+    "id": "api#101",
+    "kind": "issue",
+    "raised_by": "api-orch",
+    "repo": "acme/api",
+    "rows": [
+     {
+      "finding": "stale cache key",
+      "recommendation": "close it",
+      "ref": "acme/api#31",
+      "short": "api#31",
+      "text": "api#31: close it"
+     },
+     {
+      "finding": "duplicate of 31",
+      "recommendation": "close as duplicate of api#31",
+      "ref": "acme/api#32",
+      "short": "api#32",
+      "text": "api#32: close as duplicate of api#31"
+     },
+     {
+      "finding": "https://github.com/acme/api/issues/34 is done",
+      "recommendation": "label it done",
+      "ref": "acme/api#33",
+      "short": "api#33",
+      "text": "api#33: label it done"
+     }
+    ],
+    "since": "2027-01-15T08:00:10Z",
+    "tier": "cos",
+    "title": "Cleanup of stale issues"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 2,
+    "headline": "permission: shell echo hi",
+    "id": "api#2df",
+    "kind": "permission",
+    "repo": "acme/api",
+    "request": "per_fake000008",
+    "session": "ses_fake000004",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "permission: shell echo hi"
+   },
+   {
+    "agent": "web-coder",
+    "ask": 2,
+    "headline": "question: Which database?",
+    "id": "web#2mv",
+    "kind": "question",
+    "repo": "acme/web",
+    "request": "frm_ke000010",
+    "session": "ses_fake000005",
+    "since": "2027-01-15T08:00:15Z",
+    "tier": "cos",
+    "title": "question: Which database?"
+   },
+   {
+    "agent": "api-orch",
+    "ask": 7,
+    "considered": "no send from cos to api-orch in the last 72 hours",
+    "headline": "blocked: cannot build until the key is rotated",
+    "id": "api#7hz",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:00:21Z",
+    "tier": "cos",
+    "title": "blocked: cannot build until the key is rotated"
+   },
+   {
+    "agent": "web-orch",
+    "ask": 8,
+    "considered": "no send from cos to web-orch in the last 72 hours",
+    "headline": "Which region for the cache?",
+    "id": "web#8gj",
+    "kind": "report",
+    "repo": "acme/web",
+    "since": "2027-01-15T08:00:22Z",
+    "tier": "cos",
+    "title": "Which region for the cache?"
+   },
+   {
+    "additions": 120,
+    "agent": "api-coder",
+    "ask": null,
+    "ci": "green",
+    "deletions": 14,
+    "files": 5,
+    "headline": "acme/api#7 Add the parser",
+    "id": "pr:acme/api#7",
+    "kind": "notice",
+    "merge_after": null,
+    "note": "please look",
+    "number": 7,
+    "repo": "acme/api",
+    "review": "approved",
+    "since": "2027-01-15T08:00:23Z",
+    "stale": false,
+    "state": "open",
+    "tier": "human",
+    "title": "acme/api#7 Add the parser",
+    "url": "https://github.com/acme/api/pull/7"
+   },
+   {
+    "agent": "api-coder",
+    "ask": 6,
+    "considered": "no send from api-orch to api-coder in the last 72 hours",
+    "headline": "one more question",
+    "id": "api#6iw",
+    "kind": "report",
+    "repo": "acme/api",
+    "since": "2027-01-15T08:01:03Z",
+    "tier": "orchestrator",
+    "title": "one more question"
+   }
+  ],
+  "errors": [],
+  "generation": 5,
+  "written_at": "2027-01-15T08:01:19Z"
+ }
+}

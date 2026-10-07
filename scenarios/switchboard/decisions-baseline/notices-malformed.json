@@ -1,0 +1,22 @@
+{
+ "decisions": [
+  {
+   "agent": "api-orch",
+   "ask": null,
+   "considered": "no send from cos to api-orch in the last 72 hours",
+   "headline": "Which database?",
+   "id": "api-orch-297",
+   "kind": "report",
+   "repo": "acme/api",
+   "since": "2027-01-15T08:00:00Z",
+   "tier": "cos",
+   "title": "Which database?"
+  }
+ ],
+ "errors": [
+  {
+   "error": "cannot read <home>/xdg-state/fleet-switchboard/pr-notices.json: Expecting property name enclosed in double quotes: line 1 column 2 (char …",
+   "source": "notices"
+  }
+ ]
+}

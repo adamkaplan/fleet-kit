@@ -1,0 +1,276 @@
+[
+ {
+  "argv": "decisions batch --title Cleanup of stale issues --row acme/api#31 | stale cache key | close it --row acme/api#32 | duplicate of 31 | close as duplicate of api#31 --row acme/api#33 | https://github.com/acme/api/issues/34 is done | label it done",
+  "as": "api-orch",
+  "code": 0,
+  "err": "fleet-switchboard: batch of 3 rows raised as acme/api#101, waiting on the Chief of Staff\n",
+  "gh_writes": [
+   "POST repos/acme/api/issues"
+  ],
+  "labels_changed": {
+   "acme/api#101": [
+    "me:awaiting-cos"
+   ]
+  },
+  "out": "api#101\n"
+ },
+ {
+  "issue_created": {
+   "acme/api#101": {
+    "body": "Related findings raised as ONE decision (3 rows) by api-orch. Each row is `<issue> | <finding> | <recommendation>`; one answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row issues: the raising orchestrator acts on the answer.\n\n```decision-rows\nacme/api#31 | stale cache key | close it\nacme/api#32 | duplicate of 31 | close as duplicate of api#31\nacme/api#33 | https://github.com/acme/api/issues/34 is done | label it done\n```\n\n<!-- fleet-switchboard:from=api-orch -->",
+    "labels": [
+     "me:awaiting-cos"
+    ],
+    "title": "Cleanup of stale issues"
+   }
+  }
+ },
+ {
+  "argv": "decisions batch --title Web cleanup --row acme/web#7 | one | do it --row web#8 | two | skip",
+  "as": "web-orch",
+  "code": 0,
+  "err": "fleet-switchboard: batch of 2 rows raised as acme/web#101, waiting on the Chief of Staff\n",
+  "gh_writes": [
+   "POST repos/acme/web/issues"
+  ],
+  "labels_changed": {
+   "acme/web#101": [
+    "me:awaiting-cos"
+   ]
+  },
+  "out": "web#101\n"
+ },
+ {
+  "argv": "decisions batch --title T --row acme/web#7 | outside | x",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: row 'acme/web#7' names an issue outside acme/api: a batch holds only issues of its own repo, so a finding about a private repo can never land in a public one's batch. Raise it from that repo's orchestrator\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row https://github.com/acme/web/issues/7 | outside | x",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: row 'https://github.com/acme/web/issues/7' names an issue outside acme/api: a batch holds only issues of its own repo, so a finding about a private repo can never land in a public one's batch. Raise it from that repo's orchestrator\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#7 | | close it",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: 'acme/api#7 | | close it'\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#7 | finding",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: 'acme/api#7 | finding'\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row the web one | finding | close",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: 'the web one' is not an issue: write repo#N, owner/repo#N or the issue's URL\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#7 | ``` | close",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: a row may not contain a code fence: 'acme/api#7 | ``` | close'\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#1 | f | r --row acme/api#2 | f | r --row acme/api#3 | f | r --row acme/api#4 | f | r --row acme/api#5 | f | r --row acme/api#6 | f | r --row acme/api#7 | f | r --row acme/api#8 | f | r --row acme/api#9 | f | r --row acme/api#10 | f | r --row acme/api#11 | f | r --row acme/api#12 | f | r --row acme/api#13 | f | r --row acme/api#14 | f | r --row acme/api#15 | f | r --row acme/api#16 | f | r --row acme/api#17 | f | r --row acme/api#18 | f | r --row acme/api#19 | f | r --row acme/api#20 | f | r --row acme/api#21 | f | r --row acme/api#22 | f | r --row acme/api#23 | f | r --row acme/api#24 | f | r --row acme/api#25 | f | r --row acme/api#26 | f | r --row acme/api#27 | f | r --row acme/api#28 | f | r --row acme/api#29 | f | r --row acme/api#30 | f | r --row acme/api#31 | f | r --row acme/api#32 | f | r --row acme/api#33 | f | r --row acme/api#34 | f | r --row acme/api#35 | f | r --row acme/api#36 | f | r --row acme/api#37 | f | r --row acme/api#38 | f | r --row acme/api#39 | f | r --row acme/api#40 | f | r --row acme/api#41 | f | r",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: a batch is at most 40 rows (this one is 41): raise the rest as a second batch\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: a batch needs rows: --row \"<repo#N> | <finding> | <recommendation>\" (repeat it), or --file\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#7 | x | y",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: only an orchestrator raises a batch (cos is a chief-of-staff): a worker reports to its orchestrator\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title T --row acme/api#7 | x | y",
+  "as": "api-coder",
+  "code": 2,
+  "err": "fleet-switchboard: only an orchestrator raises a batch (api-coder is a coder): a worker reports to its orchestrator\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title  --row acme/api#7 | x | y",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: --title is one line of 1 to 120 characters\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --row acme/api#7 | x | y",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: --title is one line of 1 to 120 characters\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions batch --title From a file --file <home>/rows.txt",
+  "as": "api-orch",
+  "code": 0,
+  "err": "fleet-switchboard: batch of 2 rows raised as acme/api#102, waiting on the Chief of Staff\n",
+  "gh_writes": [
+   "POST repos/acme/api/issues"
+  ],
+  "labels_changed": {
+   "acme/api#102": [
+    "me:awaiting-cos"
+   ]
+  },
+  "out": "api#102\n"
+ },
+ {
+  "argv": "decisions batch --title From stdin",
+  "as": "api-orch",
+  "code": 0,
+  "err": "fleet-switchboard: batch of 1 rows raised as acme/api#103, waiting on the Chief of Staff\n",
+  "gh_writes": [
+   "POST repos/acme/api/issues"
+  ],
+  "labels_changed": {
+   "acme/api#103": [
+    "me:awaiting-cos"
+   ]
+  },
+  "out": "api#103\n"
+ },
+ {
+  "derived_after": {
+   "decisions": [
+    {
+     "agent": null,
+     "ask": 101,
+     "headline": "Cleanup of stale issues (3 rows)",
+     "id": "api#101",
+     "kind": "issue",
+     "raised_by": "api-orch",
+     "repo": "acme/api",
+     "rows": [
+      {
+       "finding": "stale cache key",
+       "recommendation": "close it",
+       "ref": "acme/api#31",
+       "short": "api#31",
+       "text": "api#31: close it"
+      },
+      {
+       "finding": "duplicate of 31",
+       "recommendation": "close as duplicate of api#31",
+       "ref": "acme/api#32",
+       "short": "api#32",
+       "text": "api#32: close as duplicate of api#31"
+      },
+      {
+       "finding": "https://github.com/acme/api/issues/34 is done",
+       "recommendation": "label it done",
+       "ref": "acme/api#33",
+       "short": "api#33",
+       "text": "api#33: label it done"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "Cleanup of stale issues"
+    },
+    {
+     "agent": null,
+     "ask": 102,
+     "headline": "From a file (2 rows)",
+     "id": "api#102",
+     "kind": "issue",
+     "raised_by": "api-orch",
+     "repo": "acme/api",
+     "rows": [
+      {
+       "finding": "one",
+       "recommendation": "do it",
+       "ref": "acme/api#7",
+       "short": "api#7",
+       "text": "api#7: do it"
+      },
+      {
+       "finding": "two",
+       "recommendation": "skip",
+       "ref": "acme/api#8",
+       "short": "api#8",
+       "text": "api#8: skip"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "From a file"
+    },
+    {
+     "agent": null,
+     "ask": 103,
+     "headline": "From stdin (1 row)",
+     "id": "api#103",
+     "kind": "issue",
+     "raised_by": "api-orch",
+     "repo": "acme/api",
+     "rows": [
+      {
+       "finding": "three",
+       "recommendation": "do it",
+       "ref": "acme/api#9",
+       "short": "api#9",
+       "text": "api#9: do it"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "From stdin"
+    },
+    {
+     "agent": null,
+     "ask": 101,
+     "headline": "Web cleanup (2 rows)",
+     "id": "web#101",
+     "kind": "issue",
+     "raised_by": "web-orch",
+     "repo": "acme/web",
+     "rows": [
+      {
+       "finding": "one",
+       "recommendation": "do it",
+       "ref": "acme/web#7",
+       "short": "web#7",
+       "text": "web#7: do it"
+      },
+      {
+       "finding": "two",
+       "recommendation": "skip",
+       "ref": "web#8",
+       "short": "web#8",
+       "text": "web#8: skip"
+      }
+     ],
+     "since": "2027-01-15T08:00:00Z",
+     "tier": "cos",
+     "title": "Web cleanup"
+    }
+   ],
+   "errors": []
+  }
+ }
+]

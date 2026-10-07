@@ -40,6 +40,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 import urllib.parse
 from unittest import mock
 
@@ -22181,6 +22182,1014 @@ class TestTierScenarios(Base):
         readme = (REPO / "scenarios" / "switchboard" / "README.md").read_text()
         for word in ("`decide`", "`edit-cos-orders`", "`issue_labels`", "`permission_answered`", "`label`"):
             self.assertIn(word, readme)
+
+
+# ======================================================================
+# The Decision baseline (characterisation). It pins what the Decision subsystem does TODAY, through the seams
+# that outlive a refactor: the CLI (`decisions`, `decisions --json`, `decisions --fresh`, `status`, the write
+# commands), decisions.json, the effects on the fake gh and the fake v2, and the plugin's view of the same list.
+# The expected outputs are plain files in scenarios/switchboard/decisions-baseline/ (synthetic names only).
+# A refactor that keeps behaviour changes no test and no file here, only the code under test. To record the
+# files again after a CHANGE OF BEHAVIOUR THAT WAS MEANT: DECISIONS_BASELINE_UPDATE=1 bin/test-switchboard
+# TestDecisionBaseline, then read the diff of the files like any other change. docs/switchboard.md, "Testing".
+#
+# Where only an internal function can be called there is ONE adapter function (named baseline_*, below): the
+# single place to repoint when the engine's decision code moves.
+# ======================================================================
+BASELINE_DIR = REPO / "scenarios" / "switchboard" / "decisions-baseline"
+BASELINE_UPDATE = os.environ.get("DECISIONS_BASELINE_UPDATE") == "1"
+BASELINE_NODE_PRESENT = bool(NODE)
+
+
+def baseline_assign_ids(items, repos=None):
+    """ADAPTER: ids for items {seed, ask, agent, bare, since, repo}, in order (today sb.assign_decision_ids)."""
+    return sb.assign_decision_ids(items, repos)
+
+
+def baseline_headline(kind, title, issue_title=None):
+    """ADAPTER: the headline of one decision of `kind` and `title`, for a report about an issue titled
+    `issue_title` when known (today sb.headline_of)."""
+    return sb.headline_of({"kind": kind, "title": title}, issue_title)
+
+
+def baseline_attach_hub(engine, runner, now):
+    """ADAPTER: give a daemon-style engine the GitHub picture the daemon's hub would hold, as `decisions --fresh`
+    does for its own engine (today a GitHubHub filled by read_awaiting)."""
+    hub = sb.GitHubHub(engine.config, engine.state_dir, None, runner, sb.spawn_forwarder, now, "cli")
+    hub.engine, engine.hub = engine, hub
+    engine.gh_runner = runner  # the notices' `gh pr view` reads
+    for repo in sb.decision_repos(engine):
+        hub.read_awaiting(repo, now())
+
+
+@contextlib.contextmanager
+def baseline_unreadable_inbox(session_id, failure):
+    """ADAPTER: the inbox of one session cannot be read (today V2Client.inbox_list raises)."""
+    real = sb.V2Client.inbox_list
+
+    def read(self, sid, *args, **kwargs):
+        if sid == session_id:
+            raise RuntimeError("inbox read failed") if failure == "RuntimeError" else sb.V2Error("v2 says 500")
+        return real(self, sid, *args, **kwargs)
+
+    with mock.patch.object(sb.V2Client, "inbox_list", read):
+        yield
+
+
+def baseline_failing_send(reason):
+    """ADAPTER: the engine's `send` delivers nothing: `reason` is why, or None for an error (today Switchboard.send)."""
+    if reason is None:
+        return mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent"))
+    return mock.patch.object(sb.Switchboard, "send", return_value={"sent": False, "reason": reason})
+
+
+def baseline_derive(engine, now):
+    """ADAPTER: what the derivation lists now and what it could not read, notices included: (decisions, errors)
+    (today sb.derive_decisions, after a discovery and a fact collection)."""
+    engine.discover(now())
+    engine.collect_facts()
+    return sb.derive_decisions(engine, now())
+
+
+def baseline_golden(test, name, data):
+    """Compare `data` with the golden file `name`.json (or record it under DECISIONS_BASELINE_UPDATE=1)."""
+    text = json.dumps(data, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
+    path = BASELINE_DIR / (name + ".json")
+    if BASELINE_UPDATE:
+        BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return
+    test.assertTrue(path.exists(), "no golden file %s: record it with DECISIONS_BASELINE_UPDATE=1" % path.name)
+    test.maxDiff = None
+    test.assertEqual(path.read_text(), text, "the Decision baseline %s changed: behaviour changed" % path.name)
+
+
+class BaselineWorld(WriteWorld):
+    """The Chief of Staff, two orchestrators and their coders (TierWorld), a fake gh with labels, comments and PRs,
+    and the fake v2. Every observation goes through the CLI or a file."""
+
+    def setUp(self):
+        super().setUp()
+        self.prs = {}
+        counter = iter(range(1, 10 ** 6))  # message and key ids come from uuid4: a count, so ids repeat from run to run
+        patcher = mock.patch.object(uuid, "uuid4", lambda: uuid.UUID(int=next(counter) << 64))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            if self.prs[int(argv[3])] is None:
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502 boom")
+            return subprocess.CompletedProcess(argv, 0, self.prs[int(argv[3])], "")
+        return super().route(argv, **kwargs)
+
+    def who(self, name):
+        """Run the next command as the fleet agent `name`, or as a person in a plain shell (`you`)."""
+        if name == "you":
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            self.as_agent(name)
+
+    def cmd(self, who, *argv):
+        self.who(who)
+        code, out, err = self.main(*argv)
+        return {"code": code, "out": out, "err": err}
+
+    def fresh(self, who="cos", *flags):
+        got = self.cmd(who, "decisions", "--fresh", "--json", *(flags or ("--tier", "all")))
+        self.assertEqual(got["code"], 0, got["err"])
+        body = json.loads(got["out"])
+        return {"decisions": body["decisions"], "errors": body["errors"]}
+
+    def add_worker(self, name, boss="api-orch", repo=API, issue=None):
+        fleet = {"role": "coder", "reports_to": boss, "repo": repo}
+        if issue is not None:
+            fleet["issue"] = issue
+        self.world.add_agent(name, fleet=fleet)
+
+    def say(self, sender, state, text, issue=None, everything=False):
+        self.world.new_engine("cli").report(sender, state, text, issue, everything=everything)
+        self.world.tick(1)
+
+    def send(self, boss, worker, text, issue=None):
+        outcome = self.world.new_engine("cli").send(boss, worker, text, issue)
+        self.world.tick(1)
+        return outcome
+
+    def titles(self, found=None):
+        found = self.fresh() if found is None else found
+        return sorted((d["agent"], d["kind"], d["title"]) for d in found["decisions"])
+
+    def writes(self):
+        """What the fake gh was asked to write, in order: `METHOD path`."""
+        return ["%s %s" % (c[c.index("--method") + 1], c[2]) for c in self.gh.calls if "--method" in c]
+
+    def labels(self):
+        return {"%s#%d" % key: sorted(issue["labels"]) for key, issue in sorted(self.gh.issues.items())}
+
+    def notes_to(self, name):
+        """The text of every message admitted to `name`, newest last."""
+        return [str(a.get("text") or a.get("prompt") or a) for a in self.world.admissions(name)]
+
+    # -- the world a scenario builds: every helper below only drives the fakes and the CLI
+
+    def set_config(self, **extra):
+        """Rewrite the config file (and the engine) with `extra`, as an operator would."""
+        raw = dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "github_repos": [API, WEB],
+                    "jev": {"replay": write_report_replay(self.home)}}, **TIER_LABELS)
+        raw.update(extra)
+        self.write_config(raw)
+        self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
+        self.world.engine = self.world.new_engine()
+
+    def ask_permission(self, name, timed=True):
+        return self.block(name, timed=timed)
+
+    def ask_question(self, name):
+        sid = self.world.sessions[name]
+        self.world.v2.start_turn(sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes[name]]["status"] = "blocked"
+        return self.world.v2.ask_form(sid)
+
+    def daemon_pass(self, seconds=5, hub=True):
+        """One daemon pass with the GitHub picture attached (what the daemon's hub holds), then the file."""
+        self.world.tick(seconds)
+        if hub:
+            baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        self.world.engine.run_pass()
+
+    def derived(self):
+        """The derivation itself on a daemon-style engine: the list with its notices, and its errors."""
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
+        return {"decisions": decisions, "errors": errors}
+
+    def file_body(self):
+        body = json.loads((self.world.state / sb.DECISIONS_FILE).read_text())
+        body["daemon_pid"] = "<pid>"
+        return body
+
+    def scrub(self, text):
+        return text.replace(str(self.home), "<home>")
+
+    def full_house(self):
+        """One decision of every source kind, in every tier, and a notice."""
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])
+        self.gh.issue(API, 9, "Both labels on one issue", labels=["me:awaiting-cos", "me:awaiting-user"])
+        self.world.tick(5)
+        code = self.raise_batch()["code"]
+        self.assertEqual(code, 0)
+        self.world.tick(5)
+        self.ask_permission("api-coder")
+        self.ask_question("web-coder")
+        self.world.tick(5)
+        self.say("api-coder", "question", "Which table should hold the totals?", 6)
+        self.say("api-orch", "blocked", "cannot build until the key is rotated", 7)
+        self.say("web-orch", "question", "Which region for the cache?", 8)
+        self.prs[7] = pr_view_json()
+        self.assertEqual(self.cmd("api-coder", "notice", "pr", "acme/api#7", "please", "look")["code"], 0)
+        self.world.tick(5)
+
+    BATCH_ROWS = ("acme/api#31 | stale cache key | close it", "acme/api#32 | duplicate of 31 | close as duplicate of api#31",
+                  "acme/api#33 | https://github.com/acme/api/issues/34 is done | label it done")
+
+    def raise_batch(self, who="api-orch", title="Cleanup of stale issues", rows=BATCH_ROWS):
+        argv = ["decisions", "batch", "--title", title]
+        for row in rows:
+            argv += ["--row", row]
+        return self.cmd(who, *argv)
+
+    # -- recording what a command did to the outside: the fake gh and the fake v2
+
+    def mark(self):
+        v2 = self.world.v2
+        return {"gh": len(self.gh.calls), "comments": len(self.gh.comments), "labels": self.labels(),
+                "perm": len(getattr(v2, "permission_replies", [])), "form": len(getattr(v2, "form_replies", [])),
+                "admitted": {n: len(self.world.admissions(n)) for n in self.world.sessions},
+                "escalated": dict(sb.read_escalated(self.world.state))}
+
+    def step(self, who, *argv):
+        """Run a command as `who` and say what it printed and what it did to the fakes."""
+        before = self.mark()
+        got = self.cmd(who, *argv)
+        v2 = self.world.v2
+        record = {"as": who, "argv": self.scrub(" ".join(argv)), "code": got["code"], "out": self.scrub(got["out"]),
+                  "err": self.scrub(got["err"])}
+        writes = ["%s %s" % (c[c.index("--method") + 1], c[2]) for c in self.gh.calls[before["gh"]:] if "--method" in c]
+        effects = {"gh_writes": writes, "comments": [c["body"] for c in self.gh.comments[before["comments"]:]],
+                   "labels_changed": {k: v for k, v in self.labels().items() if before["labels"].get(k) != v},
+                   "permission_replies": list(getattr(v2, "permission_replies", []))[before["perm"]:],
+                   "form_replies": list(getattr(v2, "form_replies", []))[before["form"]:],
+                   "notes": {n: [a["text"] for a in self.world.admissions(n)][before["admitted"][n]:]
+                             for n in self.world.sessions
+                             if len(self.world.admissions(n)) > before["admitted"][n]},
+                   "escalated_requests": sorted(set(sb.read_escalated(self.world.state)) - set(before["escalated"]))}
+        record.update({k: v for k, v in effects.items() if v})
+        return record
+
+class TestDecisionBaselineSources(BaselineWorld):
+    """Every source kind, in every tier: what the derivation lists (the fresh read, as `decisions --fresh` prints it)."""
+
+    def test_every_source_kind_in_every_tier(self):
+        self.full_house()
+        found = self.derived()
+        fresh = self.fresh()
+        self.assertEqual([d for d in found["decisions"] if d["kind"] != "notice"], fresh["decisions"],
+                         "`decisions --fresh` lists the derivation, less the notices")
+        kinds = sorted({(d["kind"], d["tier"]) for d in found["decisions"]})
+        baseline_golden(self, "sources", {"derived": found, "kinds_and_tiers": kinds})
+
+    def test_a_pass_publishes_exactly_what_the_fresh_read_derives(self):
+        self.full_house()
+        self.daemon_pass()
+        found = self.derived()
+        self.assertEqual(self.file_body()["decisions"], found["decisions"])
+        self.assertEqual(self.file_body()["errors"], found["errors"])
+
+    def test_the_tier_rules_and_the_grace_timer(self):
+        steps = {}
+        tiers = lambda found: sorted((d["id"], d["kind"], d["tier"]) for d in found["decisions"])
+        self.gh.issue(API, 2, "your label", labels=["me:awaiting-user"])
+        self.gh.issue(API, 3, "the cos label", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 4, "both labels", labels=["me:awaiting-cos", "me:awaiting-user"])
+        self.gh.issue(API, 5, "another label", labels=["bug"])
+        steps["1 issue labels"] = tiers(self.fresh())
+        self.say("api-orch", "question", "a report to a boss that has no boss")
+        self.add_worker("helper", "api-orch", API)
+        self.say("helper", "question", "a report to a boss that is a worker itself")
+        self.say("web-orch", "blocked", "a blocked report", 40)
+        steps["2 reports"] = tiers(self.fresh())
+        ask = self.ask_permission("web-coder")
+        steps["3 request pending 0 s"] = tiers(self.fresh())
+        self.world.tick(299)
+        steps["4 request pending 299 s"] = tiers(self.fresh())
+        self.world.tick(1)
+        steps["5 request pending 300 s (the grace edge)"] = tiers(self.fresh())
+        self.ask_question("coder")
+        steps["6 a question, pending 0 s"] = [t for t in tiers(self.fresh()) if t[1] == "question"]
+        self.world.tick(300)
+        steps["7 the question, pending 300 s"] = [t for t in tiers(self.fresh()) if t[1] == "question"]
+        self.ask_permission("api-coder")
+        found = self.fresh()
+        (fresh_request,) = [d for d in found["decisions"] if d["agent"] == "api-coder" and d["kind"] == "permission"]
+        steps["8 a new request, before escalation"] = [(fresh_request["id"], fresh_request["tier"])]
+        steps["9 the escalation"] = self.step("cos", "decisions", "escalate", fresh_request["id"], "--reason", "needs the owner")
+        steps["10 the new request after it"] = [(d["id"], d["tier"]) for d in self.fresh()["decisions"]
+                                                 if d["id"] == fresh_request["id"]]
+        self.world.tick(86400)
+        steps["11 a day on: nothing is hidden from you for good"] = sorted({d["tier"] for d in self.fresh()["decisions"]
+                                                                            if d["kind"] in ("permission", "question")})
+        baseline_golden(self, "tiers", steps)
+
+    def test_the_grace_period_is_configurable_and_zero_is_at_once(self):
+        steps = {}
+        self.set_config(decisions_cos_grace_seconds=0)
+        self.ask_permission("web-coder")
+        steps["grace 0"] = [(d["kind"], d["tier"]) for d in self.fresh()["decisions"]]
+        self.set_config(decisions_cos_grace_seconds=10)
+        self.world.v2.answer_permissions(self.world.sessions["web-coder"])
+        self.world.herdr.panes[self.world.panes["web-coder"]]["status"] = None
+        self.ask_permission("api-coder")
+        steps["grace 10, at 0 s"] = [(d["kind"], d["tier"]) for d in self.fresh()["decisions"]]
+        self.world.tick(10)
+        steps["grace 10, at 10 s"] = [(d["kind"], d["tier"]) for d in self.fresh()["decisions"]]
+        baseline_golden(self, "tiers-grace", steps)
+
+    def test_an_answered_request_is_no_longer_a_decision(self):
+        self.ask_permission("web-coder")
+        self.assertEqual(len(self.fresh()["decisions"]), 1)
+        self.world.herdr.panes[self.world.panes["web-coder"]]["status"] = None
+        self.world.v2.answer_permissions(self.world.sessions["web-coder"])
+        self.assertEqual(self.fresh()["decisions"], [])
+
+    def test_a_report_about_a_cos_issue_follows_the_issue_when_it_is_escalated(self):
+        steps = {}
+        self.gh.issue(API, 12, "The labelled issue", labels=["me:awaiting-cos"])
+        self.say("api-orch", "question", "Which way for 12?", 12)
+        steps["cos label"] = self.fresh()["decisions"]
+        steps["escalate"] = self.step("cos", "decisions", "escalate", "api#12")
+        steps["after the escalation"] = self.fresh()["decisions"]
+        baseline_golden(self, "tiers-follow-the-issue", steps)
+
+
+class TestDecisionBaselineIds(unittest.TestCase):
+    @staticmethod
+    def item(seed, ask=None, agent="coder", bare=False, since=EPOCH, repo=None):
+        return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since, "repo": repo}
+
+    @staticmethod
+    def spread(ids):
+        return {"count": len(ids), "unique": len(set(ids)), "first": ids[:3], "last": ids[-3:]}
+
+    def test_id_assignment_and_collisions(self):
+        item = self.item
+        out = {}
+        out["a bare issue is #N"] = baseline_assign_ids([item("issue:acme/web#5", ask=5, bare=True, repo="acme/web")])
+        out["with two repos the tag names the repo"] = baseline_assign_ids(
+            [item("issue:acme/web#5", ask=5, bare=True, repo="acme/web"),
+             item("issue:acme/api#5", ask=5, bare=True, since=EPOCH + 1, repo="acme/api")], ["acme/web", "acme/api"])
+        out["two repos, no repo list: the second takes the next free id"] = baseline_assign_ids(
+            [item("issue:acme/web#5", ask=5, bare=True, repo="acme/web"),
+             item("issue:acme/api#5", ask=5, bare=True, since=EPOCH + 1, repo="acme/api")])
+        out["another decision on an issue is #N and two letters"] = baseline_assign_ids(
+            [item("request:ses_a:req_1", ask=2), item("request:ses_a:req_2", ask=2, since=EPOCH + 1)])
+        out["none about an issue: agent and three digits"] = baseline_assign_ids(
+            [item("request:ses_a:req_1", agent="platform"), item("request:ses_a:req_2", agent="platform", since=EPOCH + 1)])
+        out["no agent either: fleet and three digits"] = baseline_assign_ids([item("request:ses_a:req_1", agent=None)])
+        out["the longer wait keeps the id, whatever the order given"] = [
+            baseline_assign_ids([item("s1", ask=2, since=EPOCH + 5), item("s1b", ask=2, since=EPOCH)]),
+            baseline_assign_ids([item("s1b", ask=2, since=EPOCH), item("s1", ask=2, since=EPOCH + 5)])]
+        out["the same wait: the seed decides"] = baseline_assign_ids([item("seed-b", ask=2), item("seed-a", ask=2)])
+        out["an id does not change when another goes away"] = {
+            "both": baseline_assign_ids([item("s1", ask=2), item("s2", ask=2, since=EPOCH + 1)]),
+            "the later one alone": baseline_assign_ids([item("s2", ask=2, since=EPOCH + 1)])}
+        out["300 on one issue"] = self.spread(baseline_assign_ids(
+            [item("seed-%d" % n, ask=2, since=EPOCH + n) for n in range(300)]))
+        out["700 on one issue run past every letter pair"] = self.spread(baseline_assign_ids(
+            [item("seed-%d" % n, ask=2, since=EPOCH + n) for n in range(700)]))
+        out["1000 for one agent run past every digit triple"] = self.spread(baseline_assign_ids(
+            [item("seed-%d" % n, agent="a", since=EPOCH + n) for n in range(1000)]))
+        out["ids are the same on every call"] = baseline_assign_ids([item("s1", ask=2)]) == baseline_assign_ids([item("s1", ask=2)])
+        baseline_golden(self, "ids", out)
+
+
+class TestDecisionBaselineHeadlines(BaselineWorld):
+    LONG = ("https://github.com/acme/venue-api/issues/2109 " + "needs a decision on the schema " * 8).strip()
+
+    def test_headline_cutting(self):
+        cases = [("issue", "Pick the database for https://github.com/acme/web/issues/9", None),
+                 ("issue", "two short words", None), ("issue", "x" * 200, None),
+                 ("issue", "word " * 60, None),
+                 ("report", "Which database should it use?", "Storage choice"),
+                 ("report", "Which database should it use?", None),
+                 ("report", self.LONG, None), ("report", "gist " * 40, "title " * 30),
+                 ("report", "short gist", "title " * 30), ("report", "gist " * 40, "Storage choice"),
+                 ("report", "see https://github.com/acme/web/pull/7, then https://docs.example.org/a/b?c=1 ok", "T"),
+                 ("permission", "permission: shell " + "x" * 200, None), ("question", "Which database?", "ignored"),
+                 ("report", "a" * 70, "b" * 5), ("report", "tiny", "b" * 33)]
+        out = [{"kind": k, "title": t, "issue_title": i, "headline": baseline_headline(k, t, i)} for k, t, i in cases]
+        baseline_golden(self, "headlines", out)
+
+    def test_headlines_in_the_derived_list(self):
+        self.gh.issue(API, 40, "An issue with a long title about https://github.com/acme/web/issues/9 " + "and more " * 30,
+                      labels=["me:awaiting-cos"])
+        self.say("api-orch", "question", self.LONG)
+        self.say("web-orch", "blocked", "blocked on https://github.com/acme/api/pull/77 " + "waiting " * 25)
+        self.ask_permission("api-coder")
+        found = self.fresh()
+        baseline_golden(self, "headlines-derived", [{"kind": d["kind"], "title": d["title"], "headline": d["headline"]}
+                                                    for d in found["decisions"]])
+
+
+class TestDecisionBaselineFolding(BaselineWorld):
+    def test_a_report_folds_into_its_issue_and_an_untagged_one_by_text(self):
+        self.add_worker("loner", "api-orch", API)
+        self.add_worker("loner2", "api-orch", API)
+        self.add_worker("other-repo", "api-orch", "acme/other")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 3, "Second api issue", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "Same number, other repo", labels=["me:awaiting-user"])
+        self.say("api-orch", "question", "tagged on the issue: which engine?", 2)                      # folded into api#2
+        self.say("api-coder", "question", "a second reporter on the same issue", 2)                    # folded; reported_by has both
+        self.say("web-orch", "question", "tagged with the web repo's same number", 2)                  # folded into web#2 only
+        self.say("loner", "question", "blocked on api#3 until you pick")                                # untagged, names one: folded
+        self.say("loner2", "question", "see https://github.com/acme/api/issues/3 for the plan")        # a URL names it: folded
+        self.say("other-repo", "question", "a third repo, the same number 2", 2)                       # not folded
+        for name in ("loner3", "loner4", "loner5"):
+            self.add_worker(name, "api-orch", API)
+        self.say("loner3", "question", "which of api#2 or api#3?")                                      # names two: stays
+        self.say("loner4", "question", "nothing named here, or api#99")                                 # names none: stays
+        self.say("loner5", "question", "web#2 is another repo's issue")                                 # other repo: stays
+        found = self.fresh()
+        baseline_golden(self, "folding", {"derived": found,
+                                          "folded_into": {d["id"]: d.get("reported_by") for d in found["decisions"]
+                                                          if d["kind"] == "issue"}})
+
+    def test_ids_are_the_ones_the_unfolded_list_would_assign(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        alone = [d["id"] for d in self.fresh()["decisions"]]
+        self.say("api-orch", "question", "tagged on the issue", 2)
+        self.assertEqual([d["id"] for d in self.fresh()["decisions"]], alone)
+
+
+class TestDecisionBaselineAnswered(BaselineWorld):
+    """report_answered, case by case: each case has its own worker (reporting to api-orch, which reports to cos),
+    so one derivation reads them all. A decision is `open` when the worker's report is still listed."""
+
+    def cases(self):
+        Q, W = "question", "withdrawn"
+        return [
+            ("no send", [("say", Q, "which one?", 11)]),
+            ("a tagged send on the ask after the report", [("say", Q, "which one?", 11), ("send", "use a", 11)]),
+            ("an untagged send after the report", [("say", Q, "which one?", 11), ("send", "use a", None)]),
+            ("a send on another ask", [("say", Q, "which one?", 11), ("send", "use a", 99)]),
+            ("a send before the report", [("send", "start on it", 11), ("tick", 2), ("say", Q, "which one?", 11)]),
+            ("a send from someone other than the boss",
+             [("say", Q, "which one?", 11), ("send_from", "cos", "use a", 11)]),
+            ("a boss send queued in the inbox (a person is engaged)",
+             [("say", Q, "which one?", 11), ("engage",), ("send", "use a", 11)]),
+            ("a boss send queued in the inbox, on another ask",
+             [("say", Q, "which one?", 11), ("engage",), ("send", "use a", 99)]),
+            ("a boss send queued in the inbox, untagged",
+             [("say", Q, "which one?", 11), ("engage",), ("send", "use a", None)]),
+            ("a newer question on the same ask replaces it",
+             [("say", Q, "which one?", 11), ("say", Q, "and which region?", 11)]),
+            ("a newer question on another ask leaves both",
+             [("say", Q, "which one?", 11), ("say", Q, "and which region?", 12)]),
+            ("a newer done on the ask", [("say", Q, "which one?", 11), ("say", "done", "found it", 11)]),
+            ("a newer failed on the ask", [("say", Q, "which one?", 11), ("say", "failed", "gave up", 11)]),
+            ("a newer withdrawn on the ask", [("say", Q, "which one?", 11), ("say", W, "superseded", 11)]),
+            ("a newer working on the ask", [("say", Q, "which one?", 11), ("say", "working", "still going", 11)]),
+            ("a newer paused on the ask", [("say", Q, "which one?", 11), ("say", "paused", "waiting", 11)]),
+            ("a newer blocked on the ask: both are listed",
+             [("say", Q, "which one?", 11), ("say", "blocked", "waiting on the key", 11)]),
+            ("a blocked report with nothing newer", [("say", "blocked", "waiting on the key", 11)]),
+            ("a done on another ask", [("say", Q, "which one?", 11), ("say", "done", "the other one", 99)]),
+            ("a withdrawn on another ask", [("say", Q, "which one?", 11), ("say", W, "superseded", 99)]),
+            ("withdrawn --all clears every open question of the worker, on any ask",
+             [("say", Q, "which one?", 11), ("say", "blocked", "stuck", 12), ("say", Q, "untagged one"),
+              ("withdraw_all", "all superseded")]),
+            ("a question after a withdrawal is listed",
+             [("say", Q, "which one?", 11), ("say", W, "superseded", 11), ("say", Q, "and which region?", 11)]),
+            ("untagged question, nothing else", [("say", Q, "first thing?")]),
+            ("two untagged questions both stay", [("say", Q, "first thing?"), ("say", Q, "second thing?")]),
+            ("an untagged question cleared by an untagged done",
+             [("say", Q, "first thing?"), ("say", "done", "finished")]),
+            ("an untagged question cleared by an untagged failed",
+             [("say", Q, "first thing?"), ("say", "failed", "gave up")]),
+            ("an untagged question cleared by an untagged withdrawn",
+             [("say", Q, "first thing?"), ("say", W, "superseded")]),
+            ("an untagged question is not cleared by an untagged working",
+             [("say", Q, "first thing?"), ("say", "working", "going")]),
+            ("an untagged question is not cleared by a tagged done",
+             [("say", Q, "first thing?"), ("say", "done", "another", 5)]),
+            ("an untagged question and an untagged blocked: both stay",
+             [("say", Q, "first thing?"), ("say", "blocked", "stuck")]),
+            ("a withdrawal is a rider: it hides the question before any message carries it",
+             [("say", Q, "which one?", 11), ("say", W, "superseded", 11), ("tick", 7200 * 2), ("pass",)]),
+        ]
+
+    def run_case(self, label, steps):
+        for step in steps:
+            kind = step[0]
+            if kind == "say":
+                self.say(label, step[1], step[2], step[3] if len(step) > 3 else None)
+            elif kind == "send":
+                self.send("api-orch", label, step[1], step[2])
+            elif kind == "send_from":
+                self.send(step[1], label, step[2], step[3])
+            elif kind == "engage":
+                self.world.you(label)
+            elif kind == "withdraw_all":
+                self.say(label, "withdrawn", step[1], everything=True)
+            elif kind == "tick":
+                self.world.tick(step[1])
+            elif kind == "pass":
+                self.world.engine.run_pass()
+
+    def test_report_answered_case_by_case(self):
+        names = []
+        for number, (what, steps) in enumerate(self.cases(), 1):
+            label = "w%02d" % number
+            self.add_worker(label)
+            names.append((label, what))
+            self.run_case(label, steps)
+        found = self.fresh()
+        out = []
+        for label, what in names:
+            mine = [{"title": d["title"], "ask": d["ask"], "tier": d["tier"], "considered": d.get("considered")}
+                    for d in found["decisions"] if d["agent"] == label]
+            out.append({"case": "%s: %s" % (label, what), "open": mine})
+        baseline_golden(self, "report-answered", {"cases": out, "errors": found["errors"]})
+
+    def test_a_worker_that_no_longer_runs_has_nobody_waiting(self):
+        self.add_worker("gone")
+        self.say("gone", "question", "anyone there?", 11)
+        self.assertEqual(len(self.fresh()["decisions"]), 1)
+        self.world.herdr.panes.pop(self.world.panes["gone"])
+        baseline_golden(self, "report-worker-gone", self.fresh())
+
+    def test_one_workers_unreadable_inbox_is_an_error_entry_and_spares_the_others(self):
+        self.add_worker("good")
+        self.add_worker("bad")
+        self.say("good", "question", "is it fine?", 4)
+        self.say("bad", "question", "which one?", 2)
+        self.send("api-orch", "good", "yes", 4)
+        out = {}
+        for failure in ("RuntimeError", "V2Error"):
+            with baseline_unreadable_inbox(self.world.sessions["bad"], failure):
+                out[failure] = self.fresh()
+        baseline_golden(self, "report-unreadable-inbox", out)
+
+
+class TestDecisionBaselineWrites(BaselineWorld):
+    """escalate, resolve, answer, supersede and batch: what each prints and what it does to the fake gh and fake v2."""
+
+    def ident(self, text):
+        found = [d["id"] for d in self.fresh()["decisions"] if text in d["title"]]
+        self.assertEqual(len(found), 1, "%r in %r" % (text, found))
+        return found[0]
+
+    def test_escalate_and_resolve(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos", "bug"])
+        self.gh.issue(WEB, 2, "Other repo", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 3, "Yours already", labels=["me:awaiting-user"])
+        self.gh.issue(API, 4, "To resolve with a note", labels=["me:awaiting-cos", "keep"])
+        self.gh.issue(API, 5, "To resolve silently", labels=["me:awaiting-user"])
+        self.say("api-orch", "question", "a report that names no issue")
+        self.say("web-orch", "question", "a report on an issue with no label", 60)
+        self.ask_permission("api-coder")
+        self.prs[7] = pr_view_json()
+        self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")
+        steps = []
+        steps.append(self.step("cos", "decisions", "escalate", self.ident("Which database?"), "--reason", "the owner must pick: it costs money"))
+        steps.append(self.step("cos", "decisions", "escalate", "api#2"))
+        steps.append(self.step("cos", "decisions", "escalate", "web#3"))
+        steps.append(self.step("cos", "decisions", "escalate", "nope-123"))
+        steps.append(self.step("cos", "decisions", "escalate", self.ident("a report that names no issue")))
+        steps.append(self.step("cos", "decisions", "escalate", self.ident("a report on an issue with no label"), "--reason", "your call"))
+        steps.append(self.step("cos", "decisions", "escalate", self.ident("shell"), "--reason", "needs the owner"))
+        steps.append(self.step("cos", "decisions", "escalate", "pr:api#7"))
+        steps.append(self.step("cos", "decisions", "resolve", "api#4", "--note", "settled by the standing order"))
+        steps.append(self.step("cos", "decisions", "resolve", "web#3"))
+        steps.append(self.step("you", "decisions", "resolve", "api#5"))
+        steps.append(self.step("cos", "decisions", "resolve", self.ident("a report that names no issue")))
+        steps.append(self.step("cos", "decisions", "resolve", self.ident("shell")))
+        steps.append(self.step("cos", "decisions", "resolve", "pr:api#7"))
+        steps.append(self.step("api-orch", "decisions", "escalate", "web#2"))
+        steps.append(self.step("api-coder", "decisions", "resolve", "web#2"))
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "write-escalate-resolve", steps)
+
+    def test_answer(self):
+        sid = self.world.sessions["api-coder"]
+        self.world.v2.start_turn(sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_permission(sid, timed=True)
+        self.world.v2.ask_permission(sid, timed=True)
+        field = lambda kind: [{"key": "k", "title": "t", "type": kind}]
+        for title, fields in (("text question", field("string")), ("yes or no question", field("boolean")),
+                              ("integer question", field("integer")), ("number question", field("number")),
+                              ("choice question", field("select")),
+                              ("two field question", field("string") + [{"key": "j", "title": "u", "type": "string"}])):
+            self.world.v2.ask_form(sid, fields=fields, title=title)
+        self.gh.issue(API, 2, "An issue", labels=["me:awaiting-cos"])
+        self.say("web-orch", "question", "a report")
+        perms = [d["id"] for d in self.fresh()["decisions"] if d["kind"] == "permission"]
+        form = lambda title: self.ident(title)
+        steps = []
+        steps.append(self.step("cos", "decisions", "answer", perms[0], "allow", "--note", "per the standing order"))
+        steps.append(self.step("cos", "decisions", "answer", perms[1], "deny"))
+        steps.append(self.step("cos", "decisions", "answer", perms[1], "deny"))
+        steps.append(self.step("cos", "decisions", "answer", form("text question"), "use postgres"))
+        steps.append(self.step("cos", "decisions", "answer", form("yes or no question"), "yes"))
+        steps.append(self.step("cos", "decisions", "answer", form("integer question"), "7"))
+        steps.append(self.step("cos", "decisions", "answer", form("number question"), "2.5"))
+        steps.append(self.step("cos", "decisions", "answer", form("choice question"), "a"))
+        steps.append(self.step("cos", "decisions", "answer", form("two field question"), "a"))
+        steps.append(self.step("cos", "decisions", "answer", "api#2", "allow"))
+        steps.append(self.step("cos", "decisions", "answer", self.ident("a report"), "allow"))
+        steps.append(self.step("cos", "decisions", "answer", "nope-123", "allow"))
+        steps.append(self.step("api-orch", "decisions", "answer", "api#2", "allow"))
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "write-answer", steps)
+
+    def test_answer_refusals_for_a_permission_and_a_form(self):
+        sid = self.world.sessions["api-coder"]
+        self.world.v2.start_turn(sid, "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["api-coder"]]["status"] = "blocked"
+        self.world.v2.ask_permission(sid, timed=True)
+        self.world.v2.ask_form(sid, fields=[{"key": "k", "title": "t", "type": "boolean"}], title="yes or no")
+        self.world.v2.ask_form(sid, fields=[{"key": "k", "title": "t", "type": "integer"}], title="a number")
+        (perm,) = [d["id"] for d in self.fresh()["decisions"] if d["kind"] == "permission"]
+        steps = [self.step("cos", "decisions", "answer", perm, "maybe"),
+                 self.step("cos", "decisions", "answer", perm),
+                 self.step("cos", "decisions", "answer", self.ident("yes or no"), "perhaps"),
+                 self.step("cos", "decisions", "answer", self.ident("a number"), "many"),
+                 self.step("cos", "decisions", "answer", self.ident("a number"), "--as-recommended")]
+        baseline_golden(self, "write-answer-refusals", steps)
+
+    def test_supersede_per_id_results(self):
+        self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos", "bug"])
+        self.gh.issue(WEB, 2, "one web", labels=["me:awaiting-user"])
+        self.gh.issue(API, 50, "the superseding issue")
+        self.gh.issue(API, 5, "five", labels=["bug"])
+        self.say("api-orch", "question", "merge or wait?", 5)
+        self.say("web-orch", "question", "a report with no issue")
+        self.ask_permission("api-coder")
+        self.prs[7] = pr_view_json()
+        self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")
+        steps = []
+        steps.append(self.step("cos", "decisions", "supersede", "api#2", "web#2", "--by", "acme/api#50", "--note", "folded in"))
+        steps.append(self.step("cos", "decisions", "supersede", self.ident("merge or wait?"), "--by", "https://github.com/acme/api/issues/50"))
+        steps.append(self.step("cos", "decisions", "supersede", self.ident("a report with no issue"), "--by", "api#50"))
+        steps.append(self.step("cos", "decisions", "supersede", self.ident("shell"), "--by", "api#50"))
+        steps.append(self.step("cos", "decisions", "supersede", "pr:api#7", "--by", "api#50"))
+        steps.append(self.step("cos", "decisions", "supersede", "nope-1", "nope-1", "--by", "api#50"))
+        steps.append(self.step("cos", "decisions", "supersede", "anything", "--by", "50"))
+        steps.append(self.step("cos", "decisions", "supersede", "anything", "--by", "nowhere#1"))
+        steps.append(self.step("api-orch", "decisions", "supersede", "api#2", "--by", "api#50"))
+        self.gh.issue(API, 2, "one api again", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "one web again", labels=["me:awaiting-cos"])
+        self.gh.fail_writes = {WEB}
+        steps.append(self.step("cos", "decisions", "supersede", "api#2", "nope-2", "web#2", "--by", "api#50"))
+        steps.append(self.step("you", "decisions", "supersede", "api#2", "--by", "api#50"))
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "write-supersede", steps)
+
+    def test_supersede_a_report_whose_note_cannot_be_delivered_stays_open(self):
+        self.say("api-orch", "question", "merge or wait?", 5)
+        with baseline_failing_send("held"):
+            steps = [self.step("cos", "decisions", "supersede", self.ident("merge or wait?"), "--by", "api#50")]
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "write-supersede-send-fails", steps)
+
+
+class TestDecisionBaselineBatch(BaselineWorld):
+    """`decisions batch`: raise, list, escalate and answer a batch."""
+
+    def test_raise_and_refuse(self):
+        steps = []
+        steps.append(self.step("api-orch", "decisions", "batch", "--title", "Cleanup of stale issues",
+                               *sum((["--row", r] for r in self.BATCH_ROWS), [])))
+        steps.append({"issue_created": {"%s#%d" % k: {"title": i["title"], "labels": i["labels"], "body": i["body"]}
+                                        for k, i in self.gh.issues.items()}})
+        steps.append(self.step("web-orch", "decisions", "batch", "--title", "Web cleanup", "--row", "acme/web#7 | one | do it",
+                               "--row", "web#8 | two | skip"))
+        for who, rows in (("api-orch", ("acme/web#7 | outside | x",)), ("api-orch", ("https://github.com/acme/web/issues/7 | outside | x",)),
+                          ("api-orch", ("acme/api#7 | | close it",)), ("api-orch", ("acme/api#7 | finding",)),
+                          ("api-orch", ("the web one | finding | close",)), ("api-orch", ("acme/api#7 | ``` | close",)),
+                          ("api-orch", ["acme/api#%d | f | r" % n for n in range(1, sb.BATCH_ROWS_MAX + 2)]),
+                          ("api-orch", ()), ("cos", ("acme/api#7 | x | y",)), ("api-coder", ("acme/api#7 | x | y",))):
+            argv = ["decisions", "batch", "--title", "T"] + sum((["--row", r] for r in rows), [])
+            steps.append(self.step(who, *argv))
+        steps.append(self.step("api-orch", "decisions", "batch", "--title", "", "--row", "acme/api#7 | x | y"))
+        steps.append(self.step("api-orch", "decisions", "batch", "--title", "x" * 121, "--row", "acme/api#7 | x | y"))
+        path = self.home / "rows.txt"
+        path.write_text("acme/api#7 | one | do it\n\nacme/api#8 | two | skip\n")
+        steps.append(self.step("api-orch", "decisions", "batch", "--title", "From a file", "--file", str(path)))
+        with mock.patch.object(sb.sys, "stdin", io.StringIO("acme/api#9 | three | do it\n")):
+            steps.append(self.step("api-orch", "decisions", "batch", "--title", "From stdin"))
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "batch-raise", steps)
+
+    def setup_answerable(self):
+        self.gh.issue(API, 31, "stale cache key", labels=["bug"])
+        self.gh.issue(API, 32, "dup of 31", labels=["bug", "me:awaiting-cos"])
+        self.gh.issue(API, 33, "an api one", labels=["bug"])
+        got = self.raise_batch()
+        self.assertEqual(got["code"], 0, got["err"])
+        return got["out"].strip()
+
+    def test_the_entry_and_escalating_it(self):
+        ident = self.setup_answerable()
+        steps = [{"raised_as": ident}, {"derived": self.fresh()}]
+        steps.append(self.step("cos", "decisions", "escalate", ident, "--reason", "the owner decides"))
+        steps.append(self.step("cos", "decisions", "escalate", ident))
+        steps.append({"the owner's view": self.fresh("you", "--tier", "human")})
+        baseline_golden(self, "batch-entry-escalate", steps)
+
+    def test_answer_as_recommended_and_per_row(self):
+        ident = self.setup_answerable()
+        steps = [{"raised_as": ident}]
+        steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "batch-answer-as-recommended", steps)
+
+    def test_answer_with_row_changes(self):
+        ident = self.setup_answerable()
+        steps = [self.step("cos", "decisions", "answer", ident, "--row", "2=keep it open", "--row", "3=as recommended",
+                           "--note", "per the order")]
+        steps.append({"derived_after": self.fresh()})
+        baseline_golden(self, "batch-answer-rows", steps)
+
+    def test_bad_answers_write_nothing(self):
+        ident = self.setup_answerable()
+        steps = []
+        for argv in (("--row", "4=x"), ("--row", "0=x"), ("--row", "1=a", "--row", "1=b"), ("--row", "x"), ("--row", "1="),
+                     ("--as-recommended", "--row", "1=a"), (), ("allow",)):
+            steps.append(self.step("cos", "decisions", "answer", ident, *argv))
+        steps.append(self.step("api-orch", "decisions", "answer", ident, "--as-recommended"))
+        self.gh.issue(API, 2, "plain", labels=["me:awaiting-cos"])
+        steps.append(self.step("cos", "decisions", "answer", "api#2", "--as-recommended"))
+        steps.append(self.step("cos", "decisions", "answer", "api#2", "allow"))
+        steps.append(self.step("cos", "decisions", "answer", "api#2"))
+        baseline_golden(self, "batch-answer-refusals", steps)
+
+    def test_a_note_that_cannot_be_delivered_keeps_the_batch_with_the_cos_and_the_same_answer_works_once_after(self):
+        ident = self.setup_answerable()
+        steps = []
+        with baseline_failing_send("held"):
+            steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        with baseline_failing_send(None):
+            steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        steps.append({"still listed": [d["id"] for d in self.fresh()["decisions"] if d["tier"] == "cos"]})
+        steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        steps.append(self.step("cos", "decisions", "answer", ident, "--as-recommended"))
+        baseline_golden(self, "batch-answer-note-fails", steps)
+
+    def test_from_a_plain_shell_the_comment_is_unsigned_and_nobody_is_told(self):
+        ident = self.setup_answerable()
+        steps = [self.step("you", "decisions", "answer", ident, "--as-recommended")]
+        baseline_golden(self, "batch-answer-from-a-shell", steps)
+
+
+class TestDecisionBaselineViews(BaselineWorld):
+    """The view per role, the text and JSON of the list, and the file the daemon keeps."""
+
+    def build(self):
+        self.full_house()
+        self.world.tick(11 * 60)
+        self.daemon_pass()
+
+    def test_each_role_sees_its_own_view(self):
+        self.build()
+        out = {}
+        for who in ("cos", "api-orch", "web-orch", "api-coder", "you"):
+            self.who(who)
+            code, text, err = self.main("decisions")
+            self.assertEqual(code, 0, err)
+            self.who(who)
+            code, js, err = self.main("decisions", "--json")
+            body = json.loads(js)
+            out[who] = {"text": text, "ids": [d["id"] for d in body["decisions"]], "view": body["view"]}
+        baseline_golden(self, "views-roles", out)
+
+    def test_flags_override_and_each_leaves_the_other_part_at_the_callers_default(self):
+        self.build()
+        out = {}
+        for who, flags in (("cos", ("--repo", WEB)), ("cos", ("--tier", "orchestrator")), ("cos", ("--tier", "human")),
+                           ("api-orch", ("--tier", "cos")), ("api-orch", ("--repo", WEB)), ("you", ("--tier", "all")),
+                           ("you", ("--tier", "cos", "--repo", API)), ("you", ("--repo", "api")), ("you", ("--tier", "all", "--repo", WEB))):
+            out["%s %s" % (who, " ".join(flags))] = self.cmd(who, "decisions", *flags)
+            out["%s %s" % (who, " ".join(flags))]["out"] = self.scrub(out["%s %s" % (who, " ".join(flags))]["out"])
+        baseline_golden(self, "views-flags", out)
+
+    def test_fresh_text_and_json_match_the_file(self):
+        self.build()
+        out = {"fresh text, cos": self.cmd("cos", "decisions", "--fresh"),
+               "file text, cos": self.cmd("cos", "decisions"),
+               "fresh text, you": self.cmd("you", "decisions", "--fresh"),
+               "file text, you": self.cmd("you", "decisions")}
+        fresh = json.loads(self.cmd("cos", "decisions", "--fresh", "--json", "--tier", "all")["out"])
+        from_file = json.loads(self.cmd("cos", "decisions", "--json", "--tier", "all")["out"])
+        self.assertEqual(fresh["decisions"], from_file["decisions"])
+        self.assertEqual((fresh["stale"], from_file["stale"]), (False, False))
+        baseline_golden(self, "views-fresh-and-file", out)
+
+    def test_an_empty_list_a_stale_file_and_a_missing_one(self):
+        out = {"missing": self.cmd("you", "decisions"), "missing, json": self.cmd("you", "decisions", "--json")}
+        self.daemon_pass()
+        out["empty, you"] = self.cmd("you", "decisions")
+        out["empty, cos"] = self.cmd("cos", "decisions")
+        self.world.tick(121)
+        out["stale"] = self.cmd("you", "decisions")
+        out["stale, json"] = self.cmd("you", "decisions", "--json")
+        self.world.clock.t -= 1
+        out["two minutes is the edge"] = self.cmd("you", "decisions")
+        (self.world.state / sb.DECISIONS_FILE).write_text("{not json")
+        out["not json"] = self.cmd("you", "decisions")
+        for value in out.values():
+            for key in ("out", "err"):
+                value[key] = self.scrub(value[key])
+        for key in ("missing, json", "stale, json"):  # the json carries the temp path in its message
+            out[key]["out"] = json.loads(out[key]["out"])
+        baseline_golden(self, "views-empty-stale-missing", out)
+
+    def test_columns_line_up_when_ids_differ_in_width(self):
+        self.say("api-orch", "question", "first")
+        self.ask_permission("api-coder")
+        self.gh.issue(API, 2, "an issue", labels=["me:awaiting-cos"])
+        self.daemon_pass()
+        out = self.cmd("cos", "decisions")["out"]
+        starts = {line.index("waiting") for line in out.splitlines()[1:]}
+        self.assertEqual(len(starts), 1, out)
+        baseline_golden(self, "views-columns", out)
+
+    def test_errors_are_printed_under_the_list(self):
+        self.say("api-orch", "question", "first")
+        self.daemon_pass(hub=False)  # the daemon's own engine has no GitHub picture here: that is an error entry
+        out = self.cmd("cos", "decisions")
+        out["out"] = self.scrub(out["out"])
+        baseline_golden(self, "views-errors", out)
+
+
+class TestDecisionBaselineStatus(BaselineWorld):
+    """The decisions line of `status`: the count that is yours, what else is open, over 1h, sources unread."""
+
+    def line(self):
+        got = self.cmd("you", "status")
+        self.assertEqual(got["code"], 0, got["err"])
+        found = [self.scrub(l) for l in got["out"].splitlines() if l.startswith("      decisions  ")]
+        self.assertEqual(len(found), 1, got["out"])
+        return found[0]
+
+    def test_the_decisions_line(self):
+        out = {"no file": self.line()}
+        self.full_house()
+        self.daemon_pass()
+        out["the full house"] = self.line()
+        self.world.engine.run_pass()
+        self.world.tick(130)
+        out["a file the daemon stopped keeping"] = self.line()
+        baseline_golden(self, "status-line", out)
+
+    def test_sources_that_could_not_be_read_are_counted(self):
+        self.say("api-orch", "question", "first")
+        self.daemon_pass(hub=False)
+        baseline_golden(self, "status-line-errors", {"line": self.line()})
+
+    def test_the_cos_tier_over_an_hour_is_longer_than_an_hour_exactly(self):
+        self.world.add_agent("x-orch", fleet={"role": "orchestrator", "reports_to": "cos", "repo": "acme/x"})
+        first = self.world.clock.now()
+        self.say("api-orch", "question", "first, at 0 s")
+        self.world.tick(59)
+        self.say("web-orch", "question", "second, 60 s later")
+        self.world.tick(59)
+        self.say("x-orch", "question", "third, 120 s later")
+        out = {}
+        for age in (3400, 3599, 3600, 3601, 3659, 3660, 3661, 3719, 3720, 3721, 3722):
+            self.world.clock.t = first + age - 1
+            self.daemon_pass(1, hub=False)
+            out["the first is %d s old" % age] = self.line()
+        baseline_golden(self, "status-over-an-hour", out)
+        self.assertEqual(sb.count_over_an_hour([{"since": sb.iso(EPOCH)}], EPOCH + 3600), 0)
+        self.assertEqual(sb.count_over_an_hour([{"since": sb.iso(EPOCH)}, {"since": "junk"}], EPOCH + 3601), 1)
+
+
+class TestDecisionBaselineProjection(BaselineWorld):
+    """decisions.json: its shape, its stability when nothing changed, and what a change does to it."""
+
+    def test_the_file_and_its_life(self):
+        steps = {}
+        self.daemon_pass()
+        steps["1 empty"] = self.file_body()
+        self.full_house()
+        self.daemon_pass()
+        steps["2 the full house"] = self.file_body()
+        path = self.world.state / sb.DECISIONS_FILE
+        before = path.read_text()
+        self.world.tick(30)
+        self.daemon_pass(0)
+        self.assertEqual(path.read_text(), before, "unchanged: not rewritten")
+        self.assertEqual(path.stat().st_mtime, self.world.clock.now(), "unchanged: touched, so its age says the daemon is alive")
+        self.say("api-coder", "question", "one more question", 6)
+        self.daemon_pass()
+        steps["3 a question changed: the generation moves"] = self.file_body()
+        path.unlink()
+        self.daemon_pass()
+        steps["4 the file was deleted: written again, same list"] = self.file_body()
+        path.write_text("{not json")
+        self.daemon_pass()
+        steps["5 the file was not json: replaced"] = self.file_body()
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if "decisions" in p.name), [sb.DECISIONS_FILE])
+        baseline_golden(self, "projection", steps)
+
+    def test_a_source_that_fails_is_an_error_entry_audited_once(self):
+        self.say("api-orch", "question", "first")
+        self.daemon_pass(hub=False)
+        self.daemon_pass(hub=False)
+        body = self.file_body()
+        errors = [e for e in self.world.audit() if e["event"] == "decisions.error"]
+        baseline_golden(self, "projection-errors", {"errors": body["errors"], "decisions": [d["title"] for d in body["decisions"]],
+                                                    "audit": [(e["subject"], e["detail"]) for e in errors]})
+
+
+class TestDecisionBaselineNotices(BaselineWorld):
+    """Notices: kind `notice`, tier human, id pr:<repo>#N, information that is never counted."""
+
+    def test_a_notice_its_facts_and_its_life(self):
+        steps = {}
+        self.prs[7] = pr_view_json()
+        steps["record"] = self.step("api-coder", "notice", "pr", "acme/api#7", "ready", "for", "review")
+        steps["resend"] = self.step("api-coder", "notice", "pr", "https://github.com/acme/api/pull/7/files", "again")
+        steps["not a pr"] = self.step("api-coder", "notice", "pr", "https://github.com/acme/api/issues/7")
+        self.say("api-orch", "question", "Which database?")
+        self.daemon_pass()
+        notice = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        steps["entry"] = notice
+        steps["the cos list holds the question and not the notice"] = self.cmd("cos", "decisions", "--tier", "all")["out"]
+        steps["the status line counts the question only"] = [l for l in self.cmd("you", "status")["out"].splitlines()
+                                                           if l.startswith("      decisions")]
+        self.prs[7] = None  # gh fails: the last facts are kept, marked stale
+        self.world.tick(61)
+        self.daemon_pass(0)
+        steps["stale"] = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        self.prs[7] = pr_view_json(state="MERGED")
+        self.world.tick(61)
+        self.daemon_pass(0)
+        steps["merged: dropped"] = [d for d in self.file_body()["decisions"] if d["kind"] == "notice"]
+        steps["merged: its record is forgotten"] = json.loads((self.world.state / "pr-notices.json").read_text())
+        steps["status line"] = [self.scrub(l) for l in self.cmd("you", "status")["out"].splitlines() if l.startswith("      decisions")]
+        baseline_golden(self, "notices", steps)
+
+    def test_a_malformed_notices_file_is_an_error_entry_and_the_rest_still_lists(self):
+        self.say("api-orch", "question", "Which database?")
+        (self.world.state / "pr-notices.json").write_text("{not json")
+        found = self.fresh()
+        found["errors"] = [dict(e, error=self.scrub(e["error"])) for e in found["errors"]]
+        baseline_golden(self, "notices-malformed", found)
+
+    def test_the_hold_window_and_two_repos_with_one_name(self):
+        self.set_config(pr_notice_hold_minutes=30)
+        self.prs[7] = pr_view_json()
+        self.prs[8] = pr_view_json(title="Other", checks=[{"status": "COMPLETED", "conclusion": "FAILURE"}], review="CHANGES_REQUESTED")
+        self.cmd("api-coder", "notice", "pr", "acme/api#7")
+        self.cmd("web-coder", "notice", "pr", "acme/web#8", "needs", "a", "look")
+        self.world.tick(5)
+        out = {"entries": [d for d in self.fresh()["decisions"] if d["kind"] == "notice"]}
+        baseline_golden(self, "notices-hold", out)
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin baseline needs it (skipped, not passed)")
+class TestDecisionBaselinePlugin(BaselineWorld):
+    """The node plugin's view of the list the daemon wrote: its pure functions, over the real file content."""
+
+    HARNESS = r"""
+import * as d from "%(url)s";
+import { readFileSync } from "node:fs";
+const input = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const snapshot = { status: "ok", decisions: input.decisions, errors: input.errors };
+const views = {
+  human: d.viewOf({}),
+  chief: d.viewOf({ [d.ROLE_ENV]: "chief-of-staff" }),
+  api: d.viewOf({ [d.REPO_ENV]: "acme/api" }),
+  web: d.viewOf({ [d.REPO_ENV]: "acme/web" }),
+};
+const out = {};
+for (const [name, view] of Object.entries(views)) {
+  const built = d.buildView(snapshot, input.nowMs, d.ROW_WIDTH, view);
+  out[name] = {
+    view,
+    title: built.title,
+    lines: d.viewLines(built),
+    sections: (built.sections || []).map((x) => ({ key: x.key, title: x.title, count: x.count })),
+    selected: d.selectFor(input.decisions, view).map((x) => x.id),
+    notices: d.noticesFor(input.decisions, view).map((x) => x.id),
+  };
+}
+out.stale = d.buildView({ status: "stale", decisions: [], errors: [] }, input.nowMs);
+out.facts = input.decisions.filter(d.isNotice).map((x) => d.factsOf(x));
+out.ages = [0, 59, 60, 3599, 3600, 3900, 86400].map((s) => d.formatAge(s));
+console.log(JSON.stringify(out));
+"""
+
+    def test_the_views_over_the_daemons_file(self):
+        self.full_house()
+        self.world.tick(65 * 60)
+        self.daemon_pass()
+        body = self.file_body()
+        script = self.home / "plugin-baseline.mjs"
+        script.write_text(self.HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        data = self.home / "decisions-input.json"
+        data.write_text(json.dumps({"decisions": body["decisions"], "errors": body["errors"],
+                                    "nowMs": int(round(self.world.clock.now() * 1000))}))
+        done = subprocess.run([NODE, str(script), str(data)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        baseline_golden(self, "plugin-views", json.loads(done.stdout.strip().splitlines()[-1]))
 
 
 def main(argv):

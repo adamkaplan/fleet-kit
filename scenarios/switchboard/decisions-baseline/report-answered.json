@@ -1,0 +1,286 @@
+{
+ "cases": [
+  {
+   "case": "w01: no send",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w01 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w02: a tagged send on the ask after the report",
+   "open": []
+  },
+  {
+   "case": "w03: an untagged send after the report",
+   "open": []
+  },
+  {
+   "case": "w04: a send on another ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "newest send from api-orch to w04: 2027-01-15T08:00:06Z, #99, admitted, tagged #99, not this ask",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w05: a send before the report",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "newest send from api-orch to w05: 2027-01-15T08:00:07Z, #11, admitted, older than this report",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w06: a send from someone other than the boss",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w06 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w07: a boss send queued in the inbox (a person is engaged)",
+   "open": []
+  },
+  {
+   "case": "w08: a boss send queued in the inbox, on another ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "newest send from api-orch to w08: 2027-01-15T12:01:04Z, #99, admitted, tagged #99, not this ask",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w09: a boss send queued in the inbox, untagged",
+   "open": []
+  },
+  {
+   "case": "w10: a newer question on the same ask replaces it",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w10 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "and which region?"
+    }
+   ]
+  },
+  {
+   "case": "w11: a newer question on another ask leaves both",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w11 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    },
+    {
+     "ask": 12,
+     "considered": "no send from api-orch to w11 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "and which region?"
+    }
+   ]
+  },
+  {
+   "case": "w12: a newer done on the ask",
+   "open": []
+  },
+  {
+   "case": "w13: a newer failed on the ask",
+   "open": []
+  },
+  {
+   "case": "w14: a newer withdrawn on the ask",
+   "open": []
+  },
+  {
+   "case": "w15: a newer working on the ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w15 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w16: a newer paused on the ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w16 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w17: a newer blocked on the ask: both are listed",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w17 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    },
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w17 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "blocked: waiting on the key"
+    }
+   ]
+  },
+  {
+   "case": "w18: a blocked report with nothing newer",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w18 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "blocked: waiting on the key"
+    }
+   ]
+  },
+  {
+   "case": "w19: a done on another ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w19 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w20: a withdrawn on another ask",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w20 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "which one?"
+    }
+   ]
+  },
+  {
+   "case": "w21: withdrawn --all clears every open question of the worker, on any ask",
+   "open": []
+  },
+  {
+   "case": "w22: a question after a withdrawal is listed",
+   "open": [
+    {
+     "ask": 11,
+     "considered": "no send from api-orch to w22 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "and which region?"
+    }
+   ]
+  },
+  {
+   "case": "w23: untagged question, nothing else",
+   "open": [
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w23 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "first thing?"
+    }
+   ]
+  },
+  {
+   "case": "w24: two untagged questions both stay",
+   "open": [
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w24 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "first thing?"
+    },
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w24 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "second thing?"
+    }
+   ]
+  },
+  {
+   "case": "w25: an untagged question cleared by an untagged done",
+   "open": []
+  },
+  {
+   "case": "w26: an untagged question cleared by an untagged failed",
+   "open": []
+  },
+  {
+   "case": "w27: an untagged question cleared by an untagged withdrawn",
+   "open": []
+  },
+  {
+   "case": "w28: an untagged question is not cleared by an untagged working",
+   "open": [
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w28 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "first thing?"
+    }
+   ]
+  },
+  {
+   "case": "w29: an untagged question is not cleared by a tagged done",
+   "open": [
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w29 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "first thing?"
+    }
+   ]
+  },
+  {
+   "case": "w30: an untagged question and an untagged blocked: both stay",
+   "open": [
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w30 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "first thing?"
+    },
+    {
+     "ask": null,
+     "considered": "no send from api-orch to w30 in the last 72 hours",
+     "tier": "orchestrator",
+     "title": "blocked: stuck"
+    }
+   ]
+  },
+  {
+   "case": "w31: a withdrawal is a rider: it hides the question before any message carries it",
+   "open": []
+  }
+ ],
+ "errors": []
+}

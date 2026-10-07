@@ -1,0 +1,201 @@
+{
+ "1 issue labels": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ]
+ ],
+ "10 the new request after it": [
+  [
+   "api#2dv",
+   "human"
+  ]
+ ],
+ "11 a day on: nothing is hidden from you for good": [
+  "human"
+ ],
+ "2 reports": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ],
+  [
+   "api-orch-297",
+   "report",
+   "cos"
+  ],
+  [
+   "helper-155",
+   "report",
+   "orchestrator"
+  ],
+  [
+   "web#40jw",
+   "report",
+   "cos"
+  ]
+ ],
+ "3 request pending 0 s": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ],
+  [
+   "api-orch-297",
+   "report",
+   "cos"
+  ],
+  [
+   "helper-155",
+   "report",
+   "orchestrator"
+  ],
+  [
+   "web#2fg",
+   "permission",
+   "cos"
+  ],
+  [
+   "web#40jw",
+   "report",
+   "cos"
+  ]
+ ],
+ "4 request pending 299 s": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ],
+  [
+   "api-orch-297",
+   "report",
+   "cos"
+  ],
+  [
+   "helper-155",
+   "report",
+   "orchestrator"
+  ],
+  [
+   "web#2fg",
+   "permission",
+   "cos"
+  ],
+  [
+   "web#40jw",
+   "report",
+   "cos"
+  ]
+ ],
+ "5 request pending 300 s (the grace edge)": [
+  [
+   "api#2",
+   "issue",
+   "human"
+  ],
+  [
+   "api#3",
+   "issue",
+   "cos"
+  ],
+  [
+   "api#4",
+   "issue",
+   "human"
+  ],
+  [
+   "api-orch-297",
+   "report",
+   "cos"
+  ],
+  [
+   "helper-155",
+   "report",
+   "orchestrator"
+  ],
+  [
+   "web#2fg",
+   "permission",
+   "human"
+  ],
+  [
+   "web#40jw",
+   "report",
+   "cos"
+  ]
+ ],
+ "6 a question, pending 0 s": [
+  [
+   "web#3ak",
+   "question",
+   "cos"
+  ]
+ ],
+ "7 the question, pending 300 s": [
+  [
+   "web#3ak",
+   "question",
+   "human"
+  ]
+ ],
+ "8 a new request, before escalation": [
+  [
+   "api#2dv",
+   "cos"
+  ]
+ ],
+ "9 the escalation": {
+  "argv": "decisions escalate api#2dv --reason needs the owner",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "escalated_requests": [
+   "ses_fake000004:per_fake000016"
+  ],
+  "out": "escalated api#2dv to you: the api-coder permission is waiting on you\n"
+ }
+}

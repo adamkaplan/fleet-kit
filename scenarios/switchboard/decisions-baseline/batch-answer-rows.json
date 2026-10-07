@@ -1,0 +1,43 @@
+[
+ {
+  "argv": "decisions answer api#101 --row 2=keep it open --row 3=as recommended --note per the order",
+  "as": "cos",
+  "code": 0,
+  "comments": [
+   "Answer to this batch (3 rows): 1 row changed, the rest as recommended.\n1. acme/api#31: as recommended: close it\n2. acme/api#32: changed: keep it open (recommended: close as duplicate of api#31)\n3. acme/api#33: as recommended: label it done\nNote: per the order\nThe row issues were not changed by this answer: the orchestrator that raised the batch acts on it.\n\n<!-- fleet-switchboard:from=cos -->"
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/101/comments",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/101/labels/me%3Aawaiting-user"
+  ],
+  "labels_changed": {
+   "acme/api#101": []
+  },
+  "notes": {
+   "api-orch": [
+    "[switchboard] 1 for api-orch: Batch api#101 (acme/api#101) is answered: 1 row(s) changed. The record is the comment on it; you act on it, nothing was done to the row issues.\n- send from cos (issue api#101): Batch api#101 (acme/api#101) is answered: 1 row(s) changed. The record is the comment on it; you act on it, nothing was done to the row issues."
+   ]
+  },
+  "out": "answered api#101: 3 rows (2 as recommended, 1 changed); me:awaiting-cos and me:awaiting-user are off acme/api#101; told api-orch\n"
+ },
+ {
+  "derived_after": {
+   "decisions": [
+    {
+     "agent": null,
+     "ask": 32,
+     "headline": "dup of 31",
+     "id": "api#32",
+     "kind": "issue",
+     "repo": "acme/api",
+     "since": "2027-01-15T07:59:00Z",
+     "tier": "cos",
+     "title": "dup of 31"
+    }
+   ],
+   "errors": []
+  }
+ }
+]

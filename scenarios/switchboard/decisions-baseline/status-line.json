@@ -1,0 +1,5 @@
+{
+ "a file the daemon stopped keeping": "      decisions  the daemon is not updating this list: decisions.json was last written 2m ago",
+ "no file": "      decisions  the daemon is not updating this list: there is no decisions.json in <home>/xdg-state/fleet-switchboard",
+ "the full house": "      decisions  2 waiting on you (acme/api 1, acme/web 1; `fleet-switchboard decisions`); also open: 6 with the Chief of Staff (0 over 1h), 1 with an orchestrator"
+}

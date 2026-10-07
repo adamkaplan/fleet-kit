@@ -1,0 +1,161 @@
+[
+ {
+  "argv": "decisions supersede api#2 web#2 --by acme/api#50 --note folded in",
+  "as": "cos",
+  "code": 0,
+  "comments": [
+   "Superseded by acme/api#50: folded in\n\n<!-- fleet-switchboard:from=cos -->",
+   "Superseded by acme/api#50: folded in\n\n<!-- fleet-switchboard:from=cos -->"
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/2/comments",
+   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-user",
+   "POST repos/acme/web/issues/2/comments",
+   "DELETE repos/acme/web/issues/2/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/web/issues/2/labels/me%3Aawaiting-user"
+  ],
+  "labels_changed": {
+   "acme/api#2": [
+    "bug"
+   ],
+   "acme/web#2": []
+  },
+  "out": "api#2: done: comment and both labels off acme/api#2\nweb#2: done: comment and both labels off acme/web#2\n"
+ },
+ {
+  "argv": "decisions supersede api#5kj --by https://github.com/acme/api/issues/50",
+  "as": "cos",
+  "code": 0,
+  "err": "",
+  "gh_writes": [
+   "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-user"
+  ],
+  "notes": {
+   "api-orch": [
+    "[switchboard] 1 for api-orch: Superseded by acme/api#50. Your question on this ask is covered there; carry on with that.\n- send from cos (issue api#5): Superseded by acme/api#50. Your question on this ask is covered there; carry on with that."
+   ]
+  },
+  "out": "api#5kj: done: sent to api-orch, both labels off acme/api#5\n"
+ },
+ {
+  "argv": "decisions supersede web-orch-161 --by api#50",
+  "as": "cos",
+  "code": 1,
+  "err": "",
+  "out": "web-orch-161: refused: is a report that names no issue: a send would clear every question of its worker. Answer it with `fleet-switchboard send`\n"
+ },
+ {
+  "argv": "decisions supersede api#2hv --by api#50",
+  "as": "cos",
+  "code": 1,
+  "err": "",
+  "out": "api#2hv: refused: is a permission: answer it with `fleet-switchboard decisions answer api#2hv ...`\n"
+ },
+ {
+  "argv": "decisions supersede pr:api#7 --by api#50",
+  "as": "cos",
+  "code": 1,
+  "err": "",
+  "out": "pr:api#7: refused: no decision pr:api#7 is waiting\n"
+ },
+ {
+  "argv": "decisions supersede nope-1 nope-1 --by api#50",
+  "as": "cos",
+  "code": 1,
+  "err": "",
+  "out": "nope-1: refused: no decision nope-1 is waiting\n"
+ },
+ {
+  "argv": "decisions supersede anything --by 50",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: --by names the superseding issue as owner/repo#N, name#N for a watched repo, or its URL (got '50')\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions supersede anything --by nowhere#1",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: --by names the superseding issue as owner/repo#N, name#N for a watched repo, or its URL (got 'nowhere#1')\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions supersede api#2 --by api#50",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: only the Chief of Staff, or you in a plain shell, may supersede a decision; api-orch is a orchestrator. Raise it with `fleet-switchboard report question \"...\"` and your awaiting-cos label\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions supersede api#2 nope-2 web#2 --by api#50",
+  "as": "cos",
+  "code": 1,
+  "comments": [
+   "Superseded by acme/api#50\n\n<!-- fleet-switchboard:from=cos -->"
+  ],
+  "err": "",
+  "gh_writes": [
+   "POST repos/acme/api/issues/2/comments",
+   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
+   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-user",
+   "POST repos/acme/web/issues/2/comments"
+  ],
+  "labels_changed": {
+   "acme/api#2": []
+  },
+  "out": "api#2: done: comment and both labels off acme/api#2\nnope-2: refused: no decision nope-2 is waiting\nweb#2: refused: gh: gh: HTTP 403\n"
+ },
+ {
+  "argv": "decisions supersede api#2 --by api#50",
+  "as": "you",
+  "code": 1,
+  "err": "",
+  "out": "api#2: refused: no decision api#2 is waiting\n"
+ },
+ {
+  "derived_after": {
+   "decisions": [
+    {
+     "agent": "web-coder",
+     "ask": 2,
+     "headline": "one web again",
+     "id": "web#2",
+     "kind": "issue",
+     "repo": "acme/web",
+     "since": "2027-01-15T07:59:02Z",
+     "tier": "cos",
+     "title": "one web again"
+    },
+    {
+     "agent": "web-orch",
+     "ask": null,
+     "considered": "no send from cos to web-orch in the last 72 hours",
+     "headline": "a report with no issue",
+     "id": "web-orch-161",
+     "kind": "report",
+     "repo": "acme/web",
+     "since": "2027-01-15T08:00:01Z",
+     "tier": "cos",
+     "title": "a report with no issue"
+    },
+    {
+     "agent": "api-coder",
+     "ask": 2,
+     "headline": "permission: shell echo hi",
+     "id": "api#2hv",
+     "kind": "permission",
+     "repo": "acme/api",
+     "request": "per_fake000010",
+     "session": "ses_fake000004",
+     "since": "2027-01-15T08:00:02Z",
+     "tier": "cos",
+     "title": "permission: shell echo hi"
+    }
+   ],
+   "errors": []
+  }
+ }
+]
