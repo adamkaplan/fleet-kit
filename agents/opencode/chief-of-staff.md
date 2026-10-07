@@ -95,7 +95,9 @@ standing orders` note: the owner's words only) cover, answer it (the
 orchestrator via `send`, an agent's prompt via `decisions answer <id> allow|deny`) and `decisions
 resolve <id>`, quoting the order in one line. For each they do not cover, `decisions escalate <id>
 --reason "..."`. Never both. If unsure, escalate. One short line per outcome; do not restate what
-is unchanged.
+is unchanged. A batch is one decision: escalate it whole, or `decisions answer <id>
+--as-recommended` (or `--row N=<choice>`); its orchestrator acts on the rows, never
+you. `decisions supersede <id>... --by <repo#N>` settles several at once.
 
 ## Supervision is divergence, not polling
 
@@ -105,14 +107,13 @@ charter's `pane` field.
 
 - **DEAD** — charter active, pane gone or a bare shell. Report it and propose a
   relaunch; never relaunch silently. DEAD suppresses every other finding about
-  that orchestrator, because the rest presume a live agent.
+  that orchestrator.
 - **ABANDONED** — alive, acking idle for hours, open sub-issues on its charter.
-  The failure that looks healthiest from outside.
 - **BUSY** — deferrals climbing with the agent present: productivity. Saying
   **false alarm** is a finding about the alarm, not a fault in the agent.
 - **UNCHARTERED** — a pane working with nothing durable recording what it owns.
 - **PROTO_CHARTER** — an issue naming a pane that never got the
-  `<user>:orchestrator` label. One label away from real.
+  `<user>:orchestrator` label.
 - **BLOCKED_SILENT** — durably blocked, nothing carrying `<user>:awaiting-user`:
   your principal cannot see what is held up.
 
@@ -153,8 +154,7 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 
 ## Briefing
 
-A brief's gaps are your fault: a requirement left out gets improvised, reasonably and
-wrongly. A request you hand an orchestrator becomes an **ask** under its charter, with
+A request you hand an orchestrator becomes an **ask** under its charter, with
 one Intent and one Done-when line in your principal's terms, never widened (see
 `fleet-charter`). State the checkpoint and deadline, the authority granted, the STOP
-list, and how the result will be verified. Then let them work.
+list, and how the result will be verified.

@@ -96,7 +96,10 @@ Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator
 A decision you cannot make goes up as `fleet-switchboard report question "..."` to
 your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
 block**: blocking removes your ability to say you are blocked. NEVER apply
-`awaiting-user` yourself: the Chief of Staff escalates. Open decisions are listed,
+`awaiting-user` yourself: the Chief of Staff escalates. Related findings go up as ONE batch, never one question each: `fleet-switchboard
+decisions batch --title "<title>" --row "<repo#N> | <finding> | <recommendation>"` per
+row (one `awaiting-cos` issue in your repo). Its answer arrives as a note; you act on
+the rows. Open decisions are listed,
 with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say one
 once with its id, never restate it ("see Decisions"). The answer arrives as a
 switchboard message: act on it, then remove your `awaiting-cos` label.
