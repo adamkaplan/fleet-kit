@@ -29,6 +29,7 @@ import abc
 from datetime import datetime, timezone
 import hashlib
 import re
+import uuid
 
 # ---------------------------------------------------------------- small text and time helpers
 
@@ -525,6 +526,124 @@ def count_over_an_hour(decisions, now):
     return sum(1 for since in waited if since is not None and now - since > DECISION_LONG_WAIT)
 
 
+# ---------------------------------------------------------------- external decision systems (pure rules)
+#
+# The rules for sending decisions to an external system and taking answers back. The state (links, outbox) and the
+# calls are bin/decision_sync.py's; nothing here does I/O.
+
+EXTERNAL_KINDS = ("issue", "report", "question")       # kinds that may leave the machine; a permission never does
+ROLE_TIER = {"project_agent": "orchestrator", "owner_agent": "cos", "human": "human"}   # the authority of an answerer
+_ROLE_WORDS = {"project agent": "project_agent", "project_agent": "project_agent", "owner's agent": "owner_agent",
+               "owners agent": "owner_agent", "owner agent": "owner_agent", "owner_agent": "owner_agent",
+               "human": "human"}
+_KEY_SPACE = uuid.UUID("6f1c2a52-3b0e-4d4f-9a53-1d2f6c9e7a10")
+
+
+def normalize_role(text):
+    """`project_agent`, `owner_agent` or `human` for the role an adapter reports an answerer as, else None."""
+    return _ROLE_WORDS.get(" ".join(str(text or "").lower().replace("-", " ").split()).replace("_", " ")) \
+        or _ROLE_WORDS.get(str(text or "").strip().lower())
+
+
+def answer_authority(role, tier):
+    """(ok, why): whether an answer by `role` may settle a decision now at `tier`. An answer counts as its role's:
+    the project agent's as an orchestrator's, the owner's agent's as the Chief of Staff's, the human's as the
+    human's; one from a role below the decision's tier is not applied. An unknown role never is."""
+    answers_as = ROLE_TIER.get(role)
+    if answers_as is None:
+        return False, "the answering role %r is not one this fleet knows" % (role,)
+    if tier not in TIER_LADDER:
+        return False, "the decision's tier %r is not one this fleet knows" % (tier,)
+    if TIER_LADDER.index(answers_as) < TIER_LADDER.index(tier):
+        return False, "an answer by the %s counts as the %s's; this decision waits on the %s" % (
+            role.replace("_", " "), answers_as, tier)
+    return True, "ok"
+
+
+def decision_key(seed):
+    """The stable, opaque key of a decision: from its source identity (the id seed), nothing else, so the same
+    decision has the same key on every pass and after a restart. The display id is not an identity."""
+    return str(uuid.uuid5(_KEY_SPACE, "decision:%s" % seed))
+
+
+def idempotency_key(key, op, revision):
+    """The key of one outbound operation: decision key, operation and revision, so a retry is the same write."""
+    return str(uuid.uuid5(_KEY_SPACE, "%s|%s|%d" % (key, op, revision)))
+
+
+def goes_outward(entry, repos, kinds=("issue", "report")):
+    """Whether a listed decision is put to the external system: one of `kinds` (never a permission request, never a
+    notice) in an enabled repo."""
+    return (entry.get("kind") in kinds and entry.get("kind") in EXTERNAL_KINDS
+            and entry.get("repo") in (repos or ()))
+
+
+def outward_payload(entry, floor):
+    """What is said about a decision outside, from the list entry: text with anything shaped like a credential taken
+    out, and the floor tier the mapping assigns its tier. `rows` (a batch) go as options by id."""
+    payload = {"title": line_of(entry.get("title"), DECISION_REPORT_TITLE_MAX),
+               "headline": line_of(entry.get("headline"), 300), "kind": entry.get("kind"),
+               "display_id": entry.get("id"), "tier": entry.get("tier"), "floor": floor, "ask": entry.get("ask"),
+               "repo": entry.get("repo"), "agent": entry.get("agent"), "since": entry.get("since")}
+    if entry.get("rows"):
+        payload["batch"] = True
+        payload["rows"] = [{"n": n, "ref": line_of(r.get("ref"), 100), "finding": line_of(r.get("finding"), 200),
+                            "recommendation": line_of(r.get("recommendation"), 120)}
+                           for n, r in enumerate(entry["rows"], 1)]
+        payload["options"] = [{"id": "as_recommended", "label": "As recommended"}]
+    return payload
+
+
+def payload_digest(payload):
+    """A short digest of what a decision says outside, without what changes without a new message (tier, floor,
+    time): a different digest is a revision."""
+    stable = {k: v for k, v in payload.items() if k not in ("tier", "floor", "since")}
+    return hashlib.sha256(repr(sorted(stable.items(), key=lambda kv: kv[0])).encode("utf-8")).hexdigest()[:16]
+
+
+def plan_operations(desired, links, errored_kinds=()):
+    """The outbound operations that bring `links` (what the outside system holds, projected through what is queued)
+    to `desired` ({key: {"payload", "digest", "tier", "floor", "kind", "thread"}}). Pure.
+
+    Returns a list of {"op": raise | revise | status | withdraw, "key", "revision", "rebind_from"?, "floor"?}. A key
+    new to the links is a `raise`, unless a report of the same thread (repo, ask, agent) left the list as it
+    arrived: then it is a `revise` of that item, rebound to the new key (a re-asked question is one item). A key
+    that left the list is withdrawn, except while its source could not be read (`errored_kinds`: an empty read is
+    not an answer). A link closed from outside is left alone."""
+    ops, taken = [], set()
+    for key, want in desired.items():
+        link = links.get(key)
+        if link is None:
+            old = None
+            if want["kind"] == "report" and want["thread"] is not None:
+                found = [k for k, l in links.items() if k not in desired and k not in taken and l.get("kind") == "report"
+                         and l.get("thread") == want["thread"] and not l.get("withdrawn") and not l.get("closed")]
+                old = found[0] if len(found) == 1 else None
+            if old is not None:
+                taken.add(old)
+                ops.append({"op": "revise", "key": key, "revision": links[old]["revision"] + 1, "rebind_from": old})
+            else:
+                ops.append({"op": "raise", "key": key, "revision": 1})
+            continue
+        if link.get("closed"):
+            continue
+        if link.get("withdrawn"):
+            ops.append({"op": "raise", "key": key, "revision": link["revision"] + 1})
+            continue
+        if link.get("digest") != want["digest"]:
+            ops.append({"op": "revise", "key": key, "revision": link["revision"] + 1})
+        if link.get("floor") != want["floor"] or link.get("tier") != want["tier"]:
+            ops.append({"op": "status", "key": key, "revision": link["revision"],
+                        "seq": link.get("status_seq", 0) + 1})
+    for key, link in links.items():
+        if key in desired or key in taken or link.get("withdrawn") or link.get("closed"):
+            continue
+        if link.get("kind") in errored_kinds:
+            continue
+        ops.append({"op": "withdraw", "key": key, "revision": link["revision"] + 1})
+    return ops
+
+
 # ---------------------------------------------------------------- ports
 #
 # Abstract: no implementation here. bin/fleet-switchboard holds the implementations that are today's behaviour
@@ -586,20 +705,34 @@ class DecisionStore(abc.ABC):
 
 
 class ExternalDecisionAdapter(abc.ABC):
-    """The hook point of an adapter that holds decisions outside the Switchboard and takes answers from there.
-    Optional capabilities are named in `capabilities`; a missing one is reported, not guessed."""
+    """The port of a system outside the Switchboard that holds decisions and takes answers. The sync engine
+    (bin/decision_sync.py) is its only caller; an implementation never needs to know the fleet.
+
+    Every write carries an idempotency key and the same key twice is the same write. Reads are by cursor and may
+    repeat an event: the caller de-duplicates by `event_id`. Errors are raised (any Exception); the engine retries."""
 
     capabilities = frozenset()
 
     @abc.abstractmethod
     def health(self):
-        """None when the adapter can be used now, else one line saying why not."""
+        """None when the adapter can be used now, else one line saying why not. Cheap; called once per cycle."""
 
     @abc.abstractmethod
-    def push(self, decision, idempotency_key):
-        """Record or update `decision` outside; the same key twice is the same write. Returns the outside id."""
+    def push(self, operation, idempotency_key):
+        """Apply one outbound operation. `operation` is a dict: {"op": "raise" | "revise" | "status" | "withdraw",
+        "key": the decision key, "external_id": the outside id (None for a raise), "revision": int, "decision":
+        {title, headline, kind, display_id, tier, floor, ask, repo, agent, since, [batch, rows, options]},
+        "floor": the floor tier name the mapping gives the tier, "note": optional text}. Returns {"external_id":
+        str, "url": optional}; for anything but a raise the id is the one it was given."""
+
+    @abc.abstractmethod
+    def lookup(self, key):
+        """The item already held for decision `key` (a raise whose answer was lost), as {"external_id", "revision"},
+        or None. Used to rebuild the link table."""
 
     @abc.abstractmethod
     def pull_changes(self, cursor):
-        """(events, next_cursor): what changed outside since `cursor` (answers, withdrawals), at least once;
-        the caller de-duplicates by event id."""
+        """(events, next_cursor): what changed outside since `cursor` (None the first time), at least once. An event
+        is a dict {"event_id", "external_id", "type": "answered" | "clarify" | "reversed" | "withdrawn", "answered_by":
+        "project agent" | "owner's agent" | "human", "option_id", "text", "rows": optional {row number: choice},
+        "at"}. An answer picks by option id; the text is the words that came with it."""
