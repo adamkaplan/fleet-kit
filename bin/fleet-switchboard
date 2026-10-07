@@ -4298,14 +4298,15 @@ def considered_send(engine, report, repos, since, sends):
     if worker.name not in sends:
         sends[worker.name] = synthetic_lines(engine, worker.session_id, since, waiting=True)
     newest = None
-    for created, _, _, line in sends[worker.name]:
+    for created, message_id, _, line in sends[worker.name]:
         match = SEND_LINE.match(line)
         if match and match.group(1) == report["boss"] and (newest is None or created > newest[0]):
-            newest = (created, match)
+            newest = (created, match, message_id)
     who = "%s to %s" % (report["boss"], worker.name)
     if newest is None:
         return "no send from %s in the last %g hours" % (who, engine.config["decisions_lookback_hours"])
-    created, match = newest
+    created, match, message_id = newest
+    admitted = message_id in {line[1] for line in transcript_lines(engine, worker.session_id, since)}
     tag = "%s#%s" % (match.group(2) or "", match.group(3)) if match.group(3) else "no issue"
     if created <= report["at"][0]:
         why = "older than this report"
@@ -4314,7 +4315,8 @@ def considered_send(engine, report, repos, since, sends):
         why = "tagged %s, not this ask" % tag
     else:
         why = "should answer it"
-    return "newest send from %s: %s, %s, %s" % (who, iso(created), tag, why)
+    return "newest send from %s: %s, %s, %s, %s" % (who, iso(created), tag,
+                                                    "admitted" if admitted else "queued in the inbox", why)
 
 
 def report_answered(engine, report, reports, since, sends):

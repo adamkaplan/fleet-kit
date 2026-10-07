@@ -13299,6 +13299,22 @@ class TestDecisionDerivation(DecisionsBase):
         self.world.tick(400)
         self.assertEqual([d["title"] for d in self.listed()], ["is it fine?"])
 
+    def test_a_queued_send_answers_while_mid_turn_is_older_one_does_not_and_admission_changes_nothing(self):
+        # the incident: the boss's sends were audited `queue` while the worker was mid-turn; the transcript got them 12 minutes later
+        self.world.v2.start_turn(self.world.sessions["coder"], "fleet task", fleet=True, lasts=600, steps=1)
+        self.world.new_engine("cli").send("platform", "coder", "early, before the question", 2)
+        self.world.tick(2)
+        self.ask_the_boss("Which database?", issue=2)
+        self.assertEqual(len(self.listed()), 1, "a send older than the report answers nothing")
+        self.world.new_engine("cli").send("platform", "coder", "use postgres", 2)
+        self.world.tick(1)
+        inbox = self.world.v2.sessions[self.world.sessions["coder"]]["inbox"]
+        self.assertTrue(inbox, "queued, not in the transcript")
+        self.assertEqual(self.listed(), [])
+        self.world.tick(700)
+        self.world.engine.run_pass()
+        self.assertEqual(self.listed(), [], "admitted into the transcript: still answered")
+
     def test_the_real_tag_forms_of_a_send_match_and_name_the_same_repo(self):
         repos = ["acme-org/acme-platform", "acme-org/other"]
         for tag in ("acme-platform#294", "acme-org/acme-platform#294"):
@@ -13351,7 +13367,7 @@ class TestDecisionDerivation(DecisionsBase):
         self.world.new_engine("cli").send("platform", "coder", "unrelated", 9)
         self.world.tick(1)
         (found,) = self.listed()
-        self.assertRegex(found["considered"], r"^newest send from platform to coder: \S+, #9, tagged #9, not this ask$")
+        self.assertRegex(found["considered"], r"^newest send from platform to coder: \S+, #9, admitted, tagged #9, not this ask$")
         report = {"stale": False, "message": None, "decisions": [found], "errors": [], "fresh": True}
         self.assertIn("      newest send from platform", sb.format_decisions(report, self.world.clock.now()))
         report.pop("fresh")
