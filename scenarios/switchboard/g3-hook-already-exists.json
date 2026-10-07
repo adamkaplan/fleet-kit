@@ -1,0 +1,79 @@
+{
+  "id": "G3",
+  "title": "Someone else is already forwarding the repo; the watch is a conflict and catch-up reads still deliver",
+  "problem": null,
+  "since_pr": 5,
+  "tiers": [
+    "offline"
+  ],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    }
+  },
+  "issues": {
+    "12": {
+      "intent": "Add a health check to the platform service",
+      "parent": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "world",
+      "do": "occupy-hook",
+      "why": "Another person's forwarder holds the repo's hook: ours is told Hook already exists"
+    },
+    {
+      "at": "1770s",
+      "actor": "world",
+      "do": "comment",
+      "issue": 12,
+      "id": 5001,
+      "body": "Nobody forwards this to us",
+      "why": "Just before the 30-minute read: the read after it starts one minute before the last read's marker, so it sees this comment again"
+    },
+    {
+      "at": "40m",
+      "actor": "world",
+      "do": "comment",
+      "issue": 12,
+      "id": 5002,
+      "body": "Also unseen by any webhook",
+      "why": "Read by the 60-minute fallback, which also reads 5001 again inside its slack: without the dedupe, 5001 rides along again"
+    },
+    {
+      "at": "65m",
+      "actor": "world",
+      "do": "wait",
+      "why": "Past two fallback intervals: the read repeats, and the repeat must not deliver again"
+    }
+  ],
+  "expect": [
+    {
+      "name": "conflict",
+      "that": "github_watch",
+      "state": "conflict"
+    },
+    {
+      "name": "delivered-once",
+      "that": "delivered",
+      "to": "platform",
+      "key": "github.comment:5001",
+      "count": 1
+    },
+    {
+      "name": "one-message",
+      "that": "message_count",
+      "to": "platform",
+      "count": 2
+    }
+  ],
+  "control": {
+    "fault": "no-dedupe",
+    "fails": [
+      "delivered-once"
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "M2",
+  "title": "A repo is watched when an agent naming it launches, and no longer when the agent is gone",
+  "problem": null,
+  "since_pr": 15,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1, "repo": "acme/api"},
+    "web-coder": {"role": "coder", "reports_to": "platform", "issue": 2, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/api": {"account": "alice-bot"},
+    "acme/web": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/api#1": {"intent": null},
+    "acme/web#1": {"intent": null},
+    "acme/web#2": {"intent": "Build the landing page", "done_when": "it renders", "parent": 1}
+  },
+  "steps": [
+    {"at": "20s", "actor": "world", "do": "launch", "agent": "web-coder", "brief": "Build the landing page",
+     "why": "The session's fleet metadata names acme/web: nothing in the config does"},
+    {"at": "2m", "actor": "world", "do": "leave", "agent": "web-coder",
+     "why": "The agent's pane closes: no live agent names acme/web any more"},
+    {"at": "4m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "joined-then-left", "that": "repo_membership", "repo": "acme/web", "joined": true, "left": true,
+     "why": "The daemon's own pass started a watch for the repo, and stopped it; no registry, no restart"},
+    {"name": "no-longer-watched", "that": "repo_watch", "repo": "acme/web", "how": "absent"},
+    {"name": "the-other-stays", "that": "repo_watch", "repo": "acme/api", "how": "forwarder",
+     "why": "The orchestrator still names acme/api, and its forwarder runs"}
+  ],
+  "control": {"fault": "static-repos", "fails": ["joined-then-left", "the-other-stays"]}
+}

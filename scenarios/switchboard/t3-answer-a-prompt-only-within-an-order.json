@@ -1,0 +1,123 @@
+{
+  "id": "T3",
+  "title": "A prompt is the Chief of Staff's, turns yours after the grace, and its answer is allowed only by a standing order",
+  "problem": null,
+  "since_pr": 18,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "cos": {
+      "role": "chief-of-staff"
+    },
+    "platform": {
+      "role": "orchestrator",
+      "reports_to": "cos",
+      "charter": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "10s",
+      "actor": "platform",
+      "do": "permission",
+      "why": "The orchestrator blocks on a permission prompt"
+    },
+    {
+      "at": "330s",
+      "actor": "world",
+      "do": "wait",
+      "why": "Past the 300 s grace: nobody answered, so it is yours too"
+    },
+    {
+      "at": "340s",
+      "actor": "cos",
+      "do": "decide",
+      "action": "answer",
+      "ref": "echo hi",
+      "value": "allow",
+      "why": "No order covers it: the judge asks the owner and the answer is not given"
+    },
+    {
+      "at": "360s",
+      "actor": "you",
+      "do": "edit-cos-orders",
+      "text": "Answer permission prompts for echo commands with allow.",
+      "why": "The owner writes the order, in an editor"
+    },
+    {
+      "at": "380s",
+      "actor": "cos",
+      "do": "decide",
+      "action": "answer",
+      "ref": "echo hi",
+      "value": "allow",
+      "note": "Order 1",
+      "why": "Now an order covers it, and the answer goes through v2"
+    },
+    {
+      "at": "400s",
+      "actor": "world",
+      "do": "wait"
+    }
+  ],
+  "expect": [
+    {
+      "name": "cos-first",
+      "that": "decisions",
+      "at": "30s",
+      "as": "cos",
+      "tier": "cos",
+      "count": 1,
+      "text": "echo hi"
+    },
+    {
+      "name": "hidden-at-first",
+      "that": "decisions",
+      "at": "30s",
+      "as": "you",
+      "count": 0,
+      "text": "echo hi"
+    },
+    {
+      "name": "yours-after-the-grace",
+      "that": "decisions",
+      "at": "330s",
+      "as": "you",
+      "count": 1,
+      "text": "echo hi"
+    },
+    {
+      "name": "no-answer-without-an-order",
+      "that": "policy_outcome",
+      "agent": "cos",
+      "step": 2,
+      "outcome": "ask",
+      "judged": true,
+      "reason": "speaks for you"
+    },
+    {
+      "name": "allowed-by-the-order",
+      "that": "policy_outcome",
+      "agent": "cos",
+      "step": 4,
+      "outcome": "allow",
+      "judged": true,
+      "jev_calls": 1
+    },
+    {
+      "name": "answered-once",
+      "that": "permission_answered",
+      "agent": "platform",
+      "count": 1,
+      "decision": "once"
+    }
+  ],
+  "control": {
+    "fault": "answer-unjudged",
+    "fails": [
+      "no-answer-without-an-order"
+    ]
+  }
+}

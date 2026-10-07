@@ -1,0 +1,33 @@
+{
+  "id": "P1",
+  "title": "An orchestrator runs gh pr view and git log",
+  "problem": null,
+  "since_pr": 9,
+  "tiers": ["offline"],
+  "tags": ["lab-scripted-owed-sp1"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1, "issue": 2}
+  },
+  "issues": {
+    "1": {"intent": null, "authority": "may merge green PRs"},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "platform", "do": "tool-call", "tool": "read", "arguments": "src/health.py",
+     "why": "A read never reaches the judge"},
+    {"at": "1s", "actor": "platform", "do": "tool-call", "tool": "shell", "arguments": "gh pr view 42 --json state"},
+    {"at": "2s", "actor": "platform", "do": "tool-call", "tool": "shell", "arguments": "git log --oneline -5"},
+    {"at": "30s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "read-not-judged", "that": "policy_outcome", "agent": "platform", "step": 0, "outcome": "allow",
+     "judged": false, "jev_calls": 0},
+    {"name": "pr-view-judged-and-allowed", "that": "policy_outcome", "agent": "platform", "step": 1,
+     "outcome": "allow", "judged": true, "jev_calls": 1},
+    {"name": "log-judged-and-allowed", "that": "policy_outcome", "agent": "platform", "step": 2,
+     "outcome": "allow", "judged": true, "jev_calls": 1},
+    {"name": "nobody-is-bothered", "that": "message_count", "to": "chief-of-staff", "count": 0}
+  ],
+  "control": {"fault": "no-policy-judge", "fails": ["pr-view-judged-and-allowed", "log-judged-and-allowed"]}
+}

@@ -1,0 +1,31 @@
+{
+  "id": "G2",
+  "title": "The forwarder dies while events are sent; the catch-up read recovers them exactly once",
+  "problem": 4,
+  "since_pr": 5,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "issues": {
+    "12": {"intent": "Add a health check to the platform service", "parent": 1}
+  },
+  "steps": [
+    {"at": "10s", "actor": "world", "do": "comment", "issue": 12, "id": 5001, "body": "First, while the forwarder is up"},
+    {"at": "2m", "actor": "world", "do": "kill-forwarder",
+     "why": "gh webhook forward exits after three failed reconnects and never replays"},
+    {"at": "122s", "actor": "world", "do": "comment", "issue": 12, "id": 5002, "body": "Second, while it is down",
+     "why": "Lost to the webhook path: nobody is forwarding"},
+    {"at": "124s", "actor": "world", "do": "comment", "issue": 12, "id": 5003, "body": "Third, while it is down"},
+    {"at": "8m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "first-once", "that": "delivered", "to": "platform", "key": "github.comment:5001", "count": 1,
+     "why": "The catch-up read sees it again; the transcript already has it"},
+    {"name": "second-once", "that": "delivered", "to": "platform", "key": "github.comment:5002", "count": 1},
+    {"name": "third-once", "that": "delivered", "to": "platform", "key": "github.comment:5003", "count": 1},
+    {"name": "two-messages", "that": "message_count", "to": "platform", "count": 2},
+    {"name": "restarted", "that": "github_watch", "state": "running"}
+  ],
+  "control": {"fault": "no-dedupe", "fails": ["first-once"]}
+}

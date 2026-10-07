@@ -1,6 +1,6 @@
 ---
 name: fleet-charter
-description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing work as native sub-issues, applying or removing the `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
+description: The charter convention — the single GitHub issue that carries an orchestrator's identity, scope and queue. Use when opening or maintaining a charter issue, queuing asks and work items as native sub-issues (charter -> ask -> work item, with Intent and Done when), applying or removing the `<user>:awaiting-cos` or `<user>:awaiting-user` label, keeping the `pane` field current, or handing a charter back at completion.
 ---
 
 # Fleet Charter Convention
@@ -42,20 +42,63 @@ Rules that matter:
 - Below the block: your charter (what you own), your authority, and your STOP
   list. Keep it short enough to stay true.
 
+Say your standing authority on one line below the block, starting
+`Standing authority:`, for example `Standing authority: may merge green PRs in
+this repo`. The switchboard's tool-call judge reads that line, and only that
+line, from the charter's body (the yaml block stays flat) and asks the person
+you report to about any merge, deploy, publish, message to others or spend it
+does not cover. With no such line it reads "none stated", and nothing of that
+kind is pre-authorised.
+
+Orders the owner gives live in a `## Standing orders` section of the charter
+body, one bullet each: `- <text> (ordered by <name>, <YYYY-MM-DD>)`. They count
+with that line. The switchboard sends them to every agent of the charter as a
+`[switchboard] standing orders` note at its start, after each compaction and
+when they change, and the judge reads them at every tool call; they only stop a
+pointless question, they never loosen a deny. Only the Chief of Staff records
+them, with `fleet-switchboard orders add|remove --charter <n>` (the owner may
+edit the issue directly); you never edit that section, and the judge stops an
+agent that edits its own charter. `fleet-switchboard orders list --charter <n>`
+shows them.
+
 An issue that names your pane but carries no `<user>:orchestrator` label is not a
 charter. It is one label away from being one, and until that label is on, nothing
 supervising the fleet can see it.
 
-## 2. Sub-issues are your queue
+## 2. Sub-issues are your queue: charter, ask, work item
 
-Every coder assignment is a **native sub-issue** of your charter. Not a checkbox,
-not a comment, not a local todo file.
+Three levels, each a **native sub-issue** of the one above. Not a checkbox, not a
+comment, not a local todo file.
+
+- **Charter** — your standing job. It is the same for every message, so it is
+  never repeated in one.
+- **Ask** — one per request the Chief of Staff hands you: a sub-issue of your
+  charter that opens with an Intent and a Done when.
+- **Work item** — one per coder assignment when you split an ask: a sub-issue of
+  the ask, opening with its own one-line Intent that you write. For a single
+  coder the ask itself can be the work item.
+
+````
+## Intent
+Fix the project agents that show "Agent unavailable" in production.
+Done when: both project agents answer a chat message in production.
+````
+
+The Chief of Staff writes an ask's Intent and Done when at hand-off, in the
+person's terms, and **never widens** them into a general goal or a coverage list:
+Done when is what every report is held to. After that, only the person you report
+to, or the Chief of Staff with their yes, changes either line. You do not edit
+them. If one is wrong or too small, propose the change with
+`fleet-switchboard send <chief-of-staff> --issue <ask> "<proposal>"`, and carry
+on inside the ask as written. The switchboard reads these lines from the issue
+body and heads every message about it with them, so keep them to one Intent line
+and one Done-when line.
 
 ```
 gh issue create --repo OWNER/REPO --title "<assignment>" --body "<brief>"
 # sub_issue_id is the issue's DATABASE id, not its number. Fetch it, do not guess:
 id=$(gh api repos/OWNER/REPO/issues/<new-number> --jq .id)
-gh api repos/OWNER/REPO/issues/<charter-number>/sub_issues -F sub_issue_id=$id
+gh api repos/OWNER/REPO/issues/<parent-number>/sub_issues -F sub_issue_id=$id
 ```
 
 This gives a progress rollup for free and makes your queue readable without
@@ -68,10 +111,17 @@ and check.
 Milestones group *programs* that span several orchestrators. They are never your
 per-orchestrator container.
 
-## 3. `<user>:awaiting-user` is the fleet's only blocking channel
+## 3. `<user>:awaiting-cos` and `<user>:awaiting-user` are the fleet's blocking channel
 
-Apply `<user>:awaiting-user` **the moment** you need a decision only the person
-you report to can make.
+Decisions have tiers. You never go straight to the person: a decision you cannot
+make goes up as `fleet-switchboard report question "..."` to your boss, and on the
+issue as `<user>:awaiting-cos`. NEVER apply `awaiting-user` yourself: the Chief of
+Staff either resolves it with the owner's standing orders, or escalates it
+(`awaiting-user` on, `awaiting-cos` off). Its answer arrives as a switchboard
+message: act on it, then remove your `awaiting-cos` label. The rules below hold
+for either label.
+
+Apply `<user>:awaiting-cos` **the moment** you need a decision you cannot make.
 
 **Order matters, and it is not optional: label first, ask second.** Apply the
 label and write the `## Decision required` section *before* you ask the question
@@ -113,6 +163,12 @@ Remove the label as soon as you have an answer, and remove or update the
 `## Decision required` section so the body does not go on claiming a decision is
 still open.
 
+The label is also what puts the issue in the person's read-only **Decisions** list (their TUI
+sidebar, or `fleet-switchboard decisions`), each decision with an id such as `#2`, derived from
+the label and never stored. Say a decision once, with its id, and do not restate open decisions in
+later replies ("see Decisions"). When they answer ("answer #2a: yes"), act on it, then remove the
+label: that is what takes it off the list.
+
 `gh issue list --label <user>:awaiting-user` is the complete and durable answer
 to "what is waiting on me?" across the whole fleet. If you sit blocked without
 the label, your blocker is invisible to the only person who can clear it. If you
@@ -124,7 +180,9 @@ the block visible in time, and it does not restore your ability to have asked th
 question properly. Label first.
 
 Never answer an `<user>:awaiting-user` question on their behalf, and never let a
-coder answer one for them.
+coder answer one for them. The Chief of Staff's own standing orders are one local
+file (`standing-orders.md` beside the switchboard config) that only the owner
+edits: no agent writes it.
 
 ## 4. Keep the pane field current — this is how death is detected
 
@@ -141,11 +199,13 @@ Pane addresses are only unique within one herdr server. A `wN:pN` from another
 machine is a different agent wearing the same name, which is the other reason the
 label prefix is not optional.
 
-If your fleet runs a heartbeat that expects an acknowledgement, send exactly one
-per wake and let the cadence tell the truth: short when work is in flight, long
-when there is genuinely nothing to do. Acking idle while your charter still has
-open sub-issues is how you idle yourself out of existence — the failure mode that
-looks healthiest from the outside.
+Only a message starting `Heartbeat` expects an acknowledgement, and it states the
+exact `heartbeat-ack` command; send exactly one per such wake and let the cadence
+tell the truth: short when work is in flight, long when there is genuinely nothing
+to do. A `[switchboard]` message has no acknowledgement and no cadence, and
+`heartbeat-ack` does not apply to you under it. Either way, going quiet while your
+charter still has open sub-issues is how you idle yourself out of existence — the
+failure mode that looks healthiest from the outside.
 
 ## 5. Hand back at completion
 
@@ -167,3 +227,8 @@ The Chief of Staff pushes blockers upward and stays quiet otherwise. Give it the
 same courtesy: raise blockers and divergences, not status. Your charter and its
 sub-issues already carry your status. If someone has to ask you what you are
 doing, the convention has already failed.
+
+Use plain `gh` for what you say on GitHub. The switchboard tells you about comments
+on your issues, and the harness signs the ones you post (an invisible HTML comment),
+so they do not come back to you as events. `fleet-switchboard comment` does the same
+by hand where the harness has no shim.

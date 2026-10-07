@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""gh, signing what an agent says on GitHub.
+
+The agents share one GitHub account, so an event's author cannot say who wrote a
+comment, and each comment an agent posted came back to it as a wake. The
+switchboard drops anything signed with an HTML comment (`<!-- fleet-switchboard:
+from=NAME -->`, invisible when GitHub renders it). This shim is put first on an
+agent's PATH by the `fleet-hooks` plugin's shell hook, so an agent keeps typing
+plain `gh issue comment ...` and the signature is added without its help.
+
+It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
+`gh issue create` and `gh pr create` when the body comes from --body/-b,
+--body-file/-F (a file, or - for stdin). Everything else, and anything it does
+not understand, runs the real gh unchanged: this must never block a command.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+MARK = "<!-- fleet-switchboard:from=%s -->"
+SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
+WHOAMI_SECONDS = 10
+
+
+def real_gh():
+    """The first executable named gh on PATH that is not this shim's own directory."""
+    own = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    override = os.environ.get("FLEET_REAL_GH")
+    if override and os.access(override, os.X_OK):
+        return override
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or os.path.realpath(entry) == own:
+            continue
+        candidate = os.path.join(entry, "gh")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def my_name():
+    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+    binary = os.environ.get("FLEET_SWITCHBOARD_BIN")
+    if not binary or not os.path.isabs(binary):
+        return "agent"
+    try:
+        done = subprocess.run([binary, "whoami"], capture_output=True, text=True, timeout=WHOAMI_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return "agent"
+    name = done.stdout.strip()
+    return name if done.returncode == 0 and NAME_RE.match(name) else "agent"
+
+
+def sign(body, name):
+    return body if SIGNED_RE.search(body) else body.rstrip("\n") + "\n\n" + MARK % name + "\n"
+
+
+def body_flag(args):
+    """(index, kind, inline) of the LAST body flag among args[2:]: kind "body" or "file"; inline is the
+    value when it is part of the same argument (`--body=x`, `-bx`), else None (the value is args[index+1])."""
+    found = None
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        for names, kind in ((("--body", "-b"), "body"), (("--body-file", "-F"), "file")):
+            for name in names:
+                if arg == name:
+                    found = (i, kind, None)
+                elif arg.startswith(name + "=") or (not name.startswith("--") and arg.startswith(name) and len(arg) > 2
+                                                    and not arg.startswith("--")):
+                    found = (i, kind, arg[len(name) + 1:] if arg[len(name):len(name) + 1] == "=" else arg[len(name):])
+        i += 1
+    return found
+
+
+def signed_call(args, name):
+    """(new argv, stdin text or None, temp file to remove or None), or None when there is nothing to sign."""
+    if len(args) < 3 or (args[0], args[1]) not in SIGNED_COMMANDS:
+        return None
+    flag = body_flag(args)
+    if flag is None:
+        return None
+    index, kind, inline = flag
+    value_at = index if inline is not None else index + 1
+    value = inline if inline is not None else (args[index + 1] if index + 1 < len(args) else None)
+    if value is None:
+        return None
+    new = list(args)
+    if kind == "body":
+        signed = sign(value, name)
+        if inline is not None:
+            new[index] = args[index].replace(value, signed, 1) if args[index].startswith("--") else args[index][:2] + signed
+        else:
+            new[value_at] = signed
+        return new, None, None
+    if value == "-":
+        return new, sign(sys.stdin.read(), name), None
+    try:
+        with open(value, "r") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
+    with os.fdopen(handle, "w") as out:
+        out.write(sign(text, name))
+    if inline is not None:
+        new[index] = args[index][:len(args[index]) - len(value)] + temp
+    else:
+        new[value_at] = temp
+    return new, None, temp
+
+
+def main(args):
+    gh = real_gh()
+    if gh is None:
+        sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
+        return 127
+    plan = None
+    try:
+        plan = signed_call(args, my_name()) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
+    except Exception:
+        plan = None  # never let signing stop the command
+    if plan is None:
+        os.execv(gh, [gh] + args)
+    argv, stdin_text, temp = plan
+    try:
+        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None)
+        return done.returncode
+    finally:
+        if temp:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

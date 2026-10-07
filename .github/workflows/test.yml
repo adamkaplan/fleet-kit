@@ -52,3 +52,17 @@ jobs:
         run: |
           bin/test-fleet-doctor-heartbeat 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+
+      - name: bin/test-switchboard
+        if: ${{ !cancelled() }}
+        run: |
+          bin/test-switchboard 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+
+      - name: bin/fleet-scenario validate
+        if: ${{ !cancelled() }}
+        run: bin/fleet-scenario validate
+
+      - name: bin/fleet-scenario coverage
+        if: ${{ !cancelled() }}
+        run: bin/fleet-scenario coverage --enforce --through-pr 4

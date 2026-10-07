@@ -142,17 +142,21 @@ PROVES:  two lines, the repo from STEP 5 and the prefix from STEP 1.
 
 ```
 CHECK:   gh label list --repo "$FLEET_REPO" --limit 200 \
-           | grep -E "^$(whoami):(orchestrator|awaiting-user)"
-         Both present?  -> skip to STEP 8.
+           | grep -E "^$(whoami):(orchestrator|awaiting-cos|awaiting-user)"
+         All three present?  -> skip to STEP 8.
 DO:      gh label create "$(whoami):orchestrator" --repo "$FLEET_REPO" \
            --color B60205 --description "Charter issue. One per orchestrator."
+         gh label create "$(whoami):awaiting-cos" --repo "$FLEET_REPO" \
+           --color FBCA04 --description "Waiting on the Chief of Staff: it resolves or escalates."
          gh label create "$(whoami):awaiting-user" --repo "$FLEET_REPO" \
-           --color FBCA04 --description "Blocked on a decision only the owner can make."
+           --color D93F0B --description "Blocked on a decision only the owner can make."
 VERIFY:  gh label list --repo "$FLEET_REPO" --limit 200 | grep "^$(whoami):"
-PROVES:  both labels listed, both carrying the prefix.
+PROVES:  all three labels listed, all carrying the prefix.
 ```
 
-Create only these two. Project labels come later, as work arrives.
+Create only these three. Project labels come later, as work arrives. (Once the
+switchboard is installed, `fleet-switchboard labels ensure` creates the same three
+in every watched repo, each with that repo's own account; it is how a repo joins.)
 
 **Every label carries the prefix, including these.** Labels are repo-wide. If two
 people share a repo and both create an unprefixed structural label, each one's
@@ -169,15 +173,16 @@ it. Create the prefixed one alongside.
 ## STEP 8 — Install the skills
 
 ```
-CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination
-         Both present?  -> skip to STEP 9.
+CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination ~/.agents/skills/fleet-setup
+         All present?  -> skip to STEP 9.
 DO:      mkdir -p ~/.agents/skills
          ln -s "$PWD/skills/fleet-charter"     ~/.agents/skills/fleet-charter
          ln -s "$PWD/skills/fleet-coordination" ~/.agents/skills/fleet-coordination
+         ln -s "$PWD/skills/fleet-setup"       ~/.agents/skills/fleet-setup
 VERIFY:  Copilot CLI:  copilot skill list
          opencode:     ls ~/.agents/skills/fleet-*/SKILL.md
-PROVES:  Copilot CLI: both named under "Personal skills", with their descriptions.
-         opencode: both SKILL.md paths listed, through the links.
+PROVES:  Copilot CLI: all three named under "Personal skills", with their descriptions.
+         opencode: all three SKILL.md paths listed, through the links.
 ```
 
 **Symlink, do not copy.** `~/.agents/skills/` is read natively by Copilot CLI,
@@ -384,10 +389,188 @@ in GitHub without showing the person first.**
 
 ---
 
+## The Fleet Switchboard (optional: STEPS 14 to 19)
+
+The Fleet Switchboard is the system around the fleet: it delivers messages
+between agents by OpenCode v2's own message queue (never by typing into a
+pane), keeps a Chief of Staff, and judges tool calls. Do this part only if the
+person asked for it. There is one Chief of Staff, one fleet and one daemon per
+user. The Chief of Staff never does work. Two steps need the person (the Copilot
+login and a key), and you stop at each. Read `docs/switchboard.md`, "Install
+(PR 16)", if anything here surprises you.
+
+---
+
+## STEP 14 — OpenCode v2
+
+```
+CHECK:   V2="$HOME/.local/share/fleet-switchboard/v2/node_modules/@opencode/cli/bin/opencode.exe"
+         "$V2" --version
+         Prints "opencode v2.<minor>.<patch>"?  -> skip to STEP 15.
+DO:      npm install --prefix "$HOME/.local/share/fleet-switchboard/v2" \
+           --no-audit --no-fund --ignore-scripts @opencode/cli@2.0.22
+         (cd "$HOME/.local/share/fleet-switchboard/v2/node_modules/@opencode/cli" && node ./postinstall.mjs)
+VERIFY:  "$V2" --version
+PROVES:  a version that starts with "opencode v2.". Run it by this absolute path.
+```
+
+Never trust the `opencode` on `PATH`: it may be OpenCode v1, which the person's
+other fleet runs on. Never use `npm -g` or the curl installer, which replace
+that v1 binary. If `node` or `npm` is missing, that is a `HUMAN` step: stop and
+say so.
+
+---
+
+## STEP 15 — herdr with plugins
+
+```
+CHECK:   herdr plugin list
+         Prints a list (even an empty one)?  -> skip to STEP 16.
+DO:      update herdr the way STEP 2 installed it. Plugins need 0.9.3 or later.
+VERIFY:  herdr --version; herdr plugin list
+PROVES:  the version is 0.9.3 or later and `plugin list` exits 0.
+```
+
+`install` (the next step) links the Fleet Switchboard's plugin. Do not run
+`herdr plugin link` yourself.
+
+---
+
+## STEP 16 — Install it
+
+```
+CHECK:   ./bin/fleet-switchboard install --dry-run
+         Every line says "already done"?  -> skip to STEP 17.
+DO:      show the person the dry run, and read them the herdr plugin notice in it.
+         HUMAN: the plugin's hooks run for every pane in herdr, including panes
+         that run other agents. They are silent and type nothing, but it is the
+         person's call. Wait for a yes, then:
+         ./bin/fleet-switchboard install --opencode "$V2"
+VERIFY:  ./bin/fleet-switchboard install --opencode "$V2"
+PROVES:  every step says "already done" on this second run (the first one says
+         "done" or "already done"), and no step says FAILED.
+```
+
+`install` is safe to repeat. It finds the v2 binary (it refuses OpenCode v1 and
+says how to get v2), writes the config keys that are missing and never touches
+the ones the person edited, except the two that say what a pane runs
+(`opencode` and `opencode_executable`): when the binary it found differs from the
+config it replaces both and prints `updated ... (was <old>)`, so a config from
+an earlier install does not keep pointing at an old binary. It puts the kit's agents, skills and plugins
+and herdr's OpenCode integration into a **private v2 profile** (by default
+`~/.local/share/fleet-switchboard/profile`), links the herdr plugin, installs a
+service that keeps the daemon alive (a LaunchAgent on macOS, a systemd user unit
+on Linux), starts the daemon, and prints `status`. `install --uninstall` reverses
+all of it except the config, the state and the sessions. Add `--no-service` or
+`--no-herdr-link` to skip either one, and say so in your report.
+
+The daemon reloads `config.json` by itself a few seconds after it changes (an
+invalid file is reported in the first lines of `status` and the daemon keeps
+running on what it had). Never `kill` the daemon by hand: `fleet-switchboard
+restart` stops it by its recorded pid and starts it again.
+
+`install` also makes the Chief of Staff's standing orders file if there is none,
+`standing-orders.md` beside `config.json`: a template whose comment header
+explains it. It is the person's own file, edited in an editor, and what lets the
+Chief of Staff answer for them; `install` never overwrites it and `--uninstall`
+leaves it. Tell the person where it is (`fleet-switchboard orders --cos` prints
+it); do not write it for them.
+
+`install` also puts the CLI on PATH: a symlink `fleet-switchboard` in
+`~/.local/bin` (or another directory of the person's PATH under their home),
+pointing at this checkout's `bin/fleet-switchboard`. It says which, and prints
+the exact line to add to their shell startup file when none of those is on PATH.
+It never overwrites a different file there. The Chief of Staff's shell needs it:
+without it the Chief of Staff cannot run `fleet-switchboard status` and reports
+from GitHub alone. A moved or deleted checkout breaks the link; run `install`
+again from the new one to repair it.
+
+The profile is private on purpose. The person's ordinary OpenCode (possibly v1,
+which their other fleet may run on) reads `~/.config/opencode`, and `install`
+never writes there: v2-shaped files in it can stop every v1 agent at start. The
+dry run prints the profile path it would use; read it to the person. Never pass
+`--shared-profile` unless the person asks for it by name: it puts the files where
+their ordinary OpenCode reads them, and says so.
+
+If `status` begins with "No decision-model key", or says the key is only in an
+environment variable, that is STEP 18, not a failure.
+
+---
+
+## STEP 17 — The Copilot login
+
+```
+CHECK:   "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth list
+         Lists GitHub Copilot?  -> skip to STEP 18.
+HUMAN:   yes. The login is an interactive device-code flow in a browser.
+DO:      tell the person to run
+         "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth login
+         and choose GitHub Copilot. Wait.
+VERIFY:  "$HOME/.local/share/fleet-switchboard/bin/fleet-opencode" auth list
+PROVES:  GitHub Copilot is listed.
+```
+
+Use the wrapper `install` wrote (`fleet-opencode`), not the bare binary: it
+points v2 at the private profile and sets the environment the plugins need. The
+login is stored in that profile, so the person's ordinary OpenCode is not
+affected and does not see it.
+
+---
+
+## STEP 18 — The decision-model key
+
+```
+CHECK:   ./bin/fleet-switchboard key status
+         Prints "file" or "environment"?  -> skip to STEP 19.
+HUMAN:   yes. Only the person has the key.
+DO:      tell the person to run ./bin/fleet-switchboard key set and paste the
+         key (nothing is echoed; it is saved to a private file, mode 0600).
+         Do not ask them to paste it to you. Do not put it in an argument, an
+         environment variable of yours, a file you write, or this transcript.
+VERIFY:  ./bin/fleet-switchboard key status
+PROVES:  "file" (or "environment").
+```
+
+Without a key the message classifier and the tool-call judge fail open: the
+system looks healthy and nothing is classified or judged. That is why `status`
+says so in its first line. Do not call the install done while it does.
+
+A key exported in a shell does not count for the service: launchd and systemd
+start the daemon without your shell's variables. The daemon records where its
+own key came from and `status` reports that, so if the key is only in the
+environment, `status` says so in its first line and `key status` prints
+`environment (only this shell)`. `key set` is the fix.
+
+---
+
+## STEP 19 — Open the Chief of Staff, and prove it
+
+```
+CHECK:   ./bin/fleet-switchboard status
+         A "cos" agent listed?  -> it is open; skip bootstrap.
+DO:      ./bin/fleet-switchboard bootstrap
+VERIFY:  ./bin/fleet-switchboard status
+PROVES:  the first line is not "No decision-model key"; the lines `daemon`
+         (running), `key` (file or environment), `plugin` (linked) and `service`
+         (installed) are all present and say so; and `cos` is listed with a pane.
+```
+
+`bootstrap` opens the Chief of Staff in its own herdr workspace and focuses it.
+Run again, it resumes the same Chief of Staff if its pane is gone, and refuses
+to open a second one if it is still there. If an earlier run died after it made
+the session but before the brief was sent, the resume sends the brief once (it
+reads the transcript to know), and sends nothing if it is already there. The Chief of Staff introduces
+itself, reads `status`, and tells the person plainly what is missing (a key,
+the GitHub repos to watch) and asks what they want to work on. It sets the
+repos up with them; you do not.
+
+---
+
 ## When you finish
 
 Report: which steps you ran, which you skipped and why, the full `fleet-doctor`
-output, and anything you could not verify.
+output (and, if you did STEPS 14 to 19, the full `status` output), and anything
+you could not verify.
 
 Then stop. **Do not create a charter or start an orchestrator** — installing the
 kit and using it are different things, and the person decides when to begin.

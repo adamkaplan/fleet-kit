@@ -22,6 +22,7 @@ first one cannot.
 
 ```text
 ISSUE:      <full repository-qualified GitHub issue URL>
+ASK:        <the ask's Intent and Done when, copied verbatim from its issue>
 GOAL:       <the outcome, in one sentence>
 DONE:       <what actually counts as accepted — the test, not the intention>
 SCOPE:      <the work that is included>
@@ -30,6 +31,33 @@ NEXT:       <the next deliverable and who owns it>
 AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
+
+`ASK` carries the Intent and Done when of the ask this assignment serves
+(`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
+charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this
+assignment; they never widen it, and a report is held to the ask's Done when as
+well as to `DONE`. Messages to the orchestrator go with
+`fleet-switchboard send <name> --issue <n> "<text>"`, never by typing into a pane; reports
+go with `fleet-switchboard report <done|failed|blocked|question|working|paused|withdrawn> [--issue <n>]
+"one line"` (at most 300 characters; detail goes on GitHub). Report at real deliverables, state
+changes and failures; the final report names the result and its evidence link, then stop. After
+`blocked` or `question`, end the turn at once. A worker that stops without reporting is nudged
+once, and the second time its orchestrator is told it stopped. When woken by something that
+changes nothing for you, do not report and do not answer at length.
+
+A `question` or `blocked` report is also what a decision waiting on someone looks like: the
+person you report to sees open ones in a read-only Decisions list, each with an id. Say it once, in
+the report, and do not repeat "I am still waiting" in later replies; the boss's `send` on that ask
+answers it. A decision goes up a tier at a time: a worker's to its orchestrator, an orchestrator's to
+the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
+orders or escalates it to the owner. Never apply `awaiting-user` yourself.
+If a question is superseded, take it back with `report withdrawn [--issue <n>] [--all]`.
+
+A PR is also announced. As soon as an orchestrator opens a PR (not only before it merges) it runs
+`fleet-switchboard notice pr <owner/repo#N | PR URL> ["note"]`: a heads-up in the person's Decisions panel (a
+`Heads-up` section: the PR, its size, CI and review state) while CI and review run. It is information, not a
+decision: it sends no message, wakes nobody and needs no reply, and it drops when the PR merges or closes. Sending it
+again refreshes the note.
 
 `DONE` is the field people get wrong. "Implement the parser" is a goal, not an
 acceptance test. `DONE: parser handles the three fixture files in tests/fixtures
@@ -49,10 +77,29 @@ misunderstanding that would otherwise cost you an afternoon and a wasted branch.
 
 ## Starting a named agent in a pane
 
-The brief is worthless if it lands in the wrong agent. How you start a named agent
-depends on which CLI is installed and, for opencode, which generation. A launch
-that works on one silently falls back to the default agent on another. Detect
-first, then use the matching route:
+**Under the switchboard, use one command and stop reading this section.** If
+`fleet-switchboard` is on your PATH (a message from the switchboard reached you),
+start a worker with
+
+```text
+fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
+  --reports-to <you> --issue <ask> --brief-file -     # the brief on stdin
+```
+
+It creates the v2 session, opens the tab by argv in your workspace
+(`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
+brief. It never types into a pane, and it runs the configured OpenCode, not whichever
+`opencode` is first on PATH. A worker started this way reports with
+`fleet-switchboard report`, and its report reaches you as a fact. Do **not** use the
+`herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:
+they type into a shell, and a bare `opencode` there is the old v1 install, outside the
+switchboard, with no `fleet-switchboard` on its PATH. The rest of this section is the
+legacy fleet's route, for a fleet with no switchboard.
+
+How you start a named agent without the switchboard depends on which CLI is
+installed and, for opencode, which generation. A launch that works on one silently
+falls back to the default agent on another. Detect first, then use the matching
+route:
 
 ```text
 ./bin/fleet-doctor | grep dispatch     # names the route for this machine
@@ -229,3 +276,14 @@ overrides a repo that normally takes direct pushes.
 Formal approval means the required reviewer approved the full current commit SHA.
 A pending review, a comment, or an approval against a stale head is not approval.
 If the head moved, the approval did not move with it.
+
+A `[switchboard] standing orders` note is the owner's standing instruction for the
+charter (kept in the charter issue's `## Standing orders` section, one bullet per
+order): act on it without asking again, within its words. It covers nothing it
+does not name, and nobody but the Chief of Staff, through `fleet-switchboard orders
+add|remove --charter <n>`, or the owner records or changes one. When your
+principal gives the Chief of Staff a standing order, it records it and asks nothing
+the order already answers. The Chief of Staff's own orders are one local file,
+`standing-orders.md` beside the switchboard config: only the owner edits it
+(`fleet-switchboard orders --cos` prints it), and it is told them at its start, after each
+compaction and when the file changes.

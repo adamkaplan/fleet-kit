@@ -1,0 +1,28 @@
+{
+  "id": "S6",
+  "title": "Spike S6: herdr reports working, done and blocked for a Lab v2 TUI",
+  "problem": null,
+  "since_pr": 1,
+  "tiers": ["lab-scripted"],
+  "tags": ["spike"],
+  "cast": {
+    "coder": {"role": "coder", "issue": 6}
+  },
+  "steps": [
+    {"at": "0s", "actor": "coder", "do": "turn", "lasts": "10s"},
+    {"at": "18s", "actor": "coder", "do": "permission", "why": "asks to run a shell command"},
+    {"at": "24s", "actor": "you", "do": "permission", "to": "coder", "decision": "once"},
+    {"at": "30s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"that": "status_is", "name": "working-during-turn", "agent": "coder", "status": "working", "at": "5s"},
+    {"that": "status_is", "name": "done-after-turn", "agent": "coder", "status": "done", "at": "15s"},
+    {"that": "status_is", "name": "blocked-on-ask", "agent": "coder", "status": "blocked", "at": "21s"},
+    {"that": "status_is", "name": "done-after-answer", "agent": "coder", "status": "done", "at": "29s"},
+    {"that": "tool_outcome", "name": "ran-after-answer", "agent": "coder", "tool": "shell", "outcome": "completed"}
+  ],
+  "control": {
+    "variant": {"expect": {"working-during-turn": {"status": "idle"}}},
+    "fails": ["working-during-turn"]
+  }
+}

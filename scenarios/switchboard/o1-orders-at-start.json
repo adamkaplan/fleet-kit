@@ -1,0 +1,106 @@
+{
+  "id": "O1",
+  "title": "A charter's standing orders reach each of its agents once, at the start, as a note that wakes nobody",
+  "problem": 3,
+  "since_pr": 17,
+  "tiers": [
+    "offline"
+  ],
+  "tags": [],
+  "cast": {
+    "platform": {
+      "role": "orchestrator",
+      "charter": 1
+    },
+    "coder": {
+      "role": "coder",
+      "charter": 1,
+      "issue": 2
+    }
+  },
+  "issues": {
+    "1": {
+      "intent": null,
+      "authority": "self-certify and approve deploys in this repo"
+    },
+    "2": {
+      "intent": "Add a health check",
+      "done_when": "GET /health returns 200",
+      "parent": 1
+    }
+  },
+  "steps": [
+    {
+      "at": "0s",
+      "actor": "you",
+      "do": "away",
+      "why": "You are not engaged with anyone: a wake would start a turn, a note will not"
+    },
+    {
+      "at": "20s",
+      "actor": "you",
+      "do": "message",
+      "to": "platform",
+      "text": "what is next?",
+      "why": "The orchestrator's first turn: the orders note, sent at the first pass, rides in front of it"
+    },
+    {
+      "at": "30s",
+      "actor": "coder",
+      "do": "turn",
+      "lasts": "5s",
+      "why": "The coder's first turn: its note rides in front of the task"
+    },
+    {
+      "at": "3m",
+      "actor": "world",
+      "do": "wait",
+      "why": "Many passes later nothing is sent again"
+    }
+  ],
+  "expect": [
+    {
+      "name": "orchestrator-has-the-orders",
+      "that": "delivered",
+      "to": "platform",
+      "key": "orders:*#1:*",
+      "mode": "note",
+      "count": 1,
+      "text": "self-certify and approve deploys in this repo"
+    },
+    {
+      "name": "coder-has-the-orders",
+      "that": "delivered",
+      "to": "coder",
+      "key": "orders:*#1:*",
+      "mode": "note",
+      "count": 1,
+      "text": "Act on them without asking again"
+    },
+    {
+      "name": "once-each",
+      "that": "message_count",
+      "to": "platform",
+      "count": 1
+    },
+    {
+      "name": "coder-once",
+      "that": "message_count",
+      "to": "coder",
+      "count": 1
+    },
+    {
+      "name": "no-machine-turn",
+      "that": "no_machine_turn",
+      "agent": "platform",
+      "why": "Only your message started a model call: the orders note never woke the orchestrator"
+    }
+  ],
+  "control": {
+    "fault": "orders-wake",
+    "fails": [
+      "orchestrator-has-the-orders",
+      "no-machine-turn"
+    ]
+  }
+}

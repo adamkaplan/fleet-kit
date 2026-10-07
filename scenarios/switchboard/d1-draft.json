@@ -1,0 +1,25 @@
+{
+  "id": "D1",
+  "title": "A draft is in the orchestrator's input box when an item arrives",
+  "problem": 3,
+  "since_pr": 3,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "draft", "to": "platform", "text": "also check the retry path",
+     "why": "Half a thought typed into the orchestrator's input box, not sent"},
+    {"at": "10s", "actor": "world", "do": "fact", "to": "platform", "key": "lab.fact:d1-review",
+     "kind": "review", "from": "coder", "batch": false,
+     "summary": "Review comments are in on the health check",
+     "why": "You are not engaged with the orchestrator, so the item is a wake. It arrives as a v2 message; nothing is typed"},
+    {"at": "40s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "draft-intact", "that": "draft_intact", "agent": "platform", "text": "also check the retry path",
+     "why": "The input box still holds the draft, and no message sent it"},
+    {"name": "delivered", "that": "delivered", "to": "platform", "key": "lab.fact:d1-*", "mode": "wake", "count": 1}
+  ],
+  "control": {"baseline": "fleet-heartbeat", "fails": ["draft-intact"]}
+}

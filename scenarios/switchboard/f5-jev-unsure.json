@@ -1,0 +1,27 @@
+{
+  "id": "F5",
+  "title": "Jev is unsure, or unreachable",
+  "problem": 2,
+  "since_pr": 7,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "cos": {"role": "chief-of-staff"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "you", "do": "message", "to": "cos", "text": "Please work on the migration plan", "lasts": "20s"},
+    {"at": "30s", "actor": "you", "do": "message", "to": "cos", "text": "Maybe also the other thing we discussed?", "lasts": "30s",
+     "why": "The answers file leans new but below the threshold: unsure"},
+    {"at": "70s", "actor": "you", "do": "message", "to": "cos", "text": "Could you also check the status page?", "lasts": "30s",
+     "why": "The answers file makes Jev unreachable for this one"},
+    {"at": "110s", "actor": "world", "do": "pass"},
+    {"at": "130s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "unsure-is-current", "that": "classified", "agent": "cos", "step": 1, "as": "current"},
+    {"name": "unreachable-is-current", "that": "classified", "agent": "cos", "step": 2, "as": "current"},
+    {"name": "changes-nothing", "that": "message_count", "to": "cos", "count": 0,
+     "why": "The safe default changes nothing"}
+  ],
+  "control": {"variant": {"steps": {"1": {"text": "Also, can you look at the billing export?"}}},
+              "fails": ["unsure-is-current"]}
+}

@@ -1,0 +1,202 @@
+{
+  "info": {
+    "id": "ses_shapefixture00000000000001",
+    "projectID": "shape-project",
+    "agent": "coder",
+    "cost": 0,
+    "tokens": {
+      "input": 30,
+      "output": 15,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "outcome": "succeeded",
+    "time": {
+      "created": 1790985997009,
+      "updated": 1790985997242,
+      "idle": 1790985997457
+    },
+    "title": "shape sample",
+    "metadata": {
+      "fleet": {
+        "name": "shape-agent",
+        "role": "coder"
+      }
+    },
+    "location": {
+      "directory": "/work/example-repo"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_shapefixture0000000000",
+      "time": {
+        "created": 1790985997075
+      },
+      "text": "warm up\n@script reply=WARM",
+      "type": "user"
+    },
+    {
+      "id": "msg_shapefixture0000000001",
+      "time": {
+        "created": 1790985997118,
+        "streamed": 1790985997126,
+        "completed": 1790985997167
+      },
+      "type": "assistant",
+      "agent": "coder",
+      "model": {
+        "id": "lab",
+        "providerID": "scripted"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "WARM"
+        }
+      ],
+      "snapshot": {
+        "start": "0000000000000000000000000000000000000000",
+        "end": "0000000000000000000000000000000000000000",
+        "files": []
+      },
+      "finish": "stop",
+      "rawFinish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_shapefixture0000000002",
+      "time": {
+        "created": 1790985997169
+      },
+      "type": "idle",
+      "outcome": "succeeded"
+    },
+    {
+      "id": "msg_shapefixture0000000003",
+      "time": {
+        "created": 1790985997247
+      },
+      "text": "import me\n@script tool=bash cmd=\"echo imported\" reply=IMPORTDONE",
+      "type": "user"
+    },
+    {
+      "id": "msg_shapefixture0000000004",
+      "time": {
+        "created": 1790985997304,
+        "streamed": 1790985997312,
+        "completed": 1790985997371
+      },
+      "type": "assistant",
+      "agent": "coder",
+      "model": {
+        "id": "lab",
+        "providerID": "scripted"
+      },
+      "content": [
+        {
+          "type": "tool",
+          "id": "call_shape4",
+          "name": "shell",
+          "executed": false,
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "echo imported"
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "imported\n"
+              }
+            ],
+            "metadata": {
+              "status": "completed",
+              "truncated": false,
+              "exit": 0
+            }
+          },
+          "time": {
+            "created": 1790985997310,
+            "ran": 1790985997311,
+            "completed": 1790985997334
+          }
+        }
+      ],
+      "snapshot": {
+        "start": "0000000000000000000000000000000000000000",
+        "end": "0000000000000000000000000000000000000000",
+        "files": []
+      },
+      "finish": "tool-calls",
+      "rawFinish": "tool_calls",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_shapefixture0000000005",
+      "time": {
+        "created": 1790985997415,
+        "streamed": 1790985997421,
+        "completed": 1790985997456
+      },
+      "type": "assistant",
+      "agent": "coder",
+      "model": {
+        "id": "lab",
+        "providerID": "scripted"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "IMPORTDONE"
+        }
+      ],
+      "snapshot": {
+        "start": "0000000000000000000000000000000000000000",
+        "end": "0000000000000000000000000000000000000000",
+        "files": []
+      },
+      "finish": "stop",
+      "rawFinish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_shapefixture0000000006",
+      "time": {
+        "created": 1790985997457
+      },
+      "type": "idle",
+      "outcome": "succeeded"
+    }
+  ]
+}

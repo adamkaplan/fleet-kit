@@ -1,0 +1,30 @@
+{
+  "id": "I3",
+  "title": "An Intent is edited on GitHub",
+  "problem": 1,
+  "since_pr": 6,
+  "tiers": ["offline"],
+  "cast": {
+    "chief-of-staff": {"role": "chief-of-staff"},
+    "platform": {"role": "orchestrator", "reports_to": "chief-of-staff", "charter": 1}
+  },
+  "issues": {
+    "1": {"intent": null},
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1}
+  },
+  "steps": [
+    {"at": "10s", "actor": "you", "do": "edit-intent", "issue": 2, "intent": "Add a readiness check",
+     "why": "The body is always edited; only the Intent line changes. The control leaves the Intent as it was"},
+    {"at": "5m", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "change-delivered", "that": "delivered", "to": "chief-of-staff", "key": "intent.edit:2:*", "count": 1},
+    {"name": "old-to-new", "that": "message_shows", "to": "chief-of-staff",
+     "text": "Intent: Add a health check -> Add a readiness check"},
+    {"name": "you-are-told", "that": "toast", "text": "Intent changed on #2"}
+  ],
+  "control": {
+    "variant": {"steps": {"0": {"intent": "Add a health check"}}},
+    "fails": ["change-delivered", "old-to-new", "you-are-told"]
+  }
+}

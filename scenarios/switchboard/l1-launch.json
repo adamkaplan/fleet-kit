@@ -1,0 +1,36 @@
+{
+  "id": "L1",
+  "title": "A launched agent runs the Lab's v2 on its own session and receives its brief",
+  "problem": null,
+  "since_pr": 3,
+  "tiers": ["offline", "lab-scripted"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "0s", "actor": "world", "do": "launch", "agent": "coder", "brief": "Add a health check to the service",
+     "why": "fleet-switchboard launch: a session, a tab opened by argv, the pane verified, only then the brief"},
+    {"at": "20s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "fleet-metadata", "that": "metadata_roundtrip", "agent": "coder", "of": "session",
+     "why": "session.get returns the cast's metadata.fleet: name, role, reports_to, issue"},
+    {"name": "runs-v2", "that": "pane_runs_v2", "agent": "coder",
+     "why": "herdr names the agent opencode on that session, and the pane's process is the configured v2"},
+    {"name": "brief-as-fleet-prompt", "that": "metadata_roundtrip", "agent": "coder", "of": "message",
+     "text": "Add a health check to the service", "fleet": {"from": "switchboard", "brief": true},
+     "why": "The brief is a prompt marked as the fleet's, so it is not taken for yours"},
+    {"name": "nothing-typed", "that": "no_typing", "agent": "coder",
+     "why": "The pane has no shell: v2 was started by argv, so there was nothing to type into"}
+  ],
+  "control": {
+    "variant": {"expect": {
+      "fleet-metadata": {"fleet": {"name": "coder", "role": "orchestrator", "reports_to": "platform", "issue": 2}},
+      "brief-as-fleet-prompt": {"fleet": null}}},
+    "fails": ["fleet-metadata", "brief-as-fleet-prompt"]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "D5",
+  "title": "With the daemon stopped the command says the list is stale",
+  "problem": null,
+  "since_pr": 14,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "10s", "actor": "coder", "do": "report", "state": "question", "text": "Which database?", "issue": 2},
+    {"at": "30s", "actor": "world", "do": "kill-daemon"},
+    {"at": "4m", "actor": "world", "do": "wait", "why": "More than two minutes with no pass"}
+  ],
+  "expect": [
+    {"name": "current-while-alive", "that": "decisions", "at": "25s", "count": 1, "text": "Which database?"},
+    {"name": "says-stale", "that": "decisions_say", "at": "4m", "text": "the daemon is not updating this list"},
+    {"name": "not-shown-as-current", "that": "decisions", "at": "4m", "count": 0,
+     "why": "The old list is not presented as the current one"}
+  ],
+  "control": {"fault": "stale-as-fresh", "fails": ["says-stale", "not-shown-as-current"]}
+}
