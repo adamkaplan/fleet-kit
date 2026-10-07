@@ -4525,10 +4525,11 @@ def decisions_from_notices(engine, now):
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_DAYS."""
     engine.notice_effects = {"drop": set(), "unreadable": {}}
-    if engine.state_dir is None:
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
         return [], []
     try:
-        items = read_pr_notices(engine.state_dir)
+        items = read_pr_notices(state_dir)
     except NoticeError as err:
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
