@@ -12576,9 +12576,12 @@ def batch_answer_rows(decision, args):
 
 
 def answer_batch(engine, runner, decision, args, name):
-    """ONE comment on the batch issue recording every row's outcome, then both awaiting labels off it, so the batch
-    and all its rows leave the list together; then, when it can, a note to the orchestrator that raised it. Never
-    touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
+    """First the note to the orchestrator that raised the batch; only once it is delivered, ONE comment on the batch
+    issue recording every row's outcome, then both awaiting labels off it, so the batch and all its rows leave the
+    list together. A note that cannot be delivered (agent gone, held, error) refuses the answer and writes nothing:
+    the batch stays in the cos tier with its labels and no comment, and the same answer can be run again once, with
+    no duplicate note or comment. (A batch with no known raiser, or answered with no caller name, has no one to tell.)
+    Never touches a row's issue: a row may name an issue only proposed for closing, and the orchestrator acts."""
     ident = decision["id"]
     target = _issue_target(engine, decision)
     if target is None or target[0] is None:
@@ -12593,12 +12596,6 @@ def answer_batch(engine, runner, decision, args, name):
     if args.note:
         lines.append("Note: %s" % _one_line(args.note, 300))
     lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
-    comment_as(engine, runner, repo, number, "\n".join(lines), name)
-    change_issue_labels(engine, runner, repo, number, (),
-                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
-    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
-                                            "rows": len(outcomes), "changed": changed,
-                                            "note": _one_line(args.note or "", 200)})
     told = ""
     raised = decision.get("raised_by")
     if raised and name:
@@ -12606,10 +12603,21 @@ def answer_batch(engine, runner, decision, args, name):
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
         try:
             outcome = engine.send(name, raised, text, number, repo)
-            told = "; told %s" % raised if outcome.get("sent") else "; could not tell %s (%s): the comment is the record" % (
-                raised, outcome.get("reason") or outcome.get("action"))
         except Exception as err:
-            told = "; could not tell %s (%s): the comment is the record" % (raised, _one_line(str(err), 100))
+            raise DecisionError("%s was not answered: the note to %s could not be delivered (%s); its labels stay, the "
+                                "batch stays with the Chief of Staff, nothing was commented. Run the same answer again "
+                                "once %s can be reached" % (ident, raised, _one_line(str(err), 100), raised)) from None
+        if not outcome.get("sent"):
+            raise DecisionError("%s was not answered: the note to %s was not delivered (%s); its labels stay, the batch "
+                                "stays with the Chief of Staff, nothing was commented. Run the same answer again once "
+                                "%s can be reached" % (ident, raised, outcome.get("reason") or outcome.get("action"), raised))
+        told = "; told %s" % raised
+    comment_as(engine, runner, repo, number, "\n".join(lines), name)
+    change_issue_labels(engine, runner, repo, number, (),
+                        [awaiting_cos_label(engine.config), awaiting_label(engine.config)])
+    engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
+                                            "rows": len(outcomes), "changed": changed,
+                                            "note": _one_line(args.note or "", 200)})
     return "answered %s: %d rows (%d as recommended, %d changed); %s and %s are off %s#%d%s" % (
         ident, len(outcomes), len(outcomes) - changed, changed, awaiting_cos_label(engine.config),
         awaiting_label(engine.config), repo, number, told)

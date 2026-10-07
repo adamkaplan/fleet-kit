@@ -19925,6 +19925,12 @@ class TestEscalateAndResolve(WriteWorld):
         self.assertTrue(sb.plain_switchboard_message("fleet-switchboard decisions escalate api-481 --reason 'costs money'"))
         self.assertTrue(sb.plain_switchboard_message('fleet-switchboard decisions escalate "#2"'))
 
+    def test_a_batch_whose_row_text_has_a_quoted_pipe_is_a_plain_message(self):
+        row = 'fleet-switchboard decisions batch --title "Stale" --row "acme/api#7 | stale | close it"'
+        self.assertTrue(sb.plain_switchboard_message(row), "a pipe inside quotes is text: a batch is a plain message")
+        self.assertFalse(sb.plain_switchboard_message(row.replace('"acme/api#7 | stale | close it"', "x | sh")),
+                         "a pipe outside quotes is an operator: judged")
+
     def test_a_decision_already_yours_is_left_alone(self):
         self.gh.issue(API, 3, "Yours already", labels=["me:awaiting-user"])
         before = len(self.gh.calls)
@@ -20429,12 +20435,33 @@ class TestBatchAnswer(BatchWorld):
         self.assertIn("you act on it", text)
         self.assertEqual(self.world.admissions("web-orch"), [])
 
-    def test_a_note_that_cannot_be_delivered_does_not_undo_the_answer(self):
-        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent")):
-            code, out, err = self.answer("--as-recommended")
+    def test_a_note_that_cannot_be_delivered_keeps_the_batch_in_the_cos_tier_and_says_why(self):
+        for failure in (mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent")),
+                        mock.patch.object(sb.Switchboard, "send", return_value={"sent": False, "reason": "held"})):
+            with self.subTest(failure=str(failure.kwargs)), failure:
+                code, out, err = self.answer("--as-recommended")
+            self.assertNotEqual(code, 0, out)
+            self.assertIn("was not answered", err)
+            self.assertRegex(err, r"no such agent|held")
+            self.assertEqual(self.gh.comments, [], "nothing misleading is posted")
+            self.assertIn("me:awaiting-cos", self.gh.names(*self.batch))
+            self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
+            self.assertIn(self.ident, [d["id"] for d in self.entries() if d["tier"] == "cos"],
+                          "the batch is still listed in the cos tier")
+
+    def test_the_same_answer_run_again_after_a_failed_note_succeeds_once(self):
+        with mock.patch.object(sb.Switchboard, "send", return_value={"sent": False, "reason": "held"}):
+            self.assertNotEqual(self.answer("--as-recommended")[0], 0)
+        self.assertEqual(self.world.admissions("api-orch"), [])
+        code, out, err = self.answer("--as-recommended")
         self.assertEqual(code, 0, err)
-        self.assertIn("could not tell api-orch", out)
+        self.assertEqual(len(self.gh.comments), 1)
         self.assertEqual(self.gh.names(*self.batch), [])
+        self.assertEqual(len([a for a in self.world.admissions("api-orch")
+                              if "is answered" in str(a)]), 1, "one note, not two")
+        code, out, err = self.answer("--as-recommended")
+        self.assertNotEqual(code, 0, "answered: nothing is waiting")
+        self.assertEqual(len(self.gh.comments), 1)
 
     def test_bad_answers_are_refused_and_write_nothing(self):
         for argv, why in ((("--row", "4=x"), "does not exist"), (("--row", "0=x"), "does not exist"),
