@@ -120,7 +120,7 @@ export function wrapText(text, width, maxLines = WRAP_MAX_LINES) {
   return lines
 }
 
-// One decision: its first line `<id> <age>`, then the whole title wrapped to `width`.
+// One decision: its first line `<id> <age>`, then the daemon's headline (the title, for an older file with none) wrapped to `width` and cut to HEADLINE_LINES lines, the last ending in an ellipsis if cut.
 export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const since = Date.parse(decision.since)
   const age = Number.isNaN(since) ? "?" : formatAge((nowMs - since) / 1000)
