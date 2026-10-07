@@ -451,7 +451,7 @@ fleet metadata), so `--from` is never typed.
 | Command | Who | Effect |
 |---|---|---|
 | `fleet-switchboard send <name> --issue <n> <text>` | Any agent | Delivers to another agent by the delivery rule, without batching. `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
-| `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working` and `paused` are riders: kept until a message carries them, never waking. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
+| `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working`, `paused` and `withdrawn` are riders: kept until a message carries them, never waking. `withdrawn` takes back your open `question` or `blocked` report on the ask (`--all`: on every ask) once it is superseded, and the Decisions list drops it at the next daemon pass; plain `working`, `paused` and `blocked` do not answer a question. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
 | `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
 | `fleet-switchboard decisions [--json] [--fresh] [--watch]` | You, or any agent (PR 14) | The open decisions waiting on you, one line each: `#2a  waiting 12m  platform  Close #2? and a second deploy run?`. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing; `--json` prints the list with `stale` and `errors`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty list prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
 | `fleet-switchboard intent <issue>` | Any agent (PR 6) | Prints the ask's Intent and Done-when, and the work item's Intent if the issue is one |
@@ -988,9 +988,19 @@ readers the pass already has:
 | A pending permission request or question of any fleet agent, a boss with no boss included | `permission`, `question` | `permission: shell echo hi`, the agent that asked | What `WorkerFacts` already reads for a blocked agent |
 | A `question` or `blocked` report delivered to a boss and not answered | `report` | The report's line, the worker that sent it | The boss's transcript (`decisions_lookback_hours`, default 72) |
 
-A report is **answered** when a newer `send` from the boss to that worker exists
-on the same ask (a `send` with no `--issue` counts for any ask: the worker has
-one), or the worker has since reported again on that ask. A worker that no
+A report is **answered** only when the boss has sent that worker something on
+the same ask (a `send` with no `--issue` counts for any ask: the worker has
+one), or the same worker has since reported, on the same issue and repo, a newer
+`question`, a `done`, a `failed` or a `withdrawn`. `working`, `paused` and
+`blocked` never answer: a status line does not resolve the question it sits
+beside. A report with no issue is narrower: only a later `done`, `failed` or
+`withdrawn` from that worker with no issue answers it, never another `question`
+or `blocked`, because two untagged questions need not be about the same thing.
+To take a question back once it is superseded, the worker runs
+`fleet-switchboard report withdrawn [--issue <n>] "why"`: it clears that ask's
+open questions and blocked reports (with no issue, this worker's untagged
+ones); `--all` clears every open question or blocked report of the worker, on
+any ask. The list drops it at the daemon's next pass. A worker that no
 longer runs is not waited on. A report is listed once it is in the boss's
 transcript, not before: a note still in the inbox is not yet delivered.
 

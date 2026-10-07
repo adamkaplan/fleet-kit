@@ -12638,7 +12638,7 @@ class TestReportCommand(ReportBase):
 
     def test_every_state_is_known_and_nothing_else_is(self):
         self.assertEqual(sb.REPORT_ATTENTION, ("done", "failed", "blocked", "question"))
-        self.assertEqual(sb.REPORT_PROGRESS, ("working", "paused"))
+        self.assertEqual(sb.REPORT_PROGRESS, ("working", "paused", "withdrawn"))
         code, _, err = self.cli("report", "finished", "--from", "coder", "x")
         self.assertEqual(code, 2)
         self.assertEqual(self.world.admissions("platform"), [])
@@ -13208,6 +13208,77 @@ class TestDecisionDerivation(DecisionsBase):
         (found,) = self.listed()
         self.assertEqual(found["title"], "And which region?")
 
+    def test_a_working_report_leaves_the_question_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("still going", state="working")
+        self.world.add_agent("other", fleet={"reports_to": "platform", "issue": 4})
+        self.ask_the_boss("a different matter?", sender="other")  # a message to the boss carries the rider into its transcript
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["Which database?", "a different matter?"])
+
+    def test_a_blocked_report_leaves_a_question_listed_and_is_itself_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("waiting on the key", state="blocked")
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["Which database?", "blocked: waiting on the key"])
+
+    def test_a_newer_tagged_question_replaces_the_older_one_on_the_same_issue(self):
+        self.ask_the_boss("Which database?", issue=7)
+        self.ask_the_boss("And which region?", issue=7)
+        self.assertEqual([d["title"] for d in self.listed()], ["And which region?"])
+
+    def test_two_untagged_questions_both_stay_listed(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("first thing?", sender="loner")
+        self.ask_the_boss("second thing?", sender="loner")
+        self.assertEqual(sorted(d["title"] for d in self.listed()), ["first thing?", "second thing?"])
+
+    def test_an_untagged_done_clears_an_untagged_question(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("first thing?", sender="loner")
+        self.ask_the_boss("finished", state="done", sender="loner")
+        self.assertEqual(self.listed(), [])
+
+    def test_withdrawn_clears_the_question_on_the_same_ask_by_the_next_pass(self):
+        self.ask_the_boss("Which database?")
+        self.assertEqual(len(self.listed()), 1)
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.assertEqual(self.listed(), [])
+
+    def test_withdrawn_is_a_rider_that_never_wakes_the_boss(self):
+        self.ask_the_boss("Which database?")
+        out = self.world.new_engine("cli").report("coder", "withdrawn", "superseded")
+        self.assertEqual(out["action"], "rider")
+
+    def test_a_withdrawn_on_another_ask_leaves_the_question_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn", issue=9)
+        self.assertEqual(len(self.listed()), 1)
+
+    def test_withdrawn_all_clears_every_open_question_of_the_worker_only(self):
+        self.world.add_agent("other", fleet={"reports_to": "platform", "issue": 4})
+        self.ask_the_boss("Which database?", issue=7)
+        self.ask_the_boss("blocked here", state="blocked", issue=8)
+        self.ask_the_boss("not mine", sender="other")
+        self.world.new_engine("cli").report("coder", "withdrawn", "all superseded", everything=True)
+        self.world.tick(1)
+        self.assertEqual([d["agent"] for d in self.listed()], ["other"])
+
+    def test_a_question_after_the_withdrawal_is_listed(self):
+        self.ask_the_boss("Which database?")
+        self.ask_the_boss("superseded", state="withdrawn")
+        self.ask_the_boss("Which region?")
+        self.assertEqual([d["title"] for d in self.listed()], ["Which region?"])
+
+    def test_an_untagged_withdrawn_clears_the_workers_untagged_questions(self):
+        self.world.add_agent("loner", fleet={"reports_to": "platform"})
+        self.ask_the_boss("one?", sender="loner")
+        self.ask_the_boss("two?", sender="loner")
+        self.ask_the_boss("both superseded", state="withdrawn", sender="loner")
+        self.assertEqual(self.listed(), [])
+
+    def test_all_is_refused_for_any_other_state(self):
+        with self.assertRaises(sb.ReportError):
+            self.world.new_engine("cli").report("coder", "question", "x?", everything=True)
+
     def test_a_report_on_another_ask_does_not_resolve_a_question(self):
         self.ask_the_boss("Which database?")
         self.ask_the_boss("done with the other one", state="done", issue=9)
@@ -13354,6 +13425,14 @@ class TestDecisionsFile(DecisionsBase):
         self.assertEqual([d["title"] for d in body["decisions"]], ["Which database?"])
 
     def test_an_empty_list_is_still_written(self):
+        self.pass_()
+        self.assertEqual(self.file()["decisions"], [])
+
+    def test_a_withdrawn_question_is_gone_from_the_file_at_the_next_pass(self):
+        self.ask_the_boss("Which database?")
+        self.pass_()
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+        self.ask_the_boss("superseded", state="withdrawn")
         self.pass_()
         self.assertEqual(self.file()["decisions"], [])
 
