@@ -2643,7 +2643,23 @@ at once, the first writer wins. Answers pick by option id; the text rides along.
 
 Failure modes: adapter down (a visible `external` error entry, the outbox grows, local work goes on); a lost
 acknowledgement (the retry carries the same key, so there is no second item); a lost link table (rebuilt by lookup);
-a failing delivery of an inbound answer (the event is not marked, the cursor stays, it comes again).
+a failing delivery of an inbound answer (the event is not marked, the cursor stays, it comes again). Two more:
+
+- An item the outside system **sent it back** (a clarification) is not an answer and not an end. The raising agent is
+  told by a note; for a report that note, sent by the report's boss, is also what answers the report here, so the decision
+  leaves the local list as it does for any answered report. The link table remembers it was sent back (`sent_back_at`
+  and the clarification text) and the outside item is NOT withdrawn. The engine waits for the agent's revision: a newer
+  question of the same agent on the same ask is a `revise` of that item and clears the state. If none arrives within 72
+  hours the item is withdrawn outside with the reason `no revision after clarification`, audited as
+  `external.sent_back_expired`; it is never dropped silently. (A report with no issue has no thread to match, so it waits out
+  the 72 hours.)
+- An operation the other side **refuses for good** (an invalid body, an unknown item, `already decided`) is raised by the
+  adapter with `permanent = True`; every other error, a rate limit and an unavailable service included, is retried with
+  backoff. A permanent refusal is dropped from the outbox (with the operations queued behind it for that decision), audited
+  as `external.permanent_failure`, marked on the link (`last_error`, `failed_op`) and counted in the status line (`N permanent
+  failure(s)`). It never withdraws or answers anything, is not enqueued again while the decision is unchanged, and a later
+  change of the decision enqueues a fresh operation. For a refused withdraw or revise (`already decided`) the engine does not
+  loop: the answer comes in by the next pull.
 
 `fleet-switchboard status` and `decisions` print one line when it is on: `external  ok; outbox N; last pull 12s ago`
 or `external  down: <why>`.
