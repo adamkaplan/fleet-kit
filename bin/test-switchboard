@@ -7203,8 +7203,11 @@ class FrictionBase(Base):
             self.world.add_agent(name, fleet={"role": role})
 
     def pass_at(self, seconds):
+        """A pass after `seconds`, and the next one (a wake is made at the end of one pass and delivered by the
+        next, the way every reminder is). Returns what the two sent."""
         self.world.tick(seconds)
-        return self.world.engine.run_pass()
+        first = self.world.engine.run_pass()
+        return {"sent": first["sent"] + self.world.engine.run_pass()["sent"]}
 
     def friction(self, name):
         return [a for a in self.world.admissions(name) if "Daily friction check" in a["text"]]
@@ -7213,6 +7216,9 @@ class FrictionBase(Base):
 class TestFrictionWake(FrictionBase):
     def test_it_is_off_by_default_and_the_defaults_are_the_documented_ones(self):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
+        self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
+                         ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
+                          "orders_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "fleetkit", "text": None})
         self.make("off")

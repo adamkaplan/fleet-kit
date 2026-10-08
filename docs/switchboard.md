@@ -2092,10 +2092,10 @@ fleet cannot be read the reminder waits for the next pass. Reminders without a c
 
 Each running agent whose fleet role is `orchestrator` (never the Chief of Staff, a coder, or the agent named by `to`) gets
 at most one wake per slot, delivered by the ordinary delivery rule. An orchestrator a person has prompted within the engagement window, or that is blocked or held, is
-skipped for now and asked again until the slot is four hours old; then that day's wake is skipped. A wake is recorded
-(audit event `friction.wake`, and `friction-wake.json` in the state directory) once it reached the orchestrator's
-transcript or inbox. That file is disposable: a lost file repeats at most one wake, because the wake's key
-(`friction:<name>:<slot>`) is also in the transcript.
+skipped for now and asked again until the slot is four hours old; then that day's wake is skipped. The wake is made at the end of a
+pass as an ordinary reminder to that orchestrator and recorded (audit event `friction.wake`; `friction-wake.json` in the
+state directory holds the slot last asked), so a restart or the next pass makes no second one. That file is disposable: a
+lost file means at most one extra wake.
 
 ### Data
 

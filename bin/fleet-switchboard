@@ -1095,7 +1095,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), FrictionWakeFacts(state_dir)]
+            ForegroundFacts(), OrdersFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -5585,7 +5585,7 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("reminders", "reminders", err, report)
     try:
-        friction_mark(engine, discovery)
+        friction_tick(engine, discovery)
     except Exception as err:
         engine._failed("friction-wake", "friction-wake", err, report)
     try:
@@ -5609,7 +5609,6 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
 FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
-FRICTION_LOCK = "friction-wake.lock"
 
 
 def validate_friction_config(config, source):
@@ -5672,83 +5671,40 @@ def write_friction_state(state_dir, found):
     os.replace(str(temp), str(path))
 
 
-class FrictionWakeFacts:
-    """`friction:<name>:<slot>` facts: one short wake per running orchestrator per slot (day), by the ordinary
-    delivery rule. Nothing is read or written unless the section is enabled; and an orchestrator that is not
-    due costs one small file read per pass. An orchestrator a person has engaged with, or that is blocked or
-    held, gets none this slot (the next slot asks again). `friction_mark` records a delivered wake."""
-
-    __name__ = "friction_wake_facts"
-
-    def __init__(self, state_dir):
-        self.state_dir, self.engine = Path(state_dir), None
-
-    def bind(self, engine):
-        self.engine = engine
-
-    def section(self):
-        found = (self.engine.config.get("friction_wake") if self.engine else None) or {}
-        return found if found.get("enabled") else None
-
-    def due(self):
-        """[(name, slot)] for the orchestrators to wake now."""
-        section, discovery = self.section(), self.engine.discovery if self.engine else None
-        if section is None or discovery is None:
-            return []
-        now, state, found, changed = self.engine.now(), read_friction_state(self.state_dir), [], False
-        for name, seen in sorted(discovery.agents.items()):
-            if (seen.fleet or {}).get("role") != "orchestrator" or name == section["to"]:
-                continue
-            mine = state.get(name, {})
-            anchor = mine.get("anchor") if _is_number(mine.get("anchor")) else None
-            if section["hour"] is None and anchor is None:
-                anchor, changed = int(now), True
-                state[name] = dict(mine, anchor=anchor)
-            slot = friction_slot(now, section["hour"], anchor)
-            if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0) or now - slot >= FRICTION_GRACE:
-                continue
-            if hold_reason(seen) or seen.engaged(now, self.engine.engaged_seconds):
-                continue
-            found.append((name, slot))
-        if changed:
-            try:
-                write_friction_state(self.state_dir, state)
-            except OSError:
-                pass
-        return found
-
-    def __call__(self):
-        section = self.section()
-        if section is None:
-            return []
-        text = section["text"] or FRICTION_TEXT % {"to": section["to"]}
-        return [Fact("friction:%s:%d" % (name, slot), name, "reminder", text, slot, batch=False, sender=None)
-                for name, slot in self.due()]
-
-
-def friction_mark(engine, discovery):
-    """Record the wakes that reached their orchestrator (their key is in its transcript or inbox)."""
-    source = next((s for s in engine.sources if isinstance(s, FrictionWakeFacts)), None)
-    if source is None:
+def friction_tick(engine, discovery):
+    """The end of a pass: an orchestrator whose slot has begun and has not been asked gets ONE reminder (the
+    ordinary kind, delivered by the next pass by the ordinary rule). Nothing is read from v2 and nothing is written
+    unless someone is due; `friction-wake.json` records the slot asked, so a restart or a later pass makes no second
+    one. An orchestrator a person has engaged with, or that is blocked or held, is skipped for now (asked again
+    until the slot is FRICTION_GRACE old). Returns [(name, slot)]."""
+    section = engine.config.get("friction_wake") or {}
+    if not section.get("enabled") or discovery is None or engine.state_dir is None:
         return []
-    marked, state = [], read_friction_state(source.state_dir)
-    for name, slot in source.due():
-        observation = discovery.agents.get(name)
-        if observation is None:
+    now, state, asked, changed = engine.now(), read_friction_state(engine.state_dir), [], False
+    text = section["text"] or FRICTION_TEXT % {"to": section["to"]}
+    for name, seen in sorted(discovery.agents.items()):
+        if (seen.fleet or {}).get("role") != "orchestrator" or name == section["to"]:
             continue
-        try:
-            keys, _ = engine.delivered_keys(observation.session_id, slot - SINCE_SLACK)
-        except V2Error:
+        mine = state.get(name, {})
+        anchor = mine.get("anchor") if _is_number(mine.get("anchor")) else None
+        if section["hour"] is None and anchor is None:
+            anchor, changed = int(now), True
+            state[name] = mine = dict(mine, anchor=anchor)
+        slot = friction_slot(now, section["hour"], anchor)
+        if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0) or now - slot >= FRICTION_GRACE:
             continue
-        if "friction:%s:%d" % (name, slot) in keys:
-            state[name] = dict(state.get(name, {}), done=slot)
-            marked.append((name, slot))
-    if marked:
-        write_friction_state(source.state_dir, state)
-        for name, slot in marked:
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "friction.wake", name, {"slot": iso(slot)})
-    return marked
+        if hold_reason(seen) or seen.engaged(now, engine.engaged_seconds):
+            continue
+        add_reminder(engine.state_dir, name, now, now, text)
+        state[name] = dict(mine, done=slot)
+        asked.append((name, slot))
+        changed = True
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "friction.wake", name, {"slot": iso(slot)})
+        write_friction_state(engine.state_dir, state)  # after each one: a crash repeats at most one
+    if changed:
+        write_friction_state(engine.state_dir, state)
+    return asked
 
 
 # ---- reminders
