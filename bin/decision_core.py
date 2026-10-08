@@ -217,12 +217,14 @@ def answered_by_later_report(report, reports):
 
 def answered_by_send(report, send_lines, repos):
     """True when the boss sent the worker something on the ask (a `send` with no issue counts for any ask: the
-    worker has one) after the report. `send_lines` are the worker's synthetic lines, as
-    [(created, message id, line number, line)]."""
+    worker has one) after the report. A report that names no issue (#85) is answered by ANY later send from its boss,
+    whatever issue the send carries: it names no ask for the send to be about. `send_lines` are the worker's
+    synthetic lines, as [(created, message id, line number, line)]."""
     for created, _, _, line in send_lines:
         match = SEND_LINE.match(line)
         if match and match.group(1) == report["boss"] and created > report["at"][0] \
-                and (match.group(3) is None or (int(match.group(3)) == report["issue"]
+                and (match.group(3) is None or report["issue"] is None
+                     or (int(match.group(3)) == report["issue"]
                                                 and repo_of_tag(match.group(2), repos) in (None, report["repo"]))):
             return True
     return False

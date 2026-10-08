@@ -4486,7 +4486,7 @@ def considered_send(engine, report, repos, since, sends):
     tag = "%s#%s" % (match.group(2) or "", match.group(3)) if match.group(3) else "no issue"
     if created <= report["at"][0]:
         why = "older than this report"
-    elif match.group(3) and (int(match.group(3)) != report["issue"]
+    elif match.group(3) and report["issue"] is not None and (int(match.group(3)) != report["issue"]
                              or repo_of_tag(match.group(2), repos) not in (None, report["repo"])):
         why = "tagged %s, not this ask" % tag
     else:
@@ -8886,18 +8886,56 @@ def referenced_issues(discovery, facts):
     return sorted(numbers)
 
 
-def intent_gap_report(engine, discovery, facts):
-    """{"intent_gaps": [issue...], "intent_errors": [text...]}; empty when no ask repo is configured."""
+INTENT_GAP_BUDGET = 4.0     # seconds `status` spends checking which referenced issues lack an Intent (#86)
+INTENT_GAP_WORKERS = 8      # gh reads in flight at once; each is one subprocess, so they overlap
+
+
+def intent_gap_report(engine, discovery, facts, budget=None):
+    """{"intent_gaps": [issue...], "intent_errors": [text...], "intent_unchecked": n}; empty when no ask repo is
+    configured. The reads run in parallel and share one time budget (#86): serial `gh` calls made `status` take
+    ~0.4 s per referenced issue. Issues not read in time are counted, never guessed."""
     reader = getattr(engine, "intents", None)
     if reader is None:
         return {}
-    gaps, errors = set(), []
-    for number in referenced_issues(discovery, facts):
-        try:
-            gaps.update(reader.missing_intent(number))
-        except IntentError as err:
-            errors.append("#%d: %s" % (number, err))
-    return {"intent_gaps": sorted(gaps), "intent_errors": errors}
+    budget = INTENT_GAP_BUDGET if budget is None else budget
+    numbers = list(referenced_issues(discovery, facts))
+    gaps, errors, pending = set(), [], 0
+    if numbers:
+        # Daemon threads, not an executor: an executor's workers are joined at interpreter exit, so one stuck `gh`
+        # would hold the process after the status was printed.
+        todo, results, deadline = list(reversed(numbers)), {}, time.monotonic() + budget
+        lock = threading.Lock()
+
+        def work():
+            while True:
+                with lock:
+                    if not todo:
+                        return
+                    number = todo.pop()
+                try:
+                    results[number] = ("ok", reader.missing_intent(number))
+                except IntentError as err:
+                    results[number] = ("error", "#%d: %s" % (number, err))
+                except Exception as err:  # one odd read must not take the status down
+                    results[number] = ("error", "#%d: %s" % (number, _one_line(str(err), 100)))
+
+        threads = [threading.Thread(target=work, daemon=True) for _ in range(min(INTENT_GAP_WORKERS, len(numbers)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        with lock:
+            todo.clear()  # nothing new starts after the budget
+        for number, (kind, value) in sorted(dict(results).items()):
+            if kind == "ok":
+                gaps.update(value)
+            else:
+                errors.append(value)
+        pending = len(numbers) - len(results)
+    report = {"intent_gaps": sorted(gaps), "intent_errors": errors}
+    if pending:
+        report["intent_unchecked"] = pending
+    return report
 
 
 def intent_gap_lines(agents):
@@ -8905,6 +8943,9 @@ def intent_gap_lines(agents):
     if agents.get("intent_gaps"):
         lines.append("      intent     no Intent section: %s" % ", ".join("#%d" % n for n in agents["intent_gaps"]))
     lines.extend("        intent problem: %s" % error for error in agents.get("intent_errors", []))
+    if agents.get("intent_unchecked"):
+        lines.append("        intent: %d referenced issue(s) not checked within the %gs budget (partial answer)"
+                     % (agents["intent_unchecked"], INTENT_GAP_BUDGET))
     return lines
 
 

@@ -14095,6 +14095,50 @@ class TestSyncReportFreezePerBoss(unittest.TestCase):
         self.assertIn("plan_operations(desired, self._projected(), kinds, now, scoped)", source)
 
 
+class TestStatusIntentGapsAreBounded(unittest.TestCase):
+    """#86: the intent-gap check in `status` runs its reads in parallel, within one time budget."""
+
+    class Reader:
+        def __init__(self, delays):
+            self.delays = delays
+            self.seen = []
+
+        def missing_intent(self, number):
+            self.seen.append(number)
+            time.sleep(self.delays.get(number, 0))
+            if number == 13:
+                raise sb.IntentError("gh", "boom")
+            return [number] if number % 2 else []
+
+    def report(self, delays, budget, numbers):
+        engine = types.SimpleNamespace(intents=self.Reader(delays))
+        with mock.patch.object(sb, "referenced_issues", return_value=numbers):
+            return sb.intent_gap_report(engine, None, [], budget=budget)
+
+    def test_every_issue_is_read_and_errors_are_kept(self):
+        got = self.report({}, 5, [1, 2, 3, 13])
+        self.assertEqual((got["intent_gaps"], got["intent_errors"]), ([1, 3], ["#13: gh: boom"]))
+        self.assertNotIn("intent_unchecked", got)
+
+    def test_the_reads_overlap(self):
+        started = time.time()
+        got = self.report(dict.fromkeys(range(1, 9), 0.3), 5, list(range(1, 9)))
+        self.assertLess(time.time() - started, 1.2, "eight 0.3 s reads in parallel, not 2.4 s serial")
+        self.assertEqual(got["intent_gaps"], [1, 3, 5, 7])
+
+    def test_a_read_past_the_budget_is_counted_not_waited_for(self):
+        started = time.time()
+        got = self.report({2: 3.0}, 0.3, [1, 2, 3])
+        self.assertLess(time.time() - started, 2.0)
+        self.assertEqual(got["intent_unchecked"], 1)
+        self.assertEqual(got["intent_gaps"], [1, 3])
+        lines = sb.intent_gap_lines(got)
+        self.assertTrue(any("not checked" in l and "partial" in l for l in lines), lines)
+
+    def test_no_reader_is_an_empty_report(self):
+        self.assertEqual(sb.intent_gap_report(types.SimpleNamespace(intents=None), None, []), {})
+
+
 class TestDecisionIds(unittest.TestCase):
     def item(self, seed, ask=None, agent="coder", bare=False, since=EPOCH):
         return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since}
@@ -14337,6 +14381,36 @@ class TestDecisionDerivation(DecisionsBase):
         again = sb.synthetic_lines(self.world.engine, platform, 0)
         self.assertTrue(any("And which region?" in line[3] for line in again), "a newer synthetic changes the newest id and is read")
         self.assertFalse(any("And which region?" in line[3] for line in first))
+
+    def test_a_report_naming_no_issue_is_answered_by_any_later_send_from_its_boss(self):
+        """#85: whatever issue the send is tagged to, the report named none (a worker with no issue of its own)."""
+        for n, tag in enumerate((None, 9, 2)):
+            with self.subTest(send_issue=tag):
+                name = "free%d" % n
+                self.world.add_agent(name, fleet={"role": "coder", "reports_to": "platform"})
+                self.ask_the_boss("Which database?", sender=name)
+                self.assertEqual([d["agent"] for d in self.listed()], [name])
+                self.world.new_engine("cli").send("platform", name, "use postgres", tag)
+                self.world.tick(1)
+                self.assertEqual(self.listed(), [])
+
+    def test_a_report_naming_no_issue_is_not_answered_by_a_send_from_someone_else_or_before_it(self):
+        report = {"boss": "platform", "at": (100.0, 0), "issue": None, "repo": None}
+        sends = lambda who, at, issue: [(at, "m", 0, "- send from %s%s: hi" % (who, " (issue #%d)" % issue if issue else ""))]
+        self.assertFalse(sb.decision_core.answered_by_send(report, [], []))
+        for who, at in (("other", 200.0), ("platform", 50.0), ("platform", 100.0)):
+            found = sb.decision_core.answered_by_send(report, sends(who, at, 9), [])
+            self.assertFalse(found, (who, at))
+        self.assertTrue(sb.decision_core.answered_by_send(report, sends("platform", 101.0, 9), []))
+
+    def test_a_report_naming_an_issue_still_needs_a_send_on_it(self):
+        self.ask_the_boss("Which database?", issue=2)
+        self.world.new_engine("cli").send("platform", "coder", "elsewhere", 9)
+        self.world.tick(1)
+        self.assertEqual(len(self.listed()), 1)
+        self.world.new_engine("cli").send("platform", "coder", "this one", 2)
+        self.world.tick(1)
+        self.assertEqual(self.listed(), [])
 
     def test_fresh_says_for_an_open_report_the_newest_send_it_looked_at_or_that_there_was_none(self):
         self.ask_the_boss("Which database?", issue=2)
