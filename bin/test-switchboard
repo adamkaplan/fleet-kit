@@ -25350,6 +25350,280 @@ class TestExternalInboundJudge(ExternalWorld):
         self.assertIn("speaks for you", denied["detail"]["reason"])
 
 
+# ---------------------------------------------------------------- work items from worker assignments
+
+class FakeWorkSink(sb.work_sync.WorkSink):
+    interval = 60
+
+    def __init__(self):
+        self.calls, self.down, self.defer = [], False, None
+
+    def _do(self, *call):
+        if self.down:
+            raise ConnectionError("the sink is down")
+        self.calls.append(call)
+
+    def put(self, work_id, title, **fields):
+        self._do("put", work_id, title, fields)
+
+    def patch(self, work_id, **fields):
+        if self.defer:
+            return {"sent": False, "deferred": True, "due_in": self.defer}
+        self._do("patch", work_id, fields)
+
+    def finish(self, work_id, end, summary, **fields):
+        self._do("finish", work_id, end, summary)
+
+    def kinds(self):
+        return [c[0] for c in self.calls]
+
+
+class FakeWorkHost(sb.work_sync.Host):
+    def __init__(self):
+        self.agent_list, self.report_list, self.link_table, self.events = [], [], {}, []
+
+    def agents(self):
+        return list(self.agent_list)
+
+    def reports(self):
+        return list(self.report_list)
+
+    def title_of(self, repo, issue):
+        return "The ask %s#%d" % (repo.split("/")[1], issue)
+
+    def links(self):
+        return self.link_table
+
+    def audit(self, event, subject, detail):
+        self.events.append((event, subject, detail))
+
+
+def worker(name="w1", issue=2, repo="acme/api", status="idle", **more):
+    return dict({"name": name, "role": "coder", "reports_to": "boss", "repo": repo, "issue": issue, "status": status,
+                 "intent": None}, **more)
+
+
+def report(state, text="", at=1, sender="w1", issue=2):
+    return {"sender": sender, "issue": issue, "repo": "acme/api", "state": state, "text": text, "at": at}
+
+
+class TestWorkItemRules(unittest.TestCase):
+    ws = sb.work_sync
+
+    def test_the_key_and_the_item_id_are_stable_and_per_assignment(self):
+        a = self.ws.work_id_of(self.ws.assignment_key("w1", "acme/api", 2))
+        self.assertEqual(a, self.ws.work_id_of(self.ws.assignment_key("w1", "acme/api", 2)))
+        self.assertEqual(len({a, self.ws.work_id_of(self.ws.assignment_key("w1", "acme/api", 3)),
+                              self.ws.work_id_of(self.ws.assignment_key("w2", "acme/api", 2)),
+                              self.ws.work_id_of(self.ws.assignment_key("w1", "acme/web", 2))}), 4)
+
+    def test_the_state_of_an_assignment(self):
+        cases = [("idle", [], ("queued", None)), ("working", [], ("running", None)),
+                 ("working", [report("question", "which?")], ("running", None)),
+                 ("idle", [report("question", "which?")], ("awaiting", None)),
+                 ("idle", [report("blocked", "stuck")], ("blocked", None)),
+                 ("blocked", [], ("blocked", None)), ("idle", [report("working", "on it")], ("awaiting", None)),
+                 ("idle", [report("paused", "later")], ("awaiting", None)),
+                 ("idle", [report("working", "x", 1), report("done", "shipped", 2)], ("done", "done")),
+                 ("working", [report("failed", "broke")], ("failed", "failed")),
+                 ("idle", [report("withdrawn", "moot")], ("cancelled", "cancelled")),
+                 ("idle", [report("done", "old", 1), report("working", "again", 2)], ("awaiting", None))]
+        for status, mine, want in cases:
+            with self.subTest(status=status, reports=[r["state"] for r in mine]):
+                state, end, _ = self.ws.state_of(status, mine)
+                self.assertEqual((state, end), want)
+        self.assertEqual(self.ws.state_of("idle", [report("question", "which table?")])[2], "which table?")
+
+    def test_serves_is_the_outside_item_id_when_the_ask_is_linked_else_the_issue_ref(self):
+        links = {"k": {"repo": "acme/api", "ask": 2, "external_id": "ext-9"}}
+        self.assertEqual(self.ws.serves_of(links, "acme/api", 2), "ext-9")
+        self.assertEqual(self.ws.serves_of(links, "acme/api", 3), "acme/api#3")
+        self.assertEqual(self.ws.serves_of({}, "acme/api", 2), "acme/api#2")
+        self.assertEqual(self.ws.serves_of({"k": dict(links["k"], withdrawn=True)}, "acme/api", 2), "acme/api#2")
+
+    def test_which_agents_are_assignments_and_their_fields(self):
+        host = FakeWorkHost()
+        agents = [worker("w1"), worker("noissue", issue=None), worker("noboss", reports_to=None),
+                  worker("norepo", repo=None), worker("w2", issue=5, intent="Ship the parser. More text.")]
+        found = self.ws.assignments(agents, [], host.title_of, {})
+        self.assertEqual(sorted(a["agent"] for a in found.values()), ["w1", "w2"])
+        by = {a["agent"]: a for a in found.values()}
+        self.assertEqual((by["w1"]["title"], by["w1"]["kind"], by["w1"]["state"], by["w1"]["serves"]),
+                         ("The ask api#2", "coder", "queued", "acme/api#2"))
+        self.assertEqual(by["w2"]["title"], "Ship the parser")
+
+
+class TestWorkSyncPump(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.sink, self.host, self.t = FakeWorkSink(), FakeWorkHost(), [1000.0]
+        self.settings = {"work_grace_seconds": 600, "work_outbox_alarm_depth": 3, "retry_base_seconds": 5,
+                         "retry_max_seconds": 60}
+        self.pump = self.make()
+
+    def make(self):
+        return sb.work_sync.WorkSync(self.settings, self.dir, self.sink, self.host, lambda: self.t[0])
+
+    def cycle(self, advance=0):
+        self.t[0] += advance
+        return self.pump.cycle()
+
+    def test_first_sight_is_one_put_and_nothing_more_while_nothing_changes(self):
+        self.host.agent_list = [worker()]
+        self.cycle()
+        self.cycle(100)
+        self.assertEqual(self.sink.kinds(), ["put"])
+        _, work_id, title, fields = self.sink.calls[0]
+        self.assertEqual((title, fields["state"], fields["kind"], fields["serves"]), ("The ask api#2", "queued", "coder", "acme/api#2"))
+        self.assertEqual(work_id, sb.work_sync.work_id_of("w1|acme/api|2"))
+
+    def test_a_change_is_patched_once_per_interval_and_the_last_state_wins(self):
+        self.host.agent_list = [worker()]
+        self.cycle()
+        self.host.agent_list = [worker(status="working")]
+        self.cycle(10)                                            # inside the interval: held
+        self.assertEqual(self.sink.kinds(), ["put"])
+        self.host.report_list = [report("question", "which table?")]
+        self.host.agent_list = [worker(status="idle")]            # the state moved again: still one write due
+        self.cycle(10)
+        self.assertEqual(self.sink.kinds(), ["put"])
+        self.cycle(50)                                            # the interval has run out
+        self.assertEqual(self.sink.kinds(), ["put", "patch"])
+        self.assertEqual(self.sink.calls[1][2], {"state": "awaiting", "progress": "which table?"})
+        self.cycle(10)
+        self.assertEqual(self.sink.kinds(), ["put", "patch"])
+        self.host.agent_list = [worker(status="working")]
+        self.cycle(61)                                            # and again after another interval
+        self.assertEqual(self.sink.kinds(), ["put", "patch", "patch"])
+
+    def test_the_interval_is_the_sinks_and_never_below_a_minute(self):
+        self.sink.interval = 5
+        self.assertEqual(self.pump.interval, 60)
+        self.sink.interval = 300
+        self.assertEqual(self.pump.interval, 300)
+
+    def test_an_assignment_that_ends_is_finished_exactly_once(self):
+        self.host.agent_list = [worker(status="working")]
+        self.cycle()
+        self.host.report_list = [report("done", "shipped the parser")]
+        self.host.agent_list = [worker(status="idle")]
+        self.cycle(1)
+        self.assertEqual(self.sink.kinds(), ["put", "finish"])
+        self.assertEqual(self.sink.calls[1][2:], ("done", "shipped the parser"))
+        for _ in range(3):
+            self.cycle(500)
+        self.host.agent_list = []
+        self.cycle(5000)
+        self.assertEqual(self.sink.kinds(), ["put", "finish"], "finished once, never again, not cancelled later")
+
+    def test_a_restart_makes_no_duplicate(self):
+        self.host.agent_list = [worker()]
+        self.cycle()
+        self.pump = self.make()                                   # the daemon restarted: the state file is read again
+        self.cycle(100)
+        self.assertEqual(self.sink.kinds(), ["put"])
+        (self.dir / "work-items.json").unlink()                   # even a lost state file: the same id, the put is idempotent
+        self.pump = self.make()
+        self.cycle(100)
+        self.assertEqual({c[1] for c in self.sink.calls}, {sb.work_sync.work_id_of("w1|acme/api|2")})
+
+    def test_an_agent_that_disappears_is_cancelled_after_the_grace_period(self):
+        self.host.agent_list = [worker(status="working")]
+        self.cycle()
+        self.host.agent_list = []
+        self.cycle(100)
+        self.cycle(400)
+        self.assertEqual(self.sink.kinds(), ["put"])
+        self.cycle(200)
+        self.assertEqual(self.sink.kinds(), ["put", "finish"])
+        self.assertEqual(self.sink.calls[1][2], "cancelled")
+
+    def test_a_sink_that_is_down_never_raises_and_drains_when_it_is_back(self):
+        self.sink.down = True
+        self.host.agent_list = [worker(), worker("w2", issue=3)]
+        status = self.cycle()
+        self.assertEqual((status["open"], status["outbox"], status["errors"]), (2, 2, 2))
+        self.assertIn("down", status["error"])
+        self.assertEqual(self.sink.calls, [])
+        self.cycle(1)                                             # inside the backoff: not tried
+        self.assertEqual(len([e for e in self.host.events if e[0] == "work.failed"]), 2)
+        self.sink.down = False
+        status = self.cycle(10)
+        self.assertEqual((status["outbox"], status["errors"]), (0, 0))
+        self.assertEqual(self.sink.kinds(), ["put", "put"])
+
+    def test_a_deep_outbox_is_an_alarm_and_nothing_is_dropped(self):
+        self.sink.down = True
+        self.host.agent_list = [worker("w%d" % n, issue=n + 1) for n in range(5)]
+        status = self.cycle()
+        self.assertTrue(status["alarm"])
+        self.assertEqual(status["outbox"], 5)
+
+    def test_a_deferred_patch_is_kept_and_tried_later(self):
+        self.host.agent_list = [worker()]
+        self.cycle()
+        self.sink.defer = 30
+        self.host.agent_list = [worker(status="working")]
+        self.cycle(100)
+        self.assertEqual(self.sink.kinds(), ["put"])
+        self.sink.defer = None
+        self.cycle(10)                                            # inside the deferral
+        self.assertEqual(self.sink.kinds(), ["put"])
+        self.cycle(30)
+        self.assertEqual(self.sink.kinds(), ["put", "patch"])
+
+    def test_two_assignments_for_one_agent_are_two_items(self):
+        self.host.agent_list = [worker(issue=2, status="working")]
+        self.cycle()
+        self.host.agent_list = [worker(issue=3, status="working")]   # reassigned to another ask
+        self.cycle(1)
+        ids = [c[1] for c in self.sink.calls if c[0] == "put"]
+        self.assertEqual(len(set(ids)), 2)
+        self.cycle(700)                                           # the first is no longer held: cancelled
+        self.assertEqual([c[2] for c in self.sink.calls if c[0] == "finish"], ["cancelled"])
+
+    def test_the_audit_names_each_write_and_holds_no_secret(self):
+        self.host.agent_list = [worker()]
+        self.host.report_list = [report("question", "use Bearer abcdef123456 or sk-abcdefghij1234?")]
+        self.cycle()
+        self.assertEqual([e[0] for e in self.host.events], ["work.put"])
+        self.assertNotIn("abcdef123456", json.dumps(self.sink.calls))
+        self.assertNotIn("abcdef123456", (self.dir / "work-items.json").read_text())
+
+
+class TestWorkItemsThroughTheDaemon(ExternalWorld):
+    def setUp(self):
+        super().setUp()
+        self.sink = FakeWorkSink()
+        self.fake.work = self.sink
+
+    def test_off_means_the_sink_is_never_touched(self):
+        self.turn_on()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.sink.calls, [])
+        self.assertNotIn("work items", self.cmd("you", "status")["out"])
+
+    def test_on_a_worker_assignment_becomes_one_item_linked_to_its_ask_and_status_says_so(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.turn_on(work_items=True)
+        self.run_pass()
+        self.run_pass()
+        puts = [c for c in self.sink.calls if c[0] == "put"]
+        self.assertEqual(len(puts), 3, [c[1] for c in puts])   # the three coders of the world, each holding an issue
+        mine = [c for c in puts if c[3]["serves"] == "ext-1"]
+        self.assertEqual(len(mine), 1, "the item of the api worker on issue 2 serves the outside item of the decision on it")
+        self.assertEqual(sorted(c[3]["serves"] for c in puts if c[3]["serves"] != "ext-1"), ["acme/web#2", "acme/web#3"])
+        self.assertIn("work items  3 open, last write", self.cmd("you", "status")["out"])
+
+    def test_without_a_work_sink_it_is_a_no_op(self):
+        del self.fake.work
+        self.turn_on(work_items=True)
+        self.run_pass()
+        self.assertEqual(self.sink.calls, [])
+
+
 class PermanentRefusal(Exception):
     permanent = True
 
