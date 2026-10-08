@@ -2664,6 +2664,22 @@ a failing delivery of an inbound answer (the event is not marked, the cursor sta
 `fleet-switchboard status` and `decisions` print one line when it is on: `external  ok; outbox N; last pull 12s ago`
 or `external  down: <why>`.
 
+**Work items.** With `external_decisions.work_items` on (it is off by default, and does nothing unless the adapter
+in use has a work sink), each worker assignment is mirrored as one external work item, as information for an outside
+dashboard; nothing flows back. An assignment is a fleet agent that reports to a boss and holds an ask (an issue in a
+repo) in its launch metadata; a worker with no issue is not one. Its identity is the agent name, the repo and the issue,
+and the item id is a name-based UUID of that key, so a restart creates no duplicate (the put is idempotent). The same
+name on the same issue again is the same assignment, and a finished item stays finished. The fields, in generic words
+that the mapping names: `title` (the ask's title or intent line from what the daemon already holds, never a new read),
+`kind` (the agent's role), `state` (`queued` launched and no report, `running` working, `awaiting` a question is open or
+the worker is idle awaiting input, `blocked`), `progress` (one line from its latest report) and `serves`, which carries
+the outside item id of the decision linked to that ask when there is one, else the issue ref `<repo>#<N>` as text. An
+assignment ends as `done`, `failed` (its report) or `cancelled` (withdrawn, or the agent gone without a final report for
+`work_grace_seconds`), finished exactly once. Writes to one item are at most one per interval (the sink's, never under 60
+seconds; the last state wins); a failed write is retried with backoff and never blocks the pass; more than
+`work_outbox_alarm_depth` waiting writes raise an alarm and none is dropped. The pump keeps `work-items.json` in the
+state directory (disposable: a lost file re-puts the same ids). `status` shows `work items  N open, last write ..., N error(s)`.
+
 Configuration (no key is read from the repo; the mapping file is local):
 
 | Key (`external_decisions`) | Default               | Meaning                                                                                            |
@@ -2678,6 +2694,9 @@ Configuration (no key is read from the repo; the mapping file is local):
 | `outbox_alarm_depth`       | 1000                  | A deeper outbox raises an alarm in the status line and the errors; nothing is dropped.             |
 | `retry_base_seconds`       | 5                     | First backoff of a failed outbound operation; doubles each try.                                    |
 | `retry_max_seconds`        | 600                   | The ceiling of the backoff.                                                                        |
+| `work_items`               | `false`               | One work item per worker assignment (needs an adapter with a work sink).                           |
+| `work_grace_seconds`       | 600                   | An agent gone this long without a final report is finished as cancelled.                           |
+| `work_outbox_alarm_depth`  | 1000                  | More waiting work writes than this raises an alarm; none is dropped.                               |
 
 The mapping file is read by the adapter, not by the engine. What it holds is the adapter's business; typically:
 
