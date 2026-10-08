@@ -512,7 +512,7 @@ fleet metadata), so `--from` is never typed.
 |---|---|---|
 | `fleet-switchboard send [--interrupt] <name> --issue <n> <text>` | Any agent; `--interrupt` only a boss to its own worker | Delivers to another agent by the delivery rule, without batching (a boss's send to a working agent is steered into its turn). `--interrupt` aborts the recipient's running turn first (stop and hold orders). `--issue` is required from PR 6. Everywhere an issue is named (`send`, `report`, `remind`, `intent`, `handoff`, `comment`, `launch`), `owner/repo#N` is accepted beside a bare number (PR 15) |
 | `fleet-switchboard report <state> [--issue <n>] "<one line>"` | Any agent with a `reports_to` (PR 13) | Tells the agent it reports to what happened. `done`, `failed`, `blocked` and `question` are delivered at once, by `send`'s own path (a wake, or a note when you are engaged with the boss). `working`, `paused` and `withdrawn` are riders: kept until a message carries them, never waking. `withdrawn` takes back your open `question` or `blocked` report on the ask (`--all`: on every ask) once it is superseded, and the Decisions list drops it at the next daemon pass; plain `working`, `paused` and `blocked` do not answer a question. The line is required and at most 300 characters (longer is refused, not cut); `--issue` defaults to the caller's own; a caller with no `reports_to` is refused |
-| `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later |
+| `fleet-switchboard remind <name> <when> --issue <n> <text>` | Any agent | A message due later; remind yourself when you wait on time ([Self-wakes](#self-wakes)) |
 | `fleet-switchboard decisions [list] [--repo OWNER/REPO] [--tier cos\|human\|orchestrator\|all] [--json] [--fresh] [--watch]` | You, or any agent (PR 14; views PR 18) | The open decisions in the caller's view, one line each, the first line saying which view it is: `#2a  waiting 12m  platform  Close #2? and a second deploy run?` (a view that mixes tiers adds each row's `[tier]`). The Chief of Staff sees every repo and tier by default, an orchestrator its own repo, anyone else the human tier; the flags override. Read-only. By default it reads `decisions.json`; `--fresh` derives the list now, in this process, and writes nothing, and prints under each open report the newest send from its boss to its worker that the check considered and why it did not answer (`considered` in `--json`), or that there was none; `--json` prints the list with `stale` and `view`; `--watch` redraws when the list changes, for a terminal with no TUI plugin (a herdr side pane). An empty human view prints `No decisions are waiting on you.`; a file that is missing, unreadable or older than 120 s prints that the daemon is not updating the list (exit 1) instead of showing it as current |
 | `fleet-switchboard decisions escalate <id> [--reason "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Moves a decision to you: your label on and the Chief of Staff's off, on the issue (with the repo's own account), or at once for a prompt or question. Not judged. A report with no issue is refused: put it in chat |
 | `fleet-switchboard decisions resolve <id> [--note "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Takes both awaiting labels off the issue. Judged against the Chief of Staff's standing orders |
@@ -2047,6 +2047,55 @@ the window is a time the person can see and answer ("hold") before an orchestrat
 most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC` when set, and `(stale)`
 when the last read failed), then `<id> <age>`. Notices never appear under `Waits on you` or in its count. A pane
 for one repo shows that repo's notices; the Chief of Staff's and yours show all.
+
+### Self-wakes
+
+Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and
+delivers a due reminder as an ordinary wake, so nothing in an agent polls.
+
+**Remind yourself.** When you wait on time (a CI run, a rate limit, a checkpoint, another agent), run
+`fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your turn. `<when>` is `30m`, `+2h`, `1d`
+or an ISO time with a zone. The role files of the coder and the orchestrator and the `fleet-coordination` skill say so.
+
+**Checkpoint reminders.** `fleet-switchboard launch` sets two reminders when the worker is up:
+
+| Reminder | To | At | Text | Condition |
+|---|---|---|---|---|
+| checkpoint | the worker | the checkpoint | `checkpoint due: report now, one line` | the worker is still running; if it is gone the reminder is dropped |
+| overdue | `--reports-to` (the launching orchestrator) | the overdue time | `<worker> has not reported since launch: overdue checkpoint` | delivered **only if the worker has not reported or sent anything to that orchestrator since the launch**; otherwise, or when the worker is gone, dropped |
+
+The times come from `--checkpoint 30m --overdue 60m` (a delay or an ISO time with a zone; the documented way), or, when
+neither flag is given, from a best-effort parse of the brief's `CHECKPOINT:` line: `Report at 30 minutes ... overdue
+at 60` (also `in 20m, overdue 45m`; a bare overdue number takes the checkpoint's unit; the overdue must be later). A
+line that cannot be read makes no reminder and adds one line to the launch's stderr; it is never an error. A launch
+with no brief and no flag is silent.
+
+A reminder may carry an optional `condition`, checked only once it is due: `{"unless_report_from": <worker>, "since":
+<launch time>}` and `{"while_running": <worker>}`. The check is one read of the boss's transcript and inbox (what the
+decisions list already reads for reports; `synthetic_lines`) plus the rider file, and none at all for a reminder with no
+condition. A report or send line from the worker, or a rider (a `working` report not yet carried), after `since` drops
+the reminder; a worker that is not in the fleet drops it; both are audited as `reminder.drop` with the reason. If the
+fleet cannot be read the reminder waits for the next pass. Reminders without a condition are exactly what they were.
+
+**The daily friction wake.** Off unless enabled. Add to `config.json` (the section is validated like the other keys):
+
+```json
+"friction_wake": {"enabled": true, "hour": 9, "to": "fleetkit", "text": null}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | nothing happens, and nothing is read, unless `true` |
+| `hour` | `9` | local hour (0-23, the daemon's time zone) of the daily wake; `null` = every 24 h from the first wake |
+| `to` | `fleetkit` | the agent a proposal goes to; named only in the text, and never woken by this |
+| `text` | `null` | the wake's text; `null` is `Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send <to> a one-paragraph proposal: fleet-switchboard send <to> --issue <n> "<proposal>". If nothing, do nothing and say nothing.` |
+
+Each running agent whose fleet role is `orchestrator` (never the Chief of Staff, a coder, or the agent named by `to`) gets
+at most one wake per slot, delivered by the ordinary delivery rule. An orchestrator a person has prompted within the engagement window, or that is blocked or held, is
+skipped for now and asked again until the slot is four hours old; then that day's wake is skipped. A wake is recorded
+(audit event `friction.wake`, and `friction-wake.json` in the state directory) once it reached the orchestrator's
+transcript or inbox. That file is disposable: a lost file repeats at most one wake, because the wake's key
+(`friction:<name>:<slot>`) is also in the transcript.
 
 ### Data
 

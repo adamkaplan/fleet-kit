@@ -7236,7 +7236,7 @@ class TestFrictionWake(FrictionBase):
         for name in ("coder", "cos"):
             self.assertEqual(self.friction(name), [])
         for _ in range(5):
-            self.pass_at(600)
+            self.assertEqual(self.pass_at(600)["sent"], [], "nothing is sent again, queued or not")
         self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1), "not twice in a day")
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 2)
         self.pass_at(86400)
