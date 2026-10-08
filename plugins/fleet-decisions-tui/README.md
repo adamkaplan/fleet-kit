@@ -13,6 +13,12 @@ one line, then its whole title word-wrapped to 34 characters on the lines below.
   `FLEET_SWITCHBOARD_REPO`, which `fleet-switchboard launch` and `bootstrap` put in the pane's environment
   (not secrets). A TUI that was already running has neither the variables nor this version of the plugin:
   restart it.
+- **Clicking (issue 66).** A decision row links to its issue and a heads-up row to its PR
+  (`https://github.com/<repo>/issues/<ask>`, `.../pull/<number>`; built from the repo and number only, each
+  strictly validated, never from a title). A row with no repo or no number has no link. The `id age` line is an
+  OSC 8 hyperlink: Ctrl-click (herdr; Cmd-click in iTerm2 outside herdr) opens it in the browser; a terminal that ignores OSC 8
+  shows plain text. A plain click on the row copies the link with OSC 52 and shows a toast (a terminal that
+  blocks OSC 52 gets the toast with the link). Still no process, no network.
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
   changes and touches on every pass. It never derives anything itself.
 - An empty list shows a row `none`. A file that is missing, unreadable, older than 120 s,
