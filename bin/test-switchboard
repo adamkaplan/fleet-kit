@@ -23614,6 +23614,399 @@ console.log(JSON.stringify(out));
         baseline_golden(self, "plugin-views", json.loads(done.stdout.strip().splitlines()[-1]))
 
 
+# ---------------------------------------------------------------- external decision systems (the sync engine)
+
+class FakeExternal(sb.decision_core.ExternalDecisionAdapter):
+    """An in-process adapter: items by outside id, idempotent by key, a switch for down, and a queue of events."""
+
+    def __init__(self):
+        self.up, self.items, self.applied_keys, self.calls, self.events = True, {}, {}, [], []
+        self.lose_ack = False   # apply the next write, then fail as if the answer was lost
+
+    def health(self):
+        return None if self.up else "the fake is down"
+
+    def push(self, operation, idempotency_key):
+        self.calls.append((operation["op"], operation["key"], idempotency_key))
+        if not self.up:
+            raise ConnectionError("the fake is down")
+        if idempotency_key in self.applied_keys:
+            return self.applied_keys[idempotency_key]
+        op = operation["op"]
+        if op == "raise":
+            ext = "ext-%d" % (len(self.items) + 1)
+            self.items[ext] = {"key": operation["key"], "decision": operation["decision"], "floor": operation["floor"],
+                               "state": "open", "notes": [], "revisions": [operation["revision"]]}
+        else:
+            ext = operation["external_id"]
+            item = self.items[ext]
+            if op == "revise":
+                item["decision"], item["floor"] = operation["decision"], operation["floor"]
+                item["revisions"].append(operation["revision"])
+            elif op == "status":
+                item["floor"] = operation["floor"]
+                if operation.get("note"):
+                    item["notes"].append(operation["note"])
+            elif op == "withdraw":
+                item["state"] = "withdrawn"
+        answer = {"external_id": ext}
+        self.applied_keys[idempotency_key] = answer
+        if self.lose_ack:
+            self.lose_ack = False
+            raise ConnectionError("the answer was lost")
+        return answer
+
+    def lookup(self, key):
+        for ext, item in self.items.items():
+            if item["key"] == key:
+                return {"external_id": ext, "revision": item["revisions"][-1]}
+        return None
+
+    def pull_changes(self, cursor):
+        start = cursor or 0
+        return list(self.events[start:]), len(self.events)
+
+    def open_items(self):
+        return {e: i for e, i in self.items.items() if i["state"] == "open"}
+
+
+class ExternalWorld(BaselineWorld):
+    TIERS = {"orchestrator": "floor-a", "cos": "floor-b", "human": "floor-c"}
+
+    def setUp(self):
+        super().setUp()
+        self.fake = FakeExternal()
+        sb.register_external_adapter("fake", lambda settings, mapping, state: self.fake)
+        self.addCleanup(sb.EXTERNAL_ADAPTERS.pop, "fake", None)
+        self.mapping = self.home / "mapping.json"
+        self.mapping.write_text("{}")
+
+    def turn_on(self, **extra):
+        section = dict({"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": str(self.mapping),
+                        "tier_map": self.TIERS, "poll_seconds": 1, "retry_base_seconds": 5, "retry_max_seconds": 60},
+                       **extra)
+        self.set_config(external_decisions=section)
+
+    def run_pass(self, seconds=5):
+        self.daemon_pass(seconds)
+
+    def audit_events(self, prefix="external."):
+        lines = (self.world.state / "audit.jsonl").read_text().splitlines()
+        found = [json.loads(l) for l in lines if l.strip()]
+        return [e for e in found if str(e.get("event", "")).startswith(prefix)]
+
+    def event(self, ext, kind="answered", by="human", eid=None, **more):
+        eid = eid or "ev-%d" % (len(self.fake.events) + 1)
+        self.fake.events.append(dict({"event_id": eid, "external_id": ext, "type": kind, "answered_by": by,
+                                      "option_id": "yes", "text": "go ahead"}, **more))
+        return eid
+
+    def ext_of(self, kind):
+        found = [e for e, i in self.fake.items.items() if i["decision"]["kind"] == kind]
+        self.assertEqual(len(found), 1, self.fake.items)
+        return found[0]
+
+
+class TestExternalDecisionConfig(unittest.TestCase):
+    def check(self, section):
+        return sb.validate_config({"external_decisions": section})["external_decisions"]
+
+    def test_off_by_default_and_filled_when_absent(self):
+        self.assertNotIn("external_decisions", sb.validate_config({}), "a config that never names it has no such key")
+        for raw in ({"external_decisions": None}, {"external_decisions": {}}):
+            found = sb.validate_config(raw)["external_decisions"]
+            self.assertIs(found["enabled"], False)
+            self.assertEqual((found["repos"], found["kinds"]), ([], ["issue", "report"]))
+
+    def test_each_key_is_checked(self):
+        good = {"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": "/tmp/m.json",
+                "tier_map": ExternalWorld.TIERS}
+        self.assertTrue(self.check(good)["enabled"])
+        for bad in ({"enabled": "yes"}, {"adapter": "Bad Name"}, {"repos": ["nope"]}, {"repos": "acme/api"},
+                    {"kinds": ["permission"]}, {"kinds": []}, {"mapping_file": "relative.json"},
+                    {"tier_map": {"cos": "x"}}, {"tier_map": {"orchestrator": "", "cos": "b", "human": "c"}},
+                    {"poll_seconds": 0}, {"retry_base_seconds": 10, "retry_max_seconds": 5},
+                    {"outbox_alarm_depth": 0}, {"unknown": 1}):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                self.check(dict(good, **bad))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"external_decisions": []})
+
+    def test_enabled_needs_its_adapter_mapping_tiers_and_a_repo(self):
+        for missing in ("adapter", "mapping_file", "tier_map", "repos"):
+            good = {"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": "/tmp/m.json",
+                    "tier_map": ExternalWorld.TIERS}
+            good.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(sb.ConfigError):
+                self.check(good)
+
+
+class TestExternalDecisionRules(unittest.TestCase):
+    core = sb.decision_core
+
+    def test_keys_are_stable_and_the_idempotency_key_follows_the_operation(self):
+        a = self.core.decision_key("issue:acme/api#2")
+        self.assertEqual(a, self.core.decision_key("issue:acme/api#2"))
+        self.assertNotEqual(a, self.core.decision_key("issue:acme/api#3"))
+        k = self.core.idempotency_key(a, "revise", 2)
+        self.assertEqual(k, self.core.idempotency_key(a, "revise", 2))
+        self.assertEqual(len({k, self.core.idempotency_key(a, "revise", 3), self.core.idempotency_key(a, "raise", 2),
+                              self.core.idempotency_key(self.core.decision_key("x"), "revise", 2)}), 4)
+
+    def test_authority_follows_the_role_of_the_answerer(self):
+        ok = lambda role, tier: self.core.answer_authority(role, tier)[0]
+        self.assertEqual([ok("project_agent", t) for t in ("orchestrator", "cos", "human")], [True, False, False])
+        self.assertEqual([ok("owner_agent", t) for t in ("orchestrator", "cos", "human")], [True, True, False])
+        self.assertEqual([ok("human", t) for t in ("orchestrator", "cos", "human")], [True, True, True])
+        self.assertFalse(ok(None, "cos"))
+        self.assertFalse(ok("human", "nobody"))
+        self.assertEqual([self.core.normalize_role(x) for x in ("project agent", "Owner's agent", "human", "robot")],
+                         ["project_agent", "owner_agent", "human", None])
+
+    def test_a_permission_request_and_a_notice_never_go_out(self):
+        for kind in ("permission", "notice"):
+            self.assertFalse(self.core.goes_outward({"kind": kind, "repo": API}, [API], ("issue", "report", "question")))
+        self.assertTrue(self.core.goes_outward({"kind": "issue", "repo": API}, [API]))
+        self.assertFalse(self.core.goes_outward({"kind": "issue", "repo": WEB}, [API]))
+        self.assertFalse(self.core.goes_outward({"kind": "question", "repo": API}, [API]))
+        self.assertTrue(self.core.goes_outward({"kind": "question", "repo": API}, [API], ("question",)))
+
+    def test_the_payload_carries_no_credential(self):
+        payload = self.core.outward_payload({"title": "use Bearer abcdef123456 and sk-abcdefghij1234", "headline": "h",
+                                             "kind": "report", "id": "#2", "tier": "cos"}, "floor-b")
+        self.assertNotIn("abcdef123456", json.dumps(payload))
+        self.assertNotIn("sk-abcdefghij1234", json.dumps(payload))
+
+
+class TestExternalDecisionSync(ExternalWorld):
+    def test_off_means_no_call_and_no_file(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.say("api-orch", "question", "Which table?")
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if p.name.startswith("external")), [])
+        self.assertEqual([e for e in self.file_body()["errors"] if e["source"] == "external"], [])
+        self.assertNotIn("external", self.cmd("you", "status")["out"])
+
+    def test_enabled_but_a_repo_not_listed_is_not_sent(self):
+        self.turn_on(repos=[WEB])
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_raise_revise_tier_change_and_withdraw(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])           # a repo not switched on
+        self.ask_permission("api-coder")                                                         # a permission: local only
+        self.prs[7] = pr_view_json()
+        self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")                              # a notice: local only
+        self.say("api-orch", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        self.assertEqual(sorted(i["decision"]["kind"] for i in self.fake.items.values()), ["issue", "report"])
+        self.assertEqual(sorted((i["decision"]["kind"], i["floor"]) for i in self.fake.items.values()),
+                         [("issue", "floor-b"), ("report", "floor-b")])
+        self.assertTrue(all(c[0] == "raise" for c in self.fake.calls))
+        self.assertEqual(len(self.fake.calls), 2, "the permission, the notice and the other repo stayed local")
+        # the same pass again: nothing more to say
+        self.run_pass()
+        self.assertEqual(len(self.fake.calls), 2)
+        # a re-asked question is a revise of the same item, not a second one
+        before = self.ext_of("report")
+        self.say("api-orch", "question", "Which table, really? The first answer is moot.", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.ext_of("report"), before)
+        self.assertEqual(len(self.fake.items), 2)
+        self.assertEqual(self.fake.items[before]["revisions"], [1, 2])
+        self.assertIn("really", self.fake.items[before]["decision"]["title"])
+        # escalating is a tier change
+        self.assertEqual(self.cmd("cos", "decisions", "escalate", "api#2")["code"], 0)
+        self.run_pass()
+        self.assertEqual(self.fake.items[self.ext_of("issue")]["floor"], "floor-c")
+        # resolving withdraws it
+        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass()
+        self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
+
+    def test_the_outbox_retries_and_a_lost_answer_does_not_make_a_second_item(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.fake.lose_ack = True
+        self.run_pass()
+        self.assertEqual(len(self.fake.items), 1, "the write landed; its answer was lost")
+        self.assertEqual(len(json.loads((self.world.state / "external-outbox.json").read_text())["ops"]), 1)
+        self.run_pass(1)   # inside the backoff: no new try
+        self.assertEqual(len(self.fake.calls), 1)
+        self.run_pass(10)
+        self.assertEqual(len(self.fake.items), 1, "the retry carried the same idempotency key")
+        self.assertEqual(len(set(c[2] for c in self.fake.calls)), 1)
+        self.assertEqual(json.loads((self.world.state / "external-outbox.json").read_text())["ops"], [])
+
+    def test_a_down_adapter_is_a_visible_error_and_hides_nothing_locally(self):
+        self.turn_on()
+        self.fake.up = False
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.say("api-orch", "question", "Which table?")
+        self.run_pass()
+        body = self.file_body()
+        self.assertEqual(sorted(d["kind"] for d in body["decisions"]), ["issue", "report"])
+        self.assertEqual([e["error"] for e in body["errors"] if e["source"] == "external"],
+                         ["external decision system is down: the fake is down"])
+        self.assertIn("external  down: the fake is down; outbox 2", self.cmd("you", "status")["out"])
+        self.assertEqual(self.fake.calls, [])
+        # local answering still works while it is down
+        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.fake.up = True
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual([i["decision"]["kind"] for i in self.fake.open_items().values()], ["report"])
+        self.assertIn("external  ok; outbox 0", self.cmd("you", "status")["out"])
+
+    def test_a_failing_read_of_a_source_is_not_an_answer_and_withdraws_nothing(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.assertEqual(len(self.fake.open_items()), 1)
+        with baseline_failing_source("github"):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(len(self.fake.open_items()), 1)
+
+    def test_reconcile_rebuilds_the_link_table_from_the_adapter(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        (self.world.state / "external-links.json").unlink()
+        self.world.engine.external_sync = None
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.fake.items), 1)
+        links = json.loads((self.world.state / "external-links.json").read_text())["links"]
+        self.assertEqual([l["external_id"] for l in links.values()], ["ext-1"])
+        self.assertEqual([e["event"] for e in self.audit_events("external.linked")], ["external.linked"])
+
+    def test_an_answer_is_applied_once_for_a_report_an_issue_and_a_batch(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-user"])                  # human tier
+        self.say("api-coder", "question", "Which table should hold the totals?", 6)           # orchestrator tier
+        self.assertEqual(self.raise_batch()["code"], 0)                                        # a batch, cos tier
+        self.run_pass()
+        self.assertEqual(len(self.fake.items), 3)
+        report, batch = self.ext_of("report"), [e for e, i in self.fake.items.items() if i["decision"].get("batch")][0]
+        issue = [e for e, i in self.fake.items.items() if i["decision"]["kind"] == "issue" and not i["decision"].get("batch")][0]
+        first = self.event(report, by="project agent", text="use the totals table")
+        self.event(report, by="project agent", eid=first)                                      # the same event again
+        self.event(issue, by="human", text="postgres")
+        self.event(batch, by="owner's agent", option_id="as_recommended", text="fine")
+        before = self.mark()
+        self.run_pass()
+        sent = [t for t in self.notes_to("api-coder") if "Answered outside by the project agent" in t]
+        self.assertEqual(len(sent), 1, "applied once, the duplicate ignored")
+        self.assertFalse([t for t in self.notes_to("api-coder") if "answer changed" in t], "the duplicate is not a reversal")
+        self.assertEqual(self.audit_events("external.reversed"), [])
+        self.assertIn("use the totals table", sent[0])
+        self.assertEqual(self.labels()["acme/api#2"], [], "the issue's labels are off")
+        comments = [c["body"] for c in self.gh.comments[before["comments"]:]]
+        self.assertTrue(any("Answered outside by the human: postgres" in c for c in comments), comments)
+        self.assertTrue(any("Answer to this batch" in c for c in comments), comments)
+        self.run_pass()
+        self.assertEqual([d["id"] for d in self.file_body()["decisions"]], [])
+        self.assertEqual(sorted(i["state"] for i in self.fake.items.values()), ["open", "open", "open"],
+                         "answered outside: nothing is withdrawn outside")
+        answered = self.audit_events("external.answered")
+        self.assertEqual(sorted(e["detail"]["role"] for e in answered), ["human", "owner_agent", "project_agent"])
+
+    def test_a_role_below_the_decisions_tier_is_not_applied(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "A cos issue", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 3, "A human issue", labels=["me:awaiting-user"])
+        self.run_pass()
+        cos_item = [e for e, i in self.fake.items.items() if i["decision"]["display_id"] == "api#2"][0]
+        human_item = [e for e, i in self.fake.items.items() if i["decision"]["display_id"] == "api#3"][0]
+        self.event(cos_item, by="project agent")
+        self.event(human_item, by="owner's agent")
+        self.event(human_item, by="somebody else")
+        before = self.mark()
+        self.run_pass()
+        self.assertEqual(self.labels()["acme/api#2"], ["me:awaiting-cos"])
+        self.assertEqual(self.labels()["acme/api#3"], ["me:awaiting-user"])
+        self.assertEqual(len(self.gh.comments), before["comments"])
+        refused = self.audit_events("external.refused")
+        self.assertEqual(len(refused), 3)
+        self.run_pass()
+        self.assertTrue(any("not applied" in n for n in self.fake.items[cos_item]["notes"]), "pushed back as a note")
+        self.assertEqual(sorted(d["id"] for d in self.file_body()["decisions"]), ["api#2", "api#3"], "both stay")
+        # equal or higher is applied
+        self.event(cos_item, by="owner's agent")
+        self.event(human_item, by="human")
+        self.run_pass()
+        self.assertEqual(self.labels()["acme/api#2"], [])
+        self.assertEqual(self.labels()["acme/api#3"], [])
+
+    def test_clarify_goes_to_the_agent_and_is_not_an_answer(self):
+        self.turn_on()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        ext = self.ext_of("report")
+        self.event(ext, kind="clarify", by="owner's agent", text="which environment is this for?")
+        self.run_pass()
+        self.assertTrue(any("which environment is this for?" in t for t in self.notes_to("api-orch")))
+        self.assertEqual([d["kind"] for d in self.file_body()["decisions"]], ["report"], "still open")
+        self.assertEqual(self.audit_events("external.answered"), [])
+        # the agent's next question is a revise of the same item
+        self.say("api-orch", "question", "Which table, for production?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2])
+        self.assertEqual(len(self.fake.items), 1)
+
+    def test_a_reversal_tells_the_agent_and_undoes_nothing(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-user"])
+        self.say("api-coder", "question", "Which table?", 6)
+        self.run_pass()
+        report = self.ext_of("report")
+        self.event(report, by="human", text="use totals")
+        self.run_pass()
+        self.run_pass()
+        sends = len(self.notes_to("api-coder"))
+        self.event(report, kind="reversed", by="human", text="actually use the daily table")
+        self.run_pass()
+        later = self.notes_to("api-coder")[sends:]
+        self.assertEqual(len(later), 1)
+        self.assertIn("answer changed: actually use the daily table", later[0])
+        self.assertEqual(len(self.audit_events("external.reversed")), 1)
+
+    def test_an_answer_for_an_unknown_or_closed_decision_is_an_orphan_and_delivers_nothing(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-user"])
+        self.run_pass()
+        ext = self.ext_of("issue")
+        self.event("ext-nope", by="human")
+        before = self.mark()
+        self.run_pass()
+        self.assertEqual([e["event"] for e in self.audit_events("external.orphan")], ["external.orphan"])
+        self.assertEqual(len(self.gh.comments), before["comments"])
+        # answered here first: a later outside answer finds it closed
+        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass()
+        self.event(ext, by="human")
+        count = len(self.gh.comments)
+        self.run_pass()
+        self.assertEqual(len(self.gh.comments), count)
+        self.assertEqual([e["event"] for e in self.audit_events("external.closed")], ["external.closed"])
+
+    def test_a_decision_with_no_floor_tier_for_its_tier_is_left_alone_and_status_says_off_when_off(self):
+        self.turn_on()
+        self.run_pass()
+        line = self.cmd("you", "status")["out"]
+        self.assertIn("external  ok; outbox 0; last pull", line)
+        self.set_config()
+        self.assertNotIn("external", self.cmd("you", "status")["out"])
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])

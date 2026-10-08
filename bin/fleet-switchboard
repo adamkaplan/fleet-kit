@@ -65,6 +65,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from urllib.parse import quote
 import uuid
 
@@ -92,6 +93,27 @@ def load_decision_core():
 
 
 decision_core = load_decision_core()
+
+
+def load_decision_sync():
+    """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
+    imports decision_core, which is already registered)."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_sync.py")
+    held = sys.modules.get("decision_sync")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("decision_sync", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["decision_sync"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("decision_sync", None)
+        raise
+    return module
+
+
+decision_sync = load_decision_sync()
 
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
@@ -143,6 +165,19 @@ DEFAULTS = {
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
 
+EXTERNAL_DEFAULTS = {
+    "enabled": False,             # nothing is called, read or written while this is false
+    "adapter": None,              # the registered adapter's name (register_external_adapter)
+    "repos": [],                  # a project is switched on per repo: only decisions of these repos go outward
+    "kinds": ["issue", "report"],  # which decisions go: issue (batches included), report, question; never a permission request
+    "mapping_file": None,         # an absolute path to a LOCAL file holding everything specific to the other system
+    "tier_map": None,             # {"orchestrator": name, "cos": name, "human": name}: the floor tier each tier maps to
+    "poll_seconds": 30,           # how often answers are pulled
+    "outbox_alarm_depth": 1000,   # a deeper outbox raises an alarm in the status line; nothing is ever dropped
+    "retry_base_seconds": 5,      # backoff of a failed outbound operation: base * 2^(attempts-1), up to the ceiling
+    "retry_max_seconds": 600,
+}
+
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
 
 
@@ -174,7 +209,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS))
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -221,7 +256,60 @@ def validate_config(raw, source="config"):
     validate_policy_config(config, source)  # PR 9
     validate_report_triage_config(config, source)  # PR 13
     validate_decisions_config(config, source)  # PR 14
+    validate_external_config(config, source)
     return config
+
+
+def validate_external_config(config, source):
+    """`external_decisions`: None or {} is off. Checked like every other key; filled with EXTERNAL_DEFAULTS."""
+    if "external_decisions" not in config:
+        return   # off: the key is absent from a config that never named it, so nothing about it exists
+    raw = config["external_decisions"]
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'external_decisions' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(EXTERNAL_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'external_decisions' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+    section = dict(EXTERNAL_DEFAULTS, **raw)
+    where = "%s: 'external_decisions" % source
+    if not isinstance(section["enabled"], bool):
+        raise ConfigError("%s.enabled' must be true or false, got %r" % (where, section["enabled"]))
+    if section["adapter"] is not None and (not isinstance(section["adapter"], str)
+                                           or not re.match(r"^[a-z][a-z0-9_-]{0,40}$", section["adapter"])):
+        raise ConfigError("%s.adapter' must be a lower-case adapter name, got %r" % (where, section["adapter"]))
+    repos = section["repos"]
+    if not isinstance(repos, list) or not all(isinstance(r, str) and GITHUB_REPO_RE.match(r) for r in repos):
+        raise ConfigError("%s.repos' must be a list of OWNER/REPO names, got %r" % (where, repos))
+    kinds = section["kinds"]
+    if not isinstance(kinds, list) or not kinds or not all(k in ("issue", "report", "question") for k in kinds):
+        raise ConfigError("%s.kinds' must be a list of issue, report or question (a permission request never goes "
+                          "out), got %r" % (where, kinds))
+    mapping = section["mapping_file"]
+    if mapping is not None and (not isinstance(mapping, str) or not os.path.isabs(mapping)):
+        raise ConfigError("%s.mapping_file' must be an absolute path, got %r" % (where, mapping))
+    tiers = section["tier_map"]
+    if tiers is not None:
+        if (not isinstance(tiers, dict) or set(tiers) != set(decision_core.TIER_LADDER)
+                or not all(isinstance(v, str) and v.strip() for v in tiers.values())):
+            raise ConfigError("%s.tier_map' must name a floor tier (a non-empty string) for each of %s, got %r"
+                              % (where, ", ".join(decision_core.TIER_LADDER), tiers))
+    for key in ("poll_seconds", "retry_base_seconds", "retry_max_seconds"):
+        if not _is_number(section[key]) or section[key] <= 0:
+            raise ConfigError("%s.%s' must be a positive number, got %r" % (where, key, section[key]))
+    if section["retry_max_seconds"] < section["retry_base_seconds"]:
+        raise ConfigError("%s.retry_max_seconds' must be at least retry_base_seconds" % where)
+    depth = section["outbox_alarm_depth"]
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
+        raise ConfigError("%s.outbox_alarm_depth' must be a whole number of 1 or more, got %r" % (where, depth))
+    if section["enabled"]:
+        for key in ("adapter", "mapping_file", "tier_map"):
+            if section[key] is None:
+                raise ConfigError("%s.%s' is required when external_decisions is enabled" % (where, key))
+        if not repos:
+            raise ConfigError("%s.repos' must name at least one repo when external_decisions is enabled" % where)
+    config["external_decisions"] = section
 
 
 def load_config(path=None):
@@ -1364,6 +1452,7 @@ class Switchboard:
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
+        self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
@@ -4741,6 +4830,7 @@ def derive_decisions(engine, now):
         found, problems = read_source(engine, source, now, errors)
         items.extend(found)
     ids = assign_decision_ids(items, decision_repos(engine))
+    engine.decision_seeds = {ident: item["seed"] for ident, item in zip(ids, items)}  # memory only: the sync engine's keys
     watched = decision_repos(engine)
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
     decisions = decision_core.build_entries(
@@ -4813,13 +4903,16 @@ class LocalStore(decision_core.DecisionStore):
 
 
 class NullExternal(decision_core.ExternalDecisionAdapter):
-    """The adapter hook point with nothing behind it: healthy, takes every push as a no-op and has no changes. It is
-    what the Switchboard uses while no external adapter is configured, so nothing leaves the machine."""
+    """The adapter with nothing behind it: healthy, takes every push as a no-op and has no changes. What the
+    Switchboard uses while no external adapter is configured, so nothing leaves the machine."""
 
     def health(self):
         return None
 
-    def push(self, decision, idempotency_key):
+    def push(self, operation, idempotency_key):
+        return {"external_id": operation.get("external_id")}
+
+    def lookup(self, key):
         return None
 
     def pull_changes(self, cursor):
@@ -4838,6 +4931,157 @@ def decision_external(engine):
     return getattr(engine, "external", None) or NULL_EXTERNAL
 
 
+# ---- external decision systems: OFF by default (external_decisions.enabled). The engine is decision_sync's; this
+# is the registry of adapters, the host that gives it audit and delivery, and the call at the end of a pass.
+
+EXTERNAL_ADAPTERS = {}
+
+
+def register_external_adapter(name, factory):
+    """Register an adapter under the name `external_decisions.adapter` selects: `factory(settings, mapping,
+    state_dir)` returns an ExternalDecisionAdapter. `mapping` is the parsed local mapping file."""
+    EXTERNAL_ADAPTERS[name] = factory
+    return factory
+
+
+class ExternalSyncHost(decision_sync.Host):
+    """What the sync engine needs of the Switchboard: the audit log, and the asker's own delivery paths."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def audit(self, event, subject, detail):
+        if self.engine.audit is not None:
+            self.engine.audit.append(self.engine.actor, event, subject, detail)
+
+    def _runner(self):
+        return self.engine.gh_runner or subprocess.run
+
+    def _boss(self, target):
+        discovery = self.engine.discovery or self.engine.discover(self.engine.now())
+        found = discovery.agents.get(target.get("agent")) if target.get("agent") else None
+        boss = _boss_of(found) if found is not None else None
+        if boss is None:
+            raise DecisionError("%s: there is no running agent to tell" % (target.get("display_id") or target.get("id")))
+        return boss
+
+    def deliver_answer(self, entry, intent):
+        engine, kind = self.engine, entry["kind"]
+        text = _one_line(intent.get("text") or "", 600)
+        role = (intent.get("answered_by") or "someone").replace("_", " ")
+        said = "Answered outside by the %s%s" % (role, ": " + text if text else " (option %s)" % intent.get("option_id"))
+        if kind == "report":
+            outcome = ReportSendDelivery(engine).deliver(entry, {"by": self._boss(entry), "to": entry["agent"],
+                                                                 "text": said, "ask": entry.get("ask"),
+                                                                 "repo": entry.get("repo")})
+            if not outcome.get("sent"):
+                raise DecisionError("the answer was not sent to %s (%s)" % (
+                    entry["agent"], outcome.get("reason") or outcome.get("action")))
+        elif kind == "issue" and entry.get("rows"):
+            rows = ["%s=%s" % (n, c) for n, c in sorted((intent.get("rows") or {}).items(), key=lambda kv: int(kv[0]))]
+            args = types.SimpleNamespace(as_recommended=not rows, row=rows, note=said)
+            answer_batch(engine, self._runner(), entry, args, engine.actor)
+        elif kind == "issue":
+            target = _issue_target(engine, entry)
+            if target is None or target[0] is None:
+                raise DecisionError("%s: cannot tell which repo its issue is in" % entry["id"])
+            IssueDelivery(engine, self._runner()).deliver(entry, {
+                "repo": target[0], "number": target[1], "add": (),
+                "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)],
+                "author": engine.actor, "comment": said})
+        elif kind == "question":
+            HarnessReplyDelivery(engine).deliver(entry, {"value": text or str(intent.get("option_id") or ""),
+                                                          "note": said, "by": engine.actor})
+        else:
+            raise DecisionError("%s is a %s: it is not answered from outside" % (entry["id"], kind))
+
+    def deliver_note(self, target, text):
+        outcome = ReportSendDelivery(self.engine).deliver(target, {
+            "by": self._boss(target), "to": target.get("agent"), "text": text, "ask": target.get("ask"),
+            "repo": target.get("repo")})
+        if not outcome.get("sent"):
+            raise DecisionError("the note was not sent to %s (%s)" % (
+                target.get("agent"), outcome.get("reason") or outcome.get("action")))
+
+
+def external_settings(config):
+    section = (config or {}).get("external_decisions") or {}
+    return section if section.get("enabled") else None
+
+
+def sync_for(engine):
+    """The sync engine of this daemon, built once; None while external decisions are off (nothing is called), or
+    (None, reason) is never returned: a build that fails is `engine.external_sync_error`, shown as a status."""
+    settings = external_settings(engine.config)
+    if settings is None or engine.state_dir is None:
+        return None
+    held = getattr(engine, "external_sync", None)
+    if held is not None:
+        return held
+    try:
+        factory = EXTERNAL_ADAPTERS.get(settings["adapter"])
+        if factory is None:
+            raise RuntimeError("no adapter named %r is registered" % settings["adapter"])
+        try:
+            mapping = json.loads(Path(settings["mapping_file"]).read_text())
+        except (OSError, ValueError) as err:
+            raise RuntimeError("the mapping file cannot be read: %s" % (getattr(err, "strerror", None) or err))
+        adapter = factory(settings, mapping, engine.state_dir)
+        engine.external_sync = decision_sync.SyncEngine(settings, engine.state_dir, adapter, ExternalSyncHost(engine),
+                                                       engine.now)
+        engine.external_sync_error = None
+    except Exception as err:
+        engine.external_sync_error = _one_line("%s" % err, 160)
+        return None
+    return engine.external_sync
+
+
+def sync_external(engine, decisions, errors, now):
+    """The end of a pass for a project that is switched on: mirror the list outward and take answers back. Returns
+    the error entries to show (the adapter down, an outbox past its alarm). Never raises and never changes `decisions`:
+    a down adapter cannot hide a local decision or stop local answering."""
+    if external_settings(engine.config) is None:
+        return []
+    found = []
+    try:
+        sync = sync_for(engine)
+        if sync is None:
+            reason = getattr(engine, "external_sync_error", None) or "no state directory"
+            _write_external_status(engine, {"state": "down", "reason": reason, "outbox": 0, "last_pull": None})
+            return [{"source": "external", "error": "external decision system is down: %s" % reason}]
+        status = sync.cycle(decisions, errors, getattr(engine, "decision_seeds", {}) or {})
+        if status["state"] == "down":
+            found.append({"source": "external", "error": "external decision system is down: %s" % status["reason"]})
+        if status.get("alarm"):
+            found.append({"source": "external", "error": "the outbox to the external decision system is past %d waiting "
+                          "operations (none is dropped)" % engine.config["external_decisions"]["outbox_alarm_depth"]})
+    except Exception as err:
+        found.append({"source": "external", "error": _one_line("external decisions: %s: %s" % (type(err).__name__, err), 200)})
+    return found
+
+
+def _write_external_status(engine, status):
+    try:
+        decision_sync._write_json(str(Path(engine.state_dir) / decision_sync.STATUS_FILE),
+                                  dict(status, written_at=engine.now()))
+    except OSError:
+        pass
+
+
+def external_status_line(config, state_dir, now):
+    """The one line `status` and `decisions` show: `external  ok; outbox N; last pull 12s ago`, or `down: why`. None
+    when external decisions are off (nothing is printed then)."""
+    if external_settings(config) is None:
+        return None
+    body = decision_sync._read_json(str(Path(state_dir) / decision_sync.STATUS_FILE))
+    if body is None:
+        return "external  waiting for the daemon's first pass"
+    pulled = body.get("last_pull")
+    text = "%s; outbox %s; last pull %s" % ("ok" if body.get("state") == "ok" else "down: %s" % body.get("reason"),
+                                            body.get("outbox", 0), "%s ago" % format_age(now - pulled) if pulled else "never")
+    return "external  " + text + ("; ALARM: outbox is deep" if body.get("alarm") else "")
+
+
 def publish_decisions(engine):
     """The end of a pass: derive the list and hand it to the store (decisions.json when it changed, else a touch, so
     its age says the daemon is alive). Returns True when written."""
@@ -4852,6 +5096,7 @@ def publish_decisions(engine):
         store.prune_escalated(engine.request_keys)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
+    errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
     return store.publish(decisions, errors, now)
 
 
@@ -5031,10 +5276,14 @@ def cmd_decisions(args, runner, now):
         return watch_decisions(state, now, clear=sys.stdout.isatty(), view=view)
     report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
+    external = external_status_line(config, state, now()) if config else None
     if args.json:
-        print(json.dumps(dict(shown, message=report["message"] or None, view=view), indent=2, sort_keys=True))
+        extra = {"external": external} if external is not None else {}
+        print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        if external is not None:
+            print("(%s)" % external)
     return EXIT_ERROR if report["stale"] else EXIT_OK
 
 
@@ -6960,6 +7209,9 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+        line = external_status_line(config, state, now()) if config_ok else None
+        if line is not None:   # only when external decisions are on: off prints nothing
+            report["external"] = {"line": line}
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
@@ -7044,6 +7296,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend("      " + report["external"]["line"] for _ in [0] if "external" in report)
     lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18
     lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
