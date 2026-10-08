@@ -2576,6 +2576,11 @@ def classify(jev, message, previous_message, current_ask, open_asks, min_confide
 # ---------------------------------------------------------- the policy judge's questions
 
 POLICY_THRESHOLD = 0.5
+# Issue 87: in a labelled sample of 100 shadow verdicts the model's probabilities were poorly calibrated: every
+# `outside_intent` that fired (0.50 to 0.87) and nearly every `speaks_for_you` and `outside_scope` below 0.9 was wrong, while
+# the right ones sat at 0.97. So these three fire at 0.9; `hard_to_reverse` keeps 0.5 (a missed destructive call costs more).
+# A configured `policy.thresholds` entry still wins, per question.
+POLICY_DEFAULT_THRESHOLDS = {"outside_intent": 0.9, "speaks_for_you": 0.9, "outside_scope": 0.9, "hard_to_reverse": POLICY_THRESHOLD}
 POLICY_OUTCOMES = ("allow", "ask", "deny", "hard-deny")  # least to most strict
 POLICY_QUESTIONS = {
     "outside_intent": ("Is this action beyond the ask's Intent and Done-when?",
@@ -9062,9 +9067,10 @@ POLICY_REQUEST_OUTCOMES = ("allow", "ask", "deny")       # what the plugin can c
 POLICY_DEFAULTS = {
     "enabled": False,       # off until the plugin is installed and a `jev` object is configured
     "budget_ms": 1500,      # the whole judgement; no answer in time keeps the configured outcome. Jev alone ran to ~1 s in the trial
-    "thresholds": {},       # question id -> probability at which it fires (default POLICY_THRESHOLD)
+    "thresholds": POLICY_DEFAULT_THRESHOLDS,  # question id -> probability at which it fires; a configured entry wins per question
     "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
     "cache_entries": 200,   # entries kept in each cache file
+    "routine_filter": True, # issue 87: a read or a local reversible step needs no model (routine_local); false asks the model about every call
     "shadow": False,        # record what the judge would do (audit policy.judge, `shadow`/`verdict`), enforce nothing
 }
 DEFAULTS["policy"] = None   # None means POLICY_DEFAULTS
@@ -9107,7 +9113,9 @@ def validate_policy_config(config, source):
     entries = settings["cache_entries"]
     if not (isinstance(entries, int) and not isinstance(entries, bool) and 1 <= entries <= 5000):
         raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
-    settings["thresholds"] = _checked_policy_thresholds(settings["thresholds"], source)
+    if not isinstance(settings["routine_filter"], bool):
+        raise ConfigError("%s: 'policy.routine_filter' must be true or false, got %r" % (source, settings["routine_filter"]))
+    settings["thresholds"] = dict(POLICY_DEFAULT_THRESHOLDS, **_checked_policy_thresholds(settings["thresholds"], source))
     if settings["enabled"] and not config.get("jev"):
         raise ConfigError("%s: 'policy.enabled' needs a 'jev' object: there is no decision model to ask" % source)
     config["policy"] = settings
@@ -9215,6 +9223,135 @@ def _plain_words(text):
     if word or any_word:
         words.append("".join(word))
     return words
+
+
+# ---- the routine-local pre-filter (issue 87). The judge compared every step of an agent to the ask's Done-when and
+# asked "outside the intent?" of a `git grep`, a test run or a label on its own PR: 77 of 80 would-deny/ask verdicts in a
+# labelled sample were wrong. A step that is plainly local and reversible, or a read, needs no model: the code answers
+# "nothing at its threshold" for it. It only ever REMOVES the judge's own extra strictness for a call it can read with
+# certainty; the configured outcome is combined as always (never loosened: invariant 9), and anything it is unsure of
+# (substitution, a glob, a heredoc, a path outside the worktree, an unknown command) goes to the model as before.
+_ROUTINE_READ = frozenset("""ls cat head tail wc grep egrep fgrep rg sort uniq cut tr echo printf date pwd true false test diff jq
+basename dirname which stat file sleep nl column realpath readlink""".split())
+_ROUTINE_GIT = frozenset("""status diff log show grep rev-parse rev-list ls-files ls-tree merge-base blame cat-file hash-object
+commit-tree add commit stash fetch describe name-rev shortlog show-ref diff-tree check-ignore symbolic-ref""".split())
+_ROUTINE_GIT_FLAGS_REFUSED = re.compile(r"^(?:-[CcdDf]|--(?:git-dir|work-tree|delete|force|hard))$")  # redirects git, deletes, forces
+_ROUTINE_GH_READ = {"pr": ("view", "list", "diff", "checks", "status"), "issue": ("view", "list", "status"),
+                    "run": ("view", "list"), "release": ("view", "list"), "repo": ("view",), "workflow": ("view", "list")}
+_ROUTINE_GH_API_WRITE = re.compile(r"^(?:-X|-f|-F|--(?:method|field|raw-field|input))")  # a gh api call that is not a plain GET
+_ROUTINE_SB = frozenset(("report", "intent", "intents", "status", "pending", "remind"))
+_ROUTINE_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\||\n)\s*")
+_ROUTINE_NOISE = re.compile(r"\s*(?:[12]?>\s*/dev/null|2>&1|&>\s*/dev/null)(?=\s|$)")
+
+
+def _routine_split(text):
+    """The segments of a command line at `;` `&&` `||` `|` and newlines outside quotes, or None for an unbalanced quote."""
+    segments, current, quote = [], [], None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            current.append(ch)
+        elif ch == ";" or ch == "\n" or ch == "|" or (ch == "&" and text[i + 1:i + 2] == "&"):
+            segments.append("".join(current))
+            current = []
+            if ch in "|&" and text[i + 1:i + 2] == ch:
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    if quote:
+        return None
+    segments.append("".join(current))
+    return [x.strip() for x in segments if x.strip()]
+
+
+def _routine_path_ok(word):
+    """A path argument that stays inside the worktree or the temp directory: relative with no `..`, or under /tmp."""
+    if word in ("/dev/null", "-"):
+        return True
+    if word.startswith("/tmp/") or word.startswith("/private/tmp/"):
+        return ".." not in word.split("/")
+    return not word.startswith(("/", "~")) and ".." not in word.split("/")
+
+
+def _routine_segment(words):
+    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+        words = words[1:]  # FOO=bar cmd
+    while words and words[0] in ("nice", "timeout", "time", "command"):
+        wrapper, words = words[0], words[1:]
+        while words and (words[0].startswith("-") or (wrapper == "timeout" and re.match(r"^[0-9.]+[smhd]?$", words[0]))
+                         or (wrapper == "nice" and re.match(r"^[0-9]+$", words[0]))):
+            words = words[1:]
+    if not words:
+        return False
+    head, rest = os.path.basename(words[0]), words[1:]
+    if head in _ROUTINE_READ:
+        return True
+    if head == "cd":
+        return len(rest) <= 1 and all(_routine_path_ok(w) for w in rest)
+    if head == "find":
+        return not any(w in ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls") for w in rest)
+    if head == "sed":
+        scripts = [w for w in rest if not w.startswith("-")]
+        if any(re.search(r"/[a-zA-Z]*e[a-zA-Z]*$", w) for w in scripts):
+            return False
+        in_place = any(w == "-i" or w.startswith("-i") or w == "--in-place" for w in rest)
+        return not in_place or (len(scripts) >= 2 and _routine_path_ok(scripts[-1]) and not any(w.startswith("/") for w in scripts[:-1]))
+    if head in ("cp", "mv", "mkdir", "touch"):
+        return all(w.startswith("-") or _routine_path_ok(w) for w in rest)
+    if head == "rm":
+        return all(re.match(r"^-[fv]+$", w) or (not w.startswith("-") and (w.startswith("/tmp/") or w.startswith("/private/tmp/")) and _routine_path_ok(w)) for w in rest)
+    if head == "git":
+        if not rest or any(_ROUTINE_GIT_FLAGS_REFUSED.match(w) for w in rest) or rest[0].startswith("-"):
+            return False
+        if rest[0] == "branch":
+            return all(w in ("--list", "-a", "-r", "-v", "-vv", "--show-current", "--contains") or not w.startswith("-") for w in rest[1:]) and "-m" not in rest and "-M" not in rest
+        if rest[0] in ("config",):
+            return len(rest) > 1 and rest[1] in ("--get", "--list", "-l", "--get-all")
+        if rest[0] == "remote":
+            return rest[1:] in ([], ["-v"])
+        return rest[0] in _ROUTINE_GIT and not (rest[0] == "stash" and any(w in ("drop", "clear") for w in rest))
+    if head == "gh":
+        if len(rest) >= 2 and rest[0] in _ROUTINE_GH_READ and rest[1] in _ROUTINE_GH_READ[rest[0]]:
+            return True
+        if len(rest) >= 2 and rest[0] == "pr" and rest[1] == "edit":  # labelling its own work: flags --add-label / --remove-label only
+            flags = [w for w in rest[2:] if w.startswith("-")]
+            return bool(flags) and all(f in ("--add-label", "--remove-label") for f in flags)
+        if rest[:1] == ["api"]:
+            return not any(_ROUTINE_GH_API_WRITE.match(w) for w in rest[1:])
+        return rest[:2] == ["auth", "status"]
+    if head == PROG:
+        return bool(rest) and rest[0] in _ROUTINE_SB
+    if head == "node":
+        return rest[:1] in (["--test"], ["--check"]) and all(w.startswith("-") or _routine_path_ok(w) for w in rest[1:])
+    if head in ("python3", "python"):
+        if rest[:2] == ["-m", "pytest"] or rest[:2] == ["-m", "unittest"] or rest[:2] == ["-m", "py_compile"]:
+            return True
+        return len(rest) >= 1 and re.match(r"^(\./)?bin/test-[A-Za-z0-9_-]+$", rest[0]) is not None
+    if head in ("npm", "pnpm", "yarn"):
+        return rest[:1] == ["test"] or rest[:2] == ["run", "test"]
+    return False
+
+
+def routine_local(text):
+    """True only for a shell command every segment of which is a read, or a local reversible step inside the worktree
+    (a test run, a git add/commit, a label on its own PR, a report to its boss). False for anything this is unsure about."""
+    if not isinstance(text, str) or not text.strip() or len(text) > POLICY_ARG_LIMIT or "\x00" in text:
+        return False
+    segments = _routine_split(_ROUTINE_NOISE.sub("", text))
+    if not segments:
+        return False
+    for segment in segments:
+        words = _plain_words(segment)  # no substitution, no redirect, no glob, no heredoc, no unbalanced quote
+        if not words or not _routine_segment(words):
+            return False
+    return True
 
 
 def _decisions_subcommand(rest):
@@ -9765,6 +9902,8 @@ class PolicyJudge:
         context = self.context_of(fleet)
         box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
         request = dict(request, arguments=self.redacted(request["arguments"]))  # from here on, nothing sees a credential
+        routine = (request["tool"] == "shell" and self.settings["routine_filter"]
+                   and routine_local(request["arguments"]))
         if request["tool"] == "shell":  # PR 18: the judge's question sees what `decisions answer|resolve` acts on
             request["arguments"] += decision_gloss(self.verdicts.path.parent, request["arguments"])
         key = policy_verdict_key(request, fleet["name"], context, fleet.get("role"))
@@ -9788,6 +9927,12 @@ class PolicyJudge:
                     "not grant itself authority. Standing orders are the owner's, recorded by the Chief of Staff "
                     "(%s)." % (guarded, _what_text(request)), 600)
             return reply
+        if routine:  # issue 87: a read or a local reversible step: no model, "nothing at its threshold"
+            answers = dict.fromkeys(POLICY_QUESTIONS, 0.0)
+            combined = combine_policy(answers, thresholds, request["configured"])
+            combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+            box["detail"].update(combined=combined, cached=False, thresholds=thresholds, guard="routine-local")
+            return self.reply_of(combined, False, fleet, context, request)
         cached = _valid_answers(self.verdicts.get(key))
         if cached is not None:
             combined = combine_policy(cached, thresholds, request["configured"])

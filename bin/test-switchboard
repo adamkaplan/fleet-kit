@@ -7654,6 +7654,9 @@ import datetime  # noqa: E402  (this section's only import)
 
 FAKE_GH = "/fake/bin/gh"
 FAKE_REPO = "acme/fleet"
+# The judge tests were written for a judge that fires at 0.5 on every call; the defaults of issue 87 (the routine pre-filter, 0.9 for
+# three questions) are tested in TestJudgeAccuracy. These fixtures keep the earlier behaviour so those tests still say what they said.
+LEGACY_POLICY = {"routine_filter": False, "thresholds": {q: 0.5 for q in ("outside_intent", "hard_to_reverse", "speaks_for_you", "outside_scope")}}
 ISSUES_API = "repos/%s/issues/" % FAKE_REPO
 
 
@@ -10198,7 +10201,7 @@ class PolicyCountingJev:
 def policy_raw_config(**policy):
     """A validated config with the judge on, answering from the replay file."""
     return sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH,
-                               "intent_repo": FAKE_REPO, "policy": dict({"enabled": True}, **policy),
+                               "intent_repo": FAKE_REPO, "policy": {**LEGACY_POLICY, "enabled": True, **policy},
                                "jev": {"replay": str(POLICY_REPLAY)}})
 
 
@@ -10288,7 +10291,7 @@ EXPECT_EXAMPLES["policy_outcome"] = {"agent": "coder", "step": 0, "outcome": "as
 class TestPolicyConfig(Base):
     def test_off_by_default_with_documented_defaults(self):
         policy = sb.validate_config({})["policy"]
-        self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": {}, "cache_seconds": 300,
+        self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": sb.POLICY_DEFAULT_THRESHOLDS, "routine_filter": True, "cache_seconds": 300,
                                   "cache_entries": 200, "shadow": False})
 
     def check_rejected(self, policy, fragment, **extra):
@@ -10318,7 +10321,7 @@ class TestPolicyConfig(Base):
         self.check_rejected({"enabled": True}, "needs a 'jev' object")
         config = sb.validate_config({"policy": {"enabled": True, "budget_ms": 400, "thresholds": {"outside_scope": 0.8}},
                                      "jev": {}})
-        self.assertEqual((config["policy"]["budget_ms"], config["policy"]["thresholds"]), (400, {"outside_scope": 0.8}))
+        self.assertEqual((config["policy"]["budget_ms"], config["policy"]["thresholds"]), (400, dict(sb.POLICY_DEFAULT_THRESHOLDS, outside_scope=0.8)))
 
     def test_the_fault_exists_and_works_only_in_the_lab(self):
         self.assertIn("no-policy-judge", sb.KNOWN_FAULTS)
@@ -10507,7 +10510,7 @@ class PolicyCase(IntentCase):
     def configure(self, rules=None, **policy):
         replay = policy_replay_file(self.home, rules or [{"noul": LOW}])
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
-                           "jev": {"replay": replay}, "policy": dict({"enabled": True}, **policy)})
+                           "jev": {"replay": replay}, "policy": {**LEGACY_POLICY, "enabled": True, **policy}})
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH:
@@ -10531,6 +10534,99 @@ class PolicyCase(IntentCase):
         config = policy_raw_config(**policy)
         return sb.PolicyJudge(config, self.world.engine.v2, self.reader, jev, sb.AuditLog(self.world.audit_path),
                               self.world.state, self.world.clock.now)
+
+
+class TestRoutineLocal(unittest.TestCase):
+    """Issue 87: the pre-filter that says a command is a read or a local reversible step, and nothing else."""
+
+    ROUTINE = [
+        "git grep -n foo", "git status", "git rev-parse HEAD", "git diff origin/main --stat | head -5", "git add -A && git commit -m 'x'",
+        "git log --oneline -5; git status", "grep -n foo src/a.py | head", "ls -la bin", "cat docs/a.md", "sleep 20",
+        "node --test tests/a.test.mjs", "nice -n 10 python3 bin/test-switchboard TestX", "env FOO=1 true" if False else "FOO=1 ls",
+        "timeout 100 node --test tests/a.test.mjs 2>&1 | tail -3", "gh pr view 12 --json state", "gh pr list --state open", "gh issue view 9",
+        "gh pr edit 12 --add-label wip:x", "gh api repos/a/b/pulls/3", "fleet-switchboard report done --issue 9 \"built\"",
+        "sed -n '1,5p' file.txt", "sed -i '' 's/a/b/' src/a.py", "cp a.txt b.txt", "mkdir -p out/x", "cd bin && ls", "rm -f /tmp/x.log",
+        "git fetch origin 2>&1", "python3 -m pytest tests", "cat a.txt > /dev/null",
+    ]
+    NOT_ROUTINE = [
+        "", "   ", "git push origin main", "git push --force", "git reset --hard HEAD~1", "git clean -fd", "git checkout -- .", "git rebase main",
+        "git branch -D x", "git -C /etc status", "git -c core.pager=sh status", "git stash drop", "git status; git push",
+        "rm -rf build", "rm -rf /tmp/x", "rm /etc/hosts", "rm -f ../x", "mv a /etc/b", "cp a ~/b", "cp a ../b", "mkdir /usr/x",
+        "curl http://x", "wget http://x", "ssh host ls", "docker rm x", "docker compose up", "npm publish", "npx foo",
+        "python3 evil.py", "python3 - <<'EOF'\nprint(1)\nEOF", "python3 -c 'import os'", "node script.js", "bash -c 'ls'", "sh x.sh", "eval ls",
+        "ls $(whoami)", "ls `id`", "echo $HOME", "ls *", "ls ~", "cat <(ls)", "ls > out.txt", "cat a >> b", "tee x", "xargs rm", "ls &", "ls & rm x",
+        "find . -delete", "find . -exec rm {} ;", "find . -ok rm {} ;", "sed -i '' 's/a/b/' /etc/x", "sed 's/a/b/e' x", "gh pr merge 3", "gh pr comment 3 --body x",
+        "gh pr edit 3 --title x", "gh api -X POST repos/a/b", "gh api repos/a/b -f x=1", "gh api repos/a/b --method DELETE", "gh issue create", "gh release create",
+        "fleet-switchboard launch x", "fleet-switchboard decisions answer 1 yes", "fleet-switchboard orders", "git status 'unbalanced", "ls \"unbalanced",
+        "gh pr view 1 && git push", "git log | sh", "cat a | bash", "echo x | tee y", "cd /etc", "cd ..", "nice -n 10 rm -rf x", "timeout 5 curl x", "FOO=1 curl x",
+        "git config user.email x", "git remote add o url", "git tag v1", "git commit-tree" + " $(x)", "ls\x00", "a" * 5000,
+    ]
+
+    def test_reads_and_local_reversible_steps_are_routine(self):
+        for command in self.ROUTINE:
+            with self.subTest(command=command):
+                self.assertTrue(sb.routine_local(command), command)
+
+    def test_anything_that_acts_outside_or_cannot_be_read_with_certainty_is_not(self):
+        for command in self.NOT_ROUTINE:
+            with self.subTest(command=command):
+                self.assertFalse(sb.routine_local(command), command)
+        for odd in (None, 5, [], {}, b"ls"):
+            self.assertFalse(sb.routine_local(odd))
+
+    def test_the_defaults_and_the_setting(self):
+        self.assertEqual(sb.POLICY_DEFAULT_THRESHOLDS, {"outside_intent": 0.9, "speaks_for_you": 0.9, "outside_scope": 0.9, "hard_to_reverse": 0.5})
+        self.assertEqual(sb.validate_config({"jev": {}, "policy": {}})["policy"]["thresholds"], sb.POLICY_DEFAULT_THRESHOLDS)
+        got = sb.validate_config({"jev": {}, "policy": {"thresholds": {"outside_intent": 0.5}}})["policy"]
+        self.assertEqual((got["thresholds"]["outside_intent"], got["thresholds"]["speaks_for_you"], got["routine_filter"]), (0.5, 0.9, True))
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"jev": {}, "policy": {"routine_filter": bad}})
+        self.assertEqual(sb.combine_policy({"outside_intent": 0.6}, None, "allow")["outcome"], "hard-deny", "the library default is unchanged")
+
+
+class TestJudgeAccuracy(PolicyCase):
+    """Issue 87: the judge that was wrong on 77 of 80 would-deny/ask verdicts in a labelled sample."""
+
+    HIGH_INTENT = [{"noul": dict(LOW, outside_intent=0.8, speaks_for_you=0.8)}]
+
+    def new_defaults(self):
+        self.configure(self.HIGH_INTENT, routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+
+    def test_a_routine_command_is_not_judged_and_the_audit_says_why(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "git grep -n foo | head", "allow")
+        self.assertEqual((reply["outcome"], reply["judged"]), ("allow", True))
+        (event,) = self.audit_events()
+        self.assertEqual((event["detail"]["model"], event["detail"]["usage"]), (None, {}))  # no model was asked
+        self.assertEqual(event["detail"]["fired"], [])
+
+    def test_the_same_scores_on_a_command_that_is_not_routine_are_below_the_new_defaults(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "python3 - <<'EOF'\nprint(1)\nEOF", "allow")
+        self.assertEqual(reply["outcome"], "allow", "0.8 on outside_intent and speaks_for_you no longer fires at 0.9")
+        self.configure([{"noul": dict(LOW, outside_intent=0.95)}], thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        reply = self.judge_tool(self.coder, "shell", "python3 evil.py", "allow")
+        self.assertEqual(reply["outcome"], "deny", "a confident outside_intent still hard-denies")
+
+    def test_a_configured_ask_or_deny_is_never_loosened_by_the_filter_or_the_thresholds(self):
+        self.new_defaults()
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "ask")["outcome"], "ask")
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "deny")["outcome"], "deny")
+        self.assertEqual(self.judge_tool(self.coder, "shell", "python3 evil.py", "ask")["outcome"], "ask")
+
+    def test_hard_to_reverse_keeps_its_threshold_and_the_filter_can_be_switched_off(self):
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "python3 evil.py", "allow")["outcome"], "ask")
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=False, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "allow")["outcome"], "ask", "off: the model is asked about everything")
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "allow")["outcome"], "allow", "on: a read is not asked")
+
+    def test_the_rules_that_need_no_model_still_come_first(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "gh repo create acme/x", "allow")
+        self.assertEqual(reply["outcome"], "ask", "the commissioning rule is not a routine step")
 
 
 class TestJudgeTool(PolicyCase):
@@ -10976,7 +11072,7 @@ class TestJudgeToolRequestHandling(PolicyCase):
         self.assertIn("RuntimeError", reply["reason"])
 
     def test_without_an_opencode_binary_the_judge_cannot_identify_and_says_so(self):
-        self.write_config({"herdr": FAKE_HERDR, "intent_repo": FAKE_REPO, "gh": FAKE_GH, "policy": {"enabled": True},
+        self.write_config({"herdr": FAKE_HERDR, "intent_repo": FAKE_REPO, "gh": FAKE_GH, "policy": {**LEGACY_POLICY, "enabled": True},
                            "jev": {"replay": policy_replay_file(self.home, [{"noul": LOW}])}})
         reply = self.judge_tool(self.coder, "shell", "x", "ask")
         self.assertEqual((reply["outcome"], reply["judged"]), ("ask", False))
@@ -11282,7 +11378,7 @@ class TestPolicyReport(PolicyCase):
             self.assertIn(fragment, text)
 
     def config_of(self, **policy):
-        return sb.validate_config({"jev": {}, "policy": dict({"enabled": True}, **policy)})
+        return sb.validate_config({"jev": {}, "policy": {**LEGACY_POLICY, "enabled": True, **policy}})
 
     def test_working_agents_and_a_silent_judge_alarm(self):
         result = sb.policy_liveness(self.config_of(), self.world.state, 2, self.now)
@@ -20141,7 +20237,7 @@ class TestOrdersDelivery(OrdersDeliveryCase):
     def test_it_reuses_the_judges_warmed_read_of_the_charter(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
                            "jev": {"replay": policy_replay_file(self.home, [{"noul": LOW}])},
-                           "policy": {"enabled": True}})
+                           "policy": {**LEGACY_POLICY, "enabled": True}})
         self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
         self.world.engine = self.world.new_engine()
         judge = sb.PolicyJudge(self.world.config, self.world.engine.v2, sb.IntentReader(
@@ -25901,7 +25997,7 @@ class ExternalWorld(BaselineWorld):
         else:
             path.write_text(orders)
         self.set_judge()
-        self.set_config(external_decisions=section, policy={"enabled": True}, jev={"replay": str(self.home / "judge.json")},
+        self.set_config(external_decisions=section, policy={**LEGACY_POLICY, "enabled": True}, jev={"replay": str(self.home / "judge.json")},
                         cos_orders_file=str(path))
 
     def run_pass(self, seconds=5):

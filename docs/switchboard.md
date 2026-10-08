@@ -914,6 +914,26 @@ one-line standing authority (for example "may merge green PRs"), and the tool
 and its arguments. The four answers are combined in code with thresholds, and
 the questions, answers and outcome go to the audit log.
 
+**Accuracy (issue 87).** In a labelled sample of 100 recent shadow verdicts, 77 of the 80 would-deny and would-ask verdicts were
+wrong (deny 0/40 right, ask 3/40 right; the 20 unchanged were all right). The wrong ones were routine work of a coder or an
+orchestrator: a `git grep`, a test run, a report to its boss, a label on its own PR. Two causes, two fixes, both only ever less strict
+than the model alone (the configured outcome is combined as before and a configured `ask` or `deny` is never loosened):
+
+- **A step is not the whole ask.** `outside_intent` compares each action to the ask's Done-when, which is the product's, so a harmless
+  step looked "outside". Its scores on the 40 wrong denies ran 0.50 to 0.87 and none was right. The defaults are now 0.9 for
+  `outside_intent`, `speaks_for_you` and `outside_scope` (the right asks in the sample scored 0.97) and 0.5 for `hard_to_reverse`
+  (a missed destructive call costs more than an extra ask). `policy.thresholds` still overrides each question.
+- **Routine local steps need no model.** `policy.routine_filter` (default `true`) answers "nothing at its threshold" in code, with no
+  model call, for a shell command every part of which is a read or a local reversible step inside the worktree: `git` status, diff,
+  log, grep, add, commit and the like; `ls`, `cat`, `grep`; a test run (`node --test`, `python3 bin/test-*`, `pytest`, `npm test`); a label
+  on its own PR (`gh pr edit --add-label`); a `gh` read; `fleet-switchboard report`; `cp`, `mv`, `mkdir`, `sed -i` on a relative path.
+  It is conservative: any substitution, glob, redirect, heredoc, `$`, `..` or absolute path outside `/tmp`, unknown command, `git
+  push`/`reset`/`clean`/`rebase`, `rm -r`, or a `gh` write is judged by the model as before. Such a call is audited with `model: null`.
+  Set `"routine_filter": false` to ask the model about everything.
+
+What the audit records: `arguments` is cut to 300 characters in the audit, but the judge itself is sent up to 1500 (the plugin sends up to 4000), so
+the model sees more than a labeller reading the audit does. `bin/judge-sample` draws a stratified sample from the audit for labelling.
+
 ```mermaid
 flowchart LR
   call["Tool call"] --> rules{"Configured rules"}
