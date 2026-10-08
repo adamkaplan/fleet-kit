@@ -251,7 +251,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -299,6 +299,7 @@ def validate_config(raw, source="config"):
     validate_report_triage_config(config, source)  # PR 13
     validate_decisions_config(config, source)  # PR 14
     validate_external_config(config, source)
+    validate_friction_config(config, source)
     return config
 
 
@@ -1094,7 +1095,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts()]
+            ForegroundFacts(), OrdersFacts(), FrictionWakeFacts(state_dir)]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -5584,6 +5585,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("reminders", "reminders", err, report)
     try:
+        friction_mark(engine, discovery)
+    except Exception as err:
+        engine._failed("friction-wake", "friction-wake", err, report)
+    try:
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
@@ -5592,6 +5597,157 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
     schedule_judge_warm(engine, discovery)
+
+
+# ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`; like
+# `external_decisions` the key is absent from DEFAULTS, so a config that never names it is exactly what it was.
+
+FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or your coders down in the last day? "
+                 "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
+                 "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
+                 "If nothing, do nothing and say nothing.")
+FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
+FRICTION_STATE = "friction-wake.json"
+FRICTION_LOCK = "friction-wake.lock"
+
+
+def validate_friction_config(config, source):
+    """`friction_wake`: absent or null is off. `hour` is 0-23 in the daemon's local time, or null for every 24 h
+    from the first wake; `to` is the agent a proposal goes to; `text` null is the default text."""
+    if "friction_wake" not in config:
+        return
+    raw = config["friction_wake"]
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'friction_wake' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(FRICTION_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'friction_wake' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+    section = dict(FRICTION_DEFAULTS, **raw)
+    where = "%s: 'friction_wake" % source
+    if not isinstance(section["enabled"], bool):
+        raise ConfigError("%s.enabled' must be true or false, got %r" % (where, section["enabled"]))
+    hour = section["hour"]
+    if hour is not None and (not isinstance(hour, int) or isinstance(hour, bool) or not 0 <= hour <= 23):
+        raise ConfigError("%s.hour' must be a whole hour 0-23 (the daemon's local time), or null for every 24 h "
+                          "from the first wake, got %r" % (where, hour))
+    if not isinstance(section["to"], str) or not NAME_RE.match(section["to"]):
+        raise ConfigError("%s.to' must be a fleet agent name, got %r" % (where, section["to"]))
+    text = section["text"]
+    if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > 1000):
+        raise ConfigError("%s.text' must be a non-empty string of at most 1000 characters, or null, got %r"
+                          % (where, text))
+    config["friction_wake"] = section
+
+
+def friction_slot(now, hour, anchor):
+    """The start (epoch seconds) of the newest wake slot at or before `now`: the last `hour`:00 in the daemon's
+    local time, or, with no hour, the newest 24 h step from `anchor`."""
+    if hour is None:
+        return anchor + int((now - anchor) // 86400) * 86400
+    moment = datetime.fromtimestamp(now).replace(hour=hour, minute=0, second=0, microsecond=0)
+    if moment.timestamp() > now:
+        moment = datetime.fromtimestamp(now - 86400).replace(hour=hour, minute=0, second=0, microsecond=0)
+    return moment.timestamp()
+
+
+def read_friction_state(state_dir):
+    """{name: {"anchor", "done"}}. Disposable: a file that is missing or unreadable is an empty one."""
+    try:
+        raw = json.loads((Path(state_dir) / FRICTION_STATE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+
+def write_friction_state(state_dir, found):
+    path = Path(state_dir) / FRICTION_STATE
+    temp = path.with_name("%s.%d.tmp" % (FRICTION_STATE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(found, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(str(temp), str(path))
+
+
+class FrictionWakeFacts:
+    """`friction:<name>:<slot>` facts: one short wake per running orchestrator per slot (day), by the ordinary
+    delivery rule. Nothing is read or written unless the section is enabled; and an orchestrator that is not
+    due costs one small file read per pass. An orchestrator a person has engaged with, or that is blocked or
+    held, gets none this slot (the next slot asks again). `friction_mark` records a delivered wake."""
+
+    __name__ = "friction_wake_facts"
+
+    def __init__(self, state_dir):
+        self.state_dir, self.engine = Path(state_dir), None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def section(self):
+        found = (self.engine.config.get("friction_wake") if self.engine else None) or {}
+        return found if found.get("enabled") else None
+
+    def due(self):
+        """[(name, slot)] for the orchestrators to wake now."""
+        section, discovery = self.section(), self.engine.discovery if self.engine else None
+        if section is None or discovery is None:
+            return []
+        now, state, found, changed = self.engine.now(), read_friction_state(self.state_dir), [], False
+        for name, seen in sorted(discovery.agents.items()):
+            if (seen.fleet or {}).get("role") != "orchestrator" or name == section["to"]:
+                continue
+            mine = state.get(name, {})
+            anchor = mine.get("anchor") if _is_number(mine.get("anchor")) else None
+            if section["hour"] is None and anchor is None:
+                anchor, changed = int(now), True
+                state[name] = dict(mine, anchor=anchor)
+            slot = friction_slot(now, section["hour"], anchor)
+            if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0):
+                continue
+            if hold_reason(seen) or seen.engaged(now, self.engine.engaged_seconds):
+                continue
+            found.append((name, slot))
+        if changed:
+            try:
+                write_friction_state(self.state_dir, state)
+            except OSError:
+                pass
+        return found
+
+    def __call__(self):
+        section = self.section()
+        if section is None:
+            return []
+        text = section["text"] or FRICTION_TEXT % {"to": section["to"]}
+        return [Fact("friction:%s:%d" % (name, slot), name, "reminder", text, slot, batch=False, sender=None)
+                for name, slot in self.due()]
+
+
+def friction_mark(engine, discovery):
+    """Record the wakes that reached their orchestrator (their key is in its transcript or inbox)."""
+    source = next((s for s in engine.sources if isinstance(s, FrictionWakeFacts)), None)
+    if source is None:
+        return []
+    marked, state = [], read_friction_state(source.state_dir)
+    for name, slot in source.due():
+        observation = discovery.agents.get(name)
+        if observation is None:
+            continue
+        try:
+            keys, _ = engine.delivered_keys(observation.session_id, slot - SINCE_SLACK)
+        except V2Error:
+            continue
+        if "friction:%s:%d" % (name, slot) in keys:
+            state[name] = dict(state.get(name, {}), done=slot)
+            marked.append((name, slot))
+    if marked:
+        write_friction_state(source.state_dir, state)
+        for name, slot in marked:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "friction.wake", name, {"slot": iso(slot)})
+    return marked
 
 
 # ---- reminders
@@ -5641,6 +5797,8 @@ def read_reminders(state_dir):
         if not (isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("to"), str)
                 and _is_number(item.get("at")) and isinstance(item.get("text"), str)):
             raise ReminderError("%s has a reminder without id, to, at and text: %r" % (path, item))
+        if item.get("condition") is not None and not isinstance(item["condition"], dict):
+            raise ReminderError("%s has a reminder whose condition is not an object: %r" % (path, item))
     return items
 
 
@@ -5664,7 +5822,7 @@ def write_reminders(state_dir, items):
         raise
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None):
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -5673,6 +5831,8 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
             "text": text, "issue": issue, "from": sender}
     if repo:
         item["repo"] = repo  # PR 15: the repo `issue` is in
+    if condition:
+        item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
     with reminders_lock(state_dir):
         write_reminders(state_dir, read_reminders(state_dir) + [item])
     return item
@@ -5708,10 +5868,49 @@ class ReminderFacts:
         now = self.engine.now() if self.engine else time.time()
         return [item for item in read_reminders(self.state_dir) if item["at"] <= now]
 
+    def verdict(self, item):
+        """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
+        One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
+        condition, discovery = item["condition"], self.engine.discovery if self.engine else None
+        if discovery is None:
+            return None
+        worker = condition.get("unless_report_from") or condition.get("while_running")
+        if isinstance(worker, str) and worker not in discovery.agents:
+            return "%s is gone" % worker if not discovery.problems else None
+        if not isinstance(condition.get("unless_report_from"), str):
+            return "deliver"
+        boss, since = discovery.agents.get(item["to"]), condition.get("since", 0)
+        if boss is None:
+            return None
+        try:
+            lines = synthetic_lines(self.engine, boss.session_id, since, waiting=True)
+            riders = read_report_riders(self.state_dir)
+        except (V2Error, ReminderError):
+            return None
+        for _, _, _, line in lines:
+            match = REPORT_LINE.match(line) or SEND_LINE.match(line)
+            if match and match.group(1) == worker:
+                return "%s reported to %s since the launch" % (worker, item["to"])
+        if any(r.get("from") == worker and r["to"] == item["to"] and r["created"] >= since for r in riders):
+            return "%s reported to %s since the launch" % (worker, item["to"])
+        return "deliver"
+
     def __call__(self):
-        return [Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
-                     issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo"))
-                for item in self.due()]
+        facts = []
+        for item in self.due():
+            if item.get("condition"):
+                found = self.verdict(item)
+                if found is None:
+                    continue
+                if found != "deliver":
+                    gone = remove_reminders(self.state_dir, {item["id"]})
+                    if gone and self.engine is not None and self.engine.audit is not None:
+                        self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
+                                                 {"id": item["id"], "why": found})
+                    continue
+            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
+                              issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+        return facts
 
 
 def prune_delivered_reminders(engine, discovery):
@@ -5736,6 +5935,76 @@ def prune_delivered_reminders(engine, discovery):
     if gone and engine.audit is not None:
         engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
     return gone
+
+
+# ---- checkpoint reminders: a launch sets them from the brief's CHECKPOINT (docs/switchboard.md, "Self-wakes")
+
+CHECKPOINT_WORKER_TEXT = "checkpoint due: report now, one line"
+CHECKPOINT_OVERDUE_TEXT = "%s has not reported since launch: overdue checkpoint"
+_CP_UNIT = r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])?"
+_CP_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def _cp_seconds(number, unit, default):
+    unit = (unit or default or "")[:1].lower()
+    return int(number) * _CP_UNITS[unit] if unit in _CP_UNITS else None
+
+
+def parse_checkpoint(brief):
+    """(checkpoint seconds, overdue seconds) from the brief's CHECKPOINT line, or None. Best effort and never an
+    error: 'Report at 30 minutes ...; overdue at 60', 'in 20m, overdue 45m'. A bare overdue number takes the
+    unit of the checkpoint; no unit anywhere, a missing part, or an overdue that is not later = None."""
+    line = next((l for l in (brief or "").splitlines() if re.match(r"\s*CHECKPOINT\s*:", l, re.I)), None)
+    if line is None:
+        return None
+    over = re.search(r"\boverdue(?:\s+(?:at|after|in|by))?\s+(\d+)\s*" + _CP_UNIT + r"\b", line, re.I)
+    if over is None:
+        return None
+    head = line[:over.start()]
+    first = re.search(r"\b(?:at|in|after|within)\s+(\d+)\s*" + _CP_UNIT + r"\b", head, re.I)
+    if first is None:
+        return None
+    checkpoint = _cp_seconds(first.group(1), first.group(2), over.group(2))
+    overdue = _cp_seconds(over.group(1), over.group(2), first.group(2))
+    if checkpoint is None or overdue is None or checkpoint <= 0 or overdue <= checkpoint:
+        return None
+    return checkpoint, overdue
+
+
+def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, checkpoint, overdue, launched, moment):
+    """Make the launch's two reminders. `checkpoint`/`overdue` are --checkpoint/--overdue (delays or ISO times) or
+    None; with neither, the brief's CHECKPOINT line is parsed. Returns one line for the launch output, or None.
+    Never raises: the worker is already running."""
+    try:
+        notes = []
+        if checkpoint is None and overdue is None:
+            parsed = parse_checkpoint(brief)
+            if parsed is None:
+                return ("no checkpoint reminders: no --checkpoint/--overdue and the brief's CHECKPOINT line could "
+                        "not be read as 'at <N> minutes ... overdue at <M>'")
+            checkpoint, overdue = ("%ds" % parsed[0], "%ds" % parsed[1])
+        made = []
+        if checkpoint is not None:
+            at = parse_when(checkpoint, moment)
+            item = add_reminder(state, name, at, moment, CHECKPOINT_WORKER_TEXT, issue, boss, repo,
+                                condition={"while_running": name})
+            made.append(("worker", item))
+        if overdue is not None:
+            if not boss:
+                notes.append("no overdue reminder: the launch names no --reports-to")
+            else:
+                at = parse_when(overdue, moment)
+                item = add_reminder(state, boss, at, moment, CHECKPOINT_OVERDUE_TEXT % name, issue, name, repo,
+                                    condition={"unless_report_from": name, "since": launched})
+                made.append(("overdue", item))
+        for which, item in made:
+            engine.audit.append("cli", "reminder.add", item["to"], {"id": item["id"], "at": iso(item["at"]),
+                                                                   "from": item.get("from"), "issue": issue,
+                                                                   "repo": repo, "for": "checkpoint-" + which})
+        notes[:0] = ["%s reminder at %s" % (which, iso(item["at"])) for which, item in made]
+        return "checkpoint reminders: " + "; ".join(notes) if notes else None
+    except (ReminderError, OSError) as err:
+        return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
 def cmd_remind(args, runner, now):
@@ -7658,7 +7927,7 @@ def read_brief(path, stdin):
 
 def cmd_launch(args, runner, now, socket_call=None):
     workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
-    engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     if args.resume:
         done = resume_agent(engine, args.name, args.resume, workspace)
         print(json.dumps(done, sort_keys=True))
@@ -7667,6 +7936,7 @@ def cmd_launch(args, runner, now, socket_call=None):
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
     repo = launch_repo(args)
     brief = read_brief(args.brief_file, sys.stdin)
+    launched = now()
     created = None
     if args.new_workspace:
         if args.workspace:
@@ -7691,6 +7961,11 @@ def cmd_launch(args, runner, now, socket_call=None):
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
     print(json.dumps(done, sort_keys=True))
+    note = set_checkpoint_reminders(engine, state, args.name, args.reports_to, None if args.issue is None
+                                    else int(args.issue), repo, brief, getattr(args, "checkpoint", None),
+                                    getattr(args, "overdue", None), launched, now())
+    if note and (brief or args.checkpoint or args.overdue):
+        sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
 
 
@@ -10743,6 +11018,10 @@ def build_parser():
                         help="Create a herdr workspace with this label in --dir (never focused), and launch "
                              "into it. A --charter whose `workspace:` line differs is refused")
     launch.add_argument("--charter", type=int, help="metadata.fleet.charter: an orchestrator's charter issue")
+    launch.add_argument("--checkpoint", metavar="WHEN", help="Remind the worker to report at this time (30m, or an "
+                        "ISO time with a zone). Default: read from the brief's CHECKPOINT line, if it can be")
+    launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
+                        "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
