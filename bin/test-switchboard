@@ -23916,7 +23916,12 @@ class FakeDoorServer:
     def task_of(self, seat, ident):
         return self.tasks.get((seat, ident))
 
+    def needs_reason(self, args):
+        return args.get("state") in ("paused", "stuck") and not args.get("why_state")
+
     def op_work_put(self, args, ident, seat):
+        if self.needs_reason(args):
+            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
         if not args.get("title") or ("progress" in args and not (args["progress"] or {}).get("text")):
             return 400, {"code": "bad", "message": "title or progress text is empty"}, {}
         task = self.task_of(seat, ident)
@@ -23930,6 +23935,8 @@ class FakeDoorServer:
         return 200, {"task": task, "recorded": False}, {}
 
     def op_work_patch(self, args, ident, seat):
+        if self.needs_reason(args):
+            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
         task = self.task_of(seat, ident)
         if task is None:
             return 404, {"code": "nf", "message": "no task"}, {}
@@ -23990,8 +23997,8 @@ FAKE_MAPPING = {
         "revise": {"idempotency": "op_id", "text": "body", "recommendation": "advice", "options": "choices"},
         "withdraw": {"reason": "why"},
         "acted": {"idempotency": "op_id", "answer": "on", "outcome": "result", "note": "note"},
-        "work": {"title": "title", "kind": "kind", "state": "state", "progress": "progress", "progress_text": "text",
-                 "doer": "doer", "end": "end", "summary": "said"}},
+        "work": {"title": "title", "kind": "kind", "state": "state", "state_reason": "why_state", "progress": "progress",
+                 "progress_text": "text", "doer": "doer", "end": "end", "summary": "said"}},
     "responses": {
         "item_id": "item", "items": "items",
         "item": {"id": "item", "status": "state", "text": "body", "answer": "answer", "clarification": "ask_back",
@@ -24738,6 +24745,20 @@ class TestExternalAdapterWork(ExternalAdapterCase):
             adapter.work.put("w-2", "t", unmapped_field=1)
         with self.assertRaises(EA.Unsupported):
             adapter.door.call("work_put", {}, ident="w", force="tool")
+
+    def test_a_waiting_or_blocked_state_carries_a_reason_where_the_mapping_names_one(self):
+        adapter = self.adapter()
+        adapter.work.put("w-8", "t", state="awaiting", progress="needs a review")
+        self.assertEqual(self.server.tasks[("seat-1", "w-8")]["why_state"], "needs a review")
+        adapter.work.put("w-7", "t", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-7")]["why_state"], "blocked")
+        adapter.work.put("w-6", "t", state="running", progress="going")
+        self.assertNotIn("why_state", self.server.tasks[("seat-1", "w-6")])
+        self.clock_now[0], self.server.now = 100, 1100.0
+        adapter.work.patch("w-6", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-6")]["why_state"], "going", "the last progress line")
+        adapter.work.put("w-5", "t", state="awaiting", state_reason="given")
+        self.assertEqual(self.server.tasks[("seat-1", "w-5")]["why_state"], "given")
 
     def test_an_empty_line_is_not_sent(self):
         adapter = self.adapter()

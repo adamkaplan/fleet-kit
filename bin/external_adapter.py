@@ -1359,6 +1359,17 @@ class WorkClient:
             body[spec[name]] = value
         return body
 
+    def _with_reason(self, fields, known=None):
+        """A state that waits or is blocked needs a reason where the mapping names one: the progress line, else the
+        state's own word, unless the caller gave one."""
+        spec = self.m.fields["work"]
+        state = fields.get("state")
+        if not spec.get("state_reason") or fields.get("state_reason") or state not in ("awaiting", "blocked"):
+            return fields
+        said = fields.get("progress") or (known or {}).get("progress")
+        said = said.get(spec.get("progress_text") or "text") if isinstance(said, dict) else said
+        return dict(fields, state_reason=str(said).strip() if said and str(said).strip() else state)
+
     def _result(self, reply):
         spec = self.m.responses.get("work", {})
         item = reply.get(spec["item"]) if spec.get("item") else reply
@@ -1367,7 +1378,7 @@ class WorkClient:
 
     def put(self, work_id, title, project=None, **fields):
         """Create the item (idempotent: the same id again changes nothing). Sent at once."""
-        body = self._body(dict(fields, title=title))
+        body = self._body(self._with_reason(dict(fields, title=title)))
         reply = self.door.call("work_put", body, ident=work_id, project=project, force="http")
         state = self._state(work_id, project)
         state["last"] = self.clock()
@@ -1397,8 +1408,8 @@ class WorkClient:
             return {"sent": False, "deferred": True, "due_in": wait}
         fields = state["pending"]
         try:
-            reply = self.door.call("work_patch", self._body(fields), ident=work_id, project=state["project"],
-                                   force="http")
+            reply = self.door.call("work_patch", self._body(self._with_reason(fields, state["sent"])), ident=work_id,
+                                   project=state["project"], force="http")
         except RateLimited as error:
             state["not_before"] = self.clock() + max(error.retry_after, 1.0)
             return {"sent": False, "deferred": True, "due_in": max(error.retry_after, 1.0)}
