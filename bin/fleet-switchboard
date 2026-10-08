@@ -95,6 +95,25 @@ def load_decision_core():
 decision_core = load_decision_core()
 
 
+def load_external_adapter():
+    """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
+    load_decision_core loads the core. Called only when an external decision system is switched on and names this
+    adapter: while it is off the file is never read or imported."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "external_adapter.py")
+    held = sys.modules.get("external_adapter")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("external_adapter", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["external_adapter"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("external_adapter", None)
+        raise
+    return module
+
+
 def load_decision_sync():
     """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
     imports decision_core, which is already registered)."""
@@ -4975,6 +4994,27 @@ def register_external_adapter(name, factory):
     return factory
 
 
+MAPPING_ADAPTER = "mapping"   # the generic adapter's name in `external_decisions.adapter`
+
+
+def build_mapping_adapter(settings, mapping, state_dir):
+    """The factory of the generic adapter: built from the parsed mapping file, its key source run ONCE here (a command
+    source runs now, with its own timeout, and the key is held in memory only). Any failure raises one line that
+    never holds the key; the caller shows it as `down: <why>` and tries again only after a backoff."""
+    module = load_external_adapter()
+    try:
+        adapter = module.McpRestAdapter(mapping)
+        reason = adapter.start()
+    except Exception as err:
+        raise RuntimeError(module.scrub(_one_line("%s" % err, 160)))
+    if reason:
+        raise RuntimeError(module.scrub(_one_line(reason, 160), adapter.keys.secrets()))
+    return adapter
+
+
+register_external_adapter(MAPPING_ADAPTER, build_mapping_adapter)
+
+
 def judge_inbound_answer(engine, decision, answer, role):
     """Whether an answer that came from outside may be applied, judged as the Chief of Staff's own `decisions answer`
     is: the same four questions, put to the same decision model, with the owner's standing orders as the authority.
@@ -5100,6 +5140,9 @@ def sync_for(engine):
     held = getattr(engine, "external_sync", None)
     if held is not None:
         return held
+    now = engine.now()
+    if now < getattr(engine, "external_sync_retry_at", 0):
+        return None   # a failed build is not tried again until its backoff has passed (a key command is not rerun per pass)
     try:
         factory = EXTERNAL_ADAPTERS.get(settings["adapter"])
         if factory is None:
@@ -5107,13 +5150,24 @@ def sync_for(engine):
         try:
             mapping = json.loads(Path(settings["mapping_file"]).read_text())
         except (OSError, ValueError) as err:
-            raise RuntimeError("the mapping file cannot be read: %s" % (getattr(err, "strerror", None) or err))
+            raise RuntimeError("the mapping file cannot be read: %s" % (getattr(err, "strerror", None) or "not JSON"))
         adapter = factory(settings, mapping, engine.state_dir)
         engine.external_sync = decision_sync.SyncEngine(settings, engine.state_dir, adapter, ExternalSyncHost(engine),
                                                        engine.now)
         engine.external_sync_error = None
+        engine.external_sync_fails = 0
+        ExternalSyncHost(engine).audit("external.started", "external", {"adapter": settings["adapter"]})
     except Exception as err:
+        fails = getattr(engine, "external_sync_fails", 0) + 1
+        engine.external_sync_fails = fails
         engine.external_sync_error = _one_line("%s" % err, 160)
+        engine.external_sync_retry_at = now + min(settings["retry_max_seconds"],
+                                                  settings["retry_base_seconds"] * 2 ** (fails - 1))
+        try:
+            ExternalSyncHost(engine).audit("external.down", "external", {"reason": engine.external_sync_error,
+                                                                         "attempt": fails})
+        except Exception:
+            pass
         return None
     return engine.external_sync
 

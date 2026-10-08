@@ -2708,6 +2708,43 @@ The mapping file is read by the adapter, not by the engine. What it holds is the
 | the names of its tiers, rooms or queues that the `tier_map` floor names refer to                    | the adapter  |
 | how a decision's options are named there                                                            | the adapter  |
 
+#### Switching on the generic adapter (`adapter: "mapping"`)
+
+The Switchboard ships one adapter, registered as `mapping`. It speaks to any system that offers the capabilities of the
+port over HTTP and a tool-calling protocol (MCP over streamable HTTP), and everything specific to that system lives in
+a local mapping file. Its code is `bin/external_adapter.py`; its header documents every mapping key.
+
+To switch it on for a project:
+
+1. Write the mapping file (local, never committed): the address, the tool and HTTP operations and their field names,
+   the words of its tiers and answers, which header carries the credential, and where the credential comes from.
+   `base_url` must be `https`, except for a loopback address. An inline credential is refused.
+2. Name the key source in the mapping: `env:NAME`, `file:PATH` (the file must be mode 0600 or it is refused) or a
+   command (`{"command": [argv...], "timeout": s}`, run once by the daemon at its start, no shell, stdout is the key,
+   stderr discarded: this is how a vault fetch works). Two sources are a rotation: the second is tried after a
+   refusal. The key is held in memory only; it is never written to the state directory, the audit, `status`, an error
+   text or a log, and is scrubbed from any text the adapter raises. (A command's own arguments are visible to
+   `ps`: put the secret in the vault, not in the arguments.)
+3. In the Switchboard config, add `external_decisions` with `enabled: true`, `adapter: "mapping"`, `mapping_file` (an
+   absolute path), `tier_map` (the floor for each of `orchestrator`, `cos`, `human`) and `repos` (the projects that
+   are switched on: only decisions of these repos go outward). Restart the daemon.
+
+While `external_decisions` is absent or `enabled` is false, `bin/external_adapter.py` is never read or imported.
+When it is on, the adapter is built on the first pass after the daemon starts, and its key source runs once, then.
+
+Failure modes of the start (all of them are `external  down: <why>` in `status` and `decisions`, an `external` entry
+in the errors, and an `external.down` audit line; none stops a pass or touches the local list): the mapping file is
+missing, is not JSON or is invalid (the first problems are named); the key source fails, times out, names an unset
+variable or a file with group or other access; no adapter is registered under the name. A failed start is tried again
+only after a backoff (`retry_base_seconds`, doubling up to `retry_max_seconds`), so a key command is not run on every
+pass; fixing the file brings it up without a restart. When it comes up, `external.started` is audited.
+
+Failure modes once it is up: a refused credential or an unreachable system is the same `down` line, the outbox grows
+and drains, in order and without duplicates, when it is back (a tool session the server forgot is started again by
+itself). A refusal that will not pass by itself (an already decided item, an unknown item, an invalid request) carries
+`permanent = True`; a rate limit or an outage does not. A system with no operation for a tier change or a note leaves
+those local: the adapter lists no `status` capability and does nothing for them.
+
 ## Repo and PR conventions
 
 - Work happens in a git worktree of the existing checkout; no second clone.

@@ -33,7 +33,9 @@ The mapping file (JSON; unknown top-level keys are refused, an inline credential
                    work_finish, work_get, work_list): {tool, http: {method, path}, id_arg, cursor_param}; `{id}`
                    and `{project}` in a path are filled in. feed, raise and items are required
   fields           field names of every request: raise, option, evidence, revise, withdraw, acted, work
-  responses        field names of every response: item_id, item (the read shape), feed, change, answer, work
+  responses        field names of every response: item_id, item (the read shape), feed, change, answer, work, page
+                   (page {info, next}: a reply that says it is truncated names the token of the next page; an
+                   operation's `next_param` is the request field that carries it; every page is read)
   enums            generic -> the other side's words: tier, disposition, status, change_kind, outcome,
                    work_state, work_end, integration_status, meaning (disposition -> allow|deny|text|needs_info)
   tier_map         the fleet's tier (orchestrator, cos, human) -> {class, floor}: the FLOOR consequence tier we
@@ -65,7 +67,8 @@ idempotency_key) with operation {op: raise|revise|status|withdraw, key, external
 note} returns {external_id, url}; lookup(key) -> {external_id, revision} | None; pull_changes(cursor) -> (events,
 next_cursor) with port events {event_id, external_id, type: answered|clarify|reversed|withdrawn, answered_by:
 project agent|owner's agent|human (unknown when no role rule matches), option_id, text, at}. acted(), read_items(),
-pull_normalised() and the work client are extras outside the port.
+pull_normalised() and the work client are extras outside the port. A status operation (a tier change or a note)
+when the mapping defines none is a no-op that stays local, not an error: the engine would retry an error forever.
 
 Python 3.9+, standard library only.
 """
@@ -120,7 +123,13 @@ DEFAULT_MEANING = {"accept": "allow", "edit": "text", "reject": "deny", "clarify
 
 
 class AdapterError(Exception):
-    """Base of everything this module raises on purpose. Texts never carry a key."""
+    """Base of everything this module raises on purpose. Texts never carry a key.
+
+    `permanent` tells the sync engine whether trying the same operation again can help: True for a refusal that will
+    not change by itself (a rejected request, an unknown item, an already decided one, a refused credential, a
+    disabled integration); False for what may pass (RateLimited, Unavailable)."""
+
+    permanent = False
 
     def __init__(self, message, status=None, code=None):
         Exception.__init__(self, message)
@@ -128,31 +137,37 @@ class AdapterError(Exception):
 
 
 class MappingError(AdapterError):
-    pass
+    permanent = True
 
 
 class KeySourceError(AdapterError):
-    pass
+    permanent = True
 
 
 class CredentialError(AdapterError):
     """No credential, a refused one or a revoked one (401)."""
 
+    permanent = True
+
 
 class DisabledError(AdapterError):
     """The integration is disabled on the other side (403 or 409 as the mapping says)."""
 
+    permanent = True
+
 
 class NotFound(AdapterError):
-    pass
+    permanent = True
 
 
 class InvalidRequest(AdapterError):
     """A 400, a 415, a schema failure on the tool channel, or a request we refused to build."""
 
+    permanent = True
+
 
 class Conflict(AdapterError):
-    pass
+    permanent = True
 
 
 class AlreadyDecided(Conflict):
@@ -171,6 +186,8 @@ class Unavailable(AdapterError):
 
 class Unsupported(AdapterError):
     """The mapping defines no such operation."""
+
+    permanent = True
 
 
 ERROR_CLASSES = {c.__name__: c for c in (CredentialError, DisabledError, NotFound, InvalidRequest, Conflict,
@@ -467,7 +484,10 @@ class MappingFile:
                     continue
                 if not need(isinstance(op, dict), "operations.%s must be an object" % name):
                     continue
-                need(not (set(op) - {"tool", "http", "id_arg", "cursor_param"}), "operations.%s: unknown keys" % name)
+                need(not (set(op) - {"tool", "http", "id_arg", "cursor_param", "next_param"}),
+                     "operations.%s: unknown keys" % name)
+                need(op.get("next_param") is None or (isinstance(op["next_param"], str) and op["next_param"]),
+                     "operations.%s.next_param must be a name" % name)
                 tool, http_ = op.get("tool"), op.get("http")
                 if name in WORK_OPS:
                     need(tool is None, "operations.%s: work reporting is HTTP only (no tool)" % name)
@@ -521,6 +541,9 @@ class MappingFile:
             feed = resp.get("feed", {})
             need(isinstance(feed.get("cursor"), str) and isinstance(feed.get("changes"), str),
                  "responses.feed needs cursor and changes")
+            page = resp.get("page")
+            need(page is None or (isinstance(page, dict) and isinstance(page.get("info"), str)
+                                  and isinstance(page.get("next"), str)), "responses.page needs info and next")
             change = resp.get("change", {})
             need(isinstance(change.get("kind"), str) and isinstance(change.get("item_id"), str),
                  "responses.change needs kind and item_id")
@@ -809,10 +832,10 @@ class McpClient:
             try:
                 result = self.rpc("tools/call", {"name": name, "arguments": arguments})
                 break
-            except NotFound:
-                if again or not self.session:
+            except (NotFound, InvalidRequest) as error:
+                if again or not self.session or error.status not in (400, 404):
                     raise
-                self.reset()  # the session is gone on the other side: start one and ask again, once
+                self.reset()  # the session is gone on the other side (a restart): start one and ask again, once
         result = result if isinstance(result, dict) else {}
         texts = [c.get("text") for c in result.get("content", []) if isinstance(c, dict) and c.get("type") == "text"]
         text = "\n".join(t for t in texts if isinstance(t, str))
@@ -1015,15 +1038,34 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         events, nxt = self.pull_normalised(cursor)
         return Changes([self._port_event(e) for e in events if e["type"] in PORT_TYPES], nxt)
 
+    def _pages(self, name, query=None):
+        """The replies of an operation, following the pages the other side says remain (at most 50)."""
+        data = self.door.call(name, query=query)
+        pages = [data]
+        spec = self.m.responses.get("page")
+        param = self.m.operations[name].get("next_param")
+        while spec and param and len(pages) < 50:
+            info = data.get(spec["info"])
+            token = info.get(spec["next"]) if isinstance(info, dict) else None
+            if not token:
+                break
+            data = self.door.call(name, query=dict(query or {}, **{param: token}))
+            pages.append(data)
+        return pages
+
     def pull_normalised(self, cursor):
         """Every change normalised (answered, sent_back, reversed, withdrawn, rated, revised, other), with the cursor."""
-        data = self.door.call("feed", query=self._cursor_query(cursor))
+        pages = self._pages("feed", self._cursor_query(cursor))
+        data = pages[-1]
         feed = self.m.responses["feed"]
-        raw = data.get(feed["changes"])
-        if raw is None:
-            raw = []
-        if not isinstance(raw, list):
-            raise InvalidRequest("the feed's changes are not a list")
+        raw = []
+        for page in pages:
+            one = page.get(feed["changes"])
+            if one is None:
+                one = []
+            if not isinstance(one, list):
+                raise InvalidRequest("the feed's changes are not a list")
+            raw.extend(one)
         events = [e for e in (self._normalise(c) for c in raw if isinstance(c, dict)) if e is not None]
         events.sort(key=lambda e: (e["seq"] is None, e["seq"] if e["seq"] is not None else 0))
         nxt = data.get(feed["cursor"])
@@ -1073,10 +1115,12 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
     def read_items(self):
         """The items of this integration, normalised: {external_id, status, text, answer, clarification, withdrawn,
         reversals, opened_at, raw}."""
-        data = self.door.call("items")
         spec = self.m.responses["item"]
         found = []
-        for raw in data.get(self.m.responses["items"]) or []:
+        rows = []
+        for page in self._pages("items"):
+            rows.extend(page.get(self.m.responses["items"]) or [])
+        for raw in rows:
             if not isinstance(raw, dict):
                 continue
             answer = raw.get(spec.get("answer")) if spec.get("answer") else None
@@ -1208,7 +1252,8 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
                        ident=ident)
 
     def _status(self, ident, d, key, decision_key=None, note=None):
-        self._need("status")
+        if "status" not in self.m.operations:
+            return   # the other side has no such operation: the tier change or note stays local (no "status" capability)
         f = self.m.fields.get("status", {})
         body = {f["idempotency"]: self._uuid_of(key)} if f.get("idempotency") else {}
         for name in ("status", "tier"):
@@ -1289,6 +1334,8 @@ class WorkClient:
     def __init__(self, door, mapping, clock=time.monotonic):
         self.door, self.m, self.clock = door, mapping, clock
         self.interval = float(mapping.data["work_interval"])
+        # the generic field names the mapping names (the work pump passes only these; the rest are not sent)
+        self.fields = frozenset(k for k in mapping.fields.get("work", {}) if k != "progress_text")
         self.items = {}
 
     def _state(self, work_id, project):
@@ -1299,8 +1346,8 @@ class WorkClient:
         spec = self.m.fields["work"]
         body = {}
         for name, value in fields.items():
-            if value is None:
-                continue
+            if value is None or (isinstance(value, str) and not value.strip() and name not in ("title", "summary")):
+                continue   # nothing to say is not sent (the other side refuses an empty progress line)
             if name not in spec:
                 raise InvalidRequest("work: %r is not a mapped field" % name)
             if name == "state":
@@ -1312,6 +1359,17 @@ class WorkClient:
             body[spec[name]] = value
         return body
 
+    def _with_reason(self, fields, known=None):
+        """A state that waits or is blocked needs a reason where the mapping names one: the progress line, else the
+        state's own word, unless the caller gave one."""
+        spec = self.m.fields["work"]
+        state = fields.get("state")
+        if not spec.get("state_reason") or fields.get("state_reason") or state not in ("awaiting", "blocked"):
+            return fields
+        said = fields.get("progress") or (known or {}).get("progress")
+        said = said.get(spec.get("progress_text") or "text") if isinstance(said, dict) else said
+        return dict(fields, state_reason=str(said).strip() if said and str(said).strip() else state)
+
     def _result(self, reply):
         spec = self.m.responses.get("work", {})
         item = reply.get(spec["item"]) if spec.get("item") else reply
@@ -1320,7 +1378,7 @@ class WorkClient:
 
     def put(self, work_id, title, project=None, **fields):
         """Create the item (idempotent: the same id again changes nothing). Sent at once."""
-        body = self._body(dict(fields, title=title))
+        body = self._body(self._with_reason(dict(fields, title=title)))
         reply = self.door.call("work_put", body, ident=work_id, project=project, force="http")
         state = self._state(work_id, project)
         state["last"] = self.clock()
@@ -1332,7 +1390,8 @@ class WorkClient:
         (or "unchanged"); the last state wins. `flush` sends what became due."""
         state = self._state(work_id, project)
         merged = dict(state["pending"])
-        merged.update({k: v for k, v in fields.items() if v is not None})
+        merged.update({k: v for k, v in fields.items()
+                       if v is not None and not (isinstance(v, str) and not v.strip())})
         changed = {k: v for k, v in merged.items() if state["sent"].get(k) != v}
         if not changed:
             state["pending"] = {}
@@ -1349,8 +1408,8 @@ class WorkClient:
             return {"sent": False, "deferred": True, "due_in": wait}
         fields = state["pending"]
         try:
-            reply = self.door.call("work_patch", self._body(fields), ident=work_id, project=state["project"],
-                                   force="http")
+            reply = self.door.call("work_patch", self._body(self._with_reason(fields, state["sent"])), ident=work_id,
+                                   project=state["project"], force="http")
         except RateLimited as error:
             state["not_before"] = self.clock() + max(error.retry_after, 1.0)
             return {"sent": False, "deferred": True, "due_in": max(error.retry_after, 1.0)}

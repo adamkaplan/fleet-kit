@@ -23772,7 +23772,7 @@ class FakeDoorServer:
             self.sessions.add(session)
             return self.reply(h, mid, {"protocolVersion": "2025-03-26", "capabilities": {}}, {"Mcp-Session-Id": session})
         if h.headers.get("Mcp-Session-Id") not in self.sessions:
-            return self.send(h, 404, {"code": "nf", "message": "no session"})
+            return self.send(h, self.session_miss, {"code": "nf", "message": "no session"})
         if mid is None:
             return self.send(h, 202, raw=b"")
         if method == "tools/list":
@@ -23825,11 +23825,25 @@ class FakeDoorServer:
             return (409 if op.startswith("work") else 403), {"code": "off", "message": "disabled"}, {}
         return getattr(self, "op_" + op)(args, ident, seat)
 
+    session_miss = 404   # the status of a call that names a session the server does not know
+    page_size = 0   # 0: no paging; else a reply holds this many entries and names the token of the next page
+
+    def paged(self, rows, args):
+        if not self.page_size:
+            return rows, {}
+        start = int(str(args.get("token") or "p0")[1:])
+        chunk = rows[start:start + self.page_size]
+        more = {"more": {"token": "p%d" % (start + self.page_size)}} if start + self.page_size < len(rows) else {}
+        return chunk, more
+
     def op_feed(self, args, ident, seat):
         since = int(args.get("since") or 0)
         new = [c for c in self.changes if c["n"] > since]
-        return 200, {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": new,
-                     "cursor": max([c["n"] for c in new] + [since])}, {}
+        chunk, more = self.paged(new, args)
+        body = {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": chunk,
+                "cursor": max([c["n"] for c in chunk] + [since])}
+        body.update(more)
+        return 200, body, {}
 
     def op_raise(self, args, ident, seat):
         if not self.RAISE_KEYS <= set(args) or set(args) - self.RAISE_KEYS - self.RAISE_OPT:
@@ -23862,7 +23876,8 @@ class FakeDoorServer:
         return {k: v for k, v in item.items() if not k.startswith("_")}
 
     def op_items(self, args, ident, seat):
-        return 200, {"items": [self.visible(i) for i in self.items.values()], "state": "on"}, {}
+        chunk, more = self.paged([self.visible(i) for i in self.items.values()], args)
+        return 200, dict({"items": chunk, "state": "on"}, **more), {}
 
     def find(self, ident):
         return self.items.get(ident)
@@ -23901,9 +23916,14 @@ class FakeDoorServer:
     def task_of(self, seat, ident):
         return self.tasks.get((seat, ident))
 
+    def needs_reason(self, args):
+        return args.get("state") in ("paused", "stuck") and not args.get("why_state")
+
     def op_work_put(self, args, ident, seat):
-        if not args.get("title"):
-            return 400, {"code": "bad", "message": "title"}, {}
+        if self.needs_reason(args):
+            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
+        if not args.get("title") or ("progress" in args and not (args["progress"] or {}).get("text")):
+            return 400, {"code": "bad", "message": "title or progress text is empty"}, {}
         task = self.task_of(seat, ident)
         if task is None:
             task = {"id": ident, "end": None, "recorded_at": self.now}
@@ -23915,6 +23935,8 @@ class FakeDoorServer:
         return 200, {"task": task, "recorded": False}, {}
 
     def op_work_patch(self, args, ident, seat):
+        if self.needs_reason(args):
+            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
         task = self.task_of(seat, ident)
         if task is None:
             return 404, {"code": "nf", "message": "no task"}, {}
@@ -23953,9 +23975,10 @@ FAKE_MAPPING = {
               "default_retry_after": 1},
     "poll_interval": 30, "work_interval": 60, "idempotency": {"namespace": FakeDoorServer.NAMESPACE},
     "operations": {
-        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since"},
+        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since",
+                 "next_param": "token"},
         "raise": {"tool": "item_raise", "http": {"method": "POST", "path": "/items"}},
-        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}},
+        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}, "next_param": "token"},
         "revise": {"tool": "item_revise", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/revise"}},
         "withdraw": {"tool": "item_withdraw", "id_arg": "id",
                      "http": {"method": "POST", "path": "/items/{id}/withdraw"}},
@@ -23974,13 +23997,13 @@ FAKE_MAPPING = {
         "revise": {"idempotency": "op_id", "text": "body", "recommendation": "advice", "options": "choices"},
         "withdraw": {"reason": "why"},
         "acted": {"idempotency": "op_id", "answer": "on", "outcome": "result", "note": "note"},
-        "work": {"title": "title", "kind": "kind", "state": "state", "progress": "progress", "progress_text": "text",
-                 "doer": "doer", "end": "end", "summary": "said"}},
+        "work": {"title": "title", "kind": "kind", "state": "state", "state_reason": "why_state", "progress": "progress",
+                 "progress_text": "text", "doer": "doer", "end": "end", "summary": "said"}},
     "responses": {
         "item_id": "item", "items": "items",
         "item": {"id": "item", "status": "state", "text": "body", "answer": "answer", "clarification": "ask_back",
                  "withdrawn": "withdrawn", "reversals": "reversals", "opened_at": "opened", "idempotency": "op_id"},
-        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"},
+        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"}, "page": {"info": "more", "next": "token"},
         "change": {"seq": "n", "kind": "what", "item_id": "item", "at": "when", "tier": "level", "floor": "floor",
                    "text": "body", "awaits_rating": "rerate", "replaces": "replaces", "reason": "why"},
         "answer": {"id": "answer_id", "disposition": "how", "option_id": "chosen", "text": "words", "rationale": "why",
@@ -24314,9 +24337,12 @@ class TestExternalAdapterOperations(ExternalAdapterCase):
         with self.assertRaises(EA.InvalidRequest):
             self.push(adapter, {"op": "revise", "external_id": ident}, "k-r2")
 
-    def test_status_is_unsupported_without_a_mapping_for_it(self):
-        with self.assertRaises(EA.Unsupported):
-            self.push(self.adapter(), {"op": "status", "external_id": "x", "status": "s"}, "k")
+    def test_status_without_a_mapping_for_it_is_a_local_only_no_op_not_an_error(self):
+        adapter = self.adapter()
+        self.assertNotIn("status", adapter.capabilities)
+        before = len(self.server.log)
+        self.assertEqual(self.push(adapter, {"op": "status", "external_id": "x", "status": "s"}, "k"), "x")
+        self.assertEqual(len(self.server.log), before, "nothing was sent: the engine must not retry it forever")
 
     def test_idempotent_replay_and_conflict(self):
         for channel in self.each_channel():
@@ -24494,6 +24520,15 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         self.server.sessions.clear()  # the server forgot it
         self.push(adapter, self.decision(), "k-2")
         self.assertEqual(self.server.sid, 2)
+        self.server.session_miss = 400   # some servers answer a session they forgot with a 400
+        self.server.sessions.clear()
+        self.push(adapter, self.decision(), "k-2b")
+        self.assertEqual(self.server.sid, 3)
+        with self.assertRaises(EA.InvalidRequest):   # a real 400 with a good session is asked once, not looped
+            self.server.fail_next("raise", 400, {"code": "bad", "message": "m"}, count=2)
+            self.push(adapter, self.decision(), "k-2c")
+        self.assertEqual(self.server.sid, 4)
+        self.server.session_miss = 404
         self.server.sse = True
         fresh = self.adapter("tool")
         self.assertTrue(self.push(fresh, self.decision(), "k-3").startswith("it-"))
@@ -24651,6 +24686,39 @@ class TestExternalAdapterPort(ExternalAdapterCase):
         with self.assertRaises(Exception):
             adapter.pull_changes(None)
 
+    def test_every_page_of_a_truncated_read_is_followed_over_both_channels(self):
+        for channel in ("tool", "http"):
+            self.server.items.clear()
+            self.server.changes.clear()
+            self.server.page_size = 2
+            adapter = self.adapter(channel)
+            ids = [self.push(adapter, self.decision(title="item %d" % n), "k-%d-%s" % (n, channel)) for n in range(5)]
+            self.assertEqual(sorted(i["external_id"] for i in adapter.read_items()), sorted(ids))
+            self.assertEqual(adapter.lookup("dk:k-4-%s" % channel)["external_id"], ids[4], "found on the last page")
+            for n in range(5):
+                self.server.add_change("answer", ids[n], **self.answer_fields(answer_id="a-%d" % n))
+            events, cursor = adapter.pull_changes(None)
+            self.assertEqual([e["answer_id"] for e in events], ["a-%d" % n for n in range(5)])
+            self.assertEqual(cursor, self.server.seq)
+            self.assertEqual(adapter.pull_changes(cursor), ([], cursor))
+            self.assertGreaterEqual(self.server.count("feed", channel), 4)
+
+    def test_permanent_errors_are_marked_and_transient_ones_are_not(self):
+        for cls in (EA.CredentialError, EA.DisabledError, EA.NotFound, EA.InvalidRequest, EA.Conflict,
+                    EA.AlreadyDecided, EA.MappingError, EA.KeySourceError, EA.Unsupported):
+            self.assertTrue(cls("x").permanent, cls.__name__)
+        self.assertFalse(EA.RateLimited("x", 1).permanent)
+        self.assertFalse(EA.Unavailable("x").permanent)
+        adapter = self.adapter("http")
+        for status, code, permanent in ((404, "nf", True), (400, "bad", True), (401, "cred", True),
+                                        (409, "decided", True), (403, "off", True), (500, "x", False),
+                                        (429, "slow", False)):
+            self.server.inject.clear()
+            self.server.fail_next("raise", status, {"code": code, "message": "m"}, {"Retry-After": "99"}, count=9)
+            with self.assertRaises(EA.AdapterError) as ctx:
+                self.push(adapter, self.decision(), "k-%d" % status)
+            self.assertIs(ctx.exception.permanent, permanent, status)
+
     def test_a_cursor_that_goes_back_is_ignored(self):
         adapter = self.adapter("http")
         adapter.door.call = lambda *a, **k: {"cursor": 3, "feed": []}
@@ -24677,6 +24745,27 @@ class TestExternalAdapterWork(ExternalAdapterCase):
             adapter.work.put("w-2", "t", unmapped_field=1)
         with self.assertRaises(EA.Unsupported):
             adapter.door.call("work_put", {}, ident="w", force="tool")
+
+    def test_a_waiting_or_blocked_state_carries_a_reason_where_the_mapping_names_one(self):
+        adapter = self.adapter()
+        adapter.work.put("w-8", "t", state="awaiting", progress="needs a review")
+        self.assertEqual(self.server.tasks[("seat-1", "w-8")]["why_state"], "needs a review")
+        adapter.work.put("w-7", "t", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-7")]["why_state"], "blocked")
+        adapter.work.put("w-6", "t", state="running", progress="going")
+        self.assertNotIn("why_state", self.server.tasks[("seat-1", "w-6")])
+        self.clock_now[0], self.server.now = 100, 1100.0
+        adapter.work.patch("w-6", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-6")]["why_state"], "going", "the last progress line")
+        adapter.work.put("w-5", "t", state="awaiting", state_reason="given")
+        self.assertEqual(self.server.tasks[("seat-1", "w-5")]["why_state"], "given")
+
+    def test_an_empty_line_is_not_sent(self):
+        adapter = self.adapter()
+        first = adapter.work.put("w-9", "t", state="running", progress="", doer="  ")
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("progress", self.server.tasks[("seat-1", "w-9")])
+        self.assertEqual(adapter.work.patch("w-9", progress=" "), {"sent": False, "unchanged": True})
 
     def test_updates_are_coalesced_and_the_last_state_wins(self):
         adapter = self.adapter()
@@ -25348,6 +25437,262 @@ class TestExternalInboundJudge(ExternalWorld):
         self.assertNotIn("sk-abcdefghij1234", raw)
         (denied,) = self.audit_events("external.judged")
         self.assertIn("speaks for you", denied["detail"]["reason"])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The generic adapter wired into the daemon (external_decisions.adapter = "mapping"): off means nothing is loaded;
+# on builds it once, runs its key source once, and every failure is a `down: <why>` that never touches the local list.
+
+
+class TestExternalWiring(ExternalWorld):
+    TIERS = {"orchestrator": "low", "cos": "high", "human": "reserved"}
+
+    def setUp(self):
+        super().setUp()
+        self.door = FakeDoorServer()
+        self.addCleanup(self.door.close)
+        self.runs = self.home / "key-runs"
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); print(%r)"
+                            % (str(self.runs), FakeDoorServer.KEY)]
+        self.write_mapping()
+
+    def write_mapping(self, **over):
+        over.setdefault("key_source", {"command": self.key_command, "timeout": 5})
+        data = fake_mapping(self.door.url, "tool", **over)
+        self.mapping.write_text(json.dumps(data))
+
+    def wire(self, **extra):
+        self.turn_on(adapter="mapping", **extra)
+
+    def key_runs(self):
+        return len(self.runs.read_text()) if self.runs.exists() else 0
+
+    def everything(self):
+        """Every text the daemon leaves behind or shows: state files, the audit, status, the decision list."""
+        found = [self.cmd("you", "status")["out"], self.cmd("you", "decisions", "--fresh")["out"]]
+        for path in self.world.state.rglob("*"):
+            if path.is_file():
+                found.append(path.read_text(errors="replace"))
+        return "\n".join(found)
+
+    def test_on_builds_the_adapter_once_and_runs_the_key_command_once(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1)
+        item = list(self.door.items.values())[0]
+        self.assertEqual(item["floor"], "major")  # the engine's floor name (high: an orchestrator's report is the cos's) in the adapter's words
+        self.assertEqual(self.key_runs(), 1)
+        self.assertIn("external  ok; outbox 0", self.cmd("you", "status")["out"])
+        self.assertEqual([e["event"] for e in self.audit_events("external.started")], ["external.started"])
+        self.assertEqual(self.door.count("raise"), 1)
+
+    def test_a_new_engine_in_the_same_process_builds_its_own_adapter(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.assertEqual(self.key_runs(), 1)
+        self.world.engine = self.world.new_engine()   # a daemon restart: the key source runs again, and only once
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.key_runs(), 2)
+        self.assertEqual(len(self.door.items), 1, "the restart raised nothing twice")
+
+    def test_off_loads_nothing_and_imports_nothing(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("external_adapter", None)
+            self.run_pass()                                       # no external_decisions at all
+            self.assertNotIn("external_adapter", sys.modules)
+            self.wire(enabled=False)                               # named, but off
+            self.run_pass()
+            self.run_pass()
+            self.assertNotIn("external_adapter", sys.modules)
+        self.assertEqual(self.key_runs(), 0)
+        self.assertEqual(self.door.log, [])
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if p.name.startswith("external")), [])
+        self.assertNotIn("external", self.cmd("you", "status")["out"])
+
+    def test_another_adapter_name_never_loads_this_one(self):
+        self.turn_on()   # the fake
+        self.say("api-orch", "question", "Which table?", 6)
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("external_adapter", None)
+            self.run_pass()
+            self.assertNotIn("external_adapter", sys.modules)
+
+    def failure(self, name, setup, reason):
+        """A failure mode: a pass never raises, the status says down and why, the local list is whole, the audit
+        records it, the key command did not spin, and the key is nowhere."""
+        setup()
+        self.say("api-orch", "question", "Which table (%s)?" % name, 6)
+        self.run_pass()
+        body = self.file_body()
+        self.assertEqual([d["kind"] for d in body["decisions"]], ["report"], name)
+        ours = [e["error"] for e in body["errors"] if e["source"] == "external"]
+        self.assertEqual(len(ours), 1, (name, ours))
+        self.assertIn("external decision system is down", ours[0])
+        self.assertIn(reason, ours[0], name)
+        self.assertIn("external  down: ", self.cmd("you", "status")["out"])
+        self.assertIn(reason, self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.audit_events("external.down")), 1, name)
+        self.assertEqual(self.door.log, [], name)
+        self.assertNotIn(FakeDoorServer.KEY, self.everything(), name)
+        return body
+
+    def test_every_failure_mode_is_a_down_status_and_leaves_the_local_list_alone(self):
+        def missing():
+            self.wire()
+            self.mapping.unlink()
+
+        def not_json():
+            self.wire()
+            self.mapping.write_text("{nope")
+
+        def invalid():
+            self.wire()
+            data = json.loads(self.mapping.read_text())
+            data["surprise"] = 1
+            self.mapping.write_text(json.dumps(data))
+
+        def command_fails():
+            self.key_command = [sys.executable, "-c", "import sys; print('%s'); sys.exit(3)" % FakeDoorServer.KEY]
+            self.write_mapping()
+            self.wire()
+
+        def command_hangs():
+            self.key_command = [sys.executable, "-c", "import time; time.sleep(30)"]
+            self.write_mapping()
+            data = json.loads(self.mapping.read_text())
+            data["key_source"]["timeout"] = 0.5
+            self.mapping.write_text(json.dumps(data))
+            self.wire()
+
+        def env_missing():
+            self.write_mapping(key_source="env:SURELY_NOT_SET_ANYWHERE_123")
+            self.wire()
+
+        def file_loose():
+            path = self.home / "loose-key"
+            path.write_text(FakeDoorServer.KEY)
+            os.chmod(path, 0o644)
+            self.write_mapping(key_source="file:%s" % path)
+            self.wire()
+
+        def unknown_adapter():
+            self.turn_on(adapter="nobody-by-this-name")
+
+        cases = (("mapping file missing", missing, "mapping file cannot be read"),
+                 ("mapping not json", not_json, "mapping file cannot be read"),
+                 ("mapping invalid", invalid, "mapping invalid"),
+                 ("key command fails", command_fails, "exit 3"),
+                 ("key command hangs", command_hangs, "did not answer"),
+                 ("key env missing", env_missing, "not set"),
+                 ("key file mode", file_loose, "0600"),
+                 ("adapter not registered", unknown_adapter, "no adapter named"))
+        for name, setup, reason in cases:
+            with self.subTest(name):
+                self.setUp()
+                try:
+                    self.failure(name, setup, reason)
+                finally:
+                    self.door.close()
+
+    def test_a_failed_start_is_retried_only_after_a_backoff_and_then_recovers(self):
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); sys.exit(1)" % str(self.runs)]
+        self.write_mapping()
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass(1)
+        self.run_pass(1)
+        self.run_pass(1)
+        self.assertEqual(self.key_runs(), 1, "inside the backoff the key command is not run again")
+        self.assertEqual(len(self.audit_events("external.down")), 1)
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); print(%r)"
+                            % (str(self.runs), FakeDoorServer.KEY)]
+        self.write_mapping()   # the operator fixed it
+        self.run_pass(10)
+        self.assertEqual(self.key_runs(), 2)
+        self.run_pass(1)
+        self.assertIn("external  ok", self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.door.items), 1)
+        self.assertEqual(len(self.audit_events("external.started")), 1)
+
+    def test_down_later_grows_the_outbox_and_up_again_drains_it_without_duplicates(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1)
+        self.door.down = True
+        self.say("api-orch", "question", "Which other table?", 7)
+        self.run_pass()
+        self.assertIn("external  down", self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.file_body()["decisions"]), 2)
+        self.door.down = False
+        self.run_pass(70)
+        self.run_pass(70)
+        self.assertEqual(len(self.door.items), 2, "no duplicates")
+        self.assertIn("external  ok; outbox 0", self.cmd("you", "status")["out"])
+
+    def test_the_key_is_nowhere_even_when_the_other_side_echoes_it(self):
+        self.wire()
+        self.door.fail_next("raise", 401, {"code": "cred", "message": "refused Key %s" % FakeDoorServer.KEY}, count=9)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.run_pass(10)
+        text = self.everything()
+        self.assertNotIn(FakeDoorServer.KEY, text)
+        self.assertIn("refused", text)
+
+    def test_work_items_flow_through_the_adapters_work_client(self):
+        self.write_mapping()
+        self.wire(work_items=True)
+        self.add_worker("api-w1", issue=5)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.run_pass()
+        tasks = list(self.door.tasks.values())
+        self.assertGreaterEqual(len(tasks), 1, self.door.log)   # one per assignment the world holds
+        self.assertEqual(len(tasks), self.door.count("work_put", "http"))
+        for task in tasks:
+            self.assertIn(task["state"], ("going", "paused", "stuck", "waiting"))
+            self.assertNotIn("serves", task, "a field the mapping does not name is not sent")
+            self.assertTrue(task["kind"])
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.tasks), len(tasks), "idempotent: nothing is created twice")
+        self.assertEqual(self.door.count("work_put", "http"), len(tasks))
+        self.assertNotIn(FakeDoorServer.KEY, self.everything())
+        adapter = self.world.engine.external_sync.adapter
+        self.assertTrue({"title", "kind", "state", "progress"} <= adapter.work.fields)
+        self.assertNotIn("progress_text", adapter.work.fields)
+
+    def test_a_failing_work_sink_never_blocks_the_decision_sync(self):
+        self.wire(work_items=True)
+        self.add_worker("api-w1", issue=5)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.door.fail_next("work_put", 400, {"code": "bad", "message": "no"}, count=50)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1, "the decision still went out")
+        self.assertEqual(len(self.file_body()["decisions"]), 1)
+
+    def test_loading_the_script_imports_nothing_of_the_adapter(self):
+        code = ("import importlib.machinery as m, importlib.util as u, sys\n"
+                "l = m.SourceFileLoader('x_sb', %r); s = u.spec_from_loader('x_sb', l); mod = u.module_from_spec(s)\n"
+                "l.exec_module(mod)\n"
+                "print('external_adapter' in sys.modules, 'mapping' in mod.EXTERNAL_ADAPTERS)\n" % str(SWITCHBOARD))
+        done = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "False True", "registered by name, loaded by nobody")
+
+    def test_the_loader_is_the_one_the_core_uses(self):
+        text = SWITCHBOARD.read_text()
+        self.assertIn("def load_external_adapter", text)
+        self.assertNotIn("\nimport external_adapter", text)
+        self.assertNotIn("\nfrom external_adapter", text)
 
 
 # ---------------------------------------------------------------- work items from worker assignments
