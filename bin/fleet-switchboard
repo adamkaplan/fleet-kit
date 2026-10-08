@@ -4944,6 +4944,54 @@ def register_external_adapter(name, factory):
     return factory
 
 
+def judge_inbound_answer(engine, decision, answer, role):
+    """Whether an answer that came from outside may be applied, judged as the Chief of Staff's own `decisions answer`
+    is: the same four questions, put to the same decision model, with the owner's standing orders as the authority.
+    {"verdict": "allow" | "deny" | "unavailable", "reason": one line}.
+
+    Only the owner's agent is judged (the project agent counts as an orchestrator's, the human as the human's: no
+    orders are involved). It can only tighten: it is asked after role authority has accepted the answer. It fails
+    safe: orders that are missing, empty or unusable, a judge that is not on, or a model that cannot answer is never
+    an allow (the first two and the third are a deny, the last is `unavailable`, which the sync engine retries a
+    bounded number of times). Nothing is written, and the model is never reached unless the judge is on."""
+    if role != "owner_agent":
+        return {"verdict": "allow", "reason": "no standing orders are involved for this role"}
+    if fault("answer-unjudged"):
+        return {"verdict": "allow", "reason": "answer-unjudged fault"}
+    config = engine.config
+    if not config["policy"]["enabled"] or not config.get("jev") or fault("no-policy-judge"):
+        return {"verdict": "deny", "reason": "the owner's standing orders cannot be consulted: the policy judge is not "
+                                             "on, so the owner's agent's answer goes to the owner"}
+    try:
+        orders = read_cos_orders(config)["text"]
+    except CosOrdersError as err:
+        return {"verdict": "deny", "reason": "the owner's standing orders cannot be used (%s)" % _one_line(str(err), 120)}
+    if not orders:
+        return {"verdict": "deny", "reason": "no standing orders are stated, so nothing authorises the owner's agent to "
+                                             "decide this: it goes to the owner"}
+    text = _one_line(answer.get("text") or "", 600)
+    chosen = " --option %s" % answer["option_id"] if answer.get("option_id") else ""
+    arguments = "%s decisions answer %s%s %s [the decision it acts on: %s by %s, %s tier: %s]" % (
+        PROG, decision["id"], chosen, json.dumps(text), decision.get("kind"), decision.get("agent"),
+        decision.get("tier"), _one_line(decision.get("title"), 300))
+    arguments = redact_command_text(arguments, jev_secrets(config, os.environ))
+    state = policy_state("chief-of-staff", "not stated: no ask is recorded", "not stated", orders, "shell", arguments,
+                         COS_ORDERS_STATE_CLIP)
+    thresholds = dict(config["policy"]["thresholds"])
+    thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0   # the Chief of Staff has no ask: as in the judge
+    try:
+        capped = dict(config["jev"], timeout_seconds=min(config["jev"]["timeout_seconds"], POLICY_WARM_SECONDS))
+        combined = judge_tool_call(build_jev(dict(config, jev=capped)), "allow", state, thresholds)
+    except Exception as err:
+        return {"verdict": "unavailable", "reason": "the judge failed: %s" % _one_line(str(err), 120)}
+    if "answers" not in combined:   # judge_tool_call lets the configured outcome stand when the model gave no answer
+        return {"verdict": "unavailable", "reason": _one_line(combined["reason"], 200)}
+    if combined["outcome"] == "allow":
+        return {"verdict": "allow", "reason": "within the owner's standing orders"}
+    fired = "; ".join(POLICY_FIRED_TEXT[n] for n in combined["fired"] if n in POLICY_FIRED_TEXT)
+    return {"verdict": "deny", "reason": "outside the owner's standing orders (%s): it goes to the owner" % (fired or "judge")}
+
+
 class ExternalSyncHost(decision_sync.Host):
     """What the sync engine needs of the Switchboard: the audit log, and the asker's own delivery paths."""
 
@@ -4964,6 +5012,9 @@ class ExternalSyncHost(decision_sync.Host):
         if boss is None:
             raise DecisionError("%s: there is no running agent to tell" % (target.get("display_id") or target.get("id")))
         return boss
+
+    def judge_answer(self, entry, intent):
+        return judge_inbound_answer(self.engine, entry, intent, intent.get("answered_by"))
 
     def deliver_answer(self, entry, intent):
         engine, kind = self.engine, entry["kind"]
