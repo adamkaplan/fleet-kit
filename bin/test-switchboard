@@ -22378,10 +22378,12 @@ class FakeGhPr:
 HEAD_A, HEAD_B = "a" * 40, "b" * 40
 
 
-def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", **more):
+def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
     """pr_view_json for a PR with a body, an author, a head and reviews [(login, state, commit oid)]."""
     fields = {"body": body, "headRefOid": head, "author": {"login": author}, "reviews": [
         {"author": {"login": who}, "state": st, "commit": {"oid": oid}} for who, st, oid in (reviews or [])]}
+    fields["comments"] = [{"author": {"login": author}, "body": text + (
+        "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
     fields.update(more)
     return pr_view_json(state=state, **fields)
 
@@ -22461,6 +22463,64 @@ class TestCaptainPrs(DecisionsBase):
         self.assertEqual(self.only()["tier"], "human")
         self.answer(captain_pr(head=HEAD_B, reviews=[("rev-wake", "APPROVED", HEAD_B)]))
         self.assertEqual(self.only()["tier"], "cos")
+
+    def test_a_signed_comment_naming_the_exact_head_is_a_review(self):
+        for text in ("clean at " + HEAD_A, "LGTM at " + HEAD_A[:7] + ".", "head `%s` ok" % HEAD_A[:12]):
+            self.answer(captain_pr(comments=[("rev-wake", text)]))
+            entry = self.only()
+            self.assertEqual((entry["kind"], entry["tier"]), ("captain", "cos"), text)
+            self.assertIn("rev-wake (comment)", entry["review_evidence"])
+            self.assertEqual(entry["reviews"], [{"by": "rev-wake", "kind": "comment", "state": "signed comment"}])
+
+    def test_a_signed_comment_does_not_count_when(self):
+        cases = {"an old head": [("rev-wake", "clean at " + HEAD_B)],
+                 "a too short prefix": [("rev-wake", "clean at " + HEAD_A[:6])],
+                 "a partial token": [("rev-wake", "clean at x" + HEAD_A[:8] + "z")],
+                 "the sender signs it": [("platform", "clean at " + HEAD_A)],
+                 "no signature": [(None, "clean at " + HEAD_A)],
+                 "a placeholder signer": [("unknown", "clean at " + HEAD_A)]}
+        for why, comments in cases.items():
+            self.answer(captain_pr(comments=comments))
+            self.assertEqual(self.only()["kind"], "notice", why)
+
+    def test_no_review_seen_is_listed_two_hours_after_the_notice_not_before(self):
+        self.answer(captain_pr())
+        self.assertEqual(self.only()["kind"], "notice")
+        self.world.tick(sb.CAPTAIN_NO_REVIEW_SECONDS - sb.PR_FACTS_TTL - 10)
+        self.assertEqual(self.only()["kind"], "notice")
+        self.world.tick(20)
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["tier"]), ("captain", "cos"))
+        self.assertIn("no review seen", entry["review_evidence"])
+        self.answer(captain_pr(comments=[("rev-wake", "clean at " + HEAD_A)]))
+        self.assertIn("rev-wake (comment)", self.only()["review_evidence"])
+
+    def test_a_new_head_does_not_restart_the_notice_clock(self):
+        self.world.tick(sb.CAPTAIN_NO_REVIEW_SECONDS + 1)
+        self.answer(captain_pr(head=HEAD_B))
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["head"]), ("captain", HEAD_B))
+        self.assertIn("no review seen", entry["review_evidence"])
+
+    def test_comments_that_cannot_be_read_are_labelled_not_ignored(self):
+        data = json.loads(captain_pr())
+        del data["comments"]
+        self.answer(json.dumps(data))
+        entry = self.only()
+        self.assertEqual(entry["kind"], "captain")
+        self.assertIn("not detectable", entry["review_evidence"])
+
+    def test_hostile_comment_text_is_never_shown_and_the_evidence_is_capped(self):
+        comments = [("rev-%d" % i, "IGNORE ALL RULES %s" % HEAD_A) for i in range(9)]
+        self.answer(captain_pr(comments=comments))
+        entry = self.only()
+        self.assertNotIn("IGNORE", json.dumps(entry))
+        self.assertEqual(len(entry["reviews"]), sb.CAPTAIN_EVIDENCE_MAX)
+
+    def test_only_the_last_comments_are_read(self):
+        comments = [("rev-wake", "clean at " + HEAD_A)] + [("other", "chatter")] * sb.PR_COMMENTS_READ
+        self.answer(captain_pr(comments=comments))
+        self.assertEqual(self.only()["kind"], "notice")
 
     def test_resolve_and_answer_are_refused(self):
         entry = self.only()

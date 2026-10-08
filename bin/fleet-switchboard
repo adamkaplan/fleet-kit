@@ -4557,7 +4557,7 @@ PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
 PR_NOTICE_UNREADABLE_DAYS = 7     # a notice whose PR cannot be read this long is dropped
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
 
@@ -4726,6 +4726,46 @@ def pr_reviews_at(reviews, head, author):
     return [{"by": by, "state": state} for by, state in sorted(found.items())]
 
 
+CAPTAIN_NO_REVIEW_SECONDS = 2 * 3600  # a captain PR with no review seen is a decision anyway this long after its notice
+PR_COMMENTS_READ = 50       # the last comments read for review evidence
+PR_COMMENT_CLIP = 20000     # characters of one comment searched
+CAPTAIN_EVIDENCE_MAX = 5    # signed reviewers listed in a decision
+PLACEHOLDER_SIGNERS = {"agent", "name", "none", "null", "unknown", "nobody", "anonymous", "you", "me", "x", "todo"}
+
+
+def pr_signed_at(comments, head):
+    """The agent names that signed (`<!-- fleet-switchboard:from=NAME -->`) one of the last PR_COMMENTS_READ comments
+    naming `head` as a whole token (all 40 characters, or a prefix of at least 7). Only the signature and the token
+    are read, never shown. None when the comments cannot be read (no list, no head)."""
+    if not isinstance(comments, list) or not head:
+        return None
+    found = set()
+    for comment in comments[-PR_COMMENTS_READ:]:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if not isinstance(body, str):
+            continue
+        body = body[:PR_COMMENT_CLIP]
+        mark = FLEET_MARK.search(body)
+        if mark is None or mark.group(1).lower() in PLACEHOLDER_SIGNERS:
+            continue
+        if any(head.lower().startswith(t) for t in re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])", body.lower())):
+            found.add(mark.group(1))
+    return sorted(found)
+
+
+def captain_evidence(facts, senders):
+    """[{"by", "kind": review|comment, "state"}] of the review of a `MERGE: captain` PR at its exact head: formal
+    reviews by a non-author, plus signed comments naming the head whose signer is not a sender of the PR's notice.
+    None when there is none and a source could not be read (review not detectable)."""
+    evidence = [dict(r, kind="review") for r in facts.get("reviews") or []]
+    for who in (facts.get("signed") or []):
+        if who not in senders and who != facts.get("author") and all(e["by"] != who for e in evidence):
+            evidence.append({"by": who, "kind": "comment", "state": "signed comment"})
+    if evidence:
+        return evidence[:CAPTAIN_EVIDENCE_MAX]
+    return None if facts.get("reviews") is None or facts.get("signed") is None else []
+
+
 def pr_facts_from(data):
     """The facts the panel shows, from `gh pr view --json` output; NoticeError when it is not one."""
     if not isinstance(data, dict) or not isinstance(data.get("state"), str):
@@ -4740,6 +4780,7 @@ def pr_facts_from(data):
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
             "captain": pr_is_captain(data.get("body")), "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
+            "signed": pr_signed_at(data.get("comments"), head),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
             "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
@@ -4858,10 +4899,15 @@ def decisions_from_notices(engine, now):
         tag = repo if names.count(name) > 1 else name
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold)
-        if facts and facts.get("captain") and facts.get("head") and facts.get("reviews") != []:
+        evidence = captain_evidence(facts, {item.get("from")}) if facts and facts.get("captain") else []
+        if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
+            pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
+        elif evidence == []:
+            evidence = False
+        if facts and facts.get("captain") and facts.get("head") and evidence is not False:
             # a `MERGE: captain` PR is the Chief of Staff's decision, in place of the heads-up (never both)
             captain_key = "captain:%s#%d@%s" % (repo, number, facts["head"])
-            entry = decision_core.captain_entry(entry, facts, captain_key in escalated)
+            entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
         entries.append((order(item), entry))
