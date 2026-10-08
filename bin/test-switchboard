@@ -7654,6 +7654,9 @@ import datetime  # noqa: E402  (this section's only import)
 
 FAKE_GH = "/fake/bin/gh"
 FAKE_REPO = "acme/fleet"
+# The judge tests were written for a judge that fires at 0.5 on every call; the defaults of issue 87 (the routine pre-filter, 0.9 for
+# three questions) are tested in TestJudgeAccuracy. These fixtures keep the earlier behaviour so those tests still say what they said.
+LEGACY_POLICY = {"routine_filter": False, "thresholds": {q: 0.5 for q in ("outside_intent", "hard_to_reverse", "speaks_for_you", "outside_scope")}}
 ISSUES_API = "repos/%s/issues/" % FAKE_REPO
 
 
@@ -10198,7 +10201,7 @@ class PolicyCountingJev:
 def policy_raw_config(**policy):
     """A validated config with the judge on, answering from the replay file."""
     return sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH,
-                               "intent_repo": FAKE_REPO, "policy": dict({"enabled": True}, **policy),
+                               "intent_repo": FAKE_REPO, "policy": {**LEGACY_POLICY, "enabled": True, **policy},
                                "jev": {"replay": str(POLICY_REPLAY)}})
 
 
@@ -10288,7 +10291,7 @@ EXPECT_EXAMPLES["policy_outcome"] = {"agent": "coder", "step": 0, "outcome": "as
 class TestPolicyConfig(Base):
     def test_off_by_default_with_documented_defaults(self):
         policy = sb.validate_config({})["policy"]
-        self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": {}, "cache_seconds": 300,
+        self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": sb.POLICY_DEFAULT_THRESHOLDS, "routine_filter": True, "cache_seconds": 300,
                                   "cache_entries": 200, "shadow": False})
 
     def check_rejected(self, policy, fragment, **extra):
@@ -10318,7 +10321,7 @@ class TestPolicyConfig(Base):
         self.check_rejected({"enabled": True}, "needs a 'jev' object")
         config = sb.validate_config({"policy": {"enabled": True, "budget_ms": 400, "thresholds": {"outside_scope": 0.8}},
                                      "jev": {}})
-        self.assertEqual((config["policy"]["budget_ms"], config["policy"]["thresholds"]), (400, {"outside_scope": 0.8}))
+        self.assertEqual((config["policy"]["budget_ms"], config["policy"]["thresholds"]), (400, dict(sb.POLICY_DEFAULT_THRESHOLDS, outside_scope=0.8)))
 
     def test_the_fault_exists_and_works_only_in_the_lab(self):
         self.assertIn("no-policy-judge", sb.KNOWN_FAULTS)
@@ -10507,7 +10510,7 @@ class PolicyCase(IntentCase):
     def configure(self, rules=None, **policy):
         replay = policy_replay_file(self.home, rules or [{"noul": LOW}])
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
-                           "jev": {"replay": replay}, "policy": dict({"enabled": True}, **policy)})
+                           "jev": {"replay": replay}, "policy": {**LEGACY_POLICY, "enabled": True, **policy}})
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH:
@@ -10531,6 +10534,116 @@ class PolicyCase(IntentCase):
         config = policy_raw_config(**policy)
         return sb.PolicyJudge(config, self.world.engine.v2, self.reader, jev, sb.AuditLog(self.world.audit_path),
                               self.world.state, self.world.clock.now)
+
+
+class TestRoutineLocal(unittest.TestCase):
+    """Issue 87: the pre-filter that says a command is a read or a local reversible step, and nothing else."""
+
+    ROUTINE = [
+        "git status", "git status -s -b", "git diff", "git diff --stat", "git diff origin/main --stat", "git diff --cached --name-only", "git log --oneline -5",
+        "git log -n 5 --stat", "git show --stat HEAD", "git show HEAD", "git add -A", "git add src/a.py docs/b.md", "git commit -m 'fix the thing (#9)'",
+        "git commit --amend --no-edit", "git rev-parse --short HEAD", "git grep -n foo", "git grep -n foo src", "grep -n foo src/a.py", "grep -rn foo src docs",
+        "ls", "ls -la bin", "cat docs/a.md", "cat -n a.txt", "head -n 5 a.txt", "tail -5 a.txt", "wc -l a.txt", "uptime", "pwd", "sleep 20",
+        "node --test tests/a.test.mjs", "python3 bin/test-switchboard TestX.test_y", "fleet-switchboard report done --issue 9 'built it'",
+        "fleet-switchboard report working 'still on it'",
+    ]
+    # every bypass the review of PR #90 named, and more
+    NOT_ROUTINE = [
+        "", "   ", "a" * 1100, "ls\x00", "ls\nls",
+        # an environment prefix runs code before the command
+        "GIT_SSH_COMMAND=x git status", "LD_PRELOAD=/tmp/x.so ls", "FOO=1 ls", "PATH=/tmp ls", "GIT_EXTERNAL_DIFF=x git diff", "env FOO=1 ls", "git status GIT_X=1",
+        # git flags that write, run a program or reach out
+        "git diff --output=out", "git diff --output out", "git log --output=out", "git show --output=x HEAD", "git grep -O sh foo", "git grep --open-files-in-pager=sh foo",
+        "git grep -f patterns foo", "git fetch --upload-pack=sh", "git fetch origin", "git ls-remote --upload-pack=x", "git diff --ext-diff", "git log --format=%H", "git log --pretty=oneline",
+        "git status --foo", "git -C /etc status", "git -c core.pager=sh log", "git --git-dir=/x status", "git --exec-path=/x status", "git commit", "git commit -m", "git commit -a", "git commit -m x --no-verify",
+        "git commit -F /etc/passwd", "git add", "git add .env", "git add ../x", "git add .git/config", "git push", "git push --force", "git reset --hard", "git clean -fd", "git checkout -- .", "git rebase main",
+        "git branch -D x", "git stash drop", "git tag v1", "git remote add o u", "git config user.email x", "git worktree add ../x", "git submodule update", "git gc", "git filter-branch",
+        # other commands: dropped from the list because their flags can write or run a program
+        "sort -o out in", "sort in", "rg --pre sh x", "rg foo", "sed -n 'w out' f", "sed -n '1e id' f", "sed -i '' 's/a/b/' f", "sed -n 1p f", "awk 'BEGIN{system(\"id\")}'",
+        "gh auth status --show-token", "gh pr view 1", "gh pr edit 1 --add-label x", "gh api repos/a/b", "gh pr merge 1", "find . -delete", "find . -exec id ;", "xargs ls", "tee x", "cp a b", "mv a b",
+        "mkdir x", "touch x", "rm x", "rm -rf build", "cd bin", "echo hi", "printf x", "date", "date -s x", "env", "printenv", "which ls", "stat x", "file x", "diff a b", "jq . a.json",
+        "curl http://x", "wget http://x", "ssh host ls", "docker ps", "docker compose up", "npm test", "npm publish", "npx foo", "python3 evil.py", "python3 bin/test-x; id", "python3 bin/../evil.py",
+        "python3 -c 'import os'", "python3 - <<'EOF'\nprint(1)\nEOF", "node script.js", "node --test /etc/x", "node --test ../x", "node --eval x", "bash -c ls", "sh x.sh", "eval ls", "nice ls", "timeout 5 ls",
+        # chaining, pipes, redirects, substitution, globs, quoting tricks
+        "ls; ls", "ls && ls", "ls || ls", "ls | head", "git diff | head", "ls &", "ls > x", "ls >> x", "ls 2>&1", "ls > /dev/null", "ls < x", "cat a | sh", "ls $(id)", "ls `id`", "ls ${HOME}", "echo $HOME",
+        "ls *", "ls ?", "ls [a]", "ls ~", "ls ~root", "cat <(ls)", "ls 'unbalanced", "ls \"unbalanced", "ls #comment", "ls !", "ls \\n", "ls {a,b}", "ls (a)",
+        # paths outside the worktree, dotfiles, credentials
+        "cat /etc/passwd", "cat /private/tmp/x", "cat ~/.ssh/id_rsa", "cat ../x", "cat a/../../x", "cat .env", "cat .git/config", "cat .ssh/id_rsa", "cat a/.env", "cat secrets.txt", "cat my_token.txt",
+        "cat server.pem", "cat id_rsa", "cat .netrc", "cat credentials.json", "cat .npmrc", "ls /", "ls -la /etc", "ls ..", "ls .git", "ls .ssh", "head -n 5 /etc/hosts", "tail ../x", "wc -l /etc/passwd",
+        "grep -rn foo /etc", "grep -rn foo ..", "grep foo", "grep -e foo a", "git grep", "git diff ../x", "git diff /etc/x", "git log -- /etc", "git show HEAD:../x", "git diff a..b",
+        # flags not on the list, or with the wrong value
+        "ls -z", "ls --color=always", "ls -la -z", "cat -z a", "head -n x a", "head -n", "head -z a", "tail -f a", "wc -m a", "grep -P foo a", "grep --include=x foo a", "git log -n", "git log -n x",
+        "git log --all", "git diff -U99999 --", "sleep", "sleep x", "sleep 1 2", "sleep -1", "pwd -P", "uptime -p",
+        # fleet-switchboard: only report <state> [--issue N] "<one line>"
+        "fleet-switchboard launch x", "fleet-switchboard decisions answer 1 yes", "fleet-switchboard orders", "fleet-switchboard report", "fleet-switchboard report nonsense x", "fleet-switchboard report done",
+        "fleet-switchboard report done --issue x 'y'", "fleet-switchboard report done 'a' 'b'", "fleet-switchboard report done --foo 'y'", "fleet-switchboard send x y", "./fleet-switchboard report done 'x'", "bin/fleet-switchboard report done 'x'",
+    ]
+
+    def test_reads_and_local_reversible_steps_are_routine(self):
+        for command in self.ROUTINE:
+            with self.subTest(command=command):
+                self.assertTrue(sb.routine_local(command), command)
+
+    def test_anything_that_acts_outside_or_cannot_be_read_with_certainty_is_not(self):
+        for command in self.NOT_ROUTINE:
+            with self.subTest(command=command):
+                self.assertFalse(sb.routine_local(command), command)
+        for odd in (None, 5, [], {}, b"ls"):
+            self.assertFalse(sb.routine_local(odd))
+
+    def test_the_defaults_and_the_setting(self):
+        self.assertEqual(sb.POLICY_DEFAULT_THRESHOLDS, {"outside_intent": 0.9, "speaks_for_you": 0.9, "outside_scope": 0.9, "hard_to_reverse": 0.5})
+        self.assertEqual(sb.validate_config({"jev": {}, "policy": {}})["policy"]["thresholds"], sb.POLICY_DEFAULT_THRESHOLDS)
+        got = sb.validate_config({"jev": {}, "policy": {"thresholds": {"outside_intent": 0.5}}})["policy"]
+        self.assertEqual((got["thresholds"]["outside_intent"], got["thresholds"]["speaks_for_you"], got["routine_filter"]), (0.5, 0.9, True))
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"jev": {}, "policy": {"routine_filter": bad}})
+        self.assertEqual(sb.combine_policy({"outside_intent": 0.6}, None, "allow")["outcome"], "hard-deny", "the library default is unchanged")
+
+
+class TestJudgeAccuracy(PolicyCase):
+    """Issue 87: the judge that was wrong on 77 of 80 would-deny/ask verdicts in a labelled sample."""
+
+    HIGH_INTENT = [{"noul": dict(LOW, outside_intent=0.8, speaks_for_you=0.8)}]
+
+    def new_defaults(self):
+        self.configure(self.HIGH_INTENT, routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+
+    def test_a_routine_command_is_not_judged_and_the_audit_says_why(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "git grep -n foo src", "allow")
+        self.assertEqual((reply["outcome"], reply["judged"]), ("allow", True))
+        (event,) = self.audit_events()
+        self.assertEqual((event["detail"]["model"], event["detail"]["usage"]), (None, {}))  # no model was asked
+        self.assertEqual(event["detail"]["fired"], [])
+
+    def test_the_same_scores_on_a_command_that_is_not_routine_are_below_the_new_defaults(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "python3 - <<'EOF'\nprint(1)\nEOF", "allow")
+        self.assertEqual(reply["outcome"], "allow", "0.8 on outside_intent and speaks_for_you no longer fires at 0.9")
+        self.configure([{"noul": dict(LOW, outside_intent=0.95)}], thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        reply = self.judge_tool(self.coder, "shell", "python3 evil.py", "allow")
+        self.assertEqual(reply["outcome"], "deny", "a confident outside_intent still hard-denies")
+
+    def test_a_configured_ask_or_deny_is_never_loosened_by_the_filter_or_the_thresholds(self):
+        self.new_defaults()
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "ask")["outcome"], "ask")
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "deny")["outcome"], "deny")
+        self.assertEqual(self.judge_tool(self.coder, "shell", "python3 evil.py", "ask")["outcome"], "ask")
+
+    def test_hard_to_reverse_keeps_its_threshold_and_the_filter_can_be_switched_off(self):
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "python3 evil.py", "allow")["outcome"], "ask")
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=False, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "allow")["outcome"], "ask", "off: the model is asked about everything")
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.6)}], routine_filter=True, thresholds=dict(sb.POLICY_DEFAULT_THRESHOLDS))
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git status", "allow")["outcome"], "allow", "on: a read is not asked")
+
+    def test_the_rules_that_need_no_model_still_come_first(self):
+        self.new_defaults()
+        reply = self.judge_tool(self.coder, "shell", "gh repo create acme/x", "allow")
+        self.assertEqual(reply["outcome"], "ask", "the commissioning rule is not a routine step")
 
 
 class TestJudgeTool(PolicyCase):
@@ -10976,7 +11089,7 @@ class TestJudgeToolRequestHandling(PolicyCase):
         self.assertIn("RuntimeError", reply["reason"])
 
     def test_without_an_opencode_binary_the_judge_cannot_identify_and_says_so(self):
-        self.write_config({"herdr": FAKE_HERDR, "intent_repo": FAKE_REPO, "gh": FAKE_GH, "policy": {"enabled": True},
+        self.write_config({"herdr": FAKE_HERDR, "intent_repo": FAKE_REPO, "gh": FAKE_GH, "policy": {**LEGACY_POLICY, "enabled": True},
                            "jev": {"replay": policy_replay_file(self.home, [{"noul": LOW}])}})
         reply = self.judge_tool(self.coder, "shell", "x", "ask")
         self.assertEqual((reply["outcome"], reply["judged"]), ("ask", False))
@@ -11282,7 +11395,7 @@ class TestPolicyReport(PolicyCase):
             self.assertIn(fragment, text)
 
     def config_of(self, **policy):
-        return sb.validate_config({"jev": {}, "policy": dict({"enabled": True}, **policy)})
+        return sb.validate_config({"jev": {}, "policy": {**LEGACY_POLICY, "enabled": True, **policy}})
 
     def test_working_agents_and_a_silent_judge_alarm(self):
         result = sb.policy_liveness(self.config_of(), self.world.state, 2, self.now)
@@ -20277,7 +20390,7 @@ class TestOrdersDelivery(OrdersDeliveryCase):
     def test_it_reuses_the_judges_warmed_read_of_the_charter(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
                            "jev": {"replay": policy_replay_file(self.home, [{"noul": LOW}])},
-                           "policy": {"enabled": True}})
+                           "policy": {**LEGACY_POLICY, "enabled": True}})
         self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
         self.world.engine = self.world.new_engine()
         judge = sb.PolicyJudge(self.world.config, self.world.engine.v2, sb.IntentReader(
@@ -26114,7 +26227,7 @@ class ExternalWorld(BaselineWorld):
         else:
             path.write_text(orders)
         self.set_judge()
-        self.set_config(external_decisions=section, policy={"enabled": True}, jev={"replay": str(self.home / "judge.json")},
+        self.set_config(external_decisions=section, policy={**LEGACY_POLICY, "enabled": True}, jev={"replay": str(self.home / "judge.json")},
                         cos_orders_file=str(path))
 
     def run_pass(self, seconds=5):
@@ -26201,6 +26314,36 @@ class TestExternalTiers(ExternalWorld):
                 sb.validate_config({"external_decisions": dict(good, tiers=bad)})
         for ok in ([], ["human"], ["cos", "human"], ["orchestrator", "cos", "human"]):
             self.assertEqual(sb.validate_config({"external_decisions": dict(good, tiers=ok)})["external_decisions"]["tiers"], ok)
+
+
+class TestJudgeSample(unittest.TestCase):
+    """bin/judge-sample (issue 87): a stratified, reproducible sample from the audit log, never written inside the repo."""
+
+    def row(self, i, verdict, agent="coder-a", shadow=True):
+        state = {"arguments": "cmd %d" % i, "intent": "i", "done_when": "d", "tool": "shell", "role": "coder"}
+        return {"event": "policy.judge", "ts": "2026-10-08T00:00:%02dZ" % (i % 60), "detail": {
+            "shadow": shadow, "judged": True, "verdict": verdict, "agent": agent, "role": "coder", "tool": "shell", "ask": 1,
+            "fired": ["outside_intent"], "answers": {}, "thresholds": {}, "reason": "r", "question": {"state": state}}}
+
+    def test_it_draws_each_kind_distinct_reproducible_and_refuses_the_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = Path(tmp) / "audit.jsonl"
+            rows = [self.row(i, v, agent="a%d" % (i % 3)) for i, v in enumerate(["would-deny", "would-ask", "unchanged"] * 20)]
+            rows += [self.row(0, "would-deny", agent="a0"), self.row(1, "would-deny", shadow=False)]  # a repeat, and a non-shadow
+            audit.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+            out = Path(tmp) / "s.jsonl"
+            cmd = [sys.executable, str(REPO / "bin" / "judge-sample"), "--audit", str(audit), "--out", str(out), "--deny", "5", "--ask", "4", "--control", "3"]
+            self.assertEqual(subprocess.run(cmd, capture_output=True, text=True).returncode, 0)
+            first = out.read_text()
+            got = [json.loads(l) for l in first.splitlines()]
+            self.assertEqual(sorted(r["verdict"] for r in got).count("would-deny"), 5)
+            self.assertEqual((len(got), len({(r["arguments"], r["verdict"]) for r in got})), (12, 12))
+            self.assertTrue(all(r["label"] is None and r["intent"] == "i" for r in got))
+            subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(out.read_text(), first, "the same seed gives the same sample")
+            bad = subprocess.run(cmd[:-6] + ["--out", str(REPO / "bin" / "never.jsonl")], capture_output=True, text=True)
+            self.assertEqual(bad.returncode, 2)
+            self.assertFalse((REPO / "bin" / "never.jsonl").exists())
 
 
 class TestExternalDecisionConfig(unittest.TestCase):

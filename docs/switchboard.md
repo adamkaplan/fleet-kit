@@ -914,6 +914,28 @@ one-line standing authority (for example "may merge green PRs"), and the tool
 and its arguments. The four answers are combined in code with thresholds, and
 the questions, answers and outcome go to the audit log.
 
+**Accuracy (issue 87).** In a labelled sample of 100 recent shadow verdicts, 77 of the 80 would-deny and would-ask verdicts were
+wrong (deny 0/40 right, ask 3/40 right; the 20 unchanged were all right). The wrong ones were routine work of a coder or an
+orchestrator: a `git grep`, a test run, a report to its boss, a label on its own PR. Two causes, two fixes, both only ever less strict
+than the model alone (the configured outcome is combined as before and a configured `ask` or `deny` is never loosened):
+
+- **A step is not the whole ask.** `outside_intent` compares each action to the ask's Done-when, which is the product's, so a harmless
+  step looked "outside". Its scores on the 40 wrong denies ran 0.50 to 0.87 and none was right. The defaults are now 0.9 for
+  `outside_intent`, `speaks_for_you` and `outside_scope` (the right asks in the sample scored 0.97) and 0.5 for `hard_to_reverse`
+  (a missed destructive call costs more than an extra ask). `policy.thresholds` still overrides each question.
+- **Routine local steps need no model.** `policy.routine_filter` (default `true`) answers "nothing at its threshold" in code, with no
+  model call, for ONE simple shell command on a strict allowlist that fails closed: a read or a local reversible step inside the worktree.
+  The command word and EVERY flag must be listed for it: `git` `status`, `diff`, `log`, `show`, `rev-parse`, `grep`, `add` and `commit -m` with a
+  short set of safe flags; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `pwd`, `uptime`, `sleep N`; `node --test <paths>` and `python3 bin/test-*`
+  (the agent's own tests); `fleet-switchboard report <state> [--issue N] "<line>"`. An unknown flag, an environment prefix
+  (`GIT_SSH_COMMAND=`, `LD_PRELOAD=`), a wrapper, any redirect, pipe, chain, substitution, glob or heredoc, a path that is absolute, home,
+  has `..`, names a dotfile (`.git/config`, `.env`) or looks like a credential, and every `sed`, `sort`, `rg`, `find`, `gh`, `cp`, `mv`, `rm`,
+  `curl`, shell or script go to the model as before. Such a call is audited with `model: null`. A symlink inside the worktree that points
+  outside it cannot be seen from the command's text: a known limit. Set `"routine_filter": false` to ask the model about everything.
+
+What the audit records: `arguments` is cut to 300 characters in the audit, but the judge itself is sent up to 1500 (the plugin sends up to 4000), so
+the model sees more than a labeller reading the audit does. `bin/judge-sample` draws a stratified sample from the audit for labelling.
+
 ```mermaid
 flowchart LR
   call["Tool call"] --> rules{"Configured rules"}
