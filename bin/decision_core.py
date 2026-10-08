@@ -483,19 +483,22 @@ def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_mi
             "merge_after": iso(created + hold_minutes * 60) if hold_minutes > 0 else None}
 
 
-def captain_entry(notice, facts, escalated):
+def captain_entry(notice, facts, escalated, evidence):
     """A `MERGE: captain` PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
-    of Staff escalated it for this head). Only a review by someone other than the author at the exact head counts;
-    when reviews cannot be read it stands on the notice alone, and says so."""
-    reviews, head = facts.get("reviews"), facts.get("head")
-    if reviews is None:
-        evidence, review = "review not detectable: on notice alone", "not detectable"
+    of Staff escalated it for this head). `evidence` is who reviewed it at the exact head ([{"by", "kind", "state"}]:
+    a formal review or a signed comment), [] when none was seen (the notice outlasted its wait), or None when that
+    cannot be read: it then stands on the notice alone and says so."""
+    head = facts.get("head")
+    if evidence is None:
+        text, review = "review not detectable: on notice alone", "not detectable"
+    elif not evidence:  # a readable absence, listed because the notice has waited too long
+        text, review = "no review seen at %s: on notice for over the wait limit" % head[:8], "none seen"
     else:
-        evidence = "reviewed at %s by %s" % (head[:8], ", ".join("%s (%s)" % (r["by"], r["state"]) for r in reviews))
-        review = "; ".join(r["state"] for r in reviews)
-    entry = dict(notice, kind="captain", tier="human" if escalated else "cos", head=head, review=review,
-                 reviews=reviews, review_evidence=line_of(evidence, 200))
-    return entry
+        text = "reviewed at %s by %s" % (head[:8], ", ".join(
+            "%s (%s)" % (e["by"], e["state"] if e["kind"] == "review" else "comment") for e in evidence))
+        review = "; ".join(e["state"] for e in evidence)
+    return dict(notice, kind="captain", tier="human" if escalated else "cos", head=head, review=review,
+                reviews=evidence, review_evidence=line_of(text, 200))
 
 
 def order_decisions(decisions):

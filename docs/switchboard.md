@@ -2123,7 +2123,15 @@ reviewers: a decision for the Chief of Staff, in place of the heads-up (never bo
 never in the `human` tier until the Chief of Staff runs `decisions escalate` (which holds for that head only). If
 the reviews cannot be read, it stands on the notice alone and says `review not detectable`. A review at an older head,
 the author's own review, or no review leaves a plain heads-up. It ends when the PR merges or closes; `resolve`,
-`answer` and `supersede` are refused. Limit: only a PR that carries a notice is covered.
+`answer` and `supersede` are refused. Agents in one fleet share a GitHub login, so
+review evidence is a formal review by a non-author at the head **or** a signed comment
+(`<!-- fleet-switchboard:from=NAME -->`) whose text names the exact head (all 40 characters, or a prefix of at least 7,
+as a whole token), from a signer that is neither a placeholder nor any agent that ever sent the notice (it keeps up to 20 distinct senders across re-sends); only the last 50 comments are
+read, only the signature and the head token are looked at (never shown), and at most 5 reviewers are listed, each as
+`name (review state)` or `name (comment)`. A PR with no evidence is a plain heads-up, except that 2 hours
+(`CAPTAIN_NO_REVIEW_SECONDS`) after the notice was first recorded it is listed anyway, marked `no review seen`, so
+nothing stalls silently; a new head does not restart that clock, and a later review replaces the mark with normal
+evidence. Limit: only a PR that carries a notice is covered.
 
 **The panel.** The `fleet-decisions-tui` plugin draws a `Heads-up (n)` section after `Waits on you` and before
 `Waits on cos`, grouped by repo like the others and visibly separated. Each entry is its headline (two lines at
