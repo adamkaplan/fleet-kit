@@ -1151,7 +1151,22 @@ disappears (design law: no disappearing UI): an empty list is a row `none`, and 
 missing, unreadable or stale file, or a state directory it cannot place, is a row
 `daemon not updating`. It watches the **directory** of `decisions.json` with
 `fs.watch`, because the file is replaced by rename, with one slow re-read every 60
-s and one timer for the moment a list would turn stale. It spawns no process, holds
+s and one timer for the moment a list would turn stale.
+
+**The styled panel (issue 67, iteration 1)** is the default drawing. Same sections, groups and order as above; what changes is
+only how a row looks. The title row is `Decisions` with the view label flush right, then one summary line: `N need you`
+(`need human` in the Chief of Staff's and a repo's panel) · `M PRs to watch` · `K wait on cos` (`K with cos` in a human's panel),
+with `(J over 1h)` when some have waited over an hour. Colour comes from the TUI theme (`text.muted`, and
+`text.feedback.warning`/`error`/`success`/`info`), never from a fixed colour; a theme without a token draws that text in the base colour.
+What needs you is bold. An id line is the id (muted) on the left and its age flush right: muted under 1h, warning from 1h, error
+from 24h. A heads-up shows its PR number (`#2644`) in place of `pr:<repo>#N` (it is information, never answered by id; the
+real id is unchanged in the file); its facts are coloured (`CI failing` bold red, green and approved green, pending warning,
+`no review` muted). A repo shows by its name without the org when no other repo anywhere in the file has that name (heads-ups
+and every tier included), else with the org; in a headline `org/repo#N` becomes `repo#N` by the same test, and a ref to the group's own
+repo becomes `#N`. The counts are the same ones the plain panel's titles give. `FLEET_SWITCHBOARD_PANEL=plain` in the TUI's
+environment draws the earlier plain panel instead (and so does any error while drawing the styled one); `viewLines`, the
+Decision baseline's plain view, is unchanged and still tested. To roll back, copy the previous `tui.tsx` and `decisions.mjs` over
+the installed ones and restart the TUI. It spawns no process, holds
 no credential and makes no network call; it reads only `decisions.json` in the state
 directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
 daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or
