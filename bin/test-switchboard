@@ -7042,6 +7042,298 @@ class TestRemindCLI(PR4Base):
         self.assertIn("HERDR_PANE_ID", err)
 
 
+# ---- self-wakes: checkpoint reminders and the daily friction wake (docs/switchboard.md, "Self-wakes")
+
+BRIEF_30_60 = "ISSUE: x\nCHECKPOINT: Report at 30 minutes (kind working, one line); overdue at 60.\n"
+
+
+class TestParseCheckpoint(unittest.TestCase):
+    def test_several_phrasings(self):
+        for line, want in (
+                ("CHECKPOINT: Report at 30 minutes (kind working, one line); overdue at 60.", (1800, 3600)),
+                ("CHECKPOINT: report in 20m, overdue 45m", (1200, 2700)),
+                ("checkpoint: at 15 min, overdue at 30 min", (900, 1800)),
+                ("CHECKPOINT: Report at 1 hour; overdue at 90 minutes", (3600, 5400)),
+                ("CHECKPOINT: Report at 2h ... overdue at 3", (7200, 10800)),
+                ("CHECKPOINT: report after 45 seconds, overdue after 2m", (45, 120))):
+            with self.subTest(line=line):
+                self.assertEqual(sb.parse_checkpoint("ISSUE: x\n" + line + "\nSTOP: y\n"), want)
+
+    def test_an_unparseable_line_is_none_never_an_error(self):
+        for brief in ("CHECKPOINT: <a UTC time or an agreed event, with an overdue time>",
+                      "CHECKPOINT: when the PR is up", "CHECKPOINT: Report at 30 minutes", "no such line",
+                      "CHECKPOINT: Report at 60 minutes; overdue at 30", "CHECKPOINT: at 30; overdue at 60", "", None):
+            with self.subTest(brief=brief):
+                self.assertIsNone(sb.parse_checkpoint(brief))
+
+
+class SelfWakeBase(PR4Base):
+    def set_reminders(self, checkpoint="30m", overdue="60m", brief=None, name="coder", boss="platform"):
+        engine = self.world.engine
+        return sb.set_checkpoint_reminders(engine, self.world.state, name, boss, 2, None, brief, checkpoint, overdue,
+                                           self.world.clock.now(), self.world.clock.now())
+
+    def texts(self, name):
+        return [a["text"] for a in self.world.admissions(name)]
+
+    def wait(self, seconds):
+        self.world.tick(seconds)
+        return self.world.engine.run_pass()
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+
+class TestCheckpointReminders(SelfWakeBase):
+    def test_flags_set_both_reminders(self):
+        note = self.set_reminders()
+        items = {r["to"]: r for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(set(items), {"coder", "platform"})
+        worker, boss = items["coder"], items["platform"]
+        self.assertEqual((worker["text"], worker["at"], worker["condition"]),
+                         ("checkpoint due: report now, one line", EPOCH + 1800, {"while_running": "coder"}))
+        self.assertEqual((boss["text"], boss["at"], boss["issue"]),
+                         ("coder has not reported since launch: overdue checkpoint", EPOCH + 3600, 2))
+        self.assertEqual(boss["condition"], {"unless_report_from": "coder", "since": EPOCH})
+        self.assertIn("checkpoint reminders", note)
+        self.assertEqual(len(self.events("reminder.add")), 2)
+
+    def test_the_brief_is_parsed_when_no_flag_is_given(self):
+        self.set_reminders(None, None, BRIEF_30_60)
+        self.assertEqual(sorted((r["to"], r["at"] - EPOCH) for r in sb.read_reminders(self.world.state)),
+                         [("coder", 1800), ("platform", 3600)])
+
+    def test_an_unparseable_brief_makes_no_reminder_and_one_note(self):
+        note = self.set_reminders(None, None, "CHECKPOINT: when it is done")
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        self.assertIn("no checkpoint reminders", note)
+        self.assertNotIn("\n", note)
+
+    def test_a_flag_wins_over_the_brief_and_a_bad_flag_is_a_note(self):
+        self.set_reminders("5m", "10m", BRIEF_30_60)
+        self.assertEqual(sorted(r["at"] - EPOCH for r in sb.read_reminders(self.world.state)), [300, 600])
+        note = self.set_reminders("soon", "10m")
+        self.assertIn("no checkpoint reminders", note)
+
+    def test_the_worker_is_reminded_at_its_time_and_not_before(self):
+        self.set_reminders()
+        self.assertEqual(self.wait(1790)["sent"], [])
+        self.assertEqual(self.texts("coder"), [])
+        self.assertEqual(len(self.wait(10)["sent"]), 1)
+        self.assertEqual(len(self.texts("coder")), 1)
+        self.assertIn("checkpoint due: report now, one line", self.texts("coder")[0])
+        self.assertEqual(self.texts("platform"), [])
+
+    def test_the_overdue_reminder_wakes_the_orchestrator_when_no_report_came(self):
+        self.set_reminders()
+        self.wait(3590)
+        self.assertEqual(self.texts("platform"), [])
+        self.wait(10)
+        (text,) = self.texts("platform")
+        self.assertIn("coder has not reported since launch: overdue checkpoint", text)
+
+    def test_a_report_after_the_launch_drops_the_overdue_reminder(self):
+        for state in ("question", "working"):  # an attention report, and a rider
+            with self.subTest(state=state):
+                self.tearDown()
+                self.setUp()
+                self.set_reminders()
+                self.world.tick(60)
+                self.world.new_engine("cli").report("coder", state, "on it")
+                self.world.engine.run_pass()
+                self.wait(3600)
+                self.assertFalse([t for t in self.texts("platform") if "overdue checkpoint" in t])
+                self.assertEqual([r["to"] for r in sb.read_reminders(self.world.state)], [])
+                (drop,) = self.events("reminder.drop")
+                self.assertIn("reported", drop["detail"]["why"])
+
+    def test_a_send_after_the_launch_also_cancels_it(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").send("coder", "platform", "quick question", None, None)
+        self.wait(3600)
+        self.assertFalse([t for t in self.texts("platform") if "overdue checkpoint" in t])
+        self.assertEqual(len(self.events("reminder.drop")), 1)
+
+    def test_a_report_from_before_the_launch_does_not_cancel_it(self):
+        self.world.new_engine("cli").report("coder", "done", "an older task")
+        self.world.tick(120)
+        self.set_reminders()
+        self.wait(3600)
+        self.assertTrue([t for t in self.texts("platform") if "overdue checkpoint" in t])
+
+    def test_a_gone_worker_drops_the_reminder_audited(self):
+        self.set_reminders()
+        del self.world.herdr.panes[self.world.panes["coder"]]
+        self.wait(3600)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        self.assertEqual(self.texts("platform"), [])
+        self.assertEqual(sorted(e["detail"]["id"] for e in self.events("reminder.drop")),
+                         sorted(e["detail"]["id"] for e in self.events("reminder.add")))
+        self.assertIn("gone", self.events("reminder.drop")[0]["detail"]["why"])
+
+    def test_an_unconditional_reminder_is_what_it_was(self):
+        sb.add_reminder(self.world.state, "platform", EPOCH + 10, EPOCH, "plain")
+        self.assertNotIn("condition", sb.read_reminders(self.world.state)[0])
+        self.wait(10)
+        self.assertEqual(len(self.texts("platform")), 1)
+
+
+class FrictionBase(Base):
+    def setUp(self):
+        super().setUp()
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+
+        def restore():
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.addCleanup(restore)
+        self.make()
+
+    def make(self, section=None, **kwargs):
+        config = {"friction_wake": dict({"enabled": True}, **(section or {}))} if section != "off" else {}
+        self.world = World(self, agents=(), config=config, **kwargs)
+        for name, role in (("platform", "orchestrator"), ("web", "orchestrator"), ("coder", "coder"),
+                           ("cos", "chief-of-staff")):
+            self.world.add_agent(name, fleet={"role": role})
+
+    def pass_at(self, seconds):
+        self.world.tick(seconds)
+        return self.world.engine.run_pass()
+
+    def friction(self, name):
+        return [a for a in self.world.admissions(name) if "Daily friction check" in a["text"]]
+
+
+class TestFrictionWake(FrictionBase):
+    def test_it_is_off_by_default_and_the_defaults_are_the_documented_ones(self):
+        self.assertNotIn("friction_wake", sb.DEFAULTS)
+        self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
+        self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "fleetkit", "text": None})
+        self.make("off")
+        self.pass_at(3600)
+        self.assertEqual([self.friction(n) for n in ("platform", "web")], [[], []])
+        self.make({})  # a section that is present and says nothing: still enabled only by `enabled`
+        raw = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "friction_wake": {}})
+        self.assertFalse(raw["friction_wake"]["enabled"])
+
+    def test_the_default_text_is_the_fixed_one(self):
+        self.pass_at(3600)
+        (found,) = self.friction("platform")
+        self.assertIn("Daily friction check (one short answer): what slowed you or your coders down in the last day? "
+                      "If anything is worth fixing, send fleetkit a one-paragraph proposal: fleet-switchboard send "
+                      "fleetkit --issue <n> \"<proposal>\". If nothing, do nothing and say nothing.", found["text"])
+
+    def test_one_wake_per_orchestrator_per_day_not_for_cos_or_coders(self):
+        self.assertEqual(self.pass_at(0)["sent"], [])  # 08:00, before the hour
+        self.pass_at(3600)  # 09:00
+        self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1))
+        for name in ("coder", "cos"):
+            self.assertEqual(self.friction(name), [])
+        for _ in range(5):
+            self.pass_at(600)
+        self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1), "not twice in a day")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 2)
+        self.pass_at(86400)
+        self.assertEqual(len(self.friction("platform")), 2, "and again the next day")
+
+    def test_a_restart_does_not_repeat_it_with_or_without_the_state_file(self):
+        self.pass_at(3600)
+        self.world.engine = self.world.new_engine()
+        self.pass_at(5)
+        self.assertEqual(len(self.friction("platform")), 1)
+        (self.world.state / sb.FRICTION_STATE).unlink()
+        self.world.engine = self.world.new_engine()
+        self.pass_at(5)
+        self.assertLessEqual(len(self.friction("platform")), 2, "a lost file is at most one extra wake")
+
+    def test_an_engaged_orchestrator_is_skipped_until_it_is_not(self):
+        self.world.tick(3590)
+        self.world.you("platform")
+        self.pass_at(15)
+        self.assertEqual(self.friction("platform"), [])
+        self.assertEqual(len(self.friction("web")), 1)
+        self.pass_at(700)  # the engagement window has passed
+        self.assertEqual(len(self.friction("platform")), 1)
+
+    def test_a_blocked_orchestrator_gets_none(self):
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.pass_at(3600)
+        self.assertEqual(self.friction("platform"), [])
+
+    def test_with_no_hour_it_is_every_24_hours_from_the_first(self):
+        self.make({"hour": None})
+        self.pass_at(10)
+        self.assertEqual(len(self.friction("platform")), 1)
+        self.pass_at(80000)
+        self.assertEqual(len(self.friction("platform")), 1)
+        self.pass_at(6400)
+        self.assertEqual(len(self.friction("platform")), 2)
+
+    def test_the_recipient_and_the_text_are_config(self):
+        self.make({"to": "improver", "text": "What slowed you down?"})
+        self.pass_at(3600)
+        self.assertEqual(len([a for a in self.world.admissions("platform") if "What slowed you down?" in a["text"]]), 1)
+        (self.world.state / sb.FRICTION_STATE).unlink()
+        self.make({"to": "improver"})
+        self.pass_at(3600)
+        self.assertIn("fleet-switchboard send improver --issue <n>", self.friction("platform")[0]["text"])
+
+    def test_nobody_due_means_no_agent_is_read(self):
+        self.pass_at(3600)
+        before = len(self.world.v2.calls)
+        self.pass_at(5)
+        self.assertEqual([c for c in self.world.v2.calls[before:] if "prompt" in c or "admit" in c], [])
+
+    def test_the_config_is_validated_like_the_others(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad, word in (({"enabled": "yes"}, "enabled"), ({"hour": 24}, "hour"), ({"hour": "9"}, "hour"),
+                          ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"),
+                          ({"text": ""}, "text"), ({"text": 5}, "text"), ({"when": 9}, "friction_wake")):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config(dict(base, friction_wake=bad))
+            self.assertIn(word, str(caught.exception))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config(dict(base, friction_wake=[]))
+
+
+class TestSelfWakeInstructions(unittest.TestCase):
+    NEEDLE = "fleet-switchboard remind <your name> <when> --issue <n>"
+
+    def test_the_role_files_say_it_in_one_sentence(self):
+        for path in AGENT_FILES:
+            text = " ".join(path.read_text().split())
+            with self.subTest(file=path.name):
+                self.assertEqual(role_of(path) in ("coder", "orchestrator"), self.NEEDLE in text)
+                if self.NEEDLE in text:
+                    self.assertIn("set a reminder for yourself", text)
+                    self.assertIn("end your turn", text)
+                    self.assertIn("Never poll", text)
+
+    def test_the_skill_says_it_fully(self):
+        text = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
+        for phrase in (self.NEEDLE, "a CI run, a rate limit, a checkpoint", "end your turn", "Never poll in a loop",
+                       "--checkpoint 30m --overdue 60m", "only if the worker has not reported", "daily wake"):
+            self.assertIn(phrase, text)
+
+    def test_the_trimmed_files_kept_their_stop_and_authority_rules(self):
+        rules = {"coder": ("NEVER apply `awaiting-user` yourself", "Never deploy", "Never force-push",
+                           "Never merge your own PR", "Two failed attempts", "Changing a flag", "Never close another agent's"),
+                 "orchestrator": ("NEVER apply `awaiting-user` yourself", "Never deploy", "applied before you ask",
+                                  "After two failed attempts", "never widen your own access")}
+        for path in AGENT_FILES:
+            if role_of(path) in rules:
+                text = " ".join(path.read_text().split()).lower()
+                for rule in rules[role_of(path)]:
+                    with self.subTest(file=path.name, rule=rule):
+                        self.assertIn(rule.lower(), text)
+
+
 # ---- the scenarios and the validator
 
 PR4_CATALOG = {"N1": 3, "N2": 3, "W1": 4, "W3": 4, "Q1": 3, "R1": 4, "H1": None, "R3": None}
@@ -15683,6 +15975,43 @@ class TestLaunchIntoARepo(TwoRepoCase):
         code, _, err = self.launch("--repo", "other/tool")
         self.assertEqual(code, 0, err)
         self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+
+class TestLaunchSetsCheckpointReminders(TwoRepoCase):
+    def launch(self, *extra, brief=None):
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        argv = ["launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder",
+                "--reports-to", "web-orch", "--issue", "acme/web#2", *extra]
+        if brief is not None:
+            (self.home / "brief.txt").write_text(brief)
+            argv += ["--brief-file", str(self.home / "brief.txt")]
+        return self.main(*argv)
+
+    def test_flags_on_the_command_line_set_both(self):
+        code, out, err = self.launch("--checkpoint", "30m", "--overdue", "60m")
+        self.assertEqual(code, 0, err)
+        found = {r["to"]: r for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(set(found), {"web-new", "web-orch"})
+        self.assertEqual((found["web-orch"]["at"] - EPOCH, found["web-orch"]["repo"], found["web-orch"]["issue"]),
+                         (3600, ACME_WEB, 2))
+        self.assertEqual(json.loads(out)["name"], "web-new")  # the launch output is what it was
+        self.assertIn("checkpoint reminders", err)
+
+    def test_the_brief_is_the_fallback(self):
+        code, _, err = self.launch(brief=BRIEF_30_60)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 2)
+
+    def test_an_unreadable_checkpoint_is_one_line_in_the_output_not_an_error(self):
+        code, _, err = self.launch(brief="CHECKPOINT: when done")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        self.assertEqual(len([l for l in err.splitlines() if "no checkpoint reminders" in l]), 1)
+
+    def test_no_brief_and_no_flags_is_silent(self):
+        code, _, err = self.launch()
+        self.assertEqual((code, err, sb.read_reminders(self.world.state)), (0, "", []))
 
 
 class TestLaunchNewWorkspace(TwoRepoCase):

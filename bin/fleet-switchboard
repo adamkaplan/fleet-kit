@@ -5608,6 +5608,7 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
                  "If nothing, do nothing and say nothing.")
 FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
 FRICTION_STATE = "friction-wake.json"
+FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 FRICTION_LOCK = "friction-wake.lock"
 
 
@@ -5704,7 +5705,7 @@ class FrictionWakeFacts:
                 anchor, changed = int(now), True
                 state[name] = dict(mine, anchor=anchor)
             slot = friction_slot(now, section["hour"], anchor)
-            if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0):
+            if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0) or now - slot >= FRICTION_GRACE:
                 continue
             if hold_reason(seen) or seen.engaged(now, self.engine.engaged_seconds):
                 continue
