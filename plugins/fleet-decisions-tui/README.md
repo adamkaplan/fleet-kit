@@ -46,6 +46,10 @@ The default drawing, built by subtraction: only what has something in it, blank 
 - **Plain switch:** `FLEET_SWITCHBOARD_PANEL=plain` in the TUI's environment draws the earlier panel. Any error while drawing the styled panel also falls back to it.
 - **Roll back:** copy the previous `tui.tsx` and `decisions.mjs` over the installed ones (`<profile>/opencode/fleet-decisions/`) and restart the TUI.
 
+**Iteration 3** adds a stable theme colour per project (header and PR numbers), one-cell marks (`◆` PR, `✓`/`✗` ready/failing in
+green/red, `?` question, `¶` report, `⧖` a day or more), bold for what needs you, italic muted ids and ages, more space between
+sections, and a large PR's size in the theme's diff colours. Marks are single-cell on purpose (two-cell emoji break the alignment).
+
 ## Using it
 
 OpenCode v2 loads a TUI plugin from `cli.json`, which names a **directory** that holds

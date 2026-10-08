@@ -18,7 +18,7 @@ export default {
       const snapshot = loadSnapshot(dir, now)
       let rows = null // the styled lines; null (any error) means: draw the plain panel
       if (styledMode) {
-        try { rows = styledRows(snapshot, now, ROW_WIDTH, who) } catch { rows = null }
+        try { rows = styledRows(snapshot, now, ROW_WIDTH, who, { v3: true }) } catch { rows = null }
       }
       return { view: buildView(snapshot, now, ROW_WIDTH, who), rows, next: msUntilStale(snapshot) }
     }
@@ -71,7 +71,8 @@ export default {
       const keys = (props.seg[1] || "").split("+")
       const fg = keys.map((k) => colors()[k]).find((c) => c != null)
       const inner = fg != null ? <span style={{ fg }}>{props.seg[0]}</span> : <span>{props.seg[0]}</span>
-      return keys.includes("b") ? <b>{inner}</b> : inner
+      const slanted = keys.includes("t") ? <i>{inner}</i> : inner
+      return keys.includes("b") ? <b>{slanted}</b> : slanted
     }
     const Pieces = (props: { segs: [string, string][] }) => <For each={props.segs}>{(seg) => <Piece seg={seg} />}</For>
     const plainPanel = () => (

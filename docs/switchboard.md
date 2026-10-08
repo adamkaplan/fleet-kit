@@ -1175,7 +1175,15 @@ Staff's panel the cos tier is one line per repo (`3 · oldest 1d`) and is not li
 the TUI theme's (`text.muted`, `text.feedback.*`), never a fixed colour; a theme without a token draws that text in the base colour.
 Every line of an entry carries its link (see the links above). `FLEET_SWITCHBOARD_PANEL=plain` draws the earlier plain panel (and so does
 any error while drawing the styled one); `viewLines`, the Decision baseline's plain view, is unchanged and tested. To roll back, copy the
-previous `tui.tsx` and `decisions.mjs` over the installed ones and restart the TUI. It spawns no process, holds
+previous `tui.tsx` and `decisions.mjs` over the installed ones and restart the TUI.
+
+**Iteration 3 of the styled panel** adds, on the same layout: a stable colour per project (a repo's header, and the number of its
+heads-ups): one of four theme colours (`syntax.keyword`, `function`, `operator`, `type`, chosen by a hash of the full repo name, so a repo
+keeps its colour; never the state colours); a one-cell mark per row, `◆` a PR (`✓` green when ready, `✗` red when CI fails), `?` a
+question, `¶` a report, `⧖` before an age of a day or more (the state is the mark's colour, so it does not fight the project hue);
+bold for what needs you, italic muted for ids and ages, the link underlined; two blank lines before a section; a large PR's size
+(`+A/-D`, from 500 lines) on its own line in the theme's diff colours (`diff.text.added` / `removed`, the ones the sidebar's git status
+uses). The marks are single-cell: measured in herdr, `✓ ✗ ◆ ¶ ? ⧖ ● ○ ▲` are one cell and emoji such as `✅ ❌ ⏳ 🔴 💬` (and `⚠️`) are two. It spawns no process, holds
 no credential and makes no network call; it reads only `decisions.json` in the state
 directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
 daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or

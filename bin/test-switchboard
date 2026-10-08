@@ -23708,6 +23708,20 @@ r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
 r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
 const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
+// iteration 3
+const v3 = (list, view) => d.styledRows(snap(list), now, 34, view, { v3: true });
+r.v3 = {
+  hue: [d.projectHue("acme/web"), d.projectHue("acme/web"), d.projectHue("acme/api"), d.projectHue("")],
+  hues: [...new Set(["a/1", "b/2", "c/3", "d/4", "e/5", "f/6", "g/7", "h/8"].map((x) => d.projectHue(x)))].sort(),
+  glyphs: Object.entries(d.GLYPH).map(([k, g]) => [k, [...g].length, g.codePointAt(0) < 0x10000 && g.length === 1]),
+  chief: d.styledText(v3(mix, chief), 34),
+  styles: v3(mix, human).filter((l) => l.id || /^(a|c)$/.test(textOf(l))).map((l) => [textOf(l), l.segs.map((s) => s[1]), (l.right || []).map((s) => s[1])]),
+  size: v3([pr(5, "o/a", 100, { additions: 900, deletions: 100 })], human).slice(-2).map((l) => [textOf(l), l.segs.map((s) => s[1])]),
+  gap: v3(mix, human).slice(2, 6).map((l) => textOf(l)),
+  plainC: d.styledText(d.styledRows(snap(mix), now, 34, chief), 34).join("\n") === r.chief.join("\n"),
+  theme: d.themeColors({ syntax: { keyword: "K", function: "F", operator: "O", type: "T" }, diff: { text: { added: "A", removed: "R" } } }),
+  themeNone: d.themeColors({ syntax: {} }),
+};
 console.log(JSON.stringify(r));
 """
 
@@ -23787,6 +23801,31 @@ class TestDecisionsStyledPanel(unittest.TestCase):
                                            ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
         self.assertEqual(self.r["noLink"], ["bad repo", "H"])
         self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+
+    def test_iteration_3_hues_are_stable_and_glyphs_are_one_cell(self):
+        v3 = self.r["v3"]
+        self.assertEqual(v3["hue"][0], v3["hue"][1])
+        self.assertTrue(all(h in ("p0", "p1", "p2", "p3") for h in v3["hue"]))
+        self.assertGreaterEqual(len(v3["hues"]), 3, "the hash spreads over the hues")
+        for key, count, bmp in v3["glyphs"]:
+            self.assertEqual((count, bmp), (1, True), key)  # measured one cell wide in herdr; never an emoji
+        self.assertEqual({k: v3["theme"].get(k) for k in ("p0", "p1", "p2", "p3", "a", "r")}, {"p0": "K", "p1": "F", "p2": "O", "p3": "T", "a": "A", "r": "R"})
+        self.assertEqual(v3["themeNone"], {})
+
+    def test_iteration_3_marks_kind_and_state_and_keeps_the_text(self):
+        v3 = self.r["v3"]
+        by = {t: (st, right) for t, st, right in v3["styles"]}
+        self.assertEqual(by["\u2717 #6 Add a thing" + " " * 0 + "|1h06m"][0][0], "e", "failing: a red glyph")
+        self.assertEqual(by["\u2713 #5 Add a thing|1m"][0][0], "s", "ready: a green glyph")
+        self.assertEqual(by["\u25c6 #7 Add a thing|1d"][0][0], "m", "other: a quiet glyph")
+        for text, (styles, right) in by.items():
+            if text[:1] in "\u2717\u2713\u25c6":
+                self.assertTrue(styles[1].startswith("p"), "the PR number takes the project hue: " + text)
+            if right:
+                self.assertTrue(right[-1].endswith("t"), "the age is italic: " + text)
+        self.assertEqual(v3["size"][-1], ["  +900/-100", ["", "a", "m", "r"]], "the size uses the diff colours")
+        self.assertEqual(v3["gap"][1:3], [" ", " "], "two blank lines before a section")
+        self.assertTrue(v3["plainC"], "without the option the layout is the one of step 1")
 
     def test_the_tui_keeps_the_plain_drawer_and_falls_back_to_it(self):
         source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
