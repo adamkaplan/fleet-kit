@@ -7115,6 +7115,28 @@ class TestCheckpointReminders(SelfWakeBase):
         note = self.set_reminders("soon", "10m")
         self.assertIn("no checkpoint reminders", note)
 
+    def test_absurd_checkpoints_are_one_note_and_never_an_error(self):
+        huge = "CHECKPOINT: at " + "9" * 4300 + " minutes, overdue at " + "9" * 4301 + " minutes"
+        cases = [(None, None, huge),
+                 (None, None, "CHECKPOINT: at 99999999999999m overdue 999999999999999m"),
+                 (None, None, "CHECKPOINT: at 30m overdue 99999m"),
+                 ("99999999999m", "60m", None), ("30m", "99999999999m", None),
+                 ("9" * 4300 + "m", "60m", None), ("30m", "9" * 4300 + "s", None),
+                 ("30m", "9999-12-31T00:00:00Z", None)]
+        for checkpoint, overdue, brief in cases:
+            with self.subTest(checkpoint=str(checkpoint)[:20], overdue=str(overdue)[:20], brief=str(brief)[:30]):
+                note = self.set_reminders(checkpoint, overdue, brief)
+                self.assertIn("no checkpoint reminders", note)
+                self.assertNotIn("\n", note)
+                self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_a_forged_since_is_no_condition_and_audited(self):
+        sb.add_reminder(self.world.state, "platform", EPOCH + 10, EPOCH, "overdue", 2, "coder", None,
+                        condition={"unless_report_from": "coder", "since": "yesterday"})
+        self.wait(20)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.assertEqual(len(self.events("reminder.condition_unusable")), 1)
+
     def test_the_worker_is_reminded_at_its_time_and_not_before(self):
         self.set_reminders()
         self.assertEqual(self.wait(1790)["sent"], [])

@@ -2067,7 +2067,7 @@ or an ISO time with a zone. The role files of the coder and the orchestrator and
 The times come from `--checkpoint 30m --overdue 60m` (a delay or an ISO time with a zone; the documented way), or, when
 neither flag is given, from a best-effort parse of the brief's `CHECKPOINT:` line: `Report at 30 minutes ... overdue
 at 60` (also `in 20m, overdue 45m`; a bare overdue number takes the checkpoint's unit; the overdue must be later). A
-line that cannot be read makes no reminder and adds one line to the launch's stderr; it is never an error. A launch
+line that cannot be read, or a time more than 30 days out (or a number over 6 digits), makes no reminder and adds one line to the launch's stderr; it is never an error. A launch
 with no brief and no flag is silent.
 
 A reminder may carry an optional `condition`, checked only once it is due: `{"unless_report_from": <worker>, "since":

@@ -5837,6 +5837,11 @@ class ReminderFacts:
         if not isinstance(condition.get("unless_report_from"), str):
             return "deliver"
         boss, since = discovery.agents.get(item["to"]), condition.get("since", 0)
+        if not _is_number(since):  # a forged or damaged condition is no condition: deliver, audited
+            if self.engine is not None and self.engine.audit is not None:
+                self.engine.audit.append(self.engine.actor, "reminder.condition_unusable", item["to"],
+                                         {"id": item["id"]})
+            return "deliver"
         if boss is None:
             return None
         try:
@@ -5900,6 +5905,18 @@ CHECKPOINT_WORKER_TEXT = "checkpoint due: report now, one line"
 CHECKPOINT_OVERDUE_TEXT = "%s has not reported since launch: overdue checkpoint"
 _CP_UNIT = r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])?"
 _CP_UNITS = {"s": 1, "m": 60, "h": 3600}
+CHECKPOINT_MAX_SECONDS = 30 * 86400  # a checkpoint or overdue further out than this is refused, never an error
+CHECKPOINT_MAX_DIGITS = 6
+
+
+def _cp_when(text, moment):
+    """parse_when for a checkpoint flag, bounded: too many digits or further than CHECKPOINT_MAX_SECONDS is refused."""
+    if re.search(r"[0-9]{%d}" % (CHECKPOINT_MAX_DIGITS + 1), text):
+        raise ReminderError("%r is too large; a checkpoint is at most 30 days out" % text[:40])
+    at = parse_when(text, moment)
+    if not moment - CHECKPOINT_MAX_SECONDS <= at <= moment + CHECKPOINT_MAX_SECONDS:
+        raise ReminderError("%r is too far out; a checkpoint is at most 30 days away" % text[:40])
+    return at
 
 
 def _cp_seconds(number, unit, default):
@@ -5914,16 +5931,18 @@ def parse_checkpoint(brief):
     line = next((l for l in (brief or "").splitlines() if re.match(r"\s*CHECKPOINT\s*:", l, re.I)), None)
     if line is None:
         return None
-    over = re.search(r"\boverdue(?:\s+(?:at|after|in|by))?\s+(\d+)\s*" + _CP_UNIT + r"\b", line, re.I)
+    over = re.search(r"\boverdue(?:\s+(?:at|after|in|by))?\s+(\d{1,6})\s*" + _CP_UNIT + r"\b", line, re.I)
     if over is None:
         return None
     head = line[:over.start()]
-    first = re.search(r"\b(?:at|in|after|within)\s+(\d+)\s*" + _CP_UNIT + r"\b", head, re.I)
+    first = re.search(r"\b(?:at|in|after|within)\s+(\d{1,6})\s*" + _CP_UNIT + r"\b", head, re.I)
     if first is None:
         return None
     checkpoint = _cp_seconds(first.group(1), first.group(2), over.group(2))
     overdue = _cp_seconds(over.group(1), over.group(2), first.group(2))
     if checkpoint is None or overdue is None or checkpoint <= 0 or overdue <= checkpoint:
+        return None
+    if overdue > CHECKPOINT_MAX_SECONDS:
         return None
     return checkpoint, overdue
 
@@ -5940,18 +5959,18 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
                 return ("no checkpoint reminders: no --checkpoint/--overdue and the brief's CHECKPOINT line could "
                         "not be read as 'at <N> minutes ... overdue at <M>'")
             checkpoint, overdue = ("%ds" % parsed[0], "%ds" % parsed[1])
+        when_worker = _cp_when(checkpoint, moment) if checkpoint is not None else None
+        when_boss = _cp_when(overdue, moment) if overdue is not None and boss else None  # both checked before either is made
         made = []
-        if checkpoint is not None:
-            at = parse_when(checkpoint, moment)
-            item = add_reminder(state, name, at, moment, CHECKPOINT_WORKER_TEXT, issue, boss, repo,
+        if when_worker is not None:
+            item = add_reminder(state, name, when_worker, moment, CHECKPOINT_WORKER_TEXT, issue, boss, repo,
                                 condition={"while_running": name})
             made.append(("worker", item))
         if overdue is not None:
             if not boss:
                 notes.append("no overdue reminder: the launch names no --reports-to")
             else:
-                at = parse_when(overdue, moment)
-                item = add_reminder(state, boss, at, moment, CHECKPOINT_OVERDUE_TEXT % name, issue, name, repo,
+                item = add_reminder(state, boss, when_boss, moment, CHECKPOINT_OVERDUE_TEXT % name, issue, name, repo,
                                     condition={"unless_report_from": name, "since": launched})
                 made.append(("overdue", item))
         for which, item in made:
@@ -5960,7 +5979,7 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
                                                                    "repo": repo, "for": "checkpoint-" + which})
         notes[:0] = ["%s reminder at %s" % (which, iso(item["at"])) for which, item in made]
         return "checkpoint reminders: " + "; ".join(notes) if notes else None
-    except (ReminderError, OSError) as err:
+    except (ReminderError, OSError, ValueError, OverflowError) as err:
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
