@@ -55,14 +55,17 @@ pull_changes -> (events, next_cursor), lookup, acted, read_items) and McpRestAda
 patch with coalescing, finish, get, list). `build_adapter(mapping_path)` makes one from a mapping file;
 bin/fleet-switchboard loads this file by path, as it loads decision_core.
 
-Normalised events (the ExternalEvent shape): {event_id, external_id, type, seq, at, ...} with type one of
+Normalised events (pull_normalised): {event_id, external_id, type, seq, at, ...} with type one of
 answered (answer: {id, disposition, meaning, option_id, text, rationale, clarification, rejection}, by: {role,
 raw}), sent_back (a clarify: no answer), rated (tier, floor), revised (text, awaits_rating), reversed (answer,
 replaces, by), withdrawn, other.
 
-push(decision, idempotency_key): `decision` is a dict (or an object with `entry()`); `op` says raise, revise,
-withdraw or status, else it is inferred (no external_id: raise; status withdrawn: withdraw; else revise). It returns
-the outside id.
+Port version: the step-4 contract of bin/decision_core.py (branch switchboard/decision-sync): push(operation,
+idempotency_key) with operation {op: raise|revise|status|withdraw, key, external_id, revision, decision, floor,
+note} returns {external_id, url}; lookup(key) -> {external_id, revision} | None; pull_changes(cursor) -> (events,
+next_cursor) with port events {event_id, external_id, type: answered|clarify|reversed|withdrawn, answered_by:
+project agent|owner's agent|human (unknown when no role rule matches), option_id, text, at}. acted(), read_items(),
+pull_normalised() and the work client are extras outside the port.
 
 Python 3.9+, standard library only.
 """
@@ -571,7 +574,7 @@ class MappingFile:
             need(isinstance(codes, dict) and all(v in ERROR_CLASSES for v in codes.values()),
                  "errors.codes values must be one of %s" % ", ".join(sorted(ERROR_CLASSES)))
         opts = data.get("options", {})
-        need(isinstance(opts, dict) and set(opts) <= {"id_prefix"}, "options: only {id_prefix}")
+        need(isinstance(opts, dict) and set(opts) <= {"id_prefix", "key_marker"}, "options: only {id_prefix, key_marker}")
         defaults = data.get("defaults", {})
         need(isinstance(defaults, dict) and set(defaults) <= {"recommendation"}, "defaults: only {recommendation}")
         return found
@@ -902,22 +905,36 @@ class _Changes(tuple):
 Changes = _Changes
 
 
-def _as_dict(decision):
-    if isinstance(decision, dict):
-        return decision
-    if hasattr(decision, "entry"):
-        merged = dict(decision.entry())
-        merged.setdefault("status", getattr(decision, "status", None))
-        return merged
-    return dict(vars(decision))
+ROLE_NAMES = {"orchestrator": "project agent", "cos": "owner's agent", "human": "human"}
+PORT_TYPES = {"answered": "answered", "sent_back": "clarify", "reversed": "reversed", "withdrawn": "withdrawn"}
 
 
-def _text_of(d):
+def _text_of(d, key=None, marker=None):
+    """The text an outside item carries for a decision: its title, the longer words, who is asking (opaque text),
+    batch rows, and a marker line naming the decision key (so the item can be found again by key)."""
     if d.get("text"):
-        return str(d["text"])
-    title = d.get("title") or d.get("headline") or ""
-    body = d.get("body") or ""
-    return "\n\n".join(p for p in (str(title).strip(), str(body).strip()) if p)
+        head = [str(d["text"])]
+    else:
+        title = str(d.get("title") or d.get("headline") or "").strip()
+        body = str(d.get("body") or "").strip()
+        if not body and d.get("headline") and str(d["headline"]).strip() != title:
+            body = str(d["headline"]).strip()
+        head = [p for p in (title, body) if p]
+    asker = " ".join(str(x) for x in (d.get("agent"), ("in %s" % d["repo"]) if d.get("repo") else None,
+                                      ("on #%s" % d["ask"]) if d.get("ask") else None) if x)
+    if asker:
+        head.append("From: " + asker)
+    rows = d.get("rows")
+    if isinstance(rows, dict):
+        rows = ["%s. %s" % (k, v) for k, v in rows.items()]
+    elif isinstance(rows, list):
+        rows = ["%d. %s" % (i + 1, r if isinstance(r, str) else json.dumps(r, sort_keys=True))
+                for i, r in enumerate(rows)]
+    if rows:
+        head.append("\n".join(rows))
+    if marker and key:
+        head.append("%s %s" % (marker, key))
+    return "\n\n".join(head)
 
 
 def _pick(obj, name):
@@ -969,20 +986,37 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         except Exception as error:  # a health probe never raises
             return _one_line("health check failed (%s)" % type(error).__name__, 200)
 
-    def push(self, decision, idempotency_key):
-        d = _as_dict(decision)
-        op = d.get("op") or self._infer_op(d)
+    def push(self, operation, idempotency_key):
+        """One outbound operation (the port's shape): {op: raise|revise|status|withdraw, key, external_id, revision,
+        decision, floor, note}. Returns {"external_id": ..., "url": None}. The decision may also carry the optional
+        extras recommendation, options, grounds, stakes, evidence, consequence, body."""
+        if not isinstance(operation, dict) or not isinstance(operation.get("decision", {}), dict):
+            raise InvalidRequest("push: an operation is a dict with a decision")
+        op = operation.get("op")
+        d = operation.get("decision") or {}
+        key = operation.get("key")
         if op == "raise":
-            return self._raise(d, idempotency_key)
-        if op == "revise":
-            return self._revise(d, idempotency_key)
-        if op == "withdraw":
-            return self._withdraw(d)
-        if op == "status":
-            return self._status(d, idempotency_key)
-        raise InvalidRequest("push: unknown operation %r" % (op,))
+            ident = self._raise(d, idempotency_key, key, operation.get("floor"))
+        elif op in ("revise", "status", "withdraw"):
+            ident = operation.get("external_id")
+            if not ident:
+                raise InvalidRequest("%s: no external_id" % op)
+            {"revise": self._revise, "status": self._status, "withdraw": self._withdraw}[op](
+                ident, d, idempotency_key, key, operation.get("note"))
+        else:
+            raise InvalidRequest("push: unknown operation %r" % (op,))
+        return {"external_id": ident, "url": None}
 
     def pull_changes(self, cursor):
+        """(events, next_cursor) in the port's shape: {event_id, external_id, type: answered|clarify|reversed|
+        withdrawn, answered_by: "project agent"|"owner's agent"|"human"|"unknown", option_id, text, at}, plus
+        extras (answer_id, disposition, meaning, rationale, rejection, replaces, seq). Ratings, restatements and
+        other changes are not port events: they are skipped here (see pull_normalised) and the cursor moves past."""
+        events, nxt = self.pull_normalised(cursor)
+        return Changes([self._port_event(e) for e in events if e["type"] in PORT_TYPES], nxt)
+
+    def pull_normalised(self, cursor):
+        """Every change normalised (answered, sent_back, reversed, withdrawn, rated, revised, other), with the cursor."""
         data = self.door.call("feed", query=self._cursor_query(cursor))
         feed = self.m.responses["feed"]
         raw = data.get(feed["changes"])
@@ -998,25 +1032,43 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         self.last_cursor = nxt
         return Changes(events, nxt)
 
-    # ------------------------------------------------------------ beyond the port
-
-    def lookup(self, idempotency_key, decision=None):
-        """The outside id of what `idempotency_key` raised, or None. With `decision`, the raise is replayed (the same
-        id and body is the same item, so it is safe); without, the item read is searched when the mapping says which
-        field holds the id we sent."""
-        if decision is not None:
-            try:
-                return self._raise(_as_dict(decision), idempotency_key)
-            except Conflict:
-                pass
-        field = self.m.responses.get("item", {}).get("idempotency")
-        if not field or "items" not in self.m.operations:
+    def lookup(self, key):
+        """{"external_id", "revision"} of the item raised for decision `key`, or None. Found by the marker line the
+        raise put in the item's text (mapping options.key_marker); without a marker mapped nothing can be found.
+        The revision is reported as 1: a later revise is idempotent, so under-reporting is safe."""
+        marker = self.m.data.get("options", {}).get("key_marker")
+        if not marker or "items" not in self.m.operations or not self.m.responses["item"].get("text"):
             return None
-        wanted = self._uuid_of(idempotency_key)
+        wanted = "%s %s" % (marker, key)
         for item in self.read_items():
-            if item["raw"].get(field) == wanted:
-                return item["external_id"]
+            lines = str(item.get("text") or "").splitlines()
+            if wanted in [line.strip() for line in lines] and not item.get("withdrawn"):
+                return {"external_id": item["external_id"], "revision": 1}
         return None
+
+    def _port_event(self, e):
+        answer = e.get("answer") or {}
+        by = e.get("by") or {}
+        text = answer.get("text")
+        if e["type"] == "clarify" or e["type"] == "sent_back":
+            text = e.get("clarification")
+        elif answer.get("disposition") == "reject":
+            text = answer.get("rejection") or text
+        port = {"event_id": e["event_id"], "external_id": e["external_id"], "type": PORT_TYPES[e["type"]],
+                "answered_by": ROLE_NAMES.get(by.get("role"), "unknown"), "option_id": answer.get("option_id"),
+                "text": text, "at": e.get("at"), "seq": e.get("seq")}
+        if answer:
+            port.update(answer_id=answer.get("id"), disposition=answer.get("disposition"),
+                        meaning=answer.get("meaning"), rationale=answer.get("rationale"),
+                        rejection=answer.get("rejection"))
+        if e.get("replaces") is not None:
+            port["replaces"] = e["replaces"]
+        if e["type"] == "withdrawn":
+            port["answered_by"] = ROLE_NAMES.get(by.get("role"), "unknown") if by else "unknown"
+            port["text"] = e.get("reason")
+        return port
+
+    # ------------------------------------------------------------ beyond the port
 
     def read_items(self):
         """The items of this integration, normalised: {external_id, status, text, answer, clarification, withdrawn,
@@ -1058,11 +1110,6 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         if name not in self.m.operations:
             raise Unsupported("the mapping defines no %s operation" % name)
 
-    def _infer_op(self, d):
-        if not d.get("external_id"):
-            return "raise"
-        return "withdraw" if d.get("status") == "withdrawn" else "revise"
-
     def _uuid_of(self, key):
         key = str(key)
         try:
@@ -1097,25 +1144,26 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
             made.append(row)
         return made
 
-    def _floor_of(self, d):
+    def _floor_of(self, d, floor=None):
         entry = self.m.data["tier_map"].get(d.get("tier"))
         if entry is None:
             raise InvalidRequest("no tier_map entry for tier %r" % (d.get("tier"),))
-        floor = entry["floor"]
+        # the operation's floor (the engine's mapping of the tier) when it is a generic consequence name, else ours
+        floor = floor if floor in CONSEQUENCES else entry["floor"]
         hint = d.get("consequence")
         if hint in CONSEQUENCES and CONSEQUENCES.index(hint) > CONSEQUENCES.index(floor):
             floor = hint
         return entry["class"], floor
 
-    def _raise(self, d, key):
+    def _raise(self, d, key, decision_key=None, floor=None):
         f = self.m.fields["raise"]
-        text = _text_of(d)
+        text = _text_of(d, decision_key, self.m.data.get("options", {}).get("key_marker"))
         recommendation = d.get("recommendation") or self.m.data.get("defaults", {}).get("recommendation")
         if not text:
             raise InvalidRequest("raise: the decision has no text")
         if not recommendation:
             raise InvalidRequest("raise: a recommendation is required and none was given")
-        label, floor = self._floor_of(d)
+        label, floor = self._floor_of(d, floor)
         body = {f["idempotency"]: self._uuid_of(key), f["project"]: self.m.data["project"], f["class"]: label,
                 f["text"]: text, f["recommendation"]: str(recommendation),
                 f["floor"]: self.m.to_external("tier", floor), f["options"]: self._options(d.get("options"))}
@@ -1140,16 +1188,12 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
             raise InvalidRequest("raise: the reply names no item")
         return ident
 
-    def _revise(self, d, key):
+    def _revise(self, ident, d, key, decision_key=None, note=None):
         self._need("revise")
         f = self.m.fields["revise"]
-        ident = d.get("external_id")
-        if not ident:
-            raise InvalidRequest("revise: no external_id")
         body = {f["idempotency"]: self._uuid_of(key)}
-        text = _text_of(d)
-        if text and f.get("text"):
-            body[f["text"]] = text
+        if _text_of(d) and f.get("text"):
+            body[f["text"]] = _text_of(d, decision_key, self.m.data.get("options", {}).get("key_marker"))
         if d.get("recommendation") and f.get("recommendation"):
             body[f["recommendation"]] = str(d["recommendation"])
         if d.get("options") is not None and f.get("options"):
@@ -1157,28 +1201,22 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         if len(body) < 2:
             raise InvalidRequest("revise: nothing to change")
         self.door.call("revise", body, ident=ident)
-        return ident
 
-    def _withdraw(self, d):
+    def _withdraw(self, ident, d, key, decision_key=None, note=None):
         self._need("withdraw")
-        ident = d.get("external_id")
-        if not ident:
-            raise InvalidRequest("withdraw: no external_id")
-        self.door.call("withdraw", {self.m.fields["withdraw"]["reason"]: str(d.get("reason") or "withdrawn")}, ident=ident)
-        return ident
+        self.door.call("withdraw", {self.m.fields["withdraw"]["reason"]: str(note or d.get("reason") or "withdrawn")},
+                       ident=ident)
 
-    def _status(self, d, key):
+    def _status(self, ident, d, key, decision_key=None, note=None):
         self._need("status")
-        ident = d.get("external_id")
-        if not ident:
-            raise InvalidRequest("status: no external_id")
         f = self.m.fields.get("status", {})
         body = {f["idempotency"]: self._uuid_of(key)} if f.get("idempotency") else {}
         for name in ("status", "tier"):
             if d.get(name) is not None and f.get(name):
                 body[f[name]] = d[name]
+        if note and f.get("note"):
+            body[f["note"]] = str(note)
         self.door.call("status", body, ident=ident)
-        return ident
 
     # ------------------------------------------------------------ events
 

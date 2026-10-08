@@ -24004,7 +24004,7 @@ FAKE_MAPPING = {
     "errors": {"code_field": "code", "message_field": "message", "retry_after_field": "retry_after_s",
                "codes": {"off": "DisabledError", "decided": "AlreadyDecided", "clash": "Conflict",
                          "slow": "RateLimited"}},
-    "options": {"id_prefix": "c"}, "defaults": {"recommendation": "proceed"}}
+    "options": {"id_prefix": "c", "key_marker": "ref:"}, "defaults": {"recommendation": "proceed"}}
 
 
 def fake_mapping(base_url, channel="tool", **over):
@@ -24031,6 +24031,19 @@ class ExternalAdapterCase(unittest.TestCase):
     def adapter(self, channel="tool", **over):
         return EA.McpRestAdapter(fake_mapping(self.server.url, channel, **over), sleep=self.slept.append,
                                  clock=lambda: self.clock_now[0], environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+
+    def push(self, adapter, d, key):
+        """The port's operation for a decision-shaped dict (op, external_id, status, reason are the operation's)."""
+        d = dict(d)
+        op, ext, reason = d.pop("op", None), d.pop("external_id", None), d.pop("reason", None)
+        if op is None:
+            op = "raise" if not ext else ("withdraw" if d.get("status") == "withdrawn" else "revise")
+        operation = {"op": op, "key": "dk:" + key, "external_id": ext, "revision": 1, "decision": d}
+        if reason:
+            operation["note"] = reason
+        done = adapter.push(operation, key)
+        assert set(done) == {"external_id", "url"}, done
+        return done["external_id"]
 
     def decision(self, **over):
         found = {"title": "Ship it?", "body": "The build is green.", "tier": "orchestrator",
@@ -24183,16 +24196,16 @@ class TestExternalAdapterKeys(ExternalAdapterCase):
         texts = [repr(adapter.keys.current()), str(adapter.keys.current()), repr(adapter.keys)]
         with self.assertRaises(EA.CredentialError) as ctx:  # the server echoes the credential it was shown
             self.server.fail_next("raise", 401, {"code": "cred", "message": "refused Key %s for %s" % (key, key)})
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
         texts.append(str(ctx.exception))
         self.assertIn("[key]", str(ctx.exception))
         self.server.fail_next("raise", 400, {"code": "bad", "message": "Bearer %s" % key})
         with self.assertRaises(EA.InvalidRequest) as ctx:
-            adapter.push(self.decision(), "k-2")
+            self.push(adapter, self.decision(), "k-2")
         texts.append(str(ctx.exception))
         self.server.fail_next("raise", 500, {"code": "x", "message": key}, count=5)
         with self.assertRaises(EA.Unavailable) as ctx:
-            adapter.push(self.decision(), "k-3")
+            self.push(adapter, self.decision(), "k-3")
         texts.append(str(ctx.exception))
         self.server.down = True
         texts.append(str(adapter.health()))
@@ -24210,7 +24223,7 @@ class TestExternalAdapterKeys(ExternalAdapterCase):
         env = {"OLD": "stale-key", "NEW": FakeDoorServer.KEY}
         data = fake_mapping(self.server.url, "http", key_source=["env:OLD", "env:NEW"])
         adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ=env)
-        self.assertEqual(adapter.push(self.decision(), "k-1")[:3], "it-")
+        self.assertEqual(self.push(adapter, self.decision(), "k-1")[:3], "it-")
         self.assertEqual(adapter.keys.index, 1)
 
     def test_a_bad_source_is_found_at_start(self):
@@ -24230,13 +24243,13 @@ class TestExternalAdapterOperations(ExternalAdapterCase):
     def test_raise_maps_the_decision_over_both_channels(self):
         for channel in self.each_channel():
             adapter = self.adapter(channel)
-            ident = adapter.push(self.decision(), "decision-key-1")
+            ident = self.push(adapter, self.decision(), "decision-key-1")
             sent = [a for c, o, a in self.server.requests if o == "raise"][0]
             self.assertEqual(self.server.log[-1], (channel, "raise"))
             self.assertEqual(sent["label"], "routine", channel)
             self.assertEqual(sent["floor"], "minor")
             self.assertEqual(sent["seat"], "seat-1")
-            self.assertEqual(sent["body"], "Ship it?\n\nThe build is green.")
+            self.assertEqual(sent["body"], "Ship it?\n\nThe build is green.\n\nref: dk:decision-key-1")
             self.assertEqual(sent["advice"], "yes")
             self.assertEqual(sent["choices"], [{"name": "approve", "key": "c1"},
                                                {"name": "hold", "price": "a day", "key": "c2"}])
@@ -24247,14 +24260,14 @@ class TestExternalAdapterOperations(ExternalAdapterCase):
         adapter = self.adapter("http")
         for tier, hint, floor in (("orchestrator", None, "minor"), ("cos", None, "major"), ("human", None, "sealed"),
                                   ("orchestrator", "moderate", "middling"), ("cos", "low", "major")):
-            adapter.push(self.decision(tier=tier, consequence=hint), "k-%s-%s" % (tier, hint))
+            self.push(adapter, self.decision(tier=tier, consequence=hint), "k-%s-%s" % (tier, hint))
             self.assertEqual(self.server.requests[-1][2]["floor"], floor)
         with self.assertRaises(EA.InvalidRequest):
-            adapter.push(self.decision(tier="nobody"), "k-x")
+            self.push(adapter, self.decision(tier="nobody"), "k-x")
 
     def test_options_with_their_own_ids_and_optional_fields(self):
         adapter = self.adapter("tool")
-        adapter.push(self.decision(options=[{"label": "a", "id": "mine-1", "recommended": True}],
+        self.push(adapter, self.decision(options=[{"label": "a", "id": "mine-1", "recommended": True}],
                                    grounds="g", stakes="s", evidence=[{"text": "t", "link": "http://127.0.0.1/e"}]),
                      "k-o")
         sent = self.server.requests[-1][2]
@@ -24264,74 +24277,77 @@ class TestExternalAdapterOperations(ExternalAdapterCase):
 
     def test_a_recommendation_is_required_or_defaulted(self):
         adapter = self.adapter("http")
-        adapter.push(self.decision(recommendation=None), "k-d")
+        self.push(adapter, self.decision(recommendation=None), "k-d")
         self.assertEqual(self.server.requests[-1][2]["advice"], "proceed")
         data = fake_mapping(self.server.url, "http")
         data.pop("defaults")
         bare = EA.McpRestAdapter(data, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
         with self.assertRaises(EA.InvalidRequest):
-            bare.push(self.decision(recommendation=None), "k-e")
+            self.push(bare, self.decision(recommendation=None), "k-e")
 
     def test_revise_withdraw_and_acted_over_both_channels(self):
         for channel in self.each_channel():
             adapter = self.adapter(channel)
-            ident = adapter.push(self.decision(), "k-1")
-            self.assertEqual(adapter.push({"op": "revise", "external_id": ident, "body": "new words"}, "k-r"), ident)
-            self.assertEqual(self.server.items[ident]["body"], "new words")
+            ident = self.push(adapter, self.decision(), "k-1")
+            self.assertEqual(self.push(adapter, {"op": "revise", "external_id": ident, "body": "new words"}, "k-r"), ident)
+            self.assertEqual(self.server.items[ident]["body"], "new words\n\nref: dk:k-r")
             self.assertEqual(self.server.log[-1], (channel, "revise"))
             self.server.items[ident]["answer"] = {"answer_id": "a-1"}
             self.assertEqual(adapter.acted(ident, "a-1", "done", "did it", "k-a"), ident)
             self.assertEqual(self.server.requests[-1][2]["result"], "did")
             with self.assertRaises(EA.Conflict):
                 adapter.acted(ident, "not-an-answer", "done")
-            second = adapter.push(self.decision(), "k-2")
-            adapter.push({"external_id": second, "status": "withdrawn", "reason": "gone"}, "k-w")
+            second = self.push(adapter, self.decision(), "k-2")
+            self.push(adapter, {"external_id": second, "status": "withdrawn", "reason": "gone"}, "k-w")
             self.assertEqual(self.server.items[second]["withdrawn"], {"why": "gone"})
             self.assertEqual(self.server.log[-1], (channel, "withdraw"))
-            adapter.push({"op": "withdraw", "external_id": second}, "k-w")  # idempotent
+            self.push(adapter, {"op": "withdraw", "external_id": second}, "k-w")  # idempotent
 
     def test_revise_and_withdraw_after_a_decision_are_refused(self):
         adapter = self.adapter("tool")
-        ident = adapter.push(self.decision(), "k-1")
+        ident = self.push(adapter, self.decision(), "k-1")
         self.server.items[ident].update(state="closed", answer={"answer_id": "a-1"})
         with self.assertRaises(EA.AlreadyDecided):
-            adapter.push({"op": "revise", "external_id": ident, "body": "late"}, "k-r")
+            self.push(adapter, {"op": "revise", "external_id": ident, "body": "late"}, "k-r")
         with self.assertRaises(EA.AlreadyDecided):
-            adapter.push({"op": "withdraw", "external_id": ident}, "k-w")
+            self.push(adapter, {"op": "withdraw", "external_id": ident}, "k-w")
         with self.assertRaises(EA.InvalidRequest):
-            adapter.push({"op": "revise", "external_id": ident}, "k-r2")
+            self.push(adapter, {"op": "revise", "external_id": ident}, "k-r2")
 
     def test_status_is_unsupported_without_a_mapping_for_it(self):
         with self.assertRaises(EA.Unsupported):
-            self.adapter().push({"op": "status", "external_id": "x", "status": "s"}, "k")
+            self.push(self.adapter(), {"op": "status", "external_id": "x", "status": "s"}, "k")
 
     def test_idempotent_replay_and_conflict(self):
         for channel in self.each_channel():
             adapter = self.adapter(channel)
-            first = adapter.push(self.decision(), "same-key")
-            self.assertEqual(adapter.push(self.decision(), "same-key"), first)
+            first = self.push(adapter, self.decision(), "same-key")
+            self.assertEqual(self.push(adapter, self.decision(), "same-key"), first)
             self.assertEqual(len(self.server.items), 1)
             with self.assertRaises(EA.Conflict):
-                adapter.push(self.decision(body="a different body"), "same-key")
-            other = adapter.push(self.decision(), "another-key")
+                self.push(adapter, self.decision(body="a different body"), "same-key")
+            other = self.push(adapter, self.decision(), "another-key")
             self.assertNotEqual(other, first)
             # a key that already is a UUID is kept as it is
             ident = str(uuid.uuid4())
-            adapter.push(self.decision(), ident)
+            self.push(adapter, self.decision(), ident)
             self.assertEqual(self.server.requests[-1][2]["op_id"], ident)
 
-    def test_lookup_replays_the_raise_and_searches_by_the_mapped_field(self):
+    def test_lookup_finds_an_item_by_its_decision_key(self):
         adapter = self.adapter("http")
-        first = adapter.push(self.decision(), "k-1")
-        self.assertEqual(adapter.lookup("k-1", self.decision()), first)
-        self.assertEqual(len(self.server.items), 1)
-        self.assertEqual(adapter.lookup("k-1"), first)  # the read carries the id we sent (mapped field)
-        self.assertIsNone(adapter.lookup("never-raised"))
-        self.assertEqual(adapter.lookup("k-1", self.decision(body="changed")), first)  # a conflict falls back to read
+        first = self.push(adapter, self.decision(), "k-1")
+        self.assertEqual(adapter.lookup("dk:k-1"), {"external_id": first, "revision": 1})
+        self.assertIsNone(adapter.lookup("dk:never-raised"))
+        self.assertIsNone(adapter.lookup("dk:k"))  # a prefix of a key is not the key
+        self.server.items[first]["withdrawn"] = {"why": "x"}
+        self.assertIsNone(adapter.lookup("dk:k-1"))
+        bare = fake_mapping(self.server.url, "http")
+        bare["options"] = {"id_prefix": "c"}
+        self.assertIsNone(EA.McpRestAdapter(bare, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}).lookup("dk:k-1"))
 
     def test_read_items_are_normalised(self):
         adapter = self.adapter("tool")
-        ident = adapter.push(self.decision(), "k-1")
+        ident = self.push(adapter, self.decision(), "k-1")
         self.server.items[ident].update(state="closed", answer=self.answer_fields(), ask_back=None)
         found = adapter.read_items()
         self.assertEqual(len(found), 1)
@@ -24365,7 +24381,7 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
             before = len(self.server.requests)
             self.server.fail_next("raise", status, {"code": code, "message": "m"})
             with self.assertRaises(cls) as ctx:
-                adapter.push(self.decision(), "k-%d" % status)
+                self.push(adapter, self.decision(), "k-%d" % status)
             self.assertIs(type(ctx.exception), cls)
             self.assertEqual(self.slept, [], status)
             self.assertEqual(len(self.server.requests), before)  # the injected reply is the one and only call
@@ -24375,49 +24391,49 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         for status in (400, 401, 403, 404, 409):
             self.server.fail_next("raise", status, {"code": "z", "message": "m"}, count=10)
             with self.assertRaises(EA.AdapterError):
-                adapter.push(self.decision(), "k")
+                self.push(adapter, self.decision(), "k")
             self.assertEqual(len([1 for i in self.server.inject if i["count"] == 9]), 1, status)
             self.server.inject.clear()
 
     def test_429_honours_retry_after_then_succeeds(self):
         adapter = self.adapter("http")
         self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "2"})
-        self.assertTrue(adapter.push(self.decision(), "k-1").startswith("it-"))
+        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
         self.assertEqual(self.slept, [2.0])
 
     def test_a_long_retry_after_is_reported_not_slept(self):
         adapter = self.adapter("http")
         self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "60"})
         with self.assertRaises(EA.RateLimited) as ctx:
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
         self.assertEqual(ctx.exception.retry_after, 60.0)
         self.assertEqual(self.slept, [])
         self.server.fail_next("raise", 429, {"code": "slow", "message": "later", "retry_after_s": 7})
         with self.assertRaises(EA.RateLimited) as ctx:
-            adapter.push(self.decision(), "k-2")
+            self.push(adapter, self.decision(), "k-2")
         self.assertEqual(ctx.exception.retry_after, 7.0)  # no header: the mapped body field
         self.server.fail_next("raise", 429, {"code": "x", "message": "later"}, count=10)
         with self.assertRaises(EA.RateLimited) as ctx:
-            adapter.push(self.decision(), "k-3")
+            self.push(adapter, self.decision(), "k-3")
         self.assertEqual(ctx.exception.retry_after, 1.0)  # neither: the default (short: slept, then given up)
         self.assertEqual(self.slept, [1.0, 1.0])
 
     def test_5xx_is_retried_with_a_doubling_delay_and_a_cap(self):
         adapter = self.adapter("http")
         self.server.fail_next("raise", 503, count=2)
-        self.assertTrue(adapter.push(self.decision(), "k-1").startswith("it-"))
+        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
         self.assertEqual(self.slept, [0.5, 1.0])
         self.slept.clear()
         self.server.fail_next("raise", 500, count=10)
         with self.assertRaises(EA.Unavailable):
-            adapter.push(self.decision(), "k-2")
+            self.push(adapter, self.decision(), "k-2")
         self.assertEqual(self.slept, [0.5, 1.0])  # three attempts, two waits
         self.slept.clear()
         many = self.adapter("http", retry={"attempts": 5})
         self.server.inject.clear()
         self.server.fail_next("raise", 500, count=10)
         with self.assertRaises(EA.Unavailable):
-            many.push(self.decision(), "k-3")
+            self.push(many, self.decision(), "k-3")
         self.assertEqual(self.slept, [0.5, 1.0, 1.5, 1.5])  # capped at max_delay
 
     def test_a_timeout_a_dropped_connection_and_a_closed_port_are_unavailable_and_retried(self):
@@ -24425,12 +24441,12 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
         self.server.delay = 1.0
         with self.assertRaises(EA.Unavailable):
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
         self.assertEqual(self.slept, [0.5])
         self.server.delay = 0
         self.server.down = True
         with self.assertRaises(EA.Unavailable):
-            adapter.push(self.decision(), "k-2")
+            self.push(adapter, self.decision(), "k-2")
         self.server.down = False
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
@@ -24439,8 +24455,8 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         data["base_url"] = "http://127.0.0.1:%d" % port
         self.slept.clear()
         with self.assertRaises(EA.Unavailable):
-            EA.McpRestAdapter(data, sleep=self.slept.append,
-                              environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}).push(self.decision(), "k-3")
+            self.push(EA.McpRestAdapter(data, sleep=self.slept.append,
+                                        environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}), self.decision(), "k-3")
         self.assertEqual(self.slept, [0.5])
 
     def test_tool_channel_refusals_map_by_code(self):
@@ -24451,7 +24467,7 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
             self.server.fail_next("raise", 400, {"code": code, "message": "refused: %s" % code, "retry_after_s": 90},
                                   level="result")
             with self.assertRaises(cls) as ctx:
-                adapter.push(self.decision(), "k-" + code)
+                self.push(adapter, self.decision(), "k-" + code)
             self.assertIs(type(ctx.exception), cls)
             self.assertEqual(self.slept, [])
 
@@ -24459,9 +24475,9 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         adapter = self.adapter("tool")
         self.server.fail_next("raise", 401, {"code": "cred", "message": "no"}, level="http")
         with self.assertRaises(EA.CredentialError):
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
         self.server.fail_next("raise", 503, level="http")
-        self.assertTrue(adapter.push(self.decision(), "k-2").startswith("it-"))  # retried
+        self.assertTrue(self.push(adapter, self.decision(), "k-2").startswith("it-"))  # retried
         # schema failures arrive as text, not JSON
         with self.assertRaises(EA.InvalidRequest) as ctx:
             adapter.door.mcp.call_tool("item_raise", {"bad_schema": 1})
@@ -24473,28 +24489,28 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         adapter = self.adapter("tool")
         self.assertEqual(adapter.door.mcp.list_tools()[:2], ["seats_list", "item_raise"])
         self.assertEqual(adapter.door.mcp.session, "sess-1")
-        adapter.push(self.decision(), "k-1")
+        self.push(adapter, self.decision(), "k-1")
         self.assertEqual(self.server.sid, 1)  # one session for all of it
         self.server.sessions.clear()  # the server forgot it
-        adapter.push(self.decision(), "k-2")
+        self.push(adapter, self.decision(), "k-2")
         self.assertEqual(self.server.sid, 2)
         self.server.sse = True
         fresh = self.adapter("tool")
-        self.assertTrue(fresh.push(self.decision(), "k-3").startswith("it-"))
-        self.assertEqual(fresh.pull_changes(None)[1], 0)
+        self.assertTrue(self.push(fresh, self.decision(), "k-3").startswith("it-"))
+        self.assertEqual(fresh.pull_normalised(None)[1], 0)
 
     def test_a_list_of_messages_is_joined(self):
         adapter = self.adapter("tool")
         self.server.fail_next("raise", 400, {"code": "bad", "message": ["first", "second"]}, level="result")
         with self.assertRaises(EA.InvalidRequest) as ctx:
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
         self.assertIn("first; second", str(ctx.exception))
 
     def test_a_redirect_is_never_followed(self):
         adapter = self.adapter("http")
         self.server.fail_next("raise", 302, {"code": "x", "message": "moved"}, {"Location": "http://127.0.0.1:1/"})
         with self.assertRaises(EA.InvalidRequest):
-            adapter.push(self.decision(), "k-1")
+            self.push(adapter, self.decision(), "k-1")
 
 
 class TestExternalAdapterFeed(ExternalAdapterCase):
@@ -24503,23 +24519,23 @@ class TestExternalAdapterFeed(ExternalAdapterCase):
             self.server.changes.clear()
             self.server.seq = 100
             adapter = self.adapter(channel)
-            events, cursor = adapter.pull_changes(None)
+            events, cursor = adapter.pull_normalised(None)
             self.assertEqual(events, [])
             self.server.add_change("rating", "it-1", level="major", floor="minor")
             self.server.add_change("restated", "it-1", gap=7, body="x", rerate=True)  # gaps are normal
-            events, cursor = adapter.pull_changes(0)
+            events, cursor = adapter.pull_normalised(0)
             self.assertEqual([e["seq"] for e in events], [101, 108])
             self.assertEqual(cursor, 108)
-            again, same = adapter.pull_changes(0)
+            again, same = adapter.pull_normalised(0)
             self.assertEqual(([e["event_id"] for e in again], same), ([e["event_id"] for e in events], 108))
-            nothing, kept = adapter.pull_changes(cursor)
+            nothing, kept = adapter.pull_normalised(cursor)
             self.assertEqual((nothing, kept), ([], 108))
-            self.assertEqual(adapter.pull_changes(cursor)[1], 108)
-            ahead, held = adapter.pull_changes(500)  # never goes backwards
+            self.assertEqual(adapter.pull_normalised(cursor)[1], 108)
+            ahead, held = adapter.pull_normalised(500)  # never goes backwards
             self.assertEqual((ahead, held), ([], 500))
 
     def test_the_result_unpacks_and_reads_by_name(self):
-        result = self.adapter().pull_changes(None)
+        result = self.adapter().pull_normalised(None)
         events, cursor = result
         self.assertEqual((result["events"], result["next_cursor"], result.events, result.next_cursor),
                          (events, cursor, events, cursor))
@@ -24541,7 +24557,7 @@ class TestExternalAdapterFeed(ExternalAdapterCase):
         s.add_change("restated", "it-6", body="new text", rerate=True)
         s.add_change("seat_paused", None)
         for channel in ("tool", "http"):
-            events = self.adapter(channel).pull_changes(None)[0]
+            events = self.adapter(channel).pull_normalised(None)[0]
             by = {e["seq"]: e for e in events}
             self.assertEqual([e["type"] for e in events],
                              ["rated", "answered", "answered", "answered", "sent_back", "reversed", "withdrawn",
@@ -24569,9 +24585,80 @@ class TestExternalAdapterFeed(ExternalAdapterCase):
 
     def test_an_unknown_answerer_has_no_role(self):
         self.server.add_change("answer", "it-1", **self.answer_fields(who={"type": "stranger"}))
-        event = self.adapter().pull_changes(None)[0][0]
+        event = self.adapter().pull_normalised(None)[0][0]
         self.assertEqual(event["by"]["role"], "unknown")
         self.assertEqual(event["by"]["raw"], {"type": "stranger"})
+
+
+class TestExternalAdapterPort(ExternalAdapterCase):
+    """The step-4 port shape: push(operation) -> {external_id, url}, pull_changes -> (events, cursor)."""
+
+    def test_pull_changes_yields_port_events_only(self):
+        s = self.server
+        s.add_change("rating", "it-1", level="major", floor="minor")
+        s.add_change("answer", "it-1", **self.answer_fields())
+        s.add_change("answer", "it-2", **self.answer_fields(answer_id="a-2", how="ask", chosen=None, words=None,
+                                                           ask_back="which?", who={"type": "bot"}))
+        s.add_change("flip", "it-1", **self.answer_fields(answer_id="a-3", how="no", chosen=None, words="x",
+                                                         no_reason="nope", who={"type": "owner_bot"}),
+                     replaces=self.answer_fields())
+        s.add_change("pull", "it-3", why="gone")
+        s.add_change("restated", "it-4", body="b", rerate=True)
+        s.add_change("answer", "it-5", **self.answer_fields(answer_id="a-5", who={"type": "stranger"}))
+        for channel in ("tool", "http"):
+            events, cursor = self.adapter(channel).pull_changes(None)
+            self.assertEqual([e["type"] for e in events], ["answered", "clarify", "reversed", "withdrawn", "answered"])
+            a, c, r, w, u = events
+            self.assertEqual((a["answered_by"], a["option_id"], a["text"], a["external_id"]),
+                             ("human", "k1", "approve", "it-1"))
+            self.assertEqual((c["answered_by"], c["text"], c["option_id"]), ("project agent", "which?", None))
+            self.assertEqual((r["answered_by"], r["text"], r["replaces"]["id"]), ("owner's agent", "nope", "a-1"))
+            self.assertEqual(w["text"], "gone")
+            self.assertEqual(u["answered_by"], "unknown")
+            self.assertEqual(cursor, 106 + 1)  # the cursor moves past the changes that are not port events
+            for e in events:
+                self.assertTrue({"event_id", "external_id", "type", "answered_by", "option_id", "text", "at"} <= set(e))
+
+    def test_a_raise_returns_the_id_and_the_operation_floor_is_used(self):
+        adapter = self.adapter("tool")
+        operation = {"op": "raise", "key": "dk:1", "external_id": None, "revision": 1, "floor": "high",
+                     "decision": {"title": "T", "headline": "A longer headline", "tier": "orchestrator",
+                                  "agent": "coder1", "repo": "acme/api", "ask": 7, "display_id": "#7",
+                                  "rows": {"1": "first", "2": "second"}}}
+        done = adapter.push(operation, "dk:1")
+        self.assertEqual(set(done), {"external_id", "url"})
+        sent = self.server.requests[-1][2]
+        self.assertEqual(sent["floor"], "major")  # the operation's floor, not the tier_map's
+        self.assertEqual(sent["label"], "routine")
+        self.assertEqual(sent["body"], "T\n\nA longer headline\n\nFrom: coder1 in acme/api on #7\n\n"
+                                       "1. first\n2. second\n\nref: dk:1")
+        again = adapter.push(operation, "dk:1")
+        self.assertEqual(again, done)
+        operation.update(op="revise", external_id=done["external_id"], revision=2)
+        operation["decision"]["title"] = "T2"
+        self.assertEqual(adapter.push(operation, "dk:1:r2")["external_id"], done["external_id"])
+        operation.update(op="withdraw", note="superseded")
+        self.assertEqual(adapter.push(operation, "dk:1:w")["external_id"], done["external_id"])
+        self.assertEqual(self.server.items[done["external_id"]]["withdrawn"], {"why": "superseded"})
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.push({"op": "dance", "decision": {}}, "k")
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.push({"op": "revise", "external_id": None, "decision": {"title": "x"}}, "k")
+
+    def test_an_error_is_raised_for_the_engine_to_retry(self):
+        adapter = self.adapter("http")
+        self.server.down = True
+        with self.assertRaises(Exception):
+            adapter.pull_changes(None)
+
+    def test_a_cursor_that_goes_back_is_ignored(self):
+        adapter = self.adapter("http")
+        adapter.door.call = lambda *a, **k: {"cursor": 3, "feed": []}
+        self.assertEqual(adapter.pull_changes(10)[1], 10)
+
+    def test_scrub_takes_out_a_key_with_url_unsafe_characters(self):
+        self.assertEqual(EA.scrub("x a/b+c y", [EA.Secret("a/b+c")]), "x [key] y")
+        self.assertEqual(EA.scrub("x a%2Fb%2Bc y", [EA.Secret("a/b+c")]), "x [key] y")
 
 
 class TestExternalAdapterWork(ExternalAdapterCase):
