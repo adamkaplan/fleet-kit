@@ -934,6 +934,34 @@ round by text in an issue body is no worse than having no judge: the configured
 rules still hold. With it in place, the configured rules can be permissive,
 because the judge catches what a name-based rule can't tell apart.
 
+**It runs on every call, with no service environment (#73).** The `fleet-hooks`
+plugin used to switch both hooks off unless `FLEET_SWITCHBOARD_BIN` and
+`FLEET_SWITCHBOARD_SHIMS` were in v2's service environment, and a service
+started by a TUI has neither, so nothing was ever judged. Now, when a variable
+is unset, the plugin uses `realpath(~/.local/bin/fleet-switchboard)` and
+`<checkout>/shims` beside it. A variable that is set wins, even a bad one.
+`fleet-doctor` has two checks: `switchboard-path` says when that link resolves
+anywhere but the main checkout (`~/Code/fleet-kit`, or `$FLEET_KIT_MAIN`), so a
+stale worktree is named and never used silently; `judge-liveness` fails when
+agents are working and no `policy.judge` entry has been written for 30 minutes
+(`fleet-switchboard status` carries the same line as `policy judge  ALARM: ...`).
+The alarm cannot tell an agent that has only just started from a silent
+judge, so a first alarm after a long idle spell is worth one more look.
+
+**Shadow mode.** `policy.shadow: true` (default `false`) runs the judge and
+audits every verdict, and enforces none: the reply is always the configured
+outcome. Each `policy.judge` audit entry carries `shadow: true` and `verdict`
+(`would-ask`, `would-deny`, or `unchanged`) next to `latency_ms`. It only ever
+keeps the configured outcome, so it cannot loosen anything. Use it for the first
+hours of a judge that has never been live, then remove it. (A deterministic rule
+that is not a tool call, `decisions answer` against the owner's orders, is not
+a tool-call hook and is unaffected.)
+
+**Sampling the judge.** `fleet-switchboard policy-report [--minutes 60] [--json]`
+reads the audit log and prints calls judged, would-ask, would-deny, what was
+actually enforced, and latency p50/p95. `policy-report --check` is the liveness
+check the doctor runs (exit 1 on an alarm).
+
 **A hard deny is escalated, not argued.** "Outside the Intent" is denied, and
 the denial reason tells the agent to escalate: a worker or orchestrator sends
 it to the Chief of Staff, which asks you; an orchestrator may use the

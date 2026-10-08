@@ -9,6 +9,8 @@
 // configured rules alone: a reply that is not stricter is ignored, and the
 // child process has a hard timeout, after which the configured outcome stands.
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export const OUTCOMES = ["allow", "ask", "deny"]; // least to most strict
@@ -158,11 +160,39 @@ export function makeShellHook(dir) {
   };
 }
 
+// The service that runs v2 is often auto-started by a TUI, with none of the variables above. So when they are
+// UNSET (an explicit value, even a bad one, always wins) the plugin finds the switchboard where `install` links it,
+// ~/.local/bin/fleet-switchboard, and the shims beside the checkout that link resolves to: <checkout>/bin/..
+// /shims. Nothing is looked up on PATH. `fleet-doctor` checks that this checkout is the main one.
+export const DEFAULT_LINK = [".local", "bin", "fleet-switchboard"];
+
+export function derivedPaths(home = os.homedir(), realpath = fs.realpathSync) {
+  try {
+    const bin = realpath(path.join(home, ...DEFAULT_LINK));
+    const shims = path.join(path.dirname(path.dirname(bin)), "shims");
+    return { bin, shims: realpath(shims) };
+  } catch {
+    return { bin: null, shims: null }; // no link, or a dangling one: the plugin stays off, as before
+  }
+}
+
+export function resolveSettings(env = process.env, deps = {}) {
+  const settings = settingsOf(env);
+  let shims = shimsOf(env);
+  const unsetBin = !env.FLEET_SWITCHBOARD_BIN;
+  const unsetShims = !env.FLEET_SWITCHBOARD_SHIMS;
+  if (unsetBin || unsetShims) {
+    const derived = derivedPaths(deps.home, deps.realpath);
+    if (unsetBin) settings.bin = derived.bin;
+    if (unsetShims) shims = derived.shims;
+  }
+  return { ...settings, shims };
+}
+
 export default {
   id: "fleet.hooks",
-  async setup(api, env = process.env) {
-    const { bin, timeoutMs } = settingsOf(env);
-    const shims = shimsOf(env);
+  async setup(api, env = process.env, deps = {}) {
+    const { bin, timeoutMs, shims } = resolveSettings(env, deps);
     if (shims && api.shell && typeof api.shell.hook === "function") api.shell.hook("create.before", makeShellHook(shims));
     if (!bin) return; // not configured: tool calls follow the configured rules alone
     api.permission.hook("evaluate", makeHandler({ bin, timeoutMs }));
