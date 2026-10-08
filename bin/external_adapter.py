@@ -1334,6 +1334,8 @@ class WorkClient:
     def __init__(self, door, mapping, clock=time.monotonic):
         self.door, self.m, self.clock = door, mapping, clock
         self.interval = float(mapping.data["work_interval"])
+        # the generic field names the mapping names (the work pump passes only these; the rest are not sent)
+        self.fields = frozenset(k for k in mapping.fields.get("work", {}) if k != "progress_text")
         self.items = {}
 
     def _state(self, work_id, project):

@@ -25618,6 +25618,39 @@ class TestExternalWiring(ExternalWorld):
         self.assertNotIn(FakeDoorServer.KEY, text)
         self.assertIn("refused", text)
 
+    def test_work_items_flow_through_the_adapters_work_client(self):
+        self.write_mapping()
+        self.wire(work_items=True)
+        self.add_worker("api-w1", issue=5)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.run_pass()
+        tasks = list(self.door.tasks.values())
+        self.assertGreaterEqual(len(tasks), 1, self.door.log)   # one per assignment the world holds
+        self.assertEqual(len(tasks), self.door.count("work_put", "http"))
+        for task in tasks:
+            self.assertIn(task["state"], ("going", "paused", "stuck", "waiting"))
+            self.assertNotIn("serves", task, "a field the mapping does not name is not sent")
+            self.assertTrue(task["kind"])
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.tasks), len(tasks), "idempotent: nothing is created twice")
+        self.assertEqual(self.door.count("work_put", "http"), len(tasks))
+        self.assertNotIn(FakeDoorServer.KEY, self.everything())
+        adapter = self.world.engine.external_sync.adapter
+        self.assertTrue({"title", "kind", "state", "progress"} <= adapter.work.fields)
+        self.assertNotIn("progress_text", adapter.work.fields)
+
+    def test_a_failing_work_sink_never_blocks_the_decision_sync(self):
+        self.wire(work_items=True)
+        self.add_worker("api-w1", issue=5)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.door.fail_next("work_put", 400, {"code": "bad", "message": "no"}, count=50)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1, "the decision still went out")
+        self.assertEqual(len(self.file_body()["decisions"]), 1)
+
     def test_loading_the_script_imports_nothing_of_the_adapter(self):
         code = ("import importlib.machinery as m, importlib.util as u, sys\n"
                 "l = m.SourceFileLoader('x_sb', %r); s = u.spec_from_loader('x_sb', l); mod = u.module_from_spec(s)\n"
