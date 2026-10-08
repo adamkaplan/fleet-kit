@@ -14095,6 +14095,50 @@ class TestSyncReportFreezePerBoss(unittest.TestCase):
         self.assertIn("plan_operations(desired, self._projected(), kinds, now, scoped)", source)
 
 
+class TestStatusIntentGapsAreBounded(unittest.TestCase):
+    """#86: the intent-gap check in `status` runs its reads in parallel, within one time budget."""
+
+    class Reader:
+        def __init__(self, delays):
+            self.delays = delays
+            self.seen = []
+
+        def missing_intent(self, number):
+            self.seen.append(number)
+            time.sleep(self.delays.get(number, 0))
+            if number == 13:
+                raise sb.IntentError("gh", "boom")
+            return [number] if number % 2 else []
+
+    def report(self, delays, budget, numbers):
+        engine = types.SimpleNamespace(intents=self.Reader(delays))
+        with mock.patch.object(sb, "referenced_issues", return_value=numbers):
+            return sb.intent_gap_report(engine, None, [], budget=budget)
+
+    def test_every_issue_is_read_and_errors_are_kept(self):
+        got = self.report({}, 5, [1, 2, 3, 13])
+        self.assertEqual((got["intent_gaps"], got["intent_errors"]), ([1, 3], ["#13: gh: boom"]))
+        self.assertNotIn("intent_unchecked", got)
+
+    def test_the_reads_overlap(self):
+        started = time.time()
+        got = self.report(dict.fromkeys(range(1, 9), 0.3), 5, list(range(1, 9)))
+        self.assertLess(time.time() - started, 1.2, "eight 0.3 s reads in parallel, not 2.4 s serial")
+        self.assertEqual(got["intent_gaps"], [1, 3, 5, 7])
+
+    def test_a_read_past_the_budget_is_counted_not_waited_for(self):
+        started = time.time()
+        got = self.report({2: 3.0}, 0.3, [1, 2, 3])
+        self.assertLess(time.time() - started, 2.0)
+        self.assertEqual(got["intent_unchecked"], 1)
+        self.assertEqual(got["intent_gaps"], [1, 3])
+        lines = sb.intent_gap_lines(got)
+        self.assertTrue(any("not checked" in l and "partial" in l for l in lines), lines)
+
+    def test_no_reader_is_an_empty_report(self):
+        self.assertEqual(sb.intent_gap_report(types.SimpleNamespace(intents=None), None, []), {})
+
+
 class TestDecisionIds(unittest.TestCase):
     def item(self, seed, ask=None, agent="coder", bare=False, since=EPOCH):
         return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since}

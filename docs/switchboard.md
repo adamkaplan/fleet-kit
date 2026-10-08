@@ -3554,3 +3554,12 @@ When a boss cannot be read, the `reports` error names it (`boss`), and the outbo
 the report items of that boss. An answered report to another boss is withdrawn as usual. A report item whose boss
 is not known (a link made before this field existed) is still kept while any boss is unreadable, the cautious way;
 an error that names no boss still freezes every report. The link table gains an optional `boss` per link.
+
+## Status speed (#86)
+
+`fleet-switchboard status` spent most of its time on the intent-gap check: one serial `gh api` read (about 0.4 s)
+for every issue an agent or fact refers to, over 100 reads in all for a busy fleet. Those reads now run in parallel
+(8 at a time) within one 4 s budget. A read that has not finished by then is counted, not waited for, and `status`
+says so (`intent: N referenced issue(s) not checked within the 4s budget (partial answer)`); the threads are daemon
+threads, so a stuck `gh` cannot hold the process. The remaining time is v2 and herdr reads per agent in discovery,
+which are serial and unchanged.
