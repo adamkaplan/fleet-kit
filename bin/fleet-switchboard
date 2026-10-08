@@ -4486,7 +4486,7 @@ def considered_send(engine, report, repos, since, sends):
     tag = "%s#%s" % (match.group(2) or "", match.group(3)) if match.group(3) else "no issue"
     if created <= report["at"][0]:
         why = "older than this report"
-    elif match.group(3) and (int(match.group(3)) != report["issue"]
+    elif match.group(3) and report["issue"] is not None and (int(match.group(3)) != report["issue"]
                              or repo_of_tag(match.group(2), repos) not in (None, report["repo"])):
         why = "tagged %s, not this ask" % tag
     else:

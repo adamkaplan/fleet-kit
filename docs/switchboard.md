@@ -1116,7 +1116,8 @@ decision of its own. Ids are assigned before folding and never change.
 
 A report is **answered** only when the boss has sent that worker something on
 the same ask (a `send` with no `--issue` counts for any ask: the worker has
-one), or the same worker has since reported, on the same issue and repo, a newer
+one; and a report that names no issue is answered by *any* later `send` from its boss to that worker, whatever
+issue the send carries, because the report names no ask for it to be about), or the same worker has since reported, on the same issue and repo, a newer
 `question`, a `done`, a `failed` or a `withdrawn`. `working`, `paused` and
 `blocked` never answer: a status line does not resolve the question it sits
 beside. A report with no issue is narrower: only a later `done`, `failed` or
