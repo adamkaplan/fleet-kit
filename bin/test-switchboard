@@ -14034,6 +14034,68 @@ class DecisionsBase(ReportBase):
         return code, out.getvalue(), err.getvalue()
 
 
+class TestReportChecksItsIssue(ReportBase):
+    """#89: a report tagged to an issue that does not exist is refused; an unreadable lookup never blocks one."""
+
+    class Reader:
+        repo = "acme/api"
+
+        def __init__(self, answer):
+            self.answer, self.asked = answer, []
+
+        def issue(self, number, repo=None):
+            self.asked.append((repo, number))
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            if callable(self.answer):
+                return self.answer()
+            return object()
+
+        def header(self, number, repo=None, repos=None):
+            return None
+
+    def send_report(self, answer, issue):
+        engine = self.world.new_engine("cli")
+        engine.intents = self.Reader(answer)
+        return engine, engine.report("coder", "question", "which db?", issue)
+
+    def test_a_missing_issue_is_refused_with_one_clear_line(self):
+        engine = self.world.new_engine("cli")
+        engine.intents = self.Reader(sb.IntentError("not_found", "HTTP 404"))
+        with self.assertRaises(sb.ReportError) as caught:
+            engine.report("coder", "question", "which db?", 7)
+        self.assertIn("does not exist", str(caught.exception))
+        self.assertIn("#7", str(caught.exception))
+        self.assertEqual(self.world.admissions("platform"), [], "nothing was sent")
+
+    def test_an_existing_issue_is_accepted(self):
+        engine, out = self.send_report(None, 7)
+        self.assertTrue(out["sent"] or out["action"], out)
+
+    def test_an_unreadable_lookup_never_blocks_a_report(self):
+        for err in (sb.IntentError("unavailable", "gh did not answer"), sb.IntentError("gh", "HTTP 502"),
+                    RuntimeError("odd")):
+            with self.subTest(err=str(err)):
+                self.send_report(err, 7)
+
+    def test_a_slow_lookup_is_accepted_after_the_wait(self):
+        started = time.time()
+        engine = self.world.new_engine("cli")
+        engine.intents = self.Reader(lambda: time.sleep(2))
+        with mock.patch.object(sb, "REPORT_LOOKUP_WAIT", 0.2):
+            engine.report("coder", "question", "which db?", 7)
+        self.assertLess(time.time() - started, 1.5)
+
+    def test_no_reader_and_no_issue_means_no_lookup(self):
+        engine = self.world.new_engine("cli")
+        engine.intents = None
+        engine.report("coder", "question", "which db?", 7)
+        reader = self.Reader(sb.IntentError("not_found", "x"))
+        engine.intents = reader
+        engine.report("coder", "question", "another?")      # the worker's own ask: not looked up
+        self.assertEqual(reader.asked, [])
+
+
 class TestReportsPerBoss(DecisionsBase):
     """#80: the chief-of-staff alias resolves to the registered agent, and one unreadable boss freezes only its own
     reports."""
