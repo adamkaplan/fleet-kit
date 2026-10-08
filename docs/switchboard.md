@@ -2575,6 +2575,104 @@ from tests that load it with `SourceFileLoader`, and from any directory. Nothing
 file is part of the checkout. Python 3.9, standard library only. The old function names (`assign_decision_ids`,
 `headline_of`, `report_answered`, `decisions_view`, `parse_decision_rows` and the rest) remain in the script.
 
+### External decision systems
+
+A decision can be mirrored to a system outside the Switchboard, and an answer given there can come back and unblock
+the agent. It is **off by default**: with `external_decisions.enabled` false (or absent) no adapter is built, nothing
+is called, no file is written, and `status` prints no external line. The Decision baseline pins that.
+
+The pieces:
+
+- **The engine** (`bin/decision_sync.py`, loaded like the core) runs at the end of each daemon pass. It never raises
+  into the pass and never changes the local list: a down adapter cannot hide a decision or stop local answering.
+- **The port** (`ExternalDecisionAdapter` in `bin/decision_core.py`) is the only thing an adapter implements:
+  `health()`, `push(operation, idempotency_key)`, `lookup(key)` and `pull_changes(cursor)`. Every write carries an
+  idempotency key and the same key twice is the same write; reads are by cursor and may repeat. An adapter is
+  registered under a name and built from the config section, the parsed mapping file and the state directory.
+- **Keys.** A decision's key is derived from its source identity (the same seed that numbers it), never from its
+  display id. An operation's idempotency key is derived from the decision key, the operation and the revision.
+- **The link table** (`external-links.json` in the state directory) holds key to outside id, revision, what was last
+  said, the pull cursor and the applied event ids. It is disposable: when it is missing or unreadable the engine asks
+  the adapter to look each decision up by its key and rebuilds it.
+- **The outbox** (`external-outbox.json`) holds operations not yet delivered: `raise`, `revise`, `status` (a tier change or
+  a note) and `withdraw`. They go in order per decision, with backoff, at least once. Past `outbox_alarm_depth` the
+  status line and the errors say so; nothing is ever dropped.
+
+What goes outward: decisions of the listed kinds in the listed repos, at every tier, each mapped one to one to the
+floor tier the `tier_map` names. A decision that leaves the list (answered, resolved, superseded, withdrawn) is
+withdrawn outside, except while its source could not be read (an empty read is not an answer). A question asked
+again by the same agent on the same ask is a `revise` of the linked item. An escalation is a tier change. Text is
+scrubbed of anything shaped like a credential before it leaves.
+
+What stays local: permission requests (never pushed, never answered from outside), PR notices, decisions of repos
+that are not switched on, and every decision's local answering.
+
+Inbound answers are applied once (events are de-duplicated by event id) by the delivery that already serves the asker:
+a report by a send to the worker, an issue by a comment and the labels coming off, a batch by the batch answer. Authority
+follows the role of the answerer, as the adapter reports it:
+
+| Answerer          | Counts as            | May settle a decision at tier |
+|-------------------|----------------------|-------------------------------|
+| project agent     | an orchestrator's    | orchestrator                  |
+| owner's agent     | the Chief of Staff's | orchestrator, cos             |
+| the human         | the human's          | orchestrator, cos, human      |
+
+The owner's agent is judged as well. Role authority only says whose answer it counts as; the owner's standing orders
+decide whether it is within what the owner has delegated. An answer by the owner's agent goes through the same
+policy judge as the Chief of Staff's own `decisions answer` (the same four questions, the same decision model, the
+owner's standing orders file as the authority) and is applied only when the judge allows it. The judge can only
+tighten: it is asked after role authority accepted the answer, never instead of it. It fails safe:
+
+- no standing orders file, a file with nothing in it, an unusable file, or a policy judge that is not on: not applied;
+  the answer goes to the owner (the decision stays open at its tier, and a status note naming why is pushed back);
+- the judge says the answer is outside the orders: the same, with the reason in the audit and in the note;
+- the model cannot be asked (a timeout, an error): the decision stays open and the answer is tried again later, with
+  a backoff, up to 5 tries; after that it is not applied and the owner decides. A dead judge never holds up other
+  answers and never spins.
+
+The project agent's answers (an orchestrator's) and the human's are not judged. A duplicate of an answer that is
+waiting for the judge, or that was refused, is still ignored by its event id. No configuration key was added: the
+judge is the existing `policy` and `jev` settings, and the orders are the existing standing orders file
+(`cos_orders_file`).
+
+An answer from a role below the decision's tier is not applied: it is audited, a status note is pushed back, and the
+decision stays. A clarification is sent to the raising agent as a note and is not an answer; the agent's next report
+revises the item. A reversal after delivery tells the agent (`answer changed: ...`) and undoes nothing. An answer for
+an unknown or already closed decision is an orphan: audited, not delivered. If a decision is answered here and outside
+at once, the first writer wins. Answers pick by option id; the text rides along.
+
+Failure modes: adapter down (a visible `external` error entry, the outbox grows, local work goes on); a lost
+acknowledgement (the retry carries the same key, so there is no second item); a lost link table (rebuilt by lookup);
+a failing delivery of an inbound answer (the event is not marked, the cursor stays, it comes again).
+
+`fleet-switchboard status` and `decisions` print one line when it is on: `external  ok; outbox N; last pull 12s ago`
+or `external  down: <why>`.
+
+Configuration (no key is read from the repo; the mapping file is local):
+
+| Key (`external_decisions`) | Default               | Meaning                                                                                            |
+|----------------------------|-----------------------|----------------------------------------------------------------------------------------------------|
+| `enabled`                  | `false`               | Off: nothing is called, read or written, and `status` prints no external line.                     |
+| `adapter`                  | none                  | The registered adapter's name (`register_external_adapter`). Required when enabled.                |
+| `repos`                    | `[]`                  | A project is switched on per repo: only decisions of these repos go outward.                       |
+| `kinds`                    | `["issue", "report"]` | What goes: `issue` (batches included), `report`, `question`. Never a permission request.           |
+| `mapping_file`             | none                  | Absolute path of a LOCAL file with everything specific to the other system. Required when enabled. |
+| `tier_map`                 | none                  | A floor tier name for each of `orchestrator`, `cos`, `human`, one to one. Required when enabled.   |
+| `poll_seconds`             | 30                    | How often answers are pulled.                                                                      |
+| `outbox_alarm_depth`       | 1000                  | A deeper outbox raises an alarm in the status line and the errors; nothing is dropped.             |
+| `retry_base_seconds`       | 5                     | First backoff of a failed outbound operation; doubles each try.                                    |
+| `retry_max_seconds`        | 600                   | The ceiling of the backoff.                                                                        |
+
+The mapping file is read by the adapter, not by the engine. What it holds is the adapter's business; typically:
+
+| Typical content of the mapping file                                                                 | Who reads it |
+|-----------------------------------------------------------------------------------------------------|--------------|
+| where the system is reached (an address)                                                            | the adapter  |
+| which project or space on that side holds these decisions                                           | the adapter  |
+| where the credential comes from (an environment variable name or a 0600 file; never the credential) | the adapter  |
+| the names of its tiers, rooms or queues that the `tier_map` floor names refer to                    | the adapter  |
+| how a decision's options are named there                                                            | the adapter  |
+
 ## Repo and PR conventions
 
 - Work happens in a git worktree of the existing checkout; no second clone.
