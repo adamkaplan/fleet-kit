@@ -9914,7 +9914,7 @@ class TestPolicyConfig(Base):
     def test_off_by_default_with_documented_defaults(self):
         policy = sb.validate_config({})["policy"]
         self.assertEqual(policy, {"enabled": False, "budget_ms": 1500, "thresholds": {}, "cache_seconds": 300,
-                                  "cache_entries": 200})
+                                  "cache_entries": 200, "shadow": False})
 
     def check_rejected(self, policy, fragment, **extra):
         with self.assertRaises(sb.ConfigError) as caught:
@@ -9928,7 +9928,7 @@ class TestPolicyConfig(Base):
     def test_each_value_is_checked(self):
         for policy, fragment in (({"enabled": "yes"}, "policy.enabled"), ({"budget_ms": 0}, "policy.budget_ms"),
                                  ({"budget_ms": "9"}, "policy.budget_ms"), ({"budget_ms": True}, "policy.budget_ms"),
-                                 ({"cache_seconds": -1}, "policy.cache_seconds"),
+                                 ({"cache_seconds": -1}, "policy.cache_seconds"), ({"shadow": "yes"}, "policy.shadow"),
                                  ({"cache_entries": 0}, "policy.cache_entries"),
                                  ({"cache_entries": 99999}, "policy.cache_entries"),
                                  ({"thresholds": []}, "policy.thresholds"),
@@ -10833,6 +10833,109 @@ class TestJudgeToolSecrets(PolicyCase):
 
 
 CANARY = "canary-key-7f3a9c1e5b2d"  # a made-up key: it only has to be findable
+
+
+class TestPolicyShadow(PolicyCase):
+    """#73: policy.shadow records what the judge would do and enforces nothing."""
+
+    def test_shadow_records_would_ask_and_leaves_the_configured_outcome(self):
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}], shadow=True)
+        reply = self.judge_tool(self.coder, "shell", "git push --force", "allow")
+        self.assertEqual(reply["outcome"], "allow")
+        self.assertIn("would ask", reply["reason"])
+        entry = self.audit_events()[-1]["detail"]
+        self.assertEqual((entry["shadow"], entry["verdict"], entry["outcome"]), (True, "would-ask", "allow"))
+        self.assertIsInstance(entry["latency_ms"], int)
+
+    def test_shadow_records_would_deny_and_never_denies(self):
+        self.configure([{"noul": dict(LOW, outside_intent=0.9)}], shadow=True)
+        reply = self.judge_tool(self.coder, "edit", "billing/export.py", "allow")
+        self.assertEqual(reply["outcome"], "allow")
+        self.assertEqual(self.audit_events()[-1]["detail"]["verdict"], "would-deny")
+
+    def test_shadow_never_loosens_a_configured_ask(self):
+        self.configure([{"noul": LOW}], shadow=True)
+        reply = self.judge_tool(self.coder, "shell", "ls", "ask")
+        self.assertEqual(reply["outcome"], "ask")
+        self.assertEqual(self.audit_events()[-1]["detail"]["verdict"], "unchanged")
+
+    def test_shadow_off_still_enforces_and_records_no_verdict(self):
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}])
+        self.assertEqual(self.judge_tool(self.coder, "shell", "git push --force", "allow")["outcome"], "ask")
+        self.assertNotIn("shadow", self.audit_events()[-1]["detail"])
+
+
+class TestPolicyReport(PolicyCase):
+    """#73: the sample summary and the liveness alarm, both read from the audit log."""
+
+    def write_entries(self, entries):
+        lines = []
+        for age, detail in entries:
+            ts = datetime.datetime.fromtimestamp(self.now - age, datetime.timezone.utc).isoformat(timespec="milliseconds")
+            lines.append(json.dumps({"ts": ts.replace("+00:00", "Z"), "actor": "judge-tool", "event": "policy.judge",
+                                     "subject": "x", "detail": detail}))
+        self.world.audit_path.write_text("\n".join(lines) + "\n")
+
+    def setUp(self):
+        super().setUp()
+        self.now = time.time()
+
+    def test_the_sample_counts_verdicts_and_latency_percentiles(self):
+        shadow = {"judged": True, "shadow": True, "configured": "allow", "outcome": "allow"}
+        self.write_entries(
+            [(10, dict(shadow, verdict="would-ask", latency_ms=100)),
+             (20, dict(shadow, verdict="would-deny", latency_ms=200)),
+             (30, dict(shadow, verdict="unchanged", latency_ms=300)),
+             (40, dict(shadow, verdict="unchanged", latency_ms=400)),
+             (7200, dict(shadow, verdict="would-ask", latency_ms=9999))])  # outside the window
+        sample = sb.policy_sample(self.world.state, self.now, 3600)
+        self.assertEqual((sample["calls"], sample["judged"], sample["would_ask"], sample["would_deny"]), (4, 4, 1, 1))
+        self.assertEqual((sample["latency_p50_ms"], sample["latency_p95_ms"]), (200, 400))
+
+    def test_an_empty_sample_is_zeros_not_an_error(self):
+        sample = sb.policy_sample(self.world.state, self.now, 3600)
+        self.assertEqual((sample["calls"], sample["latency_p50_ms"], sample["last_judged_age_seconds"]), (0, None, None))
+
+    def test_the_command_prints_the_summary(self):
+        self.write_entries([(5, {"judged": True, "shadow": True, "verdict": "would-ask", "latency_ms": 50,
+                                 "configured": "allow", "outcome": "allow"})])
+        with mock.patch.object(sb.time, "time", lambda: self.now), captured() as (out, err):
+            code = sb.main(["policy-report", "--minutes", "30"], runner=self.route, now=lambda: self.now)
+        self.assertEqual(code, 0, err.getvalue())
+        text = out.getvalue()
+        for fragment in ("last 30 min", "would-ask      1", "p50 50 ms"):
+            self.assertIn(fragment, text)
+
+    def config_of(self, **policy):
+        return sb.validate_config({"jev": {}, "policy": dict({"enabled": True}, **policy)})
+
+    def test_working_agents_and_a_silent_judge_alarm(self):
+        result = sb.policy_liveness(self.config_of(), self.world.state, 2, self.now)
+        self.assertEqual((result["state"], result["alarm"]), ("ALARM", True))
+        self.assertIn("ALARM", result["line"])
+        self.assertIn("2 agent(s) working", result["line"])
+
+    def test_a_judgement_inside_30_minutes_is_ok(self):
+        self.write_entries([(600, {"judged": True, "latency_ms": 5})])
+        result = sb.policy_liveness(self.config_of(), self.world.state, 2, self.now)
+        self.assertEqual((result["state"], result["alarm"]), ("ok", False))
+
+    def test_a_judgement_older_than_30_minutes_alarms(self):
+        self.write_entries([(1900, {"judged": True, "latency_ms": 5})])
+        self.assertTrue(sb.policy_liveness(self.config_of(), self.world.state, 1, self.now)["alarm"])
+
+    def test_nobody_working_is_idle_not_an_alarm(self):
+        result = sb.policy_liveness(self.config_of(), self.world.state, 0, self.now)
+        self.assertEqual((result["state"], result["alarm"]), ("idle", False))
+
+    def test_a_judge_that_is_off_cannot_alarm(self):
+        result = sb.policy_liveness(sb.validate_config({}), self.world.state, 3, self.now)
+        self.assertEqual((result["state"], result["alarm"]), ("off", False))
+
+    def test_the_shadow_mode_is_named_in_the_line(self):
+        self.write_entries([(60, {"judged": True})])
+        line = sb.policy_liveness(self.config_of(shadow=True), self.world.state, 1, self.now)["line"]
+        self.assertIn("shadow", line)
 
 
 class TestJudgeSocket(PolicyCase):

@@ -50,6 +50,7 @@ import hmac
 import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -7449,6 +7450,10 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             if work_line is not None:
                 report["external"]["work_line"] = work_line
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
+    if config_ok and state_ok:
+        working = sum(1 for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")
+                      and entry["observation"]["status"] == "working")
+        report["policy"] = policy_liveness(config, state_dir_path(), working, now())
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
@@ -7535,6 +7540,7 @@ def format_status(report):
     lines.extend("      " + report["external"]["line"] for _ in [0] if "external" in report)
     lines.extend("      " + report["external"]["work_line"] for _ in [0] if "external" in report and "work_line" in report["external"])
     lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18
+    lines.extend("      " + report["policy"]["line"] for _ in [0] if "policy" in report)
     lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
 
@@ -8678,6 +8684,7 @@ POLICY_DEFAULTS = {
     "thresholds": {},       # question id -> probability at which it fires (default POLICY_THRESHOLD)
     "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
     "cache_entries": 200,   # entries kept in each cache file
+    "shadow": False,        # record what the judge would do (audit policy.judge, `shadow`/`verdict`), enforce nothing
 }
 DEFAULTS["policy"] = None   # None means POLICY_DEFAULTS
 POLICY_STDIN_LIMIT = 65536  # bytes of request read from stdin
@@ -8714,6 +8721,8 @@ def validate_policy_config(config, source):
         if not _is_number(value) or value < 0 or (name == "budget_ms" and value <= 0):
             raise ConfigError("%s: 'policy.%s' must be a %s number, got %r"
                               % (source, name, "positive" if name == "budget_ms" else "non-negative", value))
+    if not isinstance(settings["shadow"], bool):
+        raise ConfigError("%s: 'policy.shadow' must be true or false, got %r" % (source, settings["shadow"]))
     entries = settings["cache_entries"]
     if not (isinstance(entries, int) and not isinstance(entries, bool) and 1 <= entries <= 5000):
         raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
@@ -9329,8 +9338,22 @@ class PolicyJudge:
             reply = box.get("reply") or policy_reply(request["configured"], "the judge failed: the configured "
                                                      "outcome stands", False, False, elapsed)
             reply["latency_ms"] = elapsed
-        self._audit(request, reply, box)
+        reply, shadow = self.shadowed(request, reply)
+        self._audit(request, reply, box, shadow)
         return reply
+
+    def shadowed(self, request, reply):
+        """policy.shadow: the judge's verdict is recorded and never enforced. Returns (reply, verdict-or-None); with
+        shadow on, a tightened reply becomes the configured outcome again, so nothing is ever stricter than the
+        rules alone. Only a stricter outcome is a would-ask or would-deny."""
+        if not self.settings.get("shadow"):
+            return reply, None
+        order = POLICY_REQUEST_OUTCOMES
+        would, configured = reply["outcome"], request["configured"]
+        if would in order and configured in order and order.index(would) > order.index(configured):
+            return dict(reply, outcome=configured, reason=_one_line(
+                "shadow: the judge would %s (%s); not enforced" % (would, reply["reason"]), 600)), "would-%s" % would
+        return reply, ("unchanged" if reply["judged"] else None)
 
     def finish_late(self, seconds=POLICY_WARM_SECONDS):
         """Wait for a judgement that missed its budget to finish and fill the caches (tests use it)."""
@@ -9505,7 +9528,7 @@ class PolicyJudge:
         return policy_reply("deny" if outcome == "hard-deny" else outcome, reason, judged, cached,
                             combined.get("latency_ms") or 0)
 
-    def _audit(self, request, reply, box):
+    def _audit(self, request, reply, box, shadow=None):
         detail, combined = box["detail"], box["detail"].get("combined") or {}
         state = dict(detail.get("state") or {})
         state["arguments"] = _one_line(state.get("arguments"), 300)
@@ -9516,6 +9539,8 @@ class PolicyJudge:
                  "answers": combined.get("answers"), "thresholds": detail.get("thresholds"),
                  "question": {"state": state, "ids": list(POLICY_QUESTIONS)} if state else None,
                  "model": combined.get("model"), "usage": combined.get("usage"), "error": detail.get("error")}
+        if shadow is not None:
+            entry.update(shadow=True, verdict=shadow)
         try:
             self.audit.append(POLICY_ACTOR, "policy.judge", "tool:%s:%s" % (request["session"], request["tool"]), entry)
         except OSError:
@@ -9780,10 +9805,139 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     return EXIT_OK
 
 
+POLICY_LIVENESS_SECONDS = 30 * 60   # agents active and no policy.judge for this long is an alarm
+POLICY_AUDIT_TAIL = 8 << 20         # bytes of the audit log's end that a report reads
+
+
+def _audit_tail(state_dir):
+    """The parsed entries in the last POLICY_AUDIT_TAIL bytes of audit.jsonl (a torn first line is dropped)."""
+    path = Path(state_dir) / "audit.jsonl"
+    try:
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - POLICY_AUDIT_TAIL))
+            data = handle.read()
+            torn = size > POLICY_AUDIT_TAIL
+    except OSError:
+        return []
+    lines = data.decode("utf-8", "replace").splitlines()
+    out = []
+    for number, line in enumerate(lines):
+        if number == 0 and torn:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def _audit_epoch(entry):
+    try:
+        return datetime.fromisoformat(str(entry.get("ts")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _percentile(sorted_values, fraction):
+    """Nearest-rank percentile of an ascending list (None when empty)."""
+    if not sorted_values:
+        return None
+    return sorted_values[max(0, min(len(sorted_values) - 1, int(math.ceil(fraction * len(sorted_values))) - 1))]
+
+
+def policy_sample(state_dir, now, window_seconds=3600):
+    """Summarise the policy.judge entries of the last `window_seconds`: calls, judged, would-ask, would-deny,
+    outcomes actually enforced, and latency p50/p95 (ms). Reads the audit log only."""
+    cutoff = now - window_seconds
+    calls = judged = would_ask = would_deny = asked = denied = 0
+    latencies, last = [], None
+    for entry in _audit_tail(state_dir):
+        if entry.get("event") != "policy.judge":
+            continue
+        at = _audit_epoch(entry)
+        if at is None:
+            continue
+        last = at if last is None or at > last else last
+        if at < cutoff:
+            continue
+        detail = entry.get("detail") or {}
+        calls += 1
+        judged += 1 if detail.get("judged") else 0
+        verdict = detail.get("verdict")
+        would_ask += verdict == "would-ask"
+        would_deny += verdict == "would-deny"
+        if not detail.get("shadow"):
+            asked += detail.get("outcome") == "ask" and detail.get("configured") != "ask"
+            denied += detail.get("outcome") == "deny" and detail.get("configured") != "deny"
+        if isinstance(detail.get("latency_ms"), (int, float)):
+            latencies.append(detail["latency_ms"])
+    latencies.sort()
+    return {"window_seconds": window_seconds, "calls": calls, "judged": judged, "would_ask": would_ask,
+            "would_deny": would_deny, "tightened_ask": asked, "tightened_deny": denied,
+            "latency_p50_ms": _percentile(latencies, 0.5), "latency_p95_ms": _percentile(latencies, 0.95),
+            "last_judged_age_seconds": None if last is None else max(0, int(now - last))}
+
+
+def policy_liveness(config, state_dir, active_agents, now):
+    """{state: off|ok|idle|ALARM, line}: the judge must have judged something in the last 30 minutes whenever an
+    agent is working. Silence with nobody working is fine; silence with agents working means the plugin is not
+    forwarding (the service lacks FLEET_SWITCHBOARD_BIN) and nothing is being judged."""
+    if not (config or {}).get("policy", {}).get("enabled"):
+        return {"state": "off", "alarm": False, "line": "policy judge  off (policy.enabled is false)"}
+    sample = policy_sample(state_dir, now, POLICY_LIVENESS_SECONDS)
+    mode = "shadow" if config["policy"].get("shadow") else "enforcing"
+    age = sample["last_judged_age_seconds"]
+    if sample["calls"]:
+        return {"state": "ok", "alarm": False, "sample": sample,
+                "line": "policy judge  %s, %d call(s) judged in the last 30 min" % (mode, sample["calls"])}
+    seen = "no policy.judge entry yet" if age is None else "last policy.judge %s ago" % format_age(age)
+    if active_agents:
+        return {"state": "ALARM", "alarm": True, "sample": sample,
+                "line": "policy judge  ALARM: %d agent(s) working and no policy.judge in 30 min (%s); the fleet-hooks "
+                        "plugin is probably not forwarding (is FLEET_SWITCHBOARD_BIN resolvable?)" % (active_agents, seen)}
+    return {"state": "idle", "alarm": False, "sample": sample, "line": "policy judge  %s; no agent working (%s)" % (mode, seen)}
+
+
+def cmd_policy_report(args, runner, now):
+    """`policy-report`: a sample of the judge's work, or with --check its liveness (exit 1 on an alarm)."""
+    config = load_config()
+    state = state_dir_path()
+    if args.check:
+        report = collect_status(runner, now)
+        result = report.get("policy") or {"state": "unknown", "alarm": False, "line": "policy judge  unknown"}
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(result["line"])
+        return EXIT_ERROR if result["alarm"] else EXIT_OK
+    sample = policy_sample(state, now(), int(args.minutes * 60))
+    sample["shadow"] = bool(config["policy"].get("shadow"))
+    if args.json:
+        print(json.dumps(sample, sort_keys=True))
+        return EXIT_OK
+    p50, p95 = sample["latency_p50_ms"], sample["latency_p95_ms"]
+    print("policy judge, last %g min (%s)" % (args.minutes, "shadow: recorded, not enforced" if sample["shadow"]
+                                            else "enforcing"))
+    print("  calls judged   %d (%d reached the model or a rule)" % (sample["calls"], sample["judged"]))
+    print("  would-ask      %d    would-deny  %d   (shadow verdicts)" % (sample["would_ask"], sample["would_deny"]))
+    print("  enforced       %d ask, %d deny" % (sample["tightened_ask"], sample["tightened_deny"]))
+    print("  latency        p50 %s ms, p95 %s ms" % ("-" if p50 is None else p50, "-" if p95 is None else p95))
+    return EXIT_OK
+
+
 POLICY_COMMANDS = {"judge-tool": cmd_judge_tool}
 
 
 def add_policy_parsers(sub):
+    report = sub.add_parser("policy-report", help="Summarise the judge's recent work from the audit log: calls, "
+                                                   "would-ask/would-deny, latency p50/p95; --check is its liveness")
+    report.add_argument("--minutes", type=float, default=60, help="The window to sample (default 60)")
+    report.add_argument("--json", action="store_true")
+    report.add_argument("--check", action="store_true", help="Liveness: exit 1 when agents are working and nothing "
+                                                             "was judged for 30 minutes")
     sub.add_parser("judge-tool", help="Judge one tool call: JSON on stdin, one JSON line out, exit 0 "
                                       "(the fleet-hooks plugin runs this; the judge only tightens)")
 # PR 10: move a v1 session into v2 (`import-v1`)
@@ -10777,6 +10931,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_status(args, runner, now)
     if args.action == "poke":
         return cmd_poke(args)
+    if args.action == "policy-report":
+        return cmd_policy_report(args, runner, now)
     if args.action in POLICY_COMMANDS:  # PR 9: prints one JSON line and exits 0 whatever happens
         return POLICY_COMMANDS[args.action](args, runner, now)
     try:

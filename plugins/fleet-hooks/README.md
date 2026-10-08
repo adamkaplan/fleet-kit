@@ -44,8 +44,19 @@ Give v2's environment `FLEET_SWITCHBOARD_BIN`, the absolute path of
 
 | Variable | Meaning |
 |---|---|
-| `FLEET_SWITCHBOARD_BIN` | Absolute path of `bin/fleet-switchboard`. Unset or relative: the plugin does nothing, and tool calls follow the configured rules alone. It is never looked up on `PATH`. |
+| `FLEET_SWITCHBOARD_BIN` | Absolute path of `bin/fleet-switchboard`. **Unset: the plugin uses `realpath(~/.local/bin/fleet-switchboard)`**, the link `install` makes, so a service auto-started by a TUI with no environment still judges. Set but relative: the plugin does nothing (an explicit value always wins, even a bad one). It is never looked up on `PATH`. |
+| `FLEET_SWITCHBOARD_SHIMS` | Absolute path of the `shims` directory (the signing `gh`). **Unset: `<checkout>/shims`**, where `<checkout>` is the directory above the `bin/` that the link above resolves into. Set but relative: the shell hook is off. |
 | `FLEET_HOOKS_TIMEOUT_MS` | Hard limit on one call, default 2500. Keep it above `policy.budget_ms`. When it passes, the child is killed and the configured outcome stands. |
+
+### A stale link is not silently trusted
+
+The fallback follows the link wherever it points, including a stale worktree.
+`fleet-doctor` (check `switchboard-path`) says so when the resolved switchboard
+is not the main checkout (`~/Code/fleet-kit/bin`, or `$FLEET_KIT_MAIN`).
+Fix the link with `fleet-switchboard install`; the plugin reads it at service
+start, so a running service picks the change up at its next restart.
+
+Tests: `node --test plugins/fleet-hooks/index.test.mjs`.
 
 ## Shape (measured in the Lab, v2 2.0.22)
 
