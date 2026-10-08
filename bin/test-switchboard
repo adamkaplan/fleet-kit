@@ -24168,6 +24168,38 @@ r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
 r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
 const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
+// iteration 3
+const v3 = (list, view) => d.styledRows(snap(list), now, 34, view, { v3: true });
+r.v3 = {
+  hue: [d.projectHue("acme/web"), d.projectHue("acme/web"), d.projectHue("acme/api"), d.projectHue("")],
+  hues: [...new Set(["a/1", "b/2", "c/3", "d/4", "e/5", "f/6", "g/7", "h/8"].map((x) => d.projectHue(x)))].sort(),
+  glyphs: Object.entries(d.GLYPH).map(([k, g]) => [k, [...g].length, g.codePointAt(0) < 0x10000 && g.length === 1]),
+  chief: d.styledText(v3(mix, chief), 34),
+  styles: v3(mix, human).filter((l) => l.id || /^(a|c)$/.test(textOf(l))).map((l) => [textOf(l), l.segs.map((s) => s[1]), (l.right || []).map((s) => s[1])]),
+  size: v3([pr(5, "o/a", 100, { additions: 900, deletions: 100 })], human).slice(-2).map((l) => [textOf(l), l.segs.map((s) => s[1])]),
+  gap: v3(mix, human).slice(2, 6).map((l) => textOf(l)),
+  plainC: d.styledText(d.styledRows(snap(mix), now, 34, chief), 34).join("\n") === r.chief.join("\n"),
+  theme: d.themeColors({ syntax: { keyword: "K", function: "F", operator: "O", type: "T" }, diff: { text: { added: "A", removed: "R" } } }),
+  themeNone: d.themeColors({ syntax: {} }),
+};
+// search links and kind marks
+const env = { USER: "tester" };
+const withEnv = (list, view) => d.styledRows(snap(list), now, 34, view, { v3: true, env });
+const cosList = [mk("a#1", "acme/a", "cos", "q1", 100, { kind: "issue" }), mk("a#2", "acme/a", "cos", "q2", 100, { kind: "issue" }), mk("a#3r", "acme/a", "cos", "r", 100, { kind: "report" }),
+  mk("b#9r", "acme/b", "cos", "only a report", 100, { kind: "report" }), mk("c#1", "other/c", "cos", "q", 100, { kind: "issue" }), pr(5, "acme/a", 10), pr(6, "other/c", 10)];
+const sumRows = withEnv(cosList, chief).slice(1, 3);
+r.links2 = {
+  prs: d.searchUrl("pr", ["acme/a"]), prsMany: d.searchUrl("pr", ["other/c", "acme/a", "acme/a"]),
+  cos: d.searchUrl("label", ["acme/a"], "tester:awaiting-cos"), cosMany: d.searchUrl("label", ["acme/a", "other/c"], "tester:awaiting-user"),
+  hostile: [d.searchUrl("label", ["acme/a"], 'x" repo:evil/z'), d.searchUrl("label", ["acme/a"], "a:awaiting-cos&x=1"), d.searchUrl("pr", ["a b/c"]), d.searchUrl("pr", ["../x"]), d.searchUrl("pr", []), d.searchUrl("pr", [5, null, {}])],
+  safe: [d.safeUrl("https://github.com/a/b/issues?q=is%%3Aopen"), d.safeUrl("https://github.com/a/b/issues?q=x&y=1"), d.safeUrl("https://github.com/a/b/issues?q=x\u001b"), d.safeUrl("https://github.com/search?q=x%%2By&type=issues"),
+    d.safeUrl("https://github.com/search?q=x&type=code"), d.safeUrl("https://evil.com/a/b/issues?q=x"), d.safeUrl("https://github.com/a/b/pulls?q=x y"), d.safeUrl("https://github.com/a/b/pulls?q=x#h")],
+  user: [d.labelUserOf({ USER: "tester" }), d.labelUserOf({ LOGNAME: "x.y" }), d.labelUserOf({ USER: "a b" }), d.labelUserOf({ USER: "x:y" }), d.labelUserOf({}), d.labelUserOf(null)],
+  summary: sumRows.flatMap((l) => l.segs).map((x) => [x[0], x[2] ?? null]),
+  fold: withEnv(cosList, chief).filter((l) => l.right && /oldest/.test(textOf(l))).map((l) => [textOf(l), l.segs[0][2] ?? null]),
+  noEnv: d.styledRows(snap(cosList), now, 34, chief, { v3: true }).slice(1, 3).flatMap((l) => l.segs).map((x) => x[2] ?? null),
+  marks: [{ kind: "issue" }, { kind: "question" }, { kind: "report" }, { kind: "permission" }, {}].map((e) => d.kindGlyph(e)).concat([d.GLYPH.pr]),
+};
 console.log(JSON.stringify(r));
 """
 
@@ -24247,6 +24279,60 @@ class TestDecisionsStyledPanel(unittest.TestCase):
                                            ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
         self.assertEqual(self.r["noLink"], ["bad repo", "H"])
         self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+
+    def test_iteration_3_hues_are_stable_and_glyphs_are_one_cell(self):
+        v3 = self.r["v3"]
+        self.assertEqual(v3["hue"][0], v3["hue"][1])
+        self.assertTrue(all(h in ("p0", "p1", "p2", "p3") for h in v3["hue"]))
+        self.assertGreaterEqual(len(v3["hues"]), 3, "the hash spreads over the hues")
+        for key, count, bmp in v3["glyphs"]:
+            self.assertEqual((count, bmp), (1, True), key)  # measured one cell wide in herdr; never an emoji
+        self.assertEqual({k: v3["theme"].get(k) for k in ("p0", "p1", "p2", "p3", "a", "r")}, {"p0": "K", "p1": "F", "p2": "O", "p3": "T", "a": "A", "r": "R"})
+        self.assertEqual(v3["themeNone"], {})
+
+    def test_iteration_3_marks_kind_and_state_and_keeps_the_text(self):
+        v3 = self.r["v3"]
+        by = {t: (st, right) for t, st, right in v3["styles"]}
+        self.assertEqual(by["\u2717 #6 Add a thing" + " " * 0 + "|1h06m"][0][0], "e", "failing: a red glyph")
+        self.assertEqual(by["\u2713 #5 Add a thing|1m"][0][0], "s", "ready: a green glyph")
+        self.assertEqual(by["\u25c6 #7 Add a thing|1d"][0][0], "m", "other: a quiet glyph")
+        for text, (styles, right) in by.items():
+            if text[:1] in "\u2717\u2713\u25c6":
+                self.assertTrue(styles[1].startswith("p"), "the PR number takes the project hue: " + text)
+            if right:
+                self.assertTrue(right[-1].endswith("t"), "the age is italic: " + text)
+        self.assertEqual(v3["size"][-1], ["  +900/-100", ["", "a", "m", "r"]], "the size uses the diff colours")
+        self.assertEqual(v3["gap"][1:3], [" ", " "], "two blank lines before a section")
+        self.assertTrue(v3["plainC"], "without the option the layout is the one of step 1")
+
+    def test_the_kind_marks_are_distinct_and_one_cell(self):
+        marks = self.r["links2"]["marks"]
+        self.assertEqual(marks, ["\u25cb", "?", "\u00b6", "?", "?", "\u25c6"])  # issue, question, report, (permission, other: ?), PR
+        self.assertEqual(len({marks[0], marks[1], marks[2], marks[5]}), 4)
+        self.assertTrue(all(len(m) == 1 for m in marks))
+
+    def test_search_links_are_built_only_from_valid_repos_and_labels(self):
+        k = self.r["links2"]
+        self.assertEqual(k["prs"], "https://github.com/acme/a/pulls?q=is%3Apr+is%3Aopen")
+        self.assertEqual(k["prsMany"], "https://github.com/search?q=is%3Apr+is%3Aopen+repo%3Aacme%2Fa+repo%3Aother%2Fc&type=pullrequests")
+        self.assertEqual(k["cos"], "https://github.com/acme/a/issues?q=is%3Aopen+label%3A%22tester%3Aawaiting-cos%22")
+        self.assertEqual(k["cosMany"], "https://github.com/search?q=is%3Aissue+is%3Aopen+label%3A%22tester%3Aawaiting-user%22+repo%3Aacme%2Fa+repo%3Aother%2Fc&type=issues")
+        self.assertEqual(k["hostile"], [None] * 6)
+        self.assertEqual(k["safe"][0], "https://github.com/a/b/issues?q=is%3Aopen")
+        self.assertEqual(k["safe"][3], "https://github.com/search?q=x%2By&type=issues")
+        self.assertEqual([k["safe"][i] for i in (1, 2, 4, 5, 6, 7)], [None] * 6)
+        self.assertEqual(k["user"], ["tester", "x.y", None, None, None, None])
+
+    def test_the_summary_parts_and_folded_repo_lines_are_links_the_label_user_coming_from_the_environment(self):
+        k = self.r["links2"]
+        by = dict((t, u) for t, u in k["summary"] if u)
+        self.assertEqual(by["2 PRs"], "https://github.com/search?q=is%3Apr+is%3Aopen+repo%3Aacme%2Fa+repo%3Aother%2Fc&type=pullrequests")
+        self.assertEqual(by["5 on cos"], "https://github.com/search?q=is%3Aissue+is%3Aopen+label%3A%22tester%3Aawaiting-cos%22+repo%3Aacme%2Fa+repo%3Aother%2Fc&type=issues")
+        folds = dict((t.split("|")[0], u) for t, u in k["fold"])
+        self.assertEqual(folds["a"], "https://github.com/acme/a/issues?q=is%3Aopen+label%3A%22tester%3Aawaiting-cos%22")
+        self.assertIsNone(folds["b"], "a repo with only reports has no issue to filter")
+        self.assertEqual(folds["c"], "https://github.com/other/c/issues?q=is%3Aopen+label%3A%22tester%3Aawaiting-cos%22")
+        self.assertEqual([u for u in k["noEnv"] if u and "label" in u], [], "no user, no label link")
 
     def test_the_tui_keeps_the_plain_drawer_and_falls_back_to_it(self):
         source = (DECISIONS_PLUGIN / "tui.tsx").read_text()

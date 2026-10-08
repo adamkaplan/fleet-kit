@@ -68,7 +68,37 @@ export const stripControls = (text) => String(text ?? "").replace(/[\u0000-\u000
 
 // A URL that may be handed to the terminal: only one urlOf can build, re-checked here, or null.
 export function safeUrl(url) {
-  return typeof url === "string" && /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+\/(issues|pull)\/[1-9][0-9]{0,8}$/.test(url) ? url : null
+  if (typeof url !== "string") return null
+  const repo = "[A-Za-z0-9][A-Za-z0-9._-]*\\/[A-Za-z0-9._-]+"
+  const query = "[A-Za-z0-9%+._:-]{1,1500}"  // an encoded GitHub search: no `&`, `#`, quote, space or control character
+  const forms = [
+    new RegExp(`^https://github\\.com/${repo}/(issues|pull)/[1-9][0-9]{0,8}$`),   // an issue or a PR
+    new RegExp(`^https://github\\.com/${repo}/(issues|pulls)\\?q=${query}$`),      // one repo's issue or PR search
+    new RegExp(`^https://github\\.com/search\\?q=${query}&type=(issues|pullrequests)$`),  // a search over several repos
+  ]
+  return forms.some((re) => re.test(url)) ? url : null
+}
+
+// ---- search links (a summary count, a folded repo line). Built only from repos that match REPO_PATTERN and a label
+// of the form `<user>:awaiting-cos|user`: nothing else of an entry reaches a URL. The label's user is the OS user
+// (the daemon's default; a configured label is not known to the plugin), read from the environment, never written here.
+export const LABEL_USER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$/
+export const labelUserOf = (env) => {
+  const u = env && (env.USER || env.LOGNAME)
+  return typeof u === "string" && LABEL_USER_PATTERN.test(u) ? u : null
+}
+const validRepos = (repos) => [...new Set(repos)].filter((r) => typeof r === "string" && REPO_PATTERN.test(r) && !r.split("/").some((p) => p === "." || p === "..")).sort().slice(0, 20)
+const enc = (q) => encodeURIComponent(q).replace(/%20/g, "+")
+// kind: "pr" (open PRs) or "label" (open issues carrying `label`); one repo gets its own issues/pulls page, several a search.
+export function searchUrl(kind, repos, label = null) {
+  const list = validRepos(repos)
+  if (!list.length) return null
+  if (kind === "label" && !(typeof label === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,38}:awaiting-(cos|user)$/.test(label))) return null
+  const terms = kind === "pr" ? "is:pr is:open" : `is:issue is:open label:"${label}"`
+  const url = list.length === 1
+    ? `https://github.com/${list[0]}/${kind === "pr" ? "pulls" : "issues"}?q=${enc(kind === "pr" ? "is:pr is:open" : `is:open label:"${label}"`)}`
+    : `https://github.com/search?q=${enc(`${terms} ${list.map((r) => `repo:${r}`).join(" ")}`)}&type=${kind === "pr" ? "pullrequests" : "issues"}`
+  return safeUrl(url)
 }
 
 // "14:05 UTC" from an ISO time: UTC, like every time the daemon writes, so the panel and the file agree.
@@ -285,7 +315,7 @@ export function viewLines(view, width = ROW_WIDTH) {
 //
 // A line is {segs, right?, id?}: `segs` is the left part, `right` (when there is one) is flush to the right edge
 // (the age), `id` is the decision id of a row's id line. A segment is [text, style]; style is "" or a "+"-joined set of
-// keys: b bold, m muted, w warning, e error, s success, i info. The keys name theme colours (themeColors below); no
+// keys: b bold, t italic, p0..p3 a project hue, a/r diff added/removed, m muted, w warning, e error, s success, i info. The keys name theme colours (themeColors below); no
 // colour is ever written here.
 export const PANEL_ENV = "FLEET_SWITCHBOARD_PANEL"
 export const AGE_WARN_SECONDS = LONG_WAIT_SECONDS   // an age from 1h on is tinted warning ...
@@ -304,6 +334,13 @@ export function themeColors(theme) {
     e: pick(() => theme.text.feedback.error.base),
     s: pick(() => theme.text.feedback.success.base),
     i: pick(() => theme.text.feedback.info.base),
+    // iteration 3: a stable hue per project from the theme's syntax colours (never the red/green/orange of state), and the diff colours
+    p0: pick(() => theme.syntax.keyword),
+    p1: pick(() => theme.syntax.function),
+    p2: pick(() => theme.syntax.operator),
+    p3: pick(() => theme.syntax.type),
+    a: pick(() => theme.diff.text.added),
+    r: pick(() => theme.diff.text.removed),
   }
 }
 
@@ -367,8 +404,20 @@ export function factsSegments(d, width) {
 // lines (headline, then a quiet id + age line); a heads-up is one line (headline cut, its PR number coloured by state,
 // age flush right); a repo header once per group; no rules, only blank lines; no empty sections; stats (+A/-D) only when
 // large; in the Chief of Staff's view the cos tier folds to one line per repo (count and oldest). `snapshot` is what loadSnapshot returns.
+// Iteration 3: a project's hue is a stable pick (FNV-1a of the full repo name) among four theme hues; glyphs are single-cell
+// ones, measured in herdr (docs/design notes): ◆ PR, ? question, ¶ report, ✓ ready, ✗ failing, ⧖ waiting a day or more.
+export const kindGlyph = (d) => (d.kind === "report" ? GLYPH.report : d.kind === "issue" ? GLYPH.issue : GLYPH.question)
+export const PROJECT_HUES = 4
+export const projectHue = (repo) => {
+  let h = 0x811c9dc5
+  for (const ch of String(repo ?? "")) { h ^= ch.codePointAt(0); h = Math.imul(h, 0x01000193) >>> 0 }
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0  // FNV-1a keeps its low bits tied to the last characters: mix before taking a few
+  return `p${(h >>> 13) % PROJECT_HUES}`
+}
+export const GLYPH = { pr: "\u25c6", issue: "\u25cb", question: "?", report: "\u00b6", ready: "\u2713", failing: "\u2717", long: "\u29d6" }
 export const BIG_CHANGE_LINES = 500   // a PR's +A/-D is shown only from this size up
-export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW) => {
+export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW, opts = {}) => {
+  const v3 = opts.v3 === true  // iteration 3: project hues, glyphs, italic metadata, more space
   const row = (text, style = "") => ({ segs: [[text, style]] })
   const blank = () => row(" ")
   if (snapshot.status !== "ok") return [row("Decisions (?)", "b"), row(NOT_UPDATING, "w")]
@@ -385,8 +434,10 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
   out.push({ segs: [["Decisions", "b"]], right: [[view.label, "m"]] })
   const summary = []
   if (human.length || (!notices.length && !cosAll.length)) summary.push([[`${human.length} need ${view.kind === "human" ? "you" : "human"}`, human.length ? "b+w" : "m"]])
-  if (notices.length) summary.push([[`${notices.length} PR${notices.length === 1 ? "" : "s"}`, "i"]])
-  if (cosAll.length) summary.push([[`${cosAll.length} ${view.kind === "human" ? "with" : "on"} cos`, "m"], ...(overs ? [[` (${overs} over 1h)`, "w"]] : [])])
+  const cosLabel = labelUserOf(opts.env) ? `${labelUserOf(opts.env)}:awaiting-cos` : null
+  const link = (url) => (url ? [url] : [])  // an optional third element of a segment: its link
+  if (notices.length) summary.push([[`${notices.length} PR${notices.length === 1 ? "" : "s"}`, "i", ...link(searchUrl("pr", notices.map((d) => d.repo)))]])
+  if (cosAll.length) summary.push([[`${cosAll.length} ${view.kind === "human" ? "with" : "on"} cos`, "m", ...link(cosLabel && searchUrl("label", cosAll.filter((d) => d.kind === "issue").map((d) => d.repo), cosLabel))], ...(overs ? [[` (${overs} over 1h)`, "w"]] : [])])
   let line = []
   for (const part of summary) {
     if (line.length && textOf(line).length + 3 + textOf(part).length > width) { out.push({ segs: line }); line = [] }
@@ -424,7 +475,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
     const order = [...by.keys()].sort()
     const entries = []
     order.forEach((repo, gi) => {
-      { if (gi) out.push(blank()); out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), "b")) }
+      { if (gi) out.push(blank()); out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), v3 ? `b+${projectHue(repo)}` : "b")) }
       const items = by.get(repo).map((d, i) => ({ d, i })).sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i).map(({ d }) => d)
       items.forEach((d, ei) => {
         const url = urlOf(d)
@@ -438,17 +489,36 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
           if (ei) out.push(blank())
           // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
           const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
-          for (const t of wrapText(shownHeadline, width, HEADLINE_LINES)) put(row(t, section.need ? "b" : ""))
+          const lead = v3 && !isNotice(d) ? [kindGlyph(d), "m"] : null  // one cell and a space: the headline wraps in what is left
+          wrapText(shownHeadline, lead ? width - 2 : width, HEADLINE_LINES).forEach((t, ti) => {
+            put(lead && ti === 0 ? { segs: [[lead[0] + " ", lead[1]], [t, section.need ? "b" : ""]] } : lead ? { segs: [["  ", ""], [t, section.need ? "b" : ""]] } : row(t, section.need ? "b" : ""))
+          })
           const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
           for (const r of rows) for (const t of wrapText(tidyWith(r.text), width, ROW_LINES)) put(row(t, "m"))
           const left = [[oneLine(stripControls(idText + (Array.isArray(d.reported_by) && d.reported_by.length ? ` ${d.reported_by.join(",")}` : "")), width), "m"]]
           if (isNotice(d)) for (const [t, st] of stateOf(d)) if (textOf(left).length + 3 + t.length + 1 + age[0].length <= width) left.push([" \u00b7 ", "m"], [t, st])
-          put({ segs: left, right: [age], id: d.id })
+          if (v3) {
+            left[0][1] = "m+t"
+            const long = secondsOf(d) >= AGE_ERROR_SECONDS
+            put({ segs: left, right: long ? [[GLYPH.long + " ", "w"], [age[0], "w+t"]] : [[age[0], "m+t"]], id: d.id })
+          } else put({ segs: left, right: [age], id: d.id })
         } else {
-          const room = Math.max(8, width - age[0].length - 1)
+          const room = Math.max(8, width - age[0].length - 1 - (v3 ? 2 : 0))
           const flatText = oneLine(headline, room)
-          const segs = isNotice(d) && refStyle(d) ? (() => { const cut = flatText.indexOf(" "); return cut > 0 ? [[flatText.slice(0, cut), refStyle(d)], [flatText.slice(cut), ""]] : [[flatText, refStyle(d)]] })() : [[flatText, ""]]
-          put({ segs, right: [age], id: d.id })
+          const failing = d.ci === "failing" || d.ci === "failed"
+          const ready = refStyle(d) === "s"
+          const hue = projectHue(repo)
+          const segs = v3 ? (() => {
+            const cut = flatText.indexOf(" ")
+            const body = cut > 0 ? flatText.slice(cut) : ""
+            const ref = (cut > 0 ? flatText.slice(0, cut) : flatText)
+            return isNotice(d)
+              ? [[(failing ? GLYPH.failing : ready ? GLYPH.ready : GLYPH.pr) + " ", failing ? "e" : ready ? "s" : "m"], [ref, hue], [body, ""]]
+              : [[kindGlyph(d) + " ", "m"], [flatText, ""]]
+          })() : isNotice(d) && refStyle(d) ? (() => { const cut = flatText.indexOf(" "); return cut > 0 ? [[flatText.slice(0, cut), refStyle(d)], [flatText.slice(cut), ""]] : [[flatText, refStyle(d)]] })() : [[flatText, ""]]
+          put({ segs, right: v3 ? [[age[0], age[1] === "m" ? "m+t" : "w+t"]] : [age], id: d.id })
+          if (v3 && isNotice(d) && Number.isInteger(d.additions) && Number.isInteger(d.deletions) && d.additions + d.deletions >= BIG_CHANGE_LINES)
+            put({ segs: [["  ", ""], [`+${d.additions}`, "a"], ["/", "m"], [`-${d.deletions}`, "r"]] })
         }
         entries.push(d)
       })
@@ -456,6 +526,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
   }
   for (const section of sections) {
     out.push(blank())
+    if (v3) out.push(blank())
     const label = section.label
     out.push(row(label, "b"))
     if (section.key === "cos" && view.kind !== "human") {
@@ -464,7 +535,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
       for (const r of [...by.keys()].sort()) {
         const list = by.get(r)
         const oldest = Math.max(...list.map((d) => { const x = secondsOf(d); return Number.isNaN(x) ? 0 : x }))
-        out.push({ segs: [[stripControls(r === "(no repo)" || known.ambiguous(r) ? r : shortRepo(r)), ""]], right: [[`${list.length} \u00b7 oldest ${formatAge(oldest)}`, oldest >= AGE_ERROR_SECONDS ? "w" : "m"]] })
+        out.push({ segs: [[stripControls(r === "(no repo)" || known.ambiguous(r) ? r : shortRepo(r)), v3 ? projectHue(r) : "", ...link(cosLabel && searchUrl("label", list.filter((d) => d.kind === "issue").map((d) => d.repo), cosLabel))]], right: [[`${list.length} \u00b7 oldest ${formatAge(oldest)}`, oldest >= AGE_ERROR_SECONDS ? "w" : "m"]] })
       }
       continue
     }
