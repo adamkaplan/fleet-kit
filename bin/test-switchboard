@@ -6039,6 +6039,35 @@ class TestGithubStatus(Base):
             self.hub.tick()
         self.assertIn("3 failure(s)", "\n".join(sb.format_github(self.status())))
 
+    def test_a_live_forwarder_shows_up_age_and_a_recovered_drop_as_history(self):
+        self.hub.tick()
+        w = self.hub.watches[GH_REPO]
+        self.world.clock.t += 100
+        self.gh.kill_forwarder()
+        self.hub.tick()
+        self.world.clock.t += 10
+        self.hub.tick()
+        text = "\n".join(sb.format_github(self.status()))
+        self.assertIn("live, up", text)
+        self.assertIn("1 in the last hour", text)
+        self.assertNotIn("ALARM", text)
+        self.assertNotIn("failure(s)", text)
+        self.assertNotIn("exited with code", text)
+
+    def test_health_alarms_on_long_down_and_on_flapping(self):
+        now = 10000.0
+        down = {"mode": "backoff", "down_since": now - 301, "drops": [[now - 301, 100]]}
+        self.assertIn("down for", sb.forwarder_health(down, now)["alarm"])
+        brief = {"mode": "backoff", "down_since": now - 100, "drops": [[now - 100, 100]]}
+        self.assertIsNone(sb.forwarder_health(brief, now)["alarm"])
+        flap = {"mode": "forwarder", "started": sb.iso(now - 5), "drops": [[now - 60 * i, 200] for i in range(1, 8)]}
+        self.assertIn("flapping", sb.forwarder_health(flap, now)["alarm"])
+        short = {"mode": "forwarder", "started": sb.iso(now - 5), "drops": [[now - 60 * i, 20] for i in range(1, 4)]}
+        self.assertIn("under 60s", sb.forwarder_health(short, now)["alarm"])
+        calm = {"mode": "forwarder", "started": sb.iso(now - 5), "drops": [[now - 3000, 5]]}
+        self.assertIsNone(sb.forwarder_health(calm, now)["alarm"])
+        self.assertIsNone(sb.forwarder_health(dict(down, mode="polling"), now)["alarm"])
+
     def test_a_snapshot_of_a_dead_pid_is_not_believed(self):
         self.hub.tick()
         path = self.world.state / sb.WATCH_FILE
