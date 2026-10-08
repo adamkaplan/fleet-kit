@@ -2810,6 +2810,7 @@ Configuration (no key is read from the repo; the mapping file is local):
 | `kinds`                    | `["issue", "report"]` | What goes: `issue` (batches included), `report`, `question`. Never a permission request.           |
 | `mapping_file`             | none                  | Absolute path of a LOCAL file with everything specific to the other system. Required when enabled. |
 | `tier_map`                 | none                  | A floor tier name for each of `orchestrator`, `cos`, `human`, one to one. Required when enabled.   |
+| `tiers`                    | `["human"]`           | Which fleet tiers are pushed: only what is yours by default. `[]` pushes nothing; `["cos", "human"]` turns the cos tier back on. A decision of a tier not listed is not sent, and one already in the other system is withdrawn there once (it stays a local decision). Each tier at most once; any other name is refused. `tier_map` still names all three. |
 | `poll_seconds`             | 30                    | How often answers are pulled.                                                                      |
 | `outbox_alarm_depth`       | 1000                  | A deeper outbox raises an alarm in the status line and the errors; nothing is dropped.             |
 | `retry_base_seconds`       | 5                     | First backoff of a failed outbound operation; doubles each try.                                    |
@@ -2817,6 +2818,10 @@ Configuration (no key is read from the repo; the mapping file is local):
 | `work_items`               | `false`               | One work item per worker assignment (needs an adapter with a work sink).                           |
 | `work_grace_seconds`       | 600                   | An agent gone this long without a final report is finished as cancelled.                           |
 | `work_outbox_alarm_depth`  | 1000                  | More waiting work writes than this raises an alarm; none is dropped.                               |
+
+**`tiers` changes what an existing config pushes.** Before it existed every tier was pushed, so a config written then pushes the cos and
+orchestrator tiers too; with the default `["human"]` the next daemon pass withdraws those items from the other system (once each), and the
+one line `"tiers": ["orchestrator", "cos", "human"]` keeps the old behaviour. A late answer to a withdrawn item is known as closed and delivers nothing.
 
 The mapping file is read by the adapter, not by the engine. What it holds is the adapter's business; typically:
 

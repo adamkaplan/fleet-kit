@@ -212,6 +212,7 @@ EXTERNAL_DEFAULTS = {
     "kinds": ["issue", "report"],  # which decisions go: issue (batches included), report, question; never a permission request
     "mapping_file": None,         # an absolute path to a LOCAL file holding everything specific to the other system
     "tier_map": None,             # {"orchestrator": name, "cos": name, "human": name}: the floor tier each tier maps to
+    "tiers": ["human"],           # which fleet tiers are pushed: only the human's by default; [] pushes nothing. An item of a tier not listed is withdrawn
     "poll_seconds": 30,           # how often answers are pulled
     "outbox_alarm_depth": 1000,   # a deeper outbox raises an alarm in the status line; nothing is ever dropped
     "retry_base_seconds": 5,      # backoff of a failed outbound operation: base * 2^(attempts-1), up to the ceiling
@@ -339,6 +340,11 @@ def validate_external_config(config, source):
                 or not all(isinstance(v, str) and v.strip() for v in tiers.values())):
             raise ConfigError("%s.tier_map' must name a floor tier (a non-empty string) for each of %s, got %r"
                               % (where, ", ".join(decision_core.TIER_LADDER), tiers))
+    pushed = section["tiers"]
+    if (not isinstance(pushed, list) or not all(isinstance(t, str) and t in decision_core.TIER_LADDER for t in pushed)
+            or len(set(pushed)) != len(pushed)):
+        raise ConfigError("%s.tiers' must be a list of tier names, each once, from %s (an empty list pushes nothing), got %r"
+                          % (where, ", ".join(decision_core.TIER_LADDER), pushed))
     for key in ("poll_seconds", "retry_base_seconds", "retry_max_seconds"):
         if not _is_number(section[key]) or section[key] <= 0:
             raise ConfigError("%s.%s' must be a positive number, got %r" % (where, key, section[key]))
