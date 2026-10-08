@@ -90,6 +90,7 @@ class SyncEngine:
         self.outbox_path = os.path.join(self.state_dir, OUTBOX_FILE)
         self.status_path = os.path.join(self.state_dir, STATUS_FILE)
         self.links, self.cursor, self.applied, self.last_pull = {}, None, [], None
+        self.failed = {}   # decision key -> {op, error, at, sig}: an operation refused for good, not enqueued again until the decision changes
         self.parked = {}   # event id -> {"event", "tries", "next_at"}: answers waiting for a judge that could not be asked
         self.ops, self.seq = [], 0
         self.rebuild = False
@@ -107,6 +108,8 @@ class SyncEngine:
             self.applied = [e for e in body.get("applied", []) if isinstance(e, str)]
             parked = body.get("parked")
             self.parked = parked if isinstance(parked, dict) else {}
+            failed = body.get("failed")
+            self.failed = failed if isinstance(failed, dict) else {}
         box = _read_json(self.outbox_path)
         if box is not None and isinstance(box.get("ops"), list):
             self.ops, self.seq = box["ops"], box.get("seq", 0)
@@ -118,7 +121,7 @@ class SyncEngine:
                       and not (l.get("closed") and now - l.get("closed_at", now) > WITHDRAWN_KEEP_SECONDS)}
         _write_json(self.links_path, {"version": 1, "links": self.links, "cursor": self.cursor,
                                       "last_pull": self.last_pull, "applied": self.applied[-APPLIED_LIMIT:],
-                                      "parked": self.parked})
+                                      "parked": self.parked, "failed": self.failed})
         _write_json(self.outbox_path, {"version": 1, "seq": self.seq, "ops": self.ops})
 
     # -- what is wanted outside
@@ -161,6 +164,8 @@ class SyncEngine:
             if op.get("rebind_from") in links:
                 links[key] = links.pop(op["rebind_from"])
             link = links.setdefault(key, {})
+            link.pop("sent_back_at", None)   # the agent's revision has arrived
+            link.pop("clarification", None)
             link.update(revision=op["revision"], digest=op["digest"], tier=op["tier"], floor=op["floor"],
                         thread=op["thread"], agent=op["decision"].get("agent"),
                         display_id=op["decision"].get("display_id"))
@@ -175,10 +180,18 @@ class SyncEngine:
         for item in planned:
             key, kind = item["key"], item["op"]
             want = desired.get(key)
+            failed = self.failed.get(key)
+            if failed is not None:
+                if failed["sig"] == (list((want["digest"], want["tier"], want["floor"])) if want else None):
+                    continue   # refused for good, and nothing has changed since: not tried again
+                del self.failed[key]
             link = self._projected().get(item.get("rebind_from") or key) or {}
             label = "status:%s:%d" % (want["floor"], item["seq"]) if kind == "status" else kind
             op = dict(item, id=core.idempotency_key(key, label, item["revision"]), attempts=0, next_at=0,
                       last_error=None, created=self.now())
+            if item.get("reason"):
+                op["note"] = item["reason"]
+                self.host.audit("external.sent_back_expired", key, {"reason": item["reason"]})
             if want is not None:
                 op.update(decision=want["payload"], digest=want["digest"], tier=want["tier"], floor=want["floor"],
                           kind=want["kind"], thread=want["thread"])
@@ -223,7 +236,7 @@ class SyncEngine:
             kinds = {errored[e["source"]] for e in errors if e.get("source") in errored}
             if not reason and self.rebuild:
                 self.reconcile(desired)
-            self._enqueue(core.plan_operations(desired, self._projected(), kinds), desired)
+            self._enqueue(core.plan_operations(desired, self._projected(), kinds, now), desired)
             if reason:
                 status.update(state="down", reason=core.one_line(reason, 160))
             else:
@@ -237,7 +250,7 @@ class SyncEngine:
             self._save()
         except OSError as err:
             status.update(state="down", reason="cannot write the link table: %s" % (err.strerror or err))
-        status.update(outbox=len(self.ops), last_pull=self.last_pull)
+        status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed))
         status["alarm"] = len(self.ops) > self.settings["outbox_alarm_depth"]
         failing = [o for o in self.ops if o.get("last_error")]
         if status["state"] == "ok" and failing:
@@ -287,6 +300,10 @@ class SyncEngine:
                     raise RuntimeError("no outside id is linked yet")
                 answer = self.adapter.push(operation, op["id"]) or {}
             except Exception as err:
+                if getattr(err, "permanent", False) is True:
+                    self._drop_permanent(op, err, now)
+                    blocked.add(op["key"])
+                    continue
                 op["attempts"] += 1
                 op["last_error"] = core.one_line("%s: %s" % (type(err).__name__, err), 200)
                 op["next_at"] = now + backoff_seconds(op["attempts"], self.settings["retry_base_seconds"],
@@ -295,12 +312,28 @@ class SyncEngine:
                                                                      "error": op["last_error"]})
                 blocked.add(op["key"])
                 continue
+            self.failed.pop(op["key"], None)
             if not op.get("note_only"):
                 self._apply_to(self.links, op, answer.get("external_id"))
             self.ops.remove(op)
             self.host.audit("external.pushed", op["key"], {"op": op["op"], "revision": op["revision"],
                                                            "idempotency": op["id"],
                                                            "external_id": answer.get("external_id")})
+
+    def _drop_permanent(self, op, err, now):
+        """The other side refused this operation for good: drop it and the operations queued behind it for the decision
+        (they were planned on it), say so in the audit, mark the link, and remember it so that nothing is enqueued
+        again until the decision changes. Never a withdraw, an answer or a retry."""
+        key, text = op["key"], core.one_line("%s: %s" % (type(err).__name__, err), 200)
+        self.ops = [o for o in self.ops if o["key"] != key]
+        self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1})
+        if op.get("note_only"):
+            return
+        link = self.links.get(key)
+        if link is not None:
+            link.update(last_error=text, failed_op=op["op"])
+        self.failed[key] = {"op": op["op"], "error": text, "at": now,
+                            "sig": list((op.get("digest"), op.get("tier"), op.get("floor"))) if op.get("digest") else None}
 
     # -- inbound
 
@@ -370,6 +403,7 @@ class SyncEngine:
                 self.host.audit("external.deliver_failed", key, dict(detail, error=core.one_line(str(err), 200)))
                 return False
             link.setdefault("clarified", []).append(eid)
+            link.update(sent_back_at=self.now(), clarification=core.one_line(event.get("text") or "", 300))
             return settle("external.clarify", {"role": role})
         if kind == "answered":
             intent = {"option_id": event.get("option_id"), "text": event.get("text"), "rows": event.get("rows") or {},

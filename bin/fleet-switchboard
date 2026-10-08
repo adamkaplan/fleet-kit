@@ -5184,7 +5184,9 @@ def external_status_line(config, state_dir, now):
     pulled = body.get("last_pull")
     text = "%s; outbox %s; last pull %s" % ("ok" if body.get("state") == "ok" else "down: %s" % body.get("reason"),
                                             body.get("outbox", 0), "%s ago" % format_age(now - pulled) if pulled else "never")
-    return "external  " + text + ("; ALARM: outbox is deep" if body.get("alarm") else "")
+    failures = body.get("permanent_failures") or 0
+    return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
+            + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
 
 
 def publish_decisions(engine):
