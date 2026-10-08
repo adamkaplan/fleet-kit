@@ -2617,6 +2617,24 @@ follows the role of the answerer, as the adapter reports it:
 | owner's agent     | the Chief of Staff's | orchestrator, cos             |
 | the human         | the human's          | orchestrator, cos, human      |
 
+The owner's agent is judged as well. Role authority only says whose answer it counts as; the owner's standing orders
+decide whether it is within what the owner has delegated. An answer by the owner's agent goes through the same
+policy judge as the Chief of Staff's own `decisions answer` (the same four questions, the same decision model, the
+owner's standing orders file as the authority) and is applied only when the judge allows it. The judge can only
+tighten: it is asked after role authority accepted the answer, never instead of it. It fails safe:
+
+- no standing orders file, a file with nothing in it, an unusable file, or a policy judge that is not on: not applied;
+  the answer goes to the owner (the decision stays open at its tier, and a status note naming why is pushed back);
+- the judge says the answer is outside the orders: the same, with the reason in the audit and in the note;
+- the model cannot be asked (a timeout, an error): the decision stays open and the answer is tried again later, with
+  a backoff, up to 5 tries; after that it is not applied and the owner decides. A dead judge never holds up other
+  answers and never spins.
+
+The project agent's answers (an orchestrator's) and the human's are not judged. A duplicate of an answer that is
+waiting for the judge, or that was refused, is still ignored by its event id. No configuration key was added: the
+judge is the existing `policy` and `jev` settings, and the orders are the existing standing orders file
+(`cos_orders_file`).
+
 An answer from a role below the decision's tier is not applied: it is audited, a status note is pushed back, and the
 decision stays. A clarification is sent to the raising agent as a note and is not an answer; the agent's next report
 revises the item. A reversal after delivery tells the agent (`answer changed: ...`) and undoes nothing. An answer for

@@ -23686,6 +23686,30 @@ class ExternalWorld(BaselineWorld):
                         "tier_map": self.TIERS, "poll_seconds": 1, "retry_base_seconds": 5, "retry_max_seconds": 60},
                        **extra)
         self.set_config(external_decisions=section)
+        self.owner_orders(section)
+
+    JUDGE_ALLOWS = {"hard_to_reverse": 0.0, "speaks_for_you": 0.0, "outside_scope": 0.0, "outside_intent": 0.0}
+
+    def set_judge(self, noul=None, error=None):
+        """What the (replayed, never real) decision model says to the judge's four questions."""
+        rule = {"error": error} if error else {"noul": dict(self.JUDGE_ALLOWS, **(noul or {}))}
+        (self.home / "judge.json").write_text(json.dumps({"rules": [rule]}))
+
+    def owner_orders(self, section):
+        """The owner's standing orders and a judge that allows, so an answer by the owner's agent is applied (the
+        inbound judge consults both); a test sets `orders_text` (None: no file) or `judge_off` before turn_on."""
+        if getattr(self, "judge_off", False):
+            return
+        orders = getattr(self, "orders_text", "Decide the repo's routine questions for me. Never merge, deploy or spend.")
+        path = self.home / "orders.md"
+        if orders is None:
+            if path.exists():
+                path.unlink()
+        else:
+            path.write_text(orders)
+        self.set_judge()
+        self.set_config(external_decisions=section, policy={"enabled": True}, jev={"replay": str(self.home / "judge.json")},
+                        cos_orders_file=str(path))
 
     def run_pass(self, seconds=5):
         self.daemon_pass(seconds)
@@ -24005,6 +24029,151 @@ class TestExternalDecisionSync(ExternalWorld):
         self.assertIn("external  ok; outbox 0; last pull", line)
         self.set_config()
         self.assertNotIn("external", self.cmd("you", "status")["out"])
+
+
+class TestExternalInboundJudge(ExternalWorld):
+    """An answer by the owner's agent is applied only when the owner's standing orders, consulted by the same
+    judge the Chief of Staff's own answers go through, allow it. Fails safe. The model is always a replay."""
+
+    def cos_issue(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        return self.ext_of("issue")
+
+    def answer(self, ext, **more):
+        eid = self.event(ext, by="owner's agent", text="use postgres", **more)
+        self.run_pass()
+        return eid
+
+    def applied(self):
+        return self.labels()["acme/api#2"] == []
+
+    def test_within_the_orders_the_answer_is_applied(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.answer(ext)
+        self.assertTrue(self.applied())
+        self.assertEqual([e["detail"]["role"] for e in self.audit_events("external.answered")], ["owner_agent"])
+
+    def test_outside_the_orders_it_is_not_applied_the_decision_stays_and_the_reason_is_pushed_back(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.set_judge(noul={"hard_to_reverse": 0.9})
+        self.answer(ext)
+        self.assertFalse(self.applied())
+        (denied,) = self.audit_events("external.judged")
+        self.assertIn("outside the owner's standing orders", denied["detail"]["reason"])
+        self.assertIn("hard to reverse", denied["detail"]["reason"])
+        self.run_pass()
+        self.assertTrue(any("not applied: outside the owner's standing orders" in n for n in self.fake.items[ext]["notes"]))
+        self.assertEqual([d["id"] for d in self.file_body()["decisions"]], ["api#2"], "it stays open at its tier")
+        self.run_pass(30)   # settled: not tried again
+        self.assertEqual(len(self.audit_events("external.judged")), 1)
+
+    def test_a_judge_that_cannot_answer_leaves_it_open_and_a_later_allow_applies_it_once(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.set_judge(error="timeout")
+        eid = self.answer(ext)
+        self.assertFalse(self.applied())
+        self.assertEqual(len(self.audit_events("external.judge_unavailable")), 1)
+        self.assertEqual(self.audit_events("external.answered"), [])
+        self.run_pass(1)   # inside the backoff: not asked again
+        self.assertEqual(len(self.audit_events("external.judge_unavailable")), 1)
+        self.set_judge()   # the model is back
+        self.run_pass(10)
+        self.assertTrue(self.applied())
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+        self.event(ext, by="owner's agent", eid=eid)   # the same event again
+        self.run_pass()
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+        self.assertEqual(self.audit_events("external.reversed"), [])
+
+    def test_a_dead_judge_does_not_spin_it_is_asked_a_bounded_number_of_times_and_then_not_applied(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.set_judge(error="timeout")
+        self.answer(ext)
+        for _ in range(12):
+            self.run_pass(120)
+        tries = self.audit_events("external.judge_unavailable")
+        self.assertEqual(len(tries), 5)
+        (denied,) = self.audit_events("external.judged")
+        self.assertIn("could not be asked after 5 tries", denied["detail"]["reason"])
+        self.assertFalse(self.applied())
+        self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.judge_unavailable")), 5)
+
+    def test_a_dead_judge_does_not_hold_up_other_answers(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "A cos issue", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 3, "A human issue", labels=["me:awaiting-user"])
+        self.run_pass()
+        cos_item = [e for e, i in self.fake.items.items() if i["decision"]["display_id"] == "api#2"][0]
+        human_item = [e for e, i in self.fake.items.items() if i["decision"]["display_id"] == "api#3"][0]
+        self.set_judge(error="timeout")
+        self.event(cos_item, by="owner's agent")
+        self.event(human_item, by="human")
+        self.run_pass()
+        self.assertEqual(self.labels()["acme/api#3"], [], "the human's answer was applied past the parked one")
+        self.assertEqual(self.labels()["acme/api#2"], ["me:awaiting-cos"])
+
+    def test_no_orders_file_means_none_stated_and_the_answer_goes_to_the_owner(self):
+        self.orders_text = None
+        self.turn_on()
+        ext = self.cos_issue()
+        self.answer(ext)
+        self.assertFalse(self.applied())
+        (denied,) = self.audit_events("external.judged")
+        self.assertIn("no standing orders are stated", denied["detail"]["reason"])
+        self.orders_text = "<!-- only a comment -->"
+        self.owner_orders(self.world.config["external_decisions"])
+        self.answer(ext, eid="other")
+        self.assertFalse(self.applied(), "a file with only the template's comment states nothing")
+
+    def test_a_judge_that_is_not_on_is_not_a_yes(self):
+        self.judge_off = True
+        self.turn_on()
+        ext = self.cos_issue()
+        self.answer(ext)
+        self.assertFalse(self.applied())
+        (denied,) = self.audit_events("external.judged")
+        self.assertIn("policy judge is not on", denied["detail"]["reason"])
+
+    def test_the_judge_only_tightens_it_never_lets_through_what_role_authority_refuses(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        eid = self.event(ext, by="project agent", text="go")       # below the cos tier; the judge would allow
+        self.run_pass()
+        self.assertFalse(self.applied())
+        self.assertEqual(len(self.audit_events("external.refused")), 1)
+        self.assertEqual(self.audit_events("external.judged"), [])
+
+    def test_the_project_agent_and_the_human_are_not_judged(self):
+        self.turn_on()
+        self.gh.issue(API, 3, "A human issue", labels=["me:awaiting-user"])
+        self.say("api-coder", "question", "Which table?", 6)
+        self.run_pass()
+        human_item, report = self.ext_of("issue"), self.ext_of("report")
+        self.set_judge(noul={"hard_to_reverse": 0.99, "speaks_for_you": 0.99})   # a judge that would deny everything
+        self.event(human_item, by="human", text="yes")
+        self.event(report, by="project agent", text="use totals")
+        self.run_pass()
+        self.assertEqual(self.labels()["acme/api#3"], [])
+        self.assertTrue([t for t in self.notes_to("api-coder") if "use totals" in t])
+        self.assertEqual(self.audit_events("external.judged"), [])
+
+    def test_the_audit_names_the_reason_and_holds_no_credential(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.set_judge(noul={"speaks_for_you": 0.9})
+        self.event(ext, by="owner's agent", text="deploy it with Bearer abcdef123456 and sk-abcdefghij1234")
+        self.run_pass()
+        raw = (self.world.state / "audit.jsonl").read_text()
+        self.assertNotIn("abcdef123456", raw)
+        self.assertNotIn("sk-abcdefghij1234", raw)
+        (denied,) = self.audit_events("external.judged")
+        self.assertIn("speaks for you", denied["detail"]["reason"])
 
 
 def main(argv):
