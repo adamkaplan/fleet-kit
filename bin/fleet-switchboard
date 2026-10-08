@@ -115,6 +115,26 @@ def load_decision_sync():
 
 decision_sync = load_decision_sync()
 
+
+def load_work_sync():
+    """The work-item pump, bin/work_sync.py, loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "work_sync.py")
+    held = sys.modules.get("work_sync")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("work_sync", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["work_sync"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("work_sync", None)
+        raise
+    return module
+
+
+work_sync = load_work_sync()
+
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
 
@@ -176,6 +196,9 @@ EXTERNAL_DEFAULTS = {
     "outbox_alarm_depth": 1000,   # a deeper outbox raises an alarm in the status line; nothing is ever dropped
     "retry_base_seconds": 5,      # backoff of a failed outbound operation: base * 2^(attempts-1), up to the ceiling
     "retry_max_seconds": 600,
+    "work_items": False,          # one work item per worker assignment, as information (needs an adapter with a work sink)
+    "work_grace_seconds": 600,    # an agent gone this long without a final report is finished as cancelled
+    "work_outbox_alarm_depth": 1000,   # more writes waiting than this raises an alarm in the status line; none is dropped
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -298,6 +321,14 @@ def validate_external_config(config, source):
     for key in ("poll_seconds", "retry_base_seconds", "retry_max_seconds"):
         if not _is_number(section[key]) or section[key] <= 0:
             raise ConfigError("%s.%s' must be a positive number, got %r" % (where, key, section[key]))
+    if not isinstance(section["work_items"], bool):
+        raise ConfigError("%s.work_items' must be true or false, got %r" % (where, section["work_items"]))
+    if not _is_number(section["work_grace_seconds"]) or section["work_grace_seconds"] <= 0:
+        raise ConfigError("%s.work_grace_seconds' must be a positive number, got %r" % (where, section["work_grace_seconds"]))
+    if not isinstance(section["work_outbox_alarm_depth"], int) or isinstance(section["work_outbox_alarm_depth"], bool) \
+            or section["work_outbox_alarm_depth"] < 1:
+        raise ConfigError("%s.work_outbox_alarm_depth' must be a whole number of 1 or more, got %r"
+                          % (where, section["work_outbox_alarm_depth"]))
     if section["retry_max_seconds"] < section["retry_base_seconds"]:
         raise ConfigError("%s.retry_max_seconds' must be at least retry_base_seconds" % where)
     depth = section["outbox_alarm_depth"]
@@ -5111,6 +5142,100 @@ def sync_external(engine, decisions, errors, now):
     return found
 
 
+class EngineWorkHost(work_sync.Host):
+    """What the work pump reads from this engine: the discovered fleet agents, the reports their bosses hold (the
+    transcript reads the decisions already make, cached), the intent cache the daemon already holds, and the
+    decision link table. Nothing here reads GitHub."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def agents(self):
+        discovery = self.engine.discovery
+        found = []
+        for name, obs in sorted((discovery.agents if discovery is not None else {}).items()):
+            fleet = obs.fleet or {}
+            found.append({"name": name, "role": fleet.get("role"), "reports_to": _boss_of(obs),
+                          "repo": _fleet_repo(fleet, self.engine.config), "issue": _issue_of(fleet),
+                          "status": obs.status, "intent": fleet.get("intent")})
+        return found
+
+    def reports(self):
+        engine, discovery = self.engine, self.engine.discovery
+        if discovery is None:
+            return []
+        since = engine.now() - engine.config["decisions_lookback_hours"] * 3600
+        repos, found = decision_repos(engine), []
+        for boss in sorted({_boss_of(o) for o in discovery.agents.values()} - {None}):
+            obs = discovery.agents.get(boss)
+            if obs is None or obs.problem:
+                continue
+            for created, _, number, line in synthetic_lines(engine, obs.session_id, since):
+                match = REPORT_LINE.match(line)
+                if match:
+                    sender = discovery.agents.get(match.group(1))
+                    found.append({"sender": match.group(1), "issue": int(match.group(3)) if match.group(3) else None,
+                                  "state": match.group(4), "text": match.group(5), "at": (created, number),
+                                  "repo": repo_of_tag(match.group(2), repos)
+                                  or (_fleet_repo(sender.fleet, engine.config) if sender else None)})
+        source = _report_rider_source(engine)
+        for item in (source.entries() if source is not None else []):
+            state, _, text = item["summary"].partition(": ")
+            sender = discovery.agents.get(item.get("from"))
+            if item["created"] >= since and sender is not None:
+                found.append({"sender": sender.name, "issue": item.get("issue"), "state": state, "text": text,
+                              "at": (item["created"], 1 << 60),
+                              "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config)})
+        return found
+
+    def title_of(self, repo, issue):
+        return cached_issue_title(self.engine, repo, issue, {})
+
+    def links(self):
+        sync = getattr(self.engine, "external_sync", None)
+        return dict(getattr(sync, "links", None) or {})
+
+    def audit(self, event, subject, detail):
+        if self.engine.audit is not None:
+            self.engine.audit.append(self.engine.actor, event, subject, detail)
+
+
+def work_sync_external(engine, now):
+    """The end of a pass, after the decision sync: mirror worker assignments as work items when `work_items` is on and
+    the adapter in use has a work sink. Never raises; nothing at all happens while either is off."""
+    settings = external_settings(engine.config)
+    if settings is None or not settings.get("work_items") or engine.state_dir is None:
+        return
+    try:
+        sync = getattr(engine, "external_sync", None)
+        sink = getattr(getattr(sync, "adapter", None), "work", None)
+        if sink is None:
+            return
+        pump = getattr(engine, "work_pump", None)
+        if pump is None:
+            pump = engine.work_pump = work_sync.WorkSync(settings, engine.state_dir, sink, EngineWorkHost(engine), engine.now)
+        pump.cycle()
+    except Exception as err:
+        try:
+            engine._note("work.error", "pump", {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception:
+            pass
+
+
+def work_status_line(config, state_dir, now):
+    """`work items: 3 open, last write 12s ago, 0 errors` (None when work items are off)."""
+    settings = external_settings(config)
+    if settings is None or not settings.get("work_items"):
+        return None
+    body = decision_sync._read_json(str(Path(state_dir) / work_sync.STATUS_FILE))
+    if body is None:
+        return "work items  waiting for the daemon's first pass"
+    last = body.get("last_write")
+    return "work items  %s open, last write %s, %s error(s)%s" % (
+        body.get("open", 0), "%s ago" % format_age(now - last) if last else "never", body.get("errors", 0),
+        "; ALARM: writes are piling up" if body.get("alarm") else "")
+
+
 def _write_external_status(engine, status):
     try:
         decision_sync._write_json(str(Path(engine.state_dir) / decision_sync.STATUS_FILE),
@@ -5148,6 +5273,7 @@ def publish_decisions(engine):
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
+    work_sync_external(engine, now)  # nothing unless external_decisions.work_items is on
     return store.publish(decisions, errors, now)
 
 
@@ -7263,6 +7389,9 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
             report["external"] = {"line": line}
+            work_line = work_status_line(config, state, now())
+            if work_line is not None:
+                report["external"]["work_line"] = work_line
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
@@ -7348,6 +7477,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      " + report["external"]["line"] for _ in [0] if "external" in report)
+    lines.extend("      " + report["external"]["work_line"] for _ in [0] if "external" in report and "work_line" in report["external"])
     lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18
     lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
