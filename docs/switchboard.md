@@ -1044,7 +1044,7 @@ without its one line).
 You had no place to see what is blocked on you, so agents repeated "I am still
 waiting on your two answers" in every reply. The Decisions list is that place:
 read-only, in the right sidebar of the TUI like the TODO list, and as a command.
-No click, no dialog, no text pushed into the prompt box: you read it and name a
+No dialog and no text pushed into the prompt box (a click opens or copies a link, below): you read it and name a
 decision by its id in chat ("answer #2a: yes"). It is **derived, never the source
 of truth** (invariant 1): every row comes from a fact that already lives
 somewhere else, and deleting the file loses nothing.
@@ -1068,6 +1068,17 @@ report line. Every URL is shortened (a GitHub issue or pull request URL `https:/
 characters each), with an ellipsis only past that. The issue title comes from what the daemon already holds,
 never from a new `gh` read: the open decision's own title (the hub's picture), else the intent reader's cached
 issue; a report whose issue is in neither keeps its report line.
+
+**Clicking a row (issue 66).** A decision row links to its issue (`https://github.com/<repo>/issues/<ask>`, for an
+issue decision, a report with an issue number and a batch) and a heads-up row to its PR
+(`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The
+`id age` line is drawn as an OSC 8 hyperlink (OpenTUI's own link attribute, not text, so no line gets wider), and
+a click on the row copies the link through OSC 52 and shows a toast. In herdr inside iTerm2 that means: hold
+Ctrl (herdr) or Cmd (iTerm2, where herdr passes it on) and click the `id age` line to open the issue or PR in the
+browser, or click the row to copy the link. A terminal that ignores OSC 8 shows the same plain text, and one that
+ignores OSC 52 shows the link in the toast to copy by hand. The plugin spawns no process and makes no network
+call: the terminal opens the link. The URL is built only from the entry's `repo` and `ask` or `number`, each
+matched against a strict pattern, never from a title; control characters in a title or row are dropped.
 
 **One question, shown once.** A report and an issue decision with the same repo and issue number are one question:
 the report is folded into the issue's decision, which keeps the issue's id and gains `reported_by` (the reporting
