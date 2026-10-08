@@ -195,7 +195,6 @@ EXTERNAL_DEFAULTS = {
     "outbox_alarm_depth": 1000,   # a deeper outbox raises an alarm in the status line; nothing is ever dropped
     "retry_base_seconds": 5,      # backoff of a failed outbound operation: base * 2^(attempts-1), up to the ceiling
     "retry_max_seconds": 600,
-    "work_items": False,          # also track each worker assignment as a work item outside (needs the work pump)
 }
 
 HERDR_CALL_TIMEOUT = 15  # seconds; herdr answers locally or not at all
@@ -318,8 +317,6 @@ def validate_external_config(config, source):
     for key in ("poll_seconds", "retry_base_seconds", "retry_max_seconds"):
         if not _is_number(section[key]) or section[key] <= 0:
             raise ConfigError("%s.%s' must be a positive number, got %r" % (where, key, section[key]))
-    if not isinstance(section["work_items"], bool):
-        raise ConfigError("%s.work_items' must be true or false, got %r" % (where, section["work_items"]))
     if section["retry_max_seconds"] < section["retry_base_seconds"]:
         raise ConfigError("%s.retry_max_seconds' must be at least retry_base_seconds" % where)
     depth = section["outbox_alarm_depth"]
@@ -5168,28 +5165,6 @@ def sync_external(engine, decisions, errors, now):
     return found
 
 
-WORK_PUMP_BUDGET_SECONDS = 5
-
-
-def sync_work(engine, decisions, now):
-    """THE WORK-ITEM PUMP HOOK: after the decision sync, when external_decisions.work_items is true and the external
-    system is up, call `engine.work_pump(engine, adapter, now, budget_seconds)`. The pump is coder-core's WorkSync
-    (bin/work_sync.py, one external work item per worker assignment); until it is set the call is a no-op. The pump
-    bounds itself to `budget_seconds`. Returns the error entries to show; never raises; never touches `decisions`."""
-    settings = external_settings(engine.config)
-    if settings is None or not settings.get("work_items"):
-        return []
-    pump = getattr(engine, "work_pump", None)
-    sync = getattr(engine, "external_sync", None)
-    if pump is None or sync is None:
-        return []
-    try:
-        found = pump(engine, sync.adapter, now, WORK_PUMP_BUDGET_SECONDS)
-        return [e for e in (found or []) if isinstance(e, dict) and e.get("source") and e.get("error")]
-    except Exception as err:
-        return [{"source": "external", "error": _one_line("work items: %s: %s" % (type(err).__name__, err), 200)}]
-
-
 def _write_external_status(engine, status):
     try:
         decision_sync._write_json(str(Path(engine.state_dir) / decision_sync.STATUS_FILE),
@@ -5227,7 +5202,6 @@ def publish_decisions(engine):
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
-    errors = errors + sync_work(engine, decisions, now)  # [] unless external_decisions.work_items is on and a pump is set
     return store.publish(decisions, errors, now)
 
 

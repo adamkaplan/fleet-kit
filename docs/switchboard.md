@@ -2662,7 +2662,6 @@ Configuration (no key is read from the repo; the mapping file is local):
 | `outbox_alarm_depth`       | 1000                  | A deeper outbox raises an alarm in the status line and the errors; nothing is dropped.             |
 | `retry_base_seconds`       | 5                     | First backoff of a failed outbound operation; doubles each try.                                    |
 | `retry_max_seconds`        | 600                   | The ceiling of the backoff.                                                                        |
-| `work_items`               | `false`               | Also track each worker assignment as an outside work item (needs the work pump; a no-op until it exists). |
 
 The mapping file is read by the adapter, not by the engine. What it holds is the adapter's business; typically:
 
@@ -2710,10 +2709,6 @@ and drains, in order and without duplicates, when it is back (a tool session the
 itself). A refusal that will not pass by itself (an already decided item, an unknown item, an invalid request) carries
 `permanent = True`; a rate limit or an outage does not. A system with no operation for a tier change or a note leaves
 those local: the adapter lists no `status` capability and does nothing for them.
-
-Work items: with `external_decisions.work_items: true` the pass makes one bounded, never-raising call after the decision
-sync (`sync_work`) to the work pump, which tracks each worker assignment as an outside work item. The pump is a separate
-component; until it is present the call does nothing.
 
 ## Repo and PR conventions
 

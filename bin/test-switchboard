@@ -25618,54 +25618,6 @@ class TestExternalWiring(ExternalWorld):
         self.assertNotIn(FakeDoorServer.KEY, text)
         self.assertIn("refused", text)
 
-    def test_the_work_pump_hook_is_a_no_op_until_a_pump_is_set_and_work_items_is_on(self):
-        calls = []
-
-        def pump(engine, adapter, now, budget):
-            calls.append((adapter.__class__.__name__, budget))
-            return [{"source": "external", "error": "work: one thing is stuck"}]
-
-        self.wire()
-        self.say("api-orch", "question", "Which table?", 6)
-        self.run_pass()
-        self.world.engine.work_pump = pump
-        self.run_pass()
-        self.assertEqual(calls, [], "work_items is off by default")
-        self.wire(work_items=True)
-        self.world.engine.work_pump = pump
-        self.run_pass()
-        self.run_pass()
-        self.assertEqual([c[0] for c in calls], ["McpRestAdapter"] * 2)
-        self.assertEqual(calls[0][1], sb.WORK_PUMP_BUDGET_SECONDS)
-        self.assertIn("work: one thing is stuck",
-                      [e["error"] for e in self.file_body()["errors"] if e["source"] == "external"])
-        self.assertEqual(len(self.file_body()["decisions"]), 1)
-
-    def test_a_pump_that_raises_never_breaks_the_pass_and_a_down_adapter_never_calls_it(self):
-        def boom(engine, adapter, now, budget):
-            raise RuntimeError("the pump broke")
-
-        self.wire(work_items=True)
-        self.say("api-orch", "question", "Which table?", 6)
-        self.world.engine.work_pump = boom
-        self.run_pass()
-        errors = [e["error"] for e in self.file_body()["errors"] if e["source"] == "external"]
-        self.assertEqual(errors, ["work items: RuntimeError: the pump broke"])
-        self.assertEqual(len(self.file_body()["decisions"]), 1)
-        # an adapter that never came up has no pump call
-        self.setUp()
-        self.mapping.unlink()
-        self.wire(work_items=True)
-        called = []
-        self.world.engine.work_pump = lambda *a: called.append(a)
-        self.run_pass()
-        self.assertEqual(called, [])
-
-    def test_work_items_must_be_a_flag_and_defaults_off(self):
-        self.assertIs(sb.validate_config({"external_decisions": {}})["external_decisions"]["work_items"], False)
-        with self.assertRaises(sb.ConfigError):
-            sb.validate_config({"external_decisions": {"work_items": "yes"}})
-
     def test_the_loader_is_the_one_the_core_uses(self):
         text = SWITCHBOARD.read_text()
         self.assertIn("def load_external_adapter", text)
