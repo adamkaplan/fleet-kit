@@ -26376,7 +26376,7 @@ class TestJudgeSample(unittest.TestCase):
             self.assertEqual(len(run("--since", "2026-10-08T22:15:00Z") and out.read_text().splitlines()), 7)
             self.assertEqual(run("--since", "yesterday").returncode, 2)
             self.assertEqual(run().returncode, 0)
-            self.assertEqual(len(out.read_text().splitlines()), 12, "no --since: every verdict, still under the asked counts")
+            self.assertEqual(len(out.read_text().splitlines()), 13, "no --since: every verdict, including the one with no readable time")
 
 
 class TestExternalDecisionConfig(unittest.TestCase):
