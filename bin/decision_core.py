@@ -601,7 +601,10 @@ def payload_digest(payload):
     return hashlib.sha256(repr(sorted(stable.items(), key=lambda kv: kv[0])).encode("utf-8")).hexdigest()[:16]
 
 
-def plan_operations(desired, links, errored_kinds=()):
+SENT_BACK_TIMEOUT = 72 * 3600   # seconds an item sent back for clarification waits for the agent's revision, then it is withdrawn
+
+
+def plan_operations(desired, links, errored_kinds=(), now=None):
     """The outbound operations that bring `links` (what the outside system holds, projected through what is queued)
     to `desired` ({key: {"payload", "digest", "tier", "floor", "kind", "thread"}}). Pure.
 
@@ -609,7 +612,10 @@ def plan_operations(desired, links, errored_kinds=()):
     new to the links is a `raise`, unless a report of the same thread (repo, ask, agent) left the list as it
     arrived: then it is a `revise` of that item, rebound to the new key (a re-asked question is one item). A key
     that left the list is withdrawn, except while its source could not be read (`errored_kinds`: an empty read is
-    not an answer). A link closed from outside is left alone."""
+    not an answer). A link closed from outside is left alone. A link that was SENT BACK (`sent_back_at`: the outside
+    system asked a question and the agent was told) is not withdrawn when its decision leaves the list, which the note
+    itself causes for a report: the item waits for the agent's revision (the re-asked-question rule above revises it)
+    and is withdrawn, with a reason, only when SENT_BACK_TIMEOUT has passed (`now` is needed to tell)."""
     ops, taken = [], set()
     for key, want in desired.items():
         link = links.get(key)
@@ -639,6 +645,12 @@ def plan_operations(desired, links, errored_kinds=()):
         if key in desired or key in taken or link.get("withdrawn") or link.get("closed"):
             continue
         if link.get("kind") in errored_kinds:
+            continue
+        if link.get("sent_back_at") is not None:
+            if now is None or now - link["sent_back_at"] < SENT_BACK_TIMEOUT:
+                continue
+            ops.append({"op": "withdraw", "key": key, "revision": link["revision"] + 1,
+                        "reason": "no revision after clarification"})
             continue
         ops.append({"op": "withdraw", "key": key, "revision": link["revision"] + 1})
     return ops
@@ -709,7 +721,11 @@ class ExternalDecisionAdapter(abc.ABC):
     (bin/decision_sync.py) is its only caller; an implementation never needs to know the fleet.
 
     Every write carries an idempotency key and the same key twice is the same write. Reads are by cursor and may
-    repeat an event: the caller de-duplicates by `event_id`. Errors are raised (any Exception); the engine retries."""
+    repeat an event: the caller de-duplicates by `event_id`. Errors are raised (any Exception) and the engine retries
+    them with backoff, UNLESS the exception carries the attribute `permanent = True`: the other side refused that
+    operation for good (an invalid body, an unknown item, "already decided"). Such an operation is dropped, audited
+    and shown in the status, never retried, and never makes the engine withdraw or answer anything; a later change of
+    the decision enqueues a fresh one. A rate limit or an unavailable service is not permanent."""
 
     capabilities = frozenset()
 
