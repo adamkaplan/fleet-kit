@@ -4371,6 +4371,25 @@ def transcript_lines(engine, session_id, since):
     return found
 
 
+COS_ALIAS = "chief-of-staff"   # what a worker's reports_to says when it was launched with the role name
+
+
+class BossProblem(str):
+    """A problem line that names the boss it is about (#80): the sync freezes only that boss's reports."""
+
+    boss = None
+
+
+def resolve_boss(discovery, name):
+    """The registered agent a `reports_to` names. The role name `chief-of-staff` is an alias for the one agent whose
+    role is chief-of-staff, whatever it is registered as (`cos`); any other name, or an alias with no single
+    registered chief of staff, is taken literally."""
+    if name in discovery.agents or name != COS_ALIAS:
+        return name
+    found = [n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == COS_ALIAS]
+    return found[0] if len(found) == 1 else name
+
+
 def decisions_from_reports(engine, now):
     """(items, problems): `question` and `blocked` reports delivered to a boss that nobody has answered.
 
@@ -4382,14 +4401,16 @@ def decisions_from_reports(engine, now):
     if discovery.problems:
         raise RuntimeError("the fleet cannot be read: %s" % "; ".join(discovery.problems))
     since = now - engine.config["decisions_lookback_hours"] * 3600
-    bosses = sorted({_boss_of(o) for o in discovery.agents.values()} - {None})
+    bosses = sorted({resolve_boss(discovery, _boss_of(o)) for o in discovery.agents.values() if _boss_of(o)})
     repos = decision_repos(engine)
     items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
         if observation is None or observation.problem:
-            problems.append("cannot read what was reported to %s: %s" % (
+            problem = BossProblem("cannot read what was reported to %s: %s" % (
                 boss, observation.problem if observation else "it is not running"))
+            problem.boss = boss
+            problems.append(problem)
             continue
         reports = []
         for created, message_id, number, line in synthetic_lines(engine, observation.session_id, since):
@@ -4406,7 +4427,7 @@ def decisions_from_reports(engine, now):
         for item in (source.entries() if (source := _report_rider_source(engine)) is not None else []):
             state, _, text = item["summary"].partition(": ")
             sender = discovery.agents.get(item.get("from"))
-            if item["to"] == boss and state == "withdrawn" and item["created"] >= since and sender is not None:
+            if resolve_boss(discovery, item["to"]) == boss and state == "withdrawn" and item["created"] >= since and sender is not None:
                 reports.append({"at": (item["created"], 1 << 60), "message": item["key"], "sender": sender.name,
                                 "issue": item.get("issue"), "state": state, "text": text, "boss": boss,
                                 "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
@@ -4433,7 +4454,7 @@ def decisions_from_reports(engine, now):
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": decision_core.report_tier(bool(above)),
-                          "since": report["at"][0], "bare": False,
+                          "since": report["at"][0], "bare": False, "boss": report["boss"],
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
                           "considered": considered})
     return items, problems
@@ -4864,7 +4885,8 @@ def read_source(engine, source, now, errors):
     except Exception as err:
         found, problems = [], [_one_line("%s: %s" % (type(err).__name__, err), 200)]
     for problem in problems:
-        errors.append({"source": source.name, "error": _one_line(problem, 200)})
+        errors.append(dict({"source": source.name, "error": _one_line(problem, 200)},
+                           **({"boss": problem.boss} if getattr(problem, "boss", None) else {})))
         engine._note("decisions.error", source.name, {"error": _one_line(problem, 200)})
     return found, problems
 
@@ -4882,6 +4904,7 @@ def derive_decisions(engine, now):
         found, problems = read_source(engine, source, now, errors)
         items.extend(found)
     ids = assign_decision_ids(items, decision_repos(engine))
+    engine.decision_bosses = {ident: item["boss"] for ident, item in zip(ids, items) if item.get("boss")}  # memory only
     engine.decision_seeds = {ident: item["seed"] for ident, item in zip(ids, items)}  # memory only: the sync engine's keys
     watched = decision_repos(engine)
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
@@ -5187,7 +5210,8 @@ def sync_external(engine, decisions, errors, now):
             reason = getattr(engine, "external_sync_error", None) or "no state directory"
             _write_external_status(engine, {"state": "down", "reason": reason, "outbox": 0, "last_pull": None})
             return [{"source": "external", "error": "external decision system is down: %s" % reason}]
-        status = sync.cycle(decisions, errors, getattr(engine, "decision_seeds", {}) or {})
+        status = sync.cycle(decisions, errors, getattr(engine, "decision_seeds", {}) or {},
+                            getattr(engine, "decision_bosses", {}) or {})
         if status["state"] == "down":
             found.append({"source": "external", "error": "external decision system is down: %s" % status["reason"]})
         if status.get("alarm"):

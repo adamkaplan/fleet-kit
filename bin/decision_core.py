@@ -604,14 +604,14 @@ def payload_digest(payload):
 SENT_BACK_TIMEOUT = 72 * 3600   # seconds an item sent back for clarification waits for the agent's revision, then it is withdrawn
 
 
-def plan_operations(desired, links, errored_kinds=(), now=None):
+def plan_operations(desired, links, errored_kinds=(), now=None, errored_bosses=()):
     """The outbound operations that bring `links` (what the outside system holds, projected through what is queued)
     to `desired` ({key: {"payload", "digest", "tier", "floor", "kind", "thread"}}). Pure.
 
     Returns a list of {"op": raise | revise | status | withdraw, "key", "revision", "rebind_from"?, "floor"?}. A key
     new to the links is a `raise`, unless a report of the same thread (repo, ask, agent) left the list as it
     arrived: then it is a `revise` of that item, rebound to the new key (a re-asked question is one item). A key
-    that left the list is withdrawn, except while its source could not be read (`errored_kinds`: an empty read is
+    that left the list is withdrawn, except while its source could not be read (`errored_kinds`, or for a report link `errored_bosses`: an empty read is
     not an answer). A link closed from outside is left alone. A link that was SENT BACK (`sent_back_at`: the outside
     system asked a question and the agent was told) is not withdrawn when its decision leaves the list, which the note
     itself causes for a report: the item waits for the agent's revision (the re-asked-question rule above revises it)
@@ -646,6 +646,8 @@ def plan_operations(desired, links, errored_kinds=(), now=None):
             continue
         if link.get("kind") in errored_kinds:
             continue
+        if errored_bosses and link.get("kind") == "report" and (link.get("boss") is None or link.get("boss") in errored_bosses):
+            continue  # #80: only that boss's reports wait; a link whose boss is unknown waits too (the cautious way)
         if link.get("sent_back_at") is not None:
             if now is None or now - link["sent_back_at"] < SENT_BACK_TIMEOUT:
                 continue

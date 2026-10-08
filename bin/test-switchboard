@@ -14034,6 +14034,67 @@ class DecisionsBase(ReportBase):
         return code, out.getvalue(), err.getvalue()
 
 
+class TestReportsPerBoss(DecisionsBase):
+    """#80: the chief-of-staff alias resolves to the registered agent, and one unreadable boss freezes only its own
+    reports."""
+
+    def reports_errors(self):
+        errors = self.decisions()[1]
+        return [e for e in errors if e["source"] == "reports"]
+
+    def test_the_role_name_resolves_to_the_registered_chief_of_staff(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("lead", fleet={"role": "orchestrator", "reports_to": "chief-of-staff"})
+        self.assertEqual(self.reports_errors(), [], "no boss named chief-of-staff is looked for")
+        self.world.engine.discover(self.world.clock.now())
+        self.assertEqual(sb.resolve_boss(self.world.engine.discovery, "chief-of-staff"), "cos")
+        self.assertEqual(sb.resolve_boss(self.world.engine.discovery, "platform"), "platform")
+
+    def test_the_alias_stays_literal_with_no_single_chief_of_staff(self):
+        self.world.add_agent("lead", fleet={"role": "orchestrator", "reports_to": "chief-of-staff"})
+        errors = self.reports_errors()
+        self.assertEqual([e.get("boss") for e in errors], ["chief-of-staff"])
+        self.assertIn("chief-of-staff", errors[0]["error"])
+
+    def test_an_error_names_its_boss(self):
+        self.world.add_agent("lead", fleet={"role": "orchestrator", "reports_to": "ghost"})
+        (error,) = self.reports_errors()
+        self.assertEqual(error["boss"], "ghost")
+
+
+class TestPlanOperationsPerBoss(unittest.TestCase):
+    LINKS = {"a": {"kind": "report", "boss": "boss-a", "revision": 1, "digest": "x"},
+             "b": {"kind": "report", "boss": "boss-b", "revision": 1, "digest": "x"},
+             "old": {"kind": "report", "revision": 1, "digest": "x"},
+             "q": {"kind": "question", "boss": None, "revision": 1, "digest": "x"}}
+
+    def withdrawn(self, **kw):
+        return sorted(op["key"] for op in sb.decision_core.plan_operations({}, self.LINKS, **kw) if op["op"] == "withdraw")
+
+    def test_unreadable_boss_a_does_not_stop_withdrawal_for_boss_b(self):
+        got = self.withdrawn(errored_bosses={"boss-a"})
+        self.assertIn("b", got)
+        self.assertIn("q", got)
+        self.assertNotIn("a", got)
+
+    def test_a_link_with_no_known_boss_keeps_the_cautious_freeze(self):
+        self.assertNotIn("old", self.withdrawn(errored_bosses={"boss-a"}))
+
+    def test_no_boss_error_withdraws_everything_answered(self):
+        self.assertEqual(self.withdrawn(), ["a", "b", "old", "q"])
+
+    def test_an_error_with_no_boss_still_freezes_every_report(self):
+        got = self.withdrawn(errored_kinds={"report"})
+        self.assertEqual(got, ["q"])
+
+
+class TestSyncReportFreezePerBoss(unittest.TestCase):
+    def test_the_cycle_scopes_the_freeze_by_the_errors_boss(self):
+        source = (REPO / "bin" / "decision_sync.py").read_text()
+        self.assertIn('e.get("source") == "reports" and e.get("boss")', source)
+        self.assertIn("plan_operations(desired, self._projected(), kinds, now, scoped)", source)
+
+
 class TestDecisionIds(unittest.TestCase):
     def item(self, seed, ask=None, agent="coder", bare=False, since=EPOCH):
         return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since}
@@ -25889,6 +25950,34 @@ class TestExternalDecisionSync(ExternalWorld):
         self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
+
+    def test_an_unreadable_boss_does_not_stop_an_answered_report_of_another_boss_leaving(self):
+        """#80: web-orch is gone (its reports cannot be read); api-coder's answered question still leaves."""
+        self.turn_on(repos=[API, WEB])
+        self.say("api-coder", "question", "Which table should hold the totals?", 6)
+        self.say("web-coder", "question", "Which cache layer?", 4)
+        self.run_pass()
+        self.assertEqual(len(self.fake.open_items()), 2)
+        self.world.herdr.panes.pop(self.world.panes["web-orch"])
+        self.send("api-orch", "api-coder", "use the totals table", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertTrue([e for e in self.fresh()["errors"] if e["source"] == "reports"], "web-orch is unreadable")
+        open_titles = sorted(i["decision"]["title"] for i in self.fake.open_items().values())
+        self.assertEqual(len(open_titles), 1, open_titles)
+        self.assertIn("cache", open_titles[0], "only the unreadable boss's report is kept")
+
+    def test_the_stale_role_name_boss_does_not_freeze_withdrawals(self):
+        """#80: a worker that reports to the role name `chief-of-staff` while the agent is `cos` raises no error."""
+        self.turn_on()
+        self.add_worker("alias-coder", boss="chief-of-staff")
+        self.say("api-coder", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        self.assertEqual([e for e in self.fresh()["errors"] if e["source"] == "reports"], [])
+        self.send("api-orch", "api-coder", "use the totals table", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.open_items(), {})
 
     def test_the_outbox_retries_and_a_lost_answer_does_not_make_a_second_item(self):
         self.turn_on()

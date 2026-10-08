@@ -126,7 +126,7 @@ class SyncEngine:
 
     # -- what is wanted outside
 
-    def desired(self, decisions, seeds):
+    def desired(self, decisions, seeds, bosses=None):
         """{key: want} for the listed decisions that go outward. `seeds` maps a display id to its source seed."""
         out, repos, kinds = {}, self.settings["repos"], self.settings["kinds"]
         for entry in decisions:
@@ -140,7 +140,8 @@ class SyncEngine:
             thread = (entry.get("repo"), entry.get("ask"), entry.get("agent")) if entry.get("ask") else None
             out[core.decision_key(seed)] = {"payload": payload, "digest": core.payload_digest(payload),
                                             "tier": entry.get("tier"), "floor": floor, "kind": entry.get("kind"),
-                                            "thread": list(thread) if thread else None, "entry": entry}
+                                            "thread": list(thread) if thread else None, "entry": entry,
+                                            "boss": (bosses or {}).get(entry.get("id"))}
         return out
 
     def _projected(self):
@@ -159,7 +160,7 @@ class SyncEngine:
                               digest=op["digest"], tier=op["tier"], floor=op["floor"], kind=op["kind"],
                               thread=op["thread"], repo=op["decision"].get("repo"), ask=op["decision"].get("ask"),
                               agent=op["decision"].get("agent"), display_id=op["decision"].get("display_id"),
-                              withdrawn=False, closed=False)
+                              boss=op.get("boss"), withdrawn=False, closed=False)
         elif kind == "revise":
             if op.get("rebind_from") in links:
                 links[key] = links.pop(op["rebind_from"])
@@ -169,6 +170,8 @@ class SyncEngine:
             link.update(revision=op["revision"], digest=op["digest"], tier=op["tier"], floor=op["floor"],
                         thread=op["thread"], agent=op["decision"].get("agent"),
                         display_id=op["decision"].get("display_id"))
+            if op.get("boss"):
+                link["boss"] = op["boss"]
             if external_id:
                 link["external_id"] = external_id
         elif kind == "status" and link is not None:
@@ -194,7 +197,7 @@ class SyncEngine:
                 self.host.audit("external.sent_back_expired", key, {"reason": item["reason"]})
             if want is not None:
                 op.update(decision=want["payload"], digest=want["digest"], tier=want["tier"], floor=want["floor"],
-                          kind=want["kind"], thread=want["thread"])
+                          kind=want["kind"], thread=want["thread"], boss=want.get("boss"))
             else:
                 op.update(decision={"display_id": link.get("display_id")}, floor=link.get("floor"),
                           tier=link.get("tier"))
@@ -220,7 +223,7 @@ class SyncEngine:
 
     # -- the cycle
 
-    def cycle(self, decisions, errors, seeds):
+    def cycle(self, decisions, errors, seeds, bosses=None):
         """One pass: plan what must go outward, send what can go, pull what came back. Never raises: a failure is
         in the returned status ({state: ok | down, reason, outbox, alarm, last_pull}), and the list is untouched."""
         now = self.now()
@@ -231,12 +234,14 @@ class SyncEngine:
         except Exception as err:
             reason = "health check failed: %s" % core.one_line("%s: %s" % (type(err).__name__, err), 120)
         try:
-            desired = self.desired(decisions, seeds)
+            desired = self.desired(decisions, seeds, bosses)
             errored = {"github": "issue", "reports": "report", "v2": "question"}
-            kinds = {errored[e["source"]] for e in errors if e.get("source") in errored}
+            kinds = {errored[e["source"]] for e in errors if e.get("source") in errored and not e.get("boss")}
+            # #80: an unreadable boss freezes only the report links of that boss (an error with no boss names none)
+            scoped = {e["boss"] for e in errors if e.get("source") == "reports" and e.get("boss")}
             if not reason and self.rebuild:
                 self.reconcile(desired)
-            self._enqueue(core.plan_operations(desired, self._projected(), kinds, now), desired)
+            self._enqueue(core.plan_operations(desired, self._projected(), kinds, now, scoped), desired)
             if reason:
                 status.update(state="down", reason=core.one_line(reason, 160))
             else:
@@ -276,7 +281,7 @@ class SyncEngine:
                                    "kind": want["kind"], "thread": want["thread"],
                                    "repo": want["payload"].get("repo"), "ask": want["payload"].get("ask"),
                                    "agent": want["payload"].get("agent"), "display_id": want["payload"].get("display_id"),
-                                   "withdrawn": False, "closed": False}
+                                   "boss": want.get("boss"), "withdrawn": False, "closed": False}
                 self.host.audit("external.linked", key, {"external_id": found["external_id"], "how": "reconcile"})
         self.rebuild = False
 
