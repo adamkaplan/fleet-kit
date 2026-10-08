@@ -33,7 +33,9 @@ The mapping file (JSON; unknown top-level keys are refused, an inline credential
                    work_finish, work_get, work_list): {tool, http: {method, path}, id_arg, cursor_param}; `{id}`
                    and `{project}` in a path are filled in. feed, raise and items are required
   fields           field names of every request: raise, option, evidence, revise, withdraw, acted, work
-  responses        field names of every response: item_id, item (the read shape), feed, change, answer, work
+  responses        field names of every response: item_id, item (the read shape), feed, change, answer, work, page
+                   (page {info, next}: a reply that says it is truncated names the token of the next page; an
+                   operation's `next_param` is the request field that carries it; every page is read)
   enums            generic -> the other side's words: tier, disposition, status, change_kind, outcome,
                    work_state, work_end, integration_status, meaning (disposition -> allow|deny|text|needs_info)
   tier_map         the fleet's tier (orchestrator, cos, human) -> {class, floor}: the FLOOR consequence tier we
@@ -121,7 +123,13 @@ DEFAULT_MEANING = {"accept": "allow", "edit": "text", "reject": "deny", "clarify
 
 
 class AdapterError(Exception):
-    """Base of everything this module raises on purpose. Texts never carry a key."""
+    """Base of everything this module raises on purpose. Texts never carry a key.
+
+    `permanent` tells the sync engine whether trying the same operation again can help: True for a refusal that will
+    not change by itself (a rejected request, an unknown item, an already decided one, a refused credential, a
+    disabled integration); False for what may pass (RateLimited, Unavailable)."""
+
+    permanent = False
 
     def __init__(self, message, status=None, code=None):
         Exception.__init__(self, message)
@@ -129,31 +137,37 @@ class AdapterError(Exception):
 
 
 class MappingError(AdapterError):
-    pass
+    permanent = True
 
 
 class KeySourceError(AdapterError):
-    pass
+    permanent = True
 
 
 class CredentialError(AdapterError):
     """No credential, a refused one or a revoked one (401)."""
 
+    permanent = True
+
 
 class DisabledError(AdapterError):
     """The integration is disabled on the other side (403 or 409 as the mapping says)."""
 
+    permanent = True
+
 
 class NotFound(AdapterError):
-    pass
+    permanent = True
 
 
 class InvalidRequest(AdapterError):
     """A 400, a 415, a schema failure on the tool channel, or a request we refused to build."""
 
+    permanent = True
+
 
 class Conflict(AdapterError):
-    pass
+    permanent = True
 
 
 class AlreadyDecided(Conflict):
@@ -172,6 +186,8 @@ class Unavailable(AdapterError):
 
 class Unsupported(AdapterError):
     """The mapping defines no such operation."""
+
+    permanent = True
 
 
 ERROR_CLASSES = {c.__name__: c for c in (CredentialError, DisabledError, NotFound, InvalidRequest, Conflict,
@@ -468,7 +484,10 @@ class MappingFile:
                     continue
                 if not need(isinstance(op, dict), "operations.%s must be an object" % name):
                     continue
-                need(not (set(op) - {"tool", "http", "id_arg", "cursor_param"}), "operations.%s: unknown keys" % name)
+                need(not (set(op) - {"tool", "http", "id_arg", "cursor_param", "next_param"}),
+                     "operations.%s: unknown keys" % name)
+                need(op.get("next_param") is None or (isinstance(op["next_param"], str) and op["next_param"]),
+                     "operations.%s.next_param must be a name" % name)
                 tool, http_ = op.get("tool"), op.get("http")
                 if name in WORK_OPS:
                     need(tool is None, "operations.%s: work reporting is HTTP only (no tool)" % name)
@@ -522,6 +541,9 @@ class MappingFile:
             feed = resp.get("feed", {})
             need(isinstance(feed.get("cursor"), str) and isinstance(feed.get("changes"), str),
                  "responses.feed needs cursor and changes")
+            page = resp.get("page")
+            need(page is None or (isinstance(page, dict) and isinstance(page.get("info"), str)
+                                  and isinstance(page.get("next"), str)), "responses.page needs info and next")
             change = resp.get("change", {})
             need(isinstance(change.get("kind"), str) and isinstance(change.get("item_id"), str),
                  "responses.change needs kind and item_id")
@@ -1016,15 +1038,34 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
         events, nxt = self.pull_normalised(cursor)
         return Changes([self._port_event(e) for e in events if e["type"] in PORT_TYPES], nxt)
 
+    def _pages(self, name, query=None):
+        """The replies of an operation, following the pages the other side says remain (at most 50)."""
+        data = self.door.call(name, query=query)
+        pages = [data]
+        spec = self.m.responses.get("page")
+        param = self.m.operations[name].get("next_param")
+        while spec and param and len(pages) < 50:
+            info = data.get(spec["info"])
+            token = info.get(spec["next"]) if isinstance(info, dict) else None
+            if not token:
+                break
+            data = self.door.call(name, query=dict(query or {}, **{param: token}))
+            pages.append(data)
+        return pages
+
     def pull_normalised(self, cursor):
         """Every change normalised (answered, sent_back, reversed, withdrawn, rated, revised, other), with the cursor."""
-        data = self.door.call("feed", query=self._cursor_query(cursor))
+        pages = self._pages("feed", self._cursor_query(cursor))
+        data = pages[-1]
         feed = self.m.responses["feed"]
-        raw = data.get(feed["changes"])
-        if raw is None:
-            raw = []
-        if not isinstance(raw, list):
-            raise InvalidRequest("the feed's changes are not a list")
+        raw = []
+        for page in pages:
+            one = page.get(feed["changes"])
+            if one is None:
+                one = []
+            if not isinstance(one, list):
+                raise InvalidRequest("the feed's changes are not a list")
+            raw.extend(one)
         events = [e for e in (self._normalise(c) for c in raw if isinstance(c, dict)) if e is not None]
         events.sort(key=lambda e: (e["seq"] is None, e["seq"] if e["seq"] is not None else 0))
         nxt = data.get(feed["cursor"])
@@ -1074,10 +1115,12 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
     def read_items(self):
         """The items of this integration, normalised: {external_id, status, text, answer, clarification, withdrawn,
         reversals, opened_at, raw}."""
-        data = self.door.call("items")
         spec = self.m.responses["item"]
         found = []
-        for raw in data.get(self.m.responses["items"]) or []:
+        rows = []
+        for page in self._pages("items"):
+            rows.extend(page.get(self.m.responses["items"]) or [])
+        for raw in rows:
             if not isinstance(raw, dict):
                 continue
             answer = raw.get(spec.get("answer")) if spec.get("answer") else None

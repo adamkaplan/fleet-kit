@@ -23825,11 +23825,24 @@ class FakeDoorServer:
             return (409 if op.startswith("work") else 403), {"code": "off", "message": "disabled"}, {}
         return getattr(self, "op_" + op)(args, ident, seat)
 
+    page_size = 0   # 0: no paging; else a reply holds this many entries and names the token of the next page
+
+    def paged(self, rows, args):
+        if not self.page_size:
+            return rows, {}
+        start = int(str(args.get("token") or "p0")[1:])
+        chunk = rows[start:start + self.page_size]
+        more = {"more": {"token": "p%d" % (start + self.page_size)}} if start + self.page_size < len(rows) else {}
+        return chunk, more
+
     def op_feed(self, args, ident, seat):
         since = int(args.get("since") or 0)
         new = [c for c in self.changes if c["n"] > since]
-        return 200, {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": new,
-                     "cursor": max([c["n"] for c in new] + [since])}, {}
+        chunk, more = self.paged(new, args)
+        body = {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": chunk,
+                "cursor": max([c["n"] for c in chunk] + [since])}
+        body.update(more)
+        return 200, body, {}
 
     def op_raise(self, args, ident, seat):
         if not self.RAISE_KEYS <= set(args) or set(args) - self.RAISE_KEYS - self.RAISE_OPT:
@@ -23862,7 +23875,8 @@ class FakeDoorServer:
         return {k: v for k, v in item.items() if not k.startswith("_")}
 
     def op_items(self, args, ident, seat):
-        return 200, {"items": [self.visible(i) for i in self.items.values()], "state": "on"}, {}
+        chunk, more = self.paged([self.visible(i) for i in self.items.values()], args)
+        return 200, dict({"items": chunk, "state": "on"}, **more), {}
 
     def find(self, ident):
         return self.items.get(ident)
@@ -23953,9 +23967,10 @@ FAKE_MAPPING = {
               "default_retry_after": 1},
     "poll_interval": 30, "work_interval": 60, "idempotency": {"namespace": FakeDoorServer.NAMESPACE},
     "operations": {
-        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since"},
+        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since",
+                 "next_param": "token"},
         "raise": {"tool": "item_raise", "http": {"method": "POST", "path": "/items"}},
-        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}},
+        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}, "next_param": "token"},
         "revise": {"tool": "item_revise", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/revise"}},
         "withdraw": {"tool": "item_withdraw", "id_arg": "id",
                      "http": {"method": "POST", "path": "/items/{id}/withdraw"}},
@@ -23980,7 +23995,7 @@ FAKE_MAPPING = {
         "item_id": "item", "items": "items",
         "item": {"id": "item", "status": "state", "text": "body", "answer": "answer", "clarification": "ask_back",
                  "withdrawn": "withdrawn", "reversals": "reversals", "opened_at": "opened", "idempotency": "op_id"},
-        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"},
+        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"}, "page": {"info": "more", "next": "token"},
         "change": {"seq": "n", "kind": "what", "item_id": "item", "at": "when", "tier": "level", "floor": "floor",
                    "text": "body", "awaits_rating": "rerate", "replaces": "replaces", "reason": "why"},
         "answer": {"id": "answer_id", "disposition": "how", "option_id": "chosen", "text": "words", "rationale": "why",
@@ -24653,6 +24668,39 @@ class TestExternalAdapterPort(ExternalAdapterCase):
         self.server.down = True
         with self.assertRaises(Exception):
             adapter.pull_changes(None)
+
+    def test_every_page_of_a_truncated_read_is_followed_over_both_channels(self):
+        for channel in ("tool", "http"):
+            self.server.items.clear()
+            self.server.changes.clear()
+            self.server.page_size = 2
+            adapter = self.adapter(channel)
+            ids = [self.push(adapter, self.decision(title="item %d" % n), "k-%d-%s" % (n, channel)) for n in range(5)]
+            self.assertEqual(sorted(i["external_id"] for i in adapter.read_items()), sorted(ids))
+            self.assertEqual(adapter.lookup("dk:k-4-%s" % channel)["external_id"], ids[4], "found on the last page")
+            for n in range(5):
+                self.server.add_change("answer", ids[n], **self.answer_fields(answer_id="a-%d" % n))
+            events, cursor = adapter.pull_changes(None)
+            self.assertEqual([e["answer_id"] for e in events], ["a-%d" % n for n in range(5)])
+            self.assertEqual(cursor, self.server.seq)
+            self.assertEqual(adapter.pull_changes(cursor), ([], cursor))
+            self.assertGreaterEqual(self.server.count("feed", channel), 4)
+
+    def test_permanent_errors_are_marked_and_transient_ones_are_not(self):
+        for cls in (EA.CredentialError, EA.DisabledError, EA.NotFound, EA.InvalidRequest, EA.Conflict,
+                    EA.AlreadyDecided, EA.MappingError, EA.KeySourceError, EA.Unsupported):
+            self.assertTrue(cls("x").permanent, cls.__name__)
+        self.assertFalse(EA.RateLimited("x", 1).permanent)
+        self.assertFalse(EA.Unavailable("x").permanent)
+        adapter = self.adapter("http")
+        for status, code, permanent in ((404, "nf", True), (400, "bad", True), (401, "cred", True),
+                                        (409, "decided", True), (403, "off", True), (500, "x", False),
+                                        (429, "slow", False)):
+            self.server.inject.clear()
+            self.server.fail_next("raise", status, {"code": code, "message": "m"}, {"Retry-After": "99"}, count=9)
+            with self.assertRaises(EA.AdapterError) as ctx:
+                self.push(adapter, self.decision(), "k-%d" % status)
+            self.assertIs(ctx.exception.permanent, permanent, status)
 
     def test_a_cursor_that_goes_back_is_ignored(self):
         adapter = self.adapter("http")
