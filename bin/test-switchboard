@@ -25618,6 +25618,15 @@ class TestExternalWiring(ExternalWorld):
         self.assertNotIn(FakeDoorServer.KEY, text)
         self.assertIn("refused", text)
 
+    def test_loading_the_script_imports_nothing_of_the_adapter(self):
+        code = ("import importlib.machinery as m, importlib.util as u, sys\n"
+                "l = m.SourceFileLoader('x_sb', %r); s = u.spec_from_loader('x_sb', l); mod = u.module_from_spec(s)\n"
+                "l.exec_module(mod)\n"
+                "print('external_adapter' in sys.modules, 'mapping' in mod.EXTERNAL_ADAPTERS)\n" % str(SWITCHBOARD))
+        done = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "False True", "registered by name, loaded by nobody")
+
     def test_the_loader_is_the_one_the_core_uses(self):
         text = SWITCHBOARD.read_text()
         self.assertIn("def load_external_adapter", text)
