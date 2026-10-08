@@ -23726,7 +23726,7 @@ const linked = d.styledRows(snap([mk("web#1", "acme/web", "human", "Q?", 60, { a
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
 r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
 const esc = d.styledRows(snap([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })]), now, 34, human);
-r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|row/.test(t));
+r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
 console.log(JSON.stringify(r));
 """
 
