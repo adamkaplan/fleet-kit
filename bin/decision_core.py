@@ -68,7 +68,7 @@ def parse_iso(text):
 
 # ---------------------------------------------------------------- the vocabulary
 
-KINDS = ("issue", "permission", "question", "report", "notice")
+KINDS = ("issue", "permission", "question", "report", "notice", "captain")
 DECISION_TIERS = ("cos", "human", "orchestrator")   # the order the CLI's --tier choices show
 TIER_LADDER = ("orchestrator", "cos", "human")      # a decision goes up one tier at a time, in this order
 STATUSES = ("open", "answered", "withdrawn", "superseded", "expired")   # today every listed decision is "open"
@@ -478,6 +478,21 @@ def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_mi
             "files": facts.get("files"), "ci": facts.get("ci"), "review": facts.get("review"),
             "stale": stale, "note": note or None,
             "merge_after": iso(created + hold_minutes * 60) if hold_minutes > 0 else None}
+
+
+def captain_entry(notice, facts, escalated):
+    """A `MERGE: captain` PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
+    of Staff escalated it for this head). Only a review by someone other than the author at the exact head counts;
+    when reviews cannot be read it stands on the notice alone, and says so."""
+    reviews, head = facts.get("reviews"), facts.get("head")
+    if reviews is None:
+        evidence, review = "review not detectable: on notice alone", "not detectable"
+    else:
+        evidence = "reviewed at %s by %s" % (head[:8], ", ".join("%s (%s)" % (r["by"], r["state"]) for r in reviews))
+        review = "; ".join(r["state"] for r in reviews)
+    entry = dict(notice, kind="captain", tier="human" if escalated else "cos", head=head, review=review,
+                 reviews=reviews, review_evidence=line_of(evidence, 200))
+    return entry
 
 
 def order_decisions(decisions):
