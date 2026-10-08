@@ -832,10 +832,10 @@ class McpClient:
             try:
                 result = self.rpc("tools/call", {"name": name, "arguments": arguments})
                 break
-            except NotFound:
-                if again or not self.session:
+            except (NotFound, InvalidRequest) as error:
+                if again or not self.session or error.status not in (400, 404):
                     raise
-                self.reset()  # the session is gone on the other side: start one and ask again, once
+                self.reset()  # the session is gone on the other side (a restart): start one and ask again, once
         result = result if isinstance(result, dict) else {}
         texts = [c.get("text") for c in result.get("content", []) if isinstance(c, dict) and c.get("type") == "text"]
         text = "\n".join(t for t in texts if isinstance(t, str))

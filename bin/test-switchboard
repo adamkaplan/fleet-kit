@@ -23772,7 +23772,7 @@ class FakeDoorServer:
             self.sessions.add(session)
             return self.reply(h, mid, {"protocolVersion": "2025-03-26", "capabilities": {}}, {"Mcp-Session-Id": session})
         if h.headers.get("Mcp-Session-Id") not in self.sessions:
-            return self.send(h, 404, {"code": "nf", "message": "no session"})
+            return self.send(h, self.session_miss, {"code": "nf", "message": "no session"})
         if mid is None:
             return self.send(h, 202, raw=b"")
         if method == "tools/list":
@@ -23825,6 +23825,7 @@ class FakeDoorServer:
             return (409 if op.startswith("work") else 403), {"code": "off", "message": "disabled"}, {}
         return getattr(self, "op_" + op)(args, ident, seat)
 
+    session_miss = 404   # the status of a call that names a session the server does not know
     page_size = 0   # 0: no paging; else a reply holds this many entries and names the token of the next page
 
     def paged(self, rows, args):
@@ -24512,6 +24513,15 @@ class TestExternalAdapterErrors(ExternalAdapterCase):
         self.server.sessions.clear()  # the server forgot it
         self.push(adapter, self.decision(), "k-2")
         self.assertEqual(self.server.sid, 2)
+        self.server.session_miss = 400   # some servers answer a session they forgot with a 400
+        self.server.sessions.clear()
+        self.push(adapter, self.decision(), "k-2b")
+        self.assertEqual(self.server.sid, 3)
+        with self.assertRaises(EA.InvalidRequest):   # a real 400 with a good session is asked once, not looped
+            self.server.fail_next("raise", 400, {"code": "bad", "message": "m"}, count=2)
+            self.push(adapter, self.decision(), "k-2c")
+        self.assertEqual(self.server.sid, 4)
+        self.server.session_miss = 404
         self.server.sse = True
         fresh = self.adapter("tool")
         self.assertTrue(self.push(fresh, self.decision(), "k-3").startswith("it-"))
