@@ -3538,3 +3538,13 @@ A forwarder that is not running is `down <age>`. An alarm (`ALARM: forwarder ...
 in `fleet-doctor`) fires when one has been down more than 5 minutes, has dropped more than 6 times in 10 minutes,
 or has had 3 runs under 60 s in 10 minutes. Polling repos are not alarmed. The history is memory in the daemon,
 published in the watch snapshot, so a daemon restart clears it.
+
+## Reports source: per-boss errors (#80)
+
+A worker's `reports_to` may be the role name `chief-of-staff` while the Chief of Staff is registered under another
+name (for example `cos`). The reports source resolves that alias to the one registered agent whose role is
+chief-of-staff, so it never looks for a boss that does not exist; with no single such agent the name stays literal.
+When a boss cannot be read, the `reports` error names it (`boss`), and the outbound sync keeps (does not withdraw) only
+the report items of that boss. An answered report to another boss is withdrawn as usual. A report item whose boss
+is not known (a link made before this field existed) is still kept while any boss is unreadable, the cautious way;
+an error that names no boss still freezes every report. The link table gains an optional `boss` per link.
