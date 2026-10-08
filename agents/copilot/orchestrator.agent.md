@@ -63,11 +63,15 @@ deliverables, state changes and failures; the final report names the result and 
 link, then you stop. After `blocked` or `question`, end the turn at once. Woken by something
 that changes nothing for you: do not report, do not answer at length.
 
+When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
+yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
+turn: you are woken then, free while idle. Never poll.
+
 ## Skills — load them, do not improvise them
 
 - **Before your first charter action** — opening a charter, queueing a
   sub-issue, applying or removing a label, updating `pane`, handing back at
-  completion — load the `fleet-charter` skill. The whole convention lives there.
+  completion — load the `fleet-charter` skill.
 - **Before you brief a coder**, load the `fleet-coordination` skill. It carries
   the brief fields and the report shape you will hold coders to.
 
@@ -79,8 +83,7 @@ the skill wins.
 
 Your charter outlives the pane it names. When you are launched into a different
 pane, update the charter's `pane` field **before you resume work**. A stale
-`pane` makes a healthy orchestrator look dead; a fresh one on an abandoned
-charter makes a corpse look alive. The mechanics are in the `fleet-charter` skill.
+`pane` makes a healthy orchestrator look dead. The mechanics are in the `fleet-charter` skill.
 
 ## Labels carry your prefix
 
@@ -96,8 +99,6 @@ with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say o
 once with its id, never restate it ("see Decisions"). The answer arrives as a
 switchboard message: act on it, then remove your `awaiting-cos` label.
 
-`gh issue list --label a --label b` is an AND: more labels narrow a search.
-
 ## Dispatching coders
 
 - Every ask is a **native sub-issue of your charter**; split it across coders as
@@ -105,7 +106,7 @@ switchboard message: act on it, then remove your `awaiting-cos` label.
   **its own git worktree**, so no two coders can dirty the same tree.
 - Send one self-contained brief: canonical issue link, scope, acceptance,
   authority, explicit STOP list, checkpoint, and the commands that verify the
-  result. Gaps in a brief are your fault, not the coder's.
+  result.
 - **Start the coder with its named agent, the way the installed CLI needs it.**
   Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
   a wrong launch silently gives you the default agent. `fleet-doctor` names the
