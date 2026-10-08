@@ -25350,6 +25350,199 @@ class TestExternalInboundJudge(ExternalWorld):
         self.assertIn("speaks for you", denied["detail"]["reason"])
 
 
+class PermanentRefusal(Exception):
+    permanent = True
+
+
+class Unavailable(Exception):
+    permanent = False
+    retry_after = 3
+
+
+class PickyExternal(FakeExternal):
+    """A fake that refuses chosen operations: `refuse[op]` is the exception to raise instead of applying it."""
+
+    def __init__(self):
+        super().__init__()
+        self.refuse, self.seen = {}, []
+
+    def push(self, operation, idempotency_key):
+        self.seen.append(operation)
+        if operation["op"] in self.refuse and self.up:
+            self.calls.append((operation["op"], operation["key"], idempotency_key))
+            raise self.refuse[operation["op"]]
+        return super().push(operation, idempotency_key)
+
+
+class TestSyncSentBack(ExternalWorld):
+    """An item the outside system sent back for clarification stays open outside while the agent revises."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = PickyExternal()
+
+    def links(self):
+        return json.loads((self.world.state / "external-links.json").read_text())["links"]
+
+    def worker_question(self):
+        self.turn_on()
+        self.say("api-coder", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        return self.ext_of("report")
+
+    def orchestrator_question(self):
+        self.turn_on()
+        self.say("api-orch", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        return self.ext_of("report")
+
+    def clarify(self, ext, eid=None, by="owner's agent"):
+        self.event(ext, kind="clarify", by=by, text="which environment is this for?", eid=eid)
+
+    def check_kept_open(self, ext, agent):
+        self.run_pass()
+        self.run_pass()
+        self.assertTrue([t for t in self.notes_to(agent) if "which environment is this for?" in t])
+        self.assertEqual([d["kind"] for d in self.file_body()["decisions"]], [], "the note answered it here")
+        self.assertEqual(self.fake.items[ext]["state"], "open", "and the outside item stays open")
+        (link,) = self.links().values()
+        self.assertIn("sent_back_at", link)
+        self.assertEqual(link["clarification"], "which environment is this for?")
+        self.assertNotIn("withdraw", [c[0] for c in self.fake.calls])
+
+    def test_a_workers_report_clarified_is_kept_open_outside_and_a_revision_revises_it(self):
+        ext = self.worker_question()
+        self.clarify(ext)
+        self.check_kept_open(ext, "api-coder")
+        self.say("api-coder", "question", "Which table, for production?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2])
+        self.assertEqual(len(self.fake.items), 1)
+        (link,) = self.links().values()
+        self.assertNotIn("sent_back_at", link)
+        self.assertEqual(self.fake.items[ext]["state"], "open")
+
+    def test_an_orchestrators_report_clarified_is_kept_open_the_same_way(self):
+        ext = self.orchestrator_question()
+        self.clarify(ext)
+        self.check_kept_open(ext, "api-orch")
+        self.say("api-orch", "question", "Which table, for production?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2])
+
+    def test_no_revision_within_the_bound_withdraws_it_with_a_reason_never_silently(self):
+        ext = self.worker_question()
+        self.clarify(ext)
+        self.check_kept_open(ext, "api-coder")
+        self.run_pass(sb.decision_core.SENT_BACK_TIMEOUT - 3600)    # not yet
+        self.assertEqual(self.fake.items[ext]["state"], "open")
+        self.run_pass(7200)
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["state"], "withdrawn")
+        (withdraw,) = [o for o in self.fake.seen if o["op"] == "withdraw"]
+        self.assertEqual(withdraw["note"], "no revision after clarification")
+        self.assertEqual(len(self.audit_events("external.sent_back_expired")), 1)
+
+    def test_a_duplicate_clarify_event_is_not_a_second_note(self):
+        ext = self.worker_question()
+        eid = self.event(ext, kind="clarify", by="owner's agent", text="which environment is this for?")
+        self.run_pass()
+        self.event(ext, kind="clarify", by="owner's agent", text="which environment is this for?", eid=eid)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len([t for t in self.notes_to("api-coder") if "which environment is this for?" in t]), 1)
+        self.assertEqual(len(self.audit_events("external.clarify")), 1)
+
+    def test_the_sent_back_state_survives_a_restart(self):
+        ext = self.worker_question()
+        self.clarify(ext)
+        self.check_kept_open(ext, "api-coder")
+        self.world.engine.external_sync = None            # the daemon restarted: the link table is read again
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["state"], "open")
+        (link,) = self.links().values()
+        self.assertIn("sent_back_at", link)
+        self.say("api-coder", "question", "Which table, for production?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2])
+
+
+class TestPermanentRefusals(ExternalWorld):
+    def setUp(self):
+        super().setUp()
+        self.fake = PickyExternal()
+
+    def raised(self):
+        return [c for c in self.fake.calls if c[0] == "raise"]
+
+    def test_a_permanent_refusal_is_tried_once_audited_once_and_shown_and_withdraws_nothing(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = PermanentRefusal("422: the body is invalid")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(4):
+            self.run_pass(120)
+        self.assertEqual(len(self.raised()), 1)
+        self.assertEqual(json.loads((self.world.state / "external-outbox.json").read_text())["ops"], [])
+        (event,) = self.audit_events("external.permanent_failure")
+        self.assertIn("the body is invalid", event["detail"]["error"])
+        self.assertIn("1 permanent failure(s)", self.cmd("you", "status")["out"])
+        self.assertEqual([d["id"] for d in self.file_body()["decisions"]], ["api#2"], "the local decision stays")
+        self.assertEqual(self.fake.items, {})
+
+    def test_an_ordinary_error_and_a_rate_limit_are_retried_with_backoff(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = ConnectionError("unreachable")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.run_pass(1)
+        self.assertEqual(len(self.raised()), 1, "inside the backoff")
+        self.run_pass(10)
+        self.run_pass(30)
+        self.assertGreaterEqual(len(self.raised()), 3)
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        before = len(self.raised())
+        self.fake.refuse["raise"] = Unavailable("429: slow down")
+        for _ in range(4):
+            self.run_pass(120)
+        self.assertGreater(len(self.raised()), before)
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        self.fake.refuse.clear()
+        self.run_pass(200)
+        self.assertEqual(len(self.fake.items), 1, "and it lands once the other side is back")
+
+    def test_a_later_change_of_the_decision_enqueues_a_fresh_operation(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = PermanentRefusal("422: invalid")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len(self.raised()), 1)
+        self.fake.refuse.clear()
+        self.run_pass(120)
+        self.assertEqual(len(self.raised()), 1, "nothing changed: still not tried again")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertEqual(len(self.fake.items), 1)
+        self.assertEqual(len(self.raised()), 2)
+        self.assertEqual(self.audit_events("external.permanent_failure")[0]["event"], "external.permanent_failure")
+
+    def test_a_refused_withdraw_is_not_looped_and_leaves_it_to_the_inbound_answer(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.fake.refuse["withdraw"] = PermanentRefusal("409: already decided")
+        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        for _ in range(4):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "withdraw"]), 1)
+        self.assertEqual(len(self.audit_events("external.permanent_failure")), 1)
+        self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "open")
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
