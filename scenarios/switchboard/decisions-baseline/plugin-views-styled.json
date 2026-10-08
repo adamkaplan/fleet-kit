@@ -1,0 +1,652 @@
+{
+ "api": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "pr:acme/api#7",
+   "api#2",
+   "api#101",
+   "api#7hz",
+   "api#6cc"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "m",
+    "m",
+    "m",
+    "s",
+    "m"
+   ],
+   [
+    "s"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m",
+    "w"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "m"
+   ],
+   [
+    "m"
+   ],
+   [
+    "m"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ]
+  ],
+  "text": [
+   "Decisions                 acme/api",
+   "2 need human · 1 PR to watch",
+   "4 wait on cos (4 over 1h)",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you 2",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up 1",
+   "api",
+   "#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "#7                           1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos 3, 3 over 1h",
+   "api",
+   "Which database?",
+   "api#2                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "Cleanup of stale issues (3 rows)",
+   "#31: close it",
+   "#32: close as duplicate of #31",
+   "#33: label it done",
+   "api#101                      1h05m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "blocked: cannot build until the",
+   "key is rotated",
+   "api#7hz                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on orchestrator 1",
+   "api",
+   "Which table should hold the",
+   "totals?",
+   "api#6cc                      1h05m"
+  ]
+ },
+ "chief": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "web#4",
+   "web#2mv",
+   "pr:acme/api#7",
+   "api#2",
+   "api#101",
+   "api#7hz",
+   "web#8gj",
+   "api#6cc"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "m",
+    "m",
+    "m",
+    "s",
+    "m"
+   ],
+   [
+    "s"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m",
+    "w"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "m"
+   ],
+   [
+    "m"
+   ],
+   [
+    "m"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ]
+  ],
+  "text": [
+   "Decisions                      all",
+   "4 need human · 1 PR to watch",
+   "4 wait on cos (4 over 1h)",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you 4",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up 1",
+   "api",
+   "#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "#7                           1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos 4, 4 over 1h",
+   "api",
+   "Which database?",
+   "api#2                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "Cleanup of stale issues (3 rows)",
+   "#31: close it",
+   "#32: close as duplicate of #31",
+   "#33: label it done",
+   "api#101                      1h05m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "blocked: cannot build until the",
+   "key is rotated",
+   "api#7hz                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "web",
+   "Which region for the cache?",
+   "web#8gj                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on orchestrator 1",
+   "api",
+   "Which table should hold the",
+   "totals?",
+   "api#6cc                      1h05m"
+  ]
+ },
+ "human": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "web#4",
+   "web#2mv",
+   "pr:acme/api#7"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "m",
+    "m",
+    "m",
+    "s",
+    "m"
+   ],
+   [
+    "s"
+   ],
+   [
+    "m",
+    "w"
+   ]
+  ],
+  "text": [
+   "Decisions                  for you",
+   "4 need you · 1 PR to watch",
+   "4 with cos (4 over 1h)",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you 4",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up 1",
+   "api",
+   "#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "#7                           1h05m"
+  ]
+ },
+ "stale": [
+  "Decisions (?)",
+  "daemon not updating"
+ ],
+ "web": {
+  "ids": [
+   "web#4",
+   "web#2mv",
+   "web#8gj"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    "m"
+   ],
+   [
+    "b",
+    "m",
+    "w"
+   ],
+   [
+    "b"
+   ],
+   [
+    ""
+   ],
+   [
+    "m",
+    "w"
+   ]
+  ],
+  "text": [
+   "Decisions                 acme/web",
+   "2 need human",
+   "4 wait on cos (4 over 1h)",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you 2",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos 1, 1 over 1h",
+   "web",
+   "Which region for the cache?",
+   "web#8gj                      1h05m"
+  ]
+ }
+}
