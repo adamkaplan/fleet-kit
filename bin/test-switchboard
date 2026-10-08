@@ -25875,7 +25875,8 @@ class ExternalWorld(BaselineWorld):
 
     def turn_on(self, **extra):
         section = dict({"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": str(self.mapping),
-                        "tier_map": self.TIERS, "poll_seconds": 1, "retry_base_seconds": 5, "retry_max_seconds": 60},
+                        "tier_map": self.TIERS, "tiers": ["orchestrator", "cos", "human"], "poll_seconds": 1, "retry_base_seconds": 5,
+                        "retry_max_seconds": 60},
                        **extra)
         self.set_config(external_decisions=section)
         self.owner_orders(section)
@@ -25921,6 +25922,72 @@ class ExternalWorld(BaselineWorld):
         found = [e for e, i in self.fake.items.items() if i["decision"]["kind"] == kind]
         self.assertEqual(len(found), 1, self.fake.items)
         return found[0]
+
+
+class TestExternalTiers(ExternalWorld):
+    """Issue 82: `external_decisions.tiers` says which fleet tiers are pushed; the default is the human's only."""
+
+    def two(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])        # the Chief of Staff's
+        self.gh.issue(API, 3, "Pick the cache layer", labels=["me:awaiting-user"])  # yours
+
+    def pushed(self):
+        return sorted(i["decision"]["title"] for i in self.fake.items.values() if i["state"] == "open")
+
+    def test_the_default_is_the_human_tier_only(self):
+        got = sb.validate_config({"external_decisions": {}})["external_decisions"]
+        self.assertEqual(got["tiers"], ["human"])
+        self.turn_on(tiers=got["tiers"])
+        self.two()
+        self.run_pass()
+        self.assertEqual(self.pushed(), ["Pick the cache layer"])
+        self.assertEqual([c[0] for c in self.fake.calls], ["raise"], "the cos item was never sent")
+
+    def test_cos_turns_back_on_in_one_line_and_an_item_of_an_unpushed_tier_is_withdrawn_once(self):
+        self.turn_on(tiers=["cos", "human"])
+        self.two()
+        self.run_pass()
+        self.assertEqual(self.pushed(), ["Pick the cache layer", "Which database?"])
+        cos_ext = [e for e, i in self.fake.items.items() if i["decision"]["title"] == "Which database?"][0]
+        self.turn_on(tiers=["human"])   # the one line, the other way
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.pushed(), ["Pick the cache layer"])
+        self.assertEqual(self.fake.items[cos_ext]["state"], "withdrawn")
+        self.assertEqual([c[0] for c in self.fake.calls].count("withdraw"), 1, "withdrawn once, not every pass")
+        self.assertEqual(len(self.cmd("you", "decisions")["out"].splitlines()) > 0, True, "it stays a local decision")
+        # switching back raises it again
+        self.turn_on(tiers=["cos", "human"])
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.pushed(), ["Pick the cache layer", "Which database?"])
+
+    def test_a_late_answer_on_an_item_withdrawn_for_its_tier_is_known_as_closed(self):
+        self.turn_on(tiers=["cos", "human"])
+        self.two()
+        self.run_pass()
+        cos_ext = [e for e, i in self.fake.items.items() if i["decision"]["title"] == "Which database?"][0]
+        self.turn_on(tiers=["human"])
+        self.run_pass()
+        comments = len(self.gh.comments)
+        self.event(cos_ext, by="human")
+        self.run_pass()
+        self.assertEqual(len(self.gh.comments), comments, "nothing is delivered")
+        self.assertEqual([e["event"] for e in self.audit_events("external.closed")], ["external.closed"])
+
+    def test_an_empty_list_pushes_nothing_and_is_valid(self):
+        self.turn_on(tiers=[])
+        self.two()
+        self.run_pass()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_hostile_values_are_refused(self):
+        good = {"enabled": True, "adapter": "fake", "repos": [API], "mapping_file": "/tmp/m.json", "tier_map": ExternalWorld.TIERS}
+        for bad in ("human", None, ["boss"], ["human", "human"], [1], [["human"]], {"human": True}, ["Human"], [""], True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"external_decisions": dict(good, tiers=bad)})
+        for ok in ([], ["human"], ["cos", "human"], ["orchestrator", "cos", "human"]):
+            self.assertEqual(sb.validate_config({"external_decisions": dict(good, tiers=ok)})["external_decisions"]["tiers"], ok)
 
 
 class TestExternalDecisionConfig(unittest.TestCase):

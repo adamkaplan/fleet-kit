@@ -133,6 +133,8 @@ class SyncEngine:
             seed = seeds.get(entry.get("id"))
             if seed is None or not core.goes_outward(entry, repos, kinds):
                 continue
+            if entry.get("tier") not in self.settings["tiers"]:
+                continue   # a tier that is not pushed: nothing is desired for it, so an existing link is withdrawn once
             floor = self.settings["tier_map"].get(entry.get("tier"))
             if floor is None:
                 continue
