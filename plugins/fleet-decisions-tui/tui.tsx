@@ -1,11 +1,11 @@
 /** @jsxImportSource @opentui/solid */
 // The Decisions section of the TUI sidebar: what waits on you, read-only, and the Heads-up section (PR notices). It reads decisions.json, which the
 // switchboard daemon keeps (docs/switchboard.md, "Decisions (PR 14)"), and draws it. It holds no credential,
-// makes no network call and never spawns a process. The file is replaced by rename, so the DIRECTORY is
+// makes no network call and never spawns a process (a row's link is an OSC 8 link the terminal opens, or an OSC 52 copy). The file is replaced by rename, so the DIRECTORY is
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, For } from "solid-js"
 import { watch } from "node:fs"
-import { HEAVY, THIN, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
+import { HEAVY, THIN, safeUrl, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, stateDirOf, viewOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
@@ -39,6 +39,23 @@ export default {
     }
     const safety = setInterval(refresh, SAFETY_MS)
     refresh()
+    // A click on a row copies its link (OSC 52, through the renderer: no process, no network); a terminal that
+    // honours OSC 8 also opens the same link on its own click (Cmd-click in iTerm2, Ctrl-click in herdr).
+    const copyLink = (raw: unknown, event: any) => {
+      const url = safeUrl(raw)
+      if (!url || event?.modifiers?.ctrl) return // no link, or a terminal link click: leave it to the terminal
+      let copied = false
+      try {
+        copied = api.renderer?.copyToClipboardOSC52?.(url) === true
+      } catch {
+        copied = false
+      }
+      try {
+        api.ui?.toast?.show?.({ message: copied ? `Copied ${url}` : url, variant: copied ? "success" : "info", duration: 4000 })
+      } catch {
+        // a toast is a nicety
+      }
+    }
     api.ui.slot({
       append: "sidebar.content",
       render: () => (
@@ -63,12 +80,18 @@ export default {
                       </text>
                       <For each={group.entries}>
                         {(entry, j) => (
-                          <box flexDirection="column">
+                          <box flexDirection="column" onMouseUp={entry.url ? (event: any) => copyLink(entry.url, event) : undefined}>
                             {j() > 0 ? <text>{THIN(ROW_WIDTH)}</text> : null}
                             <For each={entry.lines}>{(line) => <text>{line}</text>}</For>
                             <For each={(entry.rows ?? []).flat()}>{(line) => <text>{line}</text>}</For>
                             <For each={entry.facts ?? []}>{(line) => <text>{line}</text>}</For>
-                            <text>{entry.head}</text>
+                            {safeUrl(entry.url) ? (
+                              <text>
+                                <a href={safeUrl(entry.url) as string}>{entry.head}</a>
+                              </text>
+                            ) : (
+                              <text>{entry.head}</text>
+                            )}
                           </box>
                         )}
                       </For>
