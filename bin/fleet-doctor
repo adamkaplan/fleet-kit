@@ -457,6 +457,48 @@ if not service.get("fault") and chronic==0:
   fi
 fi
 
+# =========================================================== 8c. switchboard path and judge liveness
+# The policy plugin falls back to ~/.local/bin/fleet-switchboard when FLEET_SWITCHBOARD_BIN is unset, so that
+# link must point at the main checkout, not a stale worktree. Then the judge itself: agents working and no
+# policy.judge for 30 minutes means the plugin is not forwarding. Both skip when no switchboard is installed.
+SB_LINK="${FLEET_SWITCHBOARD_BIN:-$HOME/.local/bin/fleet-switchboard}"
+SB_MAIN="${FLEET_KIT_MAIN:-$HOME/Code/fleet-kit}"
+if [ ! -e "$SB_LINK" ]; then
+  emit ok switchboard-path "no switchboard at $SB_LINK (not installed)"
+else
+  sb_real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SB_LINK" 2>/dev/null)
+  main_real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SB_MAIN/bin" 2>/dev/null)
+  if [ -z "$sb_real" ]; then
+    emit WARN switchboard-path "could not resolve $SB_LINK"
+  elif [ "$(dirname "$sb_real")" != "$main_real" ]; then
+    emit WARN switchboard-path "STALE: $SB_LINK resolves to $sb_real, not the main checkout ($main_real); the policy plugin would use it. Re-run 'fleet-switchboard install' from the main checkout"
+  elif [ ! -d "$(dirname "$(dirname "$sb_real")")/shims" ]; then
+    emit WARN switchboard-path "$sb_real is the main checkout but has no shims/ beside bin/: gh signing would stay off"
+  else
+    emit ok switchboard-path "$SB_LINK -> $sb_real (main checkout, shims present)"
+  fi
+  if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
+    run_to 30 "$sb_real" policy-report --check --json; pj_rc=$?
+    if [ "$pj_rc" = "2" ]; then
+      emit WARN judge-liveness "$sb_real has no 'policy-report' command (a switchboard older than this check): the judge's liveness is unchecked"
+    elif [ -n "$LAST_OUT" ]; then
+      pj_line=$(printf '%s' "$LAST_OUT" | python3 -c '
+import json,sys
+try:
+    r=json.loads(sys.stdin.read())
+    print(("FAIL" if r.get("alarm") else "ok")+"\t"+r.get("line","").replace("policy judge","",1).strip())
+except Exception:
+    print("WARN\tcould not read the judge liveness")' 2>/dev/null)
+      pj_tab=$(printf '\t'); pj_level=${pj_line%%"$pj_tab"*}; pj_text=${pj_line#*"$pj_tab"}
+      emit "${pj_level:-WARN}" judge-liveness "${pj_text:-could not read the judge liveness}"
+    else
+      emit WARN judge-liveness "skipped — 'policy-report --check' failed"
+    fi
+  else
+    emit WARN judge-liveness "skipped — switchboard not executable"
+  fi
+fi
+
 # =========================================================== 9. charter drift
 # Best effort, WARN-only, never FAIL. Unparseable charters are skipped quietly.
 if [ ! -f "$TMPDIR_FD/panes.txt" ] && [ -n "$FLEET_REPO" ]; then

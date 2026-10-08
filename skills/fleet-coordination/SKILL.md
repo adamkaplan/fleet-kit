@@ -195,13 +195,40 @@ service's `/openapi.json`. For Copilot, see the
 ## What a checkpoint is
 
 A checkpoint is a promise to report at a stated moment, with an overdue time
-attached so that silence becomes visible. It is not a timer, and nothing installs
-one — it is the coder's obligation to notice the moment has passed.
+attached so that silence becomes visible. Under the switchboard, `launch` turns it
+into two reminders (see "Waking yourself"); the coder's obligation is still to
+report when it arrives.
 
 For active work, set it 15–20 minutes out unless another cadence is agreed. When
 it arrives, report even if nothing happened: "still on the same failing test,
 tried X, next is Y" is a report. Waiting is not progress, and an overdue
 checkpoint with no comment is indistinguishable from a dead agent.
+
+## Waking yourself
+
+Whenever you wait on time (a CI run, a rate limit, a checkpoint, another agent's
+answer), set a reminder for **yourself** and end your turn:
+
+```text
+fleet-switchboard remind <your name> <when> --issue <n> "<what to do when woken>"
+```
+
+`<when>` is a delay (`20m`, `2h`) or an ISO time with a zone. The daemon delivers the
+reminder at that time as an ordinary wake, so you cost nothing while you idle. Never
+poll in a loop and never `sleep` to wait: a polling agent spends tokens to learn nothing.
+
+Two reminders are made for you. `fleet-switchboard launch` reads the brief's
+`CHECKPOINT` (or `--checkpoint 30m --overdue 60m`): the worker is reminded at the
+checkpoint ("report now, one line"), and the launching orchestrator is woken at the
+overdue time **only if the worker has not reported or sent anything since the launch**.
+A worker that reported is not chased. If the CHECKPOINT line cannot be read, no
+reminder is made and `launch` says so; pass the flags. Write the CHECKPOINT in the
+shape `Report at 30 minutes (kind working, one line); overdue at 60.`
+
+If the owner enables it, each orchestrator also gets one short daily wake asking what
+slowed it or its coders down. Answer in one short paragraph to the agent it names, with
+`fleet-switchboard send`, only if something is worth fixing; otherwise do nothing and say
+nothing.
 
 ## The report
 

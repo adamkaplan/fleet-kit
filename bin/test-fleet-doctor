@@ -27,7 +27,7 @@ DOCTOR = BIN / "fleet-doctor"
 # systemctl/launchctl are deliberately absent: the heartbeat check is pointed
 # at a config that does not exist, so they are never reached.
 UTILITIES = ("bash", "sh", "env", "mktemp", "rm", "cat", "sed", "awk", "grep",
-             "head", "tr", "python3", "whoami", "uname", "sleep", "kill")
+             "head", "tr", "python3", "whoami", "uname", "sleep", "kill", "dirname")
 
 STUB = """#!/bin/sh
 printf '%(name)s %%s\\n' "$*" >> "%(log)s"
@@ -47,6 +47,7 @@ class DoctorRun:
         self.path_dir.mkdir()
         self.log = self.tmp / "calls.log"
         self.log.touch()
+        self.extra_env = {}
         for tool in UTILITIES:
             real = shutil.which(tool)
             if real:
@@ -67,6 +68,7 @@ class DoctorRun:
             "FLEET_HEARTBEAT_CONF": str(self.tmp / "no-such-heartbeat.json"),
             "HERDR_SOCKET_PATH": str(self.tmp / "no-such.sock"),
         }
+        env.update(self.extra_env)
         proc = subprocess.run([str(self.path_dir / "bash"), str(DOCTOR)], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               universal_newlines=True, timeout=60)
@@ -184,6 +186,80 @@ class OtherCLIs(DoctorCase):
         run = self.doctor()
         self.assertEqual(run.lines("dispatch"), [], run.output)
         self.assertTrue(self.only(run, "agent-cli").startswith("FAIL "))
+
+
+class SwitchboardChecks(DoctorCase):
+    """switchboard-path (the stale-link guard) and judge-liveness, against a stub switchboard in a fake HOME."""
+
+    STUB_SB = "#!/bin/sh\n[ \"$1\" = policy-report ] || exit 2\necho '%s'\nexit %d\n"
+
+    def run_with(self, checkout="main", reply=None, code=0, link=True, shims=True):
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tmp = Path(tmp).resolve()
+        run = DoctorRun(tmp, {})
+        home = tmp / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        main = tmp / "main"
+        (main / "bin").mkdir(parents=True)
+        where = tmp / checkout
+        (where / "bin").mkdir(parents=True, exist_ok=True)
+        if shims:
+            (where / "shims").mkdir(exist_ok=True)
+        sb = where / "bin" / "fleet-switchboard"
+        text = self.STUB_SB % (reply or '{"alarm": false, "line": "policy judge  enforcing, 3 call(s) judged"}', code)
+        sb.write_text(text)
+        sb.chmod(0o755)
+        if link:
+            (home / ".local" / "bin" / "fleet-switchboard").symlink_to(sb)
+        run.extra_env = {"FLEET_KIT_MAIN": str(main)}
+        run.run()
+        return run
+
+    def test_the_main_checkout_is_ok(self):
+        run = self.run_with("main")
+        self.assertTrue(self.only(run, "switchboard-path").startswith("ok "), run.output)
+
+    def test_a_stale_worktree_is_named_and_not_silently_used(self):
+        run = self.run_with("old-worktree")
+        line = self.only(run, "switchboard-path")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("STALE", line)
+        self.assertIn("old-worktree", line)
+
+    def test_a_main_checkout_without_shims_warns(self):
+        line = self.only(self.run_with("main", shims=False), "switchboard-path")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("shims", line)
+
+    def test_no_switchboard_installed_is_not_a_failure(self):
+        run = self.run_with("main", link=False)
+        self.assertTrue(self.only(run, "switchboard-path").startswith("ok "))
+        self.assertEqual(run.lines("judge-liveness"), [])
+
+    def test_a_live_judge_is_ok(self):
+        line = self.only(self.run_with("main"), "judge-liveness")
+        self.assertTrue(line.startswith("ok "), line)
+        self.assertIn("3 call(s)", line)
+
+    def test_an_alarm_fails_the_check(self):
+        reply = '{"alarm": true, "line": "policy judge  ALARM: 2 agent(s) working and no policy.judge in 30 min"}'
+        run = self.run_with("main", reply=reply, code=1)
+        line = self.only(run, "judge-liveness")
+        self.assertTrue(line.startswith("FAIL "), line)
+        self.assertIn("ALARM", line)
+
+    def test_an_older_switchboard_without_the_command_warns(self):
+        line = self.only(self.run_with_old(), "judge-liveness")
+        self.assertTrue(line.startswith("WARN "), line)
+        self.assertIn("policy-report", line)
+
+    def run_with_old(self):
+        run = self.run_with("main")
+        sb = Path(run.tmp) / "main" / "bin" / "fleet-switchboard"
+        sb.write_text("#!/bin/sh\nexit 2\n")
+        run.run()
+        return run
 
 
 # ---------------------------------------------------------------------- runner
