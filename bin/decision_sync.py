@@ -30,6 +30,7 @@ STATUS_FILE = "external-status.json"
 APPLIED_LIMIT = 5000            # event ids remembered; the cursor already bounds what is pulled again
 WITHDRAWN_KEEP_SECONDS = 7 * 86400   # a withdrawn link is kept this long so a late event is known as closed
 PASS_OP_LIMIT = 100             # outbound operations tried in one cycle: the rest wait for the next
+JUDGE_MAX_TRIES = 5             # an answer the judge could not be asked about is retried this often, then not applied
 
 
 class Host:
@@ -37,6 +38,12 @@ class Host:
 
     def audit(self, event, subject, detail):
         """Record one event in the audit log (no secrets)."""
+
+    def judge_answer(self, entry, intent):
+        """The owner's standing orders, consulted for an answer by the owner's agent: {"verdict": "allow" | "deny" |
+        "unavailable", "reason": one line}. The default allows: the script's host judges. Only ever called for an
+        answer that role authority already accepts: a judge can tighten and never loosen."""
+        return {"verdict": "allow", "reason": "no judge"}
 
     def deliver_answer(self, entry, intent):
         """Deliver an applied answer for the list entry to the asker by its own path. Raises when it cannot."""
@@ -83,6 +90,7 @@ class SyncEngine:
         self.outbox_path = os.path.join(self.state_dir, OUTBOX_FILE)
         self.status_path = os.path.join(self.state_dir, STATUS_FILE)
         self.links, self.cursor, self.applied, self.last_pull = {}, None, [], None
+        self.parked = {}   # event id -> {"event", "tries", "next_at"}: answers waiting for a judge that could not be asked
         self.ops, self.seq = [], 0
         self.rebuild = False
         self._load()
@@ -97,6 +105,8 @@ class SyncEngine:
             self.links = body["links"]
             self.cursor, self.last_pull = body.get("cursor"), body.get("last_pull")
             self.applied = [e for e in body.get("applied", []) if isinstance(e, str)]
+            parked = body.get("parked")
+            self.parked = parked if isinstance(parked, dict) else {}
         box = _read_json(self.outbox_path)
         if box is not None and isinstance(box.get("ops"), list):
             self.ops, self.seq = box["ops"], box.get("seq", 0)
@@ -107,7 +117,8 @@ class SyncEngine:
                       if not (l.get("withdrawn") and now - l.get("withdrawn_at", now) > WITHDRAWN_KEEP_SECONDS)
                       and not (l.get("closed") and now - l.get("closed_at", now) > WITHDRAWN_KEEP_SECONDS)}
         _write_json(self.links_path, {"version": 1, "links": self.links, "cursor": self.cursor,
-                                      "last_pull": self.last_pull, "applied": self.applied[-APPLIED_LIMIT:]})
+                                      "last_pull": self.last_pull, "applied": self.applied[-APPLIED_LIMIT:],
+                                      "parked": self.parked})
         _write_json(self.outbox_path, {"version": 1, "seq": self.seq, "ops": self.ops})
 
     # -- what is wanted outside
@@ -217,6 +228,7 @@ class SyncEngine:
                 status.update(state="down", reason=core.one_line(reason, 160))
             else:
                 self._flush(now)
+                self._retry_parked(desired, now)
                 if self.last_pull is None or now - self.last_pull >= self.settings["poll_seconds"]:
                     self._pull(desired, decisions, now)
         except Exception as err:   # the engine's own fault: visible, never raised into the pass
@@ -301,19 +313,26 @@ class SyncEngine:
         self.cursor = nxt if nxt is not None else self.cursor
         self.last_pull = now
 
+    def _retry_parked(self, desired, now):
+        current = {k: w["entry"] for k, w in desired.items()}
+        for eid, held in sorted(self.parked.items(), key=lambda kv: kv[1].get("next_at", 0)):
+            if held.get("next_at", 0) > now:
+                continue
+            self._apply_event(held["event"], current, retry=True)
+
     def _by_external_id(self, external_id):
         for key, link in self.links.items():
             if external_id and link.get("external_id") == external_id:
                 return key, link
         return None, None
 
-    def _apply_event(self, event, current):
+    def _apply_event(self, event, current, retry=False):
         """True when the event is settled (applied, refused or ignored: never seen again); False to try it again."""
         eid = event.get("event_id") if isinstance(event, dict) else None
         if not isinstance(eid, str) or not eid:
             self.host.audit("external.ignored", "event", {"reason": "an event with no event_id"})
             return True
-        if eid in self.applied:
+        if eid in self.applied or (eid in self.parked and not retry):
             return True
         key, link = self._by_external_id(event.get("external_id"))
         kind = event.get("type")
@@ -321,6 +340,7 @@ class SyncEngine:
                   "answered_by": event.get("answered_by")}
 
         def settle(audit_event, extra=None):
+            self.parked.pop(eid, None)
             self.applied.append(eid)
             self.host.audit(audit_event, key or str(event.get("external_id")), dict(detail, **(extra or {})))
             return True
@@ -354,6 +374,15 @@ class SyncEngine:
         if kind == "answered":
             intent = {"option_id": event.get("option_id"), "text": event.get("text"), "rows": event.get("rows") or {},
                       "answered_by": role, "event_id": eid}
+            if role == "owner_agent":   # the owner's standing orders bind it, as they bind the Chief of Staff's own answers
+                judged = self._judged(eid, event, entry, intent, key)
+                if judged is not None:
+                    why = judged["reason"]
+                    if judged["verdict"] == "unavailable":
+                        return True   # parked: asked again later, the cursor moves on
+                    self.note_back(key, "not applied: %s" % why, eid)
+                    return settle("external.judged", {"verdict": "deny", "reason": why, "role": role,
+                                                       "tier": entry["tier"]})
             try:
                 self.host.deliver_answer(entry, intent)
             except Exception as err:
@@ -364,6 +393,29 @@ class SyncEngine:
             link.update(closed=True, closed_at=self.now())   # it leaves the list because it was answered: nothing to withdraw outside
             return settle("external.answered", {"role": role, "option_id": event.get("option_id")})
         return settle("external.ignored", {"reason": "an event type this fleet does not act on"})
+
+    def _judged(self, eid, event, entry, intent, key):
+        """None when the judge allows the answer. Else {"verdict": "deny" | "unavailable", "reason"}: a deny is final;
+        an unavailable judge parks the event for another try, up to JUDGE_MAX_TRIES, and then it is a deny."""
+        try:
+            found = self.host.judge_answer(entry, intent) or {}
+        except Exception as err:
+            found = {"verdict": "unavailable", "reason": "the judge failed: %s" % core.one_line(str(err), 120)}
+        verdict = found.get("verdict")
+        reason = core.one_line(found.get("reason") or verdict or "no verdict", 300)
+        if verdict == "allow":
+            return None
+        if verdict != "unavailable":
+            return {"verdict": "deny", "reason": reason}
+        held = self.parked.setdefault(eid, {"event": event, "tries": 0, "next_at": 0})
+        held["tries"] += 1
+        self.host.audit("external.judge_unavailable", key, {"event_id": eid, "tries": held["tries"], "reason": reason})
+        if held["tries"] >= JUDGE_MAX_TRIES:
+            return {"verdict": "deny", "reason": "the judge could not be asked after %d tries (%s): not applied, "
+                                                 "the owner decides" % (held["tries"], reason)}
+        held["next_at"] = self.now() + backoff_seconds(held["tries"], self.settings["retry_base_seconds"],
+                                                        self.settings["retry_max_seconds"])
+        return {"verdict": "unavailable", "reason": reason}
 
     def _reversal(self, key, link, event, role, settle, detail):
         """The answer was changed outside after it was delivered: the asker is told, and nothing is undone."""
