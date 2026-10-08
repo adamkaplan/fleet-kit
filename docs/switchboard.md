@@ -2113,6 +2113,16 @@ window; a re-send does not move it) and the panel adds `merges after HH:MM UTC` 
 time the daemon writes). When it is 0 nothing is shown. Nothing enforces it: the tool-call judge is unchanged, and
 the window is a time the person can see and answer ("hold") before an orchestrator merges.
 
+**`MERGE: captain` PRs are a decision first.** The notice's `gh pr view` also reads the PR's body, author, head
+commit and reviews. When the body's first non-empty line starts with `MERGE: captain` (nothing else of the body is
+read or shown) and someone other than the author reviewed (approved, requested changes or commented) at the exact
+head commit, the entry is kind `captain`, tier `cos`, with the same id `pr:<repo>#N`, the PR link, the head and the
+reviewers: a decision for the Chief of Staff, in place of the heads-up (never both), counted with the decisions and
+never in the `human` tier until the Chief of Staff runs `decisions escalate` (which holds for that head only). If
+the reviews cannot be read, it stands on the notice alone and says `review not detectable`. A review at an older head,
+the author's own review, or no review leaves a plain heads-up. It ends when the PR merges or closes; `resolve`,
+`answer` and `supersede` are refused. Limit: only a PR that carries a notice is covered.
+
 **The panel.** The `fleet-decisions-tui` plugin draws a `Heads-up (n)` section after `Waits on you` and before
 `Waits on cos`, grouped by repo like the others and visibly separated. Each entry is its headline (two lines at
 most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC` when set, and `(stale)`
