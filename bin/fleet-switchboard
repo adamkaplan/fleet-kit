@@ -2097,6 +2097,8 @@ class Switchboard:
             raise ReportError("%s reports to nobody: its fleet metadata has no reports_to, so there is no one to "
                               "tell (use `%s send <name> ...` for a message)" % (sender, PROG))
         repo, number = resolve_issue(self.config, issue, me.fleet, watched_repos(self.config, discovered_fleets(discovery)))
+        if number is not None and issue is not None:
+            self.check_issue_exists(repo, number, own_repo=(me.fleet or {}).get("repo"))
         if number is None:
             number, repo = _issue_of(me.fleet), _fleet_repo(me.fleet, self.config) if _issue_of(me.fleet) else None
         fact = Fact("%s:%s:%s" % (REPORT, sender, uuid.uuid4().hex[:16]), boss, REPORT, "%s: %s" % (state, text),
@@ -2108,6 +2110,34 @@ class Switchboard:
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
         waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
         return self.send_fact(fact, discovery, now, waiting)
+
+    def check_issue_exists(self, repo, number, wait=None, own_repo=None):
+        """#89: refuse a report tagged to an issue GitHub says does not exist (a report to a ghost can only be
+        cleared by a send on the same ghost). Best effort: no reader, an unreadable or slow lookup, or any answer
+        but a clear "not found" accepts the report. The reader's cache serves a known issue without a read."""
+        reader = self.intents
+        if reader is None:
+            return
+        if repo not in (None, reader.repo, own_repo):
+            return  # a repo this report was only guessed into: not worth refusing a report over
+        wait = REPORT_LOOKUP_WAIT if wait is None else wait
+        box = {}
+
+        def look():
+            try:
+                reader.issue(number, repo)
+            except IntentError as err:
+                box["error"] = err
+            except Exception:
+                pass  # unreadable: accepted
+
+        thread = threading.Thread(target=look, daemon=True)
+        thread.start()
+        thread.join(wait)
+        err = box.get("error")
+        if err is not None and err.reason == "not_found":
+            raise ReportError("issue %s#%d does not exist, so a report cannot be tagged to it: check the number "
+                              "(or leave --issue out to use your own ask)" % (repo or reader.repo, number))
 
     def pending(self, name, discovery=None, facts=None):
         """Read-only: what is pending for `name`, and what the rule says about it."""
@@ -3838,6 +3868,9 @@ def validate_report_triage_config(config, source):
         raise ConfigError("%s: 'report_triage.budget_seconds' must be a positive number, got %r"
                           % (source, settings["budget_seconds"]))
     config["report_triage"] = settings
+
+
+REPORT_LOOKUP_WAIT = 3.0   # seconds a report waits to learn whether its issue exists; slower is accepted
 
 
 class ReportError(Exception):

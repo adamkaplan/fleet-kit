@@ -217,7 +217,8 @@ def answered_by_later_report(report, reports):
 
 def answered_by_send(report, send_lines, repos):
     """True when the boss sent the worker something on the ask (a `send` with no issue counts for any ask: the
-    worker has one) after the report. A report that names no issue (#85) is answered by ANY later send from its boss,
+    worker has one; such a send exists only where `send` does not require --issue, i.e. no `intent_repo` or
+    `intent_required: false`, and with both set the rule is simply never reached) after the report. A report that names no issue (#85) is answered by ANY later send from its boss,
     whatever issue the send carries: it names no ask for the send to be about. `send_lines` are the worker's
     synthetic lines, as [(created, message id, line number, line)]."""
     for created, _, _, line in send_lines:

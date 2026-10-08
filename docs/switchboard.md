@@ -1116,7 +1116,8 @@ decision of its own. Ids are assigned before folding and never change.
 
 A report is **answered** only when the boss has sent that worker something on
 the same ask (a `send` with no `--issue` counts for any ask: the worker has
-one; and a report that names no issue is answered by *any* later `send` from its boss to that worker, whatever
+one. Such a send exists only where `send` does not require an issue, that is with no `intent_repo` or
+`intent_required: false`; with both set `send` refuses it and this rule is never reached; and a report that names no issue is answered by *any* later `send` from its boss to that worker, whatever
 issue the send carries, because the report names no ask for it to be about), or the same worker has since reported, on the same issue and repo, a newer
 `question`, a `done`, a `failed` or a `withdrawn`. `working`, `paused` and
 `blocked` never answer: a status line does not resolve the question it sits
@@ -3563,3 +3564,11 @@ for every issue an agent or fact refers to, over 100 reads in all for a busy fle
 says so (`intent: N referenced issue(s) not checked within the 4s budget (partial answer)`); the threads are daemon
 threads, so a stuck `gh` cannot hold the process. The remaining time is v2 and herdr reads per agent in discovery,
 which are serial and unchanged.
+
+## A report's issue tag is checked (#89)
+
+`fleet-switchboard report <state> --issue <n>` looks the issue up (the intent reader's cache, else one `gh` read,
+waiting at most 3 s; only in the ask repo or the worker's own repo) and refuses with `issue repo#n does not exist ...` when GitHub says Not Found, so a report is
+never raised against a ghost that only a send on the same ghost could clear. The check is best effort: with no ask
+repo configured, an offline or slow `gh`, or any answer other than a clear Not Found, the report is accepted. A report
+without `--issue` (the worker's own ask) is not looked up.
