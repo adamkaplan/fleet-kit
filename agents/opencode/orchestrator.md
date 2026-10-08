@@ -74,6 +74,10 @@ deliverables, state changes and failures; the final report names the result and 
 link, then you stop. After `blocked` or `question`, end the turn at once. Woken by something
 that changes nothing for you: do not report, do not answer at length.
 
+When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
+yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
+turn: you are woken then, free while idle. Never poll.
+
 ## Skills
 
 - **Before your first charter action** — opening a charter, queueing a
@@ -88,7 +92,7 @@ Load them as a real first action, every session. When they disagree, the skill w
 
 Your charter outlives the pane it names. When you are launched into a different
 pane, update the charter's `pane` field **before you resume work**. A stale
-`pane` makes a healthy orchestrator look dead. The mechanics are in the `fleet-charter` skill.
+`pane` makes a healthy orchestrator look dead.
 
 ## Labels carry your prefix
 
@@ -98,13 +102,10 @@ your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask a
 block**: blocking removes your ability to say you are blocked. NEVER apply
 `awaiting-user` yourself: the Chief of Staff escalates. Related findings go up as ONE batch, never one question each: `fleet-switchboard
 decisions batch --title "<title>" --row "<repo#N> | <finding> | <recommendation>"` per
-row (one `awaiting-cos` issue in your repo). Its answer arrives as a note; you act on
-the rows. Open decisions are listed,
+row (one `awaiting-cos` issue in your repo). Open decisions are listed,
 with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say one
 once with its id, never restate it ("see Decisions"). The answer arrives as a
 switchboard message: act on it, then remove your `awaiting-cos` label.
-
-`gh issue list --label a --label b` is an AND: more labels narrow a search.
 
 ## Dispatching coders
 
@@ -113,7 +114,7 @@ switchboard message: act on it, then remove your `awaiting-cos` label.
   **its own git worktree**, so no two coders can dirty the same tree.
 - Send one self-contained brief: canonical issue link, scope, acceptance,
   authority, explicit STOP list, checkpoint, and the commands that verify the
-  result. A requirement you leave out will be improvised wrongly.
+  result.
 - **Start the coder with its named agent, the way the installed CLI needs it.**
   Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
   a wrong launch silently gives the default agent. `fleet-doctor` names the
