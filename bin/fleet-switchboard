@@ -4628,6 +4628,18 @@ def write_pr_notices(state_dir, items):
         raise
 
 
+NOTICE_SENDERS_MAX = 20  # distinct senders kept per notice
+
+
+def notice_senders(item):
+    """Every distinct agent that sent this notice (kept across re-sends); an old record has only `from`."""
+    found = item.get("senders")
+    names = [n for n in (found if isinstance(found, list) else []) if isinstance(n, str) and n]
+    if isinstance(item.get("from"), str) and item["from"] and item["from"] not in names:
+        names.append(item["from"])
+    return names[-NOTICE_SENDERS_MAX:]
+
+
 def record_pr_notice(state_dir, repo, number, sender, note, now, boss=None):
     """Record (or refresh) the notice of `repo#number`. A re-send keeps the first time (the hold window runs from
     it) and replaces the note and the sender. Returns (item, refreshed)."""
@@ -4636,6 +4648,8 @@ def record_pr_notice(state_dir, repo, number, sender, note, now, boss=None):
         old = next((i for i in items if i["repo"] == repo and i["number"] == number), None)
         item = {"repo": repo, "number": number, "from": sender, "note": note,
                 "created": old["created"] if old else now, "refreshed": now}
+        senders = notice_senders(old) if old else []
+        item["senders"] = [n for n in senders if n != sender][-(NOTICE_SENDERS_MAX - 1):] + ([sender] if sender else [])
         boss = boss or (old or {}).get("boss")
         if boss:  # PR 52: who the sender reports to, so a PR whose sender is gone still reaches someone
             item["boss"] = boss
@@ -4899,7 +4913,7 @@ def decisions_from_notices(engine, now):
         tag = repo if names.count(name) > 1 else name
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold)
-        evidence = captain_evidence(facts, {item.get("from")}) if facts and facts.get("captain") else []
+        evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
         elif evidence == []:

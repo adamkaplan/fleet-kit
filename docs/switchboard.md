@@ -2124,7 +2124,7 @@ the author's own review, or no review leaves a plain heads-up. It ends when the 
 `answer` and `supersede` are refused. Agents in one fleet share a GitHub login, so
 review evidence is a formal review by a non-author at the head **or** a signed comment
 (`<!-- fleet-switchboard:from=NAME -->`) whose text names the exact head (all 40 characters, or a prefix of at least 7,
-as a whole token), from a signer that is neither a placeholder nor the notice's sender; only the last 50 comments are
+as a whole token), from a signer that is neither a placeholder nor any agent that ever sent the notice (it keeps up to 20 distinct senders across re-sends); only the last 50 comments are
 read, only the signature and the head token are looked at (never shown), and at most 5 reviewers are listed, each as
 `name (review state)` or `name (comment)`. A PR with no evidence is a plain heads-up, except that 2 hours
 (`CAPTAIN_NO_REVIEW_SECONDS`) after the notice was first recorded it is listed anyway, marked `no review seen`, so

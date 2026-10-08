@@ -22502,6 +22502,23 @@ class TestCaptainPrs(DecisionsBase):
         self.assertEqual((entry["kind"], entry["head"]), ("captain", HEAD_B))
         self.assertIn("no review seen", entry["review_evidence"])
 
+    def test_a_re_notice_by_another_agent_keeps_the_first_sender_excluded(self):
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "other-coder", "", self.world.clock.now())
+        for who in ("platform", "other-coder"):
+            self.answer(captain_pr(comments=[(who, "clean at " + HEAD_A)]))
+            self.assertEqual(self.only()["kind"], "notice", who)
+        self.answer(captain_pr(comments=[("rev-wake", "clean at " + HEAD_A)]))
+        self.assertEqual(self.only()["kind"], "captain")
+
+    def test_the_sender_list_is_bounded_and_an_old_record_reads_fine(self):
+        for i in range(sb.NOTICE_SENDERS_MAX + 5):
+            item, _ = sb.record_pr_notice(self.world.state, "acme/api", 7, "agent-%d" % i, "", self.world.clock.now())
+        self.assertEqual(len(item["senders"]), sb.NOTICE_SENDERS_MAX)
+        self.assertEqual(item["senders"][-1], "agent-%d" % (sb.NOTICE_SENDERS_MAX + 4))
+        self.assertEqual(sb.notice_senders({"from": "old-agent"}), ["old-agent"])
+        self.assertEqual(sb.notice_senders({"from": "b", "senders": ["a", "b"]}), ["a", "b"])
+        self.assertEqual(sb.notice_senders({"senders": "junk"}), [])
+
     def test_comments_that_cannot_be_read_are_labelled_not_ignored(self):
         data = json.loads(captain_pr())
         del data["comments"]
