@@ -16,7 +16,7 @@ one line, then its whole title word-wrapped to 34 characters on the lines below.
 - **Clicking (issue 66).** A decision row links to its issue and a heads-up row to its PR
   (`https://github.com/<repo>/issues/<ask>`, `.../pull/<number>`; built from the repo and number only, each
   strictly validated, never from a title). A row with no repo or no number has no link. The `id age` line is an
-  OSC 8 hyperlink: Ctrl-click (herdr) or Cmd-click (iTerm2) opens it in the browser; a terminal that ignores OSC 8
+  OSC 8 hyperlink: Ctrl-click (herdr; Cmd-click in iTerm2 outside herdr) opens it in the browser; a terminal that ignores OSC 8
   shows plain text. A plain click on the row copies the link with OSC 52 and shows a toast (a terminal that
   blocks OSC 52 gets the toast with the link). Still no process, no network.
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
