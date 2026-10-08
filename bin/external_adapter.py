@@ -1346,8 +1346,8 @@ class WorkClient:
         spec = self.m.fields["work"]
         body = {}
         for name, value in fields.items():
-            if value is None:
-                continue
+            if value is None or (isinstance(value, str) and not value.strip() and name not in ("title", "summary")):
+                continue   # nothing to say is not sent (the other side refuses an empty progress line)
             if name not in spec:
                 raise InvalidRequest("work: %r is not a mapped field" % name)
             if name == "state":
@@ -1379,7 +1379,8 @@ class WorkClient:
         (or "unchanged"); the last state wins. `flush` sends what became due."""
         state = self._state(work_id, project)
         merged = dict(state["pending"])
-        merged.update({k: v for k, v in fields.items() if v is not None})
+        merged.update({k: v for k, v in fields.items()
+                       if v is not None and not (isinstance(v, str) and not v.strip())})
         changed = {k: v for k, v in merged.items() if state["sent"].get(k) != v}
         if not changed:
             state["pending"] = {}

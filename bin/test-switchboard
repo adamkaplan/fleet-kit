@@ -23917,8 +23917,8 @@ class FakeDoorServer:
         return self.tasks.get((seat, ident))
 
     def op_work_put(self, args, ident, seat):
-        if not args.get("title"):
-            return 400, {"code": "bad", "message": "title"}, {}
+        if not args.get("title") or ("progress" in args and not (args["progress"] or {}).get("text")):
+            return 400, {"code": "bad", "message": "title or progress text is empty"}, {}
         task = self.task_of(seat, ident)
         if task is None:
             task = {"id": ident, "end": None, "recorded_at": self.now}
@@ -24738,6 +24738,13 @@ class TestExternalAdapterWork(ExternalAdapterCase):
             adapter.work.put("w-2", "t", unmapped_field=1)
         with self.assertRaises(EA.Unsupported):
             adapter.door.call("work_put", {}, ident="w", force="tool")
+
+    def test_an_empty_line_is_not_sent(self):
+        adapter = self.adapter()
+        first = adapter.work.put("w-9", "t", state="running", progress="", doer="  ")
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("progress", self.server.tasks[("seat-1", "w-9")])
+        self.assertEqual(adapter.work.patch("w-9", progress=" "), {"sent": False, "unchanged": True})
 
     def test_updates_are_coalesced_and_the_last_state_wins(self):
         adapter = self.adapter()
