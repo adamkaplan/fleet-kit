@@ -5,21 +5,20 @@
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, ErrorBoundary, For, Show } from "solid-js"
 import { watch } from "node:fs"
-import { HEAVY, altRows, THIN, safeUrl, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, panelModeOf, stateDirOf, styledRows, themeColors, viewOf } from "./decisions.mjs"
+import { HEAVY, THIN, safeUrl, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, panelModeOf, stateDirOf, styledRows, themeColors, viewOf } from "./decisions.mjs"
 
 export default {
   id: "fleet.decisions",
   setup(api: any) {
     const dir = stateDirOf(process.env)
     const who = viewOf(process.env) // PR 18: from the pane's environment, set by `launch` and `bootstrap`
-    const mode = panelModeOf(process.env) // FLEET_SWITCHBOARD_PANEL=plain draws the old panel; a, b, c: temporary alternatives (iteration 2)
-    const styledMode = mode !== "plain"
+    const styledMode = panelModeOf(process.env) === "styled" // FLEET_SWITCHBOARD_PANEL=plain draws the old panel
     const read = () => {
       const now = Date.now()
       const snapshot = loadSnapshot(dir, now)
       let rows = null // the styled lines; null (any error) means: draw the plain panel
       if (styledMode) {
-        try { rows = mode === "styled" ? styledRows(snapshot, now, ROW_WIDTH, who) : altRows(mode, snapshot, now, ROW_WIDTH, who) } catch { rows = null }
+        try { rows = styledRows(snapshot, now, ROW_WIDTH, who) } catch { rows = null }
       }
       return { view: buildView(snapshot, now, ROW_WIDTH, who), rows, next: msUntilStale(snapshot) }
     }

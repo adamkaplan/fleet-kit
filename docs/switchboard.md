@@ -1164,20 +1164,18 @@ missing, unreadable or stale file, or a state directory it cannot place, is a ro
 `fs.watch`, because the file is replaced by rename, with one slow re-read every 60
 s and one timer for the moment a list would turn stale.
 
-**The styled panel (issue 67, iteration 1)** is the default drawing. Same sections, groups and order as above; what changes is
-only how a row looks. The title row is `Decisions` with the view label flush right, then one summary line: `N need you`
-(`need human` in the Chief of Staff's and a repo's panel) · `M PRs to watch` · `K wait on cos` (`K with cos` in a human's panel),
-with `(J over 1h)` when some have waited over an hour. Colour comes from the TUI theme (`text.muted`, and
-`text.feedback.warning`/`error`/`success`/`info`), never from a fixed colour; a theme without a token draws that text in the base colour.
-What needs you is bold. An id line is the id (muted) on the left and its age flush right: muted under 1h, warning from 1h, error
-from 24h. A heads-up shows its PR number (`#2644`) in place of `pr:<repo>#N` (it is information, never answered by id; the
-real id is unchanged in the file); its facts are coloured (`CI failing` bold red, green and approved green, pending warning,
-`no review` muted). A repo shows by its name without the org when no other repo anywhere in the file has that name (heads-ups
-and every tier included), else with the org; in a headline `org/repo#N` becomes `repo#N` by the same test, and a ref to the group's own
-repo becomes `#N`. The counts are the same ones the plain panel's titles give. `FLEET_SWITCHBOARD_PANEL=plain` in the TUI's
-environment draws the earlier plain panel instead (and so does any error while drawing the styled one); `viewLines`, the
-Decision baseline's plain view, is unchanged and still tested. To roll back, copy the previous `tui.tsx` and `decisions.mjs` over
-the installed ones and restart the TUI. It spawns no process, holds
+**The styled panel (issue 67)** is the default drawing, built by subtraction. Top: `Decisions` with the view label flush right, then
+one line of counts: `N need you` (`need human` in the Chief of Staff's and a repo's panel) · `M PRs` · `K with cos` (`on cos` there),
+with `(J over 1h)` when some have waited over an hour; a count of 0 is left out. Then only the sections that have something, each a
+bold name, a repo name once per group (without its org when no other repo in the file has that name; refs to the group's own repo
+read `#N`), and blank lines instead of rules. What needs you is two lines: the headline in bold, then the id (muted) with its age flush
+right. A heads-up is one line: `#N` and the headline cut to fit, age flush right; the number is green when CI is green and the PR approved, red
+when CI fails, plain otherwise (the real id `pr:<repo>#N` is unchanged in the file; a heads-up is never answered by id). In the Chief of
+Staff's panel the cos tier is one line per repo (`3 · oldest 1d`) and is not listed. Ages are muted, warning from 24h. Colour is
+the TUI theme's (`text.muted`, `text.feedback.*`), never a fixed colour; a theme without a token draws that text in the base colour.
+Every line of an entry carries its link (see the links above). `FLEET_SWITCHBOARD_PANEL=plain` draws the earlier plain panel (and so does
+any error while drawing the styled one); `viewLines`, the Decision baseline's plain view, is unchanged and tested. To roll back, copy the
+previous `tui.tsx` and `decisions.mjs` over the installed ones and restart the TUI. It spawns no process, holds
 no credential and makes no network call; it reads only `decisions.json` in the state
 directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
 daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or

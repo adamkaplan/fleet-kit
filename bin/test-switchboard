@@ -23658,79 +23658,55 @@ STYLED_UNIT_HARNESS = r"""
 import * as d from "%(url)s";
 const now = Date.parse("2026-10-08T12:00:00Z");
 const iso = (secs) => new Date(now - secs * 1000).toISOString();
-const mk = (id, repo, tier, headline, secs, extra = {}) => ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(secs), ...extra });
+const mk = (id, repo, tier, headline, secs, extra = {}) => ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(secs), ask: 1, ...extra });
 const snap = (decisions, errors = []) => ({ status: "ok", decisions, errors, ageMs: 0 });
 const chief = d.viewOf({ [d.ROLE_ENV]: "chief-of-staff" });
 const human = d.viewOf({});
-const text = (decisions, view, errors) => d.styledText(d.styledRows(snap(decisions, errors), now, 34, view));
+const rows = (decisions, view, errors) => d.styledRows(snap(decisions, errors), now, 34, view);
+const text = (decisions, view, errors) => d.styledText(rows(decisions, view, errors), 34);
 const pr = (number, repo, secs, extra = {}) => ({ id: "pr:" + repo + "#" + number, kind: "notice", tier: "human", repo, number, title: "x",
   headline: repo + "#" + number + " Add a thing", since: iso(secs), ci: "green", review: "approved", additions: 1, deletions: 2, files: 3, ...extra });
+const textOf = (l) => l.segs.map((s) => s[0]).join("") + (l.right ? "|" + l.right.map((s) => s[0]).join("") : "");
 const r = {};
-// panel mode
-r.mode = [d.panelModeOf({}), d.panelModeOf({ [d.PANEL_ENV]: "plain" }), d.panelModeOf({ [d.PANEL_ENV]: " PLAIN " }), d.panelModeOf({ [d.PANEL_ENV]: "styled" }), d.panelModeOf({ [d.PANEL_ENV]: "x" }), d.panelModeOf(null)];
+r.mode = [d.panelModeOf({}), d.panelModeOf({ [d.PANEL_ENV]: "plain" }), d.panelModeOf({ [d.PANEL_ENV]: " PLAIN " }), d.panelModeOf({ [d.PANEL_ENV]: "styled" }), d.panelModeOf({ [d.PANEL_ENV]: "c" }), d.panelModeOf(null)];
 r.env = d.PANEL_ENV;
-// short names: unambiguous only
-const uniq = [mk("web#1", "acme/web", "human", "see acme/web#9 and acme/api#4 and web#3 and api#4", 60), mk("api#1", "acme/api", "cos", "x", 60)];
-r.uniq = text(uniq, chief);
-const clash = [mk("web#1", "acme/web", "human", "see acme/web#9 and other/web#4 and web#3", 60), mk("web#2", "other/web", "cos", "x", 60)];
-r.clash = text(clash, chief);
-r.tidy = [
-  d.tidyRefs("fix acme/web#9, api#4.", "acme/api", d.repoAmbiguity(uniq)),
-  d.tidyRefs("acme/api#4 acme/api#5", "acme/api", d.repoAmbiguity(uniq)),
-  d.tidyRefs("pr:acme/api#4 x/acme/api#4 (acme/web#2)", "acme/web", d.repoAmbiguity(uniq)),
-  d.tidyRefs("other/web#4", "acme/web", d.repoAmbiguity(clash)),
-];
-r.short = [d.shortRepo("acme/web"), d.shortRepo("web"), d.repoAmbiguity(clash).ambiguous("acme/web"), d.repoAmbiguity(uniq).ambiguous("acme/web")];
-// age tint
-r.tint = [0, 59, 3599, 3600, 3601, 86399, 86400, 999999].map((s) => d.ageStyle(s));
-r.tintConst = [d.AGE_WARN_SECONDS, d.AGE_ERROR_SECONDS];
-const ageLine = (secs) => d.styledRows(snap([mk("web#1", "acme/web", "cos", "x", secs)]), now, 34, chief).find((l) => l.id === "web#1");
-r.ageSegs = [30, 3599, 3600, 86400].map((s) => ageLine(s).right);
-r.ageLine = [ageLine(300), ageLine(23 * 3600 + 19 * 60)].map((l) => d.styledText([l])[0]);
-// summary counts
-const mix = [mk("a#1", "o/a", "human", "h1", 10), mk("a#2", "o/a", "human", "h2", 20), mk("b#1", "o/b", "cos", "c1", 3601), mk("b#2", "o/b", "cos", "c2", 100),
-  mk("b#3", "o/b", "cos", "c3", 7200), pr(5, "o/a", 100)];
-r.summaryChief = text(mix, chief).slice(0, 3);
-r.summaryHuman = text(mix, human).slice(0, 3);
-r.summaryOne = text([mk("a#1", "o/a", "human", "h1", 10), pr(5, "o/a", 100)], human).slice(0, 3);
-r.summaryNone = text([], human);
-r.summaryStyles = d.styledRows(snap(mix), now, 34, chief).slice(0, 3).map((l) => l.segs);
-// heads-up id and facts
-r.notice = text([pr(5, "o/a", 100, { ci: "failing", review: "none", merge_after: "2026-10-08T14:05:00Z", stale: true })], human);
-r.noticeStyles = d.styledRows(snap([pr(5, "o/a", 100, { ci: "failing", review: "none" })]), now, 34, human).filter((l) => l.segs.some((s) => /CI|review/.test(s[0]))).map((l) => l.segs);
-r.noticeIds = d.styledRows(snap([pr(5, "o/a", 100)]), now, 34, human).filter((l) => l.id).map((l) => [l.id, l.segs[0][0]]);
-// id line keeps the id text; a long id puts the age on its own line, never cut
-const long = [mk("a-very-long-repository-name#12345", "o/a-very-long-repository-name", "cos", "q", 3 * 86400)];
-r.longId = text(long, chief).slice(-4);
-// bold only for what needs you; batch rows muted
-const batch = [mk("a#7", "o/a", "human", "Cleanup", 100, { rows: [{ text: "o/a#31: close it" }, { text: "o/a#32: close as duplicate of o/a#31" }] })];
-r.batch = d.styledRows(snap(batch), now, 34, human).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
-function textOf(l) { return l.segs.map((s) => s[0]).join("") + (l.right ? "|" + l.right.map((s) => s[0]).join("") : ""); }
-// states
+// the layout
+const mix = [mk("a#1", "o/a", "human", "Which database?", 600), mk("a#2", "o/a", "human", "Pick a cache", 1200), mk("b#1", "o/b", "cos", "c1", 3601),
+  mk("b#2", "o/b", "cos", "c2", 100), mk("b#3", "o/b", "cos", "c3", 90000), pr(5, "o/a", 100), pr(6, "o/a", 4000, { ci: "failing", review: "none" }),
+  pr(7, "o/c", 90000, { ci: "pending", review: "none", additions: 900, deletions: 100 })];
+r.chief = text(mix, chief);
+r.human = text(mix, human);
+r.none = text([], human);
+r.onlyCos = text([mk("c#1", "o/c", "cos", "q", 100)], human);
+r.onlyPr = text([pr(5, "o/a", 100)], human);
 r.stale = d.styledText(d.styledRows({ status: "stale", decisions: [], errors: [] }, now));
 r.errors = text([], human, [{ source: "x" }]).slice(-1);
-r.badSince = text([mk("a#1", "o/a", "cos", "h", 1, { since: "garbage" })], chief).slice(-2);
-// theme: defensive
+// ages: muted, error-tinted... from a day
+r.tint = [0, 59, 3599, 3600, 86399, 86400, 999999].map((s) => d.ageStyle(s));
+r.tintConst = [d.AGE_WARN_SECONDS, d.AGE_ERROR_SECONDS];
+const lineWith = (decisions, view, pick) => rows(decisions, view).find(pick);
+r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "human", "x", s)], human, (l) => l.id === "web#1").right);
+r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
+// PR number coloured by state; the real id is kept on the line
+const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
+r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[0]);
+r.prId = [prLine({}).id, textOf(prLine({}))];
+// a decision that needs you: two lines, bold headline, id muted
+r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
+// ambiguity and refs
+const clash = [mk("web#1", "acme/web", "human", "see acme/web#9 and other/web#4 and web#3", 60), mk("web#2", "other/web", "human", "x", 60)];
+r.clash = text(clash, human);
+r.tidy = [d.tidyRefs("fix acme/web#9, api#4.", "acme/api", d.repoAmbiguity([{ repo: "acme/web" }, { repo: "acme/api" }])), d.shortRepo("acme/web"), String(d.repoAmbiguity([{ repo: "a/web" }, { repo: "b/web" }]).ambiguous("a/web"))];
+// theme
 const theme = { text: { muted: "M", feedback: { warning: { base: "W" }, error: { base: "E" }, success: { base: "S" }, info: { base: "I" } } } };
-r.theme = [d.themeColors(theme), d.themeColors(undefined), d.themeColors({}), d.themeColors({ text: { muted: "M" } }),
-  d.themeColors({ get text() { throw new Error("boom"); } }), d.themeColors({ text: { muted: "", feedback: { error: { base: null } } } })];
-// the plain view is untouched by all of this
-r.plainSame = JSON.stringify(d.viewLines(d.buildView(snap(mix), now, 34, chief))) === JSON.stringify(d.viewLines(d.buildView(snap(mix), now, 34, chief)));
+r.theme = [d.themeColors(theme), d.themeColors(undefined), d.themeColors({}), d.themeColors({ get text() { throw new Error("boom"); } })];
+// the plain view is untouched, same order of decisions
 r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
-// grouping and order match the plain view: the same ids in the same order
-const ids = (rows) => rows.filter((l) => l.id).map((l) => l.id);
-r.sameOrder = JSON.stringify(ids(d.styledRows(snap(mix), now, 34, chief)).filter((x) => !x.startsWith("pr:") && !x.startsWith("#"))) ;
-r.plainOrder = JSON.stringify(d.buildView(snap(mix), now, 34, chief).sections.flatMap((s) => s.groups.flatMap((g) => g.entries.map((e) => e.key))).filter((k) => !k.startsWith("pr:")));
-// iteration 2 (temporary alternatives a, b, c)
-r.altModes = ["a", "B", " c "].map((m) => d.panelModeOf({ [d.PANEL_ENV]: m }));
-const altText = (m, list, view) => d.styledText(d.altRows(m, snap(list), now, 34, view), 34);
-r.alt = Object.fromEntries(["a", "b", "c"].map((m) => [m, { chief: altText(m, mix, chief), human: altText(m, mix, human), none: altText(m, [], human) }]));
-r.altStale = d.altRows("a", { status: "stale", decisions: [], errors: [] }, now).map((l) => l.segs[0][0]);
-// links: every line of an entry carries its URL, the id line is the one with `id`; a title cannot smuggle a control character
-const linked = d.styledRows(snap([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })]), now, 34, human);
+// links and control characters
+const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
 r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
-const esc = d.styledRows(snap([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })]), now, 34, human);
+const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
 console.log(JSON.stringify(r));
 """
@@ -23738,7 +23714,7 @@ console.log(JSON.stringify(r));
 
 @unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
 class TestDecisionsStyledPanel(unittest.TestCase):
-    """Issue 67, iteration 1: the styled panel's pure functions (decisions.mjs), over invented decisions."""
+    """Issue 67: the styled panel's pure functions (decisions.mjs), over invented decisions."""
 
     @classmethod
     def setUpClass(cls):
@@ -23749,97 +23725,66 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         assert done.returncode == 0, done.stderr
         cls.r = json.loads(done.stdout.strip().splitlines()[-1])
 
-    def test_the_panel_mode_is_styled_unless_the_environment_says_plain(self):
+    def test_the_panel_is_styled_unless_the_environment_says_plain(self):
         self.assertEqual(self.r["env"], "FLEET_SWITCHBOARD_PANEL")
         self.assertEqual(self.r["mode"], ["styled", "plain", "plain", "styled", "styled", "styled"])
 
-    def test_a_short_repo_name_is_used_only_when_no_other_repo_has_it(self):
-        self.assertEqual(self.r["short"], ["web", "web", True, False])
-        # unique names: the group header is short; a ref to another repo is short; a ref to the group's own repo is `#N`
-        self.assertIn("web", self.r["uniq"])
-        self.assertIn("see #9 and api#4 and #3 and api#4", self.r["uniq"])
-        # two repos called web: nothing is shortened to the bare name, the header keeps the org, a foreign ref keeps its org
+    def test_the_layout_in_the_chief_of_staffs_view(self):
+        self.assertEqual(self.r["chief"], [
+            "Decisions                      all", "2 need human \u00b7 3 PRs", "3 on cos (2 over 1h)", " ",
+            "Waits on you", "a", "Pick a cache", "a#2" + " " * 28 + "20m", " ", "Which database?", "a#1" + " " * 28 + "10m", " ",
+            "Heads-up", "a", "#6 Add a thing" + " " * 15 + "1h06m", "#5 Add a thing" + " " * 18 + "1m", " ",
+            "c", "#7 Add a thing" + " " * 18 + "1d", " ",
+            "Waits on cos", "b" + " " * 20 + "3 \u00b7 oldest 1d"])
+
+    def test_a_humans_view_has_no_cos_section_only_a_count(self):
+        self.assertEqual(self.r["human"][:3], ["Decisions                  for you", "2 need you \u00b7 3 PRs", "3 with cos (2 over 1h)"])
+        self.assertNotIn("Waits on cos", self.r["human"])
+
+    def test_nothing_empty_is_drawn_and_no_rule(self):
+        self.assertEqual(self.r["none"], ["Decisions                  for you", "0 need you", " ", "nothing waiting"])
+        self.assertEqual(self.r["onlyCos"][1:], ["1 with cos", " ", "nothing waiting"])
+        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "#5 Add a thing" + " " * 18 + "1m"])
+        for name in ("chief", "human", "none", "onlyPr"):
+            for line in self.r[name]:
+                self.assertFalse(set(line) & set("\u2501\u2504"), line)
+            self.assertTrue(all(len(x) <= 34 for x in self.r[name]), name)
+
+    def test_the_age_is_muted_and_turns_warning_from_a_day(self):
+        self.assertEqual(self.r["tint"], ["m", "m", "m", "w", "w", "e", "e"], "ageStyle keeps the 1h/24h thresholds")
+        self.assertEqual(self.r["tintConst"], [3600, 86400])
+        self.assertEqual(self.r["ageSegs"], [[["30s", "m"]], [["59m", "m"]], [["23h59m", "m"]], [["1d", "w"]]])
+        self.assertEqual(self.r["ageLine"], "web#1|5m")
+
+    def test_the_pr_number_carries_the_state_and_the_real_id_is_kept(self):
+        self.assertEqual(self.r["prState"], [["#5", "e"], ["#5", "s"], ["#5", ""], ["#5", ""]])
+        self.assertEqual(self.r["prId"][0], "pr:o/a#5")
+
+    def test_what_needs_you_is_two_lines_bold_headline_and_a_quiet_id(self):
+        self.assertEqual(self.r["need"], [["a", ["b"]], ["Which database?", ["b"]], ["a#1|10m", ["m"]]])
+
+    def test_a_repo_name_is_shortened_only_when_unambiguous(self):
         self.assertIn("acme/web", self.r["clash"])
         self.assertIn("other/web", self.r["clash"])
         self.assertIn("see #9 and other/web#4 and web#3", self.r["clash"])
-        self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "#4 #5", "pr:acme/api#4 x/acme/api#4 (#2)", "other/web#4"])
-
-    def test_the_age_is_muted_then_warning_from_an_hour_then_error_from_a_day(self):
-        self.assertEqual(self.r["tint"], ["m", "m", "m", "w", "w", "w", "e", "e"])
-        self.assertEqual(self.r["tintConst"], [3600, 86400])
-        self.assertEqual(self.r["ageSegs"], [[["30s", "m"]], [["59m", "m"]], [["1h", "w"]], [["1d", "e"]]])
-
-    def test_the_age_is_flush_right_and_the_id_stays_as_it_is(self):
-        self.assertEqual(self.r["ageLine"], ["web#1" + " " * 27 + "5m", "web#1" + " " * 23 + "23h19m"])
-        self.assertTrue(all(len(x) == 34 for x in self.r["ageLine"]))
-
-    def test_the_summary_counts_what_needs_you_the_prs_and_what_waits_on_cos(self):
-        self.assertEqual(self.r["summaryChief"], ["Decisions                      all", "2 need human \u00b7 1 PR to watch",
-                                                  "3 wait on cos (2 over 1h)"])
-        self.assertEqual(self.r["summaryHuman"], ["Decisions                  for you", "2 need you \u00b7 1 PR to watch",
-                                                  "3 with cos (2 over 1h)"])
-        self.assertEqual(self.r["summaryOne"][1:], ["1 need you \u00b7 1 PR to watch", "0 with cos"])
-        self.assertEqual(self.r["summaryNone"][1], "0 need you \u00b7 0 with cos")
-        self.assertEqual(self.r["summaryStyles"][1][0], ["2 need human", "b+w"])
-        self.assertEqual(self.r["summaryStyles"][2], [["3 wait on cos", "m"], [" (2 over 1h)", "w"]])
-
-    def test_a_heads_up_shows_the_pr_number_and_coloured_facts(self):
-        self.assertEqual(self.r["noticeIds"], [["pr:o/a#5", "#5"]], "the real id is kept on the line, the number is shown")
-        self.assertIn("#5 Add a thing", self.r["notice"])
-        self.assertEqual(self.r["notice"][-5:], ["#5 Add a thing", "+1/-2, 3 files, CI failing,", "no review, merges after 14:05 UTC", "(stale)",
-                                                 "#5" + " " * 30 + "1m"])
-        styles = {t: s for line in self.r["noticeStyles"] for t, s in line}
-        self.assertEqual(styles["CI failing"], "e+b")
-        self.assertEqual(styles["no review"], "m")
-
-    def test_a_long_id_keeps_its_age_on_its_own_line(self):
-        self.assertEqual(self.r["longId"][-2:], ["a-very-long-repository-name#12345", " " * 32 + "3d"])
-
-    def test_a_batch_row_is_muted_and_what_needs_you_is_bold(self):
-        rows = self.r["batch"]
-        self.assertEqual(rows[5], ["Cleanup", ["b"]])
-        self.assertEqual(rows[6], ["#31: close it", ["m"]])
-        self.assertEqual(rows[7], ["#32: close as duplicate of #31", ["m"]])
+        self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "web", "true"])
 
     def test_the_states_the_plain_view_has(self):
         self.assertEqual(self.r["stale"], ["Decisions (?)", "daemon not updating"])
         self.assertEqual(self.r["errors"], ["1 source(s) unreadable"])
-        self.assertEqual(self.r["badSince"][-1], "a#1" + " " * 30 + "?")
 
     def test_a_missing_or_broken_theme_gives_no_colour_and_never_throws(self):
-        full, none, empty, partial, boom, blank = self.r["theme"]
+        full, none, empty, boom = self.r["theme"]
         self.assertEqual(full, {"m": "M", "w": "W", "e": "E", "s": "S", "i": "I"})
-        self.assertEqual(none, {})
-        self.assertEqual(empty, {})
-        self.assertEqual(partial, {"m": "M"})
-        self.assertEqual(boom, {})
-        self.assertEqual(blank, {})
+        self.assertEqual((none, empty, boom), ({}, {}, {}))
 
-    def test_the_order_is_the_plain_views_and_the_plain_view_is_unchanged(self):
-        self.assertEqual(self.r["sameOrder"], self.r["plainOrder"])
+    def test_the_plain_view_is_unchanged(self):
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
-
-    def test_the_three_alternative_layouts_subtract(self):
-        self.assertEqual(self.r["altModes"], ["a", "b", "c"])
-        for mode, views in self.r["alt"].items():
-            for name in ("chief", "human"):
-                lines = views[name]
-                self.assertTrue(all(len(x) <= 34 for x in lines), (mode, name))
-                self.assertFalse(any("\u2504" in x for x in lines), "no dotted rules")
-                self.assertFalse(any(x == "none" or x.endswith(" 0") for x in lines), "no empty section")
-            self.assertEqual(views["none"][-1], "nothing waiting")
-            self.assertNotIn("Waits on cos", views["human"], "the cos tier is only a count in a human's panel")
-        self.assertIn("Waits on cos", self.r["alt"]["a"]["chief"])
-        self.assertTrue(any(x.startswith("a#1 ") for x in self.r["alt"]["a"]["chief"]), "a decision's id is kept")
-        self.assertEqual(self.r["altStale"], ["Decisions (?)", "daemon not updating"])
-        self.assertTrue(any(x.startswith("b ") and "oldest" in x for x in self.r["alt"]["c"]["chief"]), "c folds the cos tier to a line per repo")
 
     def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
         self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
                                            ["web#1|1m", "https://github.com/acme/web/issues/12", True],
-                                           ["#5 Add a thing", "https://github.com/acme/web/pull/5", False],
-                                           ["+1/-2, 3 files, CI green, approved", "https://github.com/acme/web/pull/5", False],
-                                           ["#5|1m", "https://github.com/acme/web/pull/5", True]])
+                                           ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
         self.assertEqual(self.r["noLink"], ["bad repo", "H"])
         self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
 
