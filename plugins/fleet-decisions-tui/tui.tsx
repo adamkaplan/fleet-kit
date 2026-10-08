@@ -18,7 +18,7 @@ export default {
       const snapshot = loadSnapshot(dir, now)
       let rows = null // the styled lines; null (any error) means: draw the plain panel
       if (styledMode) {
-        try { rows = styledRows(snapshot, now, ROW_WIDTH, who, { v3: true }) } catch { rows = null }
+        try { rows = styledRows(snapshot, now, ROW_WIDTH, who, { v3: true, env: process.env }) } catch { rows = null }
       }
       return { view: buildView(snapshot, now, ROW_WIDTH, who), rows, next: msUntilStale(snapshot) }
     }
@@ -67,14 +67,16 @@ export default {
     const colors = (): Record<string, any> => {
       try { return themeColors(api.theme) } catch { return {} }
     }
-    const Piece = (props: { seg: [string, string] }) => {
+    const Piece = (props: { seg: [string, string, string?] }) => {
       const keys = (props.seg[1] || "").split("+")
       const fg = keys.map((k) => colors()[k]).find((c) => c != null)
       const inner = fg != null ? <span style={{ fg }}>{props.seg[0]}</span> : <span>{props.seg[0]}</span>
       const slanted = keys.includes("t") ? <i>{inner}</i> : inner
-      return keys.includes("b") ? <b>{slanted}</b> : slanted
+      const weighted = keys.includes("b") ? <b>{slanted}</b> : slanted
+      const href = safeUrl(props.seg[2]) // an explicit OSC 8 link (a search), only through safeUrl
+      return href ? <a href={href}>{weighted}</a> : weighted
     }
-    const Pieces = (props: { segs: [string, string][] }) => <For each={props.segs}>{(seg) => <Piece seg={seg} />}</For>
+    const Pieces = (props: { segs: [string, string, string?][] }) => <For each={props.segs}>{(seg) => <Piece seg={seg} />}</For>
     const plainPanel = () => (
       <box flexDirection="column" paddingBottom={1}>
           <text>

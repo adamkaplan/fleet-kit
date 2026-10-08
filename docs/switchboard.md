@@ -1211,7 +1211,18 @@ keeps its colour; never the state colours); a one-cell mark per row, `◆` a PR 
 question, `¶` a report, `⧖` before an age of a day or more (the state is the mark's colour, so it does not fight the project hue);
 bold for what needs you, italic muted for ids and ages, the link underlined; two blank lines before a section; a large PR's size
 (`+A/-D`, from 500 lines) on its own line in the theme's diff colours (`diff.text.added` / `removed`, the ones the sidebar's git status
-uses). The marks are single-cell: measured in herdr, `✓ ✗ ◆ ¶ ? ⧖ ● ○ ▲` are one cell and emoji such as `✅ ❌ ⏳ 🔴 💬` (and `⚠️`) are two. It spawns no process, holds
+uses). The marks are single-cell: measured in herdr, `✓ ✗ ◆ ¶ ? ⧖ ● ○ ▲` are one cell and emoji such as `✅ ❌ ⏳ 🔴 💬` (and `⚠️`) are two.
+
+**Kind marks and search links.** A row's mark says its kind: `◆` a PR, `○` an issue, `?` a question or a permission, `¶` a report (all one cell).
+In the summary line `N PRs` and `N on cos` (`with cos` in a human's panel) are links, and in the Chief of Staff's panel so is each
+folded repo line of Waits on cos. A PR count links to the open PRs of its repos (one repo: that repo's pull-request search; several: one
+`github.com/search` with a `repo:` per repo), a cos count to the open issues carrying the cos label (`<user>:awaiting-cos`) in the repos
+that have one. They go through the same `safeUrl` check as a row's link, built only from a repo that matches the strict pattern and a label of
+that form; the user in the label is the OS user, read from the TUI's environment (the daemon's default label: a configured
+`awaiting_cos_label` is not known to the plugin, and then the link is the default one or none). **What a link cannot show:** a cos-tier
+decision that is a report or a prompt is not an issue, so no issue filter lists it: the link covers the issue-kind decisions of its
+repo, not the whole count (a repo with only reports has no link). A search over several repos is one GitHub search; an organisation
+you cannot see from the signed-in account (for example an enterprise-managed one) may show nothing there, and the per-repo links still work. It spawns no process, holds
 no credential and makes no network call; it reads only `decisions.json` in the state
 directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
 daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or
