@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Extract a stratified sample of recent policy.judge shadow verdicts from the audit log, for LABELLING.
+
+Read-only on the audit file. The output holds real arguments and intents: it is a LOCAL file (put it outside the repo,
+never on GitHub). One JSON object per line: {"n", "ts", "verdict", "role", "agent", "ask", "tool", "arguments", "intent",
+"done_when", "fired", "answers", "thresholds", "reason", "session", "label": null, "note": null}; a reviewer fills `label`
+with "right" or "wrong" (would the verdict, deny or ask, have been the right call for this call?) and a short `note`.
+
+  judge-sample [--audit FILE] [--out FILE] [--deny 40] [--ask 40] [--control 20] [--recent 800] [--seed 87]
+
+The sample is drawn from the last --recent verdicts of each kind (a repeated identical call is counted once), round-robin
+across agents so one chatty agent does not fill it, and is reproducible for a seed.
+"""
+import argparse
+import json
+import os
+import random
+import sys
+from collections import OrderedDict
+
+DEFAULT_AUDIT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                             "fleet-switchboard", "audit.jsonl")
+KINDS = {"would-deny": "deny", "would-ask": "ask", "unchanged": "control"}
+
+
+def read_verdicts(path):
+    """The shadow policy.judge rows that carry a verdict, oldest first. Unreadable lines are skipped."""
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if '"policy.judge"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            detail = row.get("detail") if isinstance(row, dict) else None
+            if (row.get("event") == "policy.judge" and isinstance(detail, dict) and detail.get("shadow")
+                    and detail.get("judged") and detail.get("verdict") in KINDS):
+                rows.append(row)
+    return rows
+
+
+def record(row):
+    d = row["detail"]
+    state = (d.get("question") or {}).get("state") or {}
+    return {"ts": row.get("ts"), "verdict": d.get("verdict"), "role": d.get("role"), "agent": d.get("agent"),
+            "ask": d.get("ask"), "tool": d.get("tool"), "arguments": state.get("arguments"),
+            "intent": state.get("intent"), "done_when": state.get("done_when"), "fired": d.get("fired"),
+            "answers": d.get("answers"), "thresholds": d.get("thresholds"), "reason": d.get("reason"),
+            "session": d.get("session")}
+
+
+def draw(rows, kind, count, recent, rng):
+    """`count` records of one kind from the last `recent`, distinct by (tool, arguments), round-robin over agents."""
+    pool = [r for r in rows if KINDS[r["detail"]["verdict"]] == kind][-recent:]
+    seen, by_agent = set(), OrderedDict()
+    for row in reversed(pool):  # newest first
+        rec = record(row)
+        key = (rec["tool"], rec["arguments"], rec["verdict"])
+        if key in seen:
+            continue
+        seen.add(key)
+        by_agent.setdefault(rec["agent"] or "?", []).append(rec)
+    for items in by_agent.values():
+        rng.shuffle(items)
+    out = []
+    while len(out) < count and any(by_agent.values()):
+        for agent in list(by_agent):
+            if by_agent[agent] and len(out) < count:
+                out.append(by_agent[agent].pop())
+    return out
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--audit", default=DEFAULT_AUDIT)
+    p.add_argument("--out", required=True, help="a LOCAL file, outside the repo")
+    p.add_argument("--deny", type=int, default=40)
+    p.add_argument("--ask", type=int, default=40)
+    p.add_argument("--control", type=int, default=20)
+    p.add_argument("--recent", type=int, default=800)
+    p.add_argument("--seed", type=int, default=87)
+    a = p.parse_args(argv)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.abspath(a.out).startswith(here + os.sep):
+        print("judge-sample: refusing to write inside the repo (the sample holds real content)", file=sys.stderr)
+        return 2
+    rows = read_verdicts(a.audit)
+    rng = random.Random(a.seed)
+    picked = []
+    for kind, count in (("deny", a.deny), ("ask", a.ask), ("control", a.control)):
+        picked += draw(rows, kind, count, a.recent, rng)
+    rng.shuffle(picked)  # a reviewer should not see the verdict kind in the order
+    with open(a.out, "w", encoding="utf-8") as handle:
+        for n, rec in enumerate(picked, 1):
+            handle.write(json.dumps(dict(rec, n=n, label=None, note=None), ensure_ascii=False) + "\n")
+    counts = {k: sum(1 for r in picked if KINDS_BY_VERDICT[r["verdict"]] == k) for k in ("deny", "ask", "control")}
+    print("judge-sample: %d verdicts read, %d written to %s (%s)" % (len(rows), len(picked), a.out, counts))
+    return 0
+
+
+KINDS_BY_VERDICT = KINDS
+
+if __name__ == "__main__":
+    sys.exit(main())

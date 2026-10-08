@@ -25990,6 +25990,36 @@ class TestExternalTiers(ExternalWorld):
             self.assertEqual(sb.validate_config({"external_decisions": dict(good, tiers=ok)})["external_decisions"]["tiers"], ok)
 
 
+class TestJudgeSample(unittest.TestCase):
+    """bin/judge-sample (issue 87): a stratified, reproducible sample from the audit log, never written inside the repo."""
+
+    def row(self, i, verdict, agent="coder-a", shadow=True):
+        state = {"arguments": "cmd %d" % i, "intent": "i", "done_when": "d", "tool": "shell", "role": "coder"}
+        return {"event": "policy.judge", "ts": "2026-10-08T00:00:%02dZ" % (i % 60), "detail": {
+            "shadow": shadow, "judged": True, "verdict": verdict, "agent": agent, "role": "coder", "tool": "shell", "ask": 1,
+            "fired": ["outside_intent"], "answers": {}, "thresholds": {}, "reason": "r", "question": {"state": state}}}
+
+    def test_it_draws_each_kind_distinct_reproducible_and_refuses_the_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = Path(tmp) / "audit.jsonl"
+            rows = [self.row(i, v, agent="a%d" % (i % 3)) for i, v in enumerate(["would-deny", "would-ask", "unchanged"] * 20)]
+            rows += [self.row(0, "would-deny", agent="a0"), self.row(1, "would-deny", shadow=False)]  # a repeat, and a non-shadow
+            audit.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+            out = Path(tmp) / "s.jsonl"
+            cmd = [sys.executable, str(REPO / "bin" / "judge-sample"), "--audit", str(audit), "--out", str(out), "--deny", "5", "--ask", "4", "--control", "3"]
+            self.assertEqual(subprocess.run(cmd, capture_output=True, text=True).returncode, 0)
+            first = out.read_text()
+            got = [json.loads(l) for l in first.splitlines()]
+            self.assertEqual(sorted(r["verdict"] for r in got).count("would-deny"), 5)
+            self.assertEqual((len(got), len({(r["arguments"], r["verdict"]) for r in got})), (12, 12))
+            self.assertTrue(all(r["label"] is None and r["intent"] == "i" for r in got))
+            subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(out.read_text(), first, "the same seed gives the same sample")
+            bad = subprocess.run(cmd[:-6] + ["--out", str(REPO / "bin" / "never.jsonl")], capture_output=True, text=True)
+            self.assertEqual(bad.returncode, 2)
+            self.assertFalse((REPO / "bin" / "never.jsonl").exists())
+
+
 class TestExternalDecisionConfig(unittest.TestCase):
     def check(self, section):
         return sb.validate_config({"external_decisions": section})["external_decisions"]
