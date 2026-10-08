@@ -278,6 +278,213 @@ export function viewLines(view, width = ROW_WIDTH) {
   return out
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The styled panel (issue 67, iteration 1). Pure, like everything above: it turns the same snapshot into lines of
+// styled text segments that tui.tsx draws and the tests read. `viewLines` and `buildView` are NOT changed: they
+// are the plain view (FLEET_SWITCHBOARD_PANEL=plain draws it) and the baseline pins them.
+//
+// A line is {segs, right?, id?}: `segs` is the left part, `right` (when there is one) is flush to the right edge
+// (the age), `id` is the decision id of a row's id line. A segment is [text, style]; style is "" or a "+"-joined set of
+// keys: b bold, m muted, w warning, e error, s success, i info. The keys name theme colours (themeColors below); no
+// colour is ever written here.
+export const PANEL_ENV = "FLEET_SWITCHBOARD_PANEL"
+export const AGE_WARN_SECONDS = LONG_WAIT_SECONDS   // an age from 1h on is tinted warning ...
+export const AGE_ERROR_SECONDS = 86400              // ... and from 24h on error
+
+// "plain" (any case) selects the old drawing; anything else, or nothing, is the styled panel.
+export const panelModeOf = (env) => (String((env && env[PANEL_ENV]) ?? "").trim().toLowerCase() === "plain" ? "plain" : "styled")
+
+// The theme colour of each style key, read defensively: a missing token, or no theme at all, is `undefined`
+// (the base text colour), never an exception: the plugin runs inside the user's live TUI.
+export function themeColors(theme) {
+  const pick = (read) => { try { const v = read(); return v == null || v === "" ? undefined : v } catch { return undefined } }
+  return {
+    m: pick(() => theme.text.muted),
+    w: pick(() => theme.text.feedback.warning.base),
+    e: pick(() => theme.text.feedback.error.base),
+    s: pick(() => theme.text.feedback.success.base),
+    i: pick(() => theme.text.feedback.info.base),
+  }
+}
+
+// The repo name after its org: `acme-corp/acme-web` -> `acme-web`.
+export const shortRepo = (repo) => String(repo).split("/").pop()
+
+// A short repo name is UNAMBIGUOUS when no other repo anywhere in the file (every tier, heads-ups included) has the
+// same name after the org. Returns the test `ambiguous(fullRepo)`.
+export function repoAmbiguity(decisions) {
+  const by = new Map()
+  for (const d of decisions) {
+    if (typeof d.repo !== "string" || !d.repo) continue
+    const short = shortRepo(d.repo)
+    if (!by.has(short)) by.set(short, new Set())
+    by.get(short).add(d.repo)
+  }
+  return { ambiguous: (repo) => (by.get(shortRepo(repo))?.size ?? 0) > 1, named: (short) => [...(by.get(short) ?? [])] }
+}
+
+// `org/repo#N` -> `repo#N` when the name is unambiguous, and a ref to the group's own repo -> `#N`. Anything else is left as written.
+export function tidyRefs(text, groupRepo, known) {
+  return String(text).replace(/(?<![\w/.:-])(?:([A-Za-z0-9_.-]+)\/)?([A-Za-z0-9_.-]+)#(\d+)/g, (whole, org, name, n) => {
+    const candidates = known.named(name)
+    if (org) {
+      const full = `${org}/${name}`
+      if (full === groupRepo) return `#${n}`
+      return candidates.every((c) => c === full) ? `${name}#${n}` : whole
+    }
+    return candidates.length === 1 && candidates[0] === groupRepo ? `#${n}` : whole
+  })
+}
+
+// The style of an age: muted, warning from 1h, error from 24h.
+export const ageStyle = (seconds) => (seconds >= AGE_ERROR_SECONDS ? "e" : seconds >= AGE_WARN_SECONDS ? "w" : "m")
+
+const textOf = (segs) => segs.map(([t]) => t).join("")
+
+// The facts of a heads-up as coloured parts, wrapped between parts at `width` (the text equals factsOf's, less `merges after`/`stale`, which are added).
+export function factsSegments(d, width) {
+  const parts = []
+  if (Number.isInteger(d.additions) && Number.isInteger(d.deletions)) parts.push([`+${d.additions}/-${d.deletions}`, "m"])
+  if (Number.isInteger(d.files)) parts.push([`${d.files} file${d.files === 1 ? "" : "s"}`, "m"])
+  if (d.ci) parts.push([d.ci === "none" ? "no CI" : `CI ${d.ci}`, { failing: "e+b", failed: "e+b", green: "s", passing: "s", pending: "w" }[d.ci] ?? "m"])
+  if (d.review) parts.push([d.review === "none" ? "no review" : d.review, { approved: "s", changes_requested: "e" }[d.review] ?? "m"])
+  const after = d.merge_after ? clockOf(d.merge_after) : null
+  if (after) parts.push([`merges after ${after}`, "i"])
+  if (d.stale) parts.push(["(stale)", "w", " "])  // a space before it, as in factsOf
+  if (!parts.length) return [[["facts not read yet", "m"]]]
+  const lines = [[]]
+  let len = 0
+  parts.forEach(([t, st, glue], i) => {
+    const sep = i ? (glue ?? ", ") : ""
+    if (len && len + sep.length + t.length > width) { if (sep === ", ") lines[lines.length - 1].push([",", "m"]); lines.push([]); len = 0 }
+    else if (sep) { lines[lines.length - 1].push([sep, "m"]); len += sep.length }
+    lines[lines.length - 1].push([t, st]); len += t.length
+  })
+  return lines
+}
+
+// The styled panel as lines (issue 67, iteration 2, the layout Adam picked), built by subtraction: what needs you is two
+// lines (headline, then a quiet id + age line); a heads-up is one line (headline cut, its PR number coloured by state,
+// age flush right); a repo header once per group; no rules, only blank lines; no empty sections; stats (+A/-D) only when
+// large; in the Chief of Staff's view the cos tier folds to one line per repo (count and oldest). `snapshot` is what loadSnapshot returns.
+export const BIG_CHANGE_LINES = 500   // a PR's +A/-D is shown only from this size up
+export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW) => {
+  const row = (text, style = "") => ({ segs: [[text, style]] })
+  const blank = () => row(" ")
+  if (snapshot.status !== "ok") return [row("Decisions (?)", "b"), row(NOT_UPDATING, "w")]
+  const known = repoAmbiguity(snapshot.decisions)
+  const tierOf = (d) => d.tier ?? "human"
+  const secondsOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? NaN : (nowMs - t) / 1000 }
+  const sinceOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? Infinity : t }
+  const shown = selectFor(snapshot.decisions, view)
+  const notices = noticesFor(snapshot.decisions, view)
+  const human = shown.filter((d) => tierOf(d) === "human")
+  const cosAll = snapshot.decisions.filter((d) => !isNotice(d) && tierOf(d) === "cos")
+  const overs = overLongWait(cosAll, nowMs)
+  const out = []
+  out.push({ segs: [["Decisions", "b"]], right: [[view.label, "m"]] })
+  const summary = []
+  if (human.length || (!notices.length && !cosAll.length)) summary.push([[`${human.length} need ${view.kind === "human" ? "you" : "human"}`, human.length ? "b+w" : "m"]])
+  if (notices.length) summary.push([[`${notices.length} PR${notices.length === 1 ? "" : "s"}`, "i"]])
+  if (cosAll.length) summary.push([[`${cosAll.length} ${view.kind === "human" ? "with" : "on"} cos`, "m"], ...(overs ? [[` (${overs} over 1h)`, "w"]] : [])])
+  let line = []
+  for (const part of summary) {
+    if (line.length && textOf(line).length + 3 + textOf(part).length > width) { out.push({ segs: line }); line = [] }
+    line = line.length ? [...line, [" \u00b7 ", "m"], ...part] : [...part]
+  }
+  out.push({ segs: line })
+  const sections = []
+  if (human.length) sections.push({ key: "human", label: "Waits on you", list: human, need: true })
+  if (notices.length) sections.push({ key: "notice", label: "Heads-up", list: notices })
+  if (view.kind !== "human") {
+    const cos = shown.filter((d) => tierOf(d) === "cos")
+    if (cos.length) sections.push({ key: "cos", label: "Waits on cos", list: cos })
+    const other = shown.filter((d) => !["human", "cos"].includes(tierOf(d)))
+    if (other.length) sections.push({ key: "orchestrator", label: "Waits on orchestrator", list: other })
+  }
+  const ageSeg = (d) => { const sec = secondsOf(d); return Number.isNaN(sec) ? ["?", "m"] : [formatAge(sec), sec >= AGE_ERROR_SECONDS ? "w" : "m"] }
+  const stateOf = (d) => {  // a heads-up's state, only what matters: [text, style]
+    const parts = []
+    if (d.ci === "failing" || d.ci === "failed") parts.push(["CI failing", "e"])
+    else if (d.ci === "pending") parts.push(["CI pending", "m"])
+    else if (d.ci === "green" || d.ci === "passing") parts.push(d.review === "approved" ? ["ready", "s"] : ["no review", "m"])
+    if (d.review === "changes_requested") parts.push(["changes requested", "e"])
+    if (Number.isInteger(d.additions) && Number.isInteger(d.deletions) && d.additions + d.deletions >= BIG_CHANGE_LINES) parts.push([`+${d.additions}/-${d.deletions}`, "m"])
+    if (d.stale) parts.push(["(stale)", "w"])
+    return parts
+  }
+  const refStyle = (d) => (d.ci === "failing" || d.ci === "failed" ? "e" : d.ci && d.review === "approved" && (d.ci === "green" || d.ci === "passing") ? "s" : "")
+  const listSection = (section) => {
+    const by = new Map()
+    for (const d of section.list) {
+      const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
+      if (!by.has(repo)) by.set(repo, [])
+      by.get(repo).push(d)
+    }
+    const order = [...by.keys()].sort()
+    const entries = []
+    order.forEach((repo, gi) => {
+      { if (gi) out.push(blank()); out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), "b")) }
+      const items = by.get(repo).map((d, i) => ({ d, i })).sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i).map(({ d }) => d)
+      items.forEach((d, ei) => {
+        const url = urlOf(d)
+        const put = (l) => out.push(url ? { ...l, url } : l)
+        const tidyWith = (t) => tidyRefs(stripControls(t), repo, known)
+        const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
+        const age = ageSeg(d)
+        const full = section.need
+            const idText = isNotice(d) && Number.isInteger(d.number) ? `#${d.number}` : d.id
+        if (full) {
+          if (ei) out.push(blank())
+          // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
+          const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
+          for (const t of wrapText(shownHeadline, width, HEADLINE_LINES)) put(row(t, section.need ? "b" : ""))
+          const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
+          for (const r of rows) for (const t of wrapText(tidyWith(r.text), width, ROW_LINES)) put(row(t, "m"))
+          const left = [[oneLine(stripControls(idText + (Array.isArray(d.reported_by) && d.reported_by.length ? ` ${d.reported_by.join(",")}` : "")), width), "m"]]
+          if (isNotice(d)) for (const [t, st] of stateOf(d)) if (textOf(left).length + 3 + t.length + 1 + age[0].length <= width) left.push([" \u00b7 ", "m"], [t, st])
+          put({ segs: left, right: [age], id: d.id })
+        } else {
+          const room = Math.max(8, width - age[0].length - 1)
+          const flatText = oneLine(headline, room)
+          const segs = isNotice(d) && refStyle(d) ? (() => { const cut = flatText.indexOf(" "); return cut > 0 ? [[flatText.slice(0, cut), refStyle(d)], [flatText.slice(cut), ""]] : [[flatText, refStyle(d)]] })() : [[flatText, ""]]
+          put({ segs, right: [age], id: d.id })
+        }
+        entries.push(d)
+      })
+    })
+  }
+  for (const section of sections) {
+    out.push(blank())
+    const label = section.label
+    out.push(row(label, "b"))
+    if (section.key === "cos" && view.kind !== "human") {
+      const by = new Map()
+      for (const d of section.list) { const r = d.repo ?? "(no repo)"; if (!by.has(r)) by.set(r, []); by.get(r).push(d) }
+      for (const r of [...by.keys()].sort()) {
+        const list = by.get(r)
+        const oldest = Math.max(...list.map((d) => { const x = secondsOf(d); return Number.isNaN(x) ? 0 : x }))
+        out.push({ segs: [[stripControls(r === "(no repo)" || known.ambiguous(r) ? r : shortRepo(r)), ""]], right: [[`${list.length} \u00b7 oldest ${formatAge(oldest)}`, oldest >= AGE_ERROR_SECONDS ? "w" : "m"]] })
+      }
+      continue
+    }
+    listSection(section)
+  }
+  if (!sections.length) { out.push(blank()); out.push(row("nothing waiting", "m")) }
+  if (snapshot.errors.length) out.push(row(oneLine(`${snapshot.errors.length} source(s) unreadable`, width), "w"))
+  return out
+}
+
+// The styled lines as plain text, the right part flush to `width`: what the tests and the captures show.
+export function styledText(lines, width = ROW_WIDTH) {
+  return lines.map((l) => {
+    const left = textOf(l.segs)
+    if (!l.right) return left
+    const right = textOf(l.right)
+    return left + " ".repeat(Math.max(1, width - left.length - right.length)) + right
+  })
+}
+
 // Milliseconds until a list that is "ok" now turns stale if no pass touches the file again; null otherwise.
 export function msUntilStale(snapshot) {
   return snapshot.status === "ok" ? Math.max(1000, STALE_MS - snapshot.ageMs + 1000) : null

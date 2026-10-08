@@ -32,6 +32,20 @@ one line, then its whole title word-wrapped to 34 characters on the lines below.
   directory the daemon writes to by default, `$XDG_STATE_HOME/fleet-switchboard` or
   `$HOME/.local/state/fleet-switchboard`. A real install sets nothing, so the default is what runs.
 
+## The styled panel (issue 67)
+
+The default drawing, built by subtraction: only what has something in it, blank lines instead of rules.
+
+- **Top:** `Decisions` and the view label, then counts: `2 need you · 3 PRs · 5 with cos (3 over 1h)` (`need human` / `on cos` in the Chief
+  of Staff's or a repo's panel). A zero count is left out.
+- **What needs you:** two lines, the headline in **bold** and a muted id with its age on the right. **Heads-up:** one line, `#N` and the
+  headline, age on the right; the number is green (CI green and approved) or red (CI failing). The Chief of Staff's cos tier is one line per repo.
+- **Colours** are the TUI theme's, not fixed ones: muted ids and counts; warning for an age of a day or more and `over 1h`; success/error for the PR number.
+  A theme that lacks a colour gets the base colour; nothing fails.
+- **Repos:** a repo name once per group, `org/repo` shown as `repo` unless another repo in the file has the same name.
+- **Plain switch:** `FLEET_SWITCHBOARD_PANEL=plain` in the TUI's environment draws the earlier panel. Any error while drawing the styled panel also falls back to it.
+- **Roll back:** copy the previous `tui.tsx` and `decisions.mjs` over the installed ones (`<profile>/opencode/fleet-decisions/`) and restart the TUI.
+
 ## Using it
 
 OpenCode v2 loads a TUI plugin from `cli.json`, which names a **directory** that holds

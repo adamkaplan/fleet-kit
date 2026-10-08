@@ -1190,7 +1190,20 @@ disappears (design law: no disappearing UI): an empty list is a row `none`, and 
 missing, unreadable or stale file, or a state directory it cannot place, is a row
 `daemon not updating`. It watches the **directory** of `decisions.json` with
 `fs.watch`, because the file is replaced by rename, with one slow re-read every 60
-s and one timer for the moment a list would turn stale. It spawns no process, holds
+s and one timer for the moment a list would turn stale.
+
+**The styled panel (issue 67)** is the default drawing, built by subtraction. Top: `Decisions` with the view label flush right, then
+one line of counts: `N need you` (`need human` in the Chief of Staff's and a repo's panel) · `M PRs` · `K with cos` (`on cos` there),
+with `(J over 1h)` when some have waited over an hour; a count of 0 is left out. Then only the sections that have something, each a
+bold name, a repo name once per group (without its org when no other repo in the file has that name; refs to the group's own repo
+read `#N`), and blank lines instead of rules. What needs you is two lines: the headline in bold, then the id (muted) with its age flush
+right. A heads-up is one line: `#N` and the headline cut to fit, age flush right; the number is green when CI is green and the PR approved, red
+when CI fails, plain otherwise (the real id `pr:<repo>#N` is unchanged in the file; a heads-up is never answered by id). In the Chief of
+Staff's panel the cos tier is one line per repo (`3 · oldest 1d`) and is not listed. Ages are muted, warning from 24h. Colour is
+the TUI theme's (`text.muted`, `text.feedback.*`), never a fixed colour; a theme without a token draws that text in the base colour.
+Every line of an entry carries its link (see the links above). `FLEET_SWITCHBOARD_PANEL=plain` draws the earlier plain panel (and so does
+any error while drawing the styled one); `viewLines`, the Decision baseline's plain view, is unchanged and tested. To roll back, copy the
+previous `tui.tsx` and `decisions.mjs` over the installed ones and restart the TUI. It spawns no process, holds
 no credential and makes no network call; it reads only `decisions.json` in the state
 directory: `FLEET_SWITCHBOARD_STATE` when set (the trial's wrapper exports it), else the
 daemon's default, `$XDG_STATE_HOME/fleet-switchboard` or

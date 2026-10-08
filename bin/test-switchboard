@@ -24075,6 +24075,185 @@ console.log(JSON.stringify(out));
         self.assertEqual(done.returncode, 0, done.stderr)
         baseline_golden(self, "plugin-views", json.loads(done.stdout.strip().splitlines()[-1]))
 
+    STYLED_HARNESS = r"""
+import * as d from "%(url)s";
+import { readFileSync } from "node:fs";
+const input = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const snapshot = { status: "ok", decisions: input.decisions, errors: input.errors };
+const views = {
+  human: d.viewOf({}),
+  chief: d.viewOf({ [d.ROLE_ENV]: "chief-of-staff" }),
+  api: d.viewOf({ [d.REPO_ENV]: "acme/api" }),
+  web: d.viewOf({ [d.REPO_ENV]: "acme/web" }),
+};
+const out = {};
+for (const [name, view] of Object.entries(views)) {
+  const rows = d.styledRows(snapshot, input.nowMs, d.ROW_WIDTH, view);
+  out[name] = { text: d.styledText(rows, d.ROW_WIDTH), styles: rows.map((l) => [...l.segs, ...(l.right || [])].map((s) => s[1])), ids: rows.filter((l) => l.id).map((l) => l.id) };
+}
+out.stale = d.styledText(d.styledRows({ status: "stale", decisions: [], errors: [] }, input.nowMs));
+console.log(JSON.stringify(out));
+"""
+
+    def test_the_styled_views_over_the_daemons_file(self):
+        self.full_house()
+        self.world.tick(65 * 60)
+        self.daemon_pass()
+        body = self.file_body()
+        script = self.home / "plugin-styled-baseline.mjs"
+        script.write_text(self.STYLED_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        data = self.home / "decisions-input.json"
+        data.write_text(json.dumps({"decisions": body["decisions"], "errors": body["errors"],
+                                    "nowMs": int(round(self.world.clock.now() * 1000))}))
+        done = subprocess.run([NODE, str(script), str(data)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        got = json.loads(done.stdout.strip().splitlines()[-1])
+        for name in ("human", "chief", "api", "web"):
+            self.assertTrue(all(len(x) <= 34 for x in got[name]["text"]), name)
+            self.assertEqual(len(got[name]["text"]), len(got[name]["styles"]))
+        baseline_golden(self, "plugin-views-styled", got)
+
+
+STYLED_UNIT_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.parse("2026-10-08T12:00:00Z");
+const iso = (secs) => new Date(now - secs * 1000).toISOString();
+const mk = (id, repo, tier, headline, secs, extra = {}) => ({ id, repo, tier, title: "RAW " + headline, headline, since: iso(secs), ask: 1, ...extra });
+const snap = (decisions, errors = []) => ({ status: "ok", decisions, errors, ageMs: 0 });
+const chief = d.viewOf({ [d.ROLE_ENV]: "chief-of-staff" });
+const human = d.viewOf({});
+const rows = (decisions, view, errors) => d.styledRows(snap(decisions, errors), now, 34, view);
+const text = (decisions, view, errors) => d.styledText(rows(decisions, view, errors), 34);
+const pr = (number, repo, secs, extra = {}) => ({ id: "pr:" + repo + "#" + number, kind: "notice", tier: "human", repo, number, title: "x",
+  headline: repo + "#" + number + " Add a thing", since: iso(secs), ci: "green", review: "approved", additions: 1, deletions: 2, files: 3, ...extra });
+const textOf = (l) => l.segs.map((s) => s[0]).join("") + (l.right ? "|" + l.right.map((s) => s[0]).join("") : "");
+const r = {};
+r.mode = [d.panelModeOf({}), d.panelModeOf({ [d.PANEL_ENV]: "plain" }), d.panelModeOf({ [d.PANEL_ENV]: " PLAIN " }), d.panelModeOf({ [d.PANEL_ENV]: "styled" }), d.panelModeOf({ [d.PANEL_ENV]: "c" }), d.panelModeOf(null)];
+r.env = d.PANEL_ENV;
+// the layout
+const mix = [mk("a#1", "o/a", "human", "Which database?", 600), mk("a#2", "o/a", "human", "Pick a cache", 1200), mk("b#1", "o/b", "cos", "c1", 3601),
+  mk("b#2", "o/b", "cos", "c2", 100), mk("b#3", "o/b", "cos", "c3", 90000), pr(5, "o/a", 100), pr(6, "o/a", 4000, { ci: "failing", review: "none" }),
+  pr(7, "o/c", 90000, { ci: "pending", review: "none", additions: 900, deletions: 100 })];
+r.chief = text(mix, chief);
+r.human = text(mix, human);
+r.none = text([], human);
+r.onlyCos = text([mk("c#1", "o/c", "cos", "q", 100)], human);
+r.onlyPr = text([pr(5, "o/a", 100)], human);
+r.stale = d.styledText(d.styledRows({ status: "stale", decisions: [], errors: [] }, now));
+r.errors = text([], human, [{ source: "x" }]).slice(-1);
+// ages: muted, error-tinted... from a day
+r.tint = [0, 59, 3599, 3600, 86399, 86400, 999999].map((s) => d.ageStyle(s));
+r.tintConst = [d.AGE_WARN_SECONDS, d.AGE_ERROR_SECONDS];
+const lineWith = (decisions, view, pick) => rows(decisions, view).find(pick);
+r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "human", "x", s)], human, (l) => l.id === "web#1").right);
+r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
+// PR number coloured by state; the real id is kept on the line
+const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
+r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[0]);
+r.prId = [prLine({}).id, textOf(prLine({}))];
+// a decision that needs you: two lines, bold headline, id muted
+r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
+// ambiguity and refs
+const clash = [mk("web#1", "acme/web", "human", "see acme/web#9 and other/web#4 and web#3", 60), mk("web#2", "other/web", "human", "x", 60)];
+r.clash = text(clash, human);
+r.tidy = [d.tidyRefs("fix acme/web#9, api#4.", "acme/api", d.repoAmbiguity([{ repo: "acme/web" }, { repo: "acme/api" }])), d.shortRepo("acme/web"), String(d.repoAmbiguity([{ repo: "a/web" }, { repo: "b/web" }]).ambiguous("a/web"))];
+// theme
+const theme = { text: { muted: "M", feedback: { warning: { base: "W" }, error: { base: "E" }, success: { base: "S" }, info: { base: "I" } } } };
+r.theme = [d.themeColors(theme), d.themeColors(undefined), d.themeColors({}), d.themeColors({ get text() { throw new Error("boom"); } })];
+// the plain view is untouched, same order of decisions
+r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
+// links and control characters
+const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
+r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
+r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
+const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
+r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
+console.log(JSON.stringify(r));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsStyledPanel(unittest.TestCase):
+    """Issue 67: the styled panel's pure functions (decisions.mjs), over invented decisions."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "styled-harness.mjs"
+            script.write_text(STYLED_UNIT_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+            done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        cls.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_panel_is_styled_unless_the_environment_says_plain(self):
+        self.assertEqual(self.r["env"], "FLEET_SWITCHBOARD_PANEL")
+        self.assertEqual(self.r["mode"], ["styled", "plain", "plain", "styled", "styled", "styled"])
+
+    def test_the_layout_in_the_chief_of_staffs_view(self):
+        self.assertEqual(self.r["chief"], [
+            "Decisions                      all", "2 need human \u00b7 3 PRs", "3 on cos (2 over 1h)", " ",
+            "Waits on you", "a", "Pick a cache", "a#2" + " " * 28 + "20m", " ", "Which database?", "a#1" + " " * 28 + "10m", " ",
+            "Heads-up", "a", "#6 Add a thing" + " " * 15 + "1h06m", "#5 Add a thing" + " " * 18 + "1m", " ",
+            "c", "#7 Add a thing" + " " * 18 + "1d", " ",
+            "Waits on cos", "b" + " " * 20 + "3 \u00b7 oldest 1d"])
+
+    def test_a_humans_view_has_no_cos_section_only_a_count(self):
+        self.assertEqual(self.r["human"][:3], ["Decisions                  for you", "2 need you \u00b7 3 PRs", "3 with cos (2 over 1h)"])
+        self.assertNotIn("Waits on cos", self.r["human"])
+
+    def test_nothing_empty_is_drawn_and_no_rule(self):
+        self.assertEqual(self.r["none"], ["Decisions                  for you", "0 need you", " ", "nothing waiting"])
+        self.assertEqual(self.r["onlyCos"][1:], ["1 with cos", " ", "nothing waiting"])
+        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "#5 Add a thing" + " " * 18 + "1m"])
+        for name in ("chief", "human", "none", "onlyPr"):
+            for line in self.r[name]:
+                self.assertFalse(set(line) & set("\u2501\u2504"), line)
+            self.assertTrue(all(len(x) <= 34 for x in self.r[name]), name)
+
+    def test_the_age_is_muted_and_turns_warning_from_a_day(self):
+        self.assertEqual(self.r["tint"], ["m", "m", "m", "w", "w", "e", "e"], "ageStyle keeps the 1h/24h thresholds")
+        self.assertEqual(self.r["tintConst"], [3600, 86400])
+        self.assertEqual(self.r["ageSegs"], [[["30s", "m"]], [["59m", "m"]], [["23h59m", "m"]], [["1d", "w"]]])
+        self.assertEqual(self.r["ageLine"], "web#1|5m")
+
+    def test_the_pr_number_carries_the_state_and_the_real_id_is_kept(self):
+        self.assertEqual(self.r["prState"], [["#5", "e"], ["#5", "s"], ["#5", ""], ["#5", ""]])
+        self.assertEqual(self.r["prId"][0], "pr:o/a#5")
+
+    def test_what_needs_you_is_two_lines_bold_headline_and_a_quiet_id(self):
+        self.assertEqual(self.r["need"], [["a", ["b"]], ["Which database?", ["b"]], ["a#1|10m", ["m"]]])
+
+    def test_a_repo_name_is_shortened_only_when_unambiguous(self):
+        self.assertIn("acme/web", self.r["clash"])
+        self.assertIn("other/web", self.r["clash"])
+        self.assertIn("see #9 and other/web#4 and web#3", self.r["clash"])
+        self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "web", "true"])
+
+    def test_the_states_the_plain_view_has(self):
+        self.assertEqual(self.r["stale"], ["Decisions (?)", "daemon not updating"])
+        self.assertEqual(self.r["errors"], ["1 source(s) unreadable"])
+
+    def test_a_missing_or_broken_theme_gives_no_colour_and_never_throws(self):
+        full, none, empty, boom = self.r["theme"]
+        self.assertEqual(full, {"m": "M", "w": "W", "e": "E", "s": "S", "i": "I"})
+        self.assertEqual((none, empty, boom), ({}, {}, {}))
+
+    def test_the_plain_view_is_unchanged(self):
+        self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
+
+    def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
+        self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
+                                           ["web#1|1m", "https://github.com/acme/web/issues/12", True],
+                                           ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
+        self.assertEqual(self.r["noLink"], ["bad repo", "H"])
+        self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+
+    def test_the_tui_keeps_the_plain_drawer_and_falls_back_to_it(self):
+        source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
+        for needle in ("panelModeOf(process.env)", "plainPanel", "ErrorBoundary", "rows() != null", "themeColors(api.theme)",
+                       "view().sections", "THIN(ROW_WIDTH)", "HEAVY(ROW_WIDTH)"):
+            self.assertIn(needle, source)
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # The generic external adapter (bin/external_adapter.py): tested against a fake server that speaks a made-up
