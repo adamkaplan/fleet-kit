@@ -6,12 +6,16 @@ never on GitHub). One JSON object per line: {"n", "ts", "verdict", "role", "agen
 "done_when", "fired", "answers", "thresholds", "reason", "session", "label": null, "note": null}; a reviewer fills `label`
 with "right" or "wrong" (would the verdict, deny or ask, have been the right call for this call?) and a short `note`.
 
-  judge-sample [--audit FILE] [--out FILE] [--deny 40] [--ask 40] [--control 20] [--recent 800] [--seed 87]
+  judge-sample [--audit FILE] [--out FILE] [--deny 40] [--ask 40] [--control 20] [--recent 800] [--seed 87] [--since ISO]
+
+--since keeps only verdicts at or after that UTC time (for example the restart of a daemon that changed the judge). A kind with
+fewer verdicts than asked for gives what there is; the counts written, and any shortfall, are printed.
 
 The sample is drawn from the last --recent verdicts of each kind (a repeated identical call is counted once), round-robin
 across agents so one chatty agent does not fill it, and is reproducible for a seed.
 """
 import argparse
+import datetime
 import json
 import os
 import random
@@ -23,8 +27,24 @@ DEFAULT_AUDIT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expandu
 KINDS = {"would-deny": "deny", "would-ask": "ask", "unchanged": "control"}
 
 
-def read_verdicts(path):
-    """The shadow policy.judge rows that carry a verdict, oldest first. Unreadable lines are skipped."""
+def parse_since(text):
+    """The UTC datetime of an ISO time (`2026-10-08T22:14:34Z`, a `+00:00` offset or a naive time, taken as UTC), or ValueError."""
+    when = datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    return when.replace(tzinfo=datetime.timezone.utc) if when.tzinfo is None else when.astimezone(datetime.timezone.utc)
+
+
+def at_or_after(row, since):
+    """True when the row's ts is at or after `since` (None: no limit). A row with no readable ts is not."""
+    if since is None:
+        return True
+    try:
+        return parse_since(str(row.get("ts"))) >= since
+    except ValueError:
+        return False
+
+
+def read_verdicts(path, since=None):
+    """The shadow policy.judge rows that carry a verdict, oldest first, at or after `since`. Unreadable lines are skipped."""
     rows = []
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -36,7 +56,7 @@ def read_verdicts(path):
                 continue
             detail = row.get("detail") if isinstance(row, dict) else None
             if (row.get("event") == "policy.judge" and isinstance(detail, dict) and detail.get("shadow")
-                    and detail.get("judged") and detail.get("verdict") in KINDS):
+                    and detail.get("judged") and detail.get("verdict") in KINDS and at_or_after(row, since)):
                 rows.append(row)
     return rows
 
@@ -81,12 +101,18 @@ def main(argv=None):
     p.add_argument("--control", type=int, default=20)
     p.add_argument("--recent", type=int, default=800)
     p.add_argument("--seed", type=int, default=87)
+    p.add_argument("--since", help="only verdicts at or after this ISO time (UTC when it names no zone)")
     a = p.parse_args(argv)
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if os.path.abspath(a.out).startswith(here + os.sep):
         print("judge-sample: refusing to write inside the repo (the sample holds real content)", file=sys.stderr)
         return 2
-    rows = read_verdicts(a.audit)
+    try:
+        since = parse_since(a.since) if a.since else None
+    except ValueError:
+        print("judge-sample: --since is not an ISO time: %r" % a.since, file=sys.stderr)
+        return 2
+    rows = read_verdicts(a.audit, since)
     rng = random.Random(a.seed)
     picked = []
     for kind, count in (("deny", a.deny), ("ask", a.ask), ("control", a.control)):
@@ -96,7 +122,10 @@ def main(argv=None):
         for n, rec in enumerate(picked, 1):
             handle.write(json.dumps(dict(rec, n=n, label=None, note=None), ensure_ascii=False) + "\n")
     counts = {k: sum(1 for r in picked if KINDS_BY_VERDICT[r["verdict"]] == k) for k in ("deny", "ask", "control")}
-    print("judge-sample: %d verdicts read, %d written to %s (%s)" % (len(rows), len(picked), a.out, counts))
+    wanted = {"deny": a.deny, "ask": a.ask, "control": a.control}
+    short = ", ".join("%s %d of %d" % (k, counts[k], wanted[k]) for k in counts if counts[k] < wanted[k])
+    print("judge-sample: %d verdicts read%s, %d written to %s (%s)%s" % (
+        len(rows), " since %s" % a.since if a.since else "", len(picked), a.out, counts, "; fewer than asked: " + short if short else ""))
     return 0
 
 

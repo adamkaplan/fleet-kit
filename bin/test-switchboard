@@ -26345,6 +26345,39 @@ class TestJudgeSample(unittest.TestCase):
             self.assertEqual(bad.returncode, 2)
             self.assertFalse((REPO / "bin" / "never.jsonl").exists())
 
+    def test_since_keeps_only_later_verdicts_and_a_short_kind_gives_what_there_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = Path(tmp) / "audit.jsonl"
+            rows = []
+            for i, v in enumerate(["would-deny", "would-ask", "unchanged"] * 4):
+                row = self.row(i, v)
+                row["ts"] = "2026-10-08T22:%02d:00.000Z" % (10 + i)   # 22:10 ... 22:21
+                rows.append(row)
+            bad = self.row(99, "would-deny")
+            bad["ts"] = "garbage"
+            rows.append(bad)
+            audit.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            out = Path(tmp) / "s.jsonl"
+
+            def run(*extra):
+                return subprocess.run([sys.executable, str(REPO / "bin" / "judge-sample"), "--audit", str(audit), "--out", str(out),
+                                       "--deny", "40", "--ask", "40", "--control", "40", *extra], capture_output=True, text=True)
+            done = run("--since", "2026-10-08T22:14:00Z")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            got = [json.loads(l) for l in out.read_text().splitlines()]
+            self.assertTrue(all(r["ts"] >= "2026-10-08T22:14" for r in got))
+            self.assertEqual(len(got), 8, "the garbage ts and the verdicts before 22:14 are out; 22:14 itself is in")
+            self.assertIn("fewer than asked", done.stdout)
+            self.assertIn("deny 2 of 40", done.stdout)
+            self.assertIn("since 2026-10-08T22:14:00Z", done.stdout)
+            for given in ("2026-10-08T22:14:00+00:00", "2026-10-08T22:14:00", "2026-10-08T23:14:00+01:00"):
+                run("--since", given)
+                self.assertEqual(len(out.read_text().splitlines()), 8, given)
+            self.assertEqual(len(run("--since", "2026-10-08T22:15:00Z") and out.read_text().splitlines()), 7)
+            self.assertEqual(run("--since", "yesterday").returncode, 2)
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(len(out.read_text().splitlines()), 12, "no --since: every verdict, still under the asked counts")
+
 
 class TestExternalDecisionConfig(unittest.TestCase):
     def check(self, section):
