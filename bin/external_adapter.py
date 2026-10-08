@@ -65,7 +65,8 @@ idempotency_key) with operation {op: raise|revise|status|withdraw, key, external
 note} returns {external_id, url}; lookup(key) -> {external_id, revision} | None; pull_changes(cursor) -> (events,
 next_cursor) with port events {event_id, external_id, type: answered|clarify|reversed|withdrawn, answered_by:
 project agent|owner's agent|human (unknown when no role rule matches), option_id, text, at}. acted(), read_items(),
-pull_normalised() and the work client are extras outside the port.
+pull_normalised() and the work client are extras outside the port. A status operation (a tier change or a note)
+when the mapping defines none is a no-op that stays local, not an error: the engine would retry an error forever.
 
 Python 3.9+, standard library only.
 """
@@ -1208,7 +1209,8 @@ class McpRestAdapter(decision_core.ExternalDecisionAdapter):
                        ident=ident)
 
     def _status(self, ident, d, key, decision_key=None, note=None):
-        self._need("status")
+        if "status" not in self.m.operations:
+            return   # the other side has no such operation: the tier change or note stays local (no "status" capability)
         f = self.m.fields.get("status", {})
         body = {f["idempotency"]: self._uuid_of(key)} if f.get("idempotency") else {}
         for name in ("status", "tier"):

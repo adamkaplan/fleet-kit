@@ -24314,9 +24314,12 @@ class TestExternalAdapterOperations(ExternalAdapterCase):
         with self.assertRaises(EA.InvalidRequest):
             self.push(adapter, {"op": "revise", "external_id": ident}, "k-r2")
 
-    def test_status_is_unsupported_without_a_mapping_for_it(self):
-        with self.assertRaises(EA.Unsupported):
-            self.push(self.adapter(), {"op": "status", "external_id": "x", "status": "s"}, "k")
+    def test_status_without_a_mapping_for_it_is_a_local_only_no_op_not_an_error(self):
+        adapter = self.adapter()
+        self.assertNotIn("status", adapter.capabilities)
+        before = len(self.server.log)
+        self.assertEqual(self.push(adapter, {"op": "status", "external_id": "x", "status": "s"}, "k"), "x")
+        self.assertEqual(len(self.server.log), before, "nothing was sent: the engine must not retry it forever")
 
     def test_idempotent_replay_and_conflict(self):
         for channel in self.each_channel():
