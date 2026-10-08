@@ -6524,6 +6524,9 @@ def forwarder_health(watch, now):
     health = {"live": live, "up_age": max(0, now - started) if live and started is not None else None,
               "down_age": None, "drops_hour": len(drops), "last_drop_age": max(0, now - drops[-1][0]) if drops else None,
               "alarm": None}
+    if watch.get("mode") == "conflict":  # someone else forwards, by intent; catch-up reads continue: not an alarm
+        health["quiet"] = "conflict"
+        return health
     if not live and watch.get("down_since") is not None and watch.get("mode") not in ("polling", "failed"):
         health["down_age"] = max(0, now - watch["down_since"])
         if health["down_age"] > FORWARDER_DOWN_ALARM:
@@ -7517,6 +7520,8 @@ class GitHubHub:
     def _failed(self, watch, now, reason):
         with self.lock:
             watch.failures += 1
+            if watch.down_since is None:  # a spawn that failed never ran, so _exited did not set it
+                watch.down_since = now
             delay = min(self.backoff_max, self.backoff_base * 2 ** (watch.failures - 1))
             watch.state, watch.next_start, watch.last_error = "backoff", now + delay, reason
         self._audit("github.watch", watch.repo, {"state": "backoff", "failures": watch.failures,
@@ -7642,7 +7647,7 @@ def format_github(report):
         health = entry.get("health")
         if health and health["live"]:
             line += ", live, up %s" % format_age(health["up_age"] or 0)
-        elif health and health["down_age"] is not None:
+        elif health and health["down_age"] is not None and not health.get("quiet"):
             line += ", down %s" % format_age(health["down_age"])
         line += "  account %s" % entry["account"]
         if health and health["drops_hour"]:
