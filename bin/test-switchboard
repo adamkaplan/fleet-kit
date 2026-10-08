@@ -14687,7 +14687,9 @@ class TestDecisionsPluginSource(unittest.TestCase):
 
     def test_it_is_read_only_holds_no_credential_spawns_nothing_and_calls_nothing_over_the_network(self):
         for name in ("tui.tsx", "decisions.mjs"):
-            code = self.code(name).lower()
+            # the one link host the panel may name (https://github.com, a row's issue or PR) and the one mouse
+            # handler it may have (onMouseUp on a row: copy its link) are the only exceptions; nothing else changes
+            code = self.code(name).lower().replace("https:", "").replace("onmouseup", "")
             for needle in ("child_process", "spawn", "exec(", "execsync", "fetch(", "http", "net\"", "api.client",
                            "writefile", "token", "secret", "password", "openrouter", "onmouse", "dialog", "keymap",
                            "insertText".lower()):
@@ -23719,6 +23721,12 @@ r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
 const ids = (rows) => rows.filter((l) => l.id).map((l) => l.id);
 r.sameOrder = JSON.stringify(ids(d.styledRows(snap(mix), now, 34, chief)).filter((x) => !x.startsWith("pr:") && !x.startsWith("#"))) ;
 r.plainOrder = JSON.stringify(d.buildView(snap(mix), now, 34, chief).sections.flatMap((s) => s.groups.flatMap((g) => g.entries.map((e) => e.key))).filter((k) => !k.startsWith("pr:")));
+// links: every line of an entry carries its URL, the id line is the one with `id`; a title cannot smuggle a control character
+const linked = d.styledRows(snap([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })]), now, 34, human);
+r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
+r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
+const esc = d.styledRows(snap([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })]), now, 34, human);
+r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|row/.test(t));
 console.log(JSON.stringify(r));
 """
 
@@ -23805,6 +23813,15 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_the_order_is_the_plain_views_and_the_plain_view_is_unchanged(self):
         self.assertEqual(self.r["sameOrder"], self.r["plainOrder"])
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
+
+    def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
+        self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
+                                           ["web#1|1m", "https://github.com/acme/web/issues/12", True],
+                                           ["#5 Add a thing", "https://github.com/acme/web/pull/5", False],
+                                           ["+1/-2, 3 files, CI green, approved", "https://github.com/acme/web/pull/5", False],
+                                           ["#5|1m", "https://github.com/acme/web/pull/5", True]])
+        self.assertEqual(self.r["noLink"], ["bad repo", "H"])
+        self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
 
     def test_the_tui_keeps_the_plain_drawer_and_falls_back_to_it(self):
         source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
@@ -26359,6 +26376,99 @@ class TestPermanentRefusals(ExternalWorld):
         self.assertEqual(len([c for c in self.fake.calls if c[0] == "withdraw"]), 1)
         self.assertEqual(len(self.audit_events("external.permanent_failure")), 1)
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "open")
+
+
+LINK_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.parse("2026-03-04T12:00:00Z");
+const iso = (ms) => new Date(ms).toISOString();
+const dec = (id, extra) => ({ id, tier: "human", kind: "issue", title: "t " + id, headline: "t " + id, since: iso(now - 60000), ...extra });
+const list = [
+  dec("web#5", { repo: "acme/web", ask: 5 }),
+  dec("rep#6", { repo: "acme/web", ask: "6", kind: "report" }),
+  dec("batch#7", { repo: "acme/api", ask: 7, rows: [{ text: "a: b" }] }),
+  dec("pr:web#9", { repo: "acme/web", kind: "notice", number: 9, state: "open" }),
+  dec("untagged", { kind: "report" }),
+  dec("norepo", { ask: 3 }),
+  dec("nonum", { repo: "acme/web", ask: null }),
+  dec("nonumnotice", { repo: "acme/web", kind: "notice" }),
+];
+const bad = ["acme/web/../x", "../web", "a b/c", "acme/web\x1b", "acme/web#1", "/web", "acme/", "acme//web", "https://evil/x", "acme/web?q=1", ".", "a/.."];
+const evil = "\x1b]8;;https://evil.example\x07click\x1b]8;;\x07 \x9b31m \x1b\\";
+const snap = { status: "ok", decisions: list, errors: [], ageMs: 0 };
+const view = d.buildView(snap, now, 34, d.viewOf({ FLEET_SWITCHBOARD_ROLE: "chief-of-staff" }));
+const plain = d.viewLines(view);
+const entries = view.sections.flatMap((s) => s.groups.flatMap((g) => g.entries));
+const withEvilTitle = d.entryOf(dec("web#5", { repo: "acme/web", ask: 5, title: evil, headline: evil }), now);
+console.log(JSON.stringify({
+  urls: Object.fromEntries(list.map((x) => [x.id, d.urlOf(x)])),
+  badRepos: bad.map((r) => d.urlOf({ id: "x", repo: r, ask: 1, title: "t" })),
+  badNumbers: [0, -1, 1.5, "1x", "01", "", null, undefined, "1 ", 1e12, [1], { n: 1 }].map((n) => d.urlOf({ id: "x", repo: "acme/web", ask: n, title: "t" })),
+  badNoticeNumbers: [0, "9/../x", null].map((n) => d.urlOf({ id: "x", repo: "acme/web", kind: "notice", number: n, title: "t" })),
+  entryUrls: Object.fromEntries(entries.map((e) => [e.key, "url" in e ? e.url : "ABSENT"])),
+  plain,
+  stripped: d.stripControls(evil),
+  safe: [d.safeUrl("https://github.com/acme/web/issues/5"), d.safeUrl("https://github.com/acme/web/pull/9"),
+         d.safeUrl("https://github.com/acme/web/issues/5\x07"), d.safeUrl("https://github.com/acme/web/issues/5\x1b]8;;"),
+         d.safeUrl("http://github.com/acme/web/issues/5"), d.safeUrl("https://evil.example/acme/web/issues/5"),
+         d.safeUrl("https://github.com/acme/web/issues/5 "), d.safeUrl(null), d.safeUrl(5)],
+  evilEntry: withEvilTitle,
+  widths: plain.map((l) => l.length),
+}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPanelLinks(Base):
+    """Issue 66: a row links to its issue or PR (the TUI draws it as an OSC 8 link and copies it on click)."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.home / "link-harness.mjs"
+        script.write_text(LINK_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_url_of_every_kind(self):
+        u = self.r["urls"]
+        self.assertEqual(u["web#5"], "https://github.com/acme/web/issues/5")      # an issue decision
+        self.assertEqual(u["rep#6"], "https://github.com/acme/web/issues/6")      # a report with an issue number (string)
+        self.assertEqual(u["batch#7"], "https://github.com/acme/api/issues/7")    # a batch
+        self.assertEqual(u["pr:web#9"], "https://github.com/acme/web/pull/9")     # a heads-up: its PR
+
+    def test_a_row_without_a_repo_or_a_number_has_no_link_and_is_otherwise_unchanged(self):
+        u = self.r["urls"]
+        for key in ("untagged", "norepo", "nonum", "nonumnotice"):
+            self.assertIsNone(u[key], key)
+        for key in ("untagged", "norepo", "nonum", "nonumnotice"):
+            self.assertEqual(self.r["entryUrls"].get(key, "ABSENT"), "ABSENT", key)  # no url key at all
+        self.assertEqual(self.r["entryUrls"]["web#5"], "https://github.com/acme/web/issues/5")
+
+    def test_a_repo_or_number_that_is_not_strictly_valid_gives_no_url(self):
+        self.assertEqual(self.r["badRepos"], [None] * len(self.r["badRepos"]))
+        self.assertEqual(self.r["badNumbers"], [None] * len(self.r["badNumbers"]))
+        self.assertEqual(self.r["badNoticeNumbers"], [None, None, None])
+
+    def test_the_plain_text_view_and_its_width_are_unchanged_by_links(self):
+        text = "\n".join(self.r["plain"])
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("github.com", text)  # the link is an attribute the terminal gets, never visible text
+        self.assertTrue(all(w <= 34 for w in self.r["widths"]))
+
+    def test_a_malicious_title_cannot_reach_the_link_or_an_escape(self):
+        entry = self.r["evilEntry"]
+        self.assertEqual(entry["url"], "https://github.com/acme/web/issues/5")  # from repo and ask only
+        self.assertNotIn("evil", entry["url"])
+        self.assertEqual(self.r["stripped"], "]8;;https://evil.example" + "click]8;; " + "31m " + "\\")
+        self.assertEqual(" ".join(entry["lines"]).count("\x1b"), 0)  # and none is drawn from a title
+        for control in ("\x1b", "\x07", "\x9b", "\x9d", "\x9c"):
+            self.assertNotIn(control, self.r["stripped"])
+
+    def test_only_a_url_the_panel_could_have_built_may_be_given_to_the_terminal(self):
+        good1, good2, *rest = self.r["safe"]
+        self.assertEqual((good1, good2), ("https://github.com/acme/web/issues/5", "https://github.com/acme/web/pull/9"))
+        self.assertEqual(rest, [None] * len(rest))
 
 
 def main(argv):

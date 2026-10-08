@@ -47,6 +47,30 @@ export function noticesFor(decisions, view) {
   return view.kind === "repo" ? all.filter((d) => d.repo === view.repo) : all
 }
 
+// ---- links. A row links to its issue or PR so a click can open it. The URL is built ONLY from a repo and a
+// number that match a strict pattern, never from a title or any other text of the entry, so nothing a title
+// says can reach a terminal escape. A row with no repo or no number has no link.
+export const REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$/
+const NUMBER_PATTERN = /^[1-9][0-9]{0,8}$/
+
+// The issue (a decision) or PR (a heads-up) URL of an entry, or null.
+export function urlOf(d) {
+  if (!d || typeof d.repo !== "string" || !REPO_PATTERN.test(d.repo) || d.repo.split("/").some((p) => p === "." || p === "..")) return null
+  const raw = isNotice(d) ? d.number : d.ask
+  const n = typeof raw === "number" || typeof raw === "string" ? String(raw) : ""
+  if (!NUMBER_PATTERN.test(n)) return null
+  return `https://github.com/${d.repo}/${isNotice(d) ? "pull" : "issues"}/${n}`
+}
+
+// Text safe to put on a line the terminal draws: every control character except tab and line breaks (which wrap
+// collapses to a space) removed: C0, DEL, C1: ESC, BEL, the 8-bit CSI/OSC introducers and string terminators.
+export const stripControls = (text) => String(text ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+
+// A URL that may be handed to the terminal: only one urlOf can build, re-checked here, or null.
+export function safeUrl(url) {
+  return typeof url === "string" && /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+\/(issues|pull)\/[1-9][0-9]{0,8}$/.test(url) ? url : null
+}
+
 // "14:05 UTC" from an ISO time: UTC, like every time the daemon writes, so the panel and the file agree.
 export function clockOf(iso) {
   const t = Date.parse(iso)
@@ -160,11 +184,13 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const age = Number.isNaN(since) ? "?" : formatAge((nowMs - since) / 1000)
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
-  const text = typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title
+  const text = stripControls(typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title)
   const entry = { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
   // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
-  if (rows.length) entry.rows = rows.map((r) => wrapText(r.text, width, ROW_LINES))
+  if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
+  const url = urlOf(decision)
+  if (url) entry.url = url  // only when there is one: an entry without a link is exactly what it was
   if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
   return entry
 }
@@ -386,22 +412,24 @@ export function styledRows(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
     }
     ;[...by.keys()].sort().forEach((repo, gi) => {
       if (gi) out.push(rule("\u2501"))
-      out.push(row(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo), "b"))
+      out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), "b"))
       by.get(repo).map((d, i) => ({ d, i })).sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i).forEach(({ d }, ei) => {
         if (ei) out.push(rule("\u2504"))
-        const headline = typeof d.headline === "string" && d.headline ? d.headline : d.title
-        for (const t of wrapText(tidyRefs(headline, repo, known), width, HEADLINE_LINES)) out.push(row(t, section.need ? "b" : ""))
+        const url = urlOf(d)  // every line of the entry carries it (a click anywhere on the entry copies it); the id line is the OSC 8 link
+        const put = (line) => out.push(url ? { ...line, url } : line)
+        const headline = stripControls(typeof d.headline === "string" && d.headline ? d.headline : d.title)
+        for (const t of wrapText(tidyRefs(headline, repo, known), width, HEADLINE_LINES)) put(row(t, section.need ? "b" : ""))
         const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
-        for (const r of rows) for (const t of wrapText(tidyRefs(r.text, repo, known), width, ROW_LINES)) out.push(row(t, "m"))
-        if (isNotice(d)) for (const segs of factsSegments(d, width)) out.push({ segs })
+        for (const r of rows) for (const t of wrapText(tidyRefs(stripControls(r.text), repo, known), width, ROW_LINES)) put(row(t, "m"))
+        if (isNotice(d)) for (const segs of factsSegments(d, width)) put({ segs })
         const seconds = secondsOf(d)
         const age = Number.isNaN(seconds) ? "?" : formatAge(seconds)
         const via = Array.isArray(d.reported_by) && d.reported_by.length ? ` ${d.reported_by.join(",")}` : ""
         const shownId = isNotice(d) && Number.isInteger(d.number) ? `#${d.number}` : d.id  // a heads-up is never answered by id
-        const left = oneLine(`${shownId}${via}`, width)
+        const left = oneLine(stripControls(`${shownId}${via}`), width)
         const rightSegs = [[age, Number.isNaN(seconds) ? "m" : ageStyle(seconds)]]
-        if (left.length + 1 + age.length <= width) out.push({ segs: [[left, "m"]], right: rightSegs, id: d.id })
-        else out.push({ segs: [[left, "m"]], id: d.id }, { segs: [], right: rightSegs })
+        if (left.length + 1 + age.length <= width) put({ segs: [[left, "m"]], right: rightSegs, id: d.id })
+        else { put({ segs: [[left, "m"]], id: d.id }); put({ segs: [], right: rightSegs }) }
       })
     })
   }
