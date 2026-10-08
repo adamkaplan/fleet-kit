@@ -9226,132 +9226,126 @@ def _plain_words(text):
 
 
 # ---- the routine-local pre-filter (issue 87). The judge compared every step of an agent to the ask's Done-when and
-# asked "outside the intent?" of a `git grep`, a test run or a label on its own PR: 77 of 80 would-deny/ask verdicts in a
-# labelled sample were wrong. A step that is plainly local and reversible, or a read, needs no model: the code answers
-# "nothing at its threshold" for it. It only ever REMOVES the judge's own extra strictness for a call it can read with
-# certainty; the configured outcome is combined as always (never loosened: invariant 9), and anything it is unsure of
-# (substitution, a glob, a heredoc, a path outside the worktree, an unknown command) goes to the model as before.
-_ROUTINE_READ = frozenset("""ls cat head tail wc grep egrep fgrep rg sort uniq cut tr echo printf date pwd true false test diff jq
-basename dirname which stat file sleep nl column realpath readlink""".split())
-_ROUTINE_GIT = frozenset("""status diff log show grep rev-parse rev-list ls-files ls-tree merge-base blame cat-file hash-object
-commit-tree add commit stash fetch describe name-rev shortlog show-ref diff-tree check-ignore symbolic-ref""".split())
-_ROUTINE_GIT_FLAGS_REFUSED = re.compile(r"^(?:-[CcdDf]|--(?:git-dir|work-tree|delete|force|hard))$")  # redirects git, deletes, forces
-_ROUTINE_GH_READ = {"pr": ("view", "list", "diff", "checks", "status"), "issue": ("view", "list", "status"),
-                    "run": ("view", "list"), "release": ("view", "list"), "repo": ("view",), "workflow": ("view", "list")}
-_ROUTINE_GH_API_WRITE = re.compile(r"^(?:-X|-f|-F|--(?:method|field|raw-field|input))")  # a gh api call that is not a plain GET
-_ROUTINE_SB = frozenset(("report", "intent", "intents", "status", "pending", "remind"))
-_ROUTINE_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\||\n)\s*")
-_ROUTINE_NOISE = re.compile(r"\s*(?:[12]?>\s*/dev/null|2>&1|&>\s*/dev/null)(?=\s|$)")
+# asked "outside the intent?" of a `git grep`, a test run or a report to its boss: 77 of 80 would-deny/ask verdicts in a
+# labelled sample were wrong. A plainly local, read-only or reversible step needs no model: the code answers "nothing at
+# its threshold" for it. It only ever REMOVES the judge's own extra strictness for a call it can read with certainty; the
+# configured outcome is combined as always (never loosened: invariant 9).
+#
+# FAIL CLOSED, a strict allowlist (review of PR #90): a command is routine only when it is ONE simple command, with no
+# environment prefix, no redirect, no chaining, pipe or substitution, no wrapper (`nice`, `timeout`), no `..`, no absolute or home
+# path and no dotfile or credential-looking name, whose command word is in the table below and whose EVERY flag is listed for
+# it (an unknown flag, a flag with an unlisted value, or a missing required argument is not routine). Anything else, including
+# every `sed`, `sort`, `rg`, `find`, `gh`, `cp`, `rm`, `curl`, shell, interpreter script or heredoc, goes to the model as before.
+# A symlink inside the worktree that points outside it cannot be seen from the text: the model still judges what such a link
+# is for only when a path is unusual; this is a known limit, not a proof.
+_ROUTINE_NAME = re.compile(r"^[A-Za-z0-9._/@^+=-]{1,200}$")
+_ROUTINE_SECRETISH = re.compile(r"(?i)(secret|credential|token|passw|\.pem$|\.key$|\.p12$|id_rsa|id_ed25519|netrc|npmrc|pypirc|keystore|private)")
+_ROUTINE_NUMBER = re.compile(r"^[0-9]{1,6}$")
 
 
-def _routine_split(text):
-    """The segments of a command line at `;` `&&` `||` `|` and newlines outside quotes, or None for an unbalanced quote."""
-    segments, current, quote = [], [], None
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if quote:
-            current.append(ch)
-            if ch == quote:
-                quote = None
-        elif ch in "'\"":
-            quote = ch
-            current.append(ch)
-        elif ch == ";" or ch == "\n" or ch == "|" or (ch == "&" and text[i + 1:i + 2] == "&"):
-            segments.append("".join(current))
-            current = []
-            if ch in "|&" and text[i + 1:i + 2] == ch:
-                i += 1
-        else:
-            current.append(ch)
-        i += 1
-    if quote:
-        return None
-    segments.append("".join(current))
-    return [x.strip() for x in segments if x.strip()]
-
-
-def _routine_path_ok(word):
-    """A path argument that stays inside the worktree or the temp directory: relative with no `..`, or under /tmp."""
-    if word in ("/dev/null", "-"):
-        return True
-    if word.startswith("/tmp/") or word.startswith("/private/tmp/"):
-        return ".." not in word.split("/")
-    return not word.startswith(("/", "~")) and ".." not in word.split("/")
-
-
-def _routine_segment(words):
-    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
-        words = words[1:]  # FOO=bar cmd
-    while words and words[0] in ("nice", "timeout", "time", "command"):
-        wrapper, words = words[0], words[1:]
-        while words and (words[0].startswith("-") or (wrapper == "timeout" and re.match(r"^[0-9.]+[smhd]?$", words[0]))
-                         or (wrapper == "nice" and re.match(r"^[0-9]+$", words[0]))):
-            words = words[1:]
-    if not words:
+def _routine_path(word):
+    """A path or revision that stays inside the worktree: relative, no `..`, no dotfile or credential-looking part, plain characters."""
+    if not _ROUTINE_NAME.match(word) or word.startswith(("/", "-", "=")) or _ROUTINE_SECRETISH.search(word):
         return False
-    head, rest = os.path.basename(words[0]), words[1:]
-    if head in _ROUTINE_READ:
-        return True
-    if head == "cd":
-        return len(rest) <= 1 and all(_routine_path_ok(w) for w in rest)
-    if head == "find":
-        return not any(w in ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls") for w in rest)
-    if head == "sed":
-        scripts = [w for w in rest if not w.startswith("-")]
-        if any(re.search(r"/[a-zA-Z]*e[a-zA-Z]*$", w) for w in scripts):
+    if ".." in word:
+        return False
+    for part in word.split("/"):
+        if part.startswith(".") and part not in (".", ""):
             return False
-        in_place = any(w == "-i" or w.startswith("-i") or w == "--in-place" for w in rest)
-        return not in_place or (len(scripts) >= 2 and _routine_path_ok(scripts[-1]) and not any(w.startswith("/") for w in scripts[:-1]))
-    if head in ("cp", "mv", "mkdir", "touch"):
-        return all(w.startswith("-") or _routine_path_ok(w) for w in rest)
-    if head == "rm":
-        return all(re.match(r"^-[fv]+$", w) or (not w.startswith("-") and (w.startswith("/tmp/") or w.startswith("/private/tmp/")) and _routine_path_ok(w)) for w in rest)
-    if head == "git":
-        if not rest or any(_ROUTINE_GIT_FLAGS_REFUSED.match(w) for w in rest) or rest[0].startswith("-"):
-            return False
-        if rest[0] == "branch":
-            return all(w in ("--list", "-a", "-r", "-v", "-vv", "--show-current", "--contains") or not w.startswith("-") for w in rest[1:]) and "-m" not in rest and "-M" not in rest
-        if rest[0] in ("config",):
-            return len(rest) > 1 and rest[1] in ("--get", "--list", "-l", "--get-all")
-        if rest[0] == "remote":
-            return rest[1:] in ([], ["-v"])
-        return rest[0] in _ROUTINE_GIT and not (rest[0] == "stash" and any(w in ("drop", "clear") for w in rest))
-    if head == "gh":
-        if len(rest) >= 2 and rest[0] in _ROUTINE_GH_READ and rest[1] in _ROUTINE_GH_READ[rest[0]]:
-            return True
-        if len(rest) >= 2 and rest[0] == "pr" and rest[1] == "edit":  # labelling its own work: flags --add-label / --remove-label only
-            flags = [w for w in rest[2:] if w.startswith("-")]
-            return bool(flags) and all(f in ("--add-label", "--remove-label") for f in flags)
-        if rest[:1] == ["api"]:
-            return not any(_ROUTINE_GH_API_WRITE.match(w) for w in rest[1:])
-        return rest[:2] == ["auth", "status"]
-    if head == PROG:
-        return bool(rest) and rest[0] in _ROUTINE_SB
-    if head == "node":
-        return rest[:1] in (["--test"], ["--check"]) and all(w.startswith("-") or _routine_path_ok(w) for w in rest[1:])
-    if head in ("python3", "python"):
-        if rest[:2] == ["-m", "pytest"] or rest[:2] == ["-m", "unittest"] or rest[:2] == ["-m", "py_compile"]:
-            return True
-        return len(rest) >= 1 and re.match(r"^(\./)?bin/test-[A-Za-z0-9_-]+$", rest[0]) is not None
-    if head in ("npm", "pnpm", "yarn"):
-        return rest[:1] == ["test"] or rest[:2] == ["run", "test"]
-    return False
+    return "=" not in word
+
+
+# command -> (flags without a value, flags with a value that is a number, flags with a free text value, minimum paths, kind of positionals)
+F = lambda text: set(text.split())  # the flags of a command, one string each: the allowlist is data
+_ROUTINE_SPEC = {
+    ("ls",): (F("-l -a -1 -h -t -la -al -lh -lah -lt -ltr -lR -R -d"), set(), set(), 0, "paths"),
+    ("cat",): (F("-n"), set(), set(), 1, "paths"),
+    ("head",): (set(), F("-n"), set(), 1, "paths"),
+    ("tail",): (set(), F("-n"), set(), 1, "paths"),
+    ("wc",): (F("-l -w -c"), set(), set(), 1, "paths"),
+    ("grep",): (F("-n -i -l -c -w -F -E -r -I -v -h -H -s -q"), set(), set(), 2, "pattern"),
+    ("git", "grep"): (F("-n -i -l -c -w -F -E -I -v -h --no-color --cached"), set(), set(), 0, "pattern"),
+    ("git", "status"): (F("-s --short -b --branch --porcelain --no-color"), set(), set(), 0, "paths"),
+    ("git", "diff"): (F("--stat --name-only --name-status --cached --staged --no-color --numstat --shortstat --"), set(), set(), 0, "paths"),
+    ("git", "log"): (F("--oneline --graph --decorate --stat --name-only --no-color --"), F("-n"), set(), 0, "paths"),
+    ("git", "show"): (F("--stat --name-only --oneline --no-color --"), set(), set(), 0, "paths"),
+    ("git", "rev-parse"): (F("--short --abbrev-ref --verify"), set(), set(), 1, "paths"),
+    ("git", "add"): (F("-A --all -u --update --"), set(), set(), 0, "paths"),
+    ("git", "commit"): (F("-a --amend --no-edit --allow-empty -q"), set(), F("-m"), 0, "none"),
+}
+_ROUTINE_NUMERIC_FLAG = re.compile(r"^-[0-9]{1,4}$")  # git log -5, head -5, tail -5
+_ROUTINE_NO_ARG = {("pwd",), ("uptime",), ("true",)}
+_ROUTINE_REPORT_STATES = ("done", "failed", "blocked", "question", "working", "paused", "withdrawn")
 
 
 def routine_local(text):
-    """True only for a shell command every segment of which is a read, or a local reversible step inside the worktree
-    (a test run, a git add/commit, a label on its own PR, a report to its boss). False for anything this is unsure about."""
-    if not isinstance(text, str) or not text.strip() or len(text) > POLICY_ARG_LIMIT or "\x00" in text:
+    """True only for ONE simple command that is a read or a local reversible step inside the worktree and is on the strict
+    allowlist above, flags included. False for anything this is unsure about."""
+    if not isinstance(text, str) or not text.strip() or len(text) > 1000 or "\n" in text or "\r" in text or "\x00" in text:
         return False
-    segments = _routine_split(_ROUTINE_NOISE.sub("", text))
-    if not segments:
+    words = _plain_words(text)  # no operator, redirect, substitution, glob, comment, `~`, heredoc or unbalanced quote
+    if not words or "=" in words[0] or "/" in words[0]:
         return False
-    for segment in segments:
-        words = _plain_words(segment)  # no substitution, no redirect, no glob, no heredoc, no unbalanced quote
-        if not words or not _routine_segment(words):
+    head = words[0]
+    # fleet-switchboard report <state> [--issue N] "<one line>": the agent's own report to its boss
+    if head == PROG:
+        rest = words[1:]
+        if len(rest) < 2 or rest[0] != "report" or rest[1] not in _ROUTINE_REPORT_STATES:
             return False
-    return True
+        rest = rest[2:]
+        if rest[:1] == ["--issue"]:
+            if len(rest) < 2 or not _ROUTINE_NUMBER.match(rest[1]):
+                return False
+            rest = rest[2:]
+        return len(rest) == 1 and not rest[0].startswith("-")
+    if head == "sleep":
+        return len(words) == 2 and bool(_ROUTINE_NUMBER.match(words[1]))
+    if head == "node":  # node --test <paths>: the agent's own tests
+        return words[1:2] == ["--test"] and len(words) > 2 and all(_routine_path(w) for w in words[2:])
+    if head in ("python3", "python") and len(words) >= 2 and re.match(r"^bin/test-[A-Za-z0-9_-]+$", words[1]):
+        return all(re.match(r"^[A-Za-z0-9_.]+$", w) for w in words[2:])  # `python3 bin/test-x TestClass.test_name`
+    key = (head, words[1]) if head == "git" and len(words) > 1 else (head,)
+    if key in _ROUTINE_NO_ARG:
+        return len(words) == 1
+    spec = _ROUTINE_SPEC.get(key)
+    if spec is None:
+        return False
+    flags, numeric, texty, need, kind = spec
+    rest = words[len(key):]
+    paths, patterns, i, only_paths = [], [], 0, False
+    while i < len(rest):
+        w = rest[i]
+        if only_paths or not w.startswith("-"):
+            if kind == "pattern" and not patterns and not only_paths:
+                if not w or w.startswith("-"):
+                    return False
+                patterns.append(w)
+            elif kind == "none" or not _routine_path(w):
+                return False
+            else:
+                paths.append(w)
+        elif w == "--" and "--" in flags:
+            only_paths = True
+        elif w in flags or (re.match(r"^-[A-Za-z]{2,}$", w) and all("-" + c in flags for c in w[1:])):
+            pass  # a listed flag, or a cluster of listed single-letter flags (`-rn`)
+        elif w in numeric:
+            if i + 1 >= len(rest) or not _ROUTINE_NUMBER.match(rest[i + 1]):
+                return False
+            i += 1
+        elif w in texty:
+            if i + 1 >= len(rest) or not rest[i + 1] or rest[i + 1].startswith("-"):
+                return False
+            i += 1
+        elif _ROUTINE_NUMERIC_FLAG.match(w) and (numeric or key == ("git", "log")):
+            pass
+        else:
+            return False  # an unknown flag: not routine
+        i += 1
+    if kind == "pattern":
+        return bool(patterns) and (key[0] == "git" or bool(paths))
+    if key == ("git", "add") and not paths and not any(w in ("-A", "--all", "-u", "--update") for w in rest):
+        return False  # `git add` of nothing
+    return len(paths) >= need and (key != ("git", "commit") or "-m" in rest or "--amend" in rest or "--no-edit" in rest)
 
 
 def _decisions_subcommand(rest):

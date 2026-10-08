@@ -924,12 +924,14 @@ than the model alone (the configured outcome is combined as before and a configu
   `outside_intent`, `speaks_for_you` and `outside_scope` (the right asks in the sample scored 0.97) and 0.5 for `hard_to_reverse`
   (a missed destructive call costs more than an extra ask). `policy.thresholds` still overrides each question.
 - **Routine local steps need no model.** `policy.routine_filter` (default `true`) answers "nothing at its threshold" in code, with no
-  model call, for a shell command every part of which is a read or a local reversible step inside the worktree: `git` status, diff,
-  log, grep, add, commit and the like; `ls`, `cat`, `grep`; a test run (`node --test`, `python3 bin/test-*`, `pytest`, `npm test`); a label
-  on its own PR (`gh pr edit --add-label`); a `gh` read; `fleet-switchboard report`; `cp`, `mv`, `mkdir`, `sed -i` on a relative path.
-  It is conservative: any substitution, glob, redirect, heredoc, `$`, `..` or absolute path outside `/tmp`, unknown command, `git
-  push`/`reset`/`clean`/`rebase`, `rm -r`, or a `gh` write is judged by the model as before. Such a call is audited with `model: null`.
-  Set `"routine_filter": false` to ask the model about everything.
+  model call, for ONE simple shell command on a strict allowlist that fails closed: a read or a local reversible step inside the worktree.
+  The command word and EVERY flag must be listed for it: `git` `status`, `diff`, `log`, `show`, `rev-parse`, `grep`, `add` and `commit -m` with a
+  short set of safe flags; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `pwd`, `uptime`, `sleep N`; `node --test <paths>` and `python3 bin/test-*`
+  (the agent's own tests); `fleet-switchboard report <state> [--issue N] "<line>"`. An unknown flag, an environment prefix
+  (`GIT_SSH_COMMAND=`, `LD_PRELOAD=`), a wrapper, any redirect, pipe, chain, substitution, glob or heredoc, a path that is absolute, home,
+  has `..`, names a dotfile (`.git/config`, `.env`) or looks like a credential, and every `sed`, `sort`, `rg`, `find`, `gh`, `cp`, `mv`, `rm`,
+  `curl`, shell or script go to the model as before. Such a call is audited with `model: null`. A symlink inside the worktree that points
+  outside it cannot be seen from the command's text: a known limit. Set `"routine_filter": false` to ask the model about everything.
 
 What the audit records: `arguments` is cut to 300 characters in the audit, but the judge itself is sent up to 1500 (the plugin sends up to 4000), so
 the model sees more than a labeller reading the audit does. `bin/judge-sample` draws a stratified sample from the audit for labelling.
