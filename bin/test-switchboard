@@ -25350,6 +25350,268 @@ class TestExternalInboundJudge(ExternalWorld):
         self.assertIn("speaks for you", denied["detail"]["reason"])
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# The generic adapter wired into the daemon (external_decisions.adapter = "mapping"): off means nothing is loaded;
+# on builds it once, runs its key source once, and every failure is a `down: <why>` that never touches the local list.
+
+
+class TestExternalWiring(ExternalWorld):
+    TIERS = {"orchestrator": "low", "cos": "high", "human": "reserved"}
+
+    def setUp(self):
+        super().setUp()
+        self.door = FakeDoorServer()
+        self.addCleanup(self.door.close)
+        self.runs = self.home / "key-runs"
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); print(%r)"
+                            % (str(self.runs), FakeDoorServer.KEY)]
+        self.write_mapping()
+
+    def write_mapping(self, **over):
+        over.setdefault("key_source", {"command": self.key_command, "timeout": 5})
+        data = fake_mapping(self.door.url, "tool", **over)
+        self.mapping.write_text(json.dumps(data))
+
+    def wire(self, **extra):
+        self.turn_on(adapter="mapping", **extra)
+
+    def key_runs(self):
+        return len(self.runs.read_text()) if self.runs.exists() else 0
+
+    def everything(self):
+        """Every text the daemon leaves behind or shows: state files, the audit, status, the decision list."""
+        found = [self.cmd("you", "status")["out"], self.cmd("you", "decisions", "--fresh")["out"]]
+        for path in self.world.state.rglob("*"):
+            if path.is_file():
+                found.append(path.read_text(errors="replace"))
+        return "\n".join(found)
+
+    def test_on_builds_the_adapter_once_and_runs_the_key_command_once(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table should hold the totals?", 6)
+        self.run_pass()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1)
+        item = list(self.door.items.values())[0]
+        self.assertEqual(item["floor"], "major")  # the engine's floor name (high: an orchestrator's report is the cos's) in the adapter's words
+        self.assertEqual(self.key_runs(), 1)
+        self.assertIn("external  ok; outbox 0", self.cmd("you", "status")["out"])
+        self.assertEqual([e["event"] for e in self.audit_events("external.started")], ["external.started"])
+        self.assertEqual(self.door.count("raise"), 1)
+
+    def test_a_new_engine_in_the_same_process_builds_its_own_adapter(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.assertEqual(self.key_runs(), 1)
+        self.world.engine = self.world.new_engine()   # a daemon restart: the key source runs again, and only once
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.key_runs(), 2)
+        self.assertEqual(len(self.door.items), 1, "the restart raised nothing twice")
+
+    def test_off_loads_nothing_and_imports_nothing(self):
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("external_adapter", None)
+            self.run_pass()                                       # no external_decisions at all
+            self.assertNotIn("external_adapter", sys.modules)
+            self.wire(enabled=False)                               # named, but off
+            self.run_pass()
+            self.run_pass()
+            self.assertNotIn("external_adapter", sys.modules)
+        self.assertEqual(self.key_runs(), 0)
+        self.assertEqual(self.door.log, [])
+        self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if p.name.startswith("external")), [])
+        self.assertNotIn("external", self.cmd("you", "status")["out"])
+
+    def test_another_adapter_name_never_loads_this_one(self):
+        self.turn_on()   # the fake
+        self.say("api-orch", "question", "Which table?", 6)
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("external_adapter", None)
+            self.run_pass()
+            self.assertNotIn("external_adapter", sys.modules)
+
+    def failure(self, name, setup, reason):
+        """A failure mode: a pass never raises, the status says down and why, the local list is whole, the audit
+        records it, the key command did not spin, and the key is nowhere."""
+        setup()
+        self.say("api-orch", "question", "Which table (%s)?" % name, 6)
+        self.run_pass()
+        body = self.file_body()
+        self.assertEqual([d["kind"] for d in body["decisions"]], ["report"], name)
+        ours = [e["error"] for e in body["errors"] if e["source"] == "external"]
+        self.assertEqual(len(ours), 1, (name, ours))
+        self.assertIn("external decision system is down", ours[0])
+        self.assertIn(reason, ours[0], name)
+        self.assertIn("external  down: ", self.cmd("you", "status")["out"])
+        self.assertIn(reason, self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.audit_events("external.down")), 1, name)
+        self.assertEqual(self.door.log, [], name)
+        self.assertNotIn(FakeDoorServer.KEY, self.everything(), name)
+        return body
+
+    def test_every_failure_mode_is_a_down_status_and_leaves_the_local_list_alone(self):
+        def missing():
+            self.wire()
+            self.mapping.unlink()
+
+        def not_json():
+            self.wire()
+            self.mapping.write_text("{nope")
+
+        def invalid():
+            self.wire()
+            data = json.loads(self.mapping.read_text())
+            data["surprise"] = 1
+            self.mapping.write_text(json.dumps(data))
+
+        def command_fails():
+            self.key_command = [sys.executable, "-c", "import sys; print('%s'); sys.exit(3)" % FakeDoorServer.KEY]
+            self.write_mapping()
+            self.wire()
+
+        def command_hangs():
+            self.key_command = [sys.executable, "-c", "import time; time.sleep(30)"]
+            self.write_mapping()
+            data = json.loads(self.mapping.read_text())
+            data["key_source"]["timeout"] = 0.5
+            self.mapping.write_text(json.dumps(data))
+            self.wire()
+
+        def env_missing():
+            self.write_mapping(key_source="env:SURELY_NOT_SET_ANYWHERE_123")
+            self.wire()
+
+        def file_loose():
+            path = self.home / "loose-key"
+            path.write_text(FakeDoorServer.KEY)
+            os.chmod(path, 0o644)
+            self.write_mapping(key_source="file:%s" % path)
+            self.wire()
+
+        def unknown_adapter():
+            self.turn_on(adapter="nobody-by-this-name")
+
+        cases = (("mapping file missing", missing, "mapping file cannot be read"),
+                 ("mapping not json", not_json, "mapping file cannot be read"),
+                 ("mapping invalid", invalid, "mapping invalid"),
+                 ("key command fails", command_fails, "exit 3"),
+                 ("key command hangs", command_hangs, "did not answer"),
+                 ("key env missing", env_missing, "not set"),
+                 ("key file mode", file_loose, "0600"),
+                 ("adapter not registered", unknown_adapter, "no adapter named"))
+        for name, setup, reason in cases:
+            with self.subTest(name):
+                self.setUp()
+                try:
+                    self.failure(name, setup, reason)
+                finally:
+                    self.door.close()
+
+    def test_a_failed_start_is_retried_only_after_a_backoff_and_then_recovers(self):
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); sys.exit(1)" % str(self.runs)]
+        self.write_mapping()
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass(1)
+        self.run_pass(1)
+        self.run_pass(1)
+        self.assertEqual(self.key_runs(), 1, "inside the backoff the key command is not run again")
+        self.assertEqual(len(self.audit_events("external.down")), 1)
+        self.key_command = [sys.executable, "-c", "import sys; open(%r, 'a').write('x'); print(%r)"
+                            % (str(self.runs), FakeDoorServer.KEY)]
+        self.write_mapping()   # the operator fixed it
+        self.run_pass(10)
+        self.assertEqual(self.key_runs(), 2)
+        self.run_pass(1)
+        self.assertIn("external  ok", self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.door.items), 1)
+        self.assertEqual(len(self.audit_events("external.started")), 1)
+
+    def test_down_later_grows_the_outbox_and_up_again_drains_it_without_duplicates(self):
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.assertEqual(len(self.door.items), 1)
+        self.door.down = True
+        self.say("api-orch", "question", "Which other table?", 7)
+        self.run_pass()
+        self.assertIn("external  down", self.cmd("you", "status")["out"])
+        self.assertEqual(len(self.file_body()["decisions"]), 2)
+        self.door.down = False
+        self.run_pass(70)
+        self.run_pass(70)
+        self.assertEqual(len(self.door.items), 2, "no duplicates")
+        self.assertIn("external  ok; outbox 0", self.cmd("you", "status")["out"])
+
+    def test_the_key_is_nowhere_even_when_the_other_side_echoes_it(self):
+        self.wire()
+        self.door.fail_next("raise", 401, {"code": "cred", "message": "refused Key %s" % FakeDoorServer.KEY}, count=9)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.run_pass(10)
+        text = self.everything()
+        self.assertNotIn(FakeDoorServer.KEY, text)
+        self.assertIn("refused", text)
+
+    def test_the_work_pump_hook_is_a_no_op_until_a_pump_is_set_and_work_items_is_on(self):
+        calls = []
+
+        def pump(engine, adapter, now, budget):
+            calls.append((adapter.__class__.__name__, budget))
+            return [{"source": "external", "error": "work: one thing is stuck"}]
+
+        self.wire()
+        self.say("api-orch", "question", "Which table?", 6)
+        self.run_pass()
+        self.world.engine.work_pump = pump
+        self.run_pass()
+        self.assertEqual(calls, [], "work_items is off by default")
+        self.wire(work_items=True)
+        self.world.engine.work_pump = pump
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual([c[0] for c in calls], ["McpRestAdapter"] * 2)
+        self.assertEqual(calls[0][1], sb.WORK_PUMP_BUDGET_SECONDS)
+        self.assertIn("work: one thing is stuck",
+                      [e["error"] for e in self.file_body()["errors"] if e["source"] == "external"])
+        self.assertEqual(len(self.file_body()["decisions"]), 1)
+
+    def test_a_pump_that_raises_never_breaks_the_pass_and_a_down_adapter_never_calls_it(self):
+        def boom(engine, adapter, now, budget):
+            raise RuntimeError("the pump broke")
+
+        self.wire(work_items=True)
+        self.say("api-orch", "question", "Which table?", 6)
+        self.world.engine.work_pump = boom
+        self.run_pass()
+        errors = [e["error"] for e in self.file_body()["errors"] if e["source"] == "external"]
+        self.assertEqual(errors, ["work items: RuntimeError: the pump broke"])
+        self.assertEqual(len(self.file_body()["decisions"]), 1)
+        # an adapter that never came up has no pump call
+        self.setUp()
+        self.mapping.unlink()
+        self.wire(work_items=True)
+        called = []
+        self.world.engine.work_pump = lambda *a: called.append(a)
+        self.run_pass()
+        self.assertEqual(called, [])
+
+    def test_work_items_must_be_a_flag_and_defaults_off(self):
+        self.assertIs(sb.validate_config({"external_decisions": {}})["external_decisions"]["work_items"], False)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"external_decisions": {"work_items": "yes"}})
+
+    def test_the_loader_is_the_one_the_core_uses(self):
+        text = SWITCHBOARD.read_text()
+        self.assertIn("def load_external_adapter", text)
+        self.assertNotIn("\nimport external_adapter", text)
+        self.assertNotIn("\nfrom external_adapter", text)
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
