@@ -3517,3 +3517,14 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   and `orders --cos` run from inside a pane of the private profile, whose `XDG_CONFIG_HOME` is the profile's: it
   looks beside the config that process reads, while the daemon (which feeds the judge and the note) and `install`
   use the daemon's own. Read the file from a plain shell, or with `cos_orders_file` set to one absolute path.
+
+## Forwarder status (#77)
+
+A forwarder's websocket drops are normal: the supervisor restarts it in 5 s and a catch-up read follows. `status`
+therefore shows a running forwarder as `live, up <age>`, with its drops as quiet history (`last drop 4m ago, 3 in
+the last hour`); a recovered drop is not an error and its old `last_error` is not printed. For a live forwarder the
+catch-up marker is labelled `catch-up read to ...`: it is the last backstop read, not how fresh events are.
+A forwarder that is not running is `down <age>`. An alarm (`ALARM: forwarder ...` in `status`, check `forwarders`
+in `fleet-doctor`) fires when one has been down more than 5 minutes, has dropped more than 6 times in 10 minutes,
+or has had 3 runs under 60 s in 10 minutes. Polling repos are not alarmed. The history is memory in the daemon,
+published in the watch snapshot, so a daemon restart clears it.

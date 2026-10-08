@@ -6506,6 +6506,39 @@ class GitHubUnavailable(Exception):
     """A `gh api` read that did not answer; the caller tries again later."""
 
 
+FORWARDER_HISTORY_SECONDS = 3600
+FORWARDER_DOWN_ALARM = 300       # not running this long (seconds) is an alarm
+FORWARDER_FLAP_DROPS = 6         # more than this many drops in FORWARDER_FLAP_WINDOW is flapping
+FORWARDER_FLAP_WINDOW = 600
+FORWARDER_SHORT_RUN = 60         # a run shorter than this is a short run; three in the window is flapping
+FORWARDER_SHORT_RUNS = 3
+
+
+def forwarder_health(watch, now):
+    """#77: what status says about one forwarder, from the snapshot alone: live or down with its own age, the
+    drops as quiet history, and an alarm (a string) when it has been down or flapping too long, else None."""
+    drops = [(t, r) for t, r in (watch.get("drops") or []) if now - t < FORWARDER_HISTORY_SECONDS]
+    live = watch.get("mode") == "forwarder"
+    started = parse_iso(watch["started"]) if watch.get("started") else None
+    recent = [(t, r) for t, r in drops if now - t < FORWARDER_FLAP_WINDOW]
+    health = {"live": live, "up_age": max(0, now - started) if live and started is not None else None,
+              "down_age": None, "drops_hour": len(drops), "last_drop_age": max(0, now - drops[-1][0]) if drops else None,
+              "alarm": None}
+    if watch.get("mode") == "conflict":  # someone else forwards, by intent; catch-up reads continue: not an alarm
+        health["quiet"] = "conflict"
+        return health
+    if not live and watch.get("down_since") is not None and watch.get("mode") not in ("polling", "failed"):
+        health["down_age"] = max(0, now - watch["down_since"])
+        if health["down_age"] > FORWARDER_DOWN_ALARM:
+            health["alarm"] = "down for %s" % format_age(health["down_age"])
+    if health["alarm"] is None and len(recent) > FORWARDER_FLAP_DROPS:
+        health["alarm"] = "flapping: %d drops in 10 min" % len(recent)
+    elif health["alarm"] is None and sum(1 for _, r in recent if r < FORWARDER_SHORT_RUN) >= FORWARDER_SHORT_RUNS:
+        health["alarm"] = "flapping: %d runs under %ds in 10 min" % (
+            sum(1 for _, r in recent if r < FORWARDER_SHORT_RUN), FORWARDER_SHORT_RUN)
+    return health
+
+
 class Watch:
     """One watched repo: its forwarder child and what is known about it. Memory only."""
 
@@ -6515,6 +6548,8 @@ class Watch:
         self.next_start = 0.0
         self.started = self.catchup_at = self.last_catch_up = None
         self.last_error = self.catch_up_error = None
+        self.drops = []          # #77: (time dropped, seconds it had run), the last hour's worth; memory only
+        self.down_since = None   # when the forwarder last stopped, until it runs again
         # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
         # a poll instead: the existing catch-up read, every github_poll_seconds.
         self.polling, self.poll_reason, self.next_poll, self.last_poll = False, None, 0.0, None
@@ -6540,6 +6575,7 @@ class Watch:
                 "forwarder_pid": getattr(self.proc, "pid", None), "started": iso(self.started),
                 "next_start": iso(self.next_start) if self.proc is None else None,
                 "last_catch_up": iso(self.last_catch_up), "last_error": self.last_error,
+                "drops": [[t, r] for t, r in self.drops], "down_since": self.down_since,
                 "catch_up_error": self.catch_up_error}
 
 
@@ -7442,7 +7478,7 @@ class GitHubHub:
             return
         with self.lock:
             watch.proc, watch.started, watch.starts = proc, now, watch.starts + 1
-            watch.state, watch.next_start = "running", now
+            watch.state, watch.next_start, watch.down_since = "running", now, None
             watch.catchup_at = None if watch.polling else now + self.catchup_delay  # a polled repo is read already
         self._audit("github.watch", watch.repo, {"state": "running", "starts": watch.starts})
 
@@ -7459,6 +7495,9 @@ class GitHubHub:
         tail = _scrub(self._log_tail(watch), watch.secret)
         with self.lock:
             watch.proc, watch.secret = None, None
+            ran = max(0.0, now - (watch.started or now))
+            watch.drops = [d for d in watch.drops if now - d[0] < FORWARDER_HISTORY_SECONDS] + [(now, ran)]
+            watch.down_since = now
         if CONFLICT_TEXT in tail:
             with self.lock:
                 watch.state, watch.next_start = "conflict", now + self.conflict_retry
@@ -7481,6 +7520,8 @@ class GitHubHub:
     def _failed(self, watch, now, reason):
         with self.lock:
             watch.failures += 1
+            if watch.down_since is None:  # a spawn that failed never ran, so _exited did not set it
+                watch.down_since = now
             delay = min(self.backoff_max, self.backoff_base * 2 ** (watch.failures - 1))
             watch.state, watch.next_start, watch.last_error = "backoff", now + delay, reason
         self._audit("github.watch", watch.repo, {"state": "backoff", "failures": watch.failures,
@@ -7575,8 +7616,12 @@ def github_status(config, state_dir, fleets=None, now=None):
                                         watch.get("catch_up_error")) if x) or None
         marker = parse_iso(watch.get("read_marker")) if watch and watch.get("read_marker") else None
         age = max(0, (time.time() if now is None else now) - marker) if marker is not None else None
+        current = time.time() if now is None else now
+        health = forwarder_health(watch, current) if watch else None
+        if health and health["live"]:
+            why = watch.get("poll_reason") or None  # a recovered drop is history, not an error
         report["detail"].append({"repo": repo, "how": how, "account": accounts.describe(repo),
-                                 "agents": members.get(repo, []), "why": why, "read_age": age})
+                                 "agents": members.get(repo, []), "why": why, "read_age": age, "health": health})
     return report
 
 
@@ -7597,12 +7642,22 @@ def format_github(report):
         line = "        %-24s %s" % (entry["repo"], how)
         if watch and watch["state"] == "conflict":
             line += " (someone else is forwarding; catch-up reads only)"
-        if watch and watch["failures"]:
+        if watch and watch["failures"] and not (entry.get("health") or {}).get("live"):
             line += ", %d failure(s)" % watch["failures"]
+        health = entry.get("health")
+        if health and health["live"]:
+            line += ", live, up %s" % format_age(health["up_age"] or 0)
+        elif health and health["down_age"] is not None and not health.get("quiet"):
+            line += ", down %s" % format_age(health["down_age"])
         line += "  account %s" % entry["account"]
-        if watch:
-            line += "  read to %s ago" % format_age(entry["read_age"]) if entry.get("read_age") is not None \
+        if health and health["drops_hour"]:
+            line += "  last drop %s ago, %d in the last hour" % (format_age(health["last_drop_age"]), health["drops_hour"])
+        if watch:  # for a live forwarder this is only the last catch-up read, not how fresh events are
+            label = "catch-up read to" if entry["how"] == "forwarder" else "read to"
+            line += "  %s %s ago" % (label, format_age(entry["read_age"])) if entry.get("read_age") is not None \
                 else "  not read yet"
+        if health and health["alarm"]:
+            line += "  ALARM: forwarder %s" % health["alarm"]
         line += "  agents: %s" % (", ".join(entry["agents"]) or "none")
         if entry["why"]:
             line += "  [%s]" % entry["why"]
