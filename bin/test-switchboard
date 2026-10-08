@@ -23721,6 +23721,11 @@ r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
 const ids = (rows) => rows.filter((l) => l.id).map((l) => l.id);
 r.sameOrder = JSON.stringify(ids(d.styledRows(snap(mix), now, 34, chief)).filter((x) => !x.startsWith("pr:") && !x.startsWith("#"))) ;
 r.plainOrder = JSON.stringify(d.buildView(snap(mix), now, 34, chief).sections.flatMap((s) => s.groups.flatMap((g) => g.entries.map((e) => e.key))).filter((k) => !k.startsWith("pr:")));
+// iteration 2 (temporary alternatives a, b, c)
+r.altModes = ["a", "B", " c "].map((m) => d.panelModeOf({ [d.PANEL_ENV]: m }));
+const altText = (m, list, view) => d.styledText(d.altRows(m, snap(list), now, 34, view), 34);
+r.alt = Object.fromEntries(["a", "b", "c"].map((m) => [m, { chief: altText(m, mix, chief), human: altText(m, mix, human), none: altText(m, [], human) }]));
+r.altStale = d.altRows("a", { status: "stale", decisions: [], errors: [] }, now).map((l) => l.segs[0][0]);
 // links: every line of an entry carries its URL, the id line is the one with `id`; a title cannot smuggle a control character
 const linked = d.styledRows(snap([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })]), now, 34, human);
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
@@ -23813,6 +23818,21 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_the_order_is_the_plain_views_and_the_plain_view_is_unchanged(self):
         self.assertEqual(self.r["sameOrder"], self.r["plainOrder"])
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
+
+    def test_the_three_alternative_layouts_subtract(self):
+        self.assertEqual(self.r["altModes"], ["a", "b", "c"])
+        for mode, views in self.r["alt"].items():
+            for name in ("chief", "human"):
+                lines = views[name]
+                self.assertTrue(all(len(x) <= 34 for x in lines), (mode, name))
+                self.assertFalse(any("\u2504" in x for x in lines), "no dotted rules")
+                self.assertFalse(any(x == "none" or x.endswith(" 0") for x in lines), "no empty section")
+            self.assertEqual(views["none"][-1], "nothing waiting")
+            self.assertNotIn("Waits on cos", views["human"], "the cos tier is only a count in a human's panel")
+        self.assertIn("Waits on cos", self.r["alt"]["a"]["chief"])
+        self.assertTrue(any(x.startswith("a#1 ") for x in self.r["alt"]["a"]["chief"]), "a decision's id is kept")
+        self.assertEqual(self.r["altStale"], ["Decisions (?)", "daemon not updating"])
+        self.assertTrue(any(x.startswith("b ") and "oldest" in x for x in self.r["alt"]["c"]["chief"]), "c folds the cos tier to a line per repo")
 
     def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
         self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],

@@ -292,7 +292,11 @@ export const AGE_WARN_SECONDS = LONG_WAIT_SECONDS   // an age from 1h on is tint
 export const AGE_ERROR_SECONDS = 86400              // ... and from 24h on error
 
 // "plain" (any case) selects the old drawing; anything else, or nothing, is the styled panel.
-export const panelModeOf = (env) => (String((env && env[PANEL_ENV]) ?? "").trim().toLowerCase() === "plain" ? "plain" : "styled")
+// TEMPORARY (iteration 2): "a", "b" or "c" select an alternative layout, so the three can be shown live.
+export function panelModeOf(env) {
+  const mode = String((env && env[PANEL_ENV]) ?? "").trim().toLowerCase()
+  return mode === "plain" || mode === "a" || mode === "b" || mode === "c" ? mode : "styled"
+}
 
 // The theme colour of each style key, read defensively: a missing token, or no theme at all, is `undefined`
 // (the base text colour), never an exception: the plugin runs inside the user's live TUI.
@@ -433,6 +437,131 @@ export function styledRows(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
       })
     })
   }
+  if (snapshot.errors.length) out.push(row(oneLine(`${snapshot.errors.length} source(s) unreadable`, width), "w"))
+  return out
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// ITERATION 2, TEMPORARY: three alternative layouts built by subtraction (issue 67). `altRows(mode, ...)` returns the
+// same line model as styledRows. No dotted rules, no empty sections, no stats unless they matter, colour for state only.
+//   a: every entry two lines (headline, then a quiet id + age line); no repo headers (the id carries the repo); whitespace only.
+//   b: what needs you is two lines; everything else one line (headline cut, age flush right); one rule per section, in its header.
+//   c: like b, with a repo header once per group; in the Chief of Staff's view the cos tier folds to one line per repo.
+export const BIG_CHANGE_LINES = 500   // a PR's +A/-D is shown only from this size up
+export const altRows = (mode, snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW) => {
+  const row = (text, style = "") => ({ segs: [[text, style]] })
+  const blank = () => row(" ")
+  if (snapshot.status !== "ok") return [row("Decisions (?)", "b"), row(NOT_UPDATING, "w")]
+  const known = repoAmbiguity(snapshot.decisions)
+  const tierOf = (d) => d.tier ?? "human"
+  const secondsOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? NaN : (nowMs - t) / 1000 }
+  const sinceOf = (d) => { const t = Date.parse(d.since); return Number.isNaN(t) ? Infinity : t }
+  const shown = selectFor(snapshot.decisions, view)
+  const notices = noticesFor(snapshot.decisions, view)
+  const human = shown.filter((d) => tierOf(d) === "human")
+  const cosAll = snapshot.decisions.filter((d) => !isNotice(d) && tierOf(d) === "cos")
+  const overs = overLongWait(cosAll, nowMs)
+  const out = []
+  out.push({ segs: [["Decisions", "b"]], right: [[view.label, "m"]] })
+  const summary = []
+  if (human.length || (!notices.length && !cosAll.length)) summary.push([[`${human.length} need ${view.kind === "human" ? "you" : "human"}`, human.length ? "b+w" : "m"]])
+  if (notices.length) summary.push([[`${notices.length} PR${notices.length === 1 ? "" : "s"}`, "i"]])
+  if (cosAll.length) summary.push([[`${cosAll.length} ${view.kind === "human" ? "with" : "on"} cos`, "m"], ...(overs ? [[` (${overs} over 1h)`, "w"]] : [])])
+  let line = []
+  for (const part of summary) {
+    if (line.length && textOf(line).length + 3 + textOf(part).length > width) { out.push({ segs: line }); line = [] }
+    line = line.length ? [...line, [" \u00b7 ", "m"], ...part] : [...part]
+  }
+  out.push({ segs: line })
+  const sections = []
+  if (human.length) sections.push({ key: "human", label: "Waits on you", list: human, need: true })
+  if (notices.length) sections.push({ key: "notice", label: "Heads-up", list: notices })
+  if (view.kind !== "human") {
+    const cos = shown.filter((d) => tierOf(d) === "cos")
+    if (cos.length) sections.push({ key: "cos", label: "Waits on cos", list: cos })
+    const other = shown.filter((d) => !["human", "cos"].includes(tierOf(d)))
+    if (other.length) sections.push({ key: "orchestrator", label: "Waits on orchestrator", list: other })
+  }
+  const ageSeg = (d) => { const sec = secondsOf(d); return Number.isNaN(sec) ? ["?", "m"] : [formatAge(sec), sec >= AGE_ERROR_SECONDS ? "w" : "m"] }
+  const stateOf = (d) => {  // a heads-up's state, only what matters: [text, style]
+    const parts = []
+    if (d.ci === "failing" || d.ci === "failed") parts.push(["CI failing", "e"])
+    else if (d.ci === "pending") parts.push(["CI pending", "m"])
+    else if (d.ci === "green" || d.ci === "passing") parts.push(d.review === "approved" ? ["ready", "s"] : ["no review", "m"])
+    if (d.review === "changes_requested") parts.push(["changes requested", "e"])
+    if (Number.isInteger(d.additions) && Number.isInteger(d.deletions) && d.additions + d.deletions >= BIG_CHANGE_LINES) parts.push([`+${d.additions}/-${d.deletions}`, "m"])
+    if (d.stale) parts.push(["(stale)", "w"])
+    return parts
+  }
+  const refStyle = (d) => (d.ci === "failing" || d.ci === "failed" ? "e" : d.ci && d.review === "approved" && (d.ci === "green" || d.ci === "passing") ? "s" : "")
+  const withGroups = mode === "c"
+  const listSection = (section) => {
+    const by = new Map()
+    for (const d of section.list) {
+      const repo = typeof d.repo === "string" && d.repo ? d.repo : "(no repo)"
+      if (!by.has(repo)) by.set(repo, [])
+      by.get(repo).push(d)
+    }
+    const order = [...by.keys()].sort()
+    const entries = []
+    // b: the repo most of the section is in is named once in its header; its refs are `#N`, other repos' keep their name
+    const dominant = [...by.entries()].sort((x, y) => y[1].length - x[1].length || (x[0] < y[0] ? -1 : 1))[0][0]
+    section.dominant = mode === "b" && by.size && dominant !== "(no repo)" ? dominant : ""
+    order.forEach((repo, gi) => {
+      if (withGroups) { if (gi) out.push(blank()); out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), "b")) }
+      const items = by.get(repo).map((d, i) => ({ d, i })).sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i).map(({ d }) => d)
+      items.forEach((d, ei) => {
+        const url = urlOf(d)
+        const put = (l) => out.push(url ? { ...l, url } : l)
+        const tidyWith = (t) => tidyRefs(stripControls(t), withGroups ? repo : section.dominant, known)
+        const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
+        const age = ageSeg(d)
+        const full = mode === "a" || section.need
+        const repoShort = repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)
+        const idText = isNotice(d) && Number.isInteger(d.number) ? (withGroups || (section.dominant && repo === section.dominant) ? `#${d.number}` : `${repoShort}#${d.number}`) : d.id
+        if (full) {
+          if (mode === "a" && (ei || entries.length)) out.push(blank())
+          else if (mode !== "a" && ei && section.need) out.push(blank())
+          // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
+          const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
+          for (const t of wrapText(shownHeadline, width, HEADLINE_LINES)) put(row(t, section.need ? "b" : ""))
+          const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
+          for (const r of rows) for (const t of wrapText(tidyWith(r.text), width, ROW_LINES)) put(row(t, "m"))
+          const left = [[oneLine(stripControls(idText + (Array.isArray(d.reported_by) && d.reported_by.length ? ` ${d.reported_by.join(",")}` : "")), width), "m"]]
+          if (isNotice(d)) for (const [t, st] of stateOf(d)) if (textOf(left).length + 3 + t.length + 1 + age[0].length <= width) left.push([" \u00b7 ", "m"], [t, st])
+          put({ segs: left, right: [age], id: d.id })
+        } else {
+          const room = Math.max(8, width - age[0].length - 1)
+          const flatText = oneLine(headline, room)
+          const segs = isNotice(d) && refStyle(d) ? (() => { const cut = flatText.indexOf(" "); return cut > 0 ? [[flatText.slice(0, cut), refStyle(d)], [flatText.slice(cut), ""]] : [[flatText, refStyle(d)]] })() : [[flatText, ""]]
+          put({ segs, right: [age], id: d.id })
+        }
+        entries.push(d)
+      })
+    })
+  }
+  for (const section of sections) {
+    out.push(blank())
+    const label = section.label
+    const headerAt = out.length
+    out.push(row(label, "b"))
+    if (mode === "c" && section.key === "cos" && view.kind !== "human") {
+      const by = new Map()
+      for (const d of section.list) { const r = d.repo ?? "(no repo)"; if (!by.has(r)) by.set(r, []); by.get(r).push(d) }
+      for (const r of [...by.keys()].sort()) {
+        const list = by.get(r)
+        const oldest = Math.max(...list.map((d) => { const x = secondsOf(d); return Number.isNaN(x) ? 0 : x }))
+        out.push({ segs: [[stripControls(r === "(no repo)" || known.ambiguous(r) ? r : shortRepo(r)), ""]], right: [[`${list.length} \u00b7 oldest ${formatAge(oldest)}`, oldest >= AGE_ERROR_SECONDS ? "w" : "m"]] })
+      }
+      continue
+    }
+    listSection(section)
+    if (mode === "b") {
+      const text = section.dominant ? `${label} \u00b7 ${known.ambiguous(section.dominant) ? section.dominant : shortRepo(section.dominant)}` : label
+      out[headerAt] = { segs: [[label, "b"], ...(text.length > label.length ? [[text.slice(label.length), "m"]] : []), [" ", ""], ["\u2501".repeat(Math.max(0, width - text.length - 1)), "m"]] }
+    }
+  }
+  if (!sections.length) { out.push(blank()); out.push(row("nothing waiting", "m")) }
   if (snapshot.errors.length) out.push(row(oneLine(`${snapshot.errors.length} source(s) unreadable`, width), "w"))
   return out
 }
