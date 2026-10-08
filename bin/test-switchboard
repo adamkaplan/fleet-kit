@@ -24104,6 +24104,15 @@ class TestExternalInboundJudge(ExternalWorld):
         self.run_pass(120)
         self.assertEqual(len(self.audit_events("external.judge_unavailable")), 5)
 
+    def test_a_duplicate_of_an_answer_waiting_for_the_judge_is_not_a_second_try(self):
+        self.turn_on()
+        ext = self.cos_issue()
+        self.set_judge(error="timeout")
+        eid = self.answer(ext)
+        self.event(ext, by="owner's agent", eid=eid, text="use postgres")   # the same event, delivered again
+        self.run_pass(1)
+        self.assertEqual(len(self.audit_events("external.judge_unavailable")), 1)
+
     def test_a_dead_judge_does_not_hold_up_other_answers(self):
         self.turn_on()
         self.gh.issue(API, 2, "A cos issue", labels=["me:awaiting-cos"])
