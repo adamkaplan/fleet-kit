@@ -7139,6 +7139,62 @@ class SelfWakeBase(PR4Base):
         return [e for e in self.world.audit() if e["event"] == name]
 
 
+class TestReminderCancelConditions(SelfWakeBase):
+    """`remind --until-closed OWNER/REPO#N` / `--until-merged`: dropped, audited, when it holds."""
+
+    def setUp(self):
+        super().setUp()
+        self.states = {}
+        self.calls = []
+
+        def gh(argv, **kwargs):
+            self.calls.append(argv)
+            number = int(argv[3])
+            state = self.states[number]
+            if isinstance(state, Exception):
+                raise state
+            if argv[1] == "pr":
+                return subprocess.CompletedProcess(argv, 0, pr_view_json(state=state), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"state": state}), "")
+        self.world.engine.gh_runner = gh
+
+    def remind(self, **condition):
+        sb.add_reminder(self.world.state, "platform", EPOCH + 60, EPOCH, "look at the PR", 2, "coder", None,
+                        condition=condition)
+
+    def test_a_closed_issue_drops_the_reminder_unsent_and_audited(self):
+        self.states[41] = "CLOSED"
+        self.remind(until_closed="acme/api#41")
+        self.wait(120)
+        self.assertEqual(self.texts("platform"), [])
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        (drop,) = self.events("reminder.drop")
+        self.assertIn("acme/api#41 is closed", drop["detail"]["why"])
+
+    def test_a_merged_pr_drops_until_merged_but_a_merely_open_one_delivers(self):
+        self.states[42] = "OPEN"
+        self.remind(until_merged="acme/api#42")
+        self.wait(120)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.states[43] = "MERGED"
+        self.remind(until_merged="acme/api#43")
+        self.wait(120)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.assertEqual(len(self.events("reminder.drop")), 1)
+
+    def test_an_unreadable_state_keeps_the_reminder_and_a_bad_ref_is_ignored(self):
+        self.states[44] = OSError("no network")
+        self.remind(until_closed="acme/api#44")
+        self.remind(until_closed="not a ref")
+        self.wait(120)
+        self.assertEqual(sum(len(a["keys"]) for a in self.world.admissions("platform")), 2)
+
+    def test_the_command_takes_the_flags_and_refuses_a_bad_ref(self):
+        args = sb.build_parser().parse_args(["remind", "platform", "1h", "x", "--until-closed", "a/b#3",
+                                             "--until-merged", "a/b#4"])
+        self.assertEqual((args.until_closed, args.until_merged), ("a/b#3", "a/b#4"))
+
+
 class TestCheckpointReminders(SelfWakeBase):
     def test_flags_set_both_reminders(self):
         note = self.set_reminders()
@@ -8270,13 +8326,13 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
                  "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
                  "Permission doesn't travel", "An empty queue is not a mandate")
-COS_ONLY_MAXIMS = ("The last message stands alone", "No change, no message",
+COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
-# chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 8550, "cos-subagent": 3500}
+# chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 8900, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -13980,6 +14036,64 @@ class TestUnreportedStop(ReportBase):
         self.world.tick(5)
         self.set_reply("OWED-ME")
         self.assertIn("nudge", [f.kind for f in self.facts()])
+
+    def second_stop_after_a_nudge(self, reported_before=True):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        if reported_before:
+            self.report()
+        self.world.tick(5)
+        self.world.new_engine("cli").send("platform", "coder", "do the second thing")  # a new assignment
+        self.world.tick(5)
+        self.set_reply("OWED-ME")
+        self.world.engine.run_pass()   # the nudge goes to the worker
+        self.world.tick(2)
+        self.set_reply("OWED-ME nothing reported")
+        return self.facts()
+
+    def test_a_report_from_before_the_current_assignment_never_silences_a_second_stop(self):
+        found = self.second_stop_after_a_nudge()
+        self.assertEqual(len([f for f in found if f.kind == "worker.stopped"]), 1)
+        self.assertEqual(self.triage_events()[-1]["detail"]["outcome"], "stopped")
+
+    def test_a_report_after_the_assignment_makes_the_stop_only_a_rider(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.new_engine("cli").send("platform", "coder", "do the second thing")
+        self.world.tick(5)
+        self.report()
+        self.world.tick(2)
+        self.set_reply("OWED-ME")
+        self.assertEqual([f.kind for f in self.facts() if f.kind in ("worker.stopped", "nudge")], [])
+
+    def test_a_worker_idle_line_is_folded_only_when_it_ended_cleanly(self):
+        def idle(name, clean):
+            fact = sb.Fact("worker.idle:%s:1" % name, "platform", "worker.idle", "%s finished" % name, 5,
+                           sender=name, rider=True)
+            fact.clean = clean
+            return fact
+        news = sb.Fact("report:coder:a", "platform", "report", "done: shipped", 4, sender="coder")
+        text, carried = sb.compose("platform", [idle("calm", True), idle("broken", False), news])
+        self.assertEqual(len(carried), 3)
+        self.assertIn("1 worker finish with no change (calm)", text)
+        self.assertIn("broken finished", text)  # a failed worker's line is shown in full
+        for outcome, folded in (("success", True), ("failed", False), ("aborted", False)):
+            self.assertEqual(outcome in sb.QUIET_OUTCOMES, folded)
+
+    def test_idle_riders_fold_into_one_quiet_line_next_to_real_news(self):
+        idle = [sb.Fact("worker.idle:s%d:1" % i, "platform", "worker.idle", "w%d finished its turn" % i, 5 + i,
+                        sender="w%d" % i, rider=True) for i in range(3)]
+        for fact in idle:
+            fact.clean = True
+        news = sb.Fact("report:coder:a", "platform", "report", "done: shipped", 4, sender="coder")
+        text, carried = sb.compose("platform", idle + [news])
+        self.assertEqual(len(carried), 4)
+        self.assertEqual(text.count("- quiet:"), 1)
+        self.assertIn("3 worker finishes with no change (w0, w1, w2)", text)
+        self.assertNotIn("finished its turn", text)
+        self.assertIn("done: shipped", text)
+        alone, _ = sb.compose("platform", idle)
+        self.assertEqual(alone.count("worker.idle from"), 3)  # no news: nothing to fold under
 
     def test_a_stop_older_than_the_rider_age_is_not_triaged(self):
         self.stop("OWED-ME")

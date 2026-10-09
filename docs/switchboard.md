@@ -2179,6 +2179,17 @@ delivers a due reminder as an ordinary wake, so nothing in an agent polls.
 `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your turn. `<when>` is `30m`, `+2h`, `1d`
 or an ISO time with a zone. The role files of the coder and the orchestrator and the `fleet-coordination` skill say so.
 
+**Cancel a reminder that became moot.** `remind ... --until-closed OWNER/REPO#N` (an issue, or a pull request closed
+or merged) or `--until-merged OWNER/REPO#N` (a pull request merged) stores a condition; when the reminder is due the
+switchboard reads that state once, and when it holds the reminder is dropped unsent and audited (`reminder.drop`, with
+the reason). A state that cannot be read now leaves the reminder to deliver.
+
+**Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
+ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
+still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
+report since the worker's latest assignment is only a rider (it never wakes); a report from before the assignment does
+not count, so a worker that stopped twice without reporting its new work is still told to the boss.
+
 **Checkpoint reminders.** `fleet-switchboard launch` sets two reminders when the worker is up:
 
 | Reminder | To | At | Text | Condition |
