@@ -4606,7 +4606,8 @@ PR_NOTICES = "pr-notices.json"
 PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
-PR_NOTICE_UNREADABLE_DAYS = 7     # a notice whose PR cannot be read this long is dropped
+PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
+PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
 PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
@@ -4614,6 +4615,17 @@ _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(
 
 class NoticeError(Exception):
     """A PR notice that cannot be recorded or read."""
+
+
+class NoticeNotFound(NoticeError):
+    """`gh` answered that there is no such pull request (a number that is an issue, or nothing): not an unreadable lookup."""
+
+
+# The ONE answer gh gives for a pull request number that does not exist (or is an issue): GraphQL's `Could not resolve to a PullRequest with
+# the number of N.`, at the start of a line, case-sensitive as gh prints it. Nothing looser: a 404 with a token scope, a keyring or
+# "command not found", `could not find git remotes`, `Could not resolve to a Repository` or `Could not resolve host` are failures of the
+# lookup, not a missing PR, and are never counted as one (issue 99, review).
+_PR_NOT_FOUND = re.compile(r"^(?:GraphQL: )?Could not resolve to a PullRequest with the number of [0-9]{1,9}\.", re.M)
 
 
 def parse_pr_ref(text):
@@ -4705,6 +4717,8 @@ def record_pr_notice(state_dir, repo, number, sender, note, now, boss=None):
             item["boss"] = boss
         if old and old.get("unreadable_since") is not None:
             item["unreadable_since"] = old["unreadable_since"]
+            if old.get("unreadable_for") is not None:
+                item["unreadable_for"] = old["unreadable_for"]
         write_pr_notices(state_dir, [i for i in items if i is not old] + [item])
     return item, old is not None
 
@@ -4713,7 +4727,7 @@ def apply_notice_effects(engine):
     """The daemon's end of a pass: forget the notices whose PR is merged, closed or unreadable for good, and note
     when a PR became unreadable (or readable again). Writes only on a change; a failure is tried again next pass."""
     effects = engine.notice_effects
-    if engine.state_dir is None or engine.audit is None or not (effects["drop"] or effects["unreadable"]):
+    if engine.state_dir is None or engine.audit is None or not (effects["drop"] or effects["unreadable"] or effects.get("observed")):
         return False
     try:
         with pr_notices_lock(engine.state_dir):
@@ -4727,8 +4741,15 @@ def apply_notice_effects(engine):
                     item = dict(item)
                     if effects["unreadable"][key] is None:
                         item.pop("unreadable_since", None)
+                        item.pop("unreadable_for", None)
                     else:
                         item["unreadable_since"] = effects["unreadable"][key]
+                if key in effects["observed"]:
+                    item = dict(item)
+                    if effects["observed"][key] is None:
+                        item.pop("unreadable_for", None)
+                    else:
+                        item["unreadable_for"] = effects["observed"][key]
                 kept.append(item)
             if kept != items:
                 write_pr_notices(engine.state_dir, kept)
@@ -4872,8 +4893,8 @@ def read_pr_facts(engine, repo, number):
     except (OSError, subprocess.SubprocessError) as err:
         raise NoticeError("gh pr view %s#%d: %s" % (repo, number, accounts.scrub(_one_line(str(err), 120)))) from None
     if done.returncode != 0:
-        raise NoticeError("gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(
-            _one_line(done.stderr or "", 160)) or "exit %d" % done.returncode))
+        why = "gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode)
+        raise (NoticeNotFound if _PR_NOT_FOUND.search(done.stderr or "") else NoticeError)(why)
     try:
         return pr_facts_from(json.loads(done.stdout or ""))
     except ValueError:
@@ -4922,7 +4943,8 @@ def notice_facts(engine, repo, number, now, budget=None):
     try:
         held = {"at": now, "facts": read_pr_facts(engine, repo, number), "stale": False, "error": None}
     except NoticeError as err:
-        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200)}
+        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200),
+                "not_found": isinstance(err, NoticeNotFound)}  # gh ANSWERED that there is no such PR: it worked
     if budget is not None:
         budget[0] -= max(0, engine.now() - started)
     engine.notice_facts[key] = held
@@ -4948,8 +4970,8 @@ def decisions_from_notices(engine, now):
 
     Not a decision, so not counted with them. The facts come from `gh pr view`, cached; a PR that is merged or
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
-    keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_DAYS."""
-    engine.notice_effects = {"drop": set(), "unreadable": {}}
+    keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
+    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -4960,7 +4982,7 @@ def decisions_from_notices(engine, now):
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
     names = [r.split("/")[-1] for r in decision_repos(engine)] + [i["repo"].split("/")[-1] for i in items]
-    entries = []
+    entries, bad, any_ok = [], {}, False
     budget = [PR_NOTICE_PASS_BUDGET]
     order = lambda i: (i["created"], i["repo"], i["number"])
     # the least recently read go first, so a PR that hangs cannot starve the others of the budget
@@ -4977,15 +4999,16 @@ def decisions_from_notices(engine, now):
         if held.get("skipped"):
             pass  # not read this pass: neither readable nor unreadable, so the unreadable clock is left alone
         elif held["stale"]:
+            bad[key] = (item, held)
+            if held.get("not_found"):
+                any_ok = True  # a clear "no such PR" is an answer: gh and the auth work, so this pass counts toward the hour (an auth or network error does not)
             if since is None:
                 engine.notice_effects["unreadable"][key] = iso(now)
-            elif now - (parse_iso(since) or now) >= PR_NOTICE_UNREADABLE_DAYS * 86400:
-                engine.notice_effects["drop"].add(key)
-                engine._note("notice.dropped", key, {"reason": "unreadable for %d days" % PR_NOTICE_UNREADABLE_DAYS,
-                                                     "error": held["error"]})
-                continue
-        elif since is not None:
-            engine.notice_effects["unreadable"][key] = None
+        else:
+            any_ok = True
+            if since is not None:
+                engine.notice_effects["unreadable"][key] = None
+                engine.notice_effects["observed"][key] = None
         name = repo.split("/")[-1]
         tag = repo if names.count(name) > 1 else name
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
@@ -5001,8 +5024,32 @@ def decisions_from_notices(engine, now):
             entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
-        entries.append((order(item), entry))
-    return [entry for _, entry in sorted(entries, key=lambda pair: pair[0])], []
+        entries.append((order(item), entry, key))
+    # The drop counts only time the daemon OBSERVED: seconds between passes of this process in which `gh` demonstrably worked (some
+    # notice read fine), added for the notices that still cannot be read. A pass where every read fails is an outage (gh, auth, the
+    # network), not a bad notice: nobody counts and nobody drops. A new process starts every count again, so downtime is not counted.
+    obs = getattr(engine, "notice_obs", None)
+    fresh_process = obs is None
+    if fresh_process:
+        obs = engine.notice_obs = {"last": None}
+    gap = min(PR_NOTICE_OBSERVE_MAX, max(0, now - obs["last"])) if (any_ok and obs["last"] is not None) else 0
+    obs["last"] = now if any_ok else None
+    dropped = set()
+    for key, (item, held) in bad.items():
+        if fresh_process:
+            engine.notice_effects["unreadable"][key] = iso(now)
+            engine.notice_effects["observed"][key] = 0
+            continue
+        if not any_ok:
+            continue
+        seconds = (item.get("unreadable_for") or 0) + gap
+        engine.notice_effects["observed"][key] = seconds
+        if seconds >= PR_NOTICE_UNREADABLE_SECONDS:
+            engine.notice_effects["drop"].add(key)
+            engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes of observed time" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
+                                                 "error": held["error"]})
+            dropped.add(key)
+    return [entry for _, entry, key in sorted(entries, key=lambda row: row[0]) if key not in dropped], []
 
 
 
@@ -8359,6 +8406,60 @@ def notice_boss(engine, sender):
     return boss if isinstance(boss, str) and boss.strip() else None
 
 
+def withdraw_pr_notice(state_dir, repo, number, caller):
+    """Remove the notice of `repo#number` for its sender (any agent that sent it) or the boss recorded with it.
+    Returns ("withdrawn", item), ("absent", None) or ("refused", item). Holds the notices lock; idempotent."""
+    with pr_notices_lock(state_dir):
+        items = read_pr_notices(state_dir)
+        old = next((i for i in items if i["repo"] == repo and i["number"] == number), None)
+        if old is None:
+            return "absent", None
+        allowed = {n for n in notice_senders(old)} | ({old["boss"]} if isinstance(old.get("boss"), str) and old.get("boss") else set())
+        if not caller or caller not in allowed:
+            return "refused", old
+        write_pr_notices(state_dir, [i for i in items if i is not old])
+    return "withdrawn", old
+
+
+def _check_open_pr(engine, repo, number):
+    """NoticeError unless `repo#number` is an open pull request at this moment. One bounded `gh pr view` (cached facts first);
+    a lookup that fails for any other reason (network, auth, a timeout) is accepted: best effort, never a block."""
+    held = engine.notice_facts.get("%s#%d" % (repo, number))
+    try:
+        facts = held["facts"] if held and held.get("facts") and not held.get("stale") else read_pr_facts(engine, repo, number)
+    except NoticeNotFound:
+        raise NoticeError("%s#%d is not a pull request I can find (a mistyped number, or an issue): nothing recorded" % (repo, number)) from None
+    except Exception:  # NoticeError, or a runner that fails in some other way: best effort, a lookup never blocks a notice
+        return
+    if facts.get("state") != "open":
+        raise NoticeError("%s#%d is %s, not an open pull request: nothing recorded" % (repo, number, facts.get("state") or "not open"))
+
+
+def _notice_withdraw(args, engine, state, sender, note):
+    if note:
+        sys.stderr.write("%s: notice withdraw takes only the PR\n" % PROG)
+        return EXIT_USAGE
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    try:
+        verdict, item = withdraw_pr_notice(state, repo, number, sender)
+    except NoticeError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    key = "%s#%d" % (repo, number)
+    if verdict == "refused":
+        sys.stderr.write("%s: only the agent that sent the notice for %s (or its boss) can withdraw it\n" % (PROG, key))
+        return EXIT_USAGE
+    if verdict == "withdrawn" and engine.audit is not None:
+        engine.audit.append(engine.actor, "notice.withdrawn", key, {"by": sender, "from": item.get("from"), "boss": item.get("boss")})
+    sys.stderr.write("%s: notice of %s %s\n" % (PROG, key, "withdrawn; a comment on the PR no longer routes to its sender" if verdict == "withdrawn" else "was not recorded (nothing to withdraw)"))
+    print(key)
+    return EXIT_OK
+
+
 def cmd_notice(args, runner, now):
     """PR notices: tell the person about a PR you opened or mean to merge. Recorded for the daemon to show in the
     panel; sends no message and wakes nobody."""
@@ -8372,10 +8473,13 @@ def cmd_notice(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     note = " ".join(" ".join(args.note).split())
+    if args.kind == "withdraw":
+        return _notice_withdraw(args, engine, state, sender, note)
     try:
         repo, number = parse_pr_ref(args.pr)
         if len(note) > REPORT_MAX:
             raise NoticeError("a note is one line of at most %d characters (this one is %d)" % (REPORT_MAX, len(note)))
+        _check_open_pr(engine, repo, number)  # a mistyped number is refused now; an unreadable lookup never blocks
         item, refreshed = record_pr_notice(state, repo, number, sender, note, now(), notice_boss(engine, sender))
     except NoticeError as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -11695,9 +11799,11 @@ def build_parser():
                        "wakes nobody, sends no message)",
         description="`notice pr` records a heads-up about a PR for the person's Decisions panel: information, not a "
                     "decision. It sends no message and wakes nobody. Send it as soon as you OPEN the PR, so it is seen while CI and "
-                    "review run. It stays until the PR is merged or closed; sending it again refreshes the note.")
-    notice.add_argument("kind", choices=("pr",), help="What the notice is about (only `pr`)")
-    notice.add_argument("pr", help="The pull request: owner/repo#N or its URL (an issue is refused)")
+                    "review run. It stays until the PR is merged or closed; sending it again refreshes the note. A number that is "
+                    "not an OPEN pull request is refused when you send it (an unreadable lookup never blocks). `notice withdraw <pr>` removes a "
+                    "notice (the agent that sent it, or its boss); a notice whose PR cannot be read for an hour is dropped.")
+    notice.add_argument("kind", choices=("pr", "withdraw"), help="`pr` records a notice; `withdraw` removes the one for a PR (its sender or its boss)")
+    notice.add_argument("pr", help="The pull request: owner/repo#N or its URL (an issue, a number that is not an open PR, is refused)")
     notice.add_argument("note", nargs="*", help="Optional: one line of why, or what you intend (at most %d characters)" % REPORT_MAX)
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
