@@ -67,22 +67,22 @@ permissions:
     resource: "fleet-switchboard orders list *"
     effect: allow
   - action: shell
-    resource: "fleet-switchboard orders --cos *"
+    resource: "fleet-switchboard decisions answer *"
+    effect: allow
+  - action: shell
+    resource: "fleet-switchboard decisions resolve *"
+    effect: allow
+  - action: shell
+    resource: "fleet-switchboard decisions supersede *"
+    effect: allow
+  - action: shell
+    resource: "fleet-switchboard orders add *"
+    effect: allow
+  - action: shell
+    resource: "fleet-switchboard orders remove *"
     effect: allow
   - action: shell
     resource: "fleet-switchboard decisions"
-    effect: allow
-  - action: shell
-    resource: "fleet-switchboard decisions --repo *"
-    effect: allow
-  - action: shell
-    resource: "fleet-switchboard decisions --tier *"
-    effect: allow
-  - action: shell
-    resource: "fleet-switchboard decisions --json *"
-    effect: allow
-  - action: shell
-    resource: "fleet-switchboard decisions --fresh *"
     effect: allow
   - action: shell
     resource: "gh pr view *"
@@ -131,9 +131,6 @@ permissions:
     effect: allow
   - action: shell
     resource: "gh pr merge *"
-    effect: allow
-  - action: shell
-    resource: "gh pr review *"
     effect: allow
   - action: shell
     resource: "gh pr edit *"
@@ -496,27 +493,6 @@ permissions:
     resource: "az webapp log tail *"
     effect: allow
   - action: shell
-    resource: "curl https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -s https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -sS https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -L https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -sL https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -sSL https://*"
-    effect: allow
-  - action: shell
-    resource: "curl -I https://*"
-    effect: allow
-  - action: shell
     resource: "*>*"
     effect: deny
   - action: shell
@@ -605,48 +581,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "gh api * -p*"
-    effect: deny
-  - action: shell
-    resource: "curl *://localhost*"
-    effect: deny
-  - action: shell
-    resource: "curl *://127.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://10.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://192.168.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://169.254.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://172.1?.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://172.2?.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://172.3?.*"
-    effect: deny
-  - action: shell
-    resource: "curl *://0*"
-    effect: deny
-  - action: shell
-    resource: "curl *://[*"
-    effect: deny
-  - action: shell
-    resource: "curl *.internal*"
-    effect: deny
-  - action: shell
-    resource: "curl *.local/*"
-    effect: deny
-  - action: shell
-    resource: "curl *://*@*"
-    effect: deny
-  - action: shell
-    resource: "curl *#*"
     effect: deny
   - action: shell
     resource: "az *secret*"
@@ -856,69 +790,6 @@ permissions:
     resource: "az *run-command*"
     effect: deny
   - action: shell
-    resource: "curl https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -s https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -s https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -s https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -sS https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -sS https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -sS https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -L https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -L https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -L https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -sL https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -sL https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -sL https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -sSL https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -sSL https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -sSL https://* @*"
-    effect: deny
-  - action: shell
-    resource: "curl -I https://* -*"
-    effect: deny
-  - action: shell
-    resource: "curl -I https://* *://*"
-    effect: deny
-  - action: shell
-    resource: "curl -I https://* @*"
-    effect: deny
-  - action: shell
     resource: "gh api *://*"
     effect: deny
   - action: shell
@@ -968,39 +839,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "*.p12*"
-    effect: deny
-  - action: shell
-    resource: "curl *://1*"
-    effect: deny
-  - action: shell
-    resource: "curl *://2*"
-    effect: deny
-  - action: shell
-    resource: "curl *://3*"
-    effect: deny
-  - action: shell
-    resource: "curl *://4*"
-    effect: deny
-  - action: shell
-    resource: "curl *://5*"
-    effect: deny
-  - action: shell
-    resource: "curl *://6*"
-    effect: deny
-  - action: shell
-    resource: "curl *://7*"
-    effect: deny
-  - action: shell
-    resource: "curl *://8*"
-    effect: deny
-  - action: shell
-    resource: "curl *://9*"
-    effect: deny
-  - action: shell
-    resource: "curl *://metadata*"
-    effect: deny
-  - action: shell
-    resource: "curl *://*:*"
     effect: deny
   - action: shell
     resource: "*$*"
@@ -1099,31 +937,10 @@ permissions:
     resource: "az * invoke*"
     effect: deny
   - action: shell
-    resource: "curl --output*"
-    effect: deny
-  - action: shell
     resource: "git * --output*"
     effect: deny
   - action: shell
-    resource: "curl *-o *"
-    effect: deny
-  - action: shell
     resource: "fleet-switchboard handoff*"
-    effect: deny
-  - action: shell
-    resource: "fleet-switchboard orders add*"
-    effect: deny
-  - action: shell
-    resource: "fleet-switchboard orders remove*"
-    effect: deny
-  - action: shell
-    resource: "fleet-switchboard decisions answer*"
-    effect: deny
-  - action: shell
-    resource: "fleet-switchboard decisions resolve*"
-    effect: deny
-  - action: shell
-    resource: "fleet-switchboard decisions supersede*"
     effect: deny
   - action: shell
     resource: "fleet-switchboard decisions batch*"
@@ -2415,6 +2232,1269 @@ permissions:
   - action: shell
     resource: "git log *htpasswd*"
     effect: deny
+  - action: shell
+    resource: "fleet-switchboard -*"
+    effect: deny
+  - action: shell
+    resource: "fleet-switchboard decisions -*"
+    effect: deny
+  - action: shell
+    resource: "fleet-switchboard orders -*"
+    effect: deny
+  - action: shell
+    resource: "gh pr review*"
+    effect: deny
+  - action: shell
+    resource: "curl*"
+    effect: deny
+  - action: shell
+    resource: "git *\"*"
+    effect: deny
+  - action: shell
+    resource: "git *'*"
+    effect: deny
+  - action: shell
+    resource: "cat *\"*"
+    effect: deny
+  - action: shell
+    resource: "cat *'*"
+    effect: deny
+  - action: shell
+    resource: "head *\"*"
+    effect: deny
+  - action: shell
+    resource: "head *'*"
+    effect: deny
+  - action: shell
+    resource: "tail *\"*"
+    effect: deny
+  - action: shell
+    resource: "tail *'*"
+    effect: deny
+  - action: shell
+    resource: "grep *\"*"
+    effect: deny
+  - action: shell
+    resource: "grep *'*"
+    effect: deny
+  - action: shell
+    resource: "wc *\"*"
+    effect: deny
+  - action: shell
+    resource: "wc *'*"
+    effect: deny
+  - action: shell
+    resource: "ls *\"*"
+    effect: deny
+  - action: shell
+    resource: "ls *'*"
+    effect: deny
+  - action: shell
+    resource: "az *\"*"
+    effect: deny
+  - action: shell
+    resource: "az *'*"
+    effect: deny
+  - action: shell
+    resource: "curl *\"*"
+    effect: deny
+  - action: shell
+    resource: "curl *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr view *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr view *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr list *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr list *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr checks *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr checks *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr diff *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr diff *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr status *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr status *'*"
+    effect: deny
+  - action: shell
+    resource: "gh issue view *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh issue view *'*"
+    effect: deny
+  - action: shell
+    resource: "gh issue list *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh issue list *'*"
+    effect: deny
+  - action: shell
+    resource: "gh issue status *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh issue status *'*"
+    effect: deny
+  - action: shell
+    resource: "gh run *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh run *'*"
+    effect: deny
+  - action: shell
+    resource: "gh workflow *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh workflow *'*"
+    effect: deny
+  - action: shell
+    resource: "gh api *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh api *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr merge *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr merge *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr ready *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr ready *'*"
+    effect: deny
+  - action: shell
+    resource: "gh pr reopen *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh pr reopen *'*"
+    effect: deny
+  - action: shell
+    resource: "gh issue reopen *\"*"
+    effect: deny
+  - action: shell
+    resource: "gh issue reopen *'*"
+    effect: deny
+  - action: shell
+    resource: "*--ad\"*"
+    effect: deny
+  - action: shell
+    resource: "*--ad'*"
+    effect: deny
+  - action: shell
+    resource: "*--ad/*"
+    effect: deny
+  - action: shell
+    resource: "*--adm\"*"
+    effect: deny
+  - action: shell
+    resource: "*--adm'*"
+    effect: deny
+  - action: shell
+    resource: "*--adm/*"
+    effect: deny
+  - action: shell
+    resource: "*--admi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--admi'*"
+    effect: deny
+  - action: shell
+    resource: "*--admi/*"
+    effect: deny
+  - action: shell
+    resource: "*--au\"*"
+    effect: deny
+  - action: shell
+    resource: "*--au'*"
+    effect: deny
+  - action: shell
+    resource: "*--au/*"
+    effect: deny
+  - action: shell
+    resource: "*--aut\"*"
+    effect: deny
+  - action: shell
+    resource: "*--aut'*"
+    effect: deny
+  - action: shell
+    resource: "*--aut/*"
+    effect: deny
+  - action: shell
+    resource: "*--by\"*"
+    effect: deny
+  - action: shell
+    resource: "*--by'*"
+    effect: deny
+  - action: shell
+    resource: "*--by/*"
+    effect: deny
+  - action: shell
+    resource: "*--byp\"*"
+    effect: deny
+  - action: shell
+    resource: "*--byp'*"
+    effect: deny
+  - action: shell
+    resource: "*--byp/*"
+    effect: deny
+  - action: shell
+    resource: "*--bypa\"*"
+    effect: deny
+  - action: shell
+    resource: "*--bypa'*"
+    effect: deny
+  - action: shell
+    resource: "*--bypa/*"
+    effect: deny
+  - action: shell
+    resource: "*--bypas\"*"
+    effect: deny
+  - action: shell
+    resource: "*--bypas'*"
+    effect: deny
+  - action: shell
+    resource: "*--bypas/*"
+    effect: deny
+  - action: shell
+    resource: "*--mer\"*"
+    effect: deny
+  - action: shell
+    resource: "*--mer'*"
+    effect: deny
+  - action: shell
+    resource: "*--mer/*"
+    effect: deny
+  - action: shell
+    resource: "*--merg\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merg'*"
+    effect: deny
+  - action: shell
+    resource: "*--merg/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-q\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-q'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-q/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-qu\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-qu'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-qu/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-que\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-que'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-que/*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-queu\"*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-queu'*"
+    effect: deny
+  - action: shell
+    resource: "*--merge-queu/*"
+    effect: deny
+  - action: shell
+    resource: "*--a\"*"
+    effect: deny
+  - action: shell
+    resource: "*--a'*"
+    effect: deny
+  - action: shell
+    resource: "*--a/*"
+    effect: deny
+  - action: shell
+    resource: "*--ap\"*"
+    effect: deny
+  - action: shell
+    resource: "*--ap'*"
+    effect: deny
+  - action: shell
+    resource: "*--ap/*"
+    effect: deny
+  - action: shell
+    resource: "*--app\"*"
+    effect: deny
+  - action: shell
+    resource: "*--app'*"
+    effect: deny
+  - action: shell
+    resource: "*--app/*"
+    effect: deny
+  - action: shell
+    resource: "*--appr\"*"
+    effect: deny
+  - action: shell
+    resource: "*--appr'*"
+    effect: deny
+  - action: shell
+    resource: "*--appr/*"
+    effect: deny
+  - action: shell
+    resource: "*--appro\"*"
+    effect: deny
+  - action: shell
+    resource: "*--appro'*"
+    effect: deny
+  - action: shell
+    resource: "*--appro/*"
+    effect: deny
+  - action: shell
+    resource: "*--approv\"*"
+    effect: deny
+  - action: shell
+    resource: "*--approv'*"
+    effect: deny
+  - action: shell
+    resource: "*--approv/*"
+    effect: deny
+  - action: shell
+    resource: "*--re\"*"
+    effect: deny
+  - action: shell
+    resource: "*--re'*"
+    effect: deny
+  - action: shell
+    resource: "*--re/*"
+    effect: deny
+  - action: shell
+    resource: "*--req\"*"
+    effect: deny
+  - action: shell
+    resource: "*--req'*"
+    effect: deny
+  - action: shell
+    resource: "*--req/*"
+    effect: deny
+  - action: shell
+    resource: "*--requ\"*"
+    effect: deny
+  - action: shell
+    resource: "*--requ'*"
+    effect: deny
+  - action: shell
+    resource: "*--requ/*"
+    effect: deny
+  - action: shell
+    resource: "*--reque\"*"
+    effect: deny
+  - action: shell
+    resource: "*--reque'*"
+    effect: deny
+  - action: shell
+    resource: "*--reque/*"
+    effect: deny
+  - action: shell
+    resource: "*--reques\"*"
+    effect: deny
+  - action: shell
+    resource: "*--reques'*"
+    effect: deny
+  - action: shell
+    resource: "*--reques/*"
+    effect: deny
+  - action: shell
+    resource: "*--request\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request'*"
+    effect: deny
+  - action: shell
+    resource: "*--request/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-c\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-c'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-c/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-ch\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-ch'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-ch/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-cha\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-cha'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-cha/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chan\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chan'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chan/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chang\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chang'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-chang/*"
+    effect: deny
+  - action: shell
+    resource: "*--request-change\"*"
+    effect: deny
+  - action: shell
+    resource: "*--request-change'*"
+    effect: deny
+  - action: shell
+    resource: "*--request-change/*"
+    effect: deny
+  - action: shell
+    resource: "*--b\"*"
+    effect: deny
+  - action: shell
+    resource: "*--b'*"
+    effect: deny
+  - action: shell
+    resource: "*--b/*"
+    effect: deny
+  - action: shell
+    resource: "*--bo\"*"
+    effect: deny
+  - action: shell
+    resource: "*--bo'*"
+    effect: deny
+  - action: shell
+    resource: "*--bo/*"
+    effect: deny
+  - action: shell
+    resource: "*--bod\"*"
+    effect: deny
+  - action: shell
+    resource: "*--bod'*"
+    effect: deny
+  - action: shell
+    resource: "*--bod/*"
+    effect: deny
+  - action: shell
+    resource: "*--body\"*"
+    effect: deny
+  - action: shell
+    resource: "*--body'*"
+    effect: deny
+  - action: shell
+    resource: "*--body/*"
+    effect: deny
+  - action: shell
+    resource: "*--body-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--body-'*"
+    effect: deny
+  - action: shell
+    resource: "*--body-/*"
+    effect: deny
+  - action: shell
+    resource: "*--body-f\"*"
+    effect: deny
+  - action: shell
+    resource: "*--body-f'*"
+    effect: deny
+  - action: shell
+    resource: "*--body-f/*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fi'*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fi/*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fil\"*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fil'*"
+    effect: deny
+  - action: shell
+    resource: "*--body-fil/*"
+    effect: deny
+  - action: shell
+    resource: "*--o\"*"
+    effect: deny
+  - action: shell
+    resource: "*--o'*"
+    effect: deny
+  - action: shell
+    resource: "*--o/*"
+    effect: deny
+  - action: shell
+    resource: "*--ou\"*"
+    effect: deny
+  - action: shell
+    resource: "*--ou'*"
+    effect: deny
+  - action: shell
+    resource: "*--ou/*"
+    effect: deny
+  - action: shell
+    resource: "*--out\"*"
+    effect: deny
+  - action: shell
+    resource: "*--out'*"
+    effect: deny
+  - action: shell
+    resource: "*--out/*"
+    effect: deny
+  - action: shell
+    resource: "*--outp\"*"
+    effect: deny
+  - action: shell
+    resource: "*--outp'*"
+    effect: deny
+  - action: shell
+    resource: "*--outp/*"
+    effect: deny
+  - action: shell
+    resource: "*--outpu\"*"
+    effect: deny
+  - action: shell
+    resource: "*--outpu'*"
+    effect: deny
+  - action: shell
+    resource: "*--outpu/*"
+    effect: deny
+  - action: shell
+    resource: "*--d\"*"
+    effect: deny
+  - action: shell
+    resource: "*--d'*"
+    effect: deny
+  - action: shell
+    resource: "*--d/*"
+    effect: deny
+  - action: shell
+    resource: "*--de\"*"
+    effect: deny
+  - action: shell
+    resource: "*--de'*"
+    effect: deny
+  - action: shell
+    resource: "*--de/*"
+    effect: deny
+  - action: shell
+    resource: "*--deb\"*"
+    effect: deny
+  - action: shell
+    resource: "*--deb'*"
+    effect: deny
+  - action: shell
+    resource: "*--deb/*"
+    effect: deny
+  - action: shell
+    resource: "*--debu\"*"
+    effect: deny
+  - action: shell
+    resource: "*--debu'*"
+    effect: deny
+  - action: shell
+    resource: "*--debu/*"
+    effect: deny
+  - action: shell
+    resource: "*--j\"*"
+    effect: deny
+  - action: shell
+    resource: "*--j'*"
+    effect: deny
+  - action: shell
+    resource: "*--j/*"
+    effect: deny
+  - action: shell
+    resource: "*--t\"*"
+    effect: deny
+  - action: shell
+    resource: "*--t'*"
+    effect: deny
+  - action: shell
+    resource: "*--t/*"
+    effect: deny
+  - action: shell
+    resource: "*--te\"*"
+    effect: deny
+  - action: shell
+    resource: "*--te'*"
+    effect: deny
+  - action: shell
+    resource: "*--te/*"
+    effect: deny
+  - action: shell
+    resource: "*--tem\"*"
+    effect: deny
+  - action: shell
+    resource: "*--tem'*"
+    effect: deny
+  - action: shell
+    resource: "*--tem/*"
+    effect: deny
+  - action: shell
+    resource: "*--temp\"*"
+    effect: deny
+  - action: shell
+    resource: "*--temp'*"
+    effect: deny
+  - action: shell
+    resource: "*--temp/*"
+    effect: deny
+  - action: shell
+    resource: "*--templ\"*"
+    effect: deny
+  - action: shell
+    resource: "*--templ'*"
+    effect: deny
+  - action: shell
+    resource: "*--templ/*"
+    effect: deny
+  - action: shell
+    resource: "*--templa\"*"
+    effect: deny
+  - action: shell
+    resource: "*--templa'*"
+    effect: deny
+  - action: shell
+    resource: "*--templa/*"
+    effect: deny
+  - action: shell
+    resource: "*--templat\"*"
+    effect: deny
+  - action: shell
+    resource: "*--templat'*"
+    effect: deny
+  - action: shell
+    resource: "*--templat/*"
+    effect: deny
+  - action: shell
+    resource: "*--m\"*"
+    effect: deny
+  - action: shell
+    resource: "*--m'*"
+    effect: deny
+  - action: shell
+    resource: "*--m/*"
+    effect: deny
+  - action: shell
+    resource: "*--me\"*"
+    effect: deny
+  - action: shell
+    resource: "*--me'*"
+    effect: deny
+  - action: shell
+    resource: "*--me/*"
+    effect: deny
+  - action: shell
+    resource: "*--met\"*"
+    effect: deny
+  - action: shell
+    resource: "*--met'*"
+    effect: deny
+  - action: shell
+    resource: "*--met/*"
+    effect: deny
+  - action: shell
+    resource: "*--meth\"*"
+    effect: deny
+  - action: shell
+    resource: "*--meth'*"
+    effect: deny
+  - action: shell
+    resource: "*--meth/*"
+    effect: deny
+  - action: shell
+    resource: "*--metho\"*"
+    effect: deny
+  - action: shell
+    resource: "*--metho'*"
+    effect: deny
+  - action: shell
+    resource: "*--metho/*"
+    effect: deny
+  - action: shell
+    resource: "*--i\"*"
+    effect: deny
+  - action: shell
+    resource: "*--i'*"
+    effect: deny
+  - action: shell
+    resource: "*--i/*"
+    effect: deny
+  - action: shell
+    resource: "*--in\"*"
+    effect: deny
+  - action: shell
+    resource: "*--in'*"
+    effect: deny
+  - action: shell
+    resource: "*--in/*"
+    effect: deny
+  - action: shell
+    resource: "*--inp\"*"
+    effect: deny
+  - action: shell
+    resource: "*--inp'*"
+    effect: deny
+  - action: shell
+    resource: "*--inp/*"
+    effect: deny
+  - action: shell
+    resource: "*--inpu\"*"
+    effect: deny
+  - action: shell
+    resource: "*--inpu'*"
+    effect: deny
+  - action: shell
+    resource: "*--inpu/*"
+    effect: deny
+  - action: shell
+    resource: "*--f\"*"
+    effect: deny
+  - action: shell
+    resource: "*--f'*"
+    effect: deny
+  - action: shell
+    resource: "*--f/*"
+    effect: deny
+  - action: shell
+    resource: "*--fi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--fi'*"
+    effect: deny
+  - action: shell
+    resource: "*--fi/*"
+    effect: deny
+  - action: shell
+    resource: "*--fie\"*"
+    effect: deny
+  - action: shell
+    resource: "*--fie'*"
+    effect: deny
+  - action: shell
+    resource: "*--fie/*"
+    effect: deny
+  - action: shell
+    resource: "*--fiel\"*"
+    effect: deny
+  - action: shell
+    resource: "*--fiel'*"
+    effect: deny
+  - action: shell
+    resource: "*--fiel/*"
+    effect: deny
+  - action: shell
+    resource: "*--r\"*"
+    effect: deny
+  - action: shell
+    resource: "*--r'*"
+    effect: deny
+  - action: shell
+    resource: "*--r/*"
+    effect: deny
+  - action: shell
+    resource: "*--ra\"*"
+    effect: deny
+  - action: shell
+    resource: "*--ra'*"
+    effect: deny
+  - action: shell
+    resource: "*--ra/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-f\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-f'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-f/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fi'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fi/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fie\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fie'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fie/*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fiel\"*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fiel'*"
+    effect: deny
+  - action: shell
+    resource: "*--raw-fiel/*"
+    effect: deny
+  - action: shell
+    resource: "*--ho\"*"
+    effect: deny
+  - action: shell
+    resource: "*--ho'*"
+    effect: deny
+  - action: shell
+    resource: "*--ho/*"
+    effect: deny
+  - action: shell
+    resource: "*--hos\"*"
+    effect: deny
+  - action: shell
+    resource: "*--hos'*"
+    effect: deny
+  - action: shell
+    resource: "*--hos/*"
+    effect: deny
+  - action: shell
+    resource: "*--host\"*"
+    effect: deny
+  - action: shell
+    resource: "*--host'*"
+    effect: deny
+  - action: shell
+    resource: "*--host/*"
+    effect: deny
+  - action: shell
+    resource: "*--hostn\"*"
+    effect: deny
+  - action: shell
+    resource: "*--hostn'*"
+    effect: deny
+  - action: shell
+    resource: "*--hostn/*"
+    effect: deny
+  - action: shell
+    resource: "*--hostna\"*"
+    effect: deny
+  - action: shell
+    resource: "*--hostna'*"
+    effect: deny
+  - action: shell
+    resource: "*--hostna/*"
+    effect: deny
+  - action: shell
+    resource: "*--hostnam\"*"
+    effect: deny
+  - action: shell
+    resource: "*--hostnam'*"
+    effect: deny
+  - action: shell
+    resource: "*--hostnam/*"
+    effect: deny
+  - action: shell
+    resource: "*--h\"*"
+    effect: deny
+  - action: shell
+    resource: "*--h'*"
+    effect: deny
+  - action: shell
+    resource: "*--h/*"
+    effect: deny
+  - action: shell
+    resource: "*--he\"*"
+    effect: deny
+  - action: shell
+    resource: "*--he'*"
+    effect: deny
+  - action: shell
+    resource: "*--he/*"
+    effect: deny
+  - action: shell
+    resource: "*--hea\"*"
+    effect: deny
+  - action: shell
+    resource: "*--hea'*"
+    effect: deny
+  - action: shell
+    resource: "*--hea/*"
+    effect: deny
+  - action: shell
+    resource: "*--head\"*"
+    effect: deny
+  - action: shell
+    resource: "*--head'*"
+    effect: deny
+  - action: shell
+    resource: "*--head/*"
+    effect: deny
+  - action: shell
+    resource: "*--heade\"*"
+    effect: deny
+  - action: shell
+    resource: "*--heade'*"
+    effect: deny
+  - action: shell
+    resource: "*--heade/*"
+    effect: deny
+  - action: shell
+    resource: "*--w\"*"
+    effect: deny
+  - action: shell
+    resource: "*--w'*"
+    effect: deny
+  - action: shell
+    resource: "*--w/*"
+    effect: deny
+  - action: shell
+    resource: "*--wa\"*"
+    effect: deny
+  - action: shell
+    resource: "*--wa'*"
+    effect: deny
+  - action: shell
+    resource: "*--wa/*"
+    effect: deny
+  - action: shell
+    resource: "*--wat\"*"
+    effect: deny
+  - action: shell
+    resource: "*--wat'*"
+    effect: deny
+  - action: shell
+    resource: "*--wat/*"
+    effect: deny
+  - action: shell
+    resource: "*--watc\"*"
+    effect: deny
+  - action: shell
+    resource: "*--watc'*"
+    effect: deny
+  - action: shell
+    resource: "*--watc/*"
+    effect: deny
+  - action: shell
+    resource: "*--l\"*"
+    effect: deny
+  - action: shell
+    resource: "*--l'*"
+    effect: deny
+  - action: shell
+    resource: "*--l/*"
+    effect: deny
+  - action: shell
+    resource: "*--lo\"*"
+    effect: deny
+  - action: shell
+    resource: "*--lo'*"
+    effect: deny
+  - action: shell
+    resource: "*--lo/*"
+    effect: deny
+  - action: shell
+    resource: "*--u\"*"
+    effect: deny
+  - action: shell
+    resource: "*--u'*"
+    effect: deny
+  - action: shell
+    resource: "*--u/*"
+    effect: deny
+  - action: shell
+    resource: "*--up\"*"
+    effect: deny
+  - action: shell
+    resource: "*--up'*"
+    effect: deny
+  - action: shell
+    resource: "*--up/*"
+    effect: deny
+  - action: shell
+    resource: "*--upl\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upl'*"
+    effect: deny
+  - action: shell
+    resource: "*--upl/*"
+    effect: deny
+  - action: shell
+    resource: "*--uplo\"*"
+    effect: deny
+  - action: shell
+    resource: "*--uplo'*"
+    effect: deny
+  - action: shell
+    resource: "*--uplo/*"
+    effect: deny
+  - action: shell
+    resource: "*--uploa\"*"
+    effect: deny
+  - action: shell
+    resource: "*--uploa'*"
+    effect: deny
+  - action: shell
+    resource: "*--uploa/*"
+    effect: deny
+  - action: shell
+    resource: "*--upload\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upload'*"
+    effect: deny
+  - action: shell
+    resource: "*--upload/*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-'*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-/*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-f\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-f'*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-f/*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fi'*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fi/*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fil\"*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fil'*"
+    effect: deny
+  - action: shell
+    resource: "*--upload-fil/*"
+    effect: deny
+  - action: shell
+    resource: "*--p\"*"
+    effect: deny
+  - action: shell
+    resource: "*--p'*"
+    effect: deny
+  - action: shell
+    resource: "*--p/*"
+    effect: deny
+  - action: shell
+    resource: "*--pa\"*"
+    effect: deny
+  - action: shell
+    resource: "*--pa'*"
+    effect: deny
+  - action: shell
+    resource: "*--pa/*"
+    effect: deny
+  - action: shell
+    resource: "*--pag\"*"
+    effect: deny
+  - action: shell
+    resource: "*--pag'*"
+    effect: deny
+  - action: shell
+    resource: "*--pag/*"
+    effect: deny
+  - action: shell
+    resource: "*--pagi\"*"
+    effect: deny
+  - action: shell
+    resource: "*--pagi'*"
+    effect: deny
+  - action: shell
+    resource: "*--pagi/*"
+    effect: deny
+  - action: shell
+    resource: "*--pagin\"*"
+    effect: deny
+  - action: shell
+    resource: "*--pagin'*"
+    effect: deny
+  - action: shell
+    resource: "*--pagin/*"
+    effect: deny
+  - action: shell
+    resource: "*--pagina\"*"
+    effect: deny
+  - action: shell
+    resource: "*--pagina'*"
+    effect: deny
+  - action: shell
+    resource: "*--pagina/*"
+    effect: deny
+  - action: shell
+    resource: "*--paginat\"*"
+    effect: deny
+  - action: shell
+    resource: "*--paginat'*"
+    effect: deny
+  - action: shell
+    resource: "*--paginat/*"
+    effect: deny
+  - action: shell
+    resource: "*--\"*"
+    effect: deny
+  - action: shell
+    resource: "*-\"*"
+    effect: deny
+  - action: shell
+    resource: "*--'*"
+    effect: deny
+  - action: shell
+    resource: "*-'*"
+    effect: deny
+  - action: shell
+    resource: "*/.\"*"
+    effect: deny
+  - action: shell
+    resource: "*/\".*"
+    effect: deny
+  - action: shell
+    resource: "*/.'*"
+    effect: deny
+  - action: shell
+    resource: "*/'.*"
+    effect: deny
+  - action: shell
+    resource: "* .\"*"
+    effect: deny
+  - action: shell
+    resource: "* \".*"
+    effect: deny
+  - action: shell
+    resource: "* .'*"
+    effect: deny
+  - action: shell
+    resource: "* '.*"
+    effect: deny
+  - action: shell
+    resource: "*:.\"*"
+    effect: deny
+  - action: shell
+    resource: "*:\".*"
+    effect: deny
+  - action: shell
+    resource: "*:.'*"
+    effect: deny
+  - action: shell
+    resource: "*:'.*"
+    effect: deny
+  - action: shell
+    resource: "*=.\"*"
+    effect: deny
+  - action: shell
+    resource: "*=\".*"
+    effect: deny
+  - action: shell
+    resource: "*=.'*"
+    effect: deny
+  - action: shell
+    resource: "*='.*"
+    effect: deny
   - action: edit
     resource: "*"
     effect: deny
@@ -2438,10 +3518,10 @@ You are the single interface between the person you report to and the
 orchestrator fleet. You own no project and write no code. You keep a durable,
 honest account of who owns what, whether they are moving, and what your principal
 is blocking. You can only read and coordinate: the `permissions` list above allows
-reads and the fleet's own coordination commands (`fleet-switchboard send|report|remind|intents|status|pending|decisions list|decisions escalate`,
-`gh` reads and the `gh` comment, close and merge of PRs, `az` reads, `git log`, `curl` of a literal URL) and DENIES everything else: nothing asks, nothing
+reads and the fleet's own coordination commands (`fleet-switchboard send|report|remind|intents|status|pending|decisions|orders`,
+`gh` reads and the `gh` comment, close and merge of PRs, `az` reads, `git log`; use `gh api repos/...` for anything on the web, `curl` is denied) and DENIES everything else: nothing asks, nothing
 prompts, a denied call just fails. That is enforced by the harness, not by this text. When a call is denied, do not look for a way around it:
-route the work to the owning orchestrator with `fleet-switchboard send`, or say what you need and why. Keep `$`, braces, `~` and backslashes out of commands.
+route the work to the owning orchestrator with `fleet-switchboard send`, or say what you need and why. Keep `$`, braces, `~` and backslashes out of commands; quotes are for message text only (`send`, `report`, `--body`), never in a read command, a path or a flag.
 
 ## Maxims
 
@@ -2479,9 +3559,11 @@ it, and say so when they diverge. An Intent or Done when changes only on your pr
 `fleet-switchboard intents` lists your open asks. Your comments on GitHub are signed for you, so
 they do not come back to you as events: use plain `gh`.
 
-When your principal gives a standing order ("you may approve deploys here"), you cannot record it: `orders add` and `orders remove` are
-denied to you (an order must never be able to authorise itself). Read the list with `orders list`, tell your principal the exact `orders add --charter <owner/repo#n> "<their words>"`
-to run, and ask nothing it already answers. Never invent or widen an order, and never edit your own orders file (the owner's).
+When your principal gives a standing order ("you may approve deploys here"), run `fleet-switchboard
+orders add --charter <owner/repo#n> "<their words>"`, read the list back to them, and ask nothing it already
+answers; when they revoke one, `orders remove`. Every add and remove is announced: a heads-up in your principal's panel and a comment on the
+charter with the exact text and who ran it, so record only what they said. Never invent or widen an order, and never edit
+your own orders file (the owner's).
 
 A decoration on your principal's newest message says what it is about. You cannot `handoff` (it starts an unrestricted subagent: denied). **An ask with an owner:** `send` the owner what is relevant, then carry on. Start on neither.
 
@@ -2505,10 +3587,13 @@ never reconstruct it from memory.
 
 Orchestrators raise decisions to you, never straight to your principal. On each wake, work your
 list (`fleet-switchboard decisions`). For each decision your standing orders (the `[switchboard]
-standing orders` note: the owner's words only) cover, `send` the orchestrator the
-answer. `decisions answer`, `resolve`, `supersede` and `batch` are denied to you: say in one line which order covers it and `decisions escalate <id>
---reason "..."` so your principal (or the owner's CLI) settles it. If unsure, escalate. One short line per outcome; do not restate what
-is unchanged. A batch is one decision: escalate it whole; its orchestrator acts on the rows, never you.
+standing orders` note: the owner's words only) cover, answer it (the
+orchestrator via `send`, an agent's prompt via `decisions answer <id> allow|deny`) and `decisions
+resolve <id>`, quoting the order in one line. For each they do not cover, `decisions escalate <id>
+--reason "..."`. Never both. If unsure, escalate. The command itself refuses a decision of the owner's (human) tier: you answer only your own (cos) tier. One short line per outcome; do not restate what
+is unchanged. A batch is one decision: escalate it whole, or `decisions answer <id>
+--as-recommended` (or `--row N=<choice>`); its orchestrator acts on the rows, never
+you. `decisions supersede <id>... --by <repo#N>` settles several at once.
 
 ## Supervision is divergence, not polling
 
@@ -2540,7 +3625,7 @@ principal cannot see. If GitHub is unreachable, say so; report live state.
 
 Open decisions are listed, with ids, in your principal's read-only Decisions
 list: say one once with its id, never restate open ones: "see Decisions". On
-"answer #2a: yes", act, and tell your principal the `decisions resolve` to run.
+"answer #2a: yes", act, then `decisions resolve` it.
 
 ## Wake protocol
 
@@ -2557,7 +3642,7 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 
 ## STOP
 
-- Never write product code, never deploy, never touch credentials. You are read-only and coordination-only: your shell can read, and use `gh` and `fleet-switchboard`. You may comment on, close, reopen, review, edit and merge PRs and issues, because your principal said "I don't have a problem with you using gh to write comments or close/merge PRs". A questionable PR is held and raised, never merged. Never merge with `--admin` or `--auto`, and never `--approve` a PR (an approval can satisfy the independent-review rule; comment instead).
+- Never write product code, never deploy, never touch credentials. You are read-only and coordination-only: your shell can read, and use `gh` and `fleet-switchboard`. You may comment on, close, reopen, review, edit and merge PRs and issues, because your principal said "I don't have a problem with you using gh to write comments or close/merge PRs". A questionable PR is held and raised, never merged. Never merge with `--admin` or `--auto`, and never review or approve a PR (`gh pr review` is denied: an approval can satisfy the independent-review rule; comment with `gh pr comment`).
 - When a command is denied you are not blocked and nothing will prompt: route the work to the owning orchestrator with `fleet-switchboard send`.
 - Never run `gh repo create`, `gh repo delete` or `gh repo edit --visibility`.
 - Never dispatch another orchestrator's coder: they are its own; talk to the orchestrator.

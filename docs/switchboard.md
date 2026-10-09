@@ -3714,8 +3714,7 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
 ### Review changes at f1c3c4f (#108)
 
 - `handoff`, `subagent`, `task`, `launch` are denied: handoff starts a `cos-subagent` whose own definition is allow-all.
-- `fleet-switchboard orders add|remove` and `decisions answer|resolve|supersede|batch` are denied (an order must not authorise itself; the judge no
-  longer guards them for the cos). `decisions list|escalate` and `orders list` stay. **For the owner:** with this the Chief of Staff cannot answer an
+- (Superseded by the next section: answer/resolve/supersede and orders add/remove are allowed again, with the CLI as the lock.) `decisions batch` stays denied. **For the owner:** with this the Chief of Staff cannot answer an
   orchestrator's prompt itself; it escalates. If you want it to answer under your standing orders, grant exactly `fleet-switchboard decisions answer *`
   (and `resolve *`) knowingly, or step 2 decides who answers.
 - Expansion bypasses: `$`, `{`, `}` and `~` anywhere in a command are denied; `*`, `?` and `[` are already denied by the scanner. OpenCode normalises `\`
@@ -3727,6 +3726,27 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
   and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
 - `gh`: the owner's words cover comments and close/merge; Adam's later answers also covered reopen, edit, ready and review. `--approve` is denied
   (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.
-- `curl` is a literal URL only (no `$`, no flags after the URL, no port, no numeric host). **Residual risk:** a model could still put context it holds
-  into a literal URL. `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
+- `curl` is denied (second review). `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
   inside a secret-looking filename that is not in a dot-directory (`id_\rsa`) is not caught.
+
+### Decisions and orders are allowed again, with the CLI as the lock (#105, cos decision)
+
+- The Chief of Staff's permissions allow `decisions answer|resolve|escalate|supersede` and `orders add|remove` as exact patterns
+  (`fleet-switchboard <noun> <verb> *`). `decisions batch` stays denied (it is an orchestrator's command). Any global flag before the noun or verb
+  (`decisions --repo X answer`, `orders --cos add`) matches no allow and is denied explicitly.
+- **The CLI keeps the Chief of Staff to its own tier.** `answer`, `resolve` and `supersede` run as the chief-of-staff role refuse any decision that
+  is not on the `cos` tier (an owner's, `human`, one); the refusal is audited (`decisions.refused`). `escalate` of a human-tier one is a no-op as before.
+  You, in a plain shell, are unrestricted. Tested per subcommand and per tier (`TestCosAnswersOnlyItsOwnTier`). Two baseline goldens changed
+  on purpose (a cos `resolve`/`supersede` of an owner-tier item is now refused).
+- **Every `orders add|remove` by the Chief of Staff is seen at once.** The command posts a comment on the charter (exact text, who ran it, "if the
+  owner did not give this order, remove it") and records a heads-up (`order-notices.json`, kind `notice` in the Heads-up section of the panel)
+  that drops after a day or when you run `fleet-switchboard notice ack <id>` in a plain shell (an agent is refused). The order stands if the
+  comment fails; the command then says so and exits 1.
+
+### Second review (#108 at fa7dc6f)
+
+- Shell text splices: quotes are denied in every read command (`git cat head tail grep wc ls az gh` reads, merge/ready/reopen); free text (`send`, `report`,
+  `--body`) keeps them, and each dangerous flag has guards for any prefix followed by a quote or slash (`--ad"min"`, `--ad\min`, `--body-fi"le"`), plus
+  `--"` and `-"`. `.e?v` globs are already denied by the scanner. `gh pr review` is denied outright (comment with `gh pr comment`).
+- `curl` is denied for the Chief of Staff: use `gh api repos/...`.
+- Not solved by patterns: a quote inside free text can still hide an arbitrary flag spelling that has no guard; the guards cover the flags that matter.

@@ -98,16 +98,9 @@
  {
   "argv": "decisions resolve web#3",
   "as": "cos",
-  "code": 0,
-  "err": "",
-  "gh_writes": [
-   "DELETE repos/acme/web/issues/3/labels/me%3Aawaiting-cos",
-   "DELETE repos/acme/web/issues/3/labels/me%3Aawaiting-user"
-  ],
-  "labels_changed": {
-   "acme/web#3": []
-  },
-  "out": "resolved web#3: me:awaiting-cos and me:awaiting-user are off acme/web#3\n"
+  "code": 2,
+  "err": "fleet-switchboard: web#3 is on the human tier: the Chief of Staff resolves only decisions of its own (cos) tier. It is the owner's: leave it, or escalate it with a reason\n",
+  "out": ""
  },
  {
   "argv": "decisions resolve api#5",
@@ -134,7 +127,7 @@
   "argv": "decisions resolve api#2hv",
   "as": "cos",
   "code": 2,
-  "err": "fleet-switchboard: api#2hv is a permission: answer it with `fleet-switchboard decisions answer api#2hv ...`\n",
+  "err": "fleet-switchboard: api#2hv is on the human tier: the Chief of Staff resolves only decisions of its own (cos) tier. It is the owner's: leave it, or escalate it with a reason\n",
   "out": ""
  },
  {
@@ -171,6 +164,17 @@
      "since": "2027-01-15T07:59:00Z",
      "tier": "cos",
      "title": "Other repo"
+    },
+    {
+     "agent": "coder",
+     "ask": 3,
+     "headline": "Yours already",
+     "id": "web#3",
+     "kind": "issue",
+     "repo": "acme/web",
+     "since": "2027-01-15T07:59:00Z",
+     "tier": "human",
+     "title": "Yours already"
     },
     {
      "agent": "api-orch",
