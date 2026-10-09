@@ -3309,6 +3309,14 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     the old-to-new item and, through the render step's one toast path, a toast.
     Checked live: the next message carried the new Done when, the item showed
     old to new, herdr reported the toast shown.
+  - **An Intent edit wakes the Chief of Staff only when it is ours (#96).** An edit to an issue's Intent section
+    now reaches the Chief of Staff (item and toast) only when the editor is one of the config's `owner_logins` (a list
+    of GitHub logins, default none), or the issue is one of our charters or an ask or work item under one: the same
+    climb that routes a comment finds a fleet agent's charter. Any other issue (another team's, with an Intent line
+    of its own) is only audited: one `intent.edit` entry with `woke: false` and why. The decision is made once per
+    edit and uses the routing's cached, retried reads. When the chain cannot be read the edit wakes, with the line
+    `(chain unreadable: woken to be safe)`, so an ask's Intent change is never lost. Intent edits go only to the Chief
+    of Staff today, so no orchestrator's wakes change.
   - **The judge failed open on a cold orchestrator (scenario run, live).**
     `platform` ran `gh workflow run deploy.yml` and the judge allowed it,
     unjudged: each of its calls spent the whole 900 ms resolving the ask (a `gh`
