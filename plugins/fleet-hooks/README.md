@@ -80,3 +80,16 @@ outcome.
   CLI and the plugin each enforce this). A malformed, late or missing reply
   leaves the configured outcome alone.
 - The child is killed after the timeout.
+
+## Shadow mode does not wait (#113)
+
+When the judge is in shadow (`policy.shadow: true`) its verdict decides nothing, so the plugin does not wait for it.
+The judge's reply carries `shadow: true` only when it is in shadow; the plugin keeps that for 30 s. While it holds, each
+call is sent to `judge-tool` detached (stdout and stderr ignored, at most 4 in flight, killed after 15 s) and the hook
+returns at once; the verdict is audited by the daemon as before. The mode is **never assumed**: at start, after 30 s,
+or after any reply that is not a shadow reply, the plugin awaits and enforces exactly as before, so an enforcing judge
+is never made asynchronous (one awaited call per 30 s refreshes the mode). A call over the in-flight cap is dropped,
+never blocked on, and counted: the count reaches the next child in `FLEET_SWITCHBOARD_DROPPED` and is audited as
+`policy.dropped`. Errors in this path are swallowed; nothing is written to stdout.
+
+The cached mode is **per session**, so one agent's shadow reply never makes another's calls asynchronous, and a session with no cached mode awaits. A flip (shadow to enforcing or back) is told to the next child in `FLEET_SWITCHBOARD_MODE_FLIPS` and audited as `policy.mode`, so the window up to 30 s is visible.

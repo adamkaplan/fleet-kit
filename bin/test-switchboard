@@ -11504,6 +11504,24 @@ class TestPolicyShadow(PolicyCase):
         self.assertEqual(reply["outcome"], "ask")
         self.assertEqual(self.audit_events()[-1]["detail"]["verdict"], "unchanged")
 
+    def test_a_shadow_reply_says_so_for_the_plugin_and_an_enforcing_one_does_not(self):
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}], shadow=True)
+        self.assertIs(self.judge_tool(self.coder, "shell", "git push --force", "allow").get("shadow"), True)
+        self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}])
+        self.assertNotIn("shadow", self.judge_tool(self.coder, "shell", "git push --force", "allow"))
+
+    def test_dropped_calls_told_by_the_plugin_are_audited_once(self):
+        sb.record_dropped_calls({"FLEET_SWITCHBOARD_DROPPED": "3"})
+        sb.record_dropped_calls({})
+        events = [e for e in self.world.audit() if e["event"] == "policy.dropped"]
+        self.assertEqual([e["detail"]["count"] for e in events], [3])
+
+    def test_a_mode_flip_told_by_the_plugin_is_audited(self):
+        sb.record_mode_flips({"FLEET_SWITCHBOARD_MODE_FLIPS": "ses_a:shadow>enforcing,ses_b:enforcing>shadow"})
+        sb.record_mode_flips({})
+        events = [e for e in self.world.audit() if e["event"] == "policy.mode"]
+        self.assertEqual([e["detail"]["flips"] for e in events], [["ses_a:shadow>enforcing", "ses_b:enforcing>shadow"]])
+
     def test_shadow_off_still_enforces_and_records_no_verdict(self):
         self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}])
         self.assertEqual(self.judge_tool(self.coder, "shell", "git push --force", "allow")["outcome"], "ask")

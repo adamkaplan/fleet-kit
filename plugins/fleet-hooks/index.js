@@ -16,6 +16,7 @@ import path from "node:path";
 export const OUTCOMES = ["allow", "ask", "deny"]; // least to most strict
 export const DEFAULT_TIMEOUT_MS = 2500; // the CLI's own budget is 1500 ms; this is that plus slack
 const REASON_LIMIT = 600;
+const JUDGE_ARGV = ["judge-tool"]; // the one command this plugin runs
 
 // The permission `action` names this plugin forwards, exactly as v2 reports
 // them, mapped to the CLI's tool kinds. Measured in the Lab (v2 2.0.22): the
@@ -77,7 +78,7 @@ function parseReply(text) {
 
 // Run the CLI once. Resolves with its reply, or null when it cannot answer in
 // time (a timeout kills it) or at all. Never rejects.
-export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
+export function runJudge(bin, request, timeoutMs, spawnFn = spawn, extraEnv = null) {
   return new Promise((resolve) => {
     let settled = false;
     let out = "";
@@ -93,7 +94,7 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
       finish(null);
     }, timeoutMs);
     try {
-      child = spawnFn(bin, ["judge-tool"], { stdio: ["pipe", "pipe", "ignore"], env: childEnv(), shell: false });
+      child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "pipe", "ignore"], env: Object.assign(childEnv(), extraEnv || {}), shell: false });
       child.on("error", () => finish(null));
       child.on("close", () => finish(parseReply(out)));
       child.stdout.on("data", (chunk) => {
@@ -113,12 +114,94 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
   });
 }
 
-export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn }) {
+// #113: while the judge is in shadow its verdict decides nothing, so nothing should wait for it. The plugin learns
+// the mode from the judge's own reply (`shadow: true`, only ever sent by a judge that is in shadow) and keeps it for
+// MODE_TTL_MS. It never assumes: an unknown or expired mode, or any reply without `shadow`, means AWAIT AND ENFORCE,
+// exactly as before. In shadow the call is fired detached (bounded in flight, never blocking, dropped and counted
+// when over the cap) and the hook returns at once. One awaited call per TTL refreshes the mode.
+export const MODE_TTL_MS = 30000;
+export const SHADOW_MAX_INFLIGHT = 4;
+export const SHADOW_HARD_TIMEOUT_MS = 15000;
+
+export function fireDetached(bin, request, state, spawnFn = spawn) {
+  if (state.inflight >= SHADOW_MAX_INFLIGHT) {
+    state.dropped += 1;
+    return false;
+  }
+  let child;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    state.inflight -= 1;
+    clearTimeout(timer);
+  };
+  state.inflight += 1;
+  const timer = setTimeout(() => {
+    try { child?.kill("SIGKILL"); } catch { /* already gone */ }
+    release();
+  }, SHADOW_HARD_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const owed = state.dropped;
+    const env = Object.assign(childEnv(), noticesFor(state));
+    if (owed > 0) env.FLEET_SWITCHBOARD_DROPPED = String(owed);
+    child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "ignore", "ignore"], env, shell: false });
+    if (owed > 0) state.dropped -= owed;
+    child.on("error", release);
+    child.on("close", release);
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(request));
+    child.unref?.();
+  } catch {
+    release();
+  }
+  return true;
+}
+
+// The mode is kept PER SESSION: one agent's shadow reply never makes another agent's calls asynchronous, and a
+// session with no cached mode awaits. A flip (shadow to enforcing or back) is told to the next judge-tool child in
+// FLEET_SWITCHBOARD_MODE_FLIPS ("<session>:<from>><to>,..."), which audits it as `policy.mode`, so the up-to-30 s window
+// is visible.
+export const MAX_SESSIONS = 500;
+
+export function noticesFor(state) {
+  if (!state.flips || state.flips.length === 0) return {};
+  const told = state.flips.splice(0, 20).join(",");
+  return { FLEET_SWITCHBOARD_MODE_FLIPS: told };
+}
+
+function setMode(state, session, shadow, now) {
+  const modes = state.modes;
+  const before = modes.get(session);
+  const was = before === undefined ? null : before.shadow ? "shadow" : "enforcing";
+  const is = shadow ? "shadow" : "enforcing";
+  if (was !== null && was !== is) state.flips.push(`${session}:${was}>${is}`);
+  modes.delete(session);
+  modes.set(session, { shadow, until: shadow ? now + MODE_TTL_MS : 0 });
+  if (modes.size > MAX_SESSIONS) modes.delete(modes.keys().next().value);
+}
+
+export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null }) {
+  const mode = state || {};
+  mode.inflight = mode.inflight || 0;
+  mode.dropped = mode.dropped || 0;
+  mode.modes = mode.modes || new Map();
+  mode.flips = mode.flips || [];
   return async function evaluate(input) {
     try {
       if (!input || !OUTCOMES.includes(input.effect) || typeof input.sessionID !== "string") return;
       if (toolOf(input.action) === null) return; // not an action this plugin forwards: the configured outcome stands
-      const reply = await runJudge(bin, requestOf(input), timeoutMs, spawnFn);
+      const request = requestOf(input);
+      const known = mode.modes.get(input.sessionID);
+      if (known && known.shadow && now() < known.until) {
+        fireDetached(bin, request, mode, spawnFn);
+        return; // shadow: the tool call proceeds at once
+      }
+      const reply = await runJudge(bin, request, timeoutMs, spawnFn, noticesFor(mode));
+      if (reply && reply.shadow === true) setMode(mode, input.sessionID, true, now());
+      else if (reply && reply.judged === true) setMode(mode, input.sessionID, false, now()); // enforcing: never async
+      if (reply && reply.shadow === true) return; // a shadow reply is the configured outcome anyway
       if (!isStricter(reply, input.effect)) return; // the second guard: never loosen, never repeat
       input.effect = reply.outcome;
       input.message = typeof reply.reason === "string" ? reply.reason.slice(0, REASON_LIMIT) : undefined;
