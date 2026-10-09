@@ -3666,3 +3666,47 @@ waiting at most 3 s; only in the ask repo or the worker's own repo) and refuses 
 never raised against a ghost that only a send on the same ghost could clear. The check is best effort: with no ask
 repo configured, an offline or slow `gh`, or any answer other than a clear Not Found, the report is accepted. A report
 without `--issue` (the worker's own ask) is not looked up.
+
+## The Chief of Staff is read-only by native permissions (#105)
+
+The Chief of Staff's definition (`agents/opencode/chief-of-staff.md`) carries an OpenCode v2 `permissions:` list instead of a judge or an
+instruction. The first rule is `* * deny`; allows follow (reads, `fleet-switchboard`, `gh`, a few `git`/`az`/`curl` read shapes); deny
+guards come last (redirects, `$()`, `gh api` writes, `--admin`/`--auto`, `gh repo|secret|variable|release|auth|extension|alias`, `gh workflow run`,
+`az` write verbs and secret values, `curl` to localhost, private ranges or with userinfo, secret-bearing paths). Last match wins and any deny
+denies. **Nothing asks**: a denial is hard ("Permission denied: shell") and the Chief of Staff routes the work to the owning orchestrator
+instead of blocking on a dialog. Principal's word (Adam): "I don't have a problem with you using gh to write comments or close/merge PRs";
+a questionable PR is still held and raised (instruction level, not enforceable by a pattern).
+
+Pitfalls found by `tools/cos-permissions-proof/` (read its README):
+- an agent frontmatter with a `name:` key makes v2 ignore the whole `permissions:` list (the agent runs allow-all). The cos file has none;
+  `TestChiefOfStaffNativePermissions` and `TestAgentDefinitions` assert it. The coder, orchestrator and cos-subagent files still carry `name:`
+  and the v1 `permission:` form: their rules are not enforced either; step 2.
+- patterns are whole-value globs over a scanner-split command (`*` and `?` only, no character classes); `x *` matches `x` and `x args`, never `xy`.
+  Quoted arguments keep their quotes, so `curl -s 'https://...'` is denied: write the URL unquoted.
+- an explicit deny does not invoke plugin hooks, so denials are proved by "nothing ran, nothing asked", not by a log line.
+
+Proof: `python3 tools/cos-permissions-proof/run.py`: allowed commands all run; hostile ones are denied-not-run (a hand-triaged `harmless` list
+of read-only shapes aside); asked is 0.
+
+**Rollout.** Reinstall the agents (the installer copies `agents/opencode/*.md`) and restart the Chief of Staff's opencode session; a running
+session keeps the definition it began with. This is a `~/.config` change: only on the owner's yes via the Chief of Staff.
+**Rollback.** Restore the previous `chief-of-staff.md` (`git revert` of the PR, reinstall, restart).
+
+**Draft, NOT applied: a global never-list.** A fleet-wide floor that holds even if an agent file is wrong (in `opencode.jsonc`; policy
+denials read "Blocked by configuration policy"). Shape to be confirmed against the v2 `experimental.policies` schema before anyone applies it:
+
+```jsonc
+"experimental": { "policies": [
+  { "action": "shell", "resource": "*sudo*", "effect": "deny" },
+  { "action": "shell", "resource": "bash *", "effect": "deny" },   // and sh, zsh, eval, exec
+  { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
+  { "action": "shell", "resource": "git push --force*", "effect": "deny" },
+  { "action": "shell", "resource": "gh repo delete*", "effect": "deny" }
+] }
+```
+
+Orchestrators (step 2) need data-driven allows. The last-3-days shell calls of orchestrators lead with: `cat`, `gh api`, `fleet-switchboard send`,
+`echo`, `git fetch`, `date`, `git show`, `fleet-switchboard report`, `python3`, `gh pr view`, `fleet-switchboard notice`, `gh pr merge`, `remind`,
+`gh pr checks`, `grep`, `gh issue comment`, ... A standing order lets orchestrators `gh pr merge --admin`: the cos guard against `--admin` is
+for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (the docs list none); the switchboard already tiers it
+(`decisions_cos_grace_seconds`, 300s, then the human) and can answer it (`permission_reply`), so a timeout-to-deny would be a switchboard action.

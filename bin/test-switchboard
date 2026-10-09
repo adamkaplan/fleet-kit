@@ -8423,7 +8423,8 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
           "ready for your principal's eyes", "stuck after trying")
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 8900, "cos-subagent": 3500}
+# chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 9300, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8434,6 +8435,65 @@ def role_of(path):
 def maxims_block(text):
     match = re.search(r"^## Maxims\n(.*?)(?=^## )", text, re.S | re.M)
     return match.group(1) if match else ""
+
+
+class TestChiefOfStaffNativePermissions(unittest.TestCase):
+    """The cos definition's v2 `permissions:` list is the only thing keeping it read-only: check its structure."""
+    PATH = REPO / "agents" / "opencode" / "chief-of-staff.md"
+
+    @classmethod
+    def rules(cls):
+        front = cls.PATH.read_text().split("\n---\n", 1)[0]
+        rules, current = [], None
+        for line in front.splitlines():
+            m = re.match(r"  - action: (.*)$", line)
+            if m:
+                current = {"action": m.group(1).strip('"')}
+                rules.append(current)
+            elif current is not None and (m := re.match(r"    (resource|effect): (.*)$", line)):
+                current[m.group(1)] = m.group(2).strip('"')
+        return front, rules
+
+    def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
+        _, rules = self.rules()
+        self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
+        self.assertEqual({r["effect"] for r in rules}, {"allow", "deny"})
+        self.assertTrue(all(set(r) == {"action", "resource", "effect"} for r in rules))
+
+    def test_v1_keys_that_would_void_or_widen_the_rules_are_absent(self):
+        front, _ = self.rules()
+        self.assertNotRegex(front, r"(?m)^name:")  # a named agent makes v2 ignore `permissions:` entirely
+        self.assertNotRegex(front, r"(?m)^permission:")
+        self.assertNotRegex(front, r"bash:")
+
+    def test_no_shell_allow_is_a_bare_wildcard_and_patterns_are_exact(self):
+        _, rules = self.rules()
+        for r in rules:
+            if r["action"] == "shell" and r["effect"] == "allow":
+                self.assertNotIn(r["resource"], ("*", "* *"))
+                self.assertFalse(re.search(r"[a-z]\*$", r["resource"]) and not r["resource"].startswith(("curl ", "az ")), r["resource"])
+                self.assertNotRegex(r["resource"], r"^[a-z-]+\*", r["resource"])
+
+    def test_every_deny_guard_comes_after_the_allows_it_overrides(self):
+        _, rules = self.rules()
+        shell = [r for r in rules if r["action"] == "shell"]
+        last_allow = max(i for i, r in enumerate(shell) if r["effect"] == "allow")
+        first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
+        self.assertLess(last_allow, first_guard)
+        resources = [r["resource"] for r in shell]
+        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh repo*", "gh workflow run*", "gh release*", "az * delete *", "az *secret*", "az *token*"):
+            self.assertIn(guard, resources)
+
+    def test_edit_and_subagent_are_denied_and_the_denial_is_final(self):
+        _, rules = self.rules()
+        for action in ("edit", "subagent"):
+            self.assertEqual([r["effect"] for r in rules if r["action"] == action], ["deny"])
+
+    def test_the_prose_matches_the_rules(self):
+        text = self.PATH.read_text()
+        self.assertIn("I don't have a problem with you using gh to write comments or close/merge PRs", text)
+        self.assertIn("route the work to the owning orchestrator", text)
+        self.assertNotIn("never merge,", text)
 
 
 class TestAgentDefinitions(unittest.TestCase):
@@ -8510,12 +8570,17 @@ class TestAgentDefinitions(unittest.TestCase):
             text = path.read_text()
             with self.subTest(file=path.name):
                 self.assertTrue(text.startswith("---\n"))
-                self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
+                if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+                    self.assertNotRegex(text.split("\n---\n")[0], r"(?m)^name:")  # v2: a named agent loses its `permissions:` list
+                else:
+                    self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
                 self.assertRegex(text, r"(?m)^model: __(PROVIDER__/__MODEL_ID|MODEL_ID)__$")
 
     def test_the_role_files_do_not_grow(self):
         for path in AGENT_FILES:
             text = path.read_text()
+            if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+                text = text.split("\n---\n", 1)[1]  # the permissions list is configuration, not prompt: only the body counts
             role = role_of(path)
             with self.subTest(file=path.name):
                 self.assertLessEqual(len(text.splitlines()), ROLE_LINE_LIMITS[role])
