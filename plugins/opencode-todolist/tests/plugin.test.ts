@@ -228,8 +228,16 @@ test("a todoread issued together with a todowrite sees the write (fleet-kit#38)"
   assert.doesNotMatch(read.content ?? "", /empty/)
 })
 
-test("two parallel todowrites of one session do not lose the timing of either", async () => {
+test("two parallel todowrites of one session land in the order they began (fails without the queue)", async () => {
   const fake = fakeContext()
+  const storage = fake.context.storage as unknown as { set: (key: string, value: unknown) => Promise<void> }
+  const set = storage.set
+  let calls = 0
+  storage.set = async (key, value) => {
+    // the first write is the slow one: unqueued, it would land last and overwrite the later list
+    await new Promise((resolve) => setTimeout(resolve, ++calls === 1 ? 40 : 1))
+    await set(key, value)
+  }
   await plugin.setup(fake.context)
   const ctx = { sessionID: "ses_p" }
   await Promise.all([
@@ -237,5 +245,28 @@ test("two parallel todowrites of one session do not lose the timing of either", 
     fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "completed" }] }, ctx),
   ])
   const stored = fake.storage.get("todos/ses_p") as { todos: Array<{ status: string }> }
-  assert.equal(stored.todos[0].status, "completed", "the later write wins, in the order the calls began")
+  assert.equal(stored.todos[0].status, "completed")
+})
+
+test("a hung predecessor delays the next todo call by the bounded wait only", async () => {
+  process.env.OPENCODE_TODOLIST_QUEUE_WAIT_MS = "50"
+  const warn = mock.method(console, "warn", () => {})
+  try {
+    const fake = fakeContext()
+    const storage = fake.context.storage as unknown as { get: (key: string) => Promise<unknown> }
+    const get = storage.get
+    let calls = 0
+    storage.get = (key) => (++calls === 1 ? new Promise(() => {}) : get(key)) // the first call never finishes
+    await plugin.setup(fake.context)
+    const ctx = { sessionID: "ses_h" }
+    void fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "pending" }] }, ctx)
+    const started = Date.now()
+    const read = await fake.tools.get("todoread")!.execute({}, ctx)
+    assert.match(read.content ?? "", /empty/)
+    assert.ok(Date.now() - started >= 40 && Date.now() - started < 2000, "waited about the bound, not forever")
+    assert.ok(warn.mock.calls.length <= 1, "logged at most once")
+  } finally {
+    delete process.env.OPENCODE_TODOLIST_QUEUE_WAIT_MS
+    warn.mock.restore()
+  }
 })

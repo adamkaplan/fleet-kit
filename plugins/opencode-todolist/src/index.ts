@@ -65,8 +65,31 @@ const TODOREAD_DESCRIPTION =
 // same session must see that write, so a session's tool executions run one at a time, in the order they began
 // (fleet-kit#38: cos called todowrite and todoread in one step and todoread read the list before it was stored).
 const chains = new Map<string, Promise<unknown>>()
+let warnedAboutWait = false
+
+// A predecessor that never finishes (a hung storage call) must not block the session's todo tools for good: wait for it
+// at most this long (5 s; OPENCODE_TODOLIST_QUEUE_WAIT_MS overrides it, for tests), then go ahead and say so once.
+function queueWaitMs(): number {
+  const wanted = Number(process.env.OPENCODE_TODOLIST_QUEUE_WAIT_MS)
+  return Number.isFinite(wanted) && wanted >= 0 ? wanted : 5000
+}
+
+async function waitForPredecessor(before: Promise<unknown>, sessionID: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), queueWaitMs())
+  })
+  const outcome = await Promise.race([before.then(() => "done" as const), late])
+  if (timer !== undefined) clearTimeout(timer)
+  if (outcome === "late" && !warnedAboutWait) {
+    warnedAboutWait = true
+    console.warn(`[aiev.todolist] a todo call of ${sessionID} did not finish in ${queueWaitMs()} ms; the next one goes ahead`)
+  }
+}
+
 function serialized<T>(sessionID: string, work: () => Promise<T>): Promise<T> {
-  const run = (chains.get(sessionID) ?? Promise.resolve()).then(work)
+  const before = chains.get(sessionID) ?? Promise.resolve()
+  const run = waitForPredecessor(before, sessionID).then(work)
   const tail = run.then(
     () => undefined,
     () => undefined,
