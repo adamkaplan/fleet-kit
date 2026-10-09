@@ -781,9 +781,6 @@ permissions:
     resource: "az *run-command*"
     effect: deny
   - action: shell
-    resource: "gh api *://*"
-    effect: deny
-  - action: shell
     resource: "git grep *-O*"
     effect: deny
   - action: shell
@@ -3196,9 +3193,6 @@ permissions:
     resource: "*--approv/*"
     effect: deny
   - action: shell
-    resource: "*--re/*"
-    effect: deny
-  - action: shell
     resource: "*--req/*"
     effect: deny
   - action: shell
@@ -3314,9 +3308,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "*--fiel/*"
-    effect: deny
-  - action: shell
-    resource: "*--r/*"
     effect: deny
   - action: shell
     resource: "*--ra/*"
@@ -4813,9 +4804,6 @@ permissions:
     resource: "*--j/*"
     effect: deny
   - action: shell
-    resource: "*--/*"
-    effect: deny
-  - action: shell
     resource: "*--t/*"
     effect: deny
   - action: shell
@@ -4835,6 +4823,168 @@ permissions:
     effect: deny
   - action: shell
     resource: "*--templat/*"
+    effect: deny
+  - action: shell
+    resource: "gh * -R*/*/*"
+    effect: deny
+  - action: shell
+    resource: "gh * -R*.*/*"
+    effect: deny
+  - action: shell
+    resource: "gh * -R*@*"
+    effect: deny
+  - action: shell
+    resource: "gh * --repo*/*/*"
+    effect: deny
+  - action: shell
+    resource: "gh * --repo*.*/*"
+    effect: deny
+  - action: shell
+    resource: "gh * --repo*@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr view *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr view *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr list *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr list *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr checks *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr checks *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr diff *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr diff *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr status *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr status *@*"
+    effect: deny
+  - action: shell
+    resource: "gh issue view *://*"
+    effect: deny
+  - action: shell
+    resource: "gh issue view *@*"
+    effect: deny
+  - action: shell
+    resource: "gh issue list *://*"
+    effect: deny
+  - action: shell
+    resource: "gh issue list *@*"
+    effect: deny
+  - action: shell
+    resource: "gh issue status *://*"
+    effect: deny
+  - action: shell
+    resource: "gh issue status *@*"
+    effect: deny
+  - action: shell
+    resource: "gh run *://*"
+    effect: deny
+  - action: shell
+    resource: "gh run *@*"
+    effect: deny
+  - action: shell
+    resource: "gh workflow *://*"
+    effect: deny
+  - action: shell
+    resource: "gh workflow *@*"
+    effect: deny
+  - action: shell
+    resource: "gh api *://*"
+    effect: deny
+  - action: shell
+    resource: "gh api *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr merge *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr merge *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr ready *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr ready *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr reopen *://*"
+    effect: deny
+  - action: shell
+    resource: "gh pr reopen *@*"
+    effect: deny
+  - action: shell
+    resource: "gh issue reopen *://*"
+    effect: deny
+  - action: shell
+    resource: "gh issue reopen *@*"
+    effect: deny
+  - action: shell
+    resource: "gh pr comment http*"
+    effect: deny
+  - action: shell
+    resource: "gh pr comment HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh pr close http*"
+    effect: deny
+  - action: shell
+    resource: "gh pr close HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh pr edit http*"
+    effect: deny
+  - action: shell
+    resource: "gh pr edit HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh issue comment http*"
+    effect: deny
+  - action: shell
+    resource: "gh issue comment HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh issue close http*"
+    effect: deny
+  - action: shell
+    resource: "gh issue close HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh issue edit http*"
+    effect: deny
+  - action: shell
+    resource: "gh issue edit HTTP*"
+    effect: deny
+  - action: shell
+    resource: "gh api http*"
+    effect: deny
+  - action: shell
+    resource: "gh api *HTTP*"
+    effect: deny
+  - action: shell
+    resource: "*--/*"
+    effect: deny
+  - action: shell
+    resource: "*--r/*"
+    effect: deny
+  - action: shell
+    resource: "*--re/*"
+    effect: deny
+  - action: shell
+    resource: "*--rep/*"
     effect: deny
   - action: edit
     resource: "*"
