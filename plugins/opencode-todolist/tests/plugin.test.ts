@@ -208,3 +208,65 @@ test("session.deleted removes the stored list for that session", async () => {
     await dispose()
   }
 })
+
+test("a todoread issued together with a todowrite sees the write (fleet-kit#38)", async () => {
+  const fake = fakeContext()
+  const slow = fake.context.storage as unknown as { set: (key: string, value: unknown) => Promise<void> }
+  const set = slow.set
+  slow.set = async (key, value) => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await set(key, value)
+  }
+  await plugin.setup(fake.context)
+  const ctx = { sessionID: "ses_cos" }
+  const [written, read] = await Promise.all([
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "in_progress" }] }, ctx),
+    fake.tools.get("todoread")!.execute({}, ctx),
+  ])
+  assert.match(written.content ?? "", /updated \(1 item\)/)
+  assert.match(read.content ?? "", /1\. \[•\] A/)
+  assert.doesNotMatch(read.content ?? "", /empty/)
+})
+
+test("two parallel todowrites of one session land in the order they began (fails without the queue)", async () => {
+  const fake = fakeContext()
+  const storage = fake.context.storage as unknown as { set: (key: string, value: unknown) => Promise<void> }
+  const set = storage.set
+  let calls = 0
+  storage.set = async (key, value) => {
+    // the first write is the slow one: unqueued, it would land last and overwrite the later list
+    await new Promise((resolve) => setTimeout(resolve, ++calls === 1 ? 40 : 1))
+    await set(key, value)
+  }
+  await plugin.setup(fake.context)
+  const ctx = { sessionID: "ses_p" }
+  await Promise.all([
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "pending" }] }, ctx),
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "completed" }] }, ctx),
+  ])
+  const stored = fake.storage.get("todos/ses_p") as { todos: Array<{ status: string }> }
+  assert.equal(stored.todos[0].status, "completed")
+})
+
+test("a hung predecessor delays the next todo call by the bounded wait only", async () => {
+  process.env.OPENCODE_TODOLIST_QUEUE_WAIT_MS = "50"
+  const warn = mock.method(console, "warn", () => {})
+  try {
+    const fake = fakeContext()
+    const storage = fake.context.storage as unknown as { get: (key: string) => Promise<unknown> }
+    const get = storage.get
+    let calls = 0
+    storage.get = (key) => (++calls === 1 ? new Promise(() => {}) : get(key)) // the first call never finishes
+    await plugin.setup(fake.context)
+    const ctx = { sessionID: "ses_h" }
+    void fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "pending" }] }, ctx)
+    const started = Date.now()
+    const read = await fake.tools.get("todoread")!.execute({}, ctx)
+    assert.match(read.content ?? "", /empty/)
+    assert.ok(Date.now() - started >= 40 && Date.now() - started < 2000, "waited about the bound, not forever")
+    assert.ok(warn.mock.calls.length <= 1, "logged at most once")
+  } finally {
+    delete process.env.OPENCODE_TODOLIST_QUEUE_WAIT_MS
+    warn.mock.restore()
+  }
+})
