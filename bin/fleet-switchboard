@@ -1343,8 +1343,16 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     def render(count):
         lead = next((fact for fact in facts if not fact.rider), facts[0])
         head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(lead.summary, 200))
-        lines = [head] + (sectioned_lines(facts[:count], section, item) if section
-                          else [item(fact) for fact in facts[:count]])
+        taken = facts[:count]
+        idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider]
+        shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
+        if shown is taken:
+            idle = []  # nothing but idle riders: there is no news to fold them under
+        lines = [head] + (sectioned_lines(shown, section, item) if section else [item(fact) for fact in shown])
+        if idle:  # no-change worker lines are ONE quiet line next to real news (the keys are still carried)
+            names = sorted({fact.sender or "a worker" for fact in idle})
+            lines.append("- quiet: %d worker finish%s with no change (%s)" % (
+                len(idle), "" if len(idle) == 1 else "es", ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")))
         rest = len(facts) - count
         if rest:
             lines.append("\u2026 and %d more: run fleet-switchboard pending %s" % (rest, recipient))
@@ -3922,9 +3930,22 @@ def report_jev(engine, settings):
     return build_jev(dict(engine.config, jev=capped))
 
 
+QUIET_OUTCOMES = ("succeeded", "success")  # a stop that ended cleanly
+QUIET_REPORT_HOURS = 24  # a clean second stop after a nudge is no news when the worker reported this recently
+
+
+def reported_lately(engine, boss_view, observation, at):
+    """True when a report or send from the worker reached this boss in the QUIET_REPORT_HOURS before `at`, and the
+    read of the boss's transcript went that far back."""
+    keys, complete = engine.delivered_keys(boss_view.session_id, at - QUIET_REPORT_HOURS * 3600)
+    prefixes = ("%s:%s:" % (REPORT, observation.name), "send:%s:" % observation.name)
+    return bool(complete and any(key.startswith(prefixes) for key in keys))
+
+
 def triage_stop(engine, source, observation, boss, idle_ms, reply):
     """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
-    {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
+    {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "quiet"} / {"outcome": "stopped"}.
+    `quiet` is a clean second stop of a worker that reported lately: audited, not a wake. Audited once."""
     now = engine.now()
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
@@ -3962,6 +3983,12 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
             return None  # this is the stop the nudge answered, not a second one
         verdict = {"outcome": "stopped", "reason": "nudged already for this assignment and stopped again "
                                                    "without reporting"}
+        if (observation.outcome in QUIET_OUTCOMES
+                and reported_lately(engine, boss_view, observation, observation.idle_at)):
+            # nothing new: it ended cleanly, was nudged, and has told this boss within the window. Audited below,
+            # never a wake. A worker that did not end cleanly, or never reported, is still told to the boss.
+            verdict = {"outcome": "quiet", "reason": "nudged already and stopped again, but it ended cleanly and "
+                       "reported to %s within %d hours: nothing new" % (boss, QUIET_REPORT_HOURS)}
     else:
         verdict = ask_report_owed(engine, observation, boss, reply, audit)
         if verdict["outcome"] == "nudge":
@@ -4866,6 +4893,33 @@ def read_pr_facts(engine, repo, number):
         return pr_facts_from(json.loads(done.stdout or ""))
     except ValueError:
         raise NoticeError("gh pr view %s#%d answered something that is not JSON" % (repo, number)) from None
+
+
+def read_ref_state(engine, repo, number, kind):
+    """`open`, `closed` or `merged` for an issue (kind "issue") or a pull request (kind "pr"): one `gh` read with
+    the repo's account. Raises NoticeError."""
+    if kind == "pr":
+        return read_pr_facts(engine, repo, number)["state"]
+    accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
+    try:
+        env = accounts.env_for(repo)
+    except AccountError as err:
+        raise NoticeError(str(err)) from None
+    extra = {"env": env} if env is not None else {}
+    argv = [engine.config["gh"], "issue", "view", str(number), "--repo", repo, "--json", "state"]
+    try:
+        done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
+                                                    timeout=min(engine.config["call_timeout_seconds"],
+                                                                GITHUB_ROUTE_READ_TIMEOUT),
+                                                    stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise NoticeError("gh issue view %s#%d failed" % (repo, number))
+        state = json.loads(done.stdout or "").get("state")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        raise NoticeError("gh issue view %s#%d could not be read" % (repo, number)) from None
+    if not isinstance(state, str):
+        raise NoticeError("gh issue view %s#%d gave no state" % (repo, number))
+    return state.lower()
 
 
 def notice_facts(engine, repo, number, now, budget=None):
@@ -5999,10 +6053,29 @@ class ReminderFacts:
         now = self.engine.now() if self.engine else time.time()
         return [item for item in read_reminders(self.state_dir) if item["at"] <= now]
 
+    def until_holds(self, condition):
+        """A reminder's cancel condition (`until_closed` an issue, `until_merged` a pull request, each `owner/repo#N`):
+        the reason it is moot, or None (not met, or cannot be read now: the reminder stays)."""
+        for key, kind in (("until_closed", "issue"), ("until_merged", "pr")):
+            ref = condition.get(key)
+            match = re.fullmatch(r"([\w.-]+/[\w.-]+)#([0-9]+)", ref) if isinstance(ref, str) else None
+            if match is None or self.engine is None:
+                continue
+            try:
+                state = read_ref_state(self.engine, match.group(1), int(match.group(2)), kind)
+            except (NoticeError, OSError, ValueError):
+                continue
+            if (key == "until_closed" and state in ("closed", "merged")) or (key == "until_merged" and state == "merged"):
+                return "%s is %s" % (ref, state)
+        return None
+
     def verdict(self, item):
         """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
         condition, discovery = item["condition"], self.engine.discovery if self.engine else None
+        moot = self.until_holds(condition)
+        if moot:
+            return moot  # a cancel condition holds: dropped (audited by the caller)
         if discovery is None:
             return None
         worker = condition.get("unless_report_from") or condition.get("while_running")
@@ -6173,8 +6246,15 @@ def cmd_remind(args, runner, now):
     except IssueRefError as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
+    condition = {}
+    for flag, key in ((args.until_closed, "until_closed"), (args.until_merged, "until_merged")):
+        if flag:
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+#[0-9]+", flag):
+                sys.stderr.write("%s: --until-closed/--until-merged take OWNER/REPO#N, got %r\n" % (PROG, flag[:60]))
+                return EXIT_USAGE
+            condition[key] = flag
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo)
+                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
@@ -11565,6 +11645,10 @@ def build_parser():
     remind.add_argument("text", nargs="+", help="The reminder")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
+    remind.add_argument("--until-closed", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this issue "
+                        "(or pull request) is closed or merged")
+    remind.add_argument("--until-merged", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this pull "
+                        "request is merged")
     add_intent_parsers(sub)
     add_foreground_parsers(sub)  # PR 8
     add_policy_parsers(sub)  # PR 9

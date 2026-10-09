@@ -7139,6 +7139,62 @@ class SelfWakeBase(PR4Base):
         return [e for e in self.world.audit() if e["event"] == name]
 
 
+class TestReminderCancelConditions(SelfWakeBase):
+    """`remind --until-closed OWNER/REPO#N` / `--until-merged`: dropped, audited, when it holds."""
+
+    def setUp(self):
+        super().setUp()
+        self.states = {}
+        self.calls = []
+
+        def gh(argv, **kwargs):
+            self.calls.append(argv)
+            number = int(argv[3])
+            state = self.states[number]
+            if isinstance(state, Exception):
+                raise state
+            if argv[1] == "pr":
+                return subprocess.CompletedProcess(argv, 0, pr_view_json(state=state), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"state": state}), "")
+        self.world.engine.gh_runner = gh
+
+    def remind(self, **condition):
+        sb.add_reminder(self.world.state, "platform", EPOCH + 60, EPOCH, "look at the PR", 2, "coder", None,
+                        condition=condition)
+
+    def test_a_closed_issue_drops_the_reminder_unsent_and_audited(self):
+        self.states[41] = "CLOSED"
+        self.remind(until_closed="acme/api#41")
+        self.wait(120)
+        self.assertEqual(self.texts("platform"), [])
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        (drop,) = self.events("reminder.drop")
+        self.assertIn("acme/api#41 is closed", drop["detail"]["why"])
+
+    def test_a_merged_pr_drops_until_merged_but_a_merely_open_one_delivers(self):
+        self.states[42] = "OPEN"
+        self.remind(until_merged="acme/api#42")
+        self.wait(120)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.states[43] = "MERGED"
+        self.remind(until_merged="acme/api#43")
+        self.wait(120)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.assertEqual(len(self.events("reminder.drop")), 1)
+
+    def test_an_unreadable_state_keeps_the_reminder_and_a_bad_ref_is_ignored(self):
+        self.states[44] = OSError("no network")
+        self.remind(until_closed="acme/api#44")
+        self.remind(until_closed="not a ref")
+        self.wait(120)
+        self.assertEqual(sum(len(a["keys"]) for a in self.world.admissions("platform")), 2)
+
+    def test_the_command_takes_the_flags_and_refuses_a_bad_ref(self):
+        args = sb.build_parser().parse_args(["remind", "platform", "1h", "x", "--until-closed", "a/b#3",
+                                             "--until-merged", "a/b#4"])
+        self.assertEqual((args.until_closed, args.until_merged), ("a/b#3", "a/b#4"))
+
+
 class TestCheckpointReminders(SelfWakeBase):
     def test_flags_set_both_reminders(self):
         note = self.set_reminders()
@@ -13975,6 +14031,54 @@ class TestUnreportedStop(ReportBase):
         self.world.tick(5)
         self.set_reply("OWED-ME")
         self.assertIn("nudge", [f.kind for f in self.facts()])
+
+    def second_stop_after_a_nudge(self, reported=True, outcome=None):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        if reported:
+            self.report()
+        self.world.tick(5)
+        self.world.new_engine("cli").send("platform", "coder", "ack the second thing")  # a new assignment
+        self.world.tick(5)
+        self.set_reply("OWED-ME")
+        self.world.engine.run_pass()   # the nudge goes to the worker
+        self.world.tick(2)
+        self.set_reply("OWED-ME nothing changed")
+        if outcome:
+            self.world.v2.sessions[self.coder]["outcome"] = outcome
+        return self.facts()
+
+    def test_a_clean_second_stop_of_a_worker_that_reported_lately_is_audited_never_a_wake(self):
+        found = self.second_stop_after_a_nudge()
+        self.assertEqual([f.kind for f in found if f.kind == "worker.stopped"], [])
+        last = self.triage_events()[-1]["detail"]
+        self.assertEqual(last["outcome"], "quiet")
+        self.assertIn("nothing new", last["reason"])
+        self.world.tick(100)
+        self.world.engine.run_pass()
+        self.assertEqual([k for a in self.world.admissions("platform") for k in a["keys"]
+                          if k.startswith("worker.stopped:")], [])
+
+    def test_a_second_stop_that_did_not_end_cleanly_or_never_reported_still_wakes_the_boss(self):
+        for kwargs in ({"outcome": "failed"}, {"reported": False}):
+            with self.subTest(**kwargs):
+                self.tearDown()
+                self.setUp()
+                found = self.second_stop_after_a_nudge(**kwargs)
+                self.assertEqual(len([f for f in found if f.kind == "worker.stopped"]), 1)
+
+    def test_idle_riders_fold_into_one_quiet_line_next_to_real_news(self):
+        idle = [sb.Fact("worker.idle:s%d:1" % i, "platform", "worker.idle", "w%d finished its turn" % i, 5 + i,
+                        sender="w%d" % i, rider=True) for i in range(3)]
+        news = sb.Fact("report:coder:a", "platform", "report", "done: shipped", 4, sender="coder")
+        text, carried = sb.compose("platform", idle + [news])
+        self.assertEqual(len(carried), 4)
+        self.assertEqual(text.count("- quiet:"), 1)
+        self.assertIn("3 worker finishes with no change (w0, w1, w2)", text)
+        self.assertNotIn("finished its turn", text)
+        self.assertIn("done: shipped", text)
+        alone, _ = sb.compose("platform", idle)
+        self.assertEqual(alone.count("worker.idle from"), 3)  # no news: nothing to fold under
 
     def test_a_stop_older_than_the_rider_age_is_not_triaged(self):
         self.stop("OWED-ME")
