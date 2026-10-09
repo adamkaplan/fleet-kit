@@ -10545,7 +10545,12 @@ class TestRoutineLocal(unittest.TestCase):
         "git commit --amend --no-edit", "git rev-parse --short HEAD", "git grep -n foo", "git grep -n foo src", "grep -n foo src/a.py", "grep -rn foo src docs",
         "ls", "ls -la bin", "cat docs/a.md", "cat -n a.txt", "head -n 5 a.txt", "tail -5 a.txt", "wc -l a.txt", "uptime", "pwd", "sleep 20",
         "node --test tests/a.test.mjs", "python3 bin/test-switchboard TestX.test_y", "fleet-switchboard report done --issue 9 'built it'",
-        "fleet-switchboard report working 'still on it'",
+        "fleet-switchboard report working 'still on it'", "fleet-switchboard report done 'a' 'b'",
+        # round 2: the fleet's own messaging, and gh reads
+        "fleet-switchboard notice pr acme/api#7", "fleet-switchboard notice pr https://github.com/acme/api/pull/7 'x'", "fleet-switchboard intent 87", "fleet-switchboard intent acme/api#87",
+        "fleet-switchboard orders list --charter 5", "fleet-switchboard orders list --charter 5 --json", "fleet-switchboard orders --cos", "fleet-switchboard decisions", "fleet-switchboard decisions list",
+        "gh pr view 94", "gh pr view 94 --repo acme/api --json state,title,mergeable", "gh pr list --repo acme/api --state open --limit 30", "gh pr checks 3 --repo acme/api",
+        "gh pr diff 3 --name-only", "gh issue view 9 --comments", "gh issue list --repo acme/api --label wip --state all", "gh api 'repos/acme/api/pulls?state=open&per_page=50'",
     ]
     # every bypass the review of PR #90 named, and more
     NOT_ROUTINE = [
@@ -10560,7 +10565,7 @@ class TestRoutineLocal(unittest.TestCase):
         "git branch -D x", "git stash drop", "git tag v1", "git remote add o u", "git config user.email x", "git worktree add ../x", "git submodule update", "git gc", "git filter-branch",
         # other commands: dropped from the list because their flags can write or run a program
         "sort -o out in", "sort in", "rg --pre sh x", "rg foo", "sed -n 'w out' f", "sed -n '1e id' f", "sed -i '' 's/a/b/' f", "sed -n 1p f", "awk 'BEGIN{system(\"id\")}'",
-        "gh auth status --show-token", "gh pr view 1", "gh pr edit 1 --add-label x", "gh api repos/a/b", "gh pr merge 1", "find . -delete", "find . -exec id ;", "xargs ls", "tee x", "cp a b", "mv a b",
+        "gh auth status --show-token", "gh pr edit 1 --add-label x", "gh api repos/a/b", "gh pr merge 1", "find . -delete", "find . -exec id ;", "xargs ls", "tee x", "cp a b", "mv a b",
         "mkdir x", "touch x", "rm x", "rm -rf build", "cd bin", "echo hi", "printf x", "date", "date -s x", "env", "printenv", "which ls", "stat x", "file x", "diff a b", "jq . a.json",
         "curl http://x", "wget http://x", "ssh host ls", "docker ps", "docker compose up", "npm test", "npm publish", "npx foo", "python3 evil.py", "python3 bin/test-x; id", "python3 bin/../evil.py",
         "python3 -c 'import os'", "python3 - <<'EOF'\nprint(1)\nEOF", "node script.js", "node --test /etc/x", "node --test ../x", "node --eval x", "bash -c ls", "sh x.sh", "eval ls", "nice ls", "timeout 5 ls",
@@ -10576,7 +10581,7 @@ class TestRoutineLocal(unittest.TestCase):
         "git log --all", "git diff -U99999 --", "sleep", "sleep x", "sleep 1 2", "sleep -1", "pwd -P", "uptime -p",
         # fleet-switchboard: only report <state> [--issue N] "<one line>"
         "fleet-switchboard launch x", "fleet-switchboard decisions answer 1 yes", "fleet-switchboard orders", "fleet-switchboard report", "fleet-switchboard report nonsense x", "fleet-switchboard report done",
-        "fleet-switchboard report done --issue x 'y'", "fleet-switchboard report done 'a' 'b'", "fleet-switchboard report done --foo 'y'", "fleet-switchboard send x y", "./fleet-switchboard report done 'x'", "bin/fleet-switchboard report done 'x'",
+        "fleet-switchboard report done --issue x 'y'", "fleet-switchboard report done --foo 'y'", "./fleet-switchboard report done 'x'", "bin/fleet-switchboard report done 'x'",
     ]
 
     def test_reads_and_local_reversible_steps_are_routine(self):
@@ -20047,9 +20052,9 @@ class TestJudgeSeesTheOrders(PolicyCase):
                                                "self-certify (ordered by alice, 2027-01-06)")
         self.assertEqual((context["charter"], len(context["orders"])), (1, 2))
 
-    def test_the_state_the_model_sees_holds_the_orders_clipped_to_600(self):
-        state = sb.policy_state("orchestrator", "i", "d", "o" * 900, "shell", "ls")
-        self.assertEqual(len(state["standing_authority"]), 600)
+    def test_the_state_the_model_sees_holds_the_orders_clipped_to_1200(self):  # 600 until issue 87
+        state = sb.policy_state("orchestrator", "i", "d", "o" * 1500, "shell", "ls")
+        self.assertEqual(len(state["standing_authority"]), 1200)
         self.assertEqual(sb.policy_state("orchestrator", "i", "d", "o" * 500, "shell", "ls")["standing_authority"],
                          "o" * 500)
 
@@ -22117,10 +22122,13 @@ class TestJudgeCosOrders(PolicyCase):
         context = self.direct_judge(None).context_of({"name": "orch", "role": "orchestrator", "charter": 1, "issue": 2})
         self.assertEqual(context["authority"], "may merge green PRs")
 
-    def test_the_state_the_model_sees_clips_the_chief_of_staffs_orders_to_1200_and_a_charters_to_600(self):
+    def test_the_state_the_model_sees_clips_the_chief_of_staffs_orders_and_a_charters_to_1200(self):
         self.assertEqual(len(sb.policy_state("chief-of-staff", "i", "d", "o" * 2000, "shell", "ls",
                                              sb.COS_ORDERS_STATE_CLIP)["standing_authority"]), 1200)
-        self.assertEqual(len(sb.policy_state("orchestrator", "i", "d", "o" * 2000, "shell", "ls")["standing_authority"]), 600)
+        self.assertEqual(len(sb.policy_state("orchestrator", "i", "d", "o" * 2000, "shell", "ls")["standing_authority"]), 1200)
+        late = "Orchestrators may message each other and merge green PRs."
+        seen_text = sb.policy_state("orchestrator", "i", "d", "; ".join(["x" * 100] * 9 + [late]), "shell", "ls")["standing_authority"]
+        self.assertIn(late[:20], seen_text, "an order near the end of a long charter still reaches speaks_for_you and hard_to_reverse")
         seen = []
 
         class Spy:

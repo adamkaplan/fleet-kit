@@ -9408,30 +9408,132 @@ _ROUTINE_SPEC = {
     ("git", "commit"): (F("-a --amend --no-edit --allow-empty -q"), set(), F("-m"), 0, "none"),
 }
 _ROUTINE_NUMERIC_FLAG = re.compile(r"^-[0-9]{1,4}$")  # git log -5, head -5, tail -5
+_ROUTINE_ISSUE_REF = re.compile(r"^(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#?[1-9][0-9]{0,8}$")
+_ROUTINE_PR_REF = re.compile(r"^(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]{0,8}|https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]{0,8})$")
+_ROUTINE_NAME_WORD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
+_ROUTINE_WHEN = re.compile(r"^(?:[0-9]{1,5}[smhd]|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{5,12}(?:Z|[+-][0-9]{2}:[0-9]{2}))$")
+
+
+# A message that talks of deploying, merging, publishing, approving, spending, deleting or credentials may BE the authorisation (a
+# labelled sample had a "Hold lifted: deploy ..." send that asking was right for): such a message is never routine, so the model reads it.
+_ROUTINE_CONSEQUENTIAL = re.compile(
+    r"(?i)(deploy|merg|publish|releas|ship|approv|go[- ]ahead|green[- ]?light|prod\b|production|spend|spent|purchas|pay(?:ment|ing|s)?\b|delet|drop\b|"
+    r"force|roll(?:out|back)|credential|secret|token|passw|key\b|authori|permission|lifted|unblock|proceed|sign[- ]?off|confirm)")
+
+
+def _routine_text_after(rest, issue_flag=True):
+    """(ok, words): the message words of a send/report/remind, with an optional `--issue REF` anywhere; no other flag, and no
+    message word that looks like a flag."""
+    text, i = [], 0
+    while i < len(rest):
+        w = rest[i]
+        if w == "--issue" and issue_flag:
+            if i + 1 >= len(rest) or not _ROUTINE_ISSUE_REF.match(rest[i + 1]):
+                return False, []
+            i += 1
+        elif w.startswith("-") or not w:
+            return False, []
+        elif _ROUTINE_CONSEQUENTIAL.search(w):
+            return False, []
+        else:
+            text.append(w)
+        i += 1
+    return bool(text), text
+
+
+def _routine_fleet(rest):
+    """What the fleet says UP to its boss, and its plain reads: report, notice pr, intent, orders list, decisions list. NOT send or remind
+    (they reach other agents, so free text in them is the model's to read), and never decisions answer/resolve/escalate/supersede/batch,
+    orders add/remove, launch, handoff."""
+    if not rest:
+        return False
+    action, args = rest[0], rest[1:]
+    if action == "report":
+        return len(args) >= 2 and args[0] in _ROUTINE_REPORT_STATES and _routine_text_after(args[1:])[0]
+    if action == "notice":
+        return len(args) >= 2 and args[0] == "pr" and bool(_ROUTINE_PR_REF.match(args[1])) and (len(args) == 2 or _routine_text_after(args[2:], issue_flag=False)[0])
+    if action == "intent":
+        return len(args) <= 1 and all(_ROUTINE_ISSUE_REF.match(w) for w in args)
+    if action == "orders":
+        return (args == ["--cos"]) or (args[:1] == ["list"] and args[1:3] and args[1] == "--charter" and len(args) >= 3
+                                       and bool(_ROUTINE_NUMBER.match(args[2])) and args[3:] in ([], ["--json"]))
+    if action == "decisions":
+        return args in ([], ["list"])
+    return False
+
+
+# gh READS only: a pr or issue view/list/checks/diff and a GET of a repo's issues, pulls or comments. Never merge, review, close,
+# edit, create, comment, `gh repo`, `gh auth`, `gh api` with any flag that writes, or anything that opens a browser.
+_ROUTINE_GH_READ = {"pr": ("view", "list", "checks", "diff"), "issue": ("view", "list")}
+_ROUTINE_GH_FLAG_VALUE = {"--repo": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"), "-R": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"),
+                          "--json": re.compile(r"^[A-Za-z][A-Za-z,]{0,300}$"), "--state": re.compile(r"^(?:open|closed|merged|all)$"),
+                          "--limit": _ROUTINE_NUMBER, "-L": _ROUTINE_NUMBER,
+                          "--label": re.compile(r"^[A-Za-z0-9._:-]{1,60}$"), "--author": re.compile(r"^(?:@me|[A-Za-z0-9-]{1,39})$")}
+_ROUTINE_GH_BARE_FLAGS = frozenset("--comments --name-only --patch --stat".split())
+_ROUTINE_GH_API_PATH = re.compile(r"^repos/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(?:issues(?:/comment[s]|/[1-9][0-9]{0,8}(?:/comment[s])?)?|pulls(?:/comment[s]|/[1-9][0-9]{0,8}(?:/(?:comment[s]|reviews|files|commits))?)?|comment[s])(?:\?[A-Za-z0-9_=&.%+:-]{0,200})?$")
+
+
+def _routine_gh(rest):
+    if len(rest) >= 2 and rest[0] in _ROUTINE_GH_READ and rest[1] in _ROUTINE_GH_READ[rest[0]]:
+        i, seen = 2, 0
+        while i < len(rest):
+            w = rest[i]
+            if w in _ROUTINE_GH_FLAG_VALUE:
+                if i + 1 >= len(rest) or not _ROUTINE_GH_FLAG_VALUE[w].match(rest[i + 1]):
+                    return False
+                i += 1
+            elif w in _ROUTINE_GH_BARE_FLAGS:
+                pass
+            elif _ROUTINE_NUMBER.match(w) and i == 2:
+                pass  # the number of the pr or issue
+            else:
+                return False
+            i += 1
+        return True
+    if rest[:1] == ["api"] and len(rest) >= 2 and _ROUTINE_GH_API_PATH.match(rest[1]):
+        return all(w == "--paginate" for w in rest[2:])  # no --jq/-q (it can read the environment), and no other flag
+    return False
+
+
 _ROUTINE_NO_ARG = {("pwd",), ("uptime",), ("true",)}
 _ROUTINE_REPORT_STATES = ("done", "failed", "blocked", "question", "working", "paused", "withdrawn")
+
+
+def _routine_mid_word_hash(text):
+    """`text` with each unquoted `#` that sits inside a word (`owner/repo#7`: the shell starts a comment only at the start of a word)
+    replaced by a placeholder, so `_plain_words`, which refuses every unquoted `#`, still refuses a real comment."""
+    out, quote, prev = [], None, " "
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and not prev.isspace() and prev not in ";&|<>(){}":
+            ch = "\x1f"
+        out.append(ch)
+        prev = ch
+    return "".join(out)
 
 
 def routine_local(text):
     """True only for ONE simple command that is a read or a local reversible step inside the worktree and is on the strict
     allowlist above, flags included. False for anything this is unsure about."""
-    if not isinstance(text, str) or not text.strip() or len(text) > 1000 or "\n" in text or "\r" in text or "\x00" in text:
+    if not isinstance(text, str) or not text.strip() or len(text) > POLICY_ARG_LIMIT or "\r" in text or "\x00" in text:
         return False
-    words = _plain_words(text)  # no operator, redirect, substitution, glob, comment, `~`, heredoc or unbalanced quote
+    words = _plain_words(_routine_mid_word_hash(text))  # no operator, redirect, substitution, glob, comment, `~`, heredoc or unbalanced quote (a newline only inside quotes)
+    words = [w.replace("\x1f", "#") for w in words] if words else words
     if not words or "=" in words[0] or "/" in words[0]:
         return False
+    if words[0] == "timeout" and len(words) > 2 and _ROUTINE_NUMBER.match(words[1]) and words[2] in (PROG, "gh"):
+        words = words[2:]  # `timeout 60 fleet-switchboard ...`: the same command under a time limit, for the two command words that need it
+    if words[0] not in (PROG, "gh") and (len(text) > 1000 or "\n" in text):
+        return False  # only a message may be long or span lines (inside its quotes)
     head = words[0]
-    # fleet-switchboard report <state> [--issue N] "<one line>": the agent's own report to its boss
     if head == PROG:
-        rest = words[1:]
-        if len(rest) < 2 or rest[0] != "report" or rest[1] not in _ROUTINE_REPORT_STATES:
-            return False
-        rest = rest[2:]
-        if rest[:1] == ["--issue"]:
-            if len(rest) < 2 or not _ROUTINE_NUMBER.match(rest[1]):
-                return False
-            rest = rest[2:]
-        return len(rest) == 1 and not rest[0].startswith("-")
+        return _routine_fleet(words[1:])
+    if head == "gh":
+        return _routine_gh(words[1:])
     if head == "sleep":
         return len(words) == 2 and bool(_ROUTINE_NUMBER.match(words[1]))
     if head == "node":  # node --test <paths>: the agent's own tests
@@ -9557,7 +9659,7 @@ _STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\
 ORDERS_HEADING = "## Standing orders"
 ORDERS_MAX = 20          # orders a charter may carry
 ORDER_MAX_CHARS = 300    # characters of one order's text
-ORDERS_STATE_CLIP = 600  # characters of the joined orders the judge's model sees
+ORDERS_STATE_CLIP = 1200  # characters of the joined orders the judge's model sees (issue 87: 600 cut the merge and message orders off a long charter)
 _ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
 _ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
@@ -13572,7 +13674,7 @@ def add_orders_parsers(sub):
 
 COS_ORDERS_NAME = "standing-orders.md"
 COS_ORDERS_MAX_BYTES = 8192
-COS_ORDERS_STATE_CLIP = 1200  # characters of the Chief of Staff's orders the judge's model sees (a charter's: 600)
+COS_ORDERS_STATE_CLIP = 1200  # characters of the Chief of Staff's orders the judge's model sees (a charter's: ORDERS_STATE_CLIP)
 COS_ORDERS_TEMPLATE = """<!--
 The Chief of Staff's standing orders: what it may decide for you, in your own words.
 
