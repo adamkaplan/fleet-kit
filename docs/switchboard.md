@@ -1049,6 +1049,39 @@ daemon. The key is in no file under the Lab and not in v2's service
 environment. A file write is the action `edit`; a fetch is `webfetch`; a
 subagent launch is `subagent`.
 
+### Read-only enforcement for a role (`policy.enforce_roles`, issue 105)
+
+For the roles named in `policy.enforce_roles` (default `[]`: none; the intended value is `["chief-of-staff"]`) the judge is **enforcing** and
+**deterministic**: no model is asked and `policy.shadow` does not soften it. A call by such an agent is allowed only if it is on a strict
+allow-list; every other call becomes an **ask to the person** (the permission prompt, with one line saying why), never a silent deny. Every
+other role is unchanged (in shadow, or judged as before). Activation is configuration, rollback is removing the role from the list (a running agent
+follows within ten minutes, a new session at once).
+
+**What is allowed.** A shell command is allowed only if it is ONE simple command on the list below, with an exact subcommand and flag set, no
+environment prefix, no chaining, pipe, redirect, substitution, glob or heredoc (a message may span lines inside its quotes), and no path outside the working
+tree or naming a dotfile or credential; `timeout N` may precede `fleet-switchboard`, `gh`, `az` and `curl`. Anything unsure is an ask.
+
+| Kind | Allowed |
+|---|---|
+| `fleet-switchboard` | `send <name> [--issue REF] <text>`, `report`, `remind`, `notice pr`, `intent`, `status`, `pending <name>`, `intents`, `whoami`, `version`, `orders list --charter N`, `orders --cos`, `decisions [list]` (`--repo`, `--tier`, `--json`, `--fresh`). Never `decisions answer\|resolve\|escalate\|supersede\|batch`, `orders add\|remove`, `launch`, `handoff`, `comment`, `run`, `config`, `send --interrupt\|--from` |
+| `gh` | `pr`/`issue` `view`, `list`, `checks`, `diff`; `run`, `release`, `workflow` `view\|list`; `repo view`; `api <path>` as a GET (no `-X`, `-f`, `-F`, `--input`, `--method`, header, host, `--jq` or `--template`; not `graphql`) |
+| `az` | a command group followed by exactly `show`, `list`, `get` or `exists`, with `--name`, `--resource-group`, `--subscription`, `--output`, `--query`, `--ids`, `--only-show-errors`, `--all`; refused whatever the verb: `keyvault`, `secret`, `key(s)`, `credential`, `token`, `sas`, `appsettings`, `connection-string`, `run-command`, `extension`, `login`, `config`, `rest`... |
+| `curl` | one `https` URL on a public host (not localhost, a private or link-local address, `.internal`, `.local`; port 443 or 8443; no userinfo or fragment), GET only (`-X GET`), flags `-s -S -f -L -I --compressed`, `-m`, `--connect-timeout`, an `Accept` header. Never `-d`, `-F`, `-T`, `-o`, `-O`, `-u`, `-K`, a cookie or proxy flag, a second URL |
+| local reads | `git` `log`, `show`, `status`, `diff`, `rev-parse`, `grep`; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `pwd`, `uptime`, with the flags of the routine pre-filter and relative paths |
+| other tools | the v2 actions `read`, `glob`, `grep`, `list`, `skill`, `lsp`, `question`, `todoread`, `todowrite` |
+
+**What asks.** Every file write or edit, any other shell command (a build, a clone or fetch, `git add\|commit\|push`, an interpreter or `python3 -c`, `find -exec`,
+`sed -i`, `awk`, an install, a daemon or plugin or config operation, a secret placement, a VM `run-command`), a web fetch or search, a subagent or task, an
+`external_directory` access, every MCP or unlisted action. A configured `ask` stays an ask; a configured `deny` stays final. An error, or a judgement that does
+not finish in time, is an ask for an enforced role (and the daemon's own cache of the session's role lets the CLI do the same while the daemon is down).
+
+**How the plugin knows.** The plugin cannot see roles. For each session it sends one tiny probe and the daemon answers whether the role is enforced
+(remembered ten minutes). For an enforced session it forwards EVERY action (an action it has no kind for goes as tool `other` with the v2 action name), and when the
+judge does not answer it asks instead of allowing; for every other session nothing changes. **Known limits:** a session whose very first call also gets
+no answer to the probe (daemon down and no cached role) follows the configured rules; `curl` to a public host can still carry data out in a URL, and `git`/`cat` follow
+symlinks inside the working tree; the `read` tool may read any file inside the project directory. The agent cannot change the setting through an allowed call: the config file
+is reached only by a write, an edit or a shell command, all of which ask.
+
 ### Workers report (PR 13)
 
 The trial showed that every time a worker ended a turn the switchboard derived a

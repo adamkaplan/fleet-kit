@@ -9590,6 +9590,7 @@ POLICY_DEFAULTS = {
     "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
     "cache_entries": 200,   # entries kept in each cache file
     "routine_filter": True, # issue 87: a read or a local reversible step needs no model (routine_local); false asks the model about every call
+    "enforce_roles": [],    # issue 105: roles whose calls are checked by a deterministic read-only allow-list and ENFORCED (shadow or not); [] (the default) is none
     "shadow": False,        # record what the judge would do (audit policy.judge, `shadow`/`verdict`), enforce nothing
 }
 DEFAULTS["policy"] = None   # None means POLICY_DEFAULTS
@@ -9634,6 +9635,11 @@ def validate_policy_config(config, source):
         raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
     if not isinstance(settings["routine_filter"], bool):
         raise ConfigError("%s: 'policy.routine_filter' must be true or false, got %r" % (source, settings["routine_filter"]))
+    roles = settings["enforce_roles"]
+    if not (isinstance(roles, list) and all(isinstance(r, str) and re.match(r"^[a-z][a-z0-9-]{0,40}$", r) for r in roles) and len(set(roles)) == len(roles)):
+        raise ConfigError("%s: 'policy.enforce_roles' must be a list of role names, each once (for example [\"chief-of-staff\"]), got %r" % (source, roles))
+    if roles and not settings["enabled"]:
+        raise ConfigError("%s: 'policy.enforce_roles' needs 'policy.enabled': an enforced role with the judge off would be unchecked" % source)
     settings["thresholds"] = dict(POLICY_DEFAULT_THRESHOLDS, **_checked_policy_thresholds(settings["thresholds"], source))
     if settings["enabled"] and not config.get("jev"):
         raise ConfigError("%s: 'policy.enabled' needs a 'jev' object: there is no decision model to ask" % source)
@@ -9679,8 +9685,11 @@ def parse_policy_request(text):
         arguments = ""
     elif not isinstance(arguments, str):
         arguments = _canonical(arguments)
-    return {"session": session, "tool": data["tool"], "arguments": arguments[:POLICY_ARG_LIMIT],
-            "configured": data["outcome"]}
+    request = {"session": session, "tool": data["tool"], "arguments": arguments[:POLICY_ARG_LIMIT], "configured": data["outcome"]}
+    action = data.get("action")
+    if isinstance(action, str) and re.match(r"^[A-Za-z0-9_.:-]{1,64}$", action):
+        request["action"] = action  # the v2 permission action of a call this plugin has no kind for (read-only enforcement)
+    return request
 
 
 def _guess_configured(text):
@@ -9967,6 +9976,219 @@ def routine_local(text):
     if key == ("git", "add") and not paths and not any(w in ("-A", "--all", "-u", "--update") for w in rest):
         return False  # `git add` of nothing
     return len(paths) >= need and (key != ("git", "commit") or "-m" in rest or "--amend" in rest or "--no-edit" in rest)
+
+
+# ---- read-only enforcement for a role (issue 105): policy.enforce_roles. For a listed role (the Chief of Staff) the judge is not a model
+# and not a shadow: a DETERMINISTIC allow-list passes reads and coordination and every other call is an ASK to the person. Same style
+# as routine_local and stricter: ONE simple command, an exact subcommand and flag list, no environment prefix, chaining, pipe, redirect,
+# substitution, glob or heredoc, no path outside the working tree, anything unsure is not allowed. It never loosens: the configured
+# outcome is combined as always (a configured ask stays an ask; a configured deny never gets here).
+READONLY_ACTIONS = frozenset("read glob grep list skill lsp question todoread todowrite".split())  # v2 permission actions that only read (reached as tool `other` or a pass-through kind)
+_READONLY_LOCAL = {("git", "status"), ("git", "diff"), ("git", "log"), ("git", "show"), ("git", "rev-parse"), ("git", "grep"),
+                   ("grep",), ("ls",), ("cat",), ("head",), ("tail",), ("wc",), ("pwd",), ("uptime",)}
+_READONLY_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_READONLY_GH_FLAG_VALUE = dict(_ROUTINE_GH_FLAG_VALUE, **{"--repo": _READONLY_REPO, "-R": _READONLY_REPO})
+_READONLY_GH_READ = {"pr": ("view", "list", "checks", "diff"), "issue": ("view", "list"), "run": ("view", "list"),
+                     "release": ("view", "list"), "repo": ("view",), "workflow": ("view", "list")}
+_READONLY_GH_API_PATH = re.compile(r"^(?!graphql)[A-Za-z0-9][A-Za-z0-9_./-]{0,200}(?:\?[A-Za-z0-9_=&.%+:,-]{0,300})?$")
+_READONLY_AZ_WORD = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
+_READONLY_AZ_VERBS = ("show", "list", "get", "exists")
+# command words that can hand out a secret, a token, a key, a connection string or run something, whatever the verb
+_READONLY_AZ_REFUSED = frozenset("""keyvault secret secrets key keys certificate certificates credential credentials sas token tokens appsettings
+connection-string connection-strings run-command extension login logout config configure ssh bastion cloud-shell rest interactive
+deployment-script script identity-token access-token mi managed-identity""".split())
+_READONLY_AZ_FLAGS = {"--name": 1, "-n": 1, "--resource-group": 1, "-g": 1, "--subscription": 1, "--output": 2, "-o": 2, "--query": 3,
+                      "--ids": 1, "--only-show-errors": 0, "--all": 0}
+_READONLY_AZ_VALUE = {1: re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,200}$"), 2: re.compile(r"^(?:json|jsonc|table|tsv|yaml|none)$"),
+                      3: re.compile(r"^[^\n\\$`]{1,300}$")}
+_READONLY_CURL_FLAGS = frozenset("-s -S -f -L -I -sS -sL -sSL -sf -fsSL -fsS --silent --show-error --fail --location --head --compressed".split())
+_READONLY_ACCEPT = re.compile(r"^Accept: [A-Za-z0-9/+.;= *-]{1,60}$")
+_READONLY_CURL_VALUE = {}   # flags with a value, and what the value may be: a number, `GET`, or an Accept header
+for _names, _value in (("-m --max-time --connect-timeout", _ROUTINE_NUMBER), ("-X --request", re.compile(r"^GET$")), ("-H --header", _READONLY_ACCEPT)):
+    _READONLY_CURL_VALUE.update(dict.fromkeys(_names.split(), _value))
+_READONLY_URL = re.compile(r"^https://([A-Za-z0-9](?:[A-Za-z0-9.-]{0,200}[A-Za-z0-9])?)(?::([0-9]{1,5}))?(/[A-Za-z0-9._~%/+:@!,;=?&-]{0,1000})?$")
+_READONLY_PRIVATE_HOST = re.compile(r"(?i)^(?:localhost|.*\.local|.*\.internal|.*\.localhost|metadata|0|[0-9]+|0x[0-9a-f]+|127\..*|10\..*|192\.168\..*|"
+                                    r"169\.254\..*|172\.(?:1[6-9]|2[0-9]|3[01])\..*|.*:.*)$")
+
+
+def _readonly_text_after(rest, issue_flag=True):
+    """The message words of a send/report/remind (with an optional `--issue REF`), and no other flag: ok, words."""
+    text, i = [], 0
+    while i < len(rest):
+        w = rest[i]
+        if w == "--issue" and issue_flag:
+            if i + 1 >= len(rest) or not _ROUTINE_ISSUE_REF.match(rest[i + 1]):
+                return False
+            i += 1
+        elif w.startswith("-") or not w:
+            return False
+        else:
+            text.append(w)
+        i += 1
+    return bool(text)
+
+
+def _readonly_fleet(args):
+    """The fleet's own coordination and reads: send, report, remind, notice pr, intent, status, pending, orders list, decisions list.
+    Never decisions answer/resolve/escalate/supersede/batch, orders add/remove, launch, handoff, comment, or `send --interrupt`."""
+    if not args:
+        return False
+    action, rest = args[0], args[1:]
+    if action == "send":
+        return len(rest) >= 2 and bool(_ROUTINE_NAME_WORD.match(rest[0])) and _readonly_text_after(rest[1:])
+    if action == "report":
+        return len(rest) >= 2 and rest[0] in _ROUTINE_REPORT_STATES and _readonly_text_after(rest[1:])
+    if action == "remind":
+        return len(rest) >= 3 and bool(_ROUTINE_NAME_WORD.match(rest[0])) and bool(_ROUTINE_WHEN.match(rest[1])) and _readonly_text_after(rest[2:])
+    if action == "notice":
+        return len(rest) >= 2 and rest[0] == "pr" and bool(_ROUTINE_PR_REF.match(rest[1])) and (len(rest) == 2 or _readonly_text_after(rest[2:], issue_flag=False))
+    if action == "intent":
+        return len(rest) <= 1 and all(_ROUTINE_ISSUE_REF.match(w) for w in rest)
+    if action in ("status", "intents", "whoami", "version"):
+        return rest in ([], ["--json"])
+    if action == "pending":
+        return len(rest) in (1, 2) and bool(_ROUTINE_NAME_WORD.match(rest[0])) and rest[1:] in ([], ["--json"])
+    if action == "orders":
+        return rest == ["--cos"] or (len(rest) >= 3 and rest[0] == "list" and rest[1] == "--charter" and bool(_ROUTINE_NUMBER.match(rest[2]))
+                                     and rest[3:] in ([], ["--json"]))
+    if action == "decisions":
+        if rest[:1] == ["list"]:
+            rest = rest[1:]
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("--json", "--fresh"):
+                i += 1
+            elif rest[i] == "--repo" and i + 1 < len(rest) and _READONLY_GH_FLAG_VALUE["--repo"].match(rest[i + 1]):
+                i += 2
+            elif rest[i] == "--tier" and i + 1 < len(rest) and rest[i + 1] in ("cos", "human", "orchestrator", "all"):
+                i += 2
+            else:
+                return False
+        return True
+    return False
+
+
+def _readonly_gh(args):
+    if len(args) >= 2 and args[0] in _READONLY_GH_READ and args[1] in _READONLY_GH_READ[args[0]]:
+        i = 2
+        while i < len(args):
+            w = args[i]
+            if w in _READONLY_GH_FLAG_VALUE:
+                if i + 1 >= len(args) or not _READONLY_GH_FLAG_VALUE[w].match(args[i + 1]):
+                    return False
+                i += 1
+            elif w in _ROUTINE_GH_BARE_FLAGS:
+                pass
+            elif i == 2 and (_ROUTINE_NUMBER.match(w) or (args[0] == "repo" and _READONLY_GH_FLAG_VALUE["--repo"].match(w))):
+                pass  # the number of the item, or the repo of `gh repo view`
+            else:
+                return False
+            i += 1
+        return True
+    if args[:1] == ["api"] and len(args) >= 2 and _READONLY_GH_API_PATH.match(args[1]) and ".." not in args[1]:
+        return all(w == "--paginate" for w in args[2:])  # a GET: no method, field, input, header, host, `--jq` or `--template`
+    return False
+
+
+def _readonly_az(args):
+    words, i = [], 0
+    while i < len(args) and not args[i].startswith("-"):
+        words.append(args[i])
+        i += 1
+    if len(words) < 2 or words[-1] not in _READONLY_AZ_VERBS or not all(_READONLY_AZ_WORD.match(w) for w in words):
+        return False
+    if any(w in _READONLY_AZ_REFUSED for w in words):
+        return False
+    while i < len(args):
+        kind = _READONLY_AZ_FLAGS.get(args[i])
+        if kind is None:
+            return False
+        if kind == 0:
+            i += 1
+            continue
+        if i + 1 >= len(args) or not _READONLY_AZ_VALUE[kind].match(args[i + 1]):
+            return False
+        i += 2
+    return True
+
+
+def _readonly_curl(args):
+    url, i = None, 0
+    while i < len(args):
+        w = args[i]
+        if w in _READONLY_CURL_FLAGS:
+            i += 1
+        elif w in _READONLY_CURL_VALUE:
+            if i + 1 >= len(args) or not _READONLY_CURL_VALUE[w].match(args[i + 1]):
+                return False
+            i += 2
+        elif not w.startswith("-") and url is None:
+            url = w
+            i += 1
+        else:
+            return False  # any other flag: no data, form, upload, output file, config, user or proxy
+    found = _READONLY_URL.match(url or "")
+    if not found or "#" in url or "@" in url.split("/")[2]:
+        return False
+    host, port = found.group(1), found.group(2)
+    if _READONLY_PRIVATE_HOST.match(host) or (port is not None and int(port) not in (443, 8443)):
+        return False
+    return True
+
+
+def readonly_shell(text):
+    """True only for ONE simple shell command on the read-only/coordination allow-list (see above)."""
+    if not isinstance(text, str) or not text.strip() or len(text) > POLICY_ARG_LIMIT or "\r" in text or "\x00" in text:
+        return False
+    words = _plain_words(_routine_mid_word_hash(text))
+    if not words:
+        return False
+    words = [w.replace("\x1f", "#") for w in words]
+    if "=" in words[0] or "/" in words[0]:
+        return False  # an environment prefix, or a command by path
+    if words[0] == "timeout" and len(words) > 2 and _ROUTINE_NUMBER.match(words[1]) and words[2] in (PROG, "gh", "az", "curl"):
+        words = words[2:]
+    head = words[0]
+    if "\n" in text and head != PROG:
+        return False  # only a message may span lines, inside its quotes
+    if head == PROG:
+        return _readonly_fleet(words[1:])
+    if head == "gh":
+        return _readonly_gh(words[1:])
+    if head == "az":
+        return _readonly_az(words[1:])
+    if head == "curl":
+        return _readonly_curl(words[1:])
+    key = (head, words[1]) if head == "git" and len(words) > 1 else (head,)
+    return key in _READONLY_LOCAL and routine_local(text)
+
+
+def readonly_decision(request):
+    """(allowed, what): whether a call by an enforced role is on the allow-list, and one phrase for the reason when it is not."""
+    tool, arguments = request["tool"], request.get("arguments") or ""
+    if tool == "shell":
+        return readonly_shell(arguments), "a shell command that is not a plain read or a fleet coordination command"
+    if tool in POLICY_PASS_THROUGH:
+        return True, "a read"
+    if tool == "other" and request.get("action") in READONLY_ACTIONS:
+        return True, "a read"
+    name = {"edit": "an edit or write", "webfetch": "a web fetch", "subagent": "a subagent or task", "other": "the action %r" % (request.get("action") or "unknown")}.get(tool, tool)
+    return False, name
+
+
+def readonly_ask_reason(role, what):
+    return "Needs your yes: the %s role is read-only here (reads and coordination only); this is %s." % (role, what)
+
+
+def cached_session_role(state_dir, session):
+    """The role the daemon last recorded for a session in its disposable context cache, whatever the age, or None. For a daemon that
+    cannot answer: a session known to be of an enforced role then fails to ASK, not to allow."""
+    try:
+        data = json.loads((Path(state_dir) / POLICY_CONTEXT_FILE).read_text())
+        role = data["entries"]["session:" + session]["value"]["fleet"].get("role")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return role if isinstance(role, str) else None
 
 
 def _decisions_subcommand(rest):
@@ -10465,15 +10687,37 @@ class PolicyJudge:
         elapsed = int((self.monotonic() - started) * 1000)
         if worker.is_alive():
             self._worker = worker
-            reply = policy_reply(request["configured"], "no answer within %d ms (still %s): the configured "
-                                 "outcome stands" % (self.settings["budget_ms"], box["stage"]), False, False, elapsed)
+            reply = self.failed_reply(request, box, "no answer within %d ms (still %s)" % (self.settings["budget_ms"], box["stage"]), elapsed)
         else:
-            reply = box.get("reply") or policy_reply(request["configured"], "the judge failed: the configured "
-                                                     "outcome stands", False, False, elapsed)
+            reply = box.get("reply") or self.failed_reply(request, box, "the judge failed", elapsed)
             reply["latency_ms"] = elapsed
+        if box.get("probe"):
+            return reply  # a session probe (is this role enforced?) is not a judgement: nothing to audit
+        if reply.get("enforced"):
+            self._audit(request, reply, box, None)  # an enforced role is never shadowed: its ask is an ask
+            return reply
         reply, shadow = self.shadowed(request, reply)
         self._audit(request, reply, box, shadow)
         return reply
+
+    def enforced_role_of(self, request, box):
+        """The enforced role of this call's agent: known from the identification, else from the daemon's own cache of the session
+        (whatever its age), else None."""
+        roles = self.settings.get("enforce_roles") or []
+        if box.get("enforced_role") in roles:
+            return box["enforced_role"]
+        role = cached_session_role(self.contexts.path.parent, request["session"])
+        return role if role in roles else None
+
+    def failed_reply(self, request, box, why, elapsed):
+        """The reply when the judgement did not finish: the configured outcome stands, EXCEPT for an enforced role, which fails to ASK."""
+        role = self.enforced_role_of(request, box)
+        if role is not None:
+            reply = policy_reply(_stricter(request["configured"], "ask"), readonly_ask_reason(role, "a call the judge could not check (%s)" % why),
+                                 True, False, elapsed)
+            reply["enforced"] = True
+            return reply
+        return policy_reply(request["configured"], "%s: the configured outcome stands" % why, False, False, elapsed)
 
     def shadowed(self, request, reply):
         """policy.shadow: the judge's verdict is recorded and never enforced. Returns (reply, verdict-or-None); with
@@ -10498,13 +10742,21 @@ class PolicyJudge:
             box["reply"] = self._judge(request, box)
         except Exception as err:  # a worker thread must never leak a traceback or die without a reply
             box["detail"]["error"] = _one_line("%s: %s" % (type(err).__name__, err), 200)
-            box["reply"] = policy_reply(request["configured"], "could not judge while %s (%s): the configured "
-                                        "outcome stands" % (box["stage"], _one_line(str(err), 120)))
+            box["reply"] = self.failed_reply(request, box, "could not judge while %s (%s)" % (box["stage"], _one_line(str(err), 120)), 0)
 
     def _judge(self, request, box):
         fleet = self.identify(request["session"])
         if fleet is None:
             return policy_reply(request["configured"], "not a fleet agent (no metadata.fleet): not judged")
+        probe = request["tool"] == "other" and request.get("action") == "probe"
+        if probe:
+            box["probe"] = True
+        role = fleet.get("role")
+        if role in (self.settings.get("enforce_roles") or []):
+            box["enforced_role"] = role
+            return self.enforced_reply(request, fleet, box, probe)
+        if request["tool"] == "other" and request.get("action") is not None:  # an action the plugin forwards only for an enforced session (or a probe): nothing to judge here
+            return policy_reply(request["configured"], "not judged: no model is asked about an unlisted action of a role that is not enforced")
         if request["tool"] == "shell" and plain_switchboard_message(request["arguments"]):
             return policy_reply(request["configured"], "a plain %s message is the agents' own channel: not judged" % PROG)
         rule = None if fault("repo-create-allowed") or request["tool"] != "shell" \
@@ -10662,6 +10914,24 @@ class PolicyJudge:
                             request["tool"], request["arguments"],
                             COS_ORDERS_STATE_CLIP if fleet.get("role") == "chief-of-staff" else None)
 
+    def enforced_reply(self, request, fleet, box, probe=False):
+        """Read-only enforcement for this agent's role (issue 105): allowed calls keep the configured outcome, every other call is an ASK.
+        No model, no GitHub read; any exception is the caller's to turn into an ask (`failed_reply`)."""
+        role = fleet.get("role")
+        box["detail"].update(agent=fleet["name"], role=role, ask=None, enforced=True)
+        if probe:
+            reply = policy_reply(request["configured"], "this session's role is enforced read-only", False, False, 0)
+            reply["enforced"] = True
+            return reply
+        allowed, what = readonly_decision(request)
+        box["detail"]["allowed"] = bool(allowed)
+        if allowed:
+            reply = policy_reply(request["configured"], "read-only allow-list: allowed", True, False, 0)
+        else:
+            reply = policy_reply(_stricter(request["configured"], "ask"), readonly_ask_reason(role, what), True, False, 0)
+        reply["enforced"] = True
+        return reply
+
     def reply_of(self, combined, cached, fleet, context, request):
         outcome = combined["outcome"]
         judged = "answers" in combined
@@ -10680,6 +10950,8 @@ class PolicyJudge:
                  "answers": combined.get("answers"), "thresholds": detail.get("thresholds"),
                  "question": {"state": state, "ids": list(POLICY_QUESTIONS)} if state else None,
                  "model": combined.get("model"), "usage": combined.get("usage"), "error": detail.get("error")}
+        if detail.get("enforced"):
+            entry.update(enforced=True, allowed=detail.get("allowed"), verdict="allowed" if detail.get("allowed") else "asked")
         if shadow is not None:
             entry.update(shadow=True, verdict=shadow)
         try:
@@ -10802,9 +11074,13 @@ def ask_judge_daemon(state_dir, text, timeout):
 def never_looser(reply, configured):
     """The reply, made no looser than `configured`: the client's own guard, as the plugin has its own."""
     if POLICY_REQUEST_OUTCOMES.index(reply["outcome"]) >= POLICY_REQUEST_OUTCOMES.index(configured):
-        return policy_reply(reply["outcome"], reply.get("reason") or "", reply.get("judged"), reply.get("cached"),
-                            reply.get("latency_ms") if isinstance(reply.get("latency_ms"), int) else 0)
-    return policy_reply(configured, "the daemon answered looser than the configured outcome: ignored")
+        out = policy_reply(reply["outcome"], reply.get("reason") or "", reply.get("judged"), reply.get("cached"),
+                           reply.get("latency_ms") if isinstance(reply.get("latency_ms"), int) else 0)
+    else:
+        out = policy_reply(configured, "the daemon answered looser than the configured outcome: ignored")
+    if reply.get("enforced") is True:
+        out["enforced"] = True  # the plugin keeps asking about every action of an enforced session
+    return out
 
 
 class JudgeServer:
@@ -10910,6 +11186,28 @@ def start_judge_server(config, state, runner, now):
     return JudgeServer(state, make_judge_handler(runner, now)).start()
 
 
+def enforced_fallback(config, request, why):
+    """The reply for a call the daemon could not judge, when the session is known (from the daemon's own cache, whatever its age) to be of an
+    enforced role (issue 105): the deterministic allow-list is applied right here, and a call that is not on it is an ASK. None when the
+    role is not enforced or not known: then the configured outcome stands, as for every other role."""
+    try:
+        roles = (config or {}).get("policy", {}).get("enforce_roles") or []
+        if not roles or request is None or request["configured"] == "deny" or request.get("action") == "probe":
+            return None
+        role = cached_session_role(state_dir_path(), request["session"])
+        if role not in roles:
+            return None
+        allowed, what = readonly_decision(request)
+    except Exception:
+        return None if not (config or {}).get("policy", {}).get("enforce_roles") else policy_reply(
+            _stricter(request["configured"], "ask") if request else "ask", "Needs your yes: a read-only role and the allow-list could not run", False, False, 0)
+    outcome = request["configured"] if allowed else _stricter(request["configured"], "ask")
+    reply = policy_reply(outcome, ("read-only allow-list: allowed (%s)" % why) if allowed else readonly_ask_reason(role, "%s; the judge could not be reached (%s)" % (what, why)),
+                         True, False, 0)
+    reply["enforced"] = True
+    return reply
+
+
 def cmd_judge_tool(args, runner, now, stdin=None):
     """Read one request, print one JSON line, exit 0 whatever happens (invariant 9).
 
@@ -10917,7 +11215,7 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     judge off); everything else goes to the daemon. It reads no environment
     variable of its own accord: the key is the daemon's.
     """
-    text = ""
+    text, request, config = "", None, None
     try:
         text = (stdin or sys.stdin).read(POLICY_STDIN_LIMIT + 1)
         if len(text) > POLICY_STDIN_LIMIT:
@@ -10934,10 +11232,11 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     except PolicyRequestError as err:
         reply = policy_reply(_guess_configured(text), "unusable request (%s): no change" % err)
     except PolicyDaemonError as err:
-        reply = policy_reply(request["configured"], "%s: the configured outcome stands" % err)
-    except Exception as err:  # nothing the judge does may stop a tool call: the configured outcome stands
-        reply = policy_reply(_guess_configured(text), "the judge failed (%s: %s): the configured outcome stands"
-                             % (type(err).__name__, _one_line(str(err), 120)))
+        reply = enforced_fallback(config, request, "%s" % err) or policy_reply(request["configured"], "%s: the configured outcome stands" % err)
+    except Exception as err:  # nothing the judge does may stop a tool call: the configured outcome stands (an enforced role: an ask)
+        why = "the judge failed (%s: %s)" % (type(err).__name__, _one_line(str(err), 120))
+        reply = (enforced_fallback(config, request, why) if request is not None else None) \
+            or policy_reply(_guess_configured(text), "%s: the configured outcome stands" % why)
     try:
         print(json.dumps(reply, sort_keys=True))
         sys.stdout.flush()

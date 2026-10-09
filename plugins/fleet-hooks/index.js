@@ -113,12 +113,58 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
   });
 }
 
-export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn }) {
+// A session is either "enforced" (its role is read-only, policy.enforce_roles: the daemon says so) or not. One tiny probe per session asks
+// once and the answer is kept for MODE_TTL_MS. For an ENFORCED session every action is forwarded (an action this plugin has no kind for goes
+// as tool "other" with its v2 action name), and a judge that cannot answer makes the call an ASK, not an allow; for every other session
+// nothing changes: only the listed actions are forwarded and the configured outcome stands when the judge cannot answer.
+export const MODE_TTL_MS = 10 * 60 * 1000;
+const MODE_LIMIT = 500;
+const ACTION_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+export function requestOfUnlisted(input) {
+  const resources = Array.isArray(input.resources) ? input.resources.filter((r) => typeof r === "string") : [];
+  return {
+    sessionID: input.sessionID,
+    tool: "other",
+    action: typeof input.action === "string" && ACTION_NAME.test(input.action) ? input.action : "unknown",
+    arguments: resources.join("\n"),
+    outcome: input.effect,
+  };
+}
+
+export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, modes = new Map() }) {
+  // `modes`: sessionID -> { enforced, at }; a caller (a test) may start it filled
+  const remember = (sessionID, enforced) => {
+    if (modes.size >= MODE_LIMIT) modes.delete(modes.keys().next().value);
+    const mode = { enforced, at: now() };
+    modes.set(sessionID, mode);
+    return mode;
+  };
+  const modeOf = (sessionID) => {
+    const mode = modes.get(sessionID);
+    return mode && now() - mode.at < MODE_TTL_MS ? mode : null;
+  };
   return async function evaluate(input) {
     try {
       if (!input || !OUTCOMES.includes(input.effect) || typeof input.sessionID !== "string") return;
-      if (toolOf(input.action) === null) return; // not an action this plugin forwards: the configured outcome stands
-      const reply = await runJudge(bin, requestOf(input), timeoutMs, spawnFn);
+      const listed = toolOf(input.action) !== null;
+      let mode = modeOf(input.sessionID);
+      if (!mode) {
+        const probe = await runJudge(bin, { sessionID: input.sessionID, tool: "other", action: "probe", arguments: "", outcome: input.effect }, timeoutMs, spawnFn);
+        if (probe) mode = remember(input.sessionID, probe.enforced === true);
+        // no answer to the probe: the role is not known, and the call follows the configured rules as before
+      }
+      const enforced = Boolean(mode && mode.enforced);
+      if (!listed && !enforced) return; // not an action this plugin forwards: the configured outcome stands
+      const reply = await runJudge(bin, listed ? requestOf(input) : requestOfUnlisted(input), timeoutMs, spawnFn);
+      if (reply && reply.enforced === true && !enforced) remember(input.sessionID, true);
+      if (!reply) {
+        if (enforced && OUTCOMES.indexOf(input.effect) < OUTCOMES.indexOf("ask")) {
+          input.effect = "ask"; // a read-only role fails to ASK when the judge cannot answer
+          input.message = "Needs your yes: the judge could not be reached and this role is read-only here.";
+        }
+        return;
+      }
       if (!isStricter(reply, input.effect)) return; // the second guard: never loosen, never repeat
       input.effect = reply.outcome;
       input.message = typeof reply.reason === "string" ? reply.reason.slice(0, REASON_LIMIT) : undefined;

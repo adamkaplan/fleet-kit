@@ -6,6 +6,12 @@ runs `fleet-switchboard judge-tool` for each evaluation of a shell, edit,
 web-fetch or subagent call, and applies the reply only if it is stricter than
 the outcome the configured rules chose. It holds no policy.
 
+## Read-only roles (issue 105)
+
+For a role listed in the switchboard's `policy.enforce_roles` the plugin forwards EVERY action of the session (not only shell, edit, web fetch
+and subagent), and a judge that does not answer makes the call an ask instead of leaving it as configured. It learns this once per session from a tiny
+probe (`tool: other`, `action: probe`), remembered ten minutes; other sessions are untouched. See docs/switchboard.md, "Read-only enforcement for a role".
+
 ## The daemon, not v2, holds the key
 
 The plugin runs inside v2's service process, and the environment of that
