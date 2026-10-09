@@ -14901,6 +14901,32 @@ class TestJudgeEval(Base):
         self.assertIn("agent_brief", seen[1])
         self.assertIn("recent_turns", seen[1])
 
+    def test_a_credential_in_the_session_context_never_reaches_the_model(self):
+        fake = "ghp_" + "0123456789abcdefABCDEF0123"
+        seen = []
+
+        class Spy(self.je.StubJev):
+            def decide(self, state, questions):
+                seen.append(json.dumps(state))
+                return super().decide(state, questions)
+
+        context = {"a": {"brief": "use token %s for the build" % fake,
+                         "recent": ["assistant: export GH_TOKEN=%s" % fake, "x" * 5000]}}
+        row = self.row("a", "echo %s" % fake, "allow")
+        self.je.judge_rows([row], self.je.EXPERIMENTS["session-context"], Spy(), context, 1, 10, 1.0)
+        self.assertNotIn(fake, seen[0])
+        self.assertIn("agent_brief", seen[0])
+        self.assertLess(len(seen[0]), 6000, "the turns are clipped")
+        self.assertNotIn(fake, json.dumps(self.je.build_context(types.SimpleNamespace(
+            message_list=lambda *a, **k: [{"text": "key %s" % fake}],
+            message_pages=lambda *a, **k: iter([([{"type": "assistant", "time": {"created": 1}, "text": fake}], False)])),
+            "ses_x", 10, 3)))
+
+    def test_the_docs_say_what_is_not_shared_with_the_live_judge(self):
+        text = (REPO / "docs" / "judge-eval.md").read_text()
+        for needle in ("Not\nshared", "upper bound", "redact_command_text"):
+            self.assertIn(needle, text)
+
     def test_the_wording_experiment_changes_only_the_questions_it_names(self):
         base, variant = self.je.questions_for("today"), self.je.questions_for("routine-aware")
         changed = sorted(k for k in base if base[k] != variant[k])

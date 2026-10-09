@@ -12,7 +12,8 @@ GitHub. This script refuses to write a rows, cache, context or misclassified fil
   judge-eval run rows.jsonl --experiment baseline [--stub | --offline-cache FILE] [--context context.json]
         [--concurrency 4] [--max-calls 200] [--max-cost USD] [--seed 1] [--limit N]
         [--misclassified OUT.jsonl] [--json]
-        Replay every row through the real judge code path (policy_state, judge_tool_call, combine_policy) and print
+        Replay every row through the judge's own functions (policy_state, redact_command_text, judge_tool_call,
+        combine_policy; see docs/judge-eval.md for what is and is not shared with the live judge) and print
         the confusion matrix, precision/recall for allow, ask and deny, latency p50/p95, cost per call and a
         per-category breakdown. --offline-cache FILE answers from FILE when it has the request and records new
         answers there (no re-spending); --stub answers from a fixed rule, never the network (tests).
@@ -51,6 +52,7 @@ def load_switchboard():
 
 sb = load_switchboard()
 CLASSES = ("allow", "ask", "deny")
+EXTRA_SECRETS = ()   # known key values to remove too; main() fills it from the config
 
 # ----------------------------------------------------------------------------------- experiments
 #
@@ -160,7 +162,7 @@ def text_of(message):
 
 
 def clip(text, limit):
-    text = " ".join(str(text or "").split())
+    text = " ".join(sb.redact_command_text(text).split())  # the judge's own redaction, before anything is clipped or sent
     return text if len(text) <= limit else text[:limit - 1] + "\u2026"
 
 
@@ -258,10 +260,13 @@ class CachedJev:
 def state_of(row, experiment, context):
     authority = row.get("authority") or sb.NO_STANDING_AUTHORITY
     state = sb.policy_state(row.get("role") or "unknown", row.get("intent") or "not stated: no ask is recorded",
-                            row.get("done_when") or "not stated", authority, row["tool"], row["arguments"])
+                            row.get("done_when") or "not stated", authority, row["tool"],
+                            sb.redact_command_text(row["arguments"], EXTRA_SECRETS))  # as the live judge does
     if experiment["context"] and context:
-        state["agent_brief"] = context.get("brief") or "not available"
-        state["recent_turns"] = context.get("recent") or []
+        # Redacted and clipped again here, not only when fetched: a context file made by an older version, or by hand,
+        # must not put a credential in front of the model either.
+        state["agent_brief"] = clip(context.get("brief") or "not available", 1200)
+        state["recent_turns"] = [clip(turn, 300) for turn in (context.get("recent") or [])][:6]
     return state
 
 
@@ -487,6 +492,11 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    global EXTRA_SECRETS
+    try:
+        EXTRA_SECRETS = tuple(sb.jev_secrets(sb.load_config()))
+    except Exception:  # no config (tests, a first look): the patterns still apply
+        EXTRA_SECRETS = ()
     return {"import": cmd_import, "fetch-context": cmd_fetch_context, "run": cmd_run, "sweep": cmd_sweep,
             "experiments": cmd_experiments}[args.action](args)
 
