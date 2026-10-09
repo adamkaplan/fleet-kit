@@ -1312,13 +1312,13 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def steers_into_turn(config, observation, carried):
+def steers_into_turn(config, observation, carried, discovery=None):
     """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
     the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
     message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
     a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
     return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
-            and any(fact.kind == "send" and fact.sender and fact.sender == _boss_of(observation) for fact in carried))
+            and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
 
 
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
@@ -1834,7 +1834,7 @@ class Switchboard:
         message_id = derive_message_id(observation.session_id, keys)
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
-        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried)
+        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None))
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
@@ -2049,7 +2049,7 @@ class Switchboard:
         discovery = self.discover(now)
         if interrupt:
             target = discovery.agents.get(recipient)
-            if target is None or _boss_of(target) != sender:
+            if target is None or boss_name(discovery, target) != sender:
                 reason = ("%s is not an agent of this fleet that reports to you" % recipient if target is None
                           else "only a boss may interrupt, and %s does not report to %s" % (recipient, sender))
                 if self.audit is not None:
@@ -2101,7 +2101,7 @@ class Switchboard:
         me = discovery.agents.get(sender)
         if me is None:
             raise ReportError(discovery.missing(sender))
-        boss = _boss_of(me)
+        boss = boss_name(discovery, me)  # the role name chief-of-staff resolves to the registered cos agent (#102)
         if boss is None:
             raise ReportError("%s reports to nobody: its fleet metadata has no reports_to, so there is no one to "
                               "tell (use `%s send <name> ...` for a message)" % (sender, PROG))
@@ -3734,7 +3734,7 @@ class WorkerFacts:
         horizon = worker_horizon(engine.config, engine.now())
         facts = []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
-            boss = _boss_of(observation)
+            boss = boss_name(discovery, observation)  # #102: the stop triage looks the boss up by its registered name
             if observation.conflict or observation.problem:
                 continue
             try:
@@ -4445,6 +4445,14 @@ def resolve_boss(discovery, name):
         return name
     found = [n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == COS_ALIAS]
     return found[0] if len(found) == 1 else name
+
+
+def boss_name(discovery, observation):
+    """The registered name of the agent `observation` reports to (`resolve_boss` over its `reports_to`), or None. Every lookup of a
+    boss as an AGENT goes through here (#102); `_boss_of` alone is the literal text, for display."""
+    boss = _boss_of(observation)
+    boss = resolve_boss(discovery, boss) if boss is not None and discovery is not None else boss
+    return boss if boss != observation.name else None  # a chief of staff launched with reports_to chief-of-staff is not its own boss
 
 
 def decisions_from_reports(engine, now):
@@ -5340,7 +5348,7 @@ class ExternalSyncHost(decision_sync.Host):
     def _boss(self, target):
         discovery = self.engine.discovery or self.engine.discover(self.engine.now())
         found = discovery.agents.get(target.get("agent")) if target.get("agent") else None
-        boss = _boss_of(found) if found is not None else None
+        boss = boss_name(discovery, found) if found is not None else None
         if boss is None:
             raise DecisionError("%s: there is no running agent to tell" % (target.get("display_id") or target.get("id")))
         return boss
@@ -5482,7 +5490,7 @@ class EngineWorkHost(work_sync.Host):
             return []
         since = engine.now() - engine.config["decisions_lookback_hours"] * 3600
         repos, found = decision_repos(engine), []
-        for boss in sorted({_boss_of(o) for o in discovery.agents.values()} - {None}):
+        for boss in sorted({boss_name(discovery, o) for o in discovery.agents.values()} - {None}):
             obs = discovery.agents.get(boss)
             if obs is None or obs.problem:
                 continue
@@ -6233,6 +6241,11 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
     Never raises: the worker is already running."""
     try:
         notes = []
+        if boss:  # #102: the overdue wake goes to the registered agent the role name chief-of-staff stands for
+            try:
+                boss = resolve_boss(engine.discover(engine.now()), boss)
+            except Exception:
+                pass  # the fleet cannot be read now: the name as given
         if checkpoint is None and overdue is None:
             parsed = parse_checkpoint(brief)
             if parsed is None:
@@ -8448,11 +8461,13 @@ def cmd_report(args, runner, now):
 def notice_boss(engine, sender):
     """The agent `sender` reports to, as the fleet shows it now, or None (not found, or the fleet cannot be read)."""
     try:
-        seen = engine.discover(engine.now()).agents.get(sender)
+        discovery = engine.discover(engine.now())
+        seen = discovery.agents.get(sender)
     except Exception:
         return None
     boss = (seen.fleet or {}).get("reports_to") if seen is not None else None
-    return boss if isinstance(boss, str) and boss.strip() else None
+    boss = boss if isinstance(boss, str) and boss.strip() else None
+    return resolve_boss(discovery, boss) if boss is not None else None
 
 
 def withdraw_pr_notice(state_dir, repo, number, caller):
