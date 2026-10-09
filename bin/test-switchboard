@@ -116,10 +116,23 @@ class FakeRunner:
 SAFE_PATH = "/usr/bin:/bin"
 
 
+def remove_tree_patiently(tmp, tries=20, pause=0.1):
+    """#93: clean a TemporaryDirectory up even when a daemon thread of the test is still writing into it for a
+    moment (`Directory not empty`): try again until it is gone, then let the last error show."""
+    for attempt in range(tries):
+        try:
+            tmp.cleanup()
+            return
+        except OSError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(pause)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        self.addCleanup(remove_tree_patiently, tmp)
         self.home = Path(tmp.name).resolve()
         patcher = mock.patch.dict(os.environ, {
             "HOME": str(self.home),
@@ -11100,6 +11113,9 @@ class TestJudgeToolRequestHandling(PolicyCase):
         self.assertIn("judge-tool", out.getvalue())
 
 
+BUDGET_TEST_MS = 1500   # #93: a real-time budget a loaded runner cannot outrun before the worker thread has started
+
+
 class TestJudgeToolBudget(PolicyCase):
     class Blocking:
         def __init__(self, release, inner):
@@ -11118,14 +11134,16 @@ class TestJudgeToolBudget(PolicyCase):
         release = threading.Event()
         self.addCleanup(release.set)
         jev = self.Blocking(release, FakeJev(noul_answers(**dict(LOW, hard_to_reverse=0.9))))
-        judge = self.direct_judge(jev, budget_ms=60)
+        # #93: the budget is real time, so it is generous: on a loaded runner a 60 ms budget could end before the
+        # worker thread had even reached the model call, and the stage named would be an earlier one.
+        judge = self.direct_judge(jev, budget_ms=BUDGET_TEST_MS)
         started = time.monotonic()
         reply = judge.decide(self.request())
-        self.assertLess(time.monotonic() - started, 5, "the call must not wait for Jev")
+        self.assertLess(time.monotonic() - started, 8, "the call must not wait for Jev")
         self.assertEqual((reply["outcome"], reply["judged"]), ("allow", False))
-        self.assertIn("no answer within 60 ms", reply["reason"])
+        self.assertIn("no answer within %d ms" % BUDGET_TEST_MS, reply["reason"])
         self.assertIn("asking the decision model", reply["reason"])
-        self.assertGreaterEqual(reply["latency_ms"], 55)
+        self.assertGreaterEqual(reply["latency_ms"], BUDGET_TEST_MS - 50)
         self.assertEqual(self.audit_events()[-1]["detail"]["outcome"], "allow")
 
     def test_a_late_answer_fills_the_cache_so_the_next_identical_call_is_fast_and_right(self):
@@ -11152,7 +11170,7 @@ class TestJudgeToolBudget(PolicyCase):
         self.addCleanup(release.set)
         self.reader.runner = SlowGH(self.gh, release)
         jev = FakeJev(noul_answers(**LOW))
-        reply = self.direct_judge(jev, budget_ms=60).decide(self.request())
+        reply = self.direct_judge(jev, budget_ms=BUDGET_TEST_MS).decide(self.request())
         self.assertEqual((reply["outcome"], reply["judged"], len(jev.calls)), ("allow", False, 0))
         self.assertIn("resolving the ask", reply["reason"])
 
@@ -18291,10 +18309,25 @@ class TestServiceTemplates(Base):
             rendered = sb.render_service(kind, self.values(), REPO)
             self.assertNotIn(PR16_KEY, rendered)
             self.assertNotRegex(rendered, r"(?i)api_key|secret|token|password|bearer")
-            self.assertNotIn("__", re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S), "an unfilled placeholder in %s" % name)
+            bare = re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S)
+            for value in sorted({str(v) for v in self.values().values()}, key=len, reverse=True):
+                bare = bare.replace(value, "")  # #93: a filled-in path (a runner's `/__w/...`) is not a placeholder
+            self.assertIsNone(re.search(r"__[A-Z][A-Z0-9_]*__", bare), "an unfilled placeholder in %s" % name)
             template = (REPO / "templates" / name).read_text()
             for number, line in enumerate(template.splitlines(), 1):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (name, number, line))
+
+    def test_a_runner_path_with_double_underscores_is_not_a_placeholder(self):
+        """#93: CI checkouts live under paths like `/home/runner/work/_temp/__w/repo`."""
+        repo = self.home / "work" / "__w" / "repo"
+        shutil.copytree(REPO / "templates", repo / "templates")
+        for kind in ("launchd", "systemd"):
+            rendered = sb.render_service(kind, sb.service_values(repo, ["/opt/tools/bin", "/usr/bin"]), repo)
+            self.assertIn("/__w/", rendered)
+            bare = re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S)
+            for value in sorted({str(v) for v in sb.service_values(repo, ["/opt/tools/bin"]).values()}, key=len, reverse=True):
+                bare = bare.replace(value, "")
+            self.assertIsNone(re.search(r"__[A-Z][A-Z0-9_]*__", bare))
 
     def test_the_templates_never_send_output_to_the_void(self):
         plist = re.sub(r"<!--.*?-->", "", (REPO / "templates" / self.TEMPLATES[0]).read_text(), flags=re.S)
@@ -19272,7 +19305,7 @@ class TestTheLockSurvivesAReExec(Base):
             deadline, gaps, seen_held, rivals = time.time() + 60, 0, False, 0
             while time.time() < deadline and not (state / "first.pid").exists():
                 time.sleep(0.01)  # the child holds the lock from here; before that, polling it would take it
-            while time.time() < deadline and not (state / "second.pid").exists():
+            while True:  # #93: sample at least once; on a fast machine the exec can finish before the first look
                 held = sb.run_lock_held(state)
                 seen_held = seen_held or held
                 if seen_held and not held:
@@ -19283,6 +19316,8 @@ class TestTheLockSurvivesAReExec(Base):
                             rivals += 1
                     except sb.LockError:
                         pass
+                if (state / "second.pid").exists() or time.time() >= deadline:
+                    break
             self.assertTrue((state / "second.pid").exists(), "the re-executed process started")
             self.assertTrue(seen_held)
             self.assertEqual(gaps, 0, "the lock was never free: no `ensure` could start a second daemon")
