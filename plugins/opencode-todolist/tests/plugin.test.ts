@@ -208,3 +208,34 @@ test("session.deleted removes the stored list for that session", async () => {
     await dispose()
   }
 })
+
+test("a todoread issued together with a todowrite sees the write (fleet-kit#38)", async () => {
+  const fake = fakeContext()
+  const slow = fake.context.storage as unknown as { set: (key: string, value: unknown) => Promise<void> }
+  const set = slow.set
+  slow.set = async (key, value) => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await set(key, value)
+  }
+  await plugin.setup(fake.context)
+  const ctx = { sessionID: "ses_cos" }
+  const [written, read] = await Promise.all([
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "in_progress" }] }, ctx),
+    fake.tools.get("todoread")!.execute({}, ctx),
+  ])
+  assert.match(written.content ?? "", /updated \(1 item\)/)
+  assert.match(read.content ?? "", /1\. \[•\] A/)
+  assert.doesNotMatch(read.content ?? "", /empty/)
+})
+
+test("two parallel todowrites of one session do not lose the timing of either", async () => {
+  const fake = fakeContext()
+  await plugin.setup(fake.context)
+  const ctx = { sessionID: "ses_p" }
+  await Promise.all([
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "pending" }] }, ctx),
+    fake.tools.get("todowrite")!.execute({ todos: [{ content: "A", status: "completed" }] }, ctx),
+  ])
+  const stored = fake.storage.get("todos/ses_p") as { todos: Array<{ status: string }> }
+  assert.equal(stored.todos[0].status, "completed", "the later write wins, in the order the calls began")
+})

@@ -59,7 +59,24 @@ const TODOWRITE_DESCRIPTION = [
 ].join(" ")
 
 const TODOREAD_DESCRIPTION =
-  "Read the current session todo list. Use it to recover the list after context compaction or to check progress before starting the next task."
+  "Read the current session todo list. Use it to recover the list after context compaction or to check progress before starting the next task. Call it in a step of its own: do not issue it together with todowrite."
+
+// Tool calls that a model issues in one step run concurrently. A todoread started right after a todowrite of the
+// same session must see that write, so a session's tool executions run one at a time, in the order they began
+// (fleet-kit#38: cos called todowrite and todoread in one step and todoread read the list before it was stored).
+const chains = new Map<string, Promise<unknown>>()
+function serialized<T>(sessionID: string, work: () => Promise<T>): Promise<T> {
+  const run = (chains.get(sessionID) ?? Promise.resolve()).then(work)
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  chains.set(sessionID, tail)
+  void tail.then(() => {
+    if (chains.get(sessionID) === tail) chains.delete(sessionID)
+  })
+  return run
+}
 
 const plugin: Plugin.Plugin = {
   id: "aiev.todolist",
@@ -71,17 +88,18 @@ const plugin: Plugin.Plugin = {
         description: TODOWRITE_DESCRIPTION,
         input: TODOS_INPUT_SCHEMA,
         options: { codemode: false },
-        execute: async (input, context) => {
-          const todos = normalizeTodos(input)
-          const at = Date.now()
-          const key = storageKey(context.sessionID)
-          const previous = parseTodoRecord(await ctx.storage.get(key))
-          const timing = applyTodoWrite(previous?.timing, todos, at)
-          await ctx.storage.set(key, { todos, updatedAt: at, timing })
-          return {
-            content: `Todo list updated (${todos.length} ${todos.length === 1 ? "item" : "items"}):\n${renderTodos(todos)}`,
-          }
-        },
+        execute: (input, context) =>
+          serialized(context.sessionID, async () => {
+            const todos = normalizeTodos(input)
+            const at = Date.now()
+            const key = storageKey(context.sessionID)
+            const previous = parseTodoRecord(await ctx.storage.get(key))
+            const timing = applyTodoWrite(previous?.timing, todos, at)
+            await ctx.storage.set(key, { todos, updatedAt: at, timing })
+            return {
+              content: `Todo list updated (${todos.length} ${todos.length === 1 ? "item" : "items"}):\n${renderTodos(todos)}`,
+            }
+          }),
       })
 
       editor.add({
@@ -89,15 +107,16 @@ const plugin: Plugin.Plugin = {
         description: TODOREAD_DESCRIPTION,
         input: TODO_READ_INPUT_SCHEMA,
         options: { codemode: false },
-        execute: async (_input, context) => {
-          const record = parseTodoRecord(await ctx.storage.get(storageKey(context.sessionID)))
-          const todos = record?.todos ?? []
-          const now = Date.now()
-          const summary = timingSummary(record?.timing, now)
-          const run = record?.timing?.current ?? record?.timing?.last
-          const list = renderTodos(todos, (todo) => itemTimeLabel(findItem(run, todo.content), now))
-          return { content: `Current todo list${summary ? ` (${summary})` : ""}:\n${list}` }
-        },
+        execute: (_input, context) =>
+          serialized(context.sessionID, async () => {
+            const record = parseTodoRecord(await ctx.storage.get(storageKey(context.sessionID)))
+            const todos = record?.todos ?? []
+            const now = Date.now()
+            const summary = timingSummary(record?.timing, now)
+            const run = record?.timing?.current ?? record?.timing?.last
+            const list = renderTodos(todos, (todo) => itemTimeLabel(findItem(run, todo.content), now))
+            return { content: `Current todo list${summary ? ` (${summary})` : ""}:\n${list}` }
+          }),
       })
     })
 
