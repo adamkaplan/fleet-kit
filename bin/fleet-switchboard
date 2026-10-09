@@ -1524,6 +1524,7 @@ class Switchboard:
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
+        self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
         self.notice_facts = {}          # PR notices: "owner/repo#N" -> {at, facts, stale, error}; memory only
         self.notice_effects = {"drop": set(), "unreadable": {}}  # what the last derivation asks the daemon to record
@@ -1925,7 +1926,15 @@ class Switchboard:
                 self._failed(observation.name, "convert", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
         facts, _ = self.collect_facts()
-        facts = filter_stopped_news(self, facts, discovery)
+        try:
+            facts = filter_stopped_news(self, facts, discovery)
+        except Exception as err:  # fail open: a broken judge never stops a delivery, the facts wake as today
+            reason = _one_line("%s: %s" % (type(err).__name__, err), 200)
+            if reason not in self.stopped_news_errors:
+                if len(self.stopped_news_errors) > 50:
+                    self.stopped_news_errors.clear()
+                self.stopped_news_errors.add(reason)
+                self._note("stopped_news.error", None, {"reason": reason})
         by_recipient = {}
         for fact in facts:
             by_recipient.setdefault(fact.recipient, []).append(fact)

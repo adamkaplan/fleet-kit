@@ -13861,6 +13861,23 @@ class TestStoppedNews(PR4Base):
         self.assertEqual(len(self.told()), 1)
         self.assertEqual(self.events()[0]["detail"]["outcome"], "would_drop")
 
+    def test_a_filter_that_raises_anything_still_delivers_every_fact_and_is_audited_once(self):
+        for error in (RuntimeError("boom"), KeyError("k"), TypeError("t")):
+            with self.subTest(error=type(error).__name__):
+                self.tearDown()
+                self.setUp()
+                self.stopped_twice("NEWS-NO nothing changed")
+
+                def broken(*args, **kwargs):
+                    raise error
+                with mock.patch.object(sb, "filter_stopped_news", broken):
+                    self.passes()
+                    self.passes()
+                self.assertEqual(len(self.told()), 1)
+                errors = [e for e in self.world.audit() if e["event"] == "stopped_news.error"]
+                self.assertEqual(len(errors), 1)
+                self.assertIn(type(error).__name__, errors[0]["detail"]["reason"])
+
     def test_off_is_the_default_and_judges_nothing(self):
         self.assertEqual(sb.REPORT_TRIAGE_DEFAULTS["stopped_news"], "off")
         self.tearDown()
