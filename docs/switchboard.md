@@ -1086,6 +1086,18 @@ Done when, the worker's role and its last reply.
 | Silent | probability below the threshold | The idle stays a rider |
 | Tell the boss | a nudge was already sent and the worker stopped again without reporting, or the model failed, timed out (`report_triage.budget_seconds`, 3) or is not configured, or the boss cannot be read | One `worker.stopped` fact for the boss (not a rider), replacing the idle: "<worker> stopped without reporting (<outcome>): <last reply>" |
 
+**Judging a stopped note for news (#96, off by default).** `report_triage.stopped_news` is `"off"` (default),
+`"shadow"` or `"on"`; `report_triage.news_threshold` (default 0.15) is the probability of news under which a note is
+clearly no news. When a `worker.stopped` would wake the **Chief of Staff alone** (every non-rider fact waiting for it is a
+`worker.stopped`; an orchestrator's boss is never touched), the decision model (the same client and `budget_seconds` as
+`report_owed`) is asked one question on the worker's last reply: "Does this tell the person anything new?". The note is
+dropped only when the worker ended cleanly (`succeeded`) and the answer is under the threshold. Everything else wakes as
+before: any error, timeout, missing answer, doubt, a worker that did not end cleanly, no model. It is never a rule on the
+reply text alone. `shadow` judges and audits (`would_drop`) and drops nothing, so the setting can be watched before it
+is turned on. Each note is judged once and audited once as `stopped.news` with the question, the answer, the latency,
+the model and its usage (the cost), the mode, the threshold and the outcome (`dropped`, `would_drop` or `wakes`);
+`fleet-switchboard status` shows how many were judged, dropped and would be dropped in the last hour.
+
 A stop older than `rider_max_age_seconds` is not triaged, a read-only
 `status` or `pending` never asks the model, and a stop is asked about once per
 daemon life (a cache, rebuilt after a restart). Each triage writes one
