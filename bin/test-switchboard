@@ -23024,9 +23024,9 @@ class TestPrNotices(DecisionsBase):
 
     def test_a_number_that_is_not_an_open_pr_is_refused_and_nothing_is_recorded(self):
         self.gh.answers.update({8: (1, "", "GraphQL: Could not resolve to a PullRequest with the number of 8. (repository.pullRequest)"),
-                                9: (1, "", "no pull requests found for 9"), 10: (0, pr_view_json(state="MERGED"), ""),
-                                11: (0, pr_view_json(state="CLOSED"), ""), 12: (1, "", "HTTP 404: Not Found")})
-        for number in (8, 9, 12):
+                                9: (1, "", "Could not resolve to a PullRequest with the number of 9."), 10: (0, pr_view_json(state="MERGED"), ""),
+                                11: (0, pr_view_json(state="CLOSED"), "")})
+        for number in (8, 9):
             code, _, err = self.cli("notice", "pr", "acme/api#%d" % number, "--from", "coder")
             self.assertEqual(code, 2, number)
             self.assertIn("not a pull request I can find", err)
@@ -23036,8 +23036,21 @@ class TestPrNotices(DecisionsBase):
             self.assertIn("is %s, not an open pull request" % word, err)
         self.assertFalse((self.world.state / sb.PR_NOTICES).exists())
 
+    def test_only_gh_missing_pr_answer_is_not_found(self):
+        yes = ["GraphQL: Could not resolve to a PullRequest with the number of 12. (repository.pullRequest)",
+               "Could not resolve to a PullRequest with the number of 123456."]
+        no = ["HTTP 404: Not Found", "HTTP 404: Not Found (https://api.github.com/x)\nrequires the repo scope", "keyring: not found", "could not find git remotes",
+              "Could not resolve to a Repository with the name 'a/b'.", "Could not resolve host: github.com", "gh: command not found", "no pull requests found for 7",
+              "xCould not resolve to a PullRequest with the number of 7.", "could not resolve to a pullrequest with the number of 7."]
+        for text in yes:
+            self.assertTrue(sb._PR_NOT_FOUND.search(text), text)
+        for text in no:
+            self.assertFalse(sb._PR_NOT_FOUND.search(text), text)
+
     def test_an_unreadable_lookup_never_blocks_a_notice(self):
-        for answer in ((1, "", "HTTP 502 Bad Gateway"), (1, "", "gh: authentication required"), (1, "", "dial tcp: i/o timeout"),
+        for answer in ((1, "", "HTTP 404: Not Found (https://api.github.com/graphql) needs the repo scope"), (1, "", "keyring: not found"),
+                       (1, "", "could not find git remotes"), (1, "", "Could not resolve to a Repository with the name 'acme/api'."),
+                       (1, "", "HTTP 502 Bad Gateway"), (1, "", "gh: authentication required"), (1, "", "dial tcp: i/o timeout"),
                        subprocess.TimeoutExpired(["gh"], 5), OSError("gh: not found on PATH"), (0, "not json", "")):
             self.gh.answers[7] = answer
             (self.world.state / sb.PR_NOTICES).unlink() if (self.world.state / sb.PR_NOTICES).exists() else None
@@ -23279,7 +23292,9 @@ class TestPrNotices(DecisionsBase):
         self.assertIn("60 minutes of observed time", dropped["detail"]["reason"])
 
     def test_a_lone_notice_that_gh_says_is_not_found_drops_after_an_observed_hour(self):
-        for answer in ((1, "", "GraphQL: Could not resolve to a PullRequest with the number of 7."), (1, "", "no pull requests found for 7"), (1, "", "HTTP 404: Not Found")):
+        for answer in ((1, "", "GraphQL: Could not resolve to a PullRequest with the number of 7."),
+                       (1, "", "Could not resolve to a PullRequest with the number of 7. (repository.pullRequest)\n"),
+                       (1, "", "warning: x\nGraphQL: Could not resolve to a PullRequest with the number of 7. (repository.pullRequest)")):
             self.setUp()
             self.gh.answers[7] = answer
             self.notify()
@@ -23292,7 +23307,14 @@ class TestPrNotices(DecisionsBase):
             self.assertEqual(len([e for e in self.world.audit() if e["event"] == "notice.dropped"]), 1)
 
     def test_a_lone_notice_with_network_or_auth_errors_never_drops(self):
-        for error in ("HTTP 502 Bad Gateway", "gh: authentication required", "dial tcp: i/o timeout", "HTTP 401: Bad credentials", "HTTP 403"):
+        for error in ("HTTP 502 Bad Gateway", "gh: authentication required", "dial tcp: i/o timeout", "HTTP 401: Bad credentials", "HTTP 403",
+                      # the phrases the review of PR #100 named, and the near misses
+                      "HTTP 404: Not Found (https://api.github.com/graphql)\nThis API operation needs the \"read:org\" scope",
+                      "HTTP 404: Not Found", "no pull requests found for 7", "failed to read the token from the keyring: not found",
+                      "keyring: secret not found in keyring", "could not find any git remotes", "no git remotes found: could not find a remote",
+                      "Could not resolve to a Repository with the name 'acme/api'.", "Could not resolve host: api.github.com", "gh: command not found",
+                      "x GraphQL: Could not resolve to a PullRequest with the number of 7.", "graphql: could not resolve to a pullrequest with the number of 7.",
+                      "Could not resolve to a PullRequest with the number of abc.", "Could not resolve to a PullRequest"):
             self.setUp()
             self.gh.answers[7] = (1, "", error)
             self.notify()

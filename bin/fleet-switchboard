@@ -4621,7 +4621,11 @@ class NoticeNotFound(NoticeError):
     """`gh` answered that there is no such pull request (a number that is an issue, or nothing): not an unreadable lookup."""
 
 
-_PR_NOT_FOUND = re.compile(r"(?i)could not resolve to a pull ?request|no pull requests? found|not found|HTTP 404|could not find")
+# The ONE answer gh gives for a pull request number that does not exist (or is an issue): GraphQL's `Could not resolve to a PullRequest with
+# the number of N.`, at the start of a line, case-sensitive as gh prints it. Nothing looser: a 404 with a token scope, a keyring or
+# "command not found", `could not find git remotes`, `Could not resolve to a Repository` or `Could not resolve host` are failures of the
+# lookup, not a missing PR, and are never counted as one (issue 99, review).
+_PR_NOT_FOUND = re.compile(r"^(?:GraphQL: )?Could not resolve to a PullRequest with the number of [0-9]{1,9}\.", re.M)
 
 
 def parse_pr_ref(text):

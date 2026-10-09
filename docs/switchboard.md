@@ -2123,7 +2123,7 @@ was sent), and refused with one line for anyone else; for a PR with no notice it
 sender or its boss: it routes by the PR's own references like any PR with no notice, or is unrouted and audited. A notice whose PR cannot be
 read for one hour of OBSERVED time (`PR_NOTICE_UNREADABLE_SECONDS`; it was seven days, so a mistyped number woke the wrong agent for days) is dropped at
 the next pass with an audit line (`notice.dropped`, reason `unreadable for 60 minutes of observed time`, and the error). Observed means: seconds between
-passes of the running daemon in which `gh` demonstrably worked (some notice read fine, or `gh` clearly answered "no such pull request" for one: an answer, unlike an auth or network error), added only for the notices that still cannot be read, at most
+passes of the running daemon in which `gh` demonstrably worked (some notice read fine, or `gh` printed its exact missing-PR answer, `Could not resolve to a PullRequest with the number of N.`, for one: an answer, unlike an auth, network, scope, keyring or git-remote error, none of which is ever taken for a missing PR), added only for the notices that still cannot be read, at most
 ten minutes per pass (`PR_NOTICE_OBSERVE_MAX`). A pass where every read fails is an outage of `gh`, the auth or the network, not a bad notice: nobody
 counts and nobody drops, however long it lasts. A daemon start begins every count again (downtime is not counted). A PR that becomes readable again clears its clock
 (`unreadable_since`, `unreadable_for` in `pr-notices.json`).
