@@ -11149,11 +11149,11 @@ class TestJudgeToolBudget(PolicyCase):
     def test_a_late_answer_fills_the_cache_so_the_next_identical_call_is_fast_and_right(self):
         release = threading.Event()
         jev = self.Blocking(release, FakeJev(noul_answers(**dict(LOW, hard_to_reverse=0.9))))
-        judge = self.direct_judge(jev, budget_ms=60)
+        judge = self.direct_judge(jev, budget_ms=BUDGET_TEST_MS)
         self.assertEqual(judge.decide(self.request())["outcome"], "allow")
         release.set()
         judge.finish_late()
-        again = self.direct_judge(jev, budget_ms=60).decide(self.request())
+        again = self.direct_judge(jev, budget_ms=BUDGET_TEST_MS).decide(self.request())
         self.assertEqual((again["outcome"], again["judged"], again["cached"]), ("ask", True, True))
         self.assertEqual(jev.calls, 1)
 
@@ -11532,7 +11532,7 @@ class TestJudgeSocket(PolicyCase):
         release = threading.Event()
         self.addCleanup(release.set)
         self.server.handle = lambda text: release.wait(10) and sb.policy_reply("deny", "late")
-        self.configure([{"noul": LOW}], budget_ms=100)
+        self.configure([{"noul": LOW}], budget_ms=BUDGET_TEST_MS)
         started = time.monotonic()
         reply = self.judge_tool(self.coder, "shell", "x", "ask")
         self.assertLess(time.monotonic() - started, 4)
