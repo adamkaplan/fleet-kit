@@ -4450,7 +4450,8 @@ def boss_name(discovery, observation):
     """The registered name of the agent `observation` reports to (`resolve_boss` over its `reports_to`), or None. Every lookup of a
     boss as an AGENT goes through here (#102); `_boss_of` alone is the literal text, for display."""
     boss = _boss_of(observation)
-    return resolve_boss(discovery, boss) if boss is not None and discovery is not None else boss
+    boss = resolve_boss(discovery, boss) if boss is not None and discovery is not None else boss
+    return boss if boss != observation.name else None  # a chief of staff launched with reports_to chief-of-staff is not its own boss
 
 
 def decisions_from_reports(engine, now):
