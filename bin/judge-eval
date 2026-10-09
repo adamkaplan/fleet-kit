@@ -12,7 +12,7 @@ GitHub. This script refuses to write a rows, cache, context or misclassified fil
   judge-eval run rows.jsonl --experiment baseline [--stub | --offline-cache FILE] [--context context.json]
         [--concurrency 4] [--max-calls 200] [--max-cost USD] [--seed 1] [--limit N]
         [--misclassified OUT.jsonl] [--json]
-        Replay every row through the judge's own functions (policy_state, redact_command_text, judge_tool_call,
+        Replay every row through the judge's own functions (policy_state, redact_command_text,
         combine_policy; see docs/judge-eval.md for what is and is not shared with the live judge) and print
         the confusion matrix, precision/recall for allow, ask and deny, latency p50/p95, cost per call and a
         per-category breakdown. --offline-cache FILE answers from FILE when it has the request and records new

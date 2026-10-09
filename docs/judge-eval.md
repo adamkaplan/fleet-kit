@@ -7,10 +7,11 @@ breakdown. The label standard is `docs/judge-rubric.md`.
 
 **What is shared with the live judge, and what is not.** Shared, called directly from `bin/fleet-switchboard`: the four
 questions, `policy_state` (the state the model sees), `redact_command_text` (credentials are taken out of arguments and,
-for the session-context experiments, of the brief and turns), the model client, `judge_tool_call` and `combine_policy`
+for the session-context experiments, of the brief and turns), the model client (called directly, with the same questions) and `combine_policy`
 with the shipped default thresholds (and the no-ask rule that switches the intent and scope questions off). The routine
 pre-filters (a plain `send`, the repo-commissioning rule) are applied only when the experiment enables them. **Not
-shared:** the daemon and its socket, the verdict and context caches, identifying the agent from its session, resolving
+shared:** `judge_tool_call` (the harness asks the model itself and combines with `combine_policy`), the `routine_local` filter (the live judge's
+read/local-step shortcut, `routine_filter`), the charter-edit and orders-file guards, the daemon and its socket, the verdict and context caches, identifying the agent from its session, resolving
 the ask and the standing authority from GitHub (a row carries only the Intent and Done-when it was judged with; a row with
 no authority text is judged as "none stated"), and the budget. So the numbers measure the model and the questions, not
 the plumbing around them.
