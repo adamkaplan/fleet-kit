@@ -3750,3 +3750,15 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
   `--"` and `-"`. `.e?v` globs are already denied by the scanner. `gh pr review` is denied outright (comment with `gh pr comment`).
 - `curl` is denied for the Chief of Staff: use `gh api repos/...`.
 - Not solved by patterns: a quote inside free text can still hide an arbitrary flag spelling that has no guard; the guards cover the flags that matter.
+
+### Third review (#108 at eaad941): the backslash class
+
+OpenCode normalises `\` to `/` in the text the rules see; the shell then removes the backslash, so `--\admin` ran as `--admin`. A deny list cannot tell `a\b` from a
+path `a/b`. What was done instead:
+- `*-/*` is denied (every `--\flag` and `-\X`), plus every dangerous flag with every prefix followed by `/`, a quote or nothing (`--a/`, `--ad/`, ...).
+- Mid-word splices cannot be denied, so the shapes that carried names are positive lists: **no `cat|head|tail|wc|grep|git grep` in the shell** (the `read`, `grep` and
+  `glob` tools see the real path), and `gh api` only as `repos/*/*/issues[/*]`, `pulls[/*]`, `commits`. `az` has no `--query` (and capitalised secret spellings are denied).
+- Plain tokens only for every non-message command: `! # ( ) [ ] { } < > & ; | " '` are denied after the command (a `#` stays for `fleet-switchboard` refs). Message
+  commands (`send`, `report`, `remind`, `notice`, `intent`, `decisions answer|resolve|escalate|supersede --note`, `orders add`, `gh ... comment|close|edit`) keep quotes; `$` and backtick are denied everywhere.
+- Advisory, not changed: `decision_actor` treats an unidentifiable caller as "you"; the Chief of Staff cannot reach that through its permissions (env prefix, `env` and `--from` are denied or Lab-only).
+- The replay corpus now holds the splice class explicitly (backslash after the dash, mid-word, quote, concatenation, `$IFS`, brace, glob, in every allowed command shape).

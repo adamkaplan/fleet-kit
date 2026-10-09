@@ -8424,7 +8424,7 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 9800, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 10100, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8481,7 +8481,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
         self.assertLess(last_allow, first_guard)
         resources = [r["resource"] for r in shell]
-        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "az rest*", "az *secret*", "az *token*",
+        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "*-/*", "*--a/*", "*--/*", "az rest*", "az *secret*", "az *token*",
                       "fleet-switchboard handoff*", "fleet-switchboard decisions batch*"):
             self.assertIn(guard, resources)
 
@@ -8496,6 +8496,8 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         for resource in allows:
             if resource.startswith("az "):
                 self.assertRegex(resource, r"^az [a-z0-9-]+( [a-z0-9-]+)*( show| list| query| tail) \*$", resource)
+        self.assertFalse([a for a in allows if a.split()[0] in ("cat", "head", "tail", "wc", "grep")], "file reads go through the read tool, which sees the real path")
+        self.assertFalse([a for a in allows if a == "gh api repos/*"])
         self.assertFalse([a for a in allows if a.startswith(("curl", "gh pr review", "fleet-switchboard decisions --", "fleet-switchboard orders --"))])
         for wanted in ("fleet-switchboard decisions answer *", "fleet-switchboard decisions resolve *", "fleet-switchboard decisions escalate *",
                        "fleet-switchboard decisions supersede *", "fleet-switchboard orders add *", "fleet-switchboard orders remove *"):
