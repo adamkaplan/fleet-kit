@@ -8481,7 +8481,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
         self.assertLess(last_allow, first_guard)
         resources = [r["resource"] for r in shell]
-        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "*-/*", "*--a/*", "*--/*", "az rest*", "az *secret*", "az *token*",
+        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "*-/*", "gh * -q*", "gh * -t*", "gh api *--verbose*", "*--a/*", "*--/*", "az rest*", "az *secret*", "az *token*",
                       "fleet-switchboard handoff*", "fleet-switchboard decisions batch*"):
             self.assertIn(guard, resources)
 

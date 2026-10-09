@@ -571,9 +571,6 @@ permissions:
     resource: "gh api * -t*"
     effect: deny
   - action: shell
-    resource: "gh api * -i*"
-    effect: deny
-  - action: shell
     resource: "gh api * -p*"
     effect: deny
   - action: shell
@@ -3286,24 +3283,6 @@ permissions:
     resource: "*--debu/*"
     effect: deny
   - action: shell
-    resource: "*--j/*"
-    effect: deny
-  - action: shell
-    resource: "*--tem/*"
-    effect: deny
-  - action: shell
-    resource: "*--temp/*"
-    effect: deny
-  - action: shell
-    resource: "*--templ/*"
-    effect: deny
-  - action: shell
-    resource: "*--templa/*"
-    effect: deny
-  - action: shell
-    resource: "*--templat/*"
-    effect: deny
-  - action: shell
     resource: "*--m/*"
     effect: deny
   - action: shell
@@ -3317,12 +3296,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "*--metho/*"
-    effect: deny
-  - action: shell
-    resource: "*--i/*"
-    effect: deny
-  - action: shell
-    resource: "*--in/*"
     effect: deny
   - action: shell
     resource: "*--inp/*"
@@ -3520,12 +3493,6 @@ permissions:
     resource: "*--ext-dif/*"
     effect: deny
   - action: shell
-    resource: "*--t/*"
-    effect: deny
-  - action: shell
-    resource: "*--te/*"
-    effect: deny
-  - action: shell
     resource: "*--tex/*"
     effect: deny
   - action: shell
@@ -3539,9 +3506,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "*--textcon/*"
-    effect: deny
-  - action: shell
-    resource: "*--o/*"
     effect: deny
   - action: shell
     resource: "*--op/*"
@@ -3593,12 +3557,6 @@ permissions:
     effect: deny
   - action: shell
     resource: "*--open-files-in-page/*"
-    effect: deny
-  - action: shell
-    resource: "*--/*"
-    effect: deny
-  - action: shell
-    resource: "*--p/*"
     effect: deny
   - action: shell
     resource: "*--pa/*"
@@ -4712,6 +4670,171 @@ permissions:
     effect: deny
   - action: shell
     resource: "fleet-switchboard orders remove *'*"
+    effect: deny
+  - action: shell
+    resource: "gh * -q*"
+    effect: deny
+  - action: shell
+    resource: "gh * -?q*"
+    effect: deny
+  - action: shell
+    resource: "gh * --q*"
+    effect: deny
+  - action: shell
+    resource: "gh * -t*"
+    effect: deny
+  - action: shell
+    resource: "gh api *--verbose*"
+    effect: deny
+  - action: shell
+    resource: "gh api *--include*"
+    effect: deny
+  - action: shell
+    resource: "gh api *--preview*"
+    effect: deny
+  - action: shell
+    resource: "gh api *--cache*"
+    effect: deny
+  - action: shell
+    resource: "gh api *--slurp*"
+    effect: deny
+  - action: shell
+    resource: "gh api * -i*"
+    effect: deny
+  - action: shell
+    resource: "git * -O*"
+    effect: deny
+  - action: shell
+    resource: "git *--orderfile*"
+    effect: deny
+  - action: shell
+    resource: "*--v/*"
+    effect: deny
+  - action: shell
+    resource: "*--ve/*"
+    effect: deny
+  - action: shell
+    resource: "*--ver/*"
+    effect: deny
+  - action: shell
+    resource: "*--verb/*"
+    effect: deny
+  - action: shell
+    resource: "*--verbo/*"
+    effect: deny
+  - action: shell
+    resource: "*--verbos/*"
+    effect: deny
+  - action: shell
+    resource: "*--i/*"
+    effect: deny
+  - action: shell
+    resource: "*--in/*"
+    effect: deny
+  - action: shell
+    resource: "*--inc/*"
+    effect: deny
+  - action: shell
+    resource: "*--incl/*"
+    effect: deny
+  - action: shell
+    resource: "*--inclu/*"
+    effect: deny
+  - action: shell
+    resource: "*--includ/*"
+    effect: deny
+  - action: shell
+    resource: "*--p/*"
+    effect: deny
+  - action: shell
+    resource: "*--pr/*"
+    effect: deny
+  - action: shell
+    resource: "*--pre/*"
+    effect: deny
+  - action: shell
+    resource: "*--prev/*"
+    effect: deny
+  - action: shell
+    resource: "*--previ/*"
+    effect: deny
+  - action: shell
+    resource: "*--previe/*"
+    effect: deny
+  - action: shell
+    resource: "*--c/*"
+    effect: deny
+  - action: shell
+    resource: "*--ca/*"
+    effect: deny
+  - action: shell
+    resource: "*--cac/*"
+    effect: deny
+  - action: shell
+    resource: "*--cach/*"
+    effect: deny
+  - action: shell
+    resource: "*--s/*"
+    effect: deny
+  - action: shell
+    resource: "*--sl/*"
+    effect: deny
+  - action: shell
+    resource: "*--slu/*"
+    effect: deny
+  - action: shell
+    resource: "*--slur/*"
+    effect: deny
+  - action: shell
+    resource: "*--o/*"
+    effect: deny
+  - action: shell
+    resource: "*--or/*"
+    effect: deny
+  - action: shell
+    resource: "*--ord/*"
+    effect: deny
+  - action: shell
+    resource: "*--orde/*"
+    effect: deny
+  - action: shell
+    resource: "*--order/*"
+    effect: deny
+  - action: shell
+    resource: "*--orderf/*"
+    effect: deny
+  - action: shell
+    resource: "*--orderfi/*"
+    effect: deny
+  - action: shell
+    resource: "*--orderfil/*"
+    effect: deny
+  - action: shell
+    resource: "*--j/*"
+    effect: deny
+  - action: shell
+    resource: "*--/*"
+    effect: deny
+  - action: shell
+    resource: "*--t/*"
+    effect: deny
+  - action: shell
+    resource: "*--te/*"
+    effect: deny
+  - action: shell
+    resource: "*--tem/*"
+    effect: deny
+  - action: shell
+    resource: "*--temp/*"
+    effect: deny
+  - action: shell
+    resource: "*--templ/*"
+    effect: deny
+  - action: shell
+    resource: "*--templa/*"
+    effect: deny
+  - action: shell
+    resource: "*--templat/*"
     effect: deny
   - action: edit
     resource: "*"

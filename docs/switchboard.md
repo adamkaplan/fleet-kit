@@ -3762,3 +3762,9 @@ path `a/b`. What was done instead:
   commands (`send`, `report`, `remind`, `notice`, `intent`, `decisions answer|resolve|escalate|supersede --note`, `orders add`, `gh ... comment|close|edit`) keep quotes; `$` and backtick are denied everywhere.
 - Advisory, not changed: `decision_actor` treats an unidentifiable caller as "you"; the Chief of Staff cannot reach that through its permissions (env prefix, `env` and `--from` are denied or Lab-only).
 - The replay corpus now holds the splice class explicitly (backslash after the dash, mid-word, quote, concatenation, `$IFS`, brace, glob, in every allowed command shape).
+
+### Fourth review (#108 at 5308be7)
+
+`gh ... -q env` printed the process environment (gh's jq has `env`). The short `-q` and `-t` (and `gh * --q*`, and a `-?q` cluster such as `-sq`) are denied for every `gh` shape, with the
+`-\q` splice already covered by `*-/*`. Also denied: `gh api --verbose|--include|--preview|--cache|--slurp|-i`, `git --orderfile|-O`. Left as documented residuals: patch content of committed
+secrets, the `read`/`grep`/`glob` tools' resource (the shell replay cannot exercise them), the `decision_actor` fail-open (advisory; unreachable from the Chief of Staff's permissions).
