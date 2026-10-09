@@ -10547,14 +10547,10 @@ class TestRoutineLocal(unittest.TestCase):
         "node --test tests/a.test.mjs", "python3 bin/test-switchboard TestX.test_y", "fleet-switchboard report done --issue 9 'built it'",
         "fleet-switchboard report working 'still on it'", "fleet-switchboard report done 'a' 'b'",
         # round 2: the fleet's own messaging, and gh reads
-        "fleet-switchboard send venue-ops --issue acme/api#2 'the answer is in'", "fleet-switchboard send coder-a hello there", "fleet-switchboard send coder-a 'two\nlines'",
-        "timeout 60 fleet-switchboard send venue-ops --issue acme/api#2 'x'", "fleet-switchboard report working --issue acme/api#2678 'x'",
-        "fleet-switchboard remind coder-a 15m 'look at it'", "fleet-switchboard remind coder-a 2026-10-09T10:00:00Z 'x' --issue 5", "fleet-switchboard notice pr acme/api#7 'ready'",
         "fleet-switchboard notice pr acme/api#7", "fleet-switchboard notice pr https://github.com/acme/api/pull/7 'x'", "fleet-switchboard intent 87", "fleet-switchboard intent acme/api#87",
         "fleet-switchboard orders list --charter 5", "fleet-switchboard orders list --charter 5 --json", "fleet-switchboard orders --cos", "fleet-switchboard decisions", "fleet-switchboard decisions list",
         "gh pr view 94", "gh pr view 94 --repo acme/api --json state,title,mergeable", "gh pr list --repo acme/api --state open --limit 30", "gh pr checks 3 --repo acme/api",
         "gh pr diff 3 --name-only", "gh issue view 9 --comments", "gh issue list --repo acme/api --label wip --state all", "gh api 'repos/acme/api/pulls?state=open&per_page=50'",
-        "gh api repos/acme/api/issues/3/comments", "gh api repos/acme/api/pulls/3/files --paginate", "timeout 40 gh api repos/acme/api/issues --jq '.[].number'",
     ]
     # every bypass the review of PR #90 named, and more
     NOT_ROUTINE = [

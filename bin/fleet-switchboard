@@ -9442,17 +9442,14 @@ def _routine_text_after(rest, issue_flag=True):
 
 
 def _routine_fleet(rest):
-    """The fleet's OWN messaging and reads, and nothing that acts for the owner: send, report, notice pr, remind, intent,
-    orders list, decisions list. Never decisions answer/resolve/escalate/supersede/batch, orders add/remove, launch, handoff."""
+    """What the fleet says UP to its boss, and its plain reads: report, notice pr, intent, orders list, decisions list. NOT send or remind
+    (they reach other agents, so free text in them is the model's to read), and never decisions answer/resolve/escalate/supersede/batch,
+    orders add/remove, launch, handoff."""
     if not rest:
         return False
     action, args = rest[0], rest[1:]
-    if action == "send":
-        return len(args) >= 2 and bool(_ROUTINE_NAME_WORD.match(args[0])) and _routine_text_after(args[1:])[0]
     if action == "report":
         return len(args) >= 2 and args[0] in _ROUTINE_REPORT_STATES and _routine_text_after(args[1:])[0]
-    if action == "remind":
-        return len(args) >= 3 and bool(_ROUTINE_NAME_WORD.match(args[0])) and bool(_ROUTINE_WHEN.match(args[1])) and _routine_text_after(args[2:])[0]
     if action == "notice":
         return len(args) >= 2 and args[0] == "pr" and bool(_ROUTINE_PR_REF.match(args[1])) and (len(args) == 2 or _routine_text_after(args[2:], issue_flag=False)[0])
     if action == "intent":
@@ -9470,9 +9467,8 @@ def _routine_fleet(rest):
 _ROUTINE_GH_READ = {"pr": ("view", "list", "checks", "diff"), "issue": ("view", "list")}
 _ROUTINE_GH_FLAG_VALUE = {"--repo": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"), "-R": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"),
                           "--json": re.compile(r"^[A-Za-z][A-Za-z,]{0,300}$"), "--state": re.compile(r"^(?:open|closed|merged|all)$"),
-                          "--limit": _ROUTINE_NUMBER, "-L": _ROUTINE_NUMBER, "--jq": re.compile(r"^[^\n]{1,400}$"), "-q": re.compile(r"^[^\n]{1,400}$"),
-                          "--label": re.compile(r"^[A-Za-z0-9._:-]{1,60}$"), "--author": re.compile(r"^(?:@me|[A-Za-z0-9-]{1,39})$"),
-                          "--search": re.compile(r"^[A-Za-z0-9 _.:/@#<>=-]{1,200}$")}
+                          "--limit": _ROUTINE_NUMBER, "-L": _ROUTINE_NUMBER,
+                          "--label": re.compile(r"^[A-Za-z0-9._:-]{1,60}$"), "--author": re.compile(r"^(?:@me|[A-Za-z0-9-]{1,39})$")}
 _ROUTINE_GH_BARE_FLAGS = frozenset("--comments --name-only --patch --stat".split())
 _ROUTINE_GH_API_PATH = re.compile(r"^repos/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(?:issues(?:/comment[s]|/[1-9][0-9]{0,8}(?:/comment[s])?)?|pulls(?:/comment[s]|/[1-9][0-9]{0,8}(?:/(?:comment[s]|reviews|files|commits))?)?|comment[s])(?:\?[A-Za-z0-9_=&.%+:-]{0,200})?$")
 
@@ -9495,14 +9491,7 @@ def _routine_gh(rest):
             i += 1
         return True
     if rest[:1] == ["api"] and len(rest) >= 2 and _ROUTINE_GH_API_PATH.match(rest[1]):
-        i = 2
-        while i < len(rest):
-            if rest[i] in ("--jq", "-q") and i + 1 < len(rest) and _ROUTINE_GH_FLAG_VALUE["--jq"].match(rest[i + 1]):
-                i += 1
-            elif rest[i] != "--paginate":
-                return False  # any other flag (a method, a field, an input, a header, a host) is not a plain read
-            i += 1
-        return True
+        return all(w == "--paginate" for w in rest[2:])  # no --jq/-q (it can read the environment), and no other flag
     return False
 
 

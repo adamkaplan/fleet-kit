@@ -927,13 +927,14 @@ than the model alone (the configured outcome is combined as before and a configu
   model call, for ONE simple shell command on a strict allowlist that fails closed: a read or a local reversible step inside the worktree.
   The command word and EVERY flag must be listed for it: `git` `status`, `diff`, `log`, `show`, `rev-parse`, `grep`, `add` and `commit -m` with a
   short set of safe flags; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `pwd`, `uptime`, `sleep N`; `node --test <paths>` and `python3 bin/test-*`
-  (the agent's own tests). Round 2 adds the fleet's OWN messaging and plain reads, still one simple command with exact flags:
-  `fleet-switchboard` `send`, `report`, `remind`, `notice pr`, `intent`, `orders list --charter N`, `decisions [list]` (a message may span lines inside its
-  quotes, and may sit under `timeout N`), and `gh` reads only: `pr view|list|checks|diff`, `issue view|list`, and a GET of
-  `repos/<o>/<r>/issues|pulls|comments` paths with `--jq`/`--paginate` only. **Never routine:** `decisions answer|resolve|escalate|supersede|batch`, `orders add|remove`,
+  (the agent's own tests). Round 2 adds what the fleet says UP to its boss and its plain reads, still one simple command with exact flags:
+  `fleet-switchboard` `report`, `notice pr`, `intent`, `orders list --charter N`, `decisions [list]` (a message may span lines inside its
+  quotes, and may sit under `timeout N`), and `gh` reads only, with a fixed list of flags (no `--jq`, `-q`, `--template` or `--search`, which can read the
+  environment or run a query): `pr view|list|checks|diff`, `issue view|list`, and a GET of `repos/<o>/<r>/issues|pulls|comments` paths with `--paginate` only.
+  `send` and `remind` are NOT routine: they reach other agents, and free text cannot be made safe by a word list. **Never routine:** `decisions answer|resolve|escalate|supersede|batch`, `orders add|remove`,
   `launch`, `handoff`, `gh pr merge|review|close|edit|create|comment`, `gh issue close|edit|comment|create`, `gh repo`, `gh auth`, `gh api` with any
-  method, field, input, header or host flag, and a message that mentions deploying, merging, publishing, approving, spending, deleting or credentials
-  (it may itself be the authorisation: the model reads it). The charter's standing orders reach the judge's `speaks_for_you` and `hard_to_reverse`
+  method, field, input, header or host flag, and a `report` or `notice` that mentions deploying, merging, publishing, approving, spending, deleting or credentials
+  (a best-effort stop, not a proof: the model reads it). The charter's standing orders reach the judge's `speaks_for_you` and `hard_to_reverse`
   questions as context (clipped to 1200 characters, was 600, so an order near the end of a long charter is no longer cut off) and never
   cause a configured ask or deny to be skipped. An unknown flag, an environment prefix
   (`GIT_SSH_COMMAND=`, `LD_PRELOAD=`), a wrapper, any redirect, pipe, chain, substitution, glob or heredoc, a path that is absolute, home,
