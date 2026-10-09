@@ -4606,7 +4606,8 @@ PR_NOTICES = "pr-notices.json"
 PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
-PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read this long is dropped (was 7 days: a mistyped number lingered)
+PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
+PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
 PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
@@ -4712,6 +4713,8 @@ def record_pr_notice(state_dir, repo, number, sender, note, now, boss=None):
             item["boss"] = boss
         if old and old.get("unreadable_since") is not None:
             item["unreadable_since"] = old["unreadable_since"]
+            if old.get("unreadable_for") is not None:
+                item["unreadable_for"] = old["unreadable_for"]
         write_pr_notices(state_dir, [i for i in items if i is not old] + [item])
     return item, old is not None
 
@@ -4720,7 +4723,7 @@ def apply_notice_effects(engine):
     """The daemon's end of a pass: forget the notices whose PR is merged, closed or unreadable for good, and note
     when a PR became unreadable (or readable again). Writes only on a change; a failure is tried again next pass."""
     effects = engine.notice_effects
-    if engine.state_dir is None or engine.audit is None or not (effects["drop"] or effects["unreadable"]):
+    if engine.state_dir is None or engine.audit is None or not (effects["drop"] or effects["unreadable"] or effects.get("observed")):
         return False
     try:
         with pr_notices_lock(engine.state_dir):
@@ -4734,8 +4737,15 @@ def apply_notice_effects(engine):
                     item = dict(item)
                     if effects["unreadable"][key] is None:
                         item.pop("unreadable_since", None)
+                        item.pop("unreadable_for", None)
                     else:
                         item["unreadable_since"] = effects["unreadable"][key]
+                if key in effects["observed"]:
+                    item = dict(item)
+                    if effects["observed"][key] is None:
+                        item.pop("unreadable_for", None)
+                    else:
+                        item["unreadable_for"] = effects["observed"][key]
                 kept.append(item)
             if kept != items:
                 write_pr_notices(engine.state_dir, kept)
@@ -4956,7 +4966,7 @@ def decisions_from_notices(engine, now):
     Not a decision, so not counted with them. The facts come from `gh pr view`, cached; a PR that is merged or
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
-    engine.notice_effects = {"drop": set(), "unreadable": {}}
+    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -4967,7 +4977,7 @@ def decisions_from_notices(engine, now):
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
     names = [r.split("/")[-1] for r in decision_repos(engine)] + [i["repo"].split("/")[-1] for i in items]
-    entries = []
+    entries, bad, any_ok = [], {}, False
     budget = [PR_NOTICE_PASS_BUDGET]
     order = lambda i: (i["created"], i["repo"], i["number"])
     # the least recently read go first, so a PR that hangs cannot starve the others of the budget
@@ -4984,15 +4994,14 @@ def decisions_from_notices(engine, now):
         if held.get("skipped"):
             pass  # not read this pass: neither readable nor unreadable, so the unreadable clock is left alone
         elif held["stale"]:
+            bad[key] = (item, held)
             if since is None:
                 engine.notice_effects["unreadable"][key] = iso(now)
-            elif now - (parse_iso(since) or now) >= PR_NOTICE_UNREADABLE_SECONDS:
-                engine.notice_effects["drop"].add(key)
-                engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
-                                                     "error": held["error"]})
-                continue
-        elif since is not None:
-            engine.notice_effects["unreadable"][key] = None
+        else:
+            any_ok = True
+            if since is not None:
+                engine.notice_effects["unreadable"][key] = None
+                engine.notice_effects["observed"][key] = None
         name = repo.split("/")[-1]
         tag = repo if names.count(name) > 1 else name
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
@@ -5008,8 +5017,32 @@ def decisions_from_notices(engine, now):
             entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
-        entries.append((order(item), entry))
-    return [entry for _, entry in sorted(entries, key=lambda pair: pair[0])], []
+        entries.append((order(item), entry, key))
+    # The drop counts only time the daemon OBSERVED: seconds between passes of this process in which `gh` demonstrably worked (some
+    # notice read fine), added for the notices that still cannot be read. A pass where every read fails is an outage (gh, auth, the
+    # network), not a bad notice: nobody counts and nobody drops. A new process starts every count again, so downtime is not counted.
+    obs = getattr(engine, "notice_obs", None)
+    fresh_process = obs is None
+    if fresh_process:
+        obs = engine.notice_obs = {"last": None}
+    gap = min(PR_NOTICE_OBSERVE_MAX, max(0, now - obs["last"])) if (any_ok and obs["last"] is not None) else 0
+    obs["last"] = now if any_ok else None
+    dropped = set()
+    for key, (item, held) in bad.items():
+        if fresh_process:
+            engine.notice_effects["unreadable"][key] = iso(now)
+            engine.notice_effects["observed"][key] = 0
+            continue
+        if not any_ok:
+            continue
+        seconds = (item.get("unreadable_for") or 0) + gap
+        engine.notice_effects["observed"][key] = seconds
+        if seconds >= PR_NOTICE_UNREADABLE_SECONDS:
+            engine.notice_effects["drop"].add(key)
+            engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes of observed time" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
+                                                 "error": held["error"]})
+            dropped.add(key)
+    return [entry for _, entry, key in sorted(entries, key=lambda row: row[0]) if key not in dropped], []
 
 
 

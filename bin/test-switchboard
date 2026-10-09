@@ -23258,22 +23258,86 @@ class TestPrNotices(DecisionsBase):
         self.pass_(5)
         self.assertEqual([i["number"] for i in sb.read_pr_notices(self.world.state)], [7])
 
-    def test_a_pr_unreadable_for_an_hour_is_dropped_and_logged_but_not_before(self):  # seven days until issue 99
-        self.gh.answers[7] = (1, "", "HTTP 404")
+    def test_a_pr_unreadable_for_an_observed_hour_is_dropped_and_logged_but_not_before(self):  # seven days until issue 99
+        self.gh.answers.update({7: (1, "", "HTTP 404"), 8: (0, pr_view_json(), "")})   # one notice fails, another reads fine: gh works
         self.notify()
-        self.pass_(5)
-        (item,) = sb.read_pr_notices(self.world.state)
+        self.notify(number=8)
+        self.pass_(5)   # the first pass of this process starts the count
+        (item,) = [i for i in sb.read_pr_notices(self.world.state) if i["number"] == 7]
         self.assertEqual(item["unreadable_since"], sb.iso(self.world.clock.now()))
         self.assertEqual(sb.PR_NOTICE_UNREADABLE_SECONDS, 3600)
-        self.pass_(3500)
-        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1)
+        for _ in range(5):   # five passes of ten minutes
+            self.pass_(600)
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        self.assertEqual(len([d for d in self.file()["decisions"] if d["kind"] == "notice"]), 2)
+        self.pass_(600)
+        self.pass_(10)
+        self.assertEqual([i["number"] for i in sb.read_pr_notices(self.world.state)], [8], "the good notice stays")
         self.assertEqual(len([d for d in self.file()["decisions"] if d["kind"] == "notice"]), 1)
-        self.pass_(110)
-        self.assertEqual(sb.read_pr_notices(self.world.state), [])
-        self.assertEqual([d for d in self.file()["decisions"] if d["kind"] == "notice"], [])
         (dropped,) = [e for e in self.world.audit() if e["event"] == "notice.dropped"]
         self.assertEqual(dropped["subject"], "acme/api#7")
-        self.assertIn("60 minutes", dropped["detail"]["reason"])
+        self.assertIn("60 minutes of observed time", dropped["detail"]["reason"])
+
+    def test_an_outage_where_every_read_fails_drops_nothing_however_long_it_lasts(self):
+        self.gh.answers[7] = (1, "", "HTTP 502")
+        self.gh.answers[8] = (1, "", "HTTP 502")
+        self.notify()
+        self.notify(number=8)
+        for _ in range(13):   # two hours and more of passes, every read failing
+            self.pass_(600)
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "notice.dropped"], [])
+        # gh works again: both read fine, nothing is dropped, and the clocks clear
+        self.gh.answers[7] = (0, pr_view_json(), "")
+        self.gh.answers[8] = (0, pr_view_json(), "")
+        self.pass_(600)
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        self.assertTrue(all("unreadable_since" not in i and "unreadable_for" not in i for i in sb.read_pr_notices(self.world.state)))
+
+    def test_an_outage_does_not_count_toward_the_hour_of_a_notice_that_fails_for_good(self):
+        self.gh.answers.update({7: (1, "", "HTTP 404"), 8: (0, pr_view_json(), "")})
+        self.notify()
+        self.notify(number=8)
+        self.pass_(5)
+        for _ in range(3):
+            self.pass_(600)            # 30 observed minutes
+        self.gh.answers[8] = (1, "", "HTTP 502")
+        for _ in range(12):
+            self.pass_(600)            # two hours with nothing readable: an outage, not counted
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        self.gh.answers[8] = (0, pr_view_json(), "")
+        self.pass_(600)                # 40 observed minutes now
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        for _ in range(3):
+            self.pass_(600)
+        self.assertEqual([i["number"] for i in sb.read_pr_notices(self.world.state)], [8])
+
+    def test_a_daemon_restart_starts_the_count_again(self):
+        self.gh.answers.update({7: (1, "", "HTTP 404"), 8: (0, pr_view_json(), "")})
+        self.notify()
+        self.notify(number=8)
+        self.pass_(5)
+        for _ in range(5):
+            self.pass_(600)            # 50 observed minutes
+        (item,) = [i for i in sb.read_pr_notices(self.world.state) if i["number"] == 7]
+        self.assertGreaterEqual(item["unreadable_for"], 3000)
+        del self.world.engine.notice_obs   # a new process has seen nothing yet
+        self.pass_(600)
+        (item,) = [i for i in sb.read_pr_notices(self.world.state) if i["number"] == 7]
+        self.assertEqual(item["unreadable_for"], 0)
+        self.assertEqual(item["unreadable_since"], sb.iso(self.world.clock.now()))
+        self.pass_(600)
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2, "ten minutes after the restart, not an hour")
+
+    def test_one_long_gap_between_passes_counts_for_at_most_ten_minutes(self):
+        self.gh.answers.update({7: (1, "", "HTTP 404"), 8: (0, pr_view_json(), "")})
+        self.notify()
+        self.notify(number=8)
+        self.pass_(5)
+        self.pass_(7200)               # a suspended machine: two hours between passes
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 2)
+        (item,) = [i for i in sb.read_pr_notices(self.world.state) if i["number"] == 7]
+        self.assertEqual(item["unreadable_for"], sb.PR_NOTICE_OBSERVE_MAX)
 
     def test_a_pr_that_becomes_readable_again_clears_its_unreadable_clock(self):
         self.gh.answers[7] = (1, "", "HTTP 502")
