@@ -23278,6 +23278,29 @@ class TestPrNotices(DecisionsBase):
         self.assertEqual(dropped["subject"], "acme/api#7")
         self.assertIn("60 minutes of observed time", dropped["detail"]["reason"])
 
+    def test_a_lone_notice_that_gh_says_is_not_found_drops_after_an_observed_hour(self):
+        for answer in ((1, "", "GraphQL: Could not resolve to a PullRequest with the number of 7."), (1, "", "no pull requests found for 7"), (1, "", "HTTP 404: Not Found")):
+            self.setUp()
+            self.gh.answers[7] = answer
+            self.notify()
+            self.pass_(5)
+            for _ in range(5):
+                self.pass_(600)
+            self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1, answer)
+            self.pass_(600)
+            self.assertEqual(sb.read_pr_notices(self.world.state), [], answer)
+            self.assertEqual(len([e for e in self.world.audit() if e["event"] == "notice.dropped"]), 1)
+
+    def test_a_lone_notice_with_network_or_auth_errors_never_drops(self):
+        for error in ("HTTP 502 Bad Gateway", "gh: authentication required", "dial tcp: i/o timeout", "HTTP 401: Bad credentials", "HTTP 403"):
+            self.setUp()
+            self.gh.answers[7] = (1, "", error)
+            self.notify()
+            for _ in range(13):   # two hours
+                self.pass_(600)
+            self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1, error)
+            self.assertEqual([e for e in self.world.audit() if e["event"] == "notice.dropped"], [], error)
+
     def test_an_outage_where_every_read_fails_drops_nothing_however_long_it_lasts(self):
         self.gh.answers[7] = (1, "", "HTTP 502")
         self.gh.answers[8] = (1, "", "HTTP 502")
@@ -23295,7 +23318,7 @@ class TestPrNotices(DecisionsBase):
         self.assertTrue(all("unreadable_since" not in i and "unreadable_for" not in i for i in sb.read_pr_notices(self.world.state)))
 
     def test_an_outage_does_not_count_toward_the_hour_of_a_notice_that_fails_for_good(self):
-        self.gh.answers.update({7: (1, "", "HTTP 404"), 8: (0, pr_view_json(), "")})
+        self.gh.answers.update({7: (1, "", "gh: unexpected failure"), 8: (0, pr_view_json(), "")})  # not a "no such PR" answer
         self.notify()
         self.notify(number=8)
         self.pass_(5)

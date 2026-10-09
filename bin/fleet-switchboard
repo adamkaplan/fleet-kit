@@ -4939,7 +4939,8 @@ def notice_facts(engine, repo, number, now, budget=None):
     try:
         held = {"at": now, "facts": read_pr_facts(engine, repo, number), "stale": False, "error": None}
     except NoticeError as err:
-        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200)}
+        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200),
+                "not_found": isinstance(err, NoticeNotFound)}  # gh ANSWERED that there is no such PR: it worked
     if budget is not None:
         budget[0] -= max(0, engine.now() - started)
     engine.notice_facts[key] = held
@@ -4995,6 +4996,8 @@ def decisions_from_notices(engine, now):
             pass  # not read this pass: neither readable nor unreadable, so the unreadable clock is left alone
         elif held["stale"]:
             bad[key] = (item, held)
+            if held.get("not_found"):
+                any_ok = True  # a clear "no such PR" is an answer: gh and the auth work, so this pass counts toward the hour (an auth or network error does not)
             if since is None:
                 engine.notice_effects["unreadable"][key] = iso(now)
         else:
