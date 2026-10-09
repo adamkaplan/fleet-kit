@@ -927,7 +927,15 @@ than the model alone (the configured outcome is combined as before and a configu
   model call, for ONE simple shell command on a strict allowlist that fails closed: a read or a local reversible step inside the worktree.
   The command word and EVERY flag must be listed for it: `git` `status`, `diff`, `log`, `show`, `rev-parse`, `grep`, `add` and `commit -m` with a
   short set of safe flags; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `pwd`, `uptime`, `sleep N`; `node --test <paths>` and `python3 bin/test-*`
-  (the agent's own tests); `fleet-switchboard report <state> [--issue N] "<line>"`. An unknown flag, an environment prefix
+  (the agent's own tests). Round 2 adds the fleet's OWN messaging and plain reads, still one simple command with exact flags:
+  `fleet-switchboard` `send`, `report`, `remind`, `notice pr`, `intent`, `orders list --charter N`, `decisions [list]` (a message may span lines inside its
+  quotes, and may sit under `timeout N`), and `gh` reads only: `pr view|list|checks|diff`, `issue view|list`, and a GET of
+  `repos/<o>/<r>/issues|pulls|comments` paths with `--jq`/`--paginate` only. **Never routine:** `decisions answer|resolve|escalate|supersede|batch`, `orders add|remove`,
+  `launch`, `handoff`, `gh pr merge|review|close|edit|create|comment`, `gh issue close|edit|comment|create`, `gh repo`, `gh auth`, `gh api` with any
+  method, field, input, header or host flag, and a message that mentions deploying, merging, publishing, approving, spending, deleting or credentials
+  (it may itself be the authorisation: the model reads it). The charter's standing orders reach the judge's `speaks_for_you` and `hard_to_reverse`
+  questions as context (clipped to 1200 characters, was 600, so an order near the end of a long charter is no longer cut off) and never
+  cause a configured ask or deny to be skipped. An unknown flag, an environment prefix
   (`GIT_SSH_COMMAND=`, `LD_PRELOAD=`), a wrapper, any redirect, pipe, chain, substitution, glob or heredoc, a path that is absolute, home,
   has `..`, names a dotfile (`.git/config`, `.env`) or looks like a credential, and every `sed`, `sort`, `rg`, `find`, `gh`, `cp`, `mv`, `rm`,
   `curl`, shell or script go to the model as before. Such a call is audited with `model: null`. A symlink inside the worktree that points
