@@ -1075,7 +1075,6 @@ Done when, the worker's role and its last reply.
 |---|---|---|
 | Nudge | probability at or above `report_triage.owed_threshold` (0.5), and no nudge yet for this assigning input | One wake for the worker: "You stopped without telling the boss. If your work is done, failed, blocked or needs a decision, run: fleet-switchboard report <state> \"one line\". If nothing changed since your last report, say nothing." The key `nudge:<session>:<assigning message id>` makes it once; a key found in the worker's transcript means it was sent |
 | Silent | probability below the threshold | The idle stays a rider |
-| Quiet | a nudge was already sent, the worker stopped again, ended cleanly (`succeeded`) and has sent the boss a report or message in the last 24 hours (`QUIET_REPORT_HOURS`) | Nothing for the boss: the audit's `report.triage` says `quiet` and why; the idle stays a rider. A worker that did not end cleanly, or has not reported lately, is still told to the boss (next row) |
 | Tell the boss | a nudge was already sent and the worker stopped again without reporting, or the model failed, timed out (`report_triage.budget_seconds`, 3) or is not configured, or the boss cannot be read | One `worker.stopped` fact for the boss (not a rider), replacing the idle: "<worker> stopped without reporting (<outcome>): <last reply>" |
 
 A stop older than `rider_max_age_seconds` is not triaged, a read-only
@@ -2176,10 +2175,11 @@ or merged) or `--until-merged OWNER/REPO#N` (a pull request merged) stores a con
 switchboard reads that state once, and when it holds the reminder is dropped unsent and audited (`reminder.drop`, with
 the reason). A state that cannot be read now leaves the reminder to deliver.
 
-**Quiet wakes (Chief of Staff).** Worker lines that carry no news cost the person no message: a clean repeat stop of a
-worker that reported lately is only audited (see the `Quiet` row above), and when other news is in the same wake every
-remaining `worker.idle` line is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
-still carried. A `worker.stopped` that does reach a boss still means the worker did not report or did not end cleanly.
+**Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
+ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
+still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
+report since the worker's latest assignment is only a rider (it never wakes); a report from before the assignment does
+not count, so a worker that stopped twice without reporting its new work is still told to the boss.
 
 **Checkpoint reminders.** `fleet-switchboard launch` sets two reminders when the worker is up:
 

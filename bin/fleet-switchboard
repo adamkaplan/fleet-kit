@@ -1344,7 +1344,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
         lead = next((fact for fact in facts if not fact.rider), facts[0])
         head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(lead.summary, 200))
         taken = facts[:count]
-        idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider]
+        idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:
             idle = []  # nothing but idle riders: there is no news to fold them under
@@ -3755,6 +3755,7 @@ class WorkerFacts:
         reply = self.last_reply(observation.session_id, idle_ms)
         idle = Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
                     issue=_issue_of(observation.fleet), sender=observation.name, rider=not fault("idle-wakes"))
+        idle.clean = observation.outcome in QUIET_OUTCOMES  # only a clean finish may be folded into a quiet line
         return self.stop_facts(observation, boss, idle_ms, idle, reply)
 
     def stop_facts(self, observation, boss, idle_ms, idle, reply):
@@ -3930,22 +3931,12 @@ def report_jev(engine, settings):
     return build_jev(dict(engine.config, jev=capped))
 
 
-QUIET_OUTCOMES = ("succeeded", "success")  # a stop that ended cleanly
-QUIET_REPORT_HOURS = 24  # a clean second stop after a nudge is no news when the worker reported this recently
-
-
-def reported_lately(engine, boss_view, observation, at):
-    """True when a report or send from the worker reached this boss in the QUIET_REPORT_HOURS before `at`, and the
-    read of the boss's transcript went that far back."""
-    keys, complete = engine.delivered_keys(boss_view.session_id, at - QUIET_REPORT_HOURS * 3600)
-    prefixes = ("%s:%s:" % (REPORT, observation.name), "send:%s:" % observation.name)
-    return bool(complete and any(key.startswith(prefixes) for key in keys))
+QUIET_OUTCOMES = ("succeeded", "success")  # a stop that ended cleanly: only its idle line may be folded
 
 
 def triage_stop(engine, source, observation, boss, idle_ms, reply):
     """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
-    {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "quiet"} / {"outcome": "stopped"}.
-    `quiet` is a clean second stop of a worker that reported lately: audited, not a wake. Audited once."""
+    {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
     now = engine.now()
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
@@ -3983,12 +3974,6 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
             return None  # this is the stop the nudge answered, not a second one
         verdict = {"outcome": "stopped", "reason": "nudged already for this assignment and stopped again "
                                                    "without reporting"}
-        if (observation.outcome in QUIET_OUTCOMES
-                and reported_lately(engine, boss_view, observation, observation.idle_at)):
-            # nothing new: it ended cleanly, was nudged, and has told this boss within the window. Audited below,
-            # never a wake. A worker that did not end cleanly, or never reported, is still told to the boss.
-            verdict = {"outcome": "quiet", "reason": "nudged already and stopped again, but it ended cleanly and "
-                       "reported to %s within %d hours: nothing new" % (boss, QUIET_REPORT_HOURS)}
     else:
         verdict = ask_report_owed(engine, observation, boss, reply, audit)
         if verdict["outcome"] == "nudge":

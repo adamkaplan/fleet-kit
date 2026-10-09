@@ -14032,44 +14032,54 @@ class TestUnreportedStop(ReportBase):
         self.set_reply("OWED-ME")
         self.assertIn("nudge", [f.kind for f in self.facts()])
 
-    def second_stop_after_a_nudge(self, reported=True, outcome=None):
+    def second_stop_after_a_nudge(self, reported_before=True):
         self.stop("OWED-ME")
         self.world.tick(1)
-        if reported:
+        if reported_before:
             self.report()
         self.world.tick(5)
-        self.world.new_engine("cli").send("platform", "coder", "ack the second thing")  # a new assignment
+        self.world.new_engine("cli").send("platform", "coder", "do the second thing")  # a new assignment
         self.world.tick(5)
         self.set_reply("OWED-ME")
         self.world.engine.run_pass()   # the nudge goes to the worker
         self.world.tick(2)
-        self.set_reply("OWED-ME nothing changed")
-        if outcome:
-            self.world.v2.sessions[self.coder]["outcome"] = outcome
+        self.set_reply("OWED-ME nothing reported")
         return self.facts()
 
-    def test_a_clean_second_stop_of_a_worker_that_reported_lately_is_audited_never_a_wake(self):
+    def test_a_report_from_before_the_current_assignment_never_silences_a_second_stop(self):
         found = self.second_stop_after_a_nudge()
-        self.assertEqual([f.kind for f in found if f.kind == "worker.stopped"], [])
-        last = self.triage_events()[-1]["detail"]
-        self.assertEqual(last["outcome"], "quiet")
-        self.assertIn("nothing new", last["reason"])
-        self.world.tick(100)
-        self.world.engine.run_pass()
-        self.assertEqual([k for a in self.world.admissions("platform") for k in a["keys"]
-                          if k.startswith("worker.stopped:")], [])
+        self.assertEqual(len([f for f in found if f.kind == "worker.stopped"]), 1)
+        self.assertEqual(self.triage_events()[-1]["detail"]["outcome"], "stopped")
 
-    def test_a_second_stop_that_did_not_end_cleanly_or_never_reported_still_wakes_the_boss(self):
-        for kwargs in ({"outcome": "failed"}, {"reported": False}):
-            with self.subTest(**kwargs):
-                self.tearDown()
-                self.setUp()
-                found = self.second_stop_after_a_nudge(**kwargs)
-                self.assertEqual(len([f for f in found if f.kind == "worker.stopped"]), 1)
+    def test_a_report_after_the_assignment_makes_the_stop_only_a_rider(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.new_engine("cli").send("platform", "coder", "do the second thing")
+        self.world.tick(5)
+        self.report()
+        self.world.tick(2)
+        self.set_reply("OWED-ME")
+        self.assertEqual([f.kind for f in self.facts() if f.kind in ("worker.stopped", "nudge")], [])
+
+    def test_a_worker_idle_line_is_folded_only_when_it_ended_cleanly(self):
+        def idle(name, clean):
+            fact = sb.Fact("worker.idle:%s:1" % name, "platform", "worker.idle", "%s finished" % name, 5,
+                           sender=name, rider=True)
+            fact.clean = clean
+            return fact
+        news = sb.Fact("report:coder:a", "platform", "report", "done: shipped", 4, sender="coder")
+        text, carried = sb.compose("platform", [idle("calm", True), idle("broken", False), news])
+        self.assertEqual(len(carried), 3)
+        self.assertIn("1 worker finish with no change (calm)", text)
+        self.assertIn("broken finished", text)  # a failed worker's line is shown in full
+        for outcome, folded in (("success", True), ("failed", False), ("aborted", False)):
+            self.assertEqual(outcome in sb.QUIET_OUTCOMES, folded)
 
     def test_idle_riders_fold_into_one_quiet_line_next_to_real_news(self):
         idle = [sb.Fact("worker.idle:s%d:1" % i, "platform", "worker.idle", "w%d finished its turn" % i, 5 + i,
                         sender="w%d" % i, rider=True) for i in range(3)]
+        for fact in idle:
+            fact.clean = True
         news = sb.Fact("report:coder:a", "platform", "report", "done: shipped", 4, sender="coder")
         text, carried = sb.compose("platform", idle + [news])
         self.assertEqual(len(carried), 4)
