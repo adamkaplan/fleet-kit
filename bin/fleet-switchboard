@@ -194,6 +194,7 @@ DEFAULTS = {
                       "check_suite", "workflow_run"],
     "github_port": None,
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
+    "owner_logins": [],  # GitHub logins of the person: an Intent edit by one of them always reaches the Chief of Staff
     "awaiting_label": None,         # PR 14: the label that marks a decision for you; None means `<OS user>:awaiting-user`
     "decisions_lookback_hours": 72,  # PR 14: how far back a boss's transcript is read for open report questions
     "awaiting_cos_label": None,     # PR 18: the label that marks a decision for the Chief of Staff; None means `<OS user>:awaiting-cos`
@@ -6374,6 +6375,10 @@ def _validate_github(config, source):
         raise ConfigError("%s: 'github_ignore_authors' must be a list of GitHub logins, got %r" % (source, ignore))
     config["github_repos"], config["github_events"] = list(repos), list(events)
     config["github_ignore_authors"] = list(ignore)
+    owners = config["owner_logins"]
+    if not isinstance(owners, list) or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in owners):
+        raise ConfigError("%s: 'owner_logins' must be a list of GitHub logins, got %r" % (source, owners))
+    config["owner_logins"] = list(owners)
     users = config["gh_users"]
     if not isinstance(users, dict) or not all(
             isinstance(k, str) and GH_USERS_KEY_RE.match(k) and isinstance(v, str) and GITHUB_LOGIN_RE.match(v)
@@ -6944,6 +6949,7 @@ class GitHubHub:
         self._routed_batch, self._conflicts = [], set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self.engine = None
+        self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
         self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
@@ -7151,6 +7157,42 @@ class GitHubHub:
         agents = discovery.agents if discovery is not None and not discovery.problems else {}
         return sorted(name for name, seen in agents.items() if (seen.fleet or {}).get("role") == "chief-of-staff")
 
+    def intent_edit_wakes(self, fact):
+        """(wakes, note): does this Intent edit reach the Chief of Staff? Decided once per edit (the key), then
+        remembered. It does when the editor is the person (`owner_logins`), or the issue is one of our charters, or
+        an ask or work item under one (the same climb to a fleet agent's charter that routes a comment); anything
+        else (another team's issue that happens to have an Intent line) is only audited. When the chain cannot be
+        read it wakes, labelled: an ask's Intent change is never lost to a failed read."""
+        known = self.intent_verdicts.get(fact.key)
+        if known is not None:
+            return known
+        login = (fact.sender or "").lower()
+        owners = {a.lower() for a in self.config.get("owner_logins") or []}
+        note, memo = None, True
+        if login in owners:
+            wakes, why = True, "edited by the owner"
+        else:
+            discovery = self.discover()
+            if discovery is None or discovery.problems:
+                wakes, why, note, memo = True, "the fleet cannot be read", "chain unchecked: woken to be safe", False
+            else:
+                try:
+                    owner = self._resolve(fact.repo, [fact.issue], [("issue", fact.issue)], discovery.agents,
+                                          self.now(), {})
+                except GitHubUnavailable:
+                    wakes, why, note = True, "the issue's chain cannot be read", "chain unreadable: woken to be safe"
+                else:
+                    wakes = owner is not None
+                    why = "under a charter of %s" % owner if wakes else "not under any of our charters"
+        result = (wakes, note)
+        if memo:
+            if len(self.intent_verdicts) > GITHUB_QUEUE_LIMIT:
+                self.intent_verdicts.clear()
+            self.intent_verdicts[fact.key] = result
+            self._audit("intent.edit", fact.repo or "-", {"issue": fact.issue, "by": fact.sender, "woke": wakes,
+                                                          "why": why})
+        return result
+
     def intent_edit_facts(self):
         with self.lock:
             edits = list(self.intent_edits.values())
@@ -7159,12 +7201,18 @@ class GitHubHub:
             for name in self._chiefs_of_staff():
                 for payload in edits:
                     fact = intent_change_fact(payload, name)
-                    if fact is not None and fact.created >= self.now() - self.lookback:
-                        found.append(fact)
+                    if fact is None or fact.created < self.now() - self.lookback:
+                        continue
+                    wakes, note = self.intent_edit_wakes(fact)
+                    if not wakes:
+                        continue
+                    if note:
+                        fact.summary += "\n(%s)" % note
+                    found.append(fact)
         return found
 
     def toasts(self):
-        """One toast per pending Intent edit, through the engine's render step (the one toast path)."""
+        """One toast per pending Intent edit that wakes the Chief of Staff, through the engine's render step."""
         found = []
         with self.lock:
             edits = list(self.intent_edits.values())
@@ -7172,7 +7220,8 @@ class GitHubHub:
             for name in self._chiefs_of_staff():
                 for payload in edits:
                     toast = intent_change_toast(payload)
-                    if toast is not None:
+                    fact = intent_change_fact(payload, name) if toast is not None else None
+                    if fact is not None and self.intent_edit_wakes(fact)[0]:
                         number, updated, _ = _payload_issue(payload)
                         found.append((name, "intent edit #%d %s" % (number, updated), toast["title"], toast["body"]))
         found.extend(self.polling_toasts())

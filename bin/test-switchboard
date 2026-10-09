@@ -175,6 +175,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
+            "owner_logins": [],
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -5481,6 +5482,66 @@ class TestIntentEditWiring(Base):
         shown = [a for a in self.rig.world.herdr.calls if a[1:3] == ["notification", "show"]]
         self.assertEqual(len(shown), 1)
         self.assertIn("Intent changed on #12", shown[0][3])
+
+
+class TestIntentEditFilter(TestIntentEditWiring):
+    """An Intent edit wakes the Chief of Staff only for our own charters' chain, or by the owner."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(30)                 # another team's issue: no parent, no charter of ours
+        self.gh.issue(31, parent=30)
+
+    def edit_issue(self, number, login="someone-else"):
+        issue = dict(self.gh.issues[number], body=self.NEW, updated_at=sb.iso(self.rig.world.clock.now()))
+        return self.gh.send("issues", {"action": "edited", "issue": issue, "sender": {"login": login},
+                                       "changes": {"body": {"from": self.OLD}}})
+
+    def audit_edits(self):
+        return [e for e in self.rig.world.audit() if e["event"] == "intent.edit"]
+
+    def test_an_ask_a_work_item_and_the_charter_itself_wake(self):
+        self.gh.issue(13, parent=12)
+        for number in (12, 13, 1):
+            self.edit_issue(number)
+        self.assertEqual(sorted(f.issue for f in self.intent_facts()), [1, 12, 13])
+        self.assertEqual(len(self.hub.toasts()), 3)
+
+    def test_another_teams_issue_is_only_audited_and_gives_no_toast(self):
+        self.edit_issue(30)
+        self.edit_issue(31)
+        self.assertEqual((self.intent_facts(), self.hub.toasts()), ([], []))
+        self.assertEqual([(e["detail"]["issue"], e["detail"]["woke"]) for e in self.audit_edits()],
+                         [(30, False), (31, False)])
+        self.intent_facts()
+        self.assertEqual(len(self.audit_edits()), 2)  # decided and audited once
+
+    def test_an_edit_by_the_owner_always_wakes(self):
+        self.rig.world.engine.config["owner_logins"] = ["the-owner"]
+        self.hub.config = self.rig.world.engine.config
+        self.edit_issue(30, login="The-Owner")
+        (fact,) = self.intent_facts()
+        self.assertEqual(fact.issue, 30)
+        self.assertEqual(self.audit_edits()[0]["detail"]["why"], "edited by the owner")
+
+    def test_a_chain_that_cannot_be_read_wakes_labelled_never_loses_the_edit(self):
+        self.gh.issue(40)
+        del self.gh.issues[40]
+        orig = self.hub._resolve
+
+        def broken(*args, **kwargs):
+            raise sb.GitHubUnavailable("down")
+        self.hub._resolve = broken
+        self.edit_issue(12)
+        (fact,) = self.intent_facts()
+        self.assertIn("chain unreadable: woken to be safe", fact.summary)
+        self.hub._resolve = orig
+
+    def test_the_owner_logins_are_validated_like_the_ignored_authors(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(sb.load_config(), owner_logins=["a-b"]))["owner_logins"], ["a-b"])
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config(dict(sb.load_config(), owner_logins="me"))
 
 
 class TestGithubRouting(Base):
