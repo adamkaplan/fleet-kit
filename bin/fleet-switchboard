@@ -10484,9 +10484,9 @@ class PolicyJudge:
         order = POLICY_REQUEST_OUTCOMES
         would, configured = reply["outcome"], request["configured"]
         if would in order and configured in order and order.index(would) > order.index(configured):
-            return dict(reply, outcome=configured, reason=_one_line(
+            return dict(reply, outcome=configured, shadow=True, reason=_one_line(
                 "shadow: the judge would %s (%s); not enforced" % (would, reply["reason"]), 600)), "would-%s" % would
-        return reply, ("unchanged" if reply["judged"] else None)
+        return dict(reply, shadow=True), ("unchanged" if reply["judged"] else None)
 
     def finish_late(self, seconds=POLICY_WARM_SECONDS):
         """Wait for a judgement that missed its budget to finish and fill the caches (tests use it)."""
@@ -10802,8 +10802,11 @@ def ask_judge_daemon(state_dir, text, timeout):
 def never_looser(reply, configured):
     """The reply, made no looser than `configured`: the client's own guard, as the plugin has its own."""
     if POLICY_REQUEST_OUTCOMES.index(reply["outcome"]) >= POLICY_REQUEST_OUTCOMES.index(configured):
-        return policy_reply(reply["outcome"], reply.get("reason") or "", reply.get("judged"), reply.get("cached"),
+        kept = policy_reply(reply["outcome"], reply.get("reason") or "", reply.get("judged"), reply.get("cached"),
                             reply.get("latency_ms") if isinstance(reply.get("latency_ms"), int) else 0)
+        if reply.get("shadow") is True:
+            kept["shadow"] = True  # #113: how the plugin learns it need not wait
+        return kept
     return policy_reply(configured, "the daemon answered looser than the configured outcome: ignored")
 
 
@@ -10943,6 +10946,7 @@ def cmd_judge_tool(args, runner, now, stdin=None):
         sys.stdout.flush()
     except (OSError, ValueError):
         pass  # the plugin stopped listening
+    record_dropped_calls()
     return EXIT_OK
 
 
@@ -11067,6 +11071,18 @@ def cmd_policy_report(args, runner, now):
     print("  enforced       %d ask, %d deny" % (sample["tightened_ask"], sample["tightened_deny"]))
     print("  latency        p50 %s ms, p95 %s ms" % ("-" if p50 is None else p50, "-" if p95 is None else p95))
     return EXIT_OK
+
+
+def record_dropped_calls(environ=None):
+    """#113: the plugin, in shadow mode, drops a call it cannot start at once (too many in flight) and tells the next
+    child how many through FLEET_SWITCHBOARD_DROPPED: one audit line, so no verdict is lost silently."""
+    environ = os.environ if environ is None else environ
+    try:
+        count = int(environ.get("FLEET_SWITCHBOARD_DROPPED") or 0)
+        if count > 0:
+            AuditLog(ensure_state_dir() / "audit.jsonl").append(POLICY_ACTOR, "policy.dropped", "plugin", {"count": count})
+    except Exception:
+        pass  # the audit is best effort here
 
 
 POLICY_COMMANDS = {"judge-tool": cmd_judge_tool}

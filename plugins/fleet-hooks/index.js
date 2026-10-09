@@ -16,6 +16,7 @@ import path from "node:path";
 export const OUTCOMES = ["allow", "ask", "deny"]; // least to most strict
 export const DEFAULT_TIMEOUT_MS = 2500; // the CLI's own budget is 1500 ms; this is that plus slack
 const REASON_LIMIT = 600;
+const JUDGE_ARGV = ["judge-tool"]; // the one command this plugin runs
 
 // The permission `action` names this plugin forwards, exactly as v2 reports
 // them, mapped to the CLI's tool kinds. Measured in the Lab (v2 2.0.22): the
@@ -93,7 +94,7 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
       finish(null);
     }, timeoutMs);
     try {
-      child = spawnFn(bin, ["judge-tool"], { stdio: ["pipe", "pipe", "ignore"], env: childEnv(), shell: false });
+      child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "pipe", "ignore"], env: childEnv(), shell: false });
       child.on("error", () => finish(null));
       child.on("close", () => finish(parseReply(out)));
       child.stdout.on("data", (chunk) => {
@@ -113,12 +114,66 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
   });
 }
 
-export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn }) {
+// #113: while the judge is in shadow its verdict decides nothing, so nothing should wait for it. The plugin learns
+// the mode from the judge's own reply (`shadow: true`, only ever sent by a judge that is in shadow) and keeps it for
+// MODE_TTL_MS. It never assumes: an unknown or expired mode, or any reply without `shadow`, means AWAIT AND ENFORCE,
+// exactly as before. In shadow the call is fired detached (bounded in flight, never blocking, dropped and counted
+// when over the cap) and the hook returns at once. One awaited call per TTL refreshes the mode.
+export const MODE_TTL_MS = 30000;
+export const SHADOW_MAX_INFLIGHT = 4;
+export const SHADOW_HARD_TIMEOUT_MS = 15000;
+
+export function fireDetached(bin, request, state, spawnFn = spawn) {
+  if (state.inflight >= SHADOW_MAX_INFLIGHT) {
+    state.dropped += 1;
+    return false;
+  }
+  let child;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    state.inflight -= 1;
+    clearTimeout(timer);
+  };
+  state.inflight += 1;
+  const timer = setTimeout(() => {
+    try { child?.kill("SIGKILL"); } catch { /* already gone */ }
+    release();
+  }, SHADOW_HARD_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const owed = state.dropped;
+    const env = childEnv();
+    if (owed > 0) env.FLEET_SWITCHBOARD_DROPPED = String(owed);
+    child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "ignore", "ignore"], env, shell: false });
+    if (owed > 0) state.dropped -= owed;
+    child.on("error", release);
+    child.on("close", release);
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(request));
+    child.unref?.();
+  } catch {
+    release();
+  }
+  return true;
+}
+
+export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null }) {
+  const mode = state || { shadowUntil: 0, inflight: 0, dropped: 0 };
   return async function evaluate(input) {
     try {
       if (!input || !OUTCOMES.includes(input.effect) || typeof input.sessionID !== "string") return;
       if (toolOf(input.action) === null) return; // not an action this plugin forwards: the configured outcome stands
-      const reply = await runJudge(bin, requestOf(input), timeoutMs, spawnFn);
+      const request = requestOf(input);
+      if (now() < mode.shadowUntil) {
+        fireDetached(bin, request, mode, spawnFn);
+        return; // shadow: the tool call proceeds at once
+      }
+      const reply = await runJudge(bin, request, timeoutMs, spawnFn);
+      if (reply && reply.shadow === true) mode.shadowUntil = now() + MODE_TTL_MS;
+      else if (reply && reply.judged === true) mode.shadowUntil = 0; // an enforcing judge: never async
+      if (reply && reply.shadow === true) return; // a shadow reply is the configured outcome anyway
       if (!isStricter(reply, input.effect)) return; // the second guard: never loosen, never repeat
       input.effect = reply.outcome;
       input.message = typeof reply.reason === "string" ? reply.reason.slice(0, REASON_LIMIT) : undefined;
