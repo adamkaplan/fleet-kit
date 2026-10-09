@@ -20056,9 +20056,9 @@ class TestJudgeSeesTheOrders(PolicyCase):
                                                "self-certify (ordered by alice, 2027-01-06)")
         self.assertEqual((context["charter"], len(context["orders"])), (1, 2))
 
-    def test_the_state_the_model_sees_holds_the_orders_clipped_to_600(self):
-        state = sb.policy_state("orchestrator", "i", "d", "o" * 900, "shell", "ls")
-        self.assertEqual(len(state["standing_authority"]), 600)
+    def test_the_state_the_model_sees_holds_the_orders_clipped_to_1200(self):  # 600 until issue 87
+        state = sb.policy_state("orchestrator", "i", "d", "o" * 1500, "shell", "ls")
+        self.assertEqual(len(state["standing_authority"]), 1200)
         self.assertEqual(sb.policy_state("orchestrator", "i", "d", "o" * 500, "shell", "ls")["standing_authority"],
                          "o" * 500)
 
