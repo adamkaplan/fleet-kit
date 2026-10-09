@@ -3710,3 +3710,23 @@ Orchestrators (step 2) need data-driven allows. The last-3-days shell calls of o
 `gh pr checks`, `grep`, `gh issue comment`, ... A standing order lets orchestrators `gh pr merge --admin`: the cos guard against `--admin` is
 for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (the docs list none); the switchboard already tiers it
 (`decisions_cos_grace_seconds`, 300s, then the human) and can answer it (`permission_reply`), so a timeout-to-deny would be a switchboard action.
+
+### Review changes at f1c3c4f (#108)
+
+- `handoff`, `subagent`, `task`, `launch` are denied: handoff starts a `cos-subagent` whose own definition is allow-all.
+- `fleet-switchboard orders add|remove` and `decisions answer|resolve|supersede|batch` are denied (an order must not authorise itself; the judge no
+  longer guards them for the cos). `decisions list|escalate` and `orders list` stay. **For the owner:** with this the Chief of Staff cannot answer an
+  orchestrator's prompt itself; it escalates. If you want it to answer under your standing orders, grant exactly `fleet-switchboard decisions answer *`
+  (and `resolve *`) knowingly, or step 2 decides who answers.
+- Expansion bypasses: `$`, `{`, `}` and `~` anywhere in a command are denied; `*`, `?` and `[` are already denied by the scanner. OpenCode normalises `\`
+  to `/` in both the pattern and the command, so a backslash guard would deny every path; `./` and `../` anywhere are denied instead (`.\ssh` is `./ssh`).
+  Dot-segments (`/.x`, ` .x`, `:.x`, `=.x`) are denied everywhere, plus secret-looking names for the readers, `/etc` and friends. The `read`, `grep`
+  and `glob` tools deny `*/.*` and secret names too.
+- `az` is allowed only as `az <group> [<sub>] show|list` (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
+  `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|containerapp|appconfig|deployment|webapp config|app-insights`
+  and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
+- `gh`: the owner's words cover comments and close/merge; Adam's later answers also covered reopen, edit, ready and review. `--approve` is denied
+  (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.
+- `curl` is a literal URL only (no `$`, no flags after the URL, no port, no numeric host). **Residual risk:** a model could still put context it holds
+  into a literal URL. `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
+  inside a secret-looking filename that is not in a dot-directory (`id_\rsa`) is not caught.

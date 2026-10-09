@@ -8424,7 +8424,7 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 9300, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 9500, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8481,19 +8481,30 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
         self.assertLess(last_allow, first_guard)
         resources = [r["resource"] for r in shell]
-        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh repo*", "gh workflow run*", "gh release*", "az * delete *", "az *secret*", "az *token*"):
+        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "*--approve*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "az rest*", "az *secret*", "az *token*",
+                      "fleet-switchboard handoff*", "fleet-switchboard orders add*", "fleet-switchboard decisions answer*"):
             self.assertIn(guard, resources)
 
     def test_edit_and_subagent_are_denied_and_the_denial_is_final(self):
         _, rules = self.rules()
-        for action in ("edit", "subagent"):
+        for action in ("edit", "subagent", "task", "handoff"):
             self.assertEqual([r["effect"] for r in rules if r["action"] == action], ["deny"])
+
+    def test_az_reads_name_the_verb_position_and_nothing_a_write_could_hide_behind(self):
+        _, rules = self.rules()
+        allows = [r["resource"] for r in rules if r["action"] == "shell" and r["effect"] == "allow"]
+        for resource in allows:
+            if resource.startswith("az "):
+                self.assertRegex(resource, r"^az [a-z0-9-]+( [a-z0-9-]+)*( show| list| query| tail) \*$", resource)
+        for forbidden in ("fleet-switchboard handoff", "fleet-switchboard orders add", "fleet-switchboard decisions answer", "gh api *"):
+            self.assertFalse([a for a in allows if a.startswith(forbidden)], forbidden)
 
     def test_the_prose_matches_the_rules(self):
         text = self.PATH.read_text()
         self.assertIn("I don't have a problem with you using gh to write comments or close/merge PRs", text)
         self.assertIn("route the work to the owning orchestrator", text)
         self.assertNotIn("never merge,", text)
+        self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
 
 
 class TestAgentDefinitions(unittest.TestCase):
@@ -21087,10 +21098,10 @@ class TestOrdersRoleText(unittest.TestCase):
 
     def test_the_chief_of_staff_records_reads_back_and_never_widens(self):
         text = " ".join(self.text("agents", "opencode", "chief-of-staff.md").split())
-        self.assertIn('`fleet-switchboard orders add --charter <owner/repo#n> "<their words>"`', text)
-        self.assertIn("read the list back", text)
+        # #105: the Chief of Staff's native permissions deny `orders add|remove`: it reads the list and tells the principal the command to run
+        self.assertIn('`orders add --charter <owner/repo#n> "<their words>"`', text)
+        self.assertIn("`orders add` and `orders remove` are denied to you", text)
         self.assertIn("ask nothing it already answers", text)
-        self.assertIn("`orders remove`", text)
         self.assertIn("Never invent or widen an order", text)
 
     def test_the_skills_say_the_format_and_who_writes(self):
@@ -23977,10 +23988,14 @@ class TestTierRoleText(unittest.TestCase):
         for tree, name in (("opencode", "chief-of-staff.md"), ("copilot", "chief-of-staff.agent.md")):
             with self.subTest(tree=tree):
                 text = " ".join(self.text("agents", tree, name).replace("`", "").lower().split())
-                for needle in ("fleet-switchboard decisions", "decisions answer <id> allow|deny", "decisions resolve <id>",
-                               "quoting the order in one line", "never both", "never invent or widen an order",
-                               "never edit", "orders file", "if unsure, escalate", "restate what is unchanged",
-                               "decisions escalate <id> --reason"):
+                needles = ("fleet-switchboard decisions", "decisions answer <id> allow|deny", "decisions resolve <id>",
+                           "quoting the order in one line", "never both", "never invent or widen an order",
+                           "never edit", "orders file", "if unsure, escalate", "restate what is unchanged",
+                           "decisions escalate <id> --reason")
+                if tree == "opencode":  # #105: native permissions deny answer/resolve; the cos escalates
+                    needles = ("fleet-switchboard decisions", "decisions answer, resolve, supersede and batch are denied to you", "never invent or widen an order",
+                               "never edit", "orders file", "if unsure, escalate", "restate what is unchanged", "decisions escalate <id> --reason")
+                for needle in needles:
                     self.assertIn(needle, text)
 
     def test_the_skills_say_the_same_briefly_and_setup_runs_labels_ensure(self):
