@@ -3622,6 +3622,14 @@ the report items of that boss. An answered report to another boss is withdrawn a
 is not known (a link made before this field existed) is still kept while any boss is unreadable, the cautious way;
 an error that names no boss still freezes every report. The link table gains an optional `boss` per link.
 
+**Every boss lookup resolves the alias (#102).** The same resolver (`resolve_boss`, through `boss_name`) now serves every place that looks a
+`reports_to` up as an agent, not only the reports source: the stop triage (`worker.stopped`: it no longer says "the boss chief-of-staff is not running"
+while the Chief of Staff runs, and its report-since-assignment check runs for workers who report to it, with the nudge and the quiet-stop audit
+naming the resolved agent), the recipient of a `report` and of the worker facts, the `--interrupt` check (the Chief of Staff may interrupt
+such a worker), steering into a working turn, an answer's delivery to the worker's boss, the checkpoint reminders' overdue wake, the boss recorded with
+a PR notice, and the reports listing. With no single registered agent of that role the name stays literal everywhere, so the behaviour is unchanged.
+`reports_to` as shown to a person is still the text the worker was launched with.
+
 ## Status speed (#86)
 
 `fleet-switchboard status` spent most of its time on the intent-gap check: one serial `gh api` read (about 0.4 s)

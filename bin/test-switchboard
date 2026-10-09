@@ -13685,6 +13685,105 @@ class ReportBase(PR4Base):
         return self.world.engine.run_pass()
 
 
+class TestBossAlias(ReportBase):
+    """#102: a worker whose reports_to is the role name chief-of-staff reaches the registered agent of that role in EVERY boss lookup
+    (the stop triage, report, interrupt, the checkpoint reminders, the notice's boss); with no single such agent the literal is kept."""
+
+    def worker(self, reports_to="chief-of-staff", name="worker2"):
+        self.world.add_agent(name, fleet={"role": "coder", "reports_to": reports_to, "issue": 2})
+
+    def cos(self, name="cos"):
+        self.world.add_agent(name, fleet={"role": "chief-of-staff"})
+
+    def test_a_stop_of_a_worker_reporting_to_the_role_name_runs_the_report_since_assignment_check(self):
+        self.cos()
+        self.worker()
+        self.stop("OWED-ME", name="worker2")
+        found = self.derive()
+        (event,) = self.triage_events()
+        self.assertNotIn("not running", json.dumps(event))
+        self.assertEqual((event["detail"]["boss"], event["detail"]["outcome"]), ("cos", "nudge"))
+        self.assertEqual(sorted((f.kind, f.recipient) for f in found if f.sender == "worker2" or f.kind == "nudge"),
+                         [("nudge", "worker2"), ("worker.idle", "cos")])
+
+    def test_a_report_to_the_role_name_goes_to_cos_and_makes_the_next_stop_only_a_rider(self):
+        self.cos()
+        self.worker()
+        self.stop("OWED-ME", name="worker2")
+        self.world.tick(1)
+        outcome = self.report(sender="worker2")
+        self.assertEqual(outcome.get("recipient", "cos") if isinstance(outcome, dict) else "cos", "cos")
+        self.world.tick(5)
+        found = self.derive()
+        self.assertEqual([f.kind for f in found if f.kind in ("nudge", "worker.stopped")], [])
+        self.assertEqual(self.triage_events(), [], "it reported since it was given work: nothing is asked")
+
+    def test_a_second_unreported_stop_tells_cos_not_a_boss_that_is_not_running(self):
+        self.cos()
+        self.worker()
+        self.stop("OWED-ME", name="worker2")
+        self.world.tick(1)
+        self.world.engine.run_pass()
+        self.world.tick(2)
+        self.set_reply("OWED-ME again", name="worker2")
+        found = self.derive()
+        (stopped,) = [f for f in found if f.kind == "worker.stopped"]
+        self.assertEqual(stopped.recipient, "cos")
+        self.assertEqual(self.triage_events()[-1]["detail"]["outcome"], "stopped")
+        self.assertNotIn("is not running", self.triage_events()[-1]["detail"]["reason"])
+
+    def test_with_no_chief_of_staff_registered_the_literal_is_kept_and_the_stop_is_audited(self):
+        self.worker()
+        self.stop("OWED-ME", name="worker2")
+        found = self.derive()
+        (event,) = self.triage_events()
+        self.assertEqual((event["detail"]["boss"], event["detail"]["outcome"]), ("chief-of-staff", "stopped"))
+        self.assertIn("boss chief-of-staff is not running", event["detail"]["reason"])
+        self.assertEqual([f.recipient for f in found if f.kind == "worker.stopped"], ["chief-of-staff"])
+
+    def test_with_two_chiefs_of_staff_the_literal_is_kept(self):
+        self.cos("cos-a")
+        self.cos("cos-b")
+        self.worker()
+        self.world.engine.discover(self.world.clock.now())
+        self.assertEqual(sb.resolve_boss(self.world.engine.discovery, "chief-of-staff"), "chief-of-staff")
+        self.stop("OWED-ME", name="worker2")
+        self.derive()
+        self.assertEqual(self.triage_events()[0]["detail"]["boss"], "chief-of-staff")
+
+    def test_a_quiet_stop_is_still_audited_with_the_resolved_boss(self):
+        self.cos()
+        self.worker()
+        self.stop("nothing to say", name="worker2")
+        found = self.derive()
+        (event,) = self.triage_events()
+        self.assertEqual((event["detail"]["boss"], event["detail"]["outcome"]), ("cos", "silent"))
+        self.assertEqual([(f.kind, f.recipient, f.rider) for f in found], [("worker.idle", "cos", True)])
+
+    def test_cos_may_interrupt_a_worker_that_reports_to_the_role_name_and_a_stranger_may_not(self):
+        self.cos()
+        self.worker()
+        engine = self.world.new_engine("cli")
+        engine.send("cos", "worker2", "stop and hold", interrupt=True)
+        with self.assertRaises(sb.InterruptRefused):
+            engine.send("platform", "worker2", "stop", interrupt=True)
+
+    def test_every_boss_lookup_goes_through_boss_name(self):
+        source = SWITCHBOARD.read_text()
+        start = source.index("def boss_name(")
+        lookups = [i for i in range(len(source)) if source.startswith("_boss_of(", i)]
+        offenders = []
+        for i in lookups:
+            line = source[source.rfind("\n", 0, i) + 1:source.index("\n", i)]
+            if "def _boss_of" in line or "boss_name" in line or i >= start and i < start + 400:
+                continue
+            offenders.append(line.strip())
+        # what remains is the literal text on purpose: resolve_boss's own argument, the "above" check and the display list
+        self.assertEqual(len(offenders), 4, offenders)  # the reports source line holds two calls, then the above check and the display list
+        for marker in ("resolve_boss(discovery, _boss_of(o))", "_boss_of(discovery.agents[report", '"reports_to": _boss_of(obs)'):
+            self.assertTrue(any(marker in line for line in offenders), marker)
+
+
 class TestRiders(ReportBase):
     def test_a_fact_is_not_a_rider_unless_it_says_so_and_the_field_round_trips(self):
         self.assertIn("rider", sb.Fact.FIELDS)
