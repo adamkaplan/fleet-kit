@@ -1524,6 +1524,8 @@ class Switchboard:
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
+        self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
+        self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
         self.notice_facts = {}          # PR notices: "owner/repo#N" -> {at, facts, stale, error}; memory only
         self.notice_effects = {"drop": set(), "unreadable": {}}  # what the last derivation asks the daemon to record
         self.synthetic_cache = {}       # PR 14: session -> (newest synthetic id, since, lines), a cache for the decisions
@@ -1924,6 +1926,15 @@ class Switchboard:
                 self._failed(observation.name, "convert", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
         facts, _ = self.collect_facts()
+        try:
+            facts = filter_stopped_news(self, facts, discovery)
+        except Exception as err:  # fail open: a broken judge never stops a delivery, the facts wake as today
+            reason = _one_line("%s: %s" % (type(err).__name__, err), 200)
+            if reason not in self.stopped_news_errors:
+                if len(self.stopped_news_errors) > 50:
+                    self.stopped_news_errors.clear()
+                self.stopped_news_errors.add(reason)
+                self._note("stopped_news.error", None, {"reason": reason})
         by_recipient = {}
         for fact in facts:
             by_recipient.setdefault(fact.recipient, []).append(fact)
@@ -3777,6 +3788,8 @@ class WorkerFacts:
                               observation.name, observation.outcome or "no outcome recorded",
                               ": " + reply if reply else ""), observation.idle_at,
                           issue=_issue_of(observation.fleet), sender=observation.name)]
+            found[0].stop = {"reply": reply, "clean": observation.outcome in QUIET_OUTCOMES,
+                             "role": (observation.fleet or {}).get("role"), "fleet": observation.fleet}
         elif verdict["outcome"] == "nudge":
             found = [idle, verdict["nudge"]]
         else:
@@ -3859,6 +3872,9 @@ REPORT_OWED_TEXT = ("Did this turn end with work done, blocked, failed or needin
 REPORT_TRIAGE_DEFAULTS = {
     "owed_threshold": 0.5,  # the probability at which the answer is "owed": the worker is nudged
     "budget_seconds": 3,    # the longest the decision model may take for one stop; no answer fails open
+    "stopped_news": "off",  # #96: "off", "shadow" (judge and audit, drop nothing) or "on": judge a worker.stopped that
+                            # would wake the Chief of Staff alone, and drop one that is clearly no news
+    "news_threshold": 0.15, # the probability of news below which a stopped note is clearly no news
 }
 NUDGE_TEXT = ("You stopped without telling %s. If your work is done, failed, blocked or needs a decision, run: "
               "%s report <state> \"one line\". If nothing changed since your last report, say nothing.")
@@ -3882,6 +3898,12 @@ def validate_report_triage_config(config, source):
     if not _is_number(settings["budget_seconds"]) or settings["budget_seconds"] <= 0:
         raise ConfigError("%s: 'report_triage.budget_seconds' must be a positive number, got %r"
                           % (source, settings["budget_seconds"]))
+    if settings["stopped_news"] not in ("off", "shadow", "on"):
+        raise ConfigError("%s: 'report_triage.stopped_news' must be \"off\", \"shadow\" or \"on\", got %r"
+                          % (source, settings["stopped_news"]))
+    if not _is_number(settings["news_threshold"]) or not 0 < settings["news_threshold"] < 1:
+        raise ConfigError("%s: 'report_triage.news_threshold' must be a number above 0 and below 1, got %r"
+                          % (source, settings["news_threshold"]))
     config["report_triage"] = settings
 
 
@@ -4016,6 +4038,131 @@ def ask_report_owed(engine, observation, boss, reply, audit):
     if owed >= settings["owed_threshold"]:
         return {"outcome": "nudge", "reason": "owed at %.2f, threshold %.2f" % (owed, settings["owed_threshold"])}
     return {"outcome": "silent", "reason": "owed at %.2f, below %.2f" % (owed, settings["owed_threshold"])}
+
+
+# ---- #96: a worker.stopped that would wake the Chief of Staff alone is judged for news
+
+STOPPED_NEWS_ID = "stopped_news"
+STOPPED_NEWS_TEXT = "Does this tell the person anything new?"
+
+
+def stopped_news_questions():
+    return {STOPPED_NEWS_ID: {"type": "noul", "instructions": STOPPED_NEWS_TEXT,
+                              "criteria": {"true": "The reply says something new for the person: work finished, "
+                                                   "a result, a failure, a block, a decision needed, or a change "
+                                                   "since the last update.",
+                                           "false": "The reply only says nothing changed, repeats what was already "
+                                                    "reported, or acknowledges without a result."}}}
+
+
+def judge_stopped_news(engine, fact):
+    """(clear_no, audit detail) for one worker.stopped. clear_no is True only when the worker ended cleanly and the
+    decision model answered, in time, a probability of news under `news_threshold`. Every other path is False: a
+    note that cannot be judged is a note that wakes."""
+    settings = engine.config["report_triage"]
+    info = getattr(fact, "stop", None) or {}
+    detail = {"worker": fact.sender, "key": fact.key, "mode": settings["stopped_news"], "threshold": settings["news_threshold"],
+              "question": None, "answer": None, "latency_ms": 0, "model": None, "usage": {}, "error": None}
+    if not info:
+        detail["reason"] = "not a judged stop"
+        return False, detail
+    if not info.get("clean"):
+        detail["reason"] = "the worker did not end cleanly: never dropped"
+        return False, detail
+    fleet = info.get("fleet") or {}
+    ask = ask_intent(engine, _ask_of(fleet, fact.sender)) or {}
+    state = report_owed_state(info.get("role"), ask.get("intent"), ask.get("done_when"), info.get("reply") or "",
+                              fact.recipient)
+    detail["question"] = {"state": state, "ids": [STOPPED_NEWS_ID]}
+    try:
+        jev = report_jev(engine, settings)
+        if jev is None:
+            detail["reason"] = "no decision model is configured: wakes"
+            return False, detail
+        result = jev.decide(state, stopped_news_questions())
+        detail.update(latency_ms=result["latency_ms"], model=result["model"], usage=result["usage"])
+        news = result["answers"][STOPPED_NEWS_ID]["noul"]
+        if not _is_number(news):
+            raise KeyError("no answer")
+    except JevError as err:
+        detail.update(latency_ms=err.latency_ms or 0, error=_one_line(str(err), 160),
+                      reason="decision model unavailable (%s): wakes" % err.reason)
+        return False, detail
+    except (KeyError, TypeError, ValueError):
+        detail["reason"] = "no usable answer: wakes"
+        return False, detail
+    detail["answer"] = {STOPPED_NEWS_ID: news}
+    if news < settings["news_threshold"]:
+        detail["reason"] = "news at %.2f, under %.2f: clearly nothing new" % (news, settings["news_threshold"])
+        return True, detail
+    detail["reason"] = "news at %.2f, not under %.2f: wakes" % (news, settings["news_threshold"])
+    return False, detail
+
+
+def filter_stopped_news(engine, facts, discovery):
+    """The facts for the pass, minus the worker.stopped notes that are clearly no news. Applies only to the Chief of
+    Staff's wakes, only when every non-rider fact waiting for it is a worker.stopped (it would be woken for nothing
+    else), only with `report_triage.stopped_news` "on"; "shadow" judges and audits (`would_drop`) and drops nothing.
+    One judgement per note (remembered); each is audited once with its question, answer, latency and model usage."""
+    settings = engine.config["report_triage"]
+    mode = settings["stopped_news"]
+    if mode == "off" or engine.audit is None or discovery is None:
+        return facts
+    groups = {}
+    for fact in facts:
+        groups.setdefault(fact.recipient, []).append(fact)
+    dropped = set()
+    for recipient, group in groups.items():
+        seen = discovery.agents.get(recipient)
+        if seen is None or (seen.fleet or {}).get("role") != "chief-of-staff":
+            continue  # an orchestrator's boss keeps its wakes
+        news = [f for f in group if not f.rider]
+        if not news or any(f.kind != WORKER_STOPPED for f in news):
+            continue
+        for fact in news:
+            clear = engine.stopped_news.get(fact.key)
+            if clear is None:
+                clear, detail = judge_stopped_news(engine, fact)
+                if len(engine.stopped_news) > 500:
+                    engine.stopped_news.clear()
+                engine.stopped_news[fact.key] = clear
+                detail["outcome"] = ("dropped" if mode == "on" else "would_drop") if clear else "wakes"
+                try:
+                    engine.audit.append(engine.actor, "stopped.news", fact.sender, detail)
+                except OSError:
+                    pass
+            if clear and mode == "on":
+                dropped.add(fact.key)
+    return [f for f in facts if f.key not in dropped]
+
+
+def stopped_news_summary(state_dir, now, window=3600):
+    """{judged, dropped, would_drop} of the last `window` seconds, read from the tail of the audit (a display only:
+    nothing decides from it). None when there is none."""
+    path = Path(state_dir) / "audit.jsonl"
+    try:
+        with open(str(path), "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 4000000))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    counts = {"judged": 0, "dropped": 0, "would_drop": 0}
+    for line in lines:
+        if '"stopped.news"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        at = parse_iso(row.get("ts"))
+        if row.get("event") != "stopped.news" or at is None or now - at > window:
+            continue
+        outcome = (row.get("detail") or {}).get("outcome")
+        counts["judged"] += 1
+        if outcome in ("dropped", "would_drop"):
+            counts[outcome] += 1
+    return counts if counts["judged"] else None
 
 
 # ---- progress reports: riders that wait for a message to ride in
@@ -8090,6 +8237,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+        report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
             report["external"] = {"line": line}
@@ -8184,6 +8332,10 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    counts = report.get("stopped_news")
+    if counts:  # #96: only when the judge ran in the last hour
+        lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
+                     % (counts["judged"], counts["dropped"], counts["would_drop"]))
     lines.extend("      " + report["external"]["line"] for _ in [0] if "external" in report)
     lines.extend("      " + report["external"]["work_line"] for _ in [0] if "external" in report and "work_line" in report["external"])
     lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18

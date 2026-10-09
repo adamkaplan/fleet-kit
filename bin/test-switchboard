@@ -13746,6 +13746,159 @@ class ReportBase(PR4Base):
         return self.world.engine.run_pass()
 
 
+# ======================================================================
+# #96: a worker.stopped that would wake the Chief of Staff alone is judged: "does this tell the person anything new?"
+# ======================================================================
+STOPPED_NEWS_RULES = [
+    {"contains": "NEWS-NO", "noul": {"stopped_news": 0.02, "report_owed": 0.95}},
+    {"contains": "NEWS-YES", "noul": {"stopped_news": 0.9, "report_owed": 0.95}},
+    {"contains": "NEWS-MID", "noul": {"stopped_news": 0.3, "report_owed": 0.95}},
+    {"contains": "NEWS-DOWN", "error": "unreachable"},
+    {"contains": "OWED-ME", "noul": {"report_owed": 0.95}},
+]
+
+
+class TestStoppedNews(PR4Base):
+    def make_world(self, mode="on", **kwargs):
+        config = {"jev": {"replay": write_report_replay(self.home, STOPPED_NEWS_RULES)},
+                  "report_triage": {"stopped_news": mode}}
+        world = World(self, agents=(), config=config)
+        world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "cos", "issue": 2})
+        return world
+
+    def stopped_twice(self, reply, outcome=None):
+        """A worker stops, is nudged, and stops again with `reply`: the second stop is a worker.stopped."""
+        self.world.v2.start_turn(self.coder, "fleet task", fleet=True)
+        self.world.v2.sessions[self.coder]["messages"][-1]["text"] = "OWED-ME first"
+        self.world.tick(1)
+        self.world.engine.run_pass()      # the nudge
+        self.world.tick(2)
+        self.world.v2.sessions[self.coder]["messages"][-1]["text"] = reply
+        if outcome:
+            self.world.v2.sessions[self.coder]["outcome"] = outcome
+
+    def passes(self, seconds=100):
+        self.world.tick(seconds)
+        return self.world.engine.run_pass()
+
+    def told(self):
+        return [k for a in self.world.admissions("cos") for k in a["keys"] if k.startswith("worker.stopped:")]
+
+    def events(self):
+        return [e for e in self.world.audit() if e["event"] == "stopped.news"]
+
+    def test_a_clearly_no_news_stop_alone_is_dropped_and_audited_with_its_cost(self):
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        self.passes()
+        self.assertEqual(self.told(), [])
+        (event,) = self.events()
+        detail = event["detail"]
+        self.assertEqual((detail["outcome"], detail["mode"], detail["worker"]), ("dropped", "on", "coder"))
+        self.assertEqual(detail["answer"], {"stopped_news": 0.02})
+        self.assertEqual(detail["question"]["ids"], ["stopped_news"])
+        self.assertIn("NEWS-NO", detail["question"]["state"]["last_reply"])
+        for field in ("latency_ms", "model", "usage", "threshold", "reason"):
+            self.assertIn(field, detail)
+
+    def test_doubt_or_news_wakes_and_each_note_is_judged_once(self):
+        for reply in ("NEWS-YES merged it", "NEWS-MID maybe"):
+            with self.subTest(reply=reply):
+                self.tearDown()
+                self.setUp()
+                self.stopped_twice(reply)
+                self.passes()
+                self.passes()
+                self.assertEqual(len(self.told()), 1)
+                (event,) = self.events()
+                self.assertEqual(event["detail"]["outcome"], "wakes")
+
+    def test_every_failure_wakes(self):
+        self.stopped_twice("NEWS-DOWN")  # the model is unreachable
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        self.assertEqual(self.events()[0]["detail"]["outcome"], "wakes")
+        self.assertIn("unavailable", self.events()[0]["detail"]["reason"])
+
+    def test_no_decision_model_and_a_stop_with_no_judging_info_wake(self):
+        self.world.engine.config["jev"] = None
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        self.assertIn("no decision model", self.events()[0]["detail"]["reason"])
+        fact = sb.Fact("worker.stopped:x:1", "cos", "worker.stopped", "x stopped", 1, sender="x")
+        self.assertEqual(sb.judge_stopped_news(self.world.engine, fact)[0], False)
+
+    def test_a_worker_that_did_not_end_cleanly_is_never_dropped_and_costs_no_call(self):
+        self.stopped_twice("NEWS-NO nothing changed", outcome="failed")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        (event,) = self.events()
+        self.assertIn("did not end cleanly", event["detail"]["reason"])
+        self.assertIsNone(event["detail"]["answer"])
+
+    def test_only_a_stop_that_would_wake_alone_is_judged(self):
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.world.fact("cos", "lab:news", "a real fact")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)  # carried with the real fact: not alone, not judged
+        self.assertEqual(self.events(), [])
+
+    def test_an_orchestrators_boss_keeps_its_wakes(self):
+        self.world.v2.sessions[self.world.sessions["cos"]]["metadata"]["fleet"]["role"] = "orchestrator"
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        self.assertEqual(self.events(), [])
+
+    def test_shadow_judges_and_audits_but_drops_nothing(self):
+        self.tearDown()
+        self.world = self.make_world("shadow")
+        self.coder = self.world.sessions["coder"]
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        self.assertEqual(self.events()[0]["detail"]["outcome"], "would_drop")
+
+    def test_a_filter_that_raises_anything_still_delivers_every_fact_and_is_audited_once(self):
+        for error in (RuntimeError("boom"), KeyError("k"), TypeError("t")):
+            with self.subTest(error=type(error).__name__):
+                self.tearDown()
+                self.setUp()
+                self.stopped_twice("NEWS-NO nothing changed")
+
+                def broken(*args, **kwargs):
+                    raise error
+                with mock.patch.object(sb, "filter_stopped_news", broken):
+                    self.passes()
+                    self.passes()
+                self.assertEqual(len(self.told()), 1)
+                errors = [e for e in self.world.audit() if e["event"] == "stopped_news.error"]
+                self.assertEqual(len(errors), 1)
+                self.assertIn(type(error).__name__, errors[0]["detail"]["reason"])
+
+    def test_off_is_the_default_and_judges_nothing(self):
+        self.assertEqual(sb.REPORT_TRIAGE_DEFAULTS["stopped_news"], "off")
+        self.tearDown()
+        self.world = self.make_world("off")
+        self.coder = self.world.sessions["coder"]
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        self.assertEqual(len(self.told()), 1)
+        self.assertEqual(self.events(), [])
+
+    def test_the_settings_are_validated_and_status_counts_the_last_hour(self):
+        for bad in ({"stopped_news": "yes"}, {"news_threshold": 0}, {"news_threshold": 1}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "report_triage": bad})
+        self.stopped_twice("NEWS-NO nothing changed")
+        self.passes()
+        counts = sb.stopped_news_summary(self.world.state, time.time())
+        self.assertEqual(counts, {"judged": 1, "dropped": 1, "would_drop": 0})
+        self.assertIsNone(sb.stopped_news_summary(self.world.state, time.time() + 7200))
+
+
 class TestBossAlias(ReportBase):
     """#102: a worker whose reports_to is the role name chief-of-staff reaches the registered agent of that role in EVERY boss lookup
     (the stop triage, report, interrupt, the checkpoint reminders, the notice's boss); with no single such agent the literal is kept."""
