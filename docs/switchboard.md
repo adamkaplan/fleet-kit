@@ -2112,6 +2112,18 @@ atomically, like `report-riders.json`); no message is sent and no agent is woken
 turn. Like `report` it makes sure the daemon runs. Sending it again for the same PR refreshes the note and keeps
 the first time. `fleet-switchboard decisions` does not list notices: they are not decisions.
 
+**Checked when sent, withdrawable, and short-lived when unreadable (issue 99).** `notice pr` reads the PR once before it records
+(the cached facts first, else ONE `gh pr view` with the usual short timeout) and refuses a number that is not an open pull request:
+nothing is recorded, with one line (`... is not a pull request I can find (a mistyped number, or an issue)`, or `... is merged, not an open
+pull request`). Only a `gh` answer that says there is no such PR counts as not found; a lookup that is unreadable for any other reason
+(network, auth, a timeout, an answer that is not JSON) is accepted: best effort, it never blocks. `fleet-switchboard notice withdraw <owner/repo#N | PR URL>`
+removes the notice. It is allowed for any agent that sent the notice and for the boss recorded with it (the sender's `reports_to` when it
+was sent), and refused with one line for anyone else; for a PR with no notice it is a no-op that says so (exit 0). A withdrawal is audited
+(`notice.withdrawn`: the PR, who withdrew, the sender and boss). With the notice gone, a comment or check on that PR no longer routes to the old
+sender or its boss: it routes by the PR's own references like any PR with no notice, or is unrouted and audited. A notice whose PR cannot be
+read for one hour (`PR_NOTICE_UNREADABLE_SECONDS`; it was seven days, so a mistyped number woke the wrong agent for days) is dropped at
+the next pass with an audit line (`notice.dropped`, reason `unreadable for 60 minutes`, and the error); a PR that becomes readable again clears the clock.
+
 **Deriving.** `derive_decisions` has a fourth source (after the issues, the pending requests and the reports).
 Each notice becomes one entry in `decisions.json`:
 

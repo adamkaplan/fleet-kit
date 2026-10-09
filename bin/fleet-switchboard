@@ -4606,7 +4606,7 @@ PR_NOTICES = "pr-notices.json"
 PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
-PR_NOTICE_UNREADABLE_DAYS = 7     # a notice whose PR cannot be read this long is dropped
+PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read this long is dropped (was 7 days: a mistyped number lingered)
 PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
@@ -4614,6 +4614,13 @@ _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(
 
 class NoticeError(Exception):
     """A PR notice that cannot be recorded or read."""
+
+
+class NoticeNotFound(NoticeError):
+    """`gh` answered that there is no such pull request (a number that is an issue, or nothing): not an unreadable lookup."""
+
+
+_PR_NOT_FOUND = re.compile(r"(?i)could not resolve to a pull ?request|no pull requests? found|not found|HTTP 404|could not find")
 
 
 def parse_pr_ref(text):
@@ -4872,8 +4879,8 @@ def read_pr_facts(engine, repo, number):
     except (OSError, subprocess.SubprocessError) as err:
         raise NoticeError("gh pr view %s#%d: %s" % (repo, number, accounts.scrub(_one_line(str(err), 120)))) from None
     if done.returncode != 0:
-        raise NoticeError("gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(
-            _one_line(done.stderr or "", 160)) or "exit %d" % done.returncode))
+        why = "gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode)
+        raise (NoticeNotFound if _PR_NOT_FOUND.search(done.stderr or "") else NoticeError)(why)
     try:
         return pr_facts_from(json.loads(done.stdout or ""))
     except ValueError:
@@ -4948,7 +4955,7 @@ def decisions_from_notices(engine, now):
 
     Not a decision, so not counted with them. The facts come from `gh pr view`, cached; a PR that is merged or
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
-    keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_DAYS."""
+    keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
     engine.notice_effects = {"drop": set(), "unreadable": {}}
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
@@ -4979,9 +4986,9 @@ def decisions_from_notices(engine, now):
         elif held["stale"]:
             if since is None:
                 engine.notice_effects["unreadable"][key] = iso(now)
-            elif now - (parse_iso(since) or now) >= PR_NOTICE_UNREADABLE_DAYS * 86400:
+            elif now - (parse_iso(since) or now) >= PR_NOTICE_UNREADABLE_SECONDS:
                 engine.notice_effects["drop"].add(key)
-                engine._note("notice.dropped", key, {"reason": "unreadable for %d days" % PR_NOTICE_UNREADABLE_DAYS,
+                engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
                                                      "error": held["error"]})
                 continue
         elif since is not None:
@@ -8359,6 +8366,60 @@ def notice_boss(engine, sender):
     return boss if isinstance(boss, str) and boss.strip() else None
 
 
+def withdraw_pr_notice(state_dir, repo, number, caller):
+    """Remove the notice of `repo#number` for its sender (any agent that sent it) or the boss recorded with it.
+    Returns ("withdrawn", item), ("absent", None) or ("refused", item). Holds the notices lock; idempotent."""
+    with pr_notices_lock(state_dir):
+        items = read_pr_notices(state_dir)
+        old = next((i for i in items if i["repo"] == repo and i["number"] == number), None)
+        if old is None:
+            return "absent", None
+        allowed = {n for n in notice_senders(old)} | ({old["boss"]} if isinstance(old.get("boss"), str) and old.get("boss") else set())
+        if not caller or caller not in allowed:
+            return "refused", old
+        write_pr_notices(state_dir, [i for i in items if i is not old])
+    return "withdrawn", old
+
+
+def _check_open_pr(engine, repo, number):
+    """NoticeError unless `repo#number` is an open pull request at this moment. One bounded `gh pr view` (cached facts first);
+    a lookup that fails for any other reason (network, auth, a timeout) is accepted: best effort, never a block."""
+    held = engine.notice_facts.get("%s#%d" % (repo, number))
+    try:
+        facts = held["facts"] if held and held.get("facts") and not held.get("stale") else read_pr_facts(engine, repo, number)
+    except NoticeNotFound:
+        raise NoticeError("%s#%d is not a pull request I can find (a mistyped number, or an issue): nothing recorded" % (repo, number)) from None
+    except NoticeError:
+        return
+    if facts.get("state") != "open":
+        raise NoticeError("%s#%d is %s, not an open pull request: nothing recorded" % (repo, number, facts.get("state") or "not open"))
+
+
+def _notice_withdraw(args, engine, state, sender, note):
+    if note:
+        sys.stderr.write("%s: notice withdraw takes only the PR\n" % PROG)
+        return EXIT_USAGE
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    try:
+        verdict, item = withdraw_pr_notice(state, repo, number, sender)
+    except NoticeError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    key = "%s#%d" % (repo, number)
+    if verdict == "refused":
+        sys.stderr.write("%s: only the agent that sent the notice for %s (or its boss) can withdraw it\n" % (PROG, key))
+        return EXIT_USAGE
+    if verdict == "withdrawn" and engine.audit is not None:
+        engine.audit.append(engine.actor, "notice.withdrawn", key, {"by": sender, "from": item.get("from"), "boss": item.get("boss")})
+    sys.stderr.write("%s: notice of %s %s\n" % (PROG, key, "withdrawn; a comment on the PR no longer routes to its sender" if verdict == "withdrawn" else "was not recorded (nothing to withdraw)"))
+    print(key)
+    return EXIT_OK
+
+
 def cmd_notice(args, runner, now):
     """PR notices: tell the person about a PR you opened or mean to merge. Recorded for the daemon to show in the
     panel; sends no message and wakes nobody."""
@@ -8372,10 +8433,13 @@ def cmd_notice(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     note = " ".join(" ".join(args.note).split())
+    if args.kind == "withdraw":
+        return _notice_withdraw(args, engine, state, sender, note)
     try:
         repo, number = parse_pr_ref(args.pr)
         if len(note) > REPORT_MAX:
             raise NoticeError("a note is one line of at most %d characters (this one is %d)" % (REPORT_MAX, len(note)))
+        _check_open_pr(engine, repo, number)  # a mistyped number is refused now; an unreadable lookup never blocks
         item, refreshed = record_pr_notice(state, repo, number, sender, note, now(), notice_boss(engine, sender))
     except NoticeError as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -11695,9 +11759,11 @@ def build_parser():
                        "wakes nobody, sends no message)",
         description="`notice pr` records a heads-up about a PR for the person's Decisions panel: information, not a "
                     "decision. It sends no message and wakes nobody. Send it as soon as you OPEN the PR, so it is seen while CI and "
-                    "review run. It stays until the PR is merged or closed; sending it again refreshes the note.")
-    notice.add_argument("kind", choices=("pr",), help="What the notice is about (only `pr`)")
-    notice.add_argument("pr", help="The pull request: owner/repo#N or its URL (an issue is refused)")
+                    "review run. It stays until the PR is merged or closed; sending it again refreshes the note. A number that is "
+                    "not an OPEN pull request is refused when you send it (an unreadable lookup never blocks). `notice withdraw <pr>` removes a "
+                    "notice (the agent that sent it, or its boss); a notice whose PR cannot be read for an hour is dropped.")
+    notice.add_argument("kind", choices=("pr", "withdraw"), help="`pr` records a notice; `withdraw` removes the one for a PR (its sender or its boss)")
+    notice.add_argument("pr", help="The pull request: owner/repo#N or its URL (an issue, a number that is not an open PR, is refused)")
     notice.add_argument("note", nargs="*", help="Optional: one line of why, or what you intend (at most %d characters)" % REPORT_MAX)
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")

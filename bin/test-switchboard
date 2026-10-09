@@ -5683,6 +5683,23 @@ class TestGithubPrRouting(Base):
         (line,) = self.audit("github.unrouted")
         self.assertEqual((line["subject"], line["detail"]["prs"], line["detail"]["count"]), (GH_REPO, [40], 1))
 
+    def test_after_a_withdraw_a_comment_on_the_pr_no_longer_routes_to_the_old_sender(self):
+        self.pr(40)
+        self.notice(40)
+        self.assertEqual(sb.withdraw_pr_notice(self.world.state, GH_REPO, 40, "coder")[0], "withdrawn")
+        self.check(40)
+        self.assertEqual(self.routed(), {}, "no notice, so no notice link")
+        (line,) = self.audit("github.unrouted")
+        self.assertEqual(line["detail"]["prs"], [40])
+
+    def test_after_a_drop_the_pr_routes_as_a_pr_with_no_notice(self):
+        self.pr(41, body="This is the work for #12, no keyword.")
+        self.notice(41, sender="stray-agent", boss="platform")
+        sb.write_pr_notices(self.world.state, [])  # what apply_notice_effects does for a dropped entry
+        self.check(41)
+        self.assertEqual(self.routed(), {"github.check:8001:failure": "platform"}, "the PR's own references decide, not a notice")
+        self.assertEqual(self.routed_by(), {"github.check:8001:failure": "reference"})
+
     def test_the_notice_records_the_senders_boss_and_a_resend_keeps_it(self):
         item, _ = self.notice(40)
         self.assertEqual(item["boss"], "platform")
@@ -22968,8 +22985,10 @@ class TestPrNotices(DecisionsBase):
     def cli(self, *argv, **env):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ[sb.LAB_ENV] = "1"
+        # the command now reads the PR once before it records (issue 99): `gh pr view` is answered by self.gh, the rest by the world
+        route = lambda argv, **kw: self.gh(argv, **kw) if argv[1:3] == ["pr", "view"] else self.world.route(argv, **kw)
         with captured() as (out, err):
-            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now)
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now)
         return code, out.getvalue(), err.getvalue()
 
     # -- sending
@@ -23000,6 +23019,71 @@ class TestPrNotices(DecisionsBase):
         self.assertTrue(refreshed)
         (item,) = sb.read_pr_notices(self.world.state)
         self.assertEqual((item["note"], item["created"], item["refreshed"]), ("two", EPOCH, EPOCH + 500))
+
+    # -- issue 99: a notice is verified when it is sent, and can be withdrawn
+
+    def test_a_number_that_is_not_an_open_pr_is_refused_and_nothing_is_recorded(self):
+        self.gh.answers.update({8: (1, "", "GraphQL: Could not resolve to a PullRequest with the number of 8. (repository.pullRequest)"),
+                                9: (1, "", "no pull requests found for 9"), 10: (0, pr_view_json(state="MERGED"), ""),
+                                11: (0, pr_view_json(state="CLOSED"), ""), 12: (1, "", "HTTP 404: Not Found")})
+        for number in (8, 9, 12):
+            code, _, err = self.cli("notice", "pr", "acme/api#%d" % number, "--from", "coder")
+            self.assertEqual(code, 2, number)
+            self.assertIn("not a pull request I can find", err)
+        for number, word in ((10, "merged"), (11, "closed")):
+            code, _, err = self.cli("notice", "pr", "acme/api#%d" % number, "--from", "coder")
+            self.assertEqual(code, 2)
+            self.assertIn("is %s, not an open pull request" % word, err)
+        self.assertFalse((self.world.state / sb.PR_NOTICES).exists())
+
+    def test_an_unreadable_lookup_never_blocks_a_notice(self):
+        for answer in ((1, "", "HTTP 502 Bad Gateway"), (1, "", "gh: authentication required"), (1, "", "dial tcp: i/o timeout"),
+                       subprocess.TimeoutExpired(["gh"], 5), OSError("gh: not found on PATH"), (0, "not json", "")):
+            self.gh.answers[7] = answer
+            (self.world.state / sb.PR_NOTICES).unlink() if (self.world.state / sb.PR_NOTICES).exists() else None
+            code, _, err = self.cli("notice", "pr", "acme/api#7", "--from", "coder")
+            self.assertEqual(code, 0, (answer, err))
+            self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1)
+
+    def test_an_open_pr_is_read_once_at_send_time_with_a_bounded_timeout(self):
+        self.cli("notice", "pr", "acme/api#7", "--from", "coder")
+        (argv, kwargs), = self.gh.calls
+        self.assertEqual(argv[1:6], ["pr", "view", "7", "--repo", "acme/api"])
+        self.assertLessEqual(kwargs["timeout"], sb.GITHUB_ROUTE_READ_TIMEOUT)
+
+    def test_withdraw_is_for_the_sender_or_its_boss_and_idempotent(self):
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "coder", "x", EPOCH, "platform")
+        sb.record_pr_notice(self.world.state, "acme/api", 8, "coder", "y", EPOCH, "platform")
+        sb.record_pr_notice(self.world.state, "acme/api", 9, "coder", "z", EPOCH, "platform")
+        code, _, err = self.cli("notice", "withdraw", "acme/api#7", "--from", "stranger")
+        self.assertEqual(code, 2)
+        self.assertIn("only the agent that sent the notice", err)
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 3)
+        code, out, err = self.cli("notice", "withdraw", "acme/api#7", "--from", "coder")
+        self.assertEqual((code, out.strip()), (0, "acme/api#7"))
+        self.assertIn("withdrawn", err)
+        code, _, err = self.cli("notice", "withdraw", "https://github.com/acme/api/pull/8", "--from", "platform")  # the boss
+        self.assertEqual(code, 0, err)
+        self.assertEqual([i["number"] for i in sb.read_pr_notices(self.world.state)], [9])
+        code, _, err = self.cli("notice", "withdraw", "acme/api#7", "--from", "stranger")  # absent: idempotent for anyone
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to withdraw", err)
+        self.assertEqual(self.cli("notice", "withdraw", "acme/api#9", "extra", "--from", "coder")[0], 2)
+        self.assertEqual(self.cli("notice", "withdraw", "not-a-ref", "--from", "coder")[0], 2)
+        events = [e for e in self.world.audit() if e["event"] == "notice.withdrawn"]
+        self.assertEqual([(e["subject"], e["detail"]["by"]) for e in events], [("acme/api#7", "coder"), ("acme/api#8", "platform")])
+
+    def test_a_resend_by_another_agent_makes_it_a_sender_who_can_withdraw(self):
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "coder", "x", EPOCH, "platform")
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "coder-b", "x", EPOCH + 1, "platform")
+        self.assertEqual(self.cli("notice", "withdraw", "acme/api#7", "--from", "coder")[0], 0)
+
+    def test_a_withdrawn_notice_leaves_the_panel_at_the_next_pass(self):
+        self.notify()
+        self.assertEqual(len(self.notices()), 1)
+        self.assertEqual(self.cli("notice", "withdraw", "acme/api#7", "--from", "platform")[0], 0)
+        self.pass_(5)
+        self.assertEqual([d for d in self.file()["decisions"] if d["kind"] == "notice"], [])
 
     def test_a_ref_that_is_not_a_pr_is_refused_and_nothing_is_recorded(self):
         for ref in ("https://github.com/acme/api/issues/7", "7", "#7", "acme/api", "acme/api#0", "not a ref",
@@ -23174,20 +23258,22 @@ class TestPrNotices(DecisionsBase):
         self.pass_(5)
         self.assertEqual([i["number"] for i in sb.read_pr_notices(self.world.state)], [7])
 
-    def test_a_pr_unreadable_for_seven_days_is_dropped_and_logged_but_not_before(self):
+    def test_a_pr_unreadable_for_an_hour_is_dropped_and_logged_but_not_before(self):  # seven days until issue 99
         self.gh.answers[7] = (1, "", "HTTP 404")
         self.notify()
         self.pass_(5)
         (item,) = sb.read_pr_notices(self.world.state)
         self.assertEqual(item["unreadable_since"], sb.iso(self.world.clock.now()))
-        self.pass_(6 * 86400)
+        self.assertEqual(sb.PR_NOTICE_UNREADABLE_SECONDS, 3600)
+        self.pass_(3500)
         self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1)
         self.assertEqual(len([d for d in self.file()["decisions"] if d["kind"] == "notice"]), 1)
-        self.pass_(86400 + 10)
+        self.pass_(110)
         self.assertEqual(sb.read_pr_notices(self.world.state), [])
         self.assertEqual([d for d in self.file()["decisions"] if d["kind"] == "notice"], [])
         (dropped,) = [e for e in self.world.audit() if e["event"] == "notice.dropped"]
         self.assertEqual(dropped["subject"], "acme/api#7")
+        self.assertIn("60 minutes", dropped["detail"]["reason"])
 
     def test_a_pr_that_becomes_readable_again_clears_its_unreadable_clock(self):
         self.gh.answers[7] = (1, "", "HTTP 502")
