@@ -8389,7 +8389,7 @@ def _check_open_pr(engine, repo, number):
         facts = held["facts"] if held and held.get("facts") and not held.get("stale") else read_pr_facts(engine, repo, number)
     except NoticeNotFound:
         raise NoticeError("%s#%d is not a pull request I can find (a mistyped number, or an issue): nothing recorded" % (repo, number)) from None
-    except NoticeError:
+    except Exception:  # NoticeError, or a runner that fails in some other way: best effort, a lookup never blocks a notice
         return
     if facts.get("state") != "open":
         raise NoticeError("%s#%d is %s, not an open pull request: nothing recorded" % (repo, number, facts.get("state") or "not open"))
