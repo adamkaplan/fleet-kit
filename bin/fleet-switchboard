@@ -10947,6 +10947,7 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     except (OSError, ValueError):
         pass  # the plugin stopped listening
     record_dropped_calls()
+    record_mode_flips()
     return EXIT_OK
 
 
@@ -11071,6 +11072,19 @@ def cmd_policy_report(args, runner, now):
     print("  enforced       %d ask, %d deny" % (sample["tightened_ask"], sample["tightened_deny"]))
     print("  latency        p50 %s ms, p95 %s ms" % ("-" if p50 is None else p50, "-" if p95 is None else p95))
     return EXIT_OK
+
+
+def record_mode_flips(environ=None):
+    """#113: the plugin tells the next child when a session's cached mode flipped (shadow <-> enforcing): audited as
+    `policy.mode`, so the window in which a call ran under the old mode is visible."""
+    environ = os.environ if environ is None else environ
+    try:
+        flips = [f for f in (environ.get("FLEET_SWITCHBOARD_MODE_FLIPS") or "").split(",") if f][:20]
+        if flips:
+            AuditLog(ensure_state_dir() / "audit.jsonl").append(
+                POLICY_ACTOR, "policy.mode", "plugin", {"flips": [_one_line(f, 120) for f in flips]})
+    except Exception:
+        pass
 
 
 def record_dropped_calls(environ=None):

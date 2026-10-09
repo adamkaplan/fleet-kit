@@ -11516,6 +11516,12 @@ class TestPolicyShadow(PolicyCase):
         events = [e for e in self.world.audit() if e["event"] == "policy.dropped"]
         self.assertEqual([e["detail"]["count"] for e in events], [3])
 
+    def test_a_mode_flip_told_by_the_plugin_is_audited(self):
+        sb.record_mode_flips({"FLEET_SWITCHBOARD_MODE_FLIPS": "ses_a:shadow>enforcing,ses_b:enforcing>shadow"})
+        sb.record_mode_flips({})
+        events = [e for e in self.world.audit() if e["event"] == "policy.mode"]
+        self.assertEqual([e["detail"]["flips"] for e in events], [["ses_a:shadow>enforcing", "ses_b:enforcing>shadow"]])
+
     def test_shadow_off_still_enforces_and_records_no_verdict(self):
         self.configure([{"noul": dict(LOW, hard_to_reverse=0.9)}])
         self.assertEqual(self.judge_tool(self.coder, "shell", "git push --force", "allow")["outcome"], "ask")

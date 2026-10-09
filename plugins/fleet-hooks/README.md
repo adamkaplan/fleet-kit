@@ -91,3 +91,5 @@ or after any reply that is not a shadow reply, the plugin awaits and enforces ex
 is never made asynchronous (one awaited call per 30 s refreshes the mode). A call over the in-flight cap is dropped,
 never blocked on, and counted: the count reaches the next child in `FLEET_SWITCHBOARD_DROPPED` and is audited as
 `policy.dropped`. Errors in this path are swallowed; nothing is written to stdout.
+
+The cached mode is **per session**, so one agent's shadow reply never makes another's calls asynchronous, and a session with no cached mode awaits. A flip (shadow to enforcing or back) is told to the next child in `FLEET_SWITCHBOARD_MODE_FLIPS` and audited as `policy.mode`, so the window up to 30 s is visible.

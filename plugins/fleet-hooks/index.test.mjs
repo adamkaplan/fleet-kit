@@ -102,7 +102,7 @@ function fakeSpawn(replyFor) {
   };
   return { spawnFn, calls };
 }
-const input = () => ({ sessionID: "ses_1", action: "shell", resources: ["ls"], effect: "allow" });
+const input = (sessionID = "ses_1") => ({ sessionID, action: "shell", resources: ["ls"], effect: "allow" });
 const SHADOW = { outcome: "allow", judged: true, shadow: true, reason: "x" };
 
 test("unknown mode awaits and enforces a deny", async () => {
@@ -149,7 +149,7 @@ test("the mode expires and the next call awaits again", async () => {
 
 test("over the cap calls are dropped, counted, never blocked, and the next child is told", async () => {
   const { spawnFn, calls } = fakeSpawn((n) => (n === 1 ? SHADOW : "hang"));
-  const state = { shadowUntil: 0, inflight: 0, dropped: 0 };
+  const state = {};
   const h = makeHandler({ bin: "/x", spawnFn, state });
   await h(input());
   for (let k = 0; k < SHADOW_MAX_INFLIGHT + 3; k++) await h(input());
@@ -170,4 +170,29 @@ test("errors in shadow are swallowed", async () => {
   const h = makeHandler({ bin: "/x", spawnFn });
   await h(input());
   await h(input());
+});
+
+test("the mode is per session: another session's shadow reply does not make this one async", async () => {
+  let n = 0;
+  const { spawnFn, calls } = fakeSpawn(() => (++n === 1 ? SHADOW : { outcome: "deny", judged: true, reason: "no" }));
+  const h = makeHandler({ bin: "/x", spawnFn });
+  await h(input("ses_a"));
+  const b = input("ses_b");
+  await h(b);
+  assert.equal(b.effect, "deny", "ses_b had no cached mode: it awaited and was enforced");
+  assert.equal(calls.length, 2);
+});
+
+test("a flip is told to the next child once", async () => {
+  let clock = 1000;
+  let n = 0;
+  const { spawnFn, calls } = fakeSpawn(() => (++n === 1 ? SHADOW : { outcome: "allow", judged: true, reason: "ok" }));
+  const state = {};
+  const h = makeHandler({ bin: "/x", spawnFn, now: () => clock, state });
+  await h(input());
+  clock += MODE_TTL_MS + 1;
+  await h(input()); // enforcing now: a flip
+  await h(input());
+  const told = calls.map((c) => c.env.FLEET_SWITCHBOARD_MODE_FLIPS).filter(Boolean);
+  assert.deepEqual(told, ["ses_1:shadow>enforcing"]);
 });

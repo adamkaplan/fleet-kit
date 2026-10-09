@@ -78,7 +78,7 @@ function parseReply(text) {
 
 // Run the CLI once. Resolves with its reply, or null when it cannot answer in
 // time (a timeout kills it) or at all. Never rejects.
-export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
+export function runJudge(bin, request, timeoutMs, spawnFn = spawn, extraEnv = null) {
   return new Promise((resolve) => {
     let settled = false;
     let out = "";
@@ -94,7 +94,7 @@ export function runJudge(bin, request, timeoutMs, spawnFn = spawn) {
       finish(null);
     }, timeoutMs);
     try {
-      child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "pipe", "ignore"], env: childEnv(), shell: false });
+      child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "pipe", "ignore"], env: Object.assign(childEnv(), extraEnv || {}), shell: false });
       child.on("error", () => finish(null));
       child.on("close", () => finish(parseReply(out)));
       child.stdout.on("data", (chunk) => {
@@ -144,7 +144,7 @@ export function fireDetached(bin, request, state, spawnFn = spawn) {
   timer.unref?.();
   try {
     const owed = state.dropped;
-    const env = childEnv();
+    const env = Object.assign(childEnv(), noticesFor(state));
     if (owed > 0) env.FLEET_SWITCHBOARD_DROPPED = String(owed);
     child = spawnFn(bin, JUDGE_ARGV, { stdio: ["pipe", "ignore", "ignore"], env, shell: false });
     if (owed > 0) state.dropped -= owed;
@@ -159,20 +159,48 @@ export function fireDetached(bin, request, state, spawnFn = spawn) {
   return true;
 }
 
+// The mode is kept PER SESSION: one agent's shadow reply never makes another agent's calls asynchronous, and a
+// session with no cached mode awaits. A flip (shadow to enforcing or back) is told to the next judge-tool child in
+// FLEET_SWITCHBOARD_MODE_FLIPS ("<session>:<from>><to>,..."), which audits it as `policy.mode`, so the up-to-30 s window
+// is visible.
+export const MAX_SESSIONS = 500;
+
+export function noticesFor(state) {
+  if (!state.flips || state.flips.length === 0) return {};
+  const told = state.flips.splice(0, 20).join(",");
+  return { FLEET_SWITCHBOARD_MODE_FLIPS: told };
+}
+
+function setMode(state, session, shadow, now) {
+  const modes = state.modes;
+  const before = modes.get(session);
+  const was = before === undefined ? null : before.shadow ? "shadow" : "enforcing";
+  const is = shadow ? "shadow" : "enforcing";
+  if (was !== null && was !== is) state.flips.push(`${session}:${was}>${is}`);
+  modes.delete(session);
+  modes.set(session, { shadow, until: shadow ? now + MODE_TTL_MS : 0 });
+  if (modes.size > MAX_SESSIONS) modes.delete(modes.keys().next().value);
+}
+
 export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null }) {
-  const mode = state || { shadowUntil: 0, inflight: 0, dropped: 0 };
+  const mode = state || {};
+  mode.inflight = mode.inflight || 0;
+  mode.dropped = mode.dropped || 0;
+  mode.modes = mode.modes || new Map();
+  mode.flips = mode.flips || [];
   return async function evaluate(input) {
     try {
       if (!input || !OUTCOMES.includes(input.effect) || typeof input.sessionID !== "string") return;
       if (toolOf(input.action) === null) return; // not an action this plugin forwards: the configured outcome stands
       const request = requestOf(input);
-      if (now() < mode.shadowUntil) {
+      const known = mode.modes.get(input.sessionID);
+      if (known && known.shadow && now() < known.until) {
         fireDetached(bin, request, mode, spawnFn);
         return; // shadow: the tool call proceeds at once
       }
-      const reply = await runJudge(bin, request, timeoutMs, spawnFn);
-      if (reply && reply.shadow === true) mode.shadowUntil = now() + MODE_TTL_MS;
-      else if (reply && reply.judged === true) mode.shadowUntil = 0; // an enforcing judge: never async
+      const reply = await runJudge(bin, request, timeoutMs, spawnFn, noticesFor(mode));
+      if (reply && reply.shadow === true) setMode(mode, input.sessionID, true, now());
+      else if (reply && reply.judged === true) setMode(mode, input.sessionID, false, now()); // enforcing: never async
       if (reply && reply.shadow === true) return; // a shadow reply is the configured outcome anyway
       if (!isStricter(reply, input.effect)) return; // the second guard: never loosen, never repeat
       input.effect = reply.outcome;
