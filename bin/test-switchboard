@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import re
+from urllib.parse import unquote
 import shlex
 import shutil
 import signal
@@ -2253,7 +2254,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -6011,7 +6012,7 @@ class TestGithubDelivery(Base):
 class TestGithubCatchUp(Base):
     def setUp(self):
         super().setUp()
-        self.rig = GithubRig(self, config={"sweep": False})  # this class counts every read: the sweep's are not its subject
+        self.rig = GithubRig(self, config={"sweep": False, "triage": False})  # this class counts every read: the sweep's are not its subject
         self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
         self.world.clock.t += 7200
         self.gh.issue(12, parent=1)
@@ -7442,7 +7443,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "fleetkit", "text": None})
         self.make("off")
@@ -14627,6 +14628,375 @@ class TestSweep(Base):
                 sb.validate_config(dict(base, sweep=bad))
 
 
+# ======================================================================
+# #130: the triage function (rule family T). ADAM'S HOLD: it writes nothing to GitHub. Synthetic repos only.
+# ======================================================================
+class FakeTriageHub:
+    """Reads only: read_pages / _read_one over canned repos. A write cannot even be asked for: there is no such method."""
+
+    def __init__(self):
+        self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
+        self.calls, self.unreadable = [], set()
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        self.calls.append(path)
+        repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
+        if repo in self.unreadable:
+            raise sb.GitHubUnavailable("HTTP 404: Not Found")
+        match = re.search(r"/issues/(\d+)/comments", path)
+        if match:
+            return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
+        if "/issues/comments" in path:
+            return list(self.comments.get(repo, [])), False
+        if "state=closed" in path:
+            label = unquote(re.search(r"labels=([^&]+)", path).group(1))
+            return list(self.closed.get(repo, {}).get(label, [])), False
+        return list(self.open.get(repo, {}).values()), False
+
+    def _read_one(self, repo, path, now, fresh=False):
+        self.calls.append(path)
+        number = int(path.rsplit("/", 1)[1])
+        if repo in self.unreadable:
+            raise sb.GitHubUnavailable("HTTP 404: Not Found")
+        for pool in (self.live.get(repo, {}), self.open.get(repo, {})):
+            if number in pool:
+                return dict(pool[number])
+        for records in self.closed.get(repo, {}).values():
+            for record in records:
+                if record["number"] == number:
+                    return dict(record, state="closed")
+        return {"number": number, "state": "closed"}
+
+
+def tri_issue(clock_now, number, created=5.0, updated=None, author="bot", assignees=(), labels=(), body="", pr=False,
+              draft=False, parent=None, repo="acme/api", state="open"):
+    """A record `created` / `updated` days old (updated defaults to created)."""
+    updated = created if updated is None else updated
+    record = {"number": number, "state": state, "body": body, "user": {"login": author},
+              "assignees": [{"login": a} for a in assignees], "labels": [{"name": l} for l in labels],
+              "created_at": sb.iso(clock_now - created * 86400), "updated_at": sb.iso(clock_now - updated * 86400)}
+    if pr:
+        record["pull_request"] = {"url": "x"}
+        record["draft"] = draft
+    if parent:
+        record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (repo, parent)
+    return record
+
+
+def tri_comment(clock_now, number, body, hours_ago=1.0, repo="acme/api"):
+    return {"issue_url": "https://api.github.com/repos/%s/issues/%d" % (repo, number), "body": body,
+            "created_at": sb.iso(clock_now - hours_ago * 3600)}
+
+
+class TestTriage(Base):
+    COS, USER = "osuser:awaiting-cos", "osuser:awaiting-user"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["awaiting_label"], self.engine.config["awaiting_cos_label"] = self.USER, self.COS
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"])
+        self.engine.discover(self.world.clock.now())
+        self.now = self.world.clock.now()
+        self.hub.open["acme/api"] = {}
+
+    def add(self, number, **kw):
+        self.hub.open["acme/api"][number] = tri_issue(self.world.clock.now(), number, **kw)
+
+    def comment(self, number, body, hours_ago=1.0):
+        self.hub.comments.setdefault("acme/api", []).append(tri_comment(self.world.clock.now(), number, body, hours_ago))
+
+    def go(self, decisions=(), passes=10, errors=(), **cfg):
+        self.engine.config["triage"].update(cfg)
+        for _ in range(passes):
+            self.world.tick(1)
+            sb.triage_pass(self.engine, list(decisions), self.world.clock.now(), errors)
+
+    def found(self):
+        rows = [e for e in self.world.audit() if e["event"] == "triage.finding"]
+        return sorted({(e["detail"]["rule"], e["detail"]["ref"]) for e in rows})
+
+    def only(self, rule):
+        return [ref for r, ref in self.found() if r == rule]
+
+    def charter(self):
+        self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
+        self.add(2, created=20, updated=0.1, parent=1, labels=["kind"], body="Next: go")
+
+    def test_t1_owner_missing_both_ways_and_the_grace_day(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])                         # no assignee, no chain, ours (bot): T1
+        self.add(11, created=2, labels=["kind"], assignees=["bot"])      # assigned
+        self.add(12, created=0.5, labels=["kind"])                       # inside the grace day
+        self.add(13, created=2, labels=["kind"], parent=2)               # a work item under an ask
+        self.go()
+        self.assertEqual(self.only("T1"), ["acme/api#10"])
+
+    def test_t2_labels_per_repo_config_only(self):
+        self.charter()
+        self.add(20, created=2, assignees=["bot"], labels=["bug"])
+        self.add(21, created=2, assignees=["bot"], labels=["kind"])
+        self.go()
+        self.assertEqual(self.only("T2"), [])                            # no required_labels config: nothing is guessed
+        self.go(required_labels={"acme/api": ["kind"]})
+        self.assertEqual(self.only("T2"), ["acme/api#20"])
+        self.go(required_labels={"acme/api": [["kind", "bug"]]})        # alternatives satisfy a group
+        self.assertEqual(self.only("T2"), ["acme/api#20"])               # (already audited today; 21 never)
+        self.assertNotIn(("T2", "acme/api#21"), self.found())
+
+    def test_t3_an_ask_is_quiet_after_three_days_others_after_fourteen_and_a_next_step_clears_it(self):
+        self.charter()
+        self.add(30, created=9, updated=4, parent=1, labels=["kind"])                     # an ask, quiet 4d, no next step
+        self.add(31, created=9, updated=4, parent=1, labels=["kind"])                     # an ask with a next-step comment
+        self.comment(31, "Next: wire the adapter")
+        self.add(32, created=20, updated=15, assignees=["bot"], labels=["kind"])          # other issue quiet 15d
+        self.add(33, created=20, updated=10, assignees=["bot"], labels=["kind"])          # other issue quiet 10d
+        self.add(34, created=20, updated=15, assignees=["bot"], labels=["kind"], body="## Decision required\nx")
+        self.add(35, created=20, updated=15, assignees=["bot"], labels=["kind", self.USER], body="x")
+        self.add(36, created=20, updated=15, assignees=["bot"], labels=["kind"], body="- [ ] do it")
+        self.go()
+        self.assertEqual(self.only("T3"), ["acme/api#30", "acme/api#32"])
+        self.assertNotIn(("T9", "acme/api#30"), self.found())                              # T3 takes precedence over T9
+
+    def test_t5_and_t6_wait_two_days_and_only_for_a_whole_list(self):
+        old = sb.iso(self.now - 3 * 86400)
+        decisions = [{"id": "d1", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 50, "since": old},
+                     {"id": "d2", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 51, "since": old},
+                     {"id": "d3", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 52,
+                      "since": sb.iso(self.now - 3600)},
+                     {"id": "d4", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 53, "since": old}]
+        self.go(decisions, errors=[{"source": "github", "error": "not read yet"}], passes=3)
+        self.assertEqual(self.found(), [])                                                # an incomplete list is not judged
+        self.go(decisions, passes=3)
+        self.assertEqual((self.only("T5"), self.only("T6")), (["acme/api#50"], ["acme/api#51"]))
+
+    def test_t7_is_about_our_prs_only_because_formal_reviews_are_not_in_the_data(self):
+        self.charter()
+        self.add(70, created=0.3, pr=True)                                    # ours, 7h: T7
+        self.add(71, created=0.3, pr=True)
+        self.comment(71, "Review of aaaaaaa: APPROVE", 2)
+        self.add(72, created=0.3, pr=True, draft=True)
+        self.add(73, created=0.1, pr=True)                                    # ours, 2.4h: too young
+        self.add(74, created=0.3, pr=True, author="stranger")                 # theirs, 7h: not yet
+        self.add(75, created=3, pr=True, author="stranger")                   # theirs, 3d: they use formal reviews, unseen
+        self.go()
+        self.assertEqual(self.only("T7"), ["acme/api#70"])
+        self.assertEqual((self.only("OO"), [f for f in self.found() if f[1] == "acme/api#75"]), ([], []))   # not even a flag
+
+    def test_t8_a_blocked_ask_and_t9_a_silent_ask(self):
+        self.charter()
+        self.add(80, created=9, updated=2, parent=1, labels=["kind", "blocked"], body="Next: x")
+        self.add(81, created=9, updated=4, parent=1, labels=["kind"], body="Next: x")
+        self.add(82, created=9, updated=0.5, parent=1, labels=["kind", "blocked"], body="Next: x")
+        self.go()
+        self.assertEqual((self.only("T8"), self.only("T9")), (["acme/api#80"], ["acme/api#81"]))
+
+    def test_t10_a_closed_issue_still_labelled_awaiting_is_immediate(self):
+        self.charter()
+        closed = tri_issue(self.now, 100, created=9, labels=[self.USER, "kind"], state="closed")
+        self.hub.closed["acme/api"] = {self.USER: [closed]}
+        self.go()
+        self.assertEqual(self.only("T10"), ["acme/api#100"])
+        self.hub.closed["acme/api"] = {self.USER: [closed]}
+        self.hub.live["acme/api"] = {100: dict(closed, labels=[{"name": "kind"}])}   # the label was removed since the list read
+        self.engine.triage.confirmed.clear()
+        self.engine.triage.logged.clear()
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go()
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "triage.dismissed"])
+
+    def test_t11_an_orphan_is_flag_only_and_never_with_t1(self):
+        self.charter()
+        self.add(110, created=60, labels=["kind"])                  # unowned and old: T1 only
+        self.go()
+        self.assertEqual((self.only("T1"), self.only("T11")), (["acme/api#110"], []))
+        self.world.add_agent("coder", fleet={"role": "coder", "issue": 111, "repo": "acme/api"})
+        self.engine.discover(self.world.clock.now())
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.add(111, created=60, labels=["kind"])                  # an agent works on it (no T1) but nothing else owns it
+        self.go()
+        self.assertEqual(self.only("T11"), ["acme/api#111"])
+
+    def test_another_persons_issue_is_only_ever_a_flag_never_our_violation(self):
+        self.charter()
+        self.add(120, created=40, updated=40, author="stranger", labels=[])        # would be T1, T2 and T3 (T11 yields to T1)
+        self.go(required_labels={"acme/api": ["kind"]})
+        self.assertEqual([f for f in self.found() if f[1] == "acme/api#120"], [("OO", "acme/api#120")])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "OO"][0]
+        self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
+
+    def test_an_unreadable_repo_is_reported_once_and_gives_no_findings(self):
+        self.engine.config["triage"]["repos"] = ["acme/api", "acme/gone"]
+        self.hub.unreadable = {"acme/gone"}
+        self.add(130, created=3, labels=["kind"])
+        self.go(passes=15)
+        self.assertEqual([r for _, r in self.found() if r.startswith("acme/gone")], [])
+        unread = [e for e in self.world.audit() if e["event"] == "triage.unreadable"]
+        self.assertEqual([e["detail"]["repo"] for e in unread], ["acme/gone"])
+        self.assertEqual(sb.triage_summary(self.world.state)["unreadable"], ["acme/gone"])
+        self.assertIn("unreadable repo(s)", "\n".join(sb.triage_status_lines(sb.triage_summary(self.world.state))))
+
+    def test_the_call_budget_per_pass_holds_and_every_repo_is_reached(self):
+        repos = ["acme/r%d" % i for i in range(5)]
+        for repo in repos:
+            self.hub.open[repo] = {}
+        self.engine.config["triage"]["repos"] = repos
+        worst = 0
+        for _ in range(30):
+            before = len(self.hub.calls)
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+            worst = max(worst, len(self.hub.calls) - before)
+        self.assertLessEqual(worst, sb.TRIAGE_CALLS_PER_PASS)
+        self.assertEqual({r for r, u in self.engine.triage.units if u == "issues"}, set(repos))
+        quiet = len(self.hub.calls)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.hub.calls), quiet)                  # the cache answers
+
+    def test_shadow_wakes_nobody_and_enabled_adds_only_one_batched_fact_with_a_debounce(self):
+        self.charter()
+        for n in (140, 141, 142):
+            self.add(n, created=3, labels=["kind"])
+        self.go()
+        self.assertEqual(self.engine.triage.facts, {})                                      # shadow: nobody woken
+        self.assertEqual(sb.triage_summary(self.world.state)["enabled"], False)
+        self.go(enabled=True)
+        ((key, (summary, _)),) = [(k, v) for k, v in self.engine.triage.facts.items() if "summary" not in k]
+        self.assertTrue(summary.startswith("triage: 3 findings: "))
+        self.assertEqual(summary.count("acme/api#14"), 3)
+        self.assertIn("changes nothing on GitHub", summary)
+        fact = [f for f in sb.TriageFacts.__call__(self.bound()) if f.kind == "triage" and "summary" not in f.key]
+        self.assertEqual((fact[0].recipient, fact[0].sender), ("cos", "switchboard"))
+        self.go(passes=3)
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 1)   # debounced
+        self.world.tick(25 * 3600)
+        self.engine.triage.confirmed.clear()
+        self.engine.triage.units.clear()
+        for n in (140, 141, 142):
+            self.hub.open["acme/api"][n] = tri_issue(self.world.clock.now(), n, created=4, labels=["kind"])
+        self.go()
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 2)   # re-alarmed after a day
+
+    def bound(self):
+        source = sb.TriageFacts()
+        source.bind(self.engine)
+        return source
+
+    def test_the_daily_summary_is_audited_once_a_day_and_sent_only_when_enabled(self):
+        self.charter()
+        self.add(150, created=3, labels=["kind"])
+        self.go()
+        summaries = [e for e in self.world.audit() if e["event"] == "triage.summary"]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("triage summary: found 1 (T1 1)", summaries[0]["detail"]["text"])
+        self.assertEqual([k for k in self.engine.triage.facts if "summary" in k], [])
+        self.world.tick(86400 + 5)
+        self.go(passes=2, enabled=True)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "triage.summary"]), 2)
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" in k]), 1)
+
+    def test_a_finding_is_raised_only_after_a_fresh_read_bears_it_out(self):
+        self.charter()
+        self.add(160, created=3, labels=["kind"])                                           # the list copy says unowned
+        self.hub.live["acme/api"] = {160: tri_issue(self.now, 160, created=3, labels=["kind"], assignees=["bot"])}
+        self.go()
+        self.assertEqual(self.only("T1"), [])
+        self.assertEqual([e["detail"]["ref"] for e in self.world.audit() if e["event"] == "triage.dismissed"], ["acme/api#160"])
+
+    def test_nothing_in_the_triage_can_write_to_github(self):
+        source = Path(sb.__file__).read_text() if hasattr(sb, "__file__") else ""
+        text = open(str(REPO / "bin" / "fleet-switchboard")).read()
+        start, end = text.index("# ---- #130: the triage function"), text.index("# ---- the daily friction wake")
+        section = text[start:end]
+        for forbidden in ("--method", "-X ", "issue edit", "issue comment", "issue close", "add-label", "--add-label",
+                          "assignee", "POST", "PATCH", "DELETE", "subprocess", "gh_api("):
+            if forbidden == "assignee":
+                continue   # the word appears as a field NAME read from a record
+            self.assertNotIn(forbidden, section, forbidden)
+        self.assertTrue(all(c.split("?")[0].split("/")[-1] in ("issues", "comments") or "/issues/" in c for c in self.hub.calls))
+
+    def test_config_is_validated_off_by_false_and_absent_adds_nothing(self):
+        base = {"opencode": FAKE_OPENCODE}
+        self.assertNotIn("triage", sb.validate_config(dict(base)))
+        self.assertFalse(sb.validate_config(dict(base, triage={}))["triage"]["enabled"])
+        self.assertIs(sb.validate_config(dict(base, triage=False))["triage"], False)
+        for bad in ({"enabled": "yes"}, {"repos": ["notarepo"]}, {"sla": {"t1_days": 0}}, {"sla": {"nope": 1}},
+                    {"required_labels": {"a/b": "kind"}}, {"nope": 1}, {"sla_overrides": {"a/b": {"t1_days": -1}}}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, triage=bad))
+        self.assertEqual(sb.triage_sla({"sla": {"t1_days": 2}, "sla_overrides": {"a/b": {"t1_days": 5}}}, "a/b")["t1_days"], 5)
+
+    def test_other_owner_flags_are_not_our_findings_and_never_wake_cos_alone(self):
+        self.charter()
+        self.add(180, created=40, updated=40, author="stranger")                  # only an OO flag
+        self.go(enabled=True)
+        self.assertEqual(self.only("OO"), ["acme/api#180"])                      # audited
+        self.assertEqual(sb.triage_summary(self.world.state)["counts"], {})      # not counted as ours
+        self.assertEqual(sb.triage_summary(self.world.state)["total"], 0)
+        self.assertEqual(sb.triage_summary(self.world.state)["other_owner"], 1)
+        self.assertEqual([k for k in self.engine.triage.facts if "summary" not in k], [])   # never a wake on its own
+        self.add(181, created=3, labels=["kind"])                                 # a real finding of ours
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(enabled=True)
+        ((_, (text, _)),) = [(k, v) for k, v in self.engine.triage.facts.items() if "summary" not in k]
+        self.assertIn("acme/api#181 T1", text)
+        self.assertNotIn("acme/api#180", text)
+        self.assertIn("Also 1 other-owner flag(s)", text)                         # a count only, when a wake happens anyway
+        self.assertIn("1 other-owner flag(s)", "\n".join(sb.triage_status_lines(sb.triage_summary(self.world.state))))
+
+    def test_the_summary_is_every_24_hours_since_the_last_one_not_per_calendar_day(self):
+        self.charter()
+        self.add(190, created=3, labels=["kind"])
+        self.go(enabled=True)
+        count = lambda: len([e for e in self.world.audit() if e["event"] == "triage.summary"])
+        self.assertEqual(count(), 1)
+        first = self.engine.triage.summarised
+        self.world.tick(23 * 3600)
+        self.go(passes=2, enabled=True)
+        self.assertEqual(count(), 1)                                              # 23 h later: not yet, even across midnight
+        self.world.tick(3600 + 5)
+        self.go(passes=2, enabled=True)
+        self.assertEqual(count(), 2)
+        self.assertGreaterEqual(self.engine.triage.summarised - first, 86400)
+        self.assertIn("other-owner flags", [e for e in self.world.audit() if e["event"] == "triage.summary"][0]["detail"]["text"])
+
+    def test_the_precision_sheet_is_local_deduplicated_and_summarised(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("triage_sample", str(REPO / "bin" / "triage-sample"))
+        spec = importlib.util.spec_from_loader("triage_sample", loader)
+        tool = importlib.util.module_from_spec(spec)
+        loader.exec_module(tool)
+        self.charter()
+        self.add(170, created=3, labels=["kind"])
+        self.add(171, created=3, labels=["kind"])
+        self.go()
+        self.world.tick(60)
+        self.go(passes=1)
+        out = Path(self.home) / "sheet.jsonl"
+        code = tool.main(["--audit", str(self.world.audit_path), "--out", str(out), "--days", "1"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(l) for l in out.read_text().splitlines()]
+        self.assertEqual(sorted((r["rule"], r["ref"]) for r in rows), [("T1", "acme/api#170"), ("T1", "acme/api#171")])
+        self.assertEqual({(r["label"], r["note"]) for r in rows}, {(None, None)})
+        self.assertEqual(oct(out.stat().st_mode & 0o777), "0o600")
+        rows[0]["label"], rows[1]["label"] = "TP", "fp"
+        out.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        text = tool.format_summary(tool.summarise(str(out)))
+        self.assertIn("T1      1    1           0  50%", text)
+        self.assertEqual(tool.main(["--audit", str(self.world.audit_path), "--out", str(REPO / "triage-sheet.jsonl")]), 2)
+        self.assertFalse((REPO / "triage-sheet.jsonl").exists())     # refused inside a git working tree
+
+    def test_triage_false_turns_it_fully_off(self):
+        self.engine.config["triage"] = False
+        sb.triage_pass(self.engine, [], self.now, ())
+        self.assertEqual((self.hub.calls, getattr(self.engine, "triage", None)), ([], None))
+
+
 class TestRiders(ReportBase):
     def test_a_fact_is_not_a_rider_unless_it_says_so_and_the_field_round_trips(self):
         self.assertIn("rider", sb.Fact.FIELDS)
@@ -16330,6 +16700,7 @@ class TestDecisionsFile(DecisionsBase):
     def test_the_file_is_replaced_by_rename_so_a_reader_never_sees_half_of_it(self):
         self.ask_the_boss("Which database?")
         self.world.engine.config["sweep"] = False  # the sweep's own display file is not the subject here
+        self.world.engine.config["triage"] = False
         with mock.patch.object(sb.os, "replace", wraps=os.replace) as replaced:
             self.pass_()
         (call,) = replaced.call_args_list

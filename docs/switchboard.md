@@ -2230,6 +2230,50 @@ resolves or escalates. Text in code blocks, inline code and quoted lines is igno
 S1 also flags charters and other issues that carry the awaiting label, by design. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (a `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
 counts by kind and `fleet-doctor` warns when there are findings.
 
+### The triage function (#130, rule family T)
+
+**ADAM'S HOLD, stated plainly: the triage function writes NOTHING to GitHub. No label, no assignment, no comment, no
+close, no edit, ever, until the person has reviewed its shadow findings and says otherwise.** There is no code for any of
+it: the function only reads. Its only writes are audit lines (`triage.finding`, `triage.dismissed`, `triage.unreadable`,
+`triage.summary`), `triage.json` (what `status` shows) and, only when `enabled`, one batched fact to the Chief of Staff.
+The fix rules of the plan (a missing label, an assignment, a comment) stay unbuilt.
+
+It grows the sweep: the same hub reads, call budget, fresh re-check, shadow default and batched fact. Config key `triage`
+(absent, `null` or `{}` is shadow; `"enabled": true` adds only the wake of the Chief of Staff; `false` is fully off):
+`repos` (the tracked repos, `OWNER/REPO`; default: the repos the daemon already watches. The extra tracked repos that are not watched are named here in the local config, never in this public source; each is read with its existing per-repo account),
+`required_labels` (`{repo: [label or [alternatives], ...]}`; no entry, no T2), `sla` and `sla_overrides` (per repo; the
+numbers below are the defaults), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
+(true), `realarm_hours` (24), `max_findings` (30).
+
+| Rule | Finding | Default SLA |
+|---|---|---|
+| T1 | open issue with no assignee, not in a charter's chain (charter, ask, work item, by the parent links) and not worked by an agent | 1 day after creation |
+| T2 | a required label group missing (config only) | 1 day |
+| T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 3 days, other issues 14 |
+| T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | 2 days |
+| T7 | an open non-draft PR of OURS with no review comment (`Review of <sha>`, approve, changes requested, LGTM): our agents review by signed comment, which the triage reads. Other teams use formal GitHub reviews, which it does not read, so their PRs are never called unreviewed (no T7, not even a flag) | 4 hours; a PR older than 14 days is not judged (its review may be outside the comment window) |
+| T8 | a blocked ask (a `blocked` label) | 1 day quiet |
+| T9 | an ask with no activity (T3 takes precedence) | 3 days |
+| T10 | a closed issue still carrying an awaiting label | immediate |
+| T11 | an orphan: in no chain, no assignee, untouched (T1 takes precedence, so it covers items an agent works on) | 30 days |
+
+T4 and T12 are the sweep's S5 and the report fold; they are not repeated. **Another person's or team's issue or PR is never
+our violation:** an item whose author and assignees are none of ours (`our_logins`), that is in no chain, is not
+agent-worked and has no notice, is reported only as `OO` (other-owner, flag only), whatever rules it would break, with
+`would_be` listing them. An `OO` flag is audited but is not one of our findings (it is not in the counts or the total, shown as its own `other-owner` count) and never wakes the Chief of Staff on its own: when a wake happens anyway for real findings, the fact adds a count (`Also N other-owner flag(s)`), and the daily summary carries it. Precision: each candidate is re-read fresh before it is audited or raised (T3 and T7 also re-read the
+comments); one the fresh read does not bear out is `triage.dismissed`; one that cannot be checked now is neither audited nor
+raised that pass. A repo the account cannot read is `unreadable`, audited once and shown in `status` and `fleet-doctor`,
+never findings. Reads: four units per repo (open issues, recent comments, closed issues per awaiting label), each at most 2
+pages, kept 15 minutes, at most 4 `gh` calls per pass (1 reserved for fresh checks), the stalest unit first across all repos,
+so none starves; units not yet read are listed as unchecked.
+
+Reporting: one batched fact per pass (`triage: N findings: ref rule, ...`, refs and kinds only), each item re-raised at most
+once per `realarm_hours`; one summary line every 24 hours since the last one (counts by rule: found, other-owner flags, escalated, unchecked, unreadable repos), audited
+always and sent only when enabled. `status` shows `triage shadow: N findings (T1 a, T3 b, ...)`. `bin/triage-sample` writes
+the last week's findings to a LOCAL sheet (it refuses a path inside a git working tree) with `label` and `note` columns for
+TP/FP, and `triage-sample --summary FILE` computes precision per rule from the filled sheet (like `bin/judge-sample`); a rule
+under 80% is fixed or dropped first.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and
