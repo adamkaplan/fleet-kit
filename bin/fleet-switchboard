@@ -6251,17 +6251,24 @@ def sweep_says_waiting(regex, text):
     return False
 
 
-DECISION_SECTION_RE = re.compile(r"^##[ \t]+decision required[ \t]*$", re.I | re.M)
+DECISION_SECTION_RE = re.compile(r"^##[ \t]+decision required(?![A-Za-z0-9_])", re.I | re.M)
 
 
-def sweep_has_section(body):
-    """True for a real `## Decision required` heading line (level 2, that text and nothing else on the line, any case;
-    not a longer heading such as `Resolved (was: Decision required)`, not an inline mention, not inside code or a quote),
-    or for a decision-rows block (a batch issue's decision)."""
+def sweep_has_heading(body):
+    """True when a line of the body STARTS with a level-2 `## Decision required` heading (any case, CRLF-safe) followed by
+    the end of the line or any suffix that does not continue the word: `## Decision required (re-verified 2026-10-09)`,
+    `## Decision required: pick`, `## Decision required - x`. Not a heading that merely contains the words
+    (`## Resolved (was: Decision required)`), not a deeper heading (`###`), not an inline mention, not code or a quote."""
     if not isinstance(body, str):
         return False
     body = body.replace("\r\n", "\n").replace("\r", "\n")  # text typed in the web editor keeps CRLF
-    return bool(DECISION_SECTION_RE.search(SWEEP_QUOTED_RE.sub(" ", body))) or bool(parse_decision_rows(body))
+    return bool(DECISION_SECTION_RE.search(SWEEP_QUOTED_RE.sub(" ", body)))
+
+
+def sweep_has_section(body):
+    """The heading, or a decision-rows block (a batch issue's decision). S1b (a label with no section) takes either; S1a
+    (a section with no label) takes the heading only: a resolved batch keeps its rows block."""
+    return sweep_has_heading(body) or (isinstance(body, str) and bool(parse_decision_rows(body)))
 
 
 class SweepState:
@@ -6310,7 +6317,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         body = record.get("body")
         items[number] = {"pr": _is_pr(record), "labels": names,
-                         "section": sweep_has_section(body),
+                         "section": sweep_has_section(body), "heading": sweep_has_heading(body),
                          "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
@@ -6396,7 +6403,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
         for number, item in picture["items"].items():
             if not item["pr"]:
                 labelled = bool(item["labels"] & awaiting)
-                if item["section"] and not labelled:
+                if item["heading"] and not labelled:
                     found.add(("S1a", ref_text(repo, number)))
                 elif labelled and not item["section"]:
                     found.add(("S1b", ref_text(repo, number)))
@@ -6450,8 +6457,9 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     body, is_pr = data.get("body"), _is_pr(data)
     labelled = bool(names & {awaiting_label(engine.config), awaiting_cos_label(engine.config)})
     if kind in ("S1a", "S1b"):
-        section = sweep_has_section(body)
-        return (not is_pr) and ((section and not labelled) if kind == "S1a" else (labelled and not section))
+        if is_pr:
+            return False
+        return (sweep_has_heading(body) and not labelled) if kind == "S1a" else (labelled and not sweep_has_section(body))
     waits_in_comments = False
     if comments_raised:
         budget[0] -= 1

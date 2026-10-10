@@ -14262,14 +14262,51 @@ class TestSweep(Base):
         self.assertEqual(self.found(), [])
 
     def test_only_a_real_level_two_heading_line_is_a_decision_section(self):
-        yes = ("## Decision required\r\nx", "intro\r\n## Decision required\r\n\r\nPick", "## Decision required\nx", "intro\n## decision required  \nx", "## DECISION REQUIRED")
-        no = ("## Resolved (was: Decision required)\nx", "### Decision required\nx", "# Decision required",
-              "this is a Decision required item", "text ## Decision required", "```\n## Decision required\n```",
-              "> ## Decision required", "## Decision required now", "## Decision required: pick", "")
+        yes = ("## Decision required\nx", "intro\n## decision required  \nx", "## DECISION REQUIRED",
+               "## Decision required\r\nx", "intro\r\n## Decision required\r\n\r\nPick",
+               "## Decision required (re-verified 2026-10-09; production counts read-only)\nbody",
+               "## Decision required: pick one", "## Decision required - x", "## Decision required now",
+               "## Decision required, again")
+        no = ("## Resolved (was: Decision required; 2026-10-10)\nx", "## Resolved (was: Decision required)\nx",
+              "### Decision required\nx", "# Decision required", "this is a Decision required item",
+              "text ## Decision required", "```\n## Decision required\n```", "> ## Decision required",
+              "## Decision requirednessx", "## Not a Decision required", "")
         for body in yes:
             self.assertTrue(sb.sweep_has_section(body), body)
+            self.assertTrue(sb.sweep_has_heading(body), body)
         for body in no:
             self.assertFalse(sb.sweep_has_section(body), body)
+
+    def test_the_two_live_headings_are_judged_right_in_both_directions(self):
+        resolved = "## Resolved (was: Decision required; 2026-10-10)\nthe owner decided; kept for history"
+        reverified = "## Decision required (re-verified 2026-10-09; production counts read-only)\nPick A or B"
+        self.hub.open = {3067: sweep_issue(3067, resolved), 2027: sweep_issue(2027, reverified, [self.USER])}
+        self.sweep()
+        self.assertEqual(self.found(), [])       # no S1a for the renamed heading, no S1b for the suffixed one
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "sweep.dismissed"], [])
+
+    def test_a_resolved_batch_that_keeps_its_rows_block_is_not_an_s1a_finding(self):
+        body = "## Resolved (was: Decision required)\n\n" + sb.batch_body(
+            "platform", [{"ref": "acme/api#5", "finding": "stale", "recommendation": "close"}])
+        self.assertTrue(sb.sweep_has_section(body))        # a rows block still stands for the section of a labelled batch (S1b)
+        self.assertFalse(sb.sweep_has_heading(body))       # but it is not a Decision required heading (S1a)
+        self.hub.open = {3068: sweep_issue(3068, body)}
+        self.sweep()
+        self.assertEqual(self.found(), [])
+
+    def test_a_finding_that_cannot_be_rechecked_this_pass_is_not_audited(self):
+        self.hub.open = {84: sweep_issue(84, "## Decision required\nx")}
+        original = self.hub._read_one
+
+        def failing(*args, **kwargs):
+            raise sb.GitHubUnavailable("down")
+        self.hub._read_one = failing
+        self.sweep()
+        self.assertEqual(self.found(), [])
+        self.assertEqual(self.engine.sweep.current["unchecked"], 1)
+        self.hub._read_one = original
+        self.sweep()
+        self.assertEqual(self.found(), [("S1a", "acme/api#84")])      # audited only once a fresh read bore it out
 
     def test_a_resolved_heading_is_not_an_s1a_finding_even_from_a_cached_copy(self):
         self.hub.open = {80: sweep_issue(80, "## Decision required\nold")}      # the cached list still has the heading
