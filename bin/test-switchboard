@@ -14159,19 +14159,27 @@ class FakeSweepHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.reads, self.single = {}, [], set(), [], []
-        self.caps = []
+        self.caps, self.fresh, self.live = [], [], {}   # live: a fresher copy of an item than `open` shows
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.reads.append(path)
         self.caps.append(cap)
+        match = re.search(r"/issues/(\d+)/comments", path)
+        if match:   # one item's own comments (a fresh re-check)
+            number = int(match.group(1))
+            return [c for c in self.comments if c["issue_url"].endswith("/%d" % number)][::-1], False
         if "/issues/comments" in path:
             return list(self.comments), False
         return list(self.open.values()), False
 
-    def _read_one(self, repo, path, now):
+    def _read_one(self, repo, path, now, fresh=False):
         self.single.append((repo, path))
+        self.fresh.append(fresh)
         number = int(path.rsplit("/", 1)[1])
-        return {"state": "closed" if number in self.closed else "open"}
+        data = dict(self.live.get(number, self.open.get(number, {})))
+        data["number"] = number
+        data["state"] = "closed" if number in self.closed else "open"
+        return data
 
 
 def sweep_issue(number, body="", labels=(), pr=False):
@@ -14253,10 +14261,123 @@ class TestSweep(Base):
         self.sweep()
         self.assertEqual(self.found(), [])
 
+    def test_only_a_real_level_two_heading_line_is_a_decision_section(self):
+        yes = ("## Decision required\r\nx", "intro\r\n## Decision required\r\n\r\nPick", "## Decision required\nx", "intro\n## decision required  \nx", "## DECISION REQUIRED")
+        no = ("## Resolved (was: Decision required)\nx", "### Decision required\nx", "# Decision required",
+              "this is a Decision required item", "text ## Decision required", "```\n## Decision required\n```",
+              "> ## Decision required", "## Decision required now", "## Decision required: pick", "")
+        for body in yes:
+            self.assertTrue(sb.sweep_has_section(body), body)
+        for body in no:
+            self.assertFalse(sb.sweep_has_section(body), body)
+
+    def test_a_resolved_heading_is_not_an_s1a_finding_even_from_a_cached_copy(self):
+        self.hub.open = {80: sweep_issue(80, "## Decision required\nold")}      # the cached list still has the heading
+        self.hub.live = {80: sweep_issue(80, "## Resolved (was: Decision required)\nold")}   # the owner renamed it since
+        self.sweep()
+        self.assertEqual(self.found(), [])
+        dismissed = [e for e in self.world.audit() if e["event"] == "sweep.dismissed"]
+        self.assertEqual([e["detail"]["ref"] for e in dismissed], ["acme/api#80"])
+
+    def test_a_label_added_since_the_cached_read_dismisses_s3_and_s1a(self):
+        self.hub.open = {81: sweep_issue(81, "x"), 82: sweep_issue(82, "## Decision required\nx")}
+        self.hub.comments = [sweep_comment(81, "waiting on Adam", self.at(1))]
+        self.hub.live = {81: sweep_issue(81, "x", [self.USER]), 82: sweep_issue(82, "## Decision required\nx", [self.COS])}
+        self.sweep()
+        self.assertEqual(self.found(), [])
+
+    def test_a_comment_resolved_since_the_cached_read_dismisses_s2(self):
+        self.hub.open = {83: sweep_issue(83, "fine", pr=True)}
+        self.hub.comments = [sweep_comment(83, "waiting on Adam", self.at(1))]
+        self.sweep()
+        self.assertEqual(self.found(), [("S2", "acme/api#83")])     # a fresh comment read still says so
+        self.hub.comments = []                                   # the comment was deleted; the cached list still has it
+        self.engine.sweep.confirmed.clear()
+        self.sweep()
+        self.assertEqual([e["detail"]["ref"] for e in self.world.audit() if e["event"] == "sweep.dismissed"],
+                         ["acme/api#83"])
+        self.assertEqual(self.engine.sweep.current["counts"], {})
+
+    def test_only_s3_waits_for_the_list_and_only_for_the_repo_that_is_unread(self):
+        self.hub.open = {1: sweep_issue(1, "## Decision required\nx"), 10: sweep_issue(10, "Held for Adam", pr=True),
+                         2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Adam", self.at(1))]
+        old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
+        errors = [{"source": "github", "error": "issues of acme/api that wait on you are not read yet"}]
+        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), errors)
+        self.assertEqual(self.found(), [("S1a", "acme/api#1"), ("S2", "acme/api#10"), ("S5", "d40")])   # S3 waits
+        current = sb.sweep_summary(self.world.state)
+        self.assertEqual([(d["for"], d["overdue"]) for d in current["deferred"]], [("acme/api", False)])
+        self.world.tick(1)
+        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), [])
+        self.assertIn(("S3", "acme/api#2"), self.found())
+        self.assertEqual(sb.sweep_summary(self.world.state)["deferred"], [])
+
+    def test_a_deferral_that_never_ends_is_bounded_and_shown_as_overdue(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Adam", self.at(1))]
+        errors = [{"source": "reports", "error": "cannot read the boss transcript"}]
+        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.assertEqual(self.found(), [])
+        self.world.tick(sb.SWEEP_DEFER_SECONDS + 1)
+        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.assertEqual(self.found(), [("S3", "acme/api#2")])    # runs after the bound, the fresh check still guards it
+        (item,) = sb.sweep_summary(self.world.state)["deferred"]
+        self.assertEqual((item["for"], item["overdue"]), ("*", True))
+        text = "\n".join(sb.sweep_status_lines(sb.sweep_summary(self.world.state)))
+        self.assertIn("S3 NOT deferred any more (overdue)", text)
+        self.assertIn("every repo", text)
+        self.assertIn("cannot read the boss transcript", text)
+
+    def test_status_shows_a_live_deferral_and_unchecked_findings(self):
+        shown = "\n".join(sb.sweep_status_lines({"enabled": False, "counts": {}, "total": 0, "at": "t", "unchecked": 3,
+                                                  "deferred": [{"for": "acme/api", "why": "not read yet", "since": "s",
+                                                                "overdue": False}]}))
+        self.assertIn("S3 deferred for acme/api since s: not read yet", shown)
+        self.assertIn("3 finding(s) not checked", shown)
+        self.assertEqual(sb.sweep_status_lines(None), [])
+
+    def test_every_finding_is_checked_against_a_fresh_read_and_the_list_copy_is_not_enough(self):
+        self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
+        self.sweep()
+        self.assertIn(True, self.hub.fresh)
+        self.assertEqual(len(self.engine.sweep.confirmed), 1)
+        before = len(self.hub.single)
+        self.sweep()                                            # confirmed: no new read inside the window
+        self.assertEqual(len(self.hub.single), before)
+
+    def test_the_strong_forms_in_a_plain_statement_only(self):
+        strong = sb.sweep_strong_re(["Adam"])
+        for text in ("waiting on Adam", "This waits on adam for the merge.", "Held for Adam", "needs Adam's decision",
+                     "needs Adam\u2019s OK", "ready for Adam's review", "Done. Now waiting on Adam"):
+            self.assertTrue(sb.sweep_says_waiting_strong(strong, text), text)
+        for text in ("needs Adam", "pending Adam", "awaiting Adam", "if it is waiting on Adam, ping", "it would be held for Adam",
+                     "this may be held for Adam", "proposal: needs Adam's OK",
+                     "option 2: held for Adam", "could be waiting on Adam", "not waiting on Adam", "> waiting on Adam",
+                     "`waiting on Adam`", "a comment says it waits on Adam",
+                     "was waiting on Adam, now merged", "Previously waiting on Adam; now resolved"):
+            self.assertFalse(sb.sweep_says_waiting_strong(strong, text), text)
+        self.assertTrue(sb.sweep_says_waiting_strong(strong, "Option 2 is dropped.\nNow waiting on Adam."))  # another sentence
+        for text in ("Waiting on Adam: findings attached", "Cos: waiting on Adam (review findings attached)",
+                     "Waiting on Adam's decision on the review findings.", "Waiting on Adam, if you agree reply yes"):
+            self.assertTrue(sb.sweep_says_waiting_strong(strong, text), text)   # a hedge after the phrase does not cancel it
+
+    def test_s3_reads_the_latest_comment_only_and_not_the_body_or_an_open_item_only(self):
+        self.hub.open = {90: sweep_issue(90, "waiting on Adam"), 91: sweep_issue(91, "x"), 92: sweep_issue(92, "x")}
+        self.hub.comments = [sweep_comment(91, "all clear now", self.at(0)), sweep_comment(91, "waiting on Adam", self.at(1)),
+                             sweep_comment(92, "waiting on Adam", self.at(1))]   # newest first
+        self.sweep()
+        self.assertEqual(self.found(), [("S3", "acme/api#92")])    # 90: body only; 91: superseded by a later comment
+        self.hub.closed = {92}
+        self.engine.sweep.confirmed.clear()
+        self.world.tick(sb.SWEEP_TTL + 1)
+        self.sweep()
+        self.assertEqual(self.engine.sweep.current["counts"].get("S3"), None)   # closed: not a finding
+
     def test_s3_said_to_wait_but_not_in_the_human_tier(self):
         self.hub.open = {20: sweep_issue(20, "x"), 21: sweep_issue(21, "x"), 22: sweep_issue(22, "x")}
-        self.hub.comments = [sweep_comment(20, "needs Adam", self.at(1)), sweep_comment(21, "needs Adam", self.at(1)),
-                             sweep_comment(22, "needs Adam", self.at(9))]  # older than the window: not read
+        self.hub.comments = [sweep_comment(20, "waiting on Adam", self.at(1)), sweep_comment(21, "waiting on Adam", self.at(1)),
+                             sweep_comment(22, "waiting on Adam", self.at(9))]  # older than the window: not read
         self.sweep([self.human(21)])
         self.assertEqual(self.found(), [("S3", "acme/api#20")])
         report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 23, "since": self.at(),
@@ -14289,6 +14410,8 @@ class TestSweep(Base):
 
     def test_one_batched_capped_fact_for_the_chief_of_staff_and_a_debounce(self):
         self.hub.open = {n: sweep_issue(n, "## Decision required\nx") for n in range(100, 108)}
+        state = sb.sweep_state(self.engine)   # bear them all out first, as earlier passes would have
+        state.confirmed = {("S1a", "acme/api#%d" % n): self.world.clock.now() for n in range(100, 108)}
         self.sweep(max_findings=3)
         (summary, _), = self.engine.sweep.facts.values()
         self.assertTrue(summary.startswith("sweep: 8 findings: "))
@@ -14330,7 +14453,7 @@ class TestSweep(Base):
         self.engine.discover(self.world.clock.now())
         decisions = [self.human(n) for n in range(200, 220)]
         seen, checked = set(), set()
-        for _ in range(8):
+        for _ in range(12):
             before = self.calls()
             self.sweep(decisions)
             self.assertLessEqual(self.calls() - before, sb.SWEEP_CALLS_PER_PASS)
