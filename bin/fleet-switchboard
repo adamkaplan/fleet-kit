@@ -6221,6 +6221,35 @@ def sweep_strong_re(names):
                       % (verbs, who, who, needs, who), re.I)
 
 
+SWEEP_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n")
+SWEEP_REF_RE = re.compile(r"(?<![\w/&#])(?:([\w.-]+/[\w.-]+)|([\w.-]+))?#(\d+)\b")
+
+
+def sweep_strong_statement(strong, text, default_repo, repos):
+    """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
+    person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
+    `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
+    so `v3.3, #3055` stays one sentence. No refs means the statement names nothing by itself."""
+    if not isinstance(text, str):
+        return False, []
+    text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
+    fires, refs = False, []
+    for match in strong.finditer(text):
+        before = [m.end() for m in SWEEP_BOUNDARY_RE.finditer(text, 0, match.start())]
+        start = before[-1] if before else 0
+        after = SWEEP_BOUNDARY_RE.search(text, match.end())
+        sentence_end = after.start() if after else len(text)
+        if SWEEP_HEDGE_RE.search(text[start:match.start()]) or SWEEP_NEGATION_RE.search(
+                text[max(0, match.start() - 30):match.start()]):
+            continue
+        fires = True
+        for full, short, number in SWEEP_REF_RE.findall(text[start:sentence_end]):
+            repo = full or ((decision_core.repo_of_tag(short, repos) or short) if short else default_repo)  # unresolved: kept as named
+            if repo and (repo, int(number)) not in refs:
+                refs.append((repo, int(number)))
+    return fires, refs
+
+
 def sweep_says_waiting_strong(strong, text):
     """A strong form, outside code and quotes, not negated, in a sentence with no conditional or descriptive marker before it
     (if, would, may, could, proposal, option(s), and reported speech: says, saying, said): a statement that it waits, not a description of a plan."""
@@ -6321,7 +6350,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
                          "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": [],
-                         "latest_strong": False}
+                         "latest_strong": False, "latest_refs": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
     budget[0] -= sweep_pages_used(comments, cut)
@@ -6330,7 +6359,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         number = _url_number(comment.get("issue_url"))
         if number in items and isinstance(comment.get("created_at"), str) and comment["created_at"] >= since:
             items[number]["comments"].append(sweep_says_waiting(regex, comment.get("body")))
-            items[number]["latest_strong"] = sweep_says_waiting_strong(strong, comment.get("body"))  # the last one wins
+            fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo])  # the last one wins
+            items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
     return {"at": now, "items": items, "truncated": truncated, "error": None}
 
 
@@ -6400,7 +6430,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
 
     def ref_text(repo, number):
         return "%s#%d" % (repo, number)
-    s2 = set()
+    s2, unattributed = set(), 0
     for repo, picture in state.repos.items():
         for number, item in picture["items"].items():
             if not item["pr"]:
@@ -6416,17 +6446,32 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
         if repo in defer or "*" in defer:
             continue
         for number, item in picture["items"].items():
-            if item["latest_strong"] and (repo, number) not in s2 and (repo, number) not in human:
-                found.add(("S3", ref_text(repo, number)))
+            if not item["latest_strong"]:
+                continue
+            # a comment on an item is about that item, unless its sentence names other refs and not this one
+            refs = item.get("latest_refs", [])
+            named = [r for r in refs if r[0] in state.repos]
+            targets = [(repo, number)] if not refs or (repo, number) in named else named
+            if refs and not named:
+                unattributed += 1   # it names only refs we cannot resolve to a watched item: not assumed to be about this one
+            for target in targets:
+                if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
+                    found.add(("S3", ref_text(*target)))
     for d in decisions:
         ref = sweep_ref_of(d, home)
-        if d.get("kind") == "report" and ref and ref[0] and ref[0] not in defer and "*" not in defer and ref not in human and ref not in s2 \
-                and sweep_says_waiting_strong(state.strong, d.get("title")):
-            found.add(("S3", ref_text(*ref)))
+        # a report is about the refs its sentence names, never assumed to be about its own ask
+        fires, refs = (sweep_strong_statement(state.strong, d.get("title"), ref[0], list(state.repos))
+                       if d.get("kind") == "report" and ref and ref[0] else (False, []))
+        for target in (refs if fires else ()):
+            if (target[0] in defer or "*" in defer or target in human or target in s2 or target[0] not in state.repos
+                    or target[1] not in state.repos[target[0]]["items"]):
+                continue
+            found.add(("S3", ref_text(*target)))
         since = parse_iso(d.get("since"))
         if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600):
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
+    state.unattributed = unattributed
     return sorted(found)
 
 
@@ -6582,7 +6627,8 @@ def sweep_decisions(engine, decisions, now, errors=()):
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings),
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
-                     "deferred": deferred, "unchecked": unchecked}
+                     "deferred": deferred, "unchecked": unchecked,
+                     "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
     if cfg["enabled"]:
         due = [(k, r) for k, r in findings
@@ -8946,6 +8992,9 @@ def sweep_status_lines(sweep):
         lines.append("      sweep      S3 %s for %s since %s: %s" % (
             "NOT deferred any more (overdue), running on the fresh check alone" if item.get("overdue") else "deferred",
             "every repo" if item["for"] == "*" else item["for"], item["since"], item["why"]))
+    if sweep.get("unattributed"):
+        lines.append("      sweep      %d comment(s) say it waits but name only refs outside the watched repos: not "
+                     "attributed to their own item" % sweep["unattributed"])
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
