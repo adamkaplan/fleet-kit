@@ -100,7 +100,7 @@ Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator
 A decision you cannot make goes up as `fleet-switchboard report question "..."` to
 your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
 block**: blocking removes your ability to say you are blocked. NEVER apply
-`awaiting-user` yourself: the Chief of Staff escalates. Related findings go up as ONE batch, never one question each: `fleet-switchboard
+`awaiting-user` yourself: the Chief of Staff escalates. A PR held for Adam starts with the line `MERGE: captain` as the first line of its body and gets a `fleet-switchboard notice pr`. Any other decision for Adam is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on Adam does not put it in his panel, the section and label do. The switchboard sweep (#117) flags mismatches to cos. Related findings go up as ONE batch, never one question each: `fleet-switchboard
 decisions batch --title "<title>" --row "<repo#N> | <finding> | <recommendation>"` per
 row (one `awaiting-cos` issue in your repo). Open decisions are listed,
 with ids, in the read-only Decisions list (`fleet-switchboard decisions`): say one
