@@ -2242,20 +2242,20 @@ It grows the sweep: the same hub reads, call budget, fresh re-check, shadow defa
 (absent, `null` or `{}` is shadow; `"enabled": true` adds only the wake of the Chief of Staff; `false` is fully off):
 `repos` (the tracked repos, `OWNER/REPO`; default: the repos the daemon already watches. The extra tracked repos that are not watched are named here in the local config, never in this public source; each is read with its existing per-repo account),
 `required_labels` (`{repo: [label or [alternatives], ...]}`; no entry, no T2), `sla` and `sla_overrides` (per repo; the
-numbers below are the defaults), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
+numbers below are the defaults; every `_days` value is in days and may be a fraction, `2/24` is two hours), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
 (true), `realarm_hours` (24), `max_findings` (30), `calls_per_pass` (30), `pass_seconds` (10).
 
 | Rule | Finding | Default SLA |
 |---|---|---|
 | T1 | open issue with no assignee, not in a charter's chain (charter, ask, work item, by the parent links) and not worked by an agent | 1 day after creation |
-| T2 | a required label group missing (config only) | 1 day |
-| T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 3 days, other issues 14 |
-| T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | 2 days |
+| T2 | a required label group missing (config only) | 1 hour (`1/24` day) |
+| T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 1 day, other issues 3 days |
+| T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | T5 2 hours (`2/24` day; at that age it goes to cos in the batched fact and cos reminds the person), T6 2 days |
 | T7 | an open non-draft PR of OURS with no review. Other teams use formal GitHub reviews, which the list reads do not show, so their PRs are never called unreviewed (no T7, not even a flag). The fresh re-check (one `gh pr view`) applies the captain decision's own evidence (`captain_evidence`, built on `pr_reviews_at` and `pr_signed_at`): a formal review by a non-author at the exact head, or a signed comment naming the head from a non-author agent that is not a sender of the PR's notice, means REVIEWED. A signed comment counts only when the PR's notice is on file (its sender is then known and excluded); with none, only a formal review at the head counts, and a finding says `no notice on file` (our flow always notices, so a PR without one is itself worth the flag). A `MERGE: captain` PR that is already in the decision list is T6's, not T7's (while the list is incomplete a captain PR waits). A review at an OLDER head only fires once the last push is older than the SLA, with the evidence `review at an older head` and the hours since the push | 4 hours; a PR older than 14 days is not judged |
 | T8 | a blocked ask (a `blocked` label) | 1 day quiet |
 | T9 | an ask with no activity (T3 takes precedence) | 3 days |
 | T10 | a closed issue still carrying an awaiting label | immediate |
-| T11 | an orphan: in no chain, no assignee, untouched (T1 takes precedence, so it covers items an agent works on) | 30 days |
+| T11 | an orphan: in no chain, no assignee, untouched (T1 takes precedence, so it covers items an agent works on) | 1 day |
 
 T4 and T12 are the sweep's S5 and the report fold; they are not repeated. **Another person's or team's issue or PR is never
 our violation:** an item whose author and assignees are none of ours (`our_logins`), that is in no chain, is not

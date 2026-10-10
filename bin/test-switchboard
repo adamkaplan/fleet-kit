@@ -14778,13 +14778,14 @@ class TestTriage(Base):
         self.assertEqual(self.only("T2"), ["acme/api#20"])               # (already audited today; 21 never)
         self.assertNotIn(("T2", "acme/api#21"), self.found())
 
-    def test_t3_an_ask_is_quiet_after_three_days_others_after_fourteen_and_a_next_step_clears_it(self):
+    def test_t3_an_ask_is_quiet_after_one_day_others_after_three_and_a_next_step_clears_it(self):
         self.charter()
-        self.add(30, created=9, updated=4, parent=1, labels=["kind"])                     # an ask, quiet 4d, no next step
+        self.add(30, created=9, updated=1.5, parent=1, labels=["kind"])                   # an ask, quiet 1.5d, no next step
+        self.add(37, created=9, updated=0.5, parent=1, labels=["kind"])                   # an ask quiet only 12 hours
         self.add(31, created=9, updated=4, parent=1, labels=["kind"])                     # an ask with a next-step comment
         self.comment(31, "Next: wire the adapter")
-        self.add(32, created=20, updated=15, assignees=["bot"], labels=["kind"])          # other issue quiet 15d
-        self.add(33, created=20, updated=10, assignees=["bot"], labels=["kind"])          # other issue quiet 10d
+        self.add(32, created=20, updated=4, assignees=["bot"], labels=["kind"])           # other issue quiet 4d
+        self.add(33, created=20, updated=2, assignees=["bot"], labels=["kind"])           # other issue quiet 2d
         self.add(34, created=20, updated=15, assignees=["bot"], labels=["kind"], body="## Decision required\nx")
         self.add(35, created=20, updated=15, assignees=["bot"], labels=["kind", self.USER], body="x")
         self.add(36, created=20, updated=15, assignees=["bot"], labels=["kind"], body="- [ ] do it")
@@ -14803,6 +14804,28 @@ class TestTriage(Base):
         self.assertEqual(self.found(), [])                                                # an incomplete list is not judged
         self.go(decisions, passes=3)
         self.assertEqual((self.only("T5"), self.only("T6")), (["acme/api#50"], ["acme/api#51"]))
+
+    def test_t5_fires_at_two_hours_with_the_hours_in_its_evidence(self):
+        decisions = [{"id": "d5", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 54,
+                      "since": sb.iso(self.now - 3 * 3600)},
+                     {"id": "d6", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 55,
+                      "since": sb.iso(self.now - 5400)}]                      # 1.5 hours: not yet
+        self.go(decisions, passes=2)
+        self.assertEqual(self.only("T5"), ["acme/api#54"])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T5"][0]
+        self.assertGreaterEqual(row["detail"]["evidence"]["waiting_hours"], 3.0)
+
+    def test_the_default_slas_are_the_approved_ones_and_fractions_validate(self):
+        sla = sb.TRIAGE_SLA
+        self.assertEqual((sla["t2_days"], sla["t3_ask_days"], sla["t3_other_days"], sla["t5_days"], sla["t11_days"]),
+                         (1 / 24, 1, 3, 2 / 24, 1))
+        self.assertEqual((sla["t1_days"], sla["t6_days"], sla["t7_ours_hours"], sla["t7_other_days"], sla["t8_days"],
+                          sla["t9_days"]), (1, 2, 4, 2, 1, 3))                    # the others are unchanged
+        base = {"opencode": FAKE_OPENCODE}
+        got = sb.validate_config(dict(base, triage={"sla": {"t2_days": 0.5, "t5_days": 1 / 48}}))["triage"]["sla"]
+        self.assertEqual((got["t2_days"], got["t5_days"]), (0.5, 1 / 48))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config(dict(base, triage={"sla": {"t5_days": 0}}))
 
     def test_t7_is_about_our_prs_only_because_formal_reviews_are_not_in_the_data(self):
         self.charter()
@@ -14955,7 +14978,7 @@ class TestTriage(Base):
     def test_shadow_wakes_nobody_and_enabled_adds_only_one_batched_fact_with_a_debounce(self):
         self.charter()
         for n in (140, 141, 142):
-            self.add(n, created=3, labels=["kind"])
+            self.add(n, created=3, updated=0.2, labels=["kind"])
         self.go()
         self.assertEqual(self.engine.triage.facts, {})                                      # shadow: nobody woken
         self.assertEqual(sb.triage_summary(self.world.state)["enabled"], False)
@@ -14972,7 +14995,7 @@ class TestTriage(Base):
         self.engine.triage.confirmed.clear()
         self.engine.triage.units.clear()
         for n in (140, 141, 142):
-            self.hub.open["acme/api"][n] = tri_issue(self.world.clock.now(), n, created=4, labels=["kind"])
+            self.hub.open["acme/api"][n] = tri_issue(self.world.clock.now(), n, created=4, updated=0.2, labels=["kind"])
         self.go()
         self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 2)   # re-alarmed after a day
 
@@ -14983,7 +15006,7 @@ class TestTriage(Base):
 
     def test_the_daily_summary_is_audited_once_a_day_and_sent_only_when_enabled(self):
         self.charter()
-        self.add(150, created=3, labels=["kind"])
+        self.add(150, created=3, updated=0.2, labels=["kind"])
         self.go()
         summaries = [e for e in self.world.audit() if e["event"] == "triage.summary"]
         self.assertEqual(len(summaries), 1)
@@ -15062,7 +15085,7 @@ class TestTriage(Base):
     def seven_repos(self):
         repos = ["acme/r%d" % i for i in range(7)]
         for repo in repos:
-            self.hub.open[repo] = {1: tri_issue(self.now, 1, created=3, labels=["kind"], repo=repo)}   # unowned: a T1
+            self.hub.open[repo] = {1: tri_issue(self.now, 1, created=3, updated=0.2, labels=["kind"], repo=repo)}   # unowned: a T1
         self.engine.config["triage"]["repos"] = repos
         return repos
 
@@ -15119,8 +15142,8 @@ class TestTriage(Base):
         tool = importlib.util.module_from_spec(spec)
         loader.exec_module(tool)
         self.charter()
-        self.add(170, created=3, labels=["kind"])
-        self.add(171, created=3, labels=["kind"])
+        self.add(170, created=3, updated=0.2, labels=["kind"])
+        self.add(171, created=3, updated=0.2, labels=["kind"])
         self.go()
         self.world.tick(60)
         self.go(passes=1)
