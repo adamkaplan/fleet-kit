@@ -6011,7 +6011,7 @@ class TestGithubDelivery(Base):
 class TestGithubCatchUp(Base):
     def setUp(self):
         super().setUp()
-        self.rig = GithubRig(self)
+        self.rig = GithubRig(self, config={"sweep": False})  # this class counts every read: the sweep's are not its subject
         self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
         self.world.clock.t += 7200
         self.gh.issue(12, parent=1)
@@ -14230,12 +14230,28 @@ class TestSweep(Base):
         self.sweep()
         self.assertEqual(self.found(), [("S2", "acme/api#10"), ("S2", "acme/api#12")])
 
-    def test_phrases_are_whole_case_insensitive_and_code_or_quotes_still_count(self):
-        regex = sb.sweep_phrase_re(["Adam"])
-        for text in ("HOLD for adam", "needs Adam", "for Adam\u2019s review", "> waiting on Adam", "`held for Adam`"):
+    def test_phrases_are_whole_and_case_insensitive_and_cover_the_common_wordings(self):
+        regex = sb.sweep_phrase_re(["Adam", "@the-owner"])
+        for text in ("HOLD for adam", "needs Adam", "for Adam\u2019s review", "awaiting Adam", "blocked on Adam",
+                     "pending adam", "Adam to review", "needs @the-owner", "x\n> quoted\nwaiting on Adam"):
             self.assertTrue(sb.sweep_says_waiting(regex, text), text)
         for text in ("needs Adamant", "unheld for Adam", "waiting on someone", "", None):
             self.assertFalse(sb.sweep_says_waiting(regex, text), text)
+
+    def test_quotes_code_and_negations_do_not_count(self):
+        regex = sb.sweep_phrase_re(["Adam"])
+        for text in ("> waiting on Adam", "`held for Adam`", "see:\n```\nneeds Adam\n```\ndone",
+                     "not waiting on Adam", "no longer needs Adam", "this is not currently waiting on Adam",
+                     "it never was held for Adam"):
+            self.assertFalse(sb.sweep_says_waiting(regex, text), text)
+        self.assertTrue(sb.sweep_says_waiting(regex, "was blocked, now waiting on Adam"))
+
+    def test_s3_reads_only_the_last_comments_so_a_resolved_old_one_does_not_linger(self):
+        self.hub.open = {70: sweep_issue(70, "x")}
+        self.hub.comments = [sweep_comment(70, "chat %d" % i, self.at(2)) for i in range(sb.SWEEP_PR_COMMENTS)] + [
+            sweep_comment(70, "waiting on Adam", self.at(3))]   # newest first, as the list read returns them
+        self.sweep()
+        self.assertEqual(self.found(), [])
 
     def test_s3_said_to_wait_but_not_in_the_human_tier(self):
         self.hub.open = {20: sweep_issue(20, "x"), 21: sweep_issue(21, "x"), 22: sweep_issue(22, "x")}
@@ -14247,6 +14263,13 @@ class TestSweep(Base):
                   "title": "worker: waits on Adam for the merge"}
         self.sweep([report])
         self.assertIn(("S3", "acme/api#23"), self.found())
+
+    def test_s4_leaves_a_report_decision_whose_ask_is_closed(self):
+        self.hub.closed = {32}
+        report = {"id": "r2", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 32, "since": self.at(),
+                  "title": "worker: question"}
+        self.assertEqual(len(self.sweep([report, self.human(33, "captain")])), 2)
+        self.assertEqual(self.hub.single, [("acme/api", "issues/33")])
 
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
@@ -14346,15 +14369,40 @@ class TestSweep(Base):
         shown = sb.sweep_summary(self.world.state)
         self.assertEqual((shown["counts"], shown["total"], shown["enabled"]), ({"S1a": 1}, 1, True))
 
-    def test_without_a_sweep_key_nothing_is_read_or_written(self):
+    def test_with_no_sweep_key_it_runs_in_shadow_and_wakes_and_withdraws_nothing(self):
         del self.engine.config["sweep"]
+        self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
+        self.hub.closed = {30}
+        kept = sb.sweep_decisions(self.engine, [self.human(30)], self.world.clock.now())
+        self.assertEqual(len(kept), 1)                                   # nothing withdrawn
+        self.assertEqual(self.found(), [("S1a", "acme/api#1")])         # findings audited
+        self.assertEqual((self.engine.sweep.facts, self.bound()()), ({}, []))   # nobody woken
+        self.assertFalse(sb.sweep_summary(self.world.state)["enabled"])
+        self.assertLessEqual(len(self.hub.reads) + len(self.hub.single), sb.SWEEP_CALLS_PER_PASS)
+
+    def test_sweep_false_turns_it_fully_off(self):
+        self.engine.config["sweep"] = False
+        self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
         kept = sb.sweep_decisions(self.engine, [self.human(1)], self.world.clock.now())
-        self.assertEqual((len(kept), self.hub.reads, self.hub.single), (1, [], []))
+        self.assertEqual((len(kept), self.hub.reads, self.hub.single, self.found()), (1, [], [], []))
         self.assertIsNone(sb.sweep_summary(self.world.state))
+        self.assertIs(sb.validate_config({"opencode": FAKE_OPENCODE, "sweep": False})["sweep"], False)
+
+    def test_no_new_read_starts_once_the_pass_time_is_spent(self):
+        self.engine.config["github_repos"] = ["acme/a", "acme/b"]
+        self.engine.discover(self.world.clock.now())
+        original = self.hub.read_pages
+
+        def slow(*args, **kwargs):
+            self.world.clock.t += sb.SWEEP_PASS_SECONDS
+            return original(*args, **kwargs)
+        self.hub.read_pages = slow
+        self.sweep()
+        self.assertEqual(len(self.engine.sweep.repos), 1)
 
     def test_config_is_validated_and_off_by_default(self):
         base = {"opencode": FAKE_OPENCODE}
-        self.assertNotIn("sweep", sb.validate_config(dict(base)))  # absent: the sweep does not run at all
+        self.assertNotIn("sweep", sb.validate_config(dict(base)))  # absent: adds nothing (the sweep runs in shadow)
         self.assertFalse(sb.validate_config(dict(base, sweep={}))["sweep"]["enabled"])  # present: shadow
         self.assertFalse(sb.validate_config(dict(base, sweep=None))["sweep"]["enabled"])
         for bad in ({"enabled": "yes"}, {"aged_cos_hours": 0}, {"max_findings": 0}, {"person_names": []}, {"nope": 1}):
@@ -16011,6 +16059,7 @@ class TestDecisionsFile(DecisionsBase):
 
     def test_the_file_is_replaced_by_rename_so_a_reader_never_sees_half_of_it(self):
         self.ask_the_boss("Which database?")
+        self.world.engine.config["sweep"] = False  # the sweep's own display file is not the subject here
         with mock.patch.object(sb.os, "replace", wraps=os.replace) as replaced:
             self.pass_()
         (call,) = replaced.call_args_list

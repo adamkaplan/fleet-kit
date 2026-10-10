@@ -6149,22 +6149,24 @@ SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
 SWEEP_CALLS_PER_PASS = 6      # the most `gh` calls the sweep makes in one pass (pages and single reads alike)
 SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
+SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent this long in a pass
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not MERGE: captain", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged"}
-SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "needs")
+SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
 def validate_sweep_config(config, source):
-    """`sweep`: absent means the sweep does not run at all (a config that never names it is exactly what it was). Present
-    (null or {} included) it runs in shadow: findings are audited, nobody is woken, nothing is withdrawn, until
-    `enabled` is true."""
+    """`sweep`: absent, null or {} runs in shadow (findings are audited, nobody is woken, nothing is withdrawn) until
+    `enabled` is true; an absent key adds nothing to the config. `false` turns the sweep fully off (no reads, no writes)."""
     if "sweep" not in config:
         return
     raw = config["sweep"]
+    if raw is False:
+        return
     if raw is None:
         config["sweep"] = dict(SWEEP_DEFAULTS, person_names=list(SWEEP_DEFAULTS["person_names"]))
         return
@@ -6185,7 +6187,7 @@ def validate_sweep_config(config, source):
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
     names = section["person_names"]
-    if not isinstance(names, list) or not names or not all(isinstance(n, str) and re.fullmatch(r"[\w .-]{1,40}", n)
+    if not isinstance(names, list) or not names or not all(isinstance(n, str) and re.fullmatch(r"[\w@ .-]{1,40}", n)
                                                            for n in names):
         raise ConfigError("%s.person_names' must be a non-empty list of names, got %r" % (where, names))
     section["person_names"] = list(names)
@@ -6193,16 +6195,30 @@ def validate_sweep_config(config, source):
 
 
 def sweep_phrase_re(names):
-    """The whole phrases that say an item waits on the person: held for / hold for / waiting on / waits on / needs
-    <name>, and `for <name>'s review`. Case-insensitive; a curly apostrophe is the straight one. Text inside code
-    blocks or quotes counts too (a false positive costs one line in a batched finding, a missed one costs a stall)."""
+    """The phrases that say an item waits on the person: held for / hold for / waiting on / waits on / awaiting /
+    blocked on / pending / needs <name>, `<name> to review|approve|decide|merge|answer`, and `for <name>'s review`.
+    Whole phrases, case-insensitive; a curly apostrophe is the straight one. `names` may hold a handle (`@login`)."""
     who = "|".join(re.escape(n) for n in names)
     verbs = "|".join(re.escape(v) for v in SWEEP_WAIT_VERBS)
-    return re.compile(r"(?<![\w])(?:(?:%s)\s+(?:%s)|for\s+(?:%s)'s\s+review)(?![\w])" % (verbs, who, who), re.I)
+    return re.compile(r"(?<![\w])(?:(?:%s)\s+(?:%s)|(?:%s)\s+to\s+(?:review|approve|decide|merge|answer)"
+                      r"|for\s+(?:%s)'s\s+review)(?![\w])" % (verbs, who, who, who), re.I)
+
+
+SWEEP_NEGATION_RE = re.compile(r"\b(?:not|no longer|never|isn't|aren't|wasn't|don't|doesn't|didn't|nobody|without)\s+"
+                               r"(?:\w+\s+){0,2}$", re.I)
+SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
 
 
 def sweep_says_waiting(regex, text):
-    return isinstance(text, str) and regex.search(text.replace("\u2019", "'")) is not None
+    """True when the text, outside code blocks, inline code and quoted lines, says an item waits on the person and does
+    not negate it ("not waiting on Adam", "no longer needs Adam"). Quoted text is somebody else's sentence."""
+    if not isinstance(text, str):
+        return False
+    text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
+    for match in regex.finditer(text):
+        if not SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
+            return True
+    return False
 
 
 DECISION_SECTION_RE = re.compile(r"^#{1,6}[ \t]*decision required\b", re.I | re.M)
@@ -6220,6 +6236,7 @@ class SweepState:
         self.logged = set()      # (kind, ref, day): findings already audited today
         self.facts = {}          # key -> (summary, created): the pending cos facts, until they age out
         self.current = {}        # the last run's counts
+        self.started = 0         # when this pass's sweep began (the time budget)
 
 
 def sweep_state(engine):
@@ -6272,7 +6289,7 @@ def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
     stale = sorted((r for r in repos if now - state.repos.get(r, {"at": 0})["at"] >= SWEEP_TTL),
                    key=lambda r: (state.repos.get(r, {"at": 0})["at"], r))
     for repo in stale:
-        if budget[0] - SWEEP_CONFIRM_RESERVE < 2:
+        if budget[0] - SWEEP_CONFIRM_RESERVE < 2 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             break
         try:
             state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex, budget)
@@ -6296,12 +6313,14 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     candidates = {}
     for d in decisions:
         ref = sweep_ref_of(d, home)
-        if d.get("kind") in ("issue", "report", "captain") and ref and ref[0]:
+        if d.get("kind") in ("issue", "captain") and ref and ref[0]:  # a report's question may outlive its closed ask
             candidates.setdefault(ref, []).append(d)
     if hub is not None:
         due = sorted((r for r in candidates if now - state.checked.get(r, (0, False))[0] >= SWEEP_TTL),
                      key=lambda r: (state.checked.get(r, (0, False))[0], r))
         for ref in due[:max(0, budget[0])]:
+            if engine.now() - state.started >= SWEEP_PASS_SECONDS:
+                break
             budget[0] -= 1
             try:
                 data = hub._read_one(ref[0], "issues/%d" % ref[1], now)
@@ -6336,7 +6355,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex):
                 s2.add((repo, number))
     for repo, picture in state.repos.items():
         for number, item in picture["items"].items():
-            if any(item["comments"]) and (repo, number) not in s2 and (repo, number) not in human:
+            if any(item["comments"][-SWEEP_PR_COMMENTS:]) and (repo, number) not in s2 and (repo, number) not in human:
                 found.add(("S3", ref_text(repo, number)))
     for d in decisions:
         ref = sweep_ref_of(d, home)
@@ -6353,10 +6372,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex):
 def sweep_decisions(engine, decisions, now):
     """The list after the sweep (stale decisions removed when enabled), with the sweep's side effects: audit lines, the
     pending cos fact and sweep.json. Called once per pass with the freshly derived list."""
-    cfg = engine.config.get("sweep")
-    if cfg is None:
-        return decisions  # not configured: the sweep does not run, reads nothing, writes nothing
+    cfg = engine.config.get("sweep", SWEEP_DEFAULTS)  # no key at all: shadow
+    if cfg is False or cfg is None:
+        return decisions  # `sweep: false`: fully off, reads nothing, writes nothing
     state = sweep_state(engine)
+    state.started = engine.now()
     repos = decision_repos(engine)
     watched = [d for d in decisions]
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
@@ -8787,7 +8807,8 @@ def format_status(report):
     if sweep:  # #117: only once the daemon has swept
         parts = ", ".join("%s %d" % (k, n) for k, n in sorted(sweep["counts"].items())) or "none"
         lines.append("      sweep      %s: %s finding(s) (%s)%s" % (
-            "on" if sweep.get("enabled") else "shadow (audit only)", sweep.get("total", 0), parts,
+            ("on" if sweep.get("enabled") else "shadow (audit only)") + " as of " + str(sweep.get("at", "?")),
+            sweep.get("total", 0), parts,
             "; lists capped for " + ", ".join(sweep["truncated"]) if sweep.get("truncated") else ""))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
