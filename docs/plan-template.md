@@ -57,21 +57,40 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 | Rule | Defect when |
 |---|---|
-| `id` | missing, not `S<n>` or `U<n>`, or used twice |
-| `covers` | not `DW-<n>` or `PC-<n>`; or a `DW-n` beyond the ask's Done-when clauses |
+| `id` | missing, not `S<number>` or `U<number>` with an optional lowercase letter (`S11b`, `U3a`: add a scenario in a later revision without renumbering), or used twice. Shown and hashed in the order number, then suffix |
+| `covers` | not exactly one `DW-<n>` or `PC-<n>`; or a `DW-n` beyond the ask's Done-when clauses. **`DW-n` is the ask's clause n; `PC-n` is a plan constraint** (a `PC-<n>: ...` line in the plan's constraints section). If the plan lists its constraints, every `PC-n` must be covered by a scenario and a scenario may only cover a listed one (`uncovered-constraint`, `covers-unknown-constraint`); with no list it is a warning. **`U<n>` scenarios are unchanged-behaviour scenarios**: they say what must still hold, and they do not count towards covering a Done-when clause |
 | `text` | missing or under 10 characters |
 | `proof`, `evaluator` | not one of the listed values |
 | proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam` |
-| `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
+| `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). A count (including zero: `0 occurrences of X in the tree`), `n of n` (`10 of 10 files contain Y`), identical-to-a-named-thing (`identical per file to the baseline`) and a named identifier compared to a value (`count of Z equals 3`) are observables. A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
 | `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 60 percent or more of its words are the pass rule's. Whether the named wrong build is the right one is for the plan review (G0b) |
 | evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
 | Done-when | `--ask` (or `--done-when`) is the **authority** for the clauses. If the plan states its own Done-when it must be the same clauses: fewer or different ones fail (`done-when-differs`). A plan can never weaken coverage |
-| size | warning (not a failure) over 30 scenarios: split the plan by slice |
+| size | warning (not a failure). With a `slice` key on the scenarios: more than 30 in one slice, or more than 80 in total. With no slices: more than 30 in total |
 
 The Done-when clauses are the numbered parts `(1) ... (2) ...` of the ask's `Done when:` line (`DW-n` is clause n); a
 line with no `(1)` is one clause.
+
+### Declaring the clauses
+
+A Done-when written as numbered parts `(1) ... (2) ...`, or as a numbered list (one `1.` per line, for `--done-when`),
+is split into clauses. A Done-when written as **one sentence with several comma- or semicolon-separated clauses** cannot be
+split reliably, and would count as one clause (then `covers: DW-2` is "unknown"). Declare the clauses in a second fenced
+block of the plan:
+
+```yaml
+clauses:
+  DW-1: plans are recorded on GitHub
+  DW-2: alignment is reviewed
+```
+
+Numbered from 1, in order. The check **verifies** them: joined in order they must reproduce the ask's Done-when text (case,
+spacing, punctuation and `(n)` numbers are ignored, so you may split on the Done-when's own separators), else it fails with
+`declared clauses do not match the ask`. The ask stays the authority: a plan can never declare fewer or different clauses to
+weaken coverage. Without a declared list, a one-sentence Done-when with many separators prints a warning telling you to
+declare it.
 
 ### Output, hash, exit codes
 
@@ -80,7 +99,7 @@ line with no `(1)` is one clause.
 whoever wrote it) and **two hashes**. The **scenario hash** is sha256 of the canonical scenario block plus the clause list
 (sorted by id, whitespace collapsed, comments and quoting ignored). The **plan hash** is sha256 of the whole plan text,
 whitespace collapsed. **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
-changes it, as editing a scenario does; the scenario hash only says the scenarios are unchanged. Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
+changes it, as editing a scenario does; the scenario hash only says the scenarios are unchanged. The text output groups defects by kind with counts (`vague-pass x17`, then up to five lines of each kind; `--json` has them all). Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
 tab in the indentation, too large, GitHub unreadable). It only reads (GET); it never writes GitHub. `--ask` or
 `--done-when` supply the Done-when when the plan issue has none of its own.
 

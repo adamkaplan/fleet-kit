@@ -16253,6 +16253,160 @@ scenarios:
         self.assertEqual(pc.scenario_block(mixed)[-1], "  - id: S1")
 
 
+class TestPlanCheckFeedback(unittest.TestCase):
+    """#135 follow-up: what the first real plan (52 scenarios, one ask of 7 comma-separated clauses) showed."""
+
+    ONE_SENTENCE = ("plans are recorded on GitHub, alignment is reviewed, misalignment is escalated, integration branches "
+                    "are used, tools fit, rollout is measured, the plan is approved")
+    SEVEN = ["plans are recorded on GitHub", "alignment is reviewed", "misalignment is escalated",
+             "integration branches are used", "tools fit", "rollout is measured", "the plan is approved"]
+
+    def scenario(self, n, covers, extra="", ident=None):
+        return ("  - id: %s\n    covers: %s\n    text: Given the thing number %d is set up, when run, then it behaves\n"
+                "    proof: test\n    pass: the call number %d returns status 200 and exactly %d items\n"
+                "    discriminates: a stub that returns an empty list for item %d fails the count\n    evaluator: ci\n%s"
+                % (ident or "S%d" % n, covers, n, n, n, n, extra))
+
+    def plan(self, clauses=True, cover=range(1, 8), extra_blocks="", slices=None):
+        body = "".join(self.scenario(n, "DW-%d" % n) for n in cover) + self.scenario(90, "PC-1", ident="U1")
+        text = "```yaml\nscenarios:\n" + body + "```\n"
+        if clauses:
+            text += "```yaml\nclauses:\n" + "".join("  DW-%d: %s\n" % (i, c) for i, c in enumerate(self.SEVEN, 1)) + "```\n"
+        return text + extra_blocks
+
+    def codes(self, text, done_when=None):
+        result = sb.plan_check.check(text, done_when or self.ONE_SENTENCE)
+        return sorted(d["code"] for d in result["defects"]), result
+
+    def test_without_a_declared_list_a_one_sentence_done_when_is_one_clause_and_says_so(self):
+        codes, result = self.codes(self.plan(clauses=False))
+        self.assertEqual(len(result["clauses"]), 1)
+        self.assertIn("covers-unknown-clause", codes)
+        messages = " ".join(d["message"] for d in result["defects"] if d["code"] == "covers-unknown-clause")
+        self.assertIn("declare the clauses", messages)
+        self.assertIn("one-clause-many-parts", [w["code"] for w in result["warnings"]])
+
+    def test_declared_clauses_that_reproduce_the_ask_are_used(self):
+        codes, result = self.codes(self.plan())
+        self.assertEqual((len(result["clauses"]), "covers-unknown-clause" in codes, "declared-clauses-mismatch" in codes),
+                         (7, False, False))
+        self.assertEqual(result["result"], "pass", result["defects"])
+
+    def test_declared_clauses_that_differ_from_the_ask_fail(self):
+        weaker = self.plan().replace("DW-7: the plan is approved", "DW-7: the plan is welcomed")
+        self.assertIn("declared-clauses-mismatch", self.codes(weaker)[0])
+        fewer = self.plan(cover=range(1, 7)).replace("  DW-7: the plan is approved\n", "")
+        self.assertIn("declared-clauses-mismatch", self.codes(fewer)[0], "a plan can never weaken coverage")
+        self.assertIn("do not match the ask", " ".join(d["message"] for d in self.codes(fewer)[1]["defects"]))
+
+    def test_the_declared_list_may_split_on_the_asks_separators_and_ignore_case_and_numbers(self):
+        done = "(1) Plans are recorded on GitHub; (2) alignment is reviewed. (3) Tools fit"
+        text = ("```yaml\nscenarios:\n" + self.scenario(1, "DW-1") + self.scenario(2, "DW-2") + self.scenario(3, "DW-3")
+                + self.scenario(9, "DW-1", ident="U1") + "```\n```yaml\nclauses:\n  DW-1: plans are recorded on github\n"
+                "  DW-2: ALIGNMENT is reviewed\n  DW-3: tools   fit\n```\n")
+        self.assertEqual(sb.plan_check.check(text, done)["result"], "pass")
+
+    def test_the_clauses_block_is_strict(self):
+        for block in ("clauses:\n  DW-2: out of order", "clauses:\n  DW-1: ok enough here\n  DW-3: skipped",
+                      "clauses:\n  nonsense", "clauses:\n", "clauses:\n\tDW-1: tab"):
+            with self.subTest(block=block):
+                with self.assertRaises(sb.plan_check.PlanFormatError):
+                    sb.plan_check.declared_clauses("```yaml\n%s\n```" % block)
+        with self.assertRaises(sb.plan_check.PlanFormatError):
+            sb.plan_check.declared_clauses("```yaml\nclauses:\n  DW-1: a\n```\n```yaml\nclauses:\n  DW-1: b\n```")
+        self.assertIsNone(sb.plan_check.declared_clauses("no block"))
+
+    def test_a_numbered_list_done_when_is_split_one_clause_per_line(self):
+        self.assertEqual(sb.plan_check.clauses_of("1. first thing\n2. second thing\n3) third thing"),
+                         ["first thing", "second thing", "third thing"])
+        self.assertEqual(sb.plan_check.clauses_of("1. only one line"), ["1. only one line"])
+
+    def test_ids_may_carry_a_lowercase_suffix_and_sort_by_number_then_suffix(self):
+        pc = sb.plan_check
+        for ok in ("S1", "S11b", "U3a", "S100"):
+            self.assertRegex(ok, pc.ID_RE.pattern)
+        for bad in ("S1B", "S", "X1", "S1bb", "S-1", "s1"):
+            self.assertIsNone(pc.ID_RE.match(bad), bad)
+        self.assertEqual(sorted(["S12", "S11b", "S2", "S11", "U1", "S11a"], key=pc._id_key),
+                         ["S2", "S11", "S11a", "S11b", "S12", "U1"])
+        codes, result = self.codes(self.plan().replace("id: S7", "id: S7b"))
+        self.assertNotIn("bad-id", codes)
+        codes, result = self.codes(self.plan().replace("id: S7", "id: S6"))
+        self.assertIn("duplicate-id", codes)
+
+    def test_every_message_says_what_good_looks_like(self):
+        pc = sb.plan_check
+        self.assertIn("a stub that returns an empty list", pc.discriminates_problem("n/a", "x"))
+        self.assertIn("a stub that returns an empty list", pc.discriminates_problem("a wrong build would fail this", "x"))
+        self.assertIn("a stub that returns an empty list", pc.discriminates_problem("", "x"))
+        vague = pc.pass_rule_problem("it works fine for the user today")
+        self.assertIn("'it works fine for the user today'", vague.replace('"', "'"))
+        for element in ("exit", "threshold", "expected literal", "named comparison"):
+            self.assertIn(element, vague)
+        scenarios = [dict(id="S1x!", covers="DW", text="t" * 12, proof="test", evaluator="ci", **{"pass": "exit status is 0 always",
+                     "discriminates": "a stub that returns an empty list"})]
+        messages = " ".join(d["message"] for d in pc.validate(scenarios, ["a"], "")[0])
+        for fragment in ("S<number>", "S11b", "DW-<n>", "PC-<n>"):
+            self.assertIn(fragment, messages)
+
+    PASS_CORPUS = ("0 occurrences of X in the tree", "10 of 10 files contain Y", "output is identical per file to the baseline",
+                   "exit status is 0", "count of Z equals 3", "the exit code is 0 after the run finishes",
+                   "the list returns status 200 and exactly 1 agent named \"alpha\"", "the reply arrives within 5 s",
+                   "latency stays under 200 ms at p95", "the page shows the word 'Ready' after loading",
+                   "the golden output is byte-identical to the stored fixture", "the number of failures is 0",
+                   "3 of 3 retries succeed and the error count is 0", "the config file is identical to the template",
+                   "the build output has no more than 2 warnings", "disk usage is below 80 percent after the run",
+                   "the response body contains \"created\" and status 201")
+    FAIL_CORPUS = ("it works for 1 user", "works correctly after the change is applied", "output matches the expectations",
+                   "'works'", '"works"', "result = ok and everything fine", "the feature behaves as intended by the team",
+                   "everything is fine and the user is happy", "works", "ok", "it passes", "no errors", "non-empty",
+                   "output is identical to the expectations", "the system is in a good state afterwards",
+                   "after the change, 1 thing is fine", "the thing works after 1 try", "looks right to the reviewer")
+
+    def test_a_corpus_of_pass_rules_both_ways(self):
+        pc = sb.plan_check
+        for rule in self.PASS_CORPUS:
+            with self.subTest(good=rule):
+                self.assertIsNone(pc.pass_rule_problem(rule))
+        for rule in self.FAIL_CORPUS:
+            with self.subTest(bad=rule):
+                self.assertIsNotNone(pc.pass_rule_problem(rule))
+
+    def test_pc_constraints_are_checked_when_declared_and_warned_when_not(self):
+        listed = self.plan() + "\n## Constraints\n- PC-1: nothing outside the repo changes\n- PC-2: no new dependency\n"
+        codes, result = self.codes(listed)
+        self.assertEqual(codes, ["uncovered-constraint"])
+        self.assertIn("PC-2", result["defects"][0]["message"])
+        wrong = listed.replace("covers: PC-1", "covers: PC-9")
+        self.assertIn("covers-unknown-constraint", self.codes(wrong)[0])
+        codes, result = self.codes(self.plan())
+        self.assertEqual(codes, [])
+        self.assertEqual([w["code"] for w in result["warnings"]], ["no-constraint-list"])
+        self.assertEqual(sb.plan_check.declared_constraints("```\nPC-4: in a fence\n```\n**PC-2**: bold\n  - PC-3. item"), {2, 3})
+
+    def test_size_guidance_is_per_slice_when_slices_are_used(self):
+        pc = sb.plan_check
+        def many(count, slice_of):
+            return [dict(id="S%d" % n, slice=slice_of(n), covers="PC-1", text="t", proof="test", evaluator="ci") for n in range(1, count + 1)]
+        warn = lambda scenarios: [w["message"] for w in pc.validate(scenarios, ["a"], "")[1] if w["code"] == "many-scenarios"]
+        self.assertEqual(len(warn(many(52, lambda n: "s%d" % (n % 3)))), 0, "52 scenarios over 3 slices of about 17: no nag")
+        self.assertEqual(len(warn(many(52, lambda n: "one"))), 1, "52 in one slice: that slice is over 30")
+        self.assertEqual(len(warn(many(85, lambda n: "s%d" % (n % 5)))), 1, "over 80 in total")
+        self.assertEqual(len(warn(many(31, lambda n: ""))), 1, "no slices: 30 in total is the guidance")
+        self.assertEqual(len(warn(many(30, lambda n: ""))), 0)
+
+    def test_the_text_output_groups_defects_by_kind_with_counts(self):
+        pc = sb.plan_check
+        text = re.sub(r"pass: .*", "pass: works fine for everyone here", self.plan())
+        result = pc.check(text, self.ONE_SENTENCE)
+        lines = pc.render(result, "file x")
+        self.assertIn("defects: vague-pass x8", lines)
+        self.assertIn("vague-pass x8", lines)
+        self.assertEqual(len([l for l in lines if l.startswith("  DEFECT")]), pc.GROUP_LINES)
+        self.assertTrue(any("and 3 more" in l for l in lines))
+        self.assertEqual(len(result["defects"]), 8, "the data (--json) has every defect")
+
+
 class TestPlanCheckRules(unittest.TestCase):
     """#135: every validation, both ways."""
 
@@ -16373,7 +16527,7 @@ class TestPlanCheckRules(unittest.TestCase):
         text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
         got = self.check(text)
         self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
-        self.assertEqual([w["code"] for w in got["warnings"]], ["many-scenarios"])
+        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["many-scenarios", "no-constraint-list"])
 
     def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
         base = self.check()["scenario_hash"]
@@ -16455,8 +16609,10 @@ class TestPlanCheckCommand(Base):
         code, out, err = self.run_cmd("acme/app#7")
         self.assertEqual(code, 1)
         self.assertIn("plan check: FAIL", out)
-        self.assertEqual([l for l in out.splitlines() if l.startswith("DEFECT")],
-                         ["DEFECT S2: the pass rule 'works' says nothing a wrong build could fail"])
+        defects = [l.strip() for l in out.splitlines() if l.strip().startswith("DEFECT")]
+        self.assertEqual(len(defects), 1)
+        self.assertIn("DEFECT S2: the pass rule 'works' says nothing a wrong build could fail", defects[0])
+        self.assertIn("vague-pass x1", out)
 
     def test_the_latest_plan_comment_is_the_plan(self):
         broken = GOOD_PLAN.replace("exactly 1 agent", "works").replace('named "alpha"', "")

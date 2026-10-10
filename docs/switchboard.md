@@ -3741,7 +3741,7 @@ small strict parser (no yaml dependency, nothing evaluated), checks every scenar
 every Done-when clause of the ask is covered by an S scenario, and prints PASS or FAIL, one line per defect and the
 the plan's two hashes (scenario hash and whole-plan hash; approval binds to the plan hash). Exit 0 pass, 1 fail, 2 unreadable. It reads only. The rules, the schema, a good example and three
 bad ones are in [docs/plan-template.md](plan-template.md); the checker is `bin/plan_check.py` (pure: text in, data out).
-The `fleet-planning` skill that teaches orchestrators to write plans is a later slice.
+A one-sentence Done-when with several clauses is declared in a `clauses:` block, which is verified against the ask's text. The `fleet-planning` skill that teaches orchestrators to write plans is a later slice.
 
 ## Status speed (#86)
 
