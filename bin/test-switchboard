@@ -14775,7 +14775,7 @@ class TestTriage(Base):
         self.go(decisions, passes=3)
         self.assertEqual((self.only("T5"), self.only("T6")), (["acme/api#50"], ["acme/api#51"]))
 
-    def test_t7_our_prs_after_four_hours_others_after_two_days_flag_only_and_a_review_clears_it(self):
+    def test_t7_is_about_our_prs_only_because_formal_reviews_are_not_in_the_data(self):
         self.charter()
         self.add(70, created=0.3, pr=True)                                    # ours, 7h: T7
         self.add(71, created=0.3, pr=True)
@@ -14783,10 +14783,10 @@ class TestTriage(Base):
         self.add(72, created=0.3, pr=True, draft=True)
         self.add(73, created=0.1, pr=True)                                    # ours, 2.4h: too young
         self.add(74, created=0.3, pr=True, author="stranger")                 # theirs, 7h: not yet
-        self.add(75, created=3, pr=True, author="stranger")                   # theirs, 3d: a flag only
+        self.add(75, created=3, pr=True, author="stranger")                   # theirs, 3d: they use formal reviews, unseen
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#70"])
-        self.assertEqual(self.only("OO"), ["acme/api#75"])
+        self.assertEqual((self.only("OO"), [f for f in self.found() if f[1] == "acme/api#75"]), ([], []))   # not even a flag
 
     def test_t8_a_blocked_ask_and_t9_a_silent_ask(self):
         self.charter()
@@ -14930,6 +14930,40 @@ class TestTriage(Base):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, triage=bad))
         self.assertEqual(sb.triage_sla({"sla": {"t1_days": 2}, "sla_overrides": {"a/b": {"t1_days": 5}}}, "a/b")["t1_days"], 5)
+
+    def test_other_owner_flags_are_not_our_findings_and_never_wake_cos_alone(self):
+        self.charter()
+        self.add(180, created=40, updated=40, author="stranger")                  # only an OO flag
+        self.go(enabled=True)
+        self.assertEqual(self.only("OO"), ["acme/api#180"])                      # audited
+        self.assertEqual(sb.triage_summary(self.world.state)["counts"], {})      # not counted as ours
+        self.assertEqual(sb.triage_summary(self.world.state)["total"], 0)
+        self.assertEqual(sb.triage_summary(self.world.state)["other_owner"], 1)
+        self.assertEqual([k for k in self.engine.triage.facts if "summary" not in k], [])   # never a wake on its own
+        self.add(181, created=3, labels=["kind"])                                 # a real finding of ours
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(enabled=True)
+        ((_, (text, _)),) = [(k, v) for k, v in self.engine.triage.facts.items() if "summary" not in k]
+        self.assertIn("acme/api#181 T1", text)
+        self.assertNotIn("acme/api#180", text)
+        self.assertIn("Also 1 other-owner flag(s)", text)                         # a count only, when a wake happens anyway
+        self.assertIn("1 other-owner flag(s)", "\n".join(sb.triage_status_lines(sb.triage_summary(self.world.state))))
+
+    def test_the_summary_is_every_24_hours_since_the_last_one_not_per_calendar_day(self):
+        self.charter()
+        self.add(190, created=3, labels=["kind"])
+        self.go(enabled=True)
+        count = lambda: len([e for e in self.world.audit() if e["event"] == "triage.summary"])
+        self.assertEqual(count(), 1)
+        first = self.engine.triage.summarised
+        self.world.tick(23 * 3600)
+        self.go(passes=2, enabled=True)
+        self.assertEqual(count(), 1)                                              # 23 h later: not yet, even across midnight
+        self.world.tick(3600 + 5)
+        self.go(passes=2, enabled=True)
+        self.assertEqual(count(), 2)
+        self.assertGreaterEqual(self.engine.triage.summarised - first, 86400)
+        self.assertIn("other-owner flags", [e for e in self.world.audit() if e["event"] == "triage.summary"][0]["detail"]["text"])
 
     def test_the_precision_sheet_is_local_deduplicated_and_summarised(self):
         import importlib.machinery, importlib.util

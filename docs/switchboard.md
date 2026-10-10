@@ -2251,7 +2251,7 @@ numbers below are the defaults), `our_logins` (default: the `gh_users` accounts 
 | T2 | a required label group missing (config only) | 1 day |
 | T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 3 days, other issues 14 |
 | T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | 2 days |
-| T7 | an open non-draft PR with no review comment (`Review of <sha>`, approve, changes requested, LGTM) | our PRs 4 hours; a PR older than 14 days is not judged (its review may be outside the comment window) |
+| T7 | an open non-draft PR of OURS with no review comment (`Review of <sha>`, approve, changes requested, LGTM): our agents review by signed comment, which the triage reads. Other teams use formal GitHub reviews, which it does not read, so their PRs are never called unreviewed (no T7, not even a flag) | 4 hours; a PR older than 14 days is not judged (its review may be outside the comment window) |
 | T8 | a blocked ask (a `blocked` label) | 1 day quiet |
 | T9 | an ask with no activity (T3 takes precedence) | 3 days |
 | T10 | a closed issue still carrying an awaiting label | immediate |
@@ -2260,7 +2260,7 @@ numbers below are the defaults), `our_logins` (default: the `gh_users` accounts 
 T4 and T12 are the sweep's S5 and the report fold; they are not repeated. **Another person's or team's issue or PR is never
 our violation:** an item whose author and assignees are none of ours (`our_logins`), that is in no chain, is not
 agent-worked and has no notice, is reported only as `OO` (other-owner, flag only), whatever rules it would break, with
-`would_be` listing them. Precision: each candidate is re-read fresh before it is audited or raised (T3 and T7 also re-read the
+`would_be` listing them. An `OO` flag is audited but is not one of our findings (it is not in the counts or the total, shown as its own `other-owner` count) and never wakes the Chief of Staff on its own: when a wake happens anyway for real findings, the fact adds a count (`Also N other-owner flag(s)`), and the daily summary carries it. Precision: each candidate is re-read fresh before it is audited or raised (T3 and T7 also re-read the
 comments); one the fresh read does not bear out is `triage.dismissed`; one that cannot be checked now is neither audited nor
 raised that pass. A repo the account cannot read is `unreadable`, audited once and shown in `status` and `fleet-doctor`,
 never findings. Reads: four units per repo (open issues, recent comments, closed issues per awaiting label), each at most 2
@@ -2268,7 +2268,7 @@ pages, kept 15 minutes, at most 4 `gh` calls per pass (1 reserved for fresh chec
 so none starves; units not yet read are listed as unchecked.
 
 Reporting: one batched fact per pass (`triage: N findings: ref rule, ...`, refs and kinds only), each item re-raised at most
-once per `realarm_hours`; one summary line per day (counts by rule: found, escalated, unchecked, unreadable repos), audited
+once per `realarm_hours`; one summary line every 24 hours since the last one (counts by rule: found, other-owner flags, escalated, unchecked, unreadable repos), audited
 always and sent only when enabled. `status` shows `triage shadow: N findings (T1 a, T3 b, ...)`. `bin/triage-sample` writes
 the last week's findings to a LOCAL sheet (it refuses a path inside a git working tree) with `label` and `note` columns for
 TP/FP, and `triage-sample --summary FILE` computes precision per rule from the filled sheet (like `bin/judge-sample`); a rule

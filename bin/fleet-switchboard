@@ -6914,8 +6914,10 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T9"] = {"quiet_days": round(age_updated, 1)}
         if not chain and not item["assignees"] and "T1" not in found and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 1)}
-    elif not item["draft"] and comments is not None:
-        limit = sla["t7_ours_hours"] * 3600 if ours else sla["t7_other_days"] * day
+    elif not item["draft"] and comments is not None and ours:
+        # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
+        # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
+        limit = sla["t7_ours_hours"] * 3600
         if now - item["created"] >= limit and not any(c["review"] for c in comments):
             if now - item["created"] <= TRIAGE_COMMENT_DAYS * day:   # older: the review may be outside the window
                 found["T7"] = {"waiting_hours": round((now - item["created"]) / 3600, 1)}
@@ -7139,30 +7141,36 @@ def triage_pass(engine, decisions, now, errors=()):
                 engine._note("triage.dismissed", ref, {"rule": rule, "ref": ref, "why": "a fresh read does not bear it out"})
     findings.sort()
     day = int(now // 86400)
-    if state.day != day:
-        state.day, state.day_counts = day, {}
-    counts = {}
+    counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
-        counts[rule] = counts.get(rule, 0) + 1
+        if rule == "OO":
+            other_owner += 1   # a flag, never counted as one of our findings
+        else:
+            counts[rule] = counts.get(rule, 0) + 1
         if (rule, ref, day) not in state.logged:
             if len(state.logged) > 20000:
                 state.logged.clear()
             state.logged.add((rule, ref, day))
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": cfg["enabled"], "applied": False})
-    state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings), "at": iso(now),
+    state.current = {"enabled": cfg["enabled"], "counts": counts, "total": sum(counts.values()),
+                     "other_owner": other_owner, "at": iso(now),
                      "unchecked": unchecked, "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
                      "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
     triage_write(engine, state)
-    due = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
-    if cfg["enabled"] and due:
-        triage_queue_fact(state, due, now, cfg)
+    due_all = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    due = [pair for pair in due_all if pair[0] != "OO"]
+    flagged = [pair for pair in due_all if pair[0] == "OO"]
+    if cfg["enabled"] and due:   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
+        triage_queue_fact(state, due, now, cfg, len(flagged))
+        for pair in flagged:
+            state.alarmed[pair] = now
         for rule, _ in due:
             state.day_counts[rule] = state.day_counts.get(rule, 0) + 1
     triage_daily_summary(engine, state, cfg, now, day, repos)
 
 
-def triage_queue_fact(state, due, now, cfg):
+def triage_queue_fact(state, due, now, cfg, other_owner=0):
     shown = due[:cfg["max_findings"]]
     digest = hashlib.sha256("|".join("%s:%s" % pair for pair in shown).encode()).hexdigest()[:10]
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
@@ -7171,6 +7179,8 @@ def triage_queue_fact(state, due, now, cfg):
         len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    if other_owner:
+        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
     for pair in due:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
@@ -7179,21 +7189,23 @@ def triage_queue_fact(state, due, now, cfg):
 
 
 def triage_daily_summary(engine, state, cfg, now, day, repos):
-    """Once per 24 h (the key names the day, so a restart repeats nothing): found, escalated, unchecked and unreadable
-    counts by rule. Audited always; sent to the Chief of Staff only when enabled and `daily_summary`."""
-    if state.summarised == day or not state.current:
+    """Once per 24 h SINCE THE LAST ONE (not per calendar day): found, other-owner, escalated, unchecked and unreadable counts.
+    Audited always; sent to the Chief of Staff only when enabled and `daily_summary`. Not before every repo was read once."""
+    if not state.current or (state.summarised is not None and now - state.summarised < 86400):
         return
     if not all((r, "issues") in state.units or r in state.unreadable for r in repos):
         return   # not every repo has been read once yet (a restart's first passes): a summary of nothing says nothing
-    state.summarised = day
+    state.summarised = now
     counts = state.current["counts"]
-    text = "triage summary: found %d (%s); escalated today %d; unchecked %d; unreadable repos %d%s" % (
+    text = "triage summary: found %d (%s); other-owner flags %d; escalated since the last summary %d; unchecked %d; unreadable repos %d%s" % (
         state.current["total"], ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none",
-        sum(state.day_counts.values()), state.current["unchecked"], len(state.current["unreadable"]),
+        state.current.get("other_owner", 0), sum(state.day_counts.values()), state.current["unchecked"],
+        len(state.current["unreadable"]),
         " (" + ", ".join(state.current["unreadable"][:5]) + ")" if state.current["unreadable"] else "")
-    engine._note("triage.summary", None, {"text": text, "counts": counts, "enabled": cfg["enabled"]})
+    state.day_counts = {}
+    engine._note("triage.summary", None, {"text": text, "counts": counts, "enabled": cfg["enabled"], "at": iso(now)})
     if cfg["enabled"] and cfg["daily_summary"]:
-        state.facts["triage.summary:%d" % day] = (text, now)
+        state.facts["triage.summary:%d" % int(now)] = (text, now)
 
 
 def triage_write(engine, state):
@@ -7227,6 +7239,8 @@ def triage_status_lines(triage):
     lines = ["      triage     %s: %s finding(s) (%s) over %s repo(s) as of %s" % (
         "on (wakes the Chief of Staff; writes nothing to GitHub)" if triage.get("enabled") else "shadow (audit only; writes nothing to GitHub)",
         triage.get("total", 0), parts, triage.get("repos", "?"), triage.get("at", "?"))]
+    if triage.get("other_owner"):
+        lines.append("      triage     %d other-owner flag(s): not ours, not counted, never a wake on their own" % triage["other_owner"])
     if triage.get("unreadable"):
         lines.append("      triage     unreadable repo(s), no findings from them: " + ", ".join(triage["unreadable"]))
     if triage.get("unchecked_units"):
