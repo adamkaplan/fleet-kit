@@ -4971,6 +4971,29 @@ def pr_reviews_at(reviews, head, author):
     return [{"by": by, "state": state} for by, state in sorted(found.items())]
 
 
+def pr_review_older(reviews, head, author):
+    """True when someone other than the author reviewed this PR at a commit that is NOT its head (the review predates the
+    last push). Companion of `pr_reviews_at`; False when none or when the list cannot be read."""
+    if not isinstance(reviews, list) or not head or not author:
+        return False
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        commit = review.get("commit")
+        oid = commit.get("oid") if isinstance(commit, dict) else None
+        if (oid and oid != head and pr_login(review.get("author")) not in (None, author)
+                and str(review.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")):
+            return True
+    return False
+
+
+def pr_head_time(commits):
+    """When the PR's last commit was made (epoch seconds), from `gh pr view --json commits`, or None."""
+    if not isinstance(commits, list) or not commits or not isinstance(commits[-1], dict):
+        return None
+    return parse_iso(commits[-1].get("committedDate"))
+
+
 CAPTAIN_NO_REVIEW_SECONDS = 2 * 3600  # a captain PR with no review seen is a decision anyway this long after its notice
 PR_COMMENTS_READ = 50       # the last comments read for review evidence
 PR_COMMENT_CLIP = 20000     # characters of one comment searched
@@ -5026,6 +5049,8 @@ def pr_facts_from(data):
             "captain": pr_is_captain(data.get("body")), "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
+            "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
+            "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
             "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
@@ -5034,7 +5059,7 @@ def pr_facts_from(data):
             "head": head}
 
 
-def read_pr_facts(engine, repo, number):
+def read_pr_facts(engine, repo, number, extra_fields=""):
     """ONE `gh pr view` of the PR, with the repo's configured account (gh_users). The hub's picture holds the PR's
     title, size and state only (not checks or review), so it cannot answer this on its own. Raises NoticeError."""
     config = engine.config
@@ -5044,7 +5069,8 @@ def read_pr_facts(engine, repo, number):
     except AccountError as err:
         raise NoticeError(str(err)) from None
     extra = {"env": env} if env is not None else {}
-    argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json", PR_VIEW_FIELDS]
+    argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json",
+            PR_VIEW_FIELDS + ("," + extra_fields if extra_fields else "")]
     try:
         done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
                                                     timeout=min(config["call_timeout_seconds"],
@@ -6832,6 +6858,7 @@ class TriageState:
         self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
         self.unreadable = {}     # repo -> reason, audited once
         self.confirmed, self.attempted, self.alarmed = {}, {}, {}
+        self.enriched = {}       # (rule, ref) -> evidence the fresh read added
         self.logged, self.facts, self.current = set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
@@ -6898,7 +6925,7 @@ def triage_context(engine, repo, items, discovery):
     return {"charters": charters, "asks": asks, "chain": charters | asks | work, "owned": owned}
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True):
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -6927,7 +6954,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T9"] = {"quiet_days": round(age_updated, 2)}
         if not chain and not item["assignees"] and "T1" not in found and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
-    elif not item["draft"] and comments is not None and ours:
+    elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
         # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
         limit = sla["t7_ours_hours"] * 3600
@@ -6998,6 +7025,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
         issues_unit = state.units.get((repo, "issues"))
         if issues_unit is None:
@@ -7022,7 +7050,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             unchecked.setdefault(repo, []).append("comments")
         for number, item in sorted(items.items()):
             comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
-            found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()))
+            # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
+            captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
+            found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
+                                       captain_skip=captain_skip)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -7070,6 +7101,8 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
         return None
     wants_comments = rule in ("T3", "T7") or (rule == "OO" and {"T3", "T7"} & set((evidence or {}).get("would_be", [])))
     number, need = int(number), (2 if wants_comments else 1)
+    if rule == "T7":
+        return triage_verify_t7(engine, state, repo, number, cfg, now, budget)
     if budget[0] < need:
         return None
     budget[0] -= 1
@@ -7116,6 +7149,50 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
     return (rule in found) if (ours and rule != "OO") else (rule == "OO" and bool(found))
 
 
+def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
+    """T7 against the captain decision's own evidence (`captain_evidence`, built on `pr_reviews_at` and `pr_signed_at`): a
+    formal review by a non-author at the exact head, or a signed head-naming comment from a non-author agent that is not a
+    sender of the PR's notice, means REVIEWED: no finding. A review at an OLDER head only fires once the last push is older
+    than the T7 SLA, with the evidence 'review at an older head'. True/False/None as `triage_verify`."""
+    if budget[0] < 1:
+        return None
+    budget[0] -= 1
+    try:
+        facts = read_pr_facts(engine, repo, number, "commits")
+    except NoticeError:
+        return None
+    if facts["state"] != "open":
+        return False
+    senders, noticed = set(), False
+    try:
+        for item in read_pr_notices(engine.state_dir):
+            if item["repo"] == repo and item["number"] == number:
+                senders |= set(notice_senders(item))
+                noticed = True
+    except (NoticeError, OSError, TypeError):
+        noticed = False
+    # A signed comment is review evidence only when the PR's notice is on file (its sender is then known and excluded):
+    # with none, the author's own signed comment would pass for a review. Without a notice only a formal review counts.
+    if noticed:
+        evidence = captain_evidence(facts, senders)
+    else:
+        evidence = facts["reviews"] if facts.get("reviews") is None else [dict(r, kind="review") for r in facts["reviews"]]
+    if evidence is None:
+        return None          # reviews or comments could not be read: no finding either way
+    if evidence:
+        return False         # reviewed at the exact head, in the fleet's own flow
+    note = {} if noticed else {"notice": "no notice on file"}
+    if facts.get("reviews_older"):
+        pushed = facts.get("head_at")
+        hours = cfg and triage_sla(cfg, repo)["t7_ours_hours"]
+        if pushed is None or now - pushed < hours * 3600:
+            return False     # reviewed before the last push, and the push is not older than the SLA yet
+        note.update(review="review at an older head", since_push_hours=round((now - pushed) / 3600, 1))
+    if note:
+        state.enriched[("T7", "%s#%d" % (repo, number))] = note
+    return True
+
+
 def triage_pass(engine, decisions, now, errors=()):
     """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
     and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
@@ -7145,7 +7222,7 @@ def triage_pass(engine, decisions, now, errors=()):
         verdict = triage_verify(engine, state, rule, ref, cfg, now, budget, evidence)
         if verdict:
             state.confirmed[pair] = now
-            findings.append((rule, ref, evidence))
+            findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
         elif verdict is None:
             unchecked += 1
         else:
