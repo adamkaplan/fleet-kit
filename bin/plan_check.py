@@ -418,8 +418,11 @@ UNITS = (r"ms|s|sec|secs|second|seconds|minute|minutes|min|mins|hour|hours|h|day
          r"occurrences?|matches|hits|failures?|warnings?|defects?|violations?|dirs?|directories|modules?|functions?")
 THRESHOLD = (r"(?:at least|at most|exactly|more than|fewer than|less than|greater than|no more than|no fewer than|"
              r"under|over|within|above|below|up to)")
-STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|responds?|code)\s*(?:is|=|==|of|:)?\s*[1-5][0-9][0-9]\b",
+STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|responds?|code)\s*(?:is|=|==|of|:)?\s*(?:[1-5][0-9][0-9]|[1-5]xx)\b",
                        re.IGNORECASE)
+STATUS_CLASS_RE = re.compile(r"\b[1-5]xx\b|\b(?:a|an)\s+[1-5][0-9][0-9]\b", re.IGNORECASE)   # a status CLASS: `a 4xx`, `5xx`
+# zero, or an exact number, of anything: `sends 0 accepts`, `received 0 responses`, `exactly 3 retries`
+COUNT_OF_ANYTHING_RE = re.compile(r"\b(?:0|exactly\s+[0-9]+)\s+(?:[A-Za-z-]+\s+){0,2}?[A-Za-z]{3,}", re.IGNORECASE)
 EXIT_RE = re.compile(r"\bexit (?:code|status)\s*(?:is|=|==|of|:)?\s*[0-9]+\b", re.IGNORECASE)
 UNIT_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?\s*(?:%%|percent|%s)(?![A-Za-z])" % UNITS, re.IGNORECASE)
 PERCENT_RE = re.compile(r"[0-9]\s*%")
@@ -434,7 +437,7 @@ THRESHOLD_RE = re.compile(r"\b%s\s+[0-9]" % THRESHOLD, re.IGNORECASE)
 IDENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*(?:[._/-][A-Za-z0-9_]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Za-z_][A-Za-z0-9_]*)"
 COMPARED_RE = re.compile(r"(%s)\s*(?:==|!=|>=|<=|=|<|>|\bis\b|\bequals\b|\bcontains\b|\bmatches\b)\s*(\"[^\"]+\"|'[^']+'|`[^`]+`|[0-9][0-9.]*)"
                          % IDENT, re.IGNORECASE)
-STRONG_PHRASES = ("byte-identical", "identical to the stored", "identical to the fixture", "no diff", "diff is empty",
+STRONG_PHRASES = ("byte-identical", "byte equal", "byte-equal", "byte for byte", "byte-for-byte", "identical to the stored", "identical to the fixture", "no diff", "diff is empty",
                   "zero diff", "checksum", "sha256", "empty diff")
 QUOTED_RE = re.compile(r"[\"'`]([^\"'`]+)[\"'`]")
 
@@ -456,7 +459,7 @@ def _has_observable(rule):
     vague word, or a strong comparison phrase (byte-identical, no diff). A bare digit, `=`, `after` or `before` is not."""
     lowered = rule.lower()
     if STATUS_RE.search(rule) or EXIT_RE.search(rule) or UNIT_RE.search(rule) or PERCENT_RE.search(rule) \
-            or THRESHOLD_RE.search(rule) or _equal_n_of_n(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
+            or THRESHOLD_RE.search(rule) or STATUS_CLASS_RE.search(rule) or COUNT_OF_ANYTHING_RE.search(rule) or _equal_n_of_n(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
         return True
     named = IDENTICAL_RE.search(rule)
     if named and named.group(1).lower() not in VAGUE_TARGETS and named.group(1).lower() not in VAGUE_WORDS:
@@ -506,7 +509,22 @@ NEGATIVE_MARKERS = ("stub", "canned", "empty", "nothing", "missing", "without", 
                     "never", "not", "no", "zero", "diff", "differs", "mismatch", "extra", "reordered", "ordering",
                     "changed", "old", "leaks", "crash", "crashes", "hangs", "times", "timeout", "denied", "refused",
                     "rejects", "accepts", "wrong", "creates", "deletes", "overwrites", "different")
-OVERLAP_LIMIT = 0.6
+OVERLAP_LIMIT = 0.6   # at or above: a warning
+OVERLAP_FAIL = 0.8    # at or above: a failure (the pass rule reworded)
+
+
+# `a build that <does X> ... <an observable outcome>`: structure, not a list of verbs the plan must happen to use
+BUILD_NOUNS = r"(?:build|builds|implementation|version|stub|variant|fake|mock|regression|bug|handler|client|agent|service|change|patch|fix|shortcut|cache)"
+STRUCT_RE = re.compile(r"^(?:a|an|the|any)\s+(?:[a-z-]+\s+){0,3}?%s\s+(?:that|which|where|with|can|still|only|just|always|"
+                       r"does|did|has|had|would|will|never)\s+\S+(?:\s+\S+){2,}" % BUILD_NOUNS, re.IGNORECASE)
+OUTCOME_RE = re.compile(r"\b(?:shows?|returns?|sends?|finds?|changes?|queues?|prints?|reports?|emits?|writes?|leaves?|"
+                        r"yields?|produces?|gives?|answers?|replies|logs?|creates?|lists?|accepts?|rejects?|posts?|opens?|"
+                        r"displays?|reads?|drops?|skips?|loses?|keeps?|sets?|updates?|marks?|counts?|resolves?|"
+                        r"hides?|exposes?|leaks?|retries|retry|waits?|times? out|crash(?:es)?|hangs?)\b", re.IGNORECASE)
+
+
+def _structural_wrong_build(value):
+    return bool(STRUCT_RE.match(value) and OUTCOME_RE.search(value))
 
 
 def _content_words(text):
@@ -528,12 +546,26 @@ def discriminates_problem(value, pass_rule):
     if len(rest) < 3:
         return ("`discriminates` only says that a wrong build fails (%r): say what the wrong build does, for example "
                 "'a stub that returns an empty list'" % value[:60])
-    if not (any(w in NEGATIVE_MARKERS for w in words) or re.search(r"[0-9]", value) or QUOTED_RE.search(value)):
+    if not (any(w in NEGATIVE_MARKERS for w in words) or re.search(r"[0-9]", value) or QUOTED_RE.search(value)
+            or _structural_wrong_build(value)):
         return ("`discriminates` %r names no concrete wrong build or negative case: say what the wrong build does, e.g. a "
                 "stub that returns an empty list" % value[:60])
-    ours, theirs = _content_words(value), _content_words(pass_rule)
-    if ours and len(ours & theirs) / len(ours) >= OVERLAP_LIMIT:
+    if _overlap(value, pass_rule) >= OVERLAP_FAIL:
         return "`discriminates` is nearly the pass rule reworded: say what a WRONG build would show instead"
+    return None
+
+
+def _overlap(value, pass_rule):
+    ours, theirs = _content_words(value), _content_words(pass_rule)
+    return len(ours & theirs) / len(ours) if ours else 0.0
+
+
+def discriminates_overlap_warning(value, pass_rule):
+    """A warning (not a failure) when a wrong build shares most of its words with the pass rule: a wrong build is often
+    the right one with one thing changed, so only a near copy (OVERLAP_FAIL) is refused."""
+    if OVERLAP_LIMIT <= _overlap(_normal(value), pass_rule) < OVERLAP_FAIL:
+        return ("`discriminates` repeats much of the pass rule: check it names what a WRONG build shows, not the right "
+                "build's result again")
     return None
 
 
@@ -604,6 +636,10 @@ def validate(scenarios, clauses, text=""):
             problem = discriminates_problem(scenario["discriminates"], scenario.get("pass", ""))
             if problem:
                 bad(ident, "no-discriminator", problem)
+            else:
+                note = discriminates_overlap_warning(scenario["discriminates"], scenario.get("pass", ""))
+                if note:
+                    warnings.append({"id": ident, "code": "discriminates-overlap", "message": "%s: %s" % (ident, note)})
 
     for number in range(1, len(clauses) + 1):
         tag = "DW-%d" % number

@@ -16538,6 +16538,69 @@ scenarios:
         self.assertEqual(pc.scenario_block(mixed)[-1], "  - id: S1")
 
 
+class TestPlanCheckRound2(unittest.TestCase):
+    """#135 round 2: false positives from a real 52-scenario plan, reproduced with paraphrased, synthetic text."""
+
+    def test_zero_and_exact_counts_of_any_noun_are_observables(self):
+        for rule in ("the agent sends 0 accepts to the boss", "0 cancellations originating from the agent appear in the log",
+                     "the reader received 0 responses from the queue", "the summary shows (0 new decisions, 1 accept)",
+                     "the run asserts 0 tool calls and 0 facts", "the job makes exactly 3 retries before it stops",
+                     "the page lists exactly 2 open questions"):
+            with self.subTest(rule=rule):
+                self.assertIsNone(sb.plan_check.pass_rule_problem(rule))
+        for rule in ("after the change, 1 thing is fine", "the thing works after 1 try", "works for 0 users happily today",
+                     "the agent has 3 accepts and that is fine", "0 hits yes fine ok"):
+            with self.subTest(still_vague=rule):
+                self.assertIsNotNone(sb.plan_check.pass_rule_problem(rule))
+
+    def test_a_status_class_counts_like_a_status(self):
+        for rule in ("the endpoint returns a 4xx for a bad token", "the call answers 5xx under load",
+                     "a missing record gives a 404 and a body naming the id", "the reply status is 2xx"):
+            with self.subTest(rule=rule):
+                self.assertIsNone(sb.plan_check.pass_rule_problem(rule))
+        self.assertIsNotNone(sb.plan_check.pass_rule_problem("the endpoint returns some kind of error class"))
+
+    def test_byte_equal_phrases_are_strong(self):
+        for rule in ("yields identical output (byte equal)", "the two outputs are byte for byte the same file",
+                     "the exported file is byte-for-byte the stored copy", "the output is byte-equal to the golden file"):
+            with self.subTest(rule=rule):
+                self.assertIsNone(sb.plan_check.pass_rule_problem(rule))
+
+    GOOD_WRONG_BUILDS = (
+        "a build that drops the retry queue sends the message twice and the count reads 2",
+        "a build that skips the dedupe step finds two rows for one key",
+        "a build that ignores the header changes the status to the default value",
+        "an implementation that caches the first reply returns a stale value on the second call",
+        "a handler that only logs the event never queues the follow-up job",
+        "a version that loses the draft keeps the old title after a restart")
+    BAD_WRONG_BUILDS = ("a bad build", "a build that fails", "a wrong build would fail this", "the scenario would fail",
+                        "fails", "it is wrong", "n/a", "a broken implementation")
+
+    def test_a_concrete_wrong_build_is_recognised_by_structure_not_a_verb_list(self):
+        pass_rule = "the list call returns status 200 and exactly 1 agent named alpha"
+        for text in self.GOOD_WRONG_BUILDS:
+            with self.subTest(good=text):
+                self.assertIsNone(sb.plan_check.discriminates_problem(text, pass_rule))
+        for text in self.BAD_WRONG_BUILDS:
+            with self.subTest(bad=text):
+                self.assertIsNotNone(sb.plan_check.discriminates_problem(text, pass_rule))
+
+    def test_overlap_with_the_pass_rule_warns_and_only_a_near_copy_fails(self):
+        pc = sb.plan_check
+        pass_rule = "the list call returns status 200 and exactly 1 agent named alpha"
+        some = "a build that returns status 200 and the list call lists exactly 2 agents named alpha"
+        self.assertIsNone(pc.discriminates_problem(some, pass_rule), "a wrong build is the right one with a thing changed")
+        self.assertIsNotNone(pc.discriminates_overlap_warning(some, pass_rule))
+        near = "the list call returns status 200 and not exactly 1 agent named alpha"
+        self.assertIn("reworded", pc.discriminates_problem(near, pass_rule))
+        self.assertIsNone(pc.discriminates_overlap_warning("a stub that returns an empty list for every project", pass_rule))
+        scenario = dict(id="S1", covers="DW-1", text="a scenario that is long enough", proof="test", evaluator="ci",
+                        **{"pass": pass_rule, "discriminates": some})
+        defects, warnings = pc.validate([scenario], ["a"], "unchanged: none because this is only a unit test")
+        self.assertEqual([d["code"] for d in defects], [])
+        self.assertEqual([w["code"] for w in warnings], ["discriminates-overlap"])
+
+
 class TestPlanCheckFeedback(unittest.TestCase):
     """#135 follow-up: what the first real plan (52 scenarios, one ask of 7 comma-separated clauses) showed."""
 
