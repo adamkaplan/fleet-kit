@@ -6204,6 +6204,37 @@ def sweep_phrase_re(names):
                       r"|for\s+(?:%s)'s\s+review)(?![\w])" % (verbs, who, who, who), re.I)
 
 
+SWEEP_STRONG_VERBS = ("waiting on", "waits on", "held for")
+SWEEP_STRONG_NEEDS = ("decision", "yes", "answer", "approval", "review", "ok")
+SWEEP_HEDGE_RE = re.compile(r"\b(?:if|would|may|proposal|proposals|option|options|could|says|saying|said|finding|findings)\b", re.I)
+
+
+def sweep_strong_re(names):
+    """The strong forms only (S3): waiting on / waits on / held for <name>, needs <name>'s decision|yes|answer|approval|
+    review|OK, for <name>'s review. Whole phrases, any case."""
+    who = "|".join(re.escape(n) for n in names)
+    verbs = "|".join(re.escape(v) for v in SWEEP_STRONG_VERBS)
+    needs = "|".join(SWEEP_STRONG_NEEDS)
+    return re.compile(r"(?<![\w])(?:(?:%s)\s+(?:%s)|needs\s+(?:%s)'s\s+(?:%s)|for\s+(?:%s)'s\s+review)(?![\w])"
+                      % (verbs, who, who, needs, who), re.I)
+
+
+def sweep_says_waiting_strong(strong, text):
+    """A strong form, outside code and quotes, not negated, in a sentence with no conditional or descriptive marker
+    (if, would, may, could, proposal, option(s), and reported speech: says, saying, said, finding(s)): a statement that it waits, not a description of a plan."""
+    if not isinstance(text, str):
+        return False
+    text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
+    for match in strong.finditer(text):
+        start = max(text.rfind(c, 0, match.start()) for c in ".!?\n") + 1
+        ends = [i for i in (text.find(c, match.end()) for c in ".!?\n") if i >= 0]
+        sentence = text[start:min(ends) if ends else len(text)]
+        if SWEEP_HEDGE_RE.search(sentence) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
+            continue
+        return True
+    return False
+
+
 SWEEP_NEGATION_RE = re.compile(r"\b(?:not|no longer|never|isn't|aren't|wasn't|don't|doesn't|didn't|nobody|without)\s+"
                                r"(?:\w+\s+){0,2}$", re.I)
 SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
@@ -6247,6 +6278,7 @@ class SweepState:
         self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
         self.attempted = {}      # (kind, ref) -> when it was last tried (the oldest is tried first)
         self.current = {}        # the last run's counts
+        self.strong = sweep_strong_re(SWEEP_DEFAULTS["person_names"])
         self.started = 0         # when this pass's sweep began (the time budget)
 
 
@@ -6261,7 +6293,7 @@ def sweep_pages_used(records, truncated):
     return SWEEP_LIST_PAGES if truncated else max(1, -(-len(records) // GITHUB_PAGE_SIZE))
 
 
-def sweep_read_repo(hub, repo, now, window_days, regex, budget):
+def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     """One repo's open issues and PRs (one bounded list read: bodies and labels come with it) and the recent
     comments (one bounded list read, newest first). Only reduced facts are kept: no text survives. `budget` is a
     one-item list: the calls this pass may still make; each read is charged what it used."""
@@ -6278,7 +6310,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget):
         body = record.get("body")
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body),
-                         "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": []}
+                         "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": [],
+                         "latest_strong": False}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
     budget[0] -= sweep_pages_used(comments, cut)
@@ -6287,6 +6320,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget):
         number = _url_number(comment.get("issue_url"))
         if number in items and isinstance(comment.get("created_at"), str) and comment["created_at"] >= since:
             items[number]["comments"].append(sweep_says_waiting(regex, comment.get("body")))
+            items[number]["latest_strong"] = sweep_says_waiting_strong(strong, comment.get("body"))  # the last one wins
     return {"at": now, "items": items, "truncated": truncated, "error": None}
 
 
@@ -6303,7 +6337,8 @@ def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
         if budget[0] - SWEEP_CONFIRM_RESERVE < 2 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             break
         try:
-            state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex, budget)
+            state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex, budget,
+                                                state.strong)
         except GitHubUnavailable as err:
             budget[0] -= 1
             old = state.repos.get(repo) or {"items": {}, "truncated": False}
@@ -6370,12 +6405,12 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, complete=Tru
                 s2.add((repo, number))
     for repo, picture in (state.repos.items() if complete else ()):
         for number, item in picture["items"].items():
-            if any(item["comments"][-SWEEP_PR_COMMENTS:]) and (repo, number) not in s2 and (repo, number) not in human:
+            if item["latest_strong"] and (repo, number) not in s2 and (repo, number) not in human:
                 found.add(("S3", ref_text(repo, number)))
     for d in (decisions if complete else ()):
         ref = sweep_ref_of(d, home)
         if d.get("kind") == "report" and ref and ref[0] and ref not in human and ref not in s2 \
-                and sweep_says_waiting(regex, d.get("title")):
+                and sweep_says_waiting_strong(state.strong, d.get("title")):
             found.add(("S3", ref_text(*ref)))
         since = parse_iso(d.get("since"))
         if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
@@ -6396,7 +6431,8 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         return None
     number = int(number)
     picture = (state.repos.get(repo) or {"items": {}})["items"].get(number) or {}
-    comments_raised = kind in ("S2", "S3") and any(picture.get("comments", [])[-SWEEP_PR_COMMENTS:])
+    comments_raised = ((kind == "S2" and any(picture.get("comments", [])[-SWEEP_PR_COMMENTS:]))
+                       or (kind == "S3" and picture.get("latest_strong", False)))
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
@@ -6425,7 +6461,10 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
             return None
         if cut:
             return None  # the last comments are not on the first page: cannot say
-        waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
+        if kind == "S3":   # only the LATEST comment on the item counts
+            waits_in_comments = bool(recent) and sweep_says_waiting_strong(state.strong, recent[-1].get("body"))
+        else:
+            waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
     if kind == "S2":
         return is_pr and not pr_is_captain(body) and (sweep_says_waiting(regex, body) or waits_in_comments)
     if kind == "S3":
@@ -6447,6 +6486,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
     watched = [d for d in decisions]
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
     regex = sweep_phrase_re(cfg["person_names"])
+    state.strong = sweep_strong_re(cfg["person_names"])
     budget = [SWEEP_CALLS_PER_PASS]
     sweep_refresh(engine, state, repos, now, cfg, regex, budget)
     share = [(budget[0] + 1) // 2]  # the single reads are split: half for S4, the rest (and S4's unused) to verifying

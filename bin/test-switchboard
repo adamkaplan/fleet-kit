@@ -14281,7 +14281,7 @@ class TestSweep(Base):
 
     def test_a_label_added_since_the_cached_read_dismisses_s3_and_s1a(self):
         self.hub.open = {81: sweep_issue(81, "x"), 82: sweep_issue(82, "## Decision required\nx")}
-        self.hub.comments = [sweep_comment(81, "needs Adam", self.at(1))]
+        self.hub.comments = [sweep_comment(81, "waiting on Adam", self.at(1))]
         self.hub.live = {81: sweep_issue(81, "x", [self.USER]), 82: sweep_issue(82, "## Decision required\nx", [self.COS])}
         self.sweep()
         self.assertEqual(self.found(), [])
@@ -14300,7 +14300,7 @@ class TestSweep(Base):
 
     def test_nothing_that_depends_on_the_list_is_judged_while_the_list_is_incomplete(self):
         self.hub.open = {1: sweep_issue(1, "## Decision required\nx"), 10: sweep_issue(10, "Held for Adam", pr=True)}
-        self.hub.comments = [sweep_comment(1, "needs Adam", self.at(1))]
+        self.hub.comments = [sweep_comment(1, "waiting on Adam", self.at(1))]
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         errors = [{"source": "github", "error": "issues of acme/api that wait on you are not read yet"}]
         sb.sweep_decisions(self.engine, [old], self.world.clock.now(), errors)
@@ -14320,10 +14320,34 @@ class TestSweep(Base):
         self.sweep()                                            # confirmed: no new read inside the window
         self.assertEqual(len(self.hub.single), before)
 
+    def test_the_strong_forms_in_a_plain_statement_only(self):
+        strong = sb.sweep_strong_re(["Adam"])
+        for text in ("waiting on Adam", "This waits on adam for the merge.", "Held for Adam", "needs Adam's decision",
+                     "needs Adam\u2019s OK", "ready for Adam's review", "Done. Now waiting on Adam"):
+            self.assertTrue(sb.sweep_says_waiting_strong(strong, text), text)
+        for text in ("needs Adam", "pending Adam", "awaiting Adam", "if it is waiting on Adam, ping", "it would be held for Adam",
+                     "may need Adam's decision? needs Adam's decision if X", "proposal: needs Adam's OK",
+                     "option 2: held for Adam", "could be waiting on Adam", "not waiting on Adam", "> waiting on Adam",
+                     "`waiting on Adam`", "a comment says it waits on Adam", "the finding: held for Adam"):
+            self.assertFalse(sb.sweep_says_waiting_strong(strong, text), text)
+        self.assertTrue(sb.sweep_says_waiting_strong(strong, "Option 2 is dropped.\nNow waiting on Adam."))  # another sentence
+
+    def test_s3_reads_the_latest_comment_only_and_not_the_body_or_an_open_item_only(self):
+        self.hub.open = {90: sweep_issue(90, "waiting on Adam"), 91: sweep_issue(91, "x"), 92: sweep_issue(92, "x")}
+        self.hub.comments = [sweep_comment(91, "all clear now", self.at(0)), sweep_comment(91, "waiting on Adam", self.at(1)),
+                             sweep_comment(92, "waiting on Adam", self.at(1))]   # newest first
+        self.sweep()
+        self.assertEqual(self.found(), [("S3", "acme/api#92")])    # 90: body only; 91: superseded by a later comment
+        self.hub.closed = {92}
+        self.engine.sweep.confirmed.clear()
+        self.world.tick(sb.SWEEP_TTL + 1)
+        self.sweep()
+        self.assertEqual(self.engine.sweep.current["counts"].get("S3"), None)   # closed: not a finding
+
     def test_s3_said_to_wait_but_not_in_the_human_tier(self):
         self.hub.open = {20: sweep_issue(20, "x"), 21: sweep_issue(21, "x"), 22: sweep_issue(22, "x")}
-        self.hub.comments = [sweep_comment(20, "needs Adam", self.at(1)), sweep_comment(21, "needs Adam", self.at(1)),
-                             sweep_comment(22, "needs Adam", self.at(9))]  # older than the window: not read
+        self.hub.comments = [sweep_comment(20, "waiting on Adam", self.at(1)), sweep_comment(21, "waiting on Adam", self.at(1)),
+                             sweep_comment(22, "waiting on Adam", self.at(9))]  # older than the window: not read
         self.sweep([self.human(21)])
         self.assertEqual(self.found(), [("S3", "acme/api#20")])
         report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 23, "since": self.at(),
