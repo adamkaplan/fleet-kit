@@ -11,6 +11,9 @@
     "reported_by": [
      "api-orch"
     ],
+    "reported_lines": [
+     "api-orch: which engine, on the escalated issue?"
+    ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "human",
     "title": "Escalated to you"
@@ -25,6 +28,9 @@
     "reported_by": [
      "api-coder"
     ],
+    "reported_lines": [
+     "api-coder: blocked: waiting on the cos issue"
+    ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "cos",
     "title": "Still with the cos"
@@ -38,6 +44,9 @@
     "repo": "acme/api",
     "reported_by": [
      "api-orch"
+    ],
+    "reported_lines": [
+     "api-orch: and on the issue with both labels?"
     ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "human",

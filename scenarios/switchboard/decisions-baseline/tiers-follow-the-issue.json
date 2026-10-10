@@ -10,6 +10,9 @@
    "reported_by": [
     "api-orch"
    ],
+   "reported_lines": [
+    "api-orch: Which way for 12?"
+   ],
    "since": "2027-01-15T08:00:01Z",
    "tier": "human",
    "title": "The labelled issue"
@@ -25,6 +28,9 @@
    "repo": "acme/api",
    "reported_by": [
     "api-orch"
+   ],
+   "reported_lines": [
+    "api-orch: Which way for 12?"
    ],
    "since": "2027-01-15T07:59:00Z",
    "tier": "cos",

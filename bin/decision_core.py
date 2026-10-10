@@ -405,17 +405,22 @@ def parse_decision_rows(body):
 # ---------------------------------------------------------------- folding: items in, the decision list out
 
 
+FOLDED_LINES_KEPT = 3    # the newest folded report lines an issue decision keeps (`reported_lines`)
+FOLDED_LINE_MAX = 160    # characters of each
+
+
 def build_entries(items, ids, home, known_title, tier_flat=False):
     """The decisions (as list entries) the source `items` become, not yet ordered and without notices.
 
     `items` are what the sources found (dicts with kind, title, ask, repo, agent, since, seed, bare, tier, and
-    optionally rows, raised_by, considered, session, request); `ids` are their display ids, in the same order
+    optionally rows, raised_by, considered, session, request, repo_known); `ids` are their display ids, in the same order
     (assign_ids); `home` is the repo a bare issue belongs to (or None); `known_title(repo, number)` is a lookup of
     an issue's title the caller already holds, never a read (None when unknown). `tier_flat` is the Lab's
     `tier-flat` fault.
 
     One question, shown once: a report on an issue that is itself a decision (same repo and number) is folded into
-    the issue's decision; so is an untagged report whose text names exactly one such issue in its repo. A report
+    the issue's decision (its newest lines stay in the entry as `reported_lines`); a report whose repo is only a guess
+    (`repo_known` false: no repo was named at all) folds into the one listed issue decision with its number; so is an untagged report whose text names exactly one such issue in its repo. A report
     about an issue the Chief of Staff escalated is the human's too."""
     yours = {(item["repo"] or home, item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
     listed = {(item["repo"] or home, item["ask"]): item["title"] for item in items if item["kind"] == "issue"}
@@ -433,10 +438,16 @@ def build_entries(items, ids, home, known_title, tier_flat=False):
             number = named.pop() if len(named) == 1 else None
         if number and (repo, number) in listed:
             folded[id(item)] = (repo, number)
-    reporters = {}
-    for item in items:
-        if id(item) in folded:
-            reporters.setdefault(folded[id(item)], []).append(item["agent"])
+        elif number and item.get("repo_known") is False:
+            # #126: the report named no repo the switchboard knows, so its repo is a guess (its sender's). The same
+            # number on exactly one listed issue decision is that issue: one question, shown once
+            same = [key for key in listed if key[1] == number]
+            if len(same) == 1:
+                folded[id(item)] = same[0]
+    reporters, lines = {}, {}
+    for item in sorted((i for i in items if id(i) in folded), key=lambda i: (i["since"], i["seed"])):
+        reporters.setdefault(folded[id(item)], []).append(item["agent"])
+        lines.setdefault(folded[id(item)], []).append("%s: %s" % (item["agent"], line_of(item["title"], FOLDED_LINE_MAX)))
     decisions = []
     for item in items:
         if id(item) in folded:
@@ -458,6 +469,7 @@ def build_entries(items, ids, home, known_title, tier_flat=False):
                 extra["raised_by"] = item["raised_by"]
         if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
+            extra["reported_lines"] = lines[(item["repo"] or home, item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):
