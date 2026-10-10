@@ -16026,6 +16026,429 @@ class TestJudgeEval(Base):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
+GOOD_PLAN = """## Intent
+Commissioning works.
+Done when: (1) an owner can commission an agent; (2) it answers a chat message.
+
+```yaml
+scenarios:
+  - id: S1
+    covers: DW-1
+    text: Given a project with no agents, when an owner commissions one, then it is listed
+    proof: test
+    pass: the list call returns status 200 and exactly 1 agent named "alpha"
+    discriminates: a build that creates nothing returns an empty list and fails
+    evaluator: ci
+  - id: S2
+    covers: DW-2
+    text: Given a commissioned agent, when the owner sends a chat message, then it answers
+    proof: live
+    pass: the reply arrives within 5 s and is longer than 0 characters
+    discriminates: a stub that returns a canned empty reply fails
+    evaluator: tester
+  - id: U1
+    covers: PC-1
+    text: Existing projects with agents are listed exactly as before this change
+    proof: test
+    pass: the golden list output is byte-identical to the stored fixture
+    discriminates: a change in ordering or fields shows as a diff against the fixture
+    evaluator: ci
+```
+"""
+GOOD_DONE_WHEN = "(1) an owner can commission an agent; (2) it answers a chat message."
+
+
+class TestPlanCheckParser(unittest.TestCase):
+    """#135: the strict yaml-subset parser, on synthetic blocks."""
+
+    def parse(self, block):
+        return sb.plan_check.parse_scenarios(block.strip("\n").splitlines())
+
+    def refused(self, block, fragment):
+        with self.assertRaises(sb.plan_check.PlanFormatError) as caught:
+            self.parse(block)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_quotes_comments_and_plain_values(self):
+        got = self.parse("""
+scenarios:
+  - id: S1            # a comment
+    text: "say \\"hi\\" # not a comment"
+    pass: 'it''s 5 s' # a comment
+    covers: DW-1
+  # a whole-line comment
+
+  - id: S2
+    text: plain with: a colon inside
+""")
+        self.assertEqual(got[0], {"id": "S1", "text": 'say "hi" # not a comment', "pass": "it's 5 s", "covers": "DW-1"})
+        self.assertEqual(got[1]["text"], "plain with: a colon inside")
+
+    def test_a_value_continues_on_deeper_lines_and_block_scalars_work(self):
+        got = self.parse("""
+scenarios:
+  - id: S1
+    text: first part
+      second part
+        third part
+    pass: >
+      folded one
+      folded two
+    discriminates: |
+      literal one
+      literal two
+    covers: DW-1
+""")
+        self.assertEqual(got[0]["text"], "first part second part third part")
+        self.assertEqual(got[0]["pass"], "folded one folded two")
+        self.assertEqual(got[0]["discriminates"], "literal one\nliteral two")
+        self.assertEqual(got[0]["covers"], "DW-1")
+
+    def test_each_thing_outside_the_subset_is_refused_with_a_reason(self):
+        for block, fragment in (
+                ("scenarios:\n  - id: S1\n\ttext: x", "tab"),
+                ("scenarios:\n  - id: S1\n    id: S2", "twice"),
+                ("scenarios:\n  - id: S1\n    text: [a, b]", "quote it"),
+                ("scenarios:\n  - id: S1\n    text: &anchor x", "quote it"),
+                ("scenarios:\n  - id: S1\n    text: !tag x", "quote it"),
+                ("scenarios:\n  - id: S1\n    text: {a: b}", "quote it"),
+                ("scenarios:\n  - id: S1\n    text: > 5 s", "quote it"),
+                ("scenarios:\n  - id: S1\n    text: 'open", "unterminated"),
+                ('scenarios:\n  - id: S1\n    text: "open', "unterminated"),
+                ('scenarios:\n  - id: S1\n    text: "bad \\x escape"', "escapes"),
+                ("scenarios:\n  - id: S1\n    sub:\n      nested: 1", "nested value"),
+                ("scenarios:\n  - id: S1\n  - - nested", "nested list"),
+                ("scenarios:\n---\n  - id: S1", "document"),
+                ("scenarios:", "no items"),
+                ("other:\n  - id: S1", "start with `scenarios:`"),
+                ("scenarios:\n  - id: S1\n   text: off by one", "column"),
+                ("scenarios:\n  - just words", "key: value")):
+            with self.subTest(block=block):
+                self.refused(block, fragment)
+
+    def test_size_limits(self):
+        with self.assertRaises(sb.plan_check.PlanFormatError):
+            sb.plan_check.parse_scenarios(["scenarios:", "  - id: S1", "    text: " + "x" * (sb.plan_check.MAX_BYTES + 1)])
+        with self.assertRaises(sb.plan_check.PlanFormatError):
+            sb.plan_check.parse_scenarios(["scenarios:", "  - id: S1", "    text: " + "x" * (sb.plan_check.MAX_LINE + 1)])
+        many = ["scenarios:"] + ["  - id: S%d" % n for n in range(sb.plan_check.MAX_SCENARIOS + 1)]
+        with self.assertRaises(sb.plan_check.PlanFormatError):
+            sb.plan_check.parse_scenarios(many)
+
+    def test_exactly_one_scenarios_block_is_wanted(self):
+        pc = sb.plan_check
+        with self.assertRaises(pc.PlanFormatError):
+            pc.scenario_block("no fence here")
+        with self.assertRaises(pc.PlanFormatError):
+            pc.scenario_block("```yaml\nother: 1\n```")
+        two = "```yaml\nscenarios:\n  - id: S1\n```\n\n~~~\nscenarios:\n  - id: S2\n~~~"
+        with self.assertRaises(pc.PlanFormatError):
+            pc.scenario_block(two)
+        mixed = "```yaml\nstatus: active\n```\n```yaml\n# note\nscenarios:\n  - id: S1\n```"
+        self.assertEqual(pc.scenario_block(mixed)[-1], "  - id: S1")
+
+
+class TestPlanCheckRules(unittest.TestCase):
+    """#135: every validation, both ways."""
+
+    def check(self, text=GOOD_PLAN, done_when=GOOD_DONE_WHEN):
+        return sb.plan_check.check(text, done_when)
+
+    def codes(self, text, done_when=GOOD_DONE_WHEN):
+        return sorted(d["code"] for d in self.check(text, done_when)["defects"])
+
+    def edit(self, old, new, text=GOOD_PLAN):
+        self.assertIn(old, text)
+        return text.replace(old, new, 1)
+
+    def test_the_good_plan_passes_with_a_hash_and_no_defect(self):
+        got = self.check()
+        self.assertEqual((got["result"], got["defects"], got["scenarios"], len(got["clauses"])), ("pass", [], 3, 2))
+        self.assertRegex(got["hash"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_clauses_are_the_numbered_parts_and_a_plain_line_is_one(self):
+        c = sb.plan_check.clauses_of
+        self.assertEqual(c("(1) one thing; (2) another (see (3) below)"), ["one thing", "another (see (3) below)"])
+        self.assertEqual(c("(1) a; (2) b; (3) c"), ["a", "b", "c"])
+        self.assertEqual(c("just one sentence, no numbers"), ["just one sentence, no numbers"])
+        self.assertEqual(c("(2) starts at two"), ["(2) starts at two"])
+        self.assertEqual(c(""), [])
+        self.assertEqual(c(None), [])
+
+    def test_a_vague_pass_rule_fails_and_a_concrete_one_passes(self):
+        for vague in ("works", "it works", "ok", "non-empty", "passes", "Works.", "no errors", "short one"):
+            with self.subTest(vague=vague):
+                self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                              "pass: %s" % vague)))
+        for concrete in ("the exit code is 0 after the run finishes", "the page shows the word 'Ready' after loading",
+                         "the count is greater than the previous count", "latency stays under 200 ms at p95"):
+            with self.subTest(concrete=concrete):
+                self.assertEqual(self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                      "pass: %s" % concrete)), [])
+        self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                         "pass: the thing behaves nicely for the user overall")))
+
+    def test_a_missing_or_vacuous_discriminator_fails(self):
+        base = "discriminates: a build that creates nothing returns an empty list and fails"
+        for new in ("discriminates: n/a", "discriminates: none", "discriminates: tbd", "discriminates: short",
+                    'discriminates: the list call returns status 200 and exactly 1 agent named "alpha"'):
+            with self.subTest(new=new):
+                self.assertIn("no-discriminator", self.codes(self.edit(base, new)))
+        self.assertIn("missing-discriminates", self.codes(self.edit("    " + base + "\n", "")))
+
+    def test_each_required_key_is_required(self):
+        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
+        for key in sb.plan_check.REQUIRED:
+            with self.subTest(key=key):
+                scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+                del scenarios[1][key]
+                defects, _ = sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)
+                self.assertIn("missing-%s" % key, [d["code"] for d in defects])
+        scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+        scenarios[1]["text"] = "   "
+        self.assertIn("missing-text", [d["code"] for d in sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)[0]])
+
+    def test_id_pattern_and_uniqueness(self):
+        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: X2")))
+        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: S")))
+        self.assertIn("duplicate-id", self.codes(self.edit("id: S2", "id: S1")))
+        self.assertEqual(self.codes(self.edit("id: S2", "id: S12")), [])
+
+    def test_covers_pattern_and_range(self):
+        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: 2")))
+        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: DW-1, DW-2")))
+        self.assertIn("covers-unknown-clause", self.codes(self.edit("covers: PC-1", "covers: DW-9")))
+        self.assertEqual(self.codes(self.edit("covers: PC-1", "covers: PC-7")), [])
+
+    def test_unknown_keys_are_rejected_and_the_optional_ones_allowed(self):
+        self.assertIn("unknown-key", self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    owner: me")))
+        self.assertEqual(self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    slice: one\n    phase: shadow\n    claim: epic")), [])
+
+    def test_proof_evaluator_and_claim_values_and_consistency(self):
+        self.assertIn("bad-proof", self.codes(self.edit("proof: live", "proof: manual")))
+        self.assertIn("bad-evaluator", self.codes(self.edit("evaluator: tester", "evaluator: bob")))
+        self.assertIn("bad-claim", self.codes(self.edit("evaluator: tester", "evaluator: tester\n    claim: both")))
+        for proof, evaluator, ok in (("test", "ci", True), ("test", "tester", False), ("test", "adam", False),
+                                     ("screenshot", "reviewer", True), ("screenshot", "adam", True),
+                                     ("screenshot", "ci", False), ("live", "tester", True), ("live", "adam", True),
+                                     ("live", "ci", False), ("live", "reviewer", False), ("measure", "tester", True),
+                                     ("measure", "reviewer", False)):
+            with self.subTest(proof=proof, evaluator=evaluator):
+                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
+                self.assertEqual("evaluator-mismatch" in self.codes(text), not ok)
+
+    def test_every_done_when_clause_must_be_covered_by_an_s_scenario(self):
+        self.assertIn("uncovered-clause", self.codes(self.edit("covers: DW-2", "covers: PC-2")))
+        self.assertEqual(self.codes(GOOD_PLAN, "(1) one; (2) two; (3) three").count("uncovered-clause"), 1)
+        self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
+        self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
+
+    def test_an_unchanged_scenario_is_needed_unless_the_plan_says_why_not(self):
+        scen = GOOD_PLAN[:GOOD_PLAN.index("  - id: U1")] + "```\n"
+        self.assertIn("no-unchanged-scenario", self.codes(scen))
+        self.assertEqual(self.codes(scen + "\nunchanged: none because this is a brand new endpoint\n"), [])
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because\n"))
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because x\n"))
+
+    def test_more_than_thirty_scenarios_warns_but_does_not_fail(self):
+        extra = "".join("  - id: S%d\n    covers: PC-1\n    text: Another behaviour of the system under test\n"
+                        "    proof: test\n    pass: the call returns status 200 and the count is %d\n"
+                        "    discriminates: a build that ignores the input fails the count\n    evaluator: ci\n" % (n, n)
+                        for n in range(10, 40))
+        text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
+        got = self.check(text)
+        self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
+        self.assertEqual([w["code"] for w in got["warnings"]], ["many-scenarios"])
+
+    def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
+        base = self.check()["hash"]
+        spaced = GOOD_PLAN.replace("    proof: test", "    proof:   test   # note").replace("evaluator: ci", "evaluator: 'ci'  ")
+        self.assertEqual(self.check(spaced)["hash"], base)
+        explicit = GOOD_PLAN.replace("evaluator: ci", "evaluator: ci\n    claim: pr")
+        self.assertEqual(self.check(explicit)["hash"], base, "claim: pr is the default")
+        scen = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
+        self.assertEqual(sb.plan_check.content_hash(list(reversed(scen)), clauses, GOOD_PLAN), base, "order is not content")
+        for old, new in (("exactly 1 agent", "exactly 2 agents"), ("evaluator: tester", "evaluator: adam"),
+                         ("proof: live", "proof: measure")):
+            with self.subTest(change=new):
+                self.assertNotEqual(self.check(self.edit(old, new))["hash"], base)
+        self.assertNotEqual(self.check(GOOD_PLAN, "(1) an owner can commission an agent; (2) it answers a chat reply.")["hash"], base)
+
+    def test_the_hash_is_the_same_for_the_same_plan_on_every_call(self):
+        self.assertEqual(self.check()["hash"], self.check()["hash"])
+
+
+class TestPlanCheckSelection(unittest.TestCase):
+    def test_the_latest_plan_scenarios_comment_wins_else_the_body(self):
+        pick = sb.plan_check.select_plan_text
+        comments = [{"id": 1, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\nfirst"},
+                    {"id": 3, "created_at": "2026-01-03T00:00:00Z", "body": "### Plan (Scenarios) rev 2\nlatest"},
+                    {"id": 2, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios)\nsecond"},
+                    {"id": 4, "created_at": "2026-01-04T00:00:00Z", "body": "just talking about Plan (scenarios) here"}]
+        self.assertEqual(pick("body text", comments), ("### Plan (Scenarios) rev 2\nlatest", "comment 3"))
+        self.assertEqual(pick("body text", comments[3:]), ("body text", "issue body"))
+        self.assertEqual(pick("body text", []), ("body text", "issue body"))
+        self.assertEqual(pick(None, None), ("", "issue body"))
+
+
+class TestPlanCheckCommand(Base):
+    """#135: the command: exit codes, the issue reader (injected), --file, --json. GETs only."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": "acme/app"})
+        self.calls = []
+        self.issue = {"number": 7, "state": "open", "title": "t", "body": GOOD_PLAN, "updated_at": "2026-01-01T00:00:00Z"}
+        self.comments = []
+        self.down = False
+
+    def runner(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[0] != FAKE_GH or argv[1] != "api":
+            raise AssertionError("plan check may only run `gh api`: %r" % (argv,))
+        if "--method" in argv or "-X" in argv or "-f" in argv or "--input" in argv:
+            raise AssertionError("plan check must only GET: %r" % (argv,))
+        if self.down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable")
+        path = argv[2]
+        if "/comments" in path:
+            page = int(re.search(r"&page=(\d+)", path).group(1))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments[(page - 1) * 100:page * 100]), "")
+        if re.search(r"/issues/7$", path):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.issue), "")
+        return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+
+    def run_cmd(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["plan", "check", *argv], runner=self.runner, now=self.world_now)
+        return code, out.getvalue(), err.getvalue()
+
+    def world_now(self):
+        return 1000.0
+
+    def test_a_good_plan_from_an_issue_body_passes_with_exit_0(self):
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan check: PASS", out)
+        self.assertIn("source: issue body of acme/app#7", out)
+        self.assertRegex(out, r"plan hash: sha256:[0-9a-f]{64}")
+
+    def test_a_bad_plan_fails_with_exit_1_and_one_line_per_defect(self):
+        self.issue["body"] = GOOD_PLAN.replace("pass: the reply arrives within 5 s and is longer than 0 characters", "pass: works")
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual(code, 1)
+        self.assertIn("plan check: FAIL", out)
+        self.assertEqual([l for l in out.splitlines() if l.startswith("DEFECT")],
+                         ["DEFECT S2: the pass rule 'works' says nothing a wrong build could fail"])
+
+    def test_the_latest_plan_comment_is_the_plan(self):
+        broken = GOOD_PLAN.replace("exactly 1 agent", "works").replace('named "alpha"', "")
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n\nSee the plan comment.\n" % GOOD_DONE_WHEN
+        self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + broken[broken.index("```yaml"):]},
+                         {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios) rev 2\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}]
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("source: comment 12 of acme/app#7", out)
+
+    def test_an_issue_comment_url_picks_that_comment(self):
+        self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}]
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n" % GOOD_DONE_WHEN
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7#issuecomment-11")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("source: comment 11", out)
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7#issuecomment-99")
+        self.assertEqual(code, 2)
+        self.assertIn("no comment 99", err)
+
+    def test_a_bare_number_uses_the_intent_repo(self):
+        code, out, err = self.run_cmd("7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#7", out)
+
+    def test_unreadable_inputs_exit_2_and_say_why(self):
+        self.down = True
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("cannot read", err)
+        self.down = False
+        for argv, fragment in ((("acme/app#99",), "cannot read"), (("not a plan",), "is not a plan"), ((), "give a plan"),
+                               (("--file", str(self.home / "missing.md")), "cannot read")):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cmd(*argv)
+                self.assertEqual(code, 2)
+                self.assertIn(fragment, err)
+        self.issue["body"] = "## Intent\nx\nDone when: (1) y\n\nno block here"
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual(code, 2)
+        self.assertIn("no fenced yaml block", err)
+        self.issue["body"] = "```yaml\nscenarios:\n\t- id: S1\n```"
+        self.assertEqual(self.run_cmd("acme/app#7")[0], 2)
+
+    def test_file_and_json_and_done_when_override(self):
+        path = self.home / "plan.md"
+        path.write_text(GOOD_PLAN)
+        code, out, err = self.run_cmd("--file", str(path), "--json")
+        body = json.loads(out)
+        self.assertEqual((code, body["result"], body["scenarios"], body["defects"]), (0, "pass", 3, []))
+        self.assertEqual(self.calls, [], "a file is read without GitHub")
+        code, out, err = self.run_cmd("--file", str(path), "--done-when", "(1) a; (2) b; (3) c", "--json")
+        self.assertEqual(code, 1)
+        self.assertIn("uncovered-clause", [d["code"] for d in json.loads(out)["defects"]])
+        code, out, err = self.run_cmd("--file", str(self.home / "nope.md"), "--json")
+        self.assertEqual((code, json.loads(out)["result"]), (2, "error"))
+
+    def test_a_plan_issue_with_no_done_when_takes_it_from_the_ask(self):
+        self.issue["body"] = GOOD_PLAN.replace("Done when: " + GOOD_DONE_WHEN, "")
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual(code, 1)
+        self.assertIn("no Done-when", out)
+        code, out, err = self.run_cmd("acme/app#7", "--done-when", GOOD_DONE_WHEN)
+        self.assertEqual(code, 0, out)
+
+    def test_more_than_a_hundred_comments_are_paged(self):
+        filler = [{"id": 1000 + n, "created_at": "2026-01-01T00:00:%02dZ" % (n % 60), "body": "chatter"} for n in range(120)]
+        plan = {"id": 5000, "created_at": "2027-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}
+        self.comments = filler + [plan]
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n" % GOOD_DONE_WHEN
+        code, out, err = self.run_cmd("acme/app#7")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("comment 5000", out)
+        self.assertEqual(len([c for c in self.calls if "/comments" in c[2]]), 2)
+
+    def test_it_only_reads_and_never_ensures_the_daemon(self):
+        self.run_cmd("acme/app#7")
+        self.assertTrue(self.calls)
+        self.assertTrue(all(c[1] == "api" and "--method" not in c for c in self.calls))
+        self.assertNotIn("plan", sb.ENSURE_ON_USE_COMMANDS)
+
+
+class TestPlanTemplateDoc(unittest.TestCase):
+    TEMPLATE = REPO / "docs" / "plan-template.md"
+
+    def test_the_good_example_in_the_template_passes_and_the_bad_ones_fail(self):
+        text = self.TEMPLATE.read_text()
+        blocks = [b for _, b in sb.plan_check.fenced_blocks(text)]
+        full = [b for b in blocks if b and b[0].strip() == "scenarios:"]
+        self.assertGreaterEqual(len(full), 2, "the schema block and the good example")
+        good = "\n".join(["```yaml"] + full[-1] + ["```"])
+        self.assertEqual(sb.plan_check.check(good, GOOD_DONE_WHEN)["result"], "pass")
+        bad = [b for b in blocks if b and b[0].lstrip().startswith("- id:")]
+        self.assertEqual(len(bad), 2, "the two example fragments that show one defective scenario each")
+        for fragment, code in zip(bad, ("vague-pass", "no-discriminator")):
+            plan = "\n".join(["```yaml", "scenarios:"] + fragment + ["```", "unchanged: none because this is a test"])
+            codes = [d["code"] for d in sb.plan_check.check(plan, "(1) one thing")["defects"]]
+            self.assertIn(code, codes)
+        self.assertIn("DW-2 is not covered", text)
+
+    def test_the_template_is_referenced_and_carries_nothing_private(self):
+        self.assertIn("plan-template.md", (REPO / "docs" / "switchboard.md").read_text())
+        for number, line in enumerate(self.TEMPLATE.read_text().splitlines(), 1):
+            self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%d: %s" % (number, line))
+        for number, line in enumerate((BIN / "plan_check.py").read_text().splitlines(), 1):
+            self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%d: %s" % (number, line))
+
+
 class TestDecisionIds(unittest.TestCase):
     def item(self, seed, ask=None, agent="coder", bare=False, since=EPOCH):
         return {"seed": seed, "ask": ask, "agent": agent, "bare": bare, "since": since}
