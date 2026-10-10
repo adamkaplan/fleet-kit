@@ -2,27 +2,22 @@
  {
   "argv": "decisions supersede api#2 web#2 --by acme/api#50 --note folded in",
   "as": "cos",
-  "code": 0,
+  "code": 1,
   "comments": [
-   "Superseded by acme/api#50: folded in\n\n<!-- fleet-switchboard:from=cos -->",
    "Superseded by acme/api#50: folded in\n\n<!-- fleet-switchboard:from=cos -->"
   ],
   "err": "",
   "gh_writes": [
    "POST repos/acme/api/issues/2/comments",
    "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
-   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-user",
-   "POST repos/acme/web/issues/2/comments",
-   "DELETE repos/acme/web/issues/2/labels/me%3Aawaiting-cos",
-   "DELETE repos/acme/web/issues/2/labels/me%3Aawaiting-user"
+   "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-user"
   ],
   "labels_changed": {
    "acme/api#2": [
     "bug"
-   ],
-   "acme/web#2": []
+   ]
   },
-  "out": "api#2: done: comment and both labels off acme/api#2\nweb#2: done: comment and both labels off acme/web#2\n"
+  "out": "api#2: done: comment and both labels off acme/api#2\nweb#2: refused: web#2 is on the human tier: the Chief of Staff supersedes only decisions of its own (cos) tier. It is the owner's: leave it, or escalate it with a reason\n"
  },
  {
   "argv": "decisions supersede api#5kj --by https://github.com/acme/api/issues/50",

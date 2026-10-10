@@ -5242,6 +5242,113 @@ class ReportsSource(decision_core.DecisionSource):
         return decisions_from_reports(self.engine, now)
 
 
+# ---- #105: an order the Chief of Staff records or removes is a heads-up to the owner (the visibility half of letting it)
+
+ORDER_NOTICES = "order-notices.json"
+ORDER_NOTICES_LOCK = "order-notices.lock"
+ORDER_NOTICE_TTL_SECONDS = 86400  # a heads-up about an order drops after a day, or at once when the owner acks it
+
+
+@contextmanager
+def order_notices_lock(state_dir):
+    fd = os.open(str(Path(state_dir) / ORDER_NOTICES_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_order_notices(state_dir):
+    """The recorded order heads-ups ([] for none). Raises NoticeError for a file that is not one."""
+    path = Path(state_dir) / ORDER_NOTICES
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as err:
+        raise NoticeError("cannot read %s: %s" % (path, err)) from None
+    items = raw.get("notices") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        raise NoticeError("%s must hold {\"notices\": [...]}" % path)
+    return [i for i in items if isinstance(i, dict) and isinstance(i.get("id"), str) and isinstance(i.get("repo"), str)
+            and isinstance(i.get("charter"), int) and _is_number(i.get("created"))]
+
+
+def write_order_notices(state_dir, items):
+    path = Path(state_dir) / ORDER_NOTICES
+    temp = path.with_name("%s.%d.tmp" % (ORDER_NOTICES, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"notices": items}, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+
+
+def record_order_notice(state_dir, repo, charter, action, text, caller, ordered_by, now):
+    """Record that `caller` (the Chief of Staff) `action`ed (add or remove) an order on `repo#charter`. Expired ones are
+    dropped here. Returns the item."""
+    with order_notices_lock(state_dir):
+        items = [i for i in read_order_notices(state_dir) if now - i["created"] < ORDER_NOTICE_TTL_SECONDS]
+        taken = {i["id"] for i in items}
+        base = "order:%s#%d.%d" % (repo.split("/")[-1], charter, int(now))
+        ident, n = base, 1
+        while ident in taken:
+            n += 1
+            ident = "%s-%d" % (base, n)
+        item = {"id": ident, "repo": repo, "charter": charter, "action": action, "text": text, "from": caller,
+                "ordered_by": ordered_by, "created": now}
+        write_order_notices(state_dir, items + [item])
+    return item
+
+
+def ack_order_notice(state_dir, ident):
+    """Drop one heads-up; True when it was there."""
+    with order_notices_lock(state_dir):
+        items = read_order_notices(state_dir)
+        kept = [i for i in items if i["id"] != ident]
+        if len(kept) == len(items):
+            return False
+        write_order_notices(state_dir, kept)
+    return True
+
+
+def decisions_from_order_notices(engine, now):
+    """(entries, problems): each unexpired order heads-up as an entry of kind `notice` (tier `human`, id `order:<repo>#N.<time>`):
+    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here."""
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
+        return [], []
+    try:
+        items = read_order_notices(state_dir)
+    except NoticeError as err:
+        return [], [str(err)]
+    entries = []
+    for item in items:
+        if now - item["created"] >= ORDER_NOTICE_TTL_SECONDS:
+            continue
+        what = "added" if item.get("action") == "add" else "removed"
+        headline = decision_core.fit_lines("order %s by cos on %s#%d: %s" % (
+            what, item["repo"].split("/")[-1], item["charter"], item.get("text") or ""))
+        entries.append({"id": item["id"], "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
+                        "headline": headline, "ask": None, "repo": item["repo"], "agent": item.get("from"),
+                        "kind": "notice", "tier": "human", "since": iso(item["created"]), "number": item["charter"],
+                        "url": "https://github.com/%s/issues/%d" % (item["repo"], item["charter"]),
+                        "state": None, "additions": None, "deletions": None, "files": None, "ci": None,
+                        "review": None, "stale": False, "note": "not ack'd: `%s notice ack %s` drops it" % (PROG, item["id"]),
+                        "merge_after": None})
+    return entries, []
+
+
 class PrNoticesSource(decision_core.DecisionSource):
     name = "notices"
     entries = True
@@ -5253,9 +5360,20 @@ class PrNoticesSource(decision_core.DecisionSource):
         return decisions_from_notices(self.engine, now)
 
 
+class OrderNoticesSource(decision_core.DecisionSource):
+    name = "order-notices"
+    entries = True
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def read_open(self, now):
+        return decisions_from_order_notices(self.engine, now)
+
+
 # The registry, in the order the list is built: sources of items (folded and numbered) in registration order, then
 # the sources of finished entries. A later adapter appends a factory (`factory(engine)` -> a DecisionSource).
-DECISION_SOURCE_REGISTRY = [GitHubIssuesSource, HarnessRequestsSource, ReportsSource, PrNoticesSource]
+DECISION_SOURCE_REGISTRY = [GitHubIssuesSource, HarnessRequestsSource, ReportsSource, PrNoticesSource, OrderNoticesSource]
 
 
 def register_decision_source(factory):
@@ -8676,10 +8794,36 @@ def _notice_withdraw(args, engine, state, sender, note):
     return EXIT_OK
 
 
+def _notice_ack(args, engine, state):
+    """`notice ack <id>`: the owner drops an order heads-up. Only you, in a plain shell: any fleet agent is refused."""
+    try:
+        caller = None
+        if args.sender is not None and os.environ.get(LAB_ENV) == "1":
+            caller = args.sender
+        else:
+            try:
+                caller = caller_fleet(engine.herdr, engine.v2, os.environ)["name"]
+            except CallerError:
+                caller = None  # a plain shell: you
+        if caller is not None:
+            sys.stderr.write("%s: only the owner, in a plain shell, acks a heads-up; %s is a fleet agent\n" % (PROG, caller))
+            return EXIT_USAGE
+        found = ack_order_notice(state, args.pr)
+    except (NoticeError, OSError) as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    if engine.audit is not None and found:
+        engine.audit.append(engine.actor, "notice.ack", args.pr, {})
+    sys.stderr.write("%s: %s\n" % (PROG, "heads-up %s dropped" % args.pr if found else "no heads-up %s" % args.pr))
+    return EXIT_OK if found else EXIT_USAGE
+
+
 def cmd_notice(args, runner, now):
     """PR notices: tell the person about a PR you opened or mean to merge. Recorded for the daemon to show in the
     panel; sends no message and wakes nobody."""
     engine, state, _ = build_engine(runner, now, "cli")
+    if args.kind == "ack":
+        return _notice_ack(args, engine, state)
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
@@ -12048,7 +12192,7 @@ def build_parser():
                     "review run. It stays until the PR is merged or closed; sending it again refreshes the note. A number that is "
                     "not an OPEN pull request is refused when you send it (an unreadable lookup never blocks). `notice withdraw <pr>` removes a "
                     "notice (the agent that sent it, or its boss); a notice whose PR cannot be read for an hour is dropped.")
-    notice.add_argument("kind", choices=("pr", "withdraw"), help="`pr` records a notice; `withdraw` removes the one for a PR (its sender or its boss)")
+    notice.add_argument("kind", choices=("pr", "withdraw", "ack"), help="`pr` records a notice; `withdraw` removes the one for a PR (its sender or its boss); `ack` (you, in a plain shell) drops an order heads-up by its id")
     notice.add_argument("pr", help="The pull request: owner/repo#N or its URL (an issue, a number that is not an open PR, is refused)")
     notice.add_argument("note", nargs="*", help="Optional: one line of why, or what you intend (at most %d characters)" % REPORT_MAX)
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
@@ -14046,6 +14190,29 @@ def orders_write(engine, args, caller, role, repo, charter):
         print("%d. %s" % (number, text))
     if not orders:
         print("no standing orders for charter %s" % issue_tag(repo, charter))
+    return announce_order_change(engine, args, caller, repo, charter, detail)
+
+
+def announce_order_change(engine, args, caller, repo, charter, detail):
+    """#105: every order the Chief of Staff adds or removes is SEEN at once: a heads-up row in the owner's Decisions
+    panel (until they ack it, or a day) and a comment on the charter naming the exact text and who ran it. The order stands
+    either way; when the comment cannot be posted this says so and exits 1."""
+    action = args.orders_action
+    text = detail.get("text") or ""
+    ordered_by = detail.get("by")
+    try:
+        if engine.state_dir is not None:
+            record_order_notice(engine.state_dir, repo, charter, action, text, caller, ordered_by, engine.now())
+    except (OSError, NoticeError) as err:
+        sys.stderr.write("%s: the order stands, but its heads-up for the owner was not recorded: %s\n" % (PROG, _one_line(str(err), 200)))
+    what = "added" if action == "add" else "removed (order %d)" % args.number
+    comment = "Standing order %s by `%s` (chief-of-staff)%s:\n\n> %s\n\nIf the owner did not give this order, remove it." % (
+        what, caller, " as ordered by `%s`" % ordered_by if ordered_by else "", text.replace("\n", " "))
+    try:
+        comment_as(engine, getattr(engine, "gh_runner", None) or subprocess.run, repo, charter, comment, caller)
+    except IntentError as err:
+        sys.stderr.write("%s: the order stands, but the comment on the charter failed (%s): tell the owner what was changed\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
     return EXIT_OK
 
 
@@ -14352,6 +14519,19 @@ def decision_by_id(decisions, ident):
             if decision["id"] == wanted:
                 return decision
     return None
+
+
+def refuse_human_tier(engine, decision, action, name, role):
+    """#105: the Chief of Staff answers, resolves and supersedes ONLY the decisions of its own tier (`cos`), never one that is
+    the owner's (`human`, or any other tier). You, in a plain shell, may do anything. Audited when refused."""
+    if role != "chief-of-staff" or action == "escalate":
+        return
+    if decision.get("tier") != "cos":
+        engine.audit.append(engine.actor, "decisions.refused", decision["id"],
+                            {"caller": name, "role": role, "action": action, "tier": decision.get("tier")})
+        raise DecisionError("%s is on the %s tier: the Chief of Staff %ss only decisions of its own (cos) tier. It is the "
+                            "owner's: leave it, or escalate it with a reason" % (
+                                decision["id"], decision.get("tier") or "human", action))
 
 
 def decision_actor(engine, args):
@@ -14690,7 +14870,7 @@ def supersede_decision(engine, runner, decision, shown, note, name):
     return "done: sent to %s" % decision["agent"]
 
 
-def cmd_decision_supersede(args, engine, decisions, name, runner):
+def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
     """`decisions supersede <id> ... --by <issue>`: per id one line, `done` or `refused: why`; it carries on past a
     failure. Returns the exit code."""
     repo, number, shown = parse_superseding(engine, args.by)
@@ -14700,6 +14880,7 @@ def cmd_decision_supersede(args, engine, decisions, name, runner):
             decision = decision_by_id(decisions, ident)
             if decision is None:
                 raise DecisionError("no decision %s is waiting" % ident)
+            refuse_human_tier(engine, decision, "supersede", name, role)
             line = supersede_decision(engine, runner, decision, shown, args.note, name)
             print("%s: %s" % (ident, line))
         except (DecisionError, IntentError) as err:
@@ -14726,7 +14907,7 @@ def cmd_decision_write(args, action, runner, now):
                              % (PROG, action, name, "a %s" % role if role else "not given a role", PROG))
             return EXIT_USAGE
         if action == "supersede":
-            code = cmd_decision_supersede(args, engine, decisions, name, runner)
+            code = cmd_decision_supersede(args, engine, decisions, name, runner, role)
             try:
                 send_poke(state_dir_path())
             except Exception:
@@ -14735,6 +14916,7 @@ def cmd_decision_write(args, action, runner, now):
         decision = decision_by_id(decisions, args.id)
         if decision is None:
             raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
+        refuse_human_tier(engine, decision, action, name, role)
         if action == "escalate":
             line = escalate_decision(engine, runner, decision, args.reason, name)
         elif action == "resolve":

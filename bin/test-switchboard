@@ -8423,7 +8423,8 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
           "ready for your principal's eyes", "stuck after trying")
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 8900, "cos-subagent": 3500}
+# chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 10100, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8434,6 +8435,82 @@ def role_of(path):
 def maxims_block(text):
     match = re.search(r"^## Maxims\n(.*?)(?=^## )", text, re.S | re.M)
     return match.group(1) if match else ""
+
+
+class TestChiefOfStaffNativePermissions(unittest.TestCase):
+    """The cos definition's v2 `permissions:` list is the only thing keeping it read-only: check its structure."""
+    PATH = REPO / "agents" / "opencode" / "chief-of-staff.md"
+
+    @classmethod
+    def rules(cls):
+        front = cls.PATH.read_text().split("\n---\n", 1)[0]
+        rules, current = [], None
+        for line in front.splitlines():
+            m = re.match(r"  - action: (.*)$", line)
+            if m:
+                current = {"action": m.group(1).strip('"')}
+                rules.append(current)
+            elif current is not None and (m := re.match(r"    (resource|effect): (.*)$", line)):
+                current[m.group(1)] = m.group(2).strip('"')
+        return front, rules
+
+    def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
+        _, rules = self.rules()
+        self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
+        self.assertEqual({r["effect"] for r in rules}, {"allow", "deny"})
+        self.assertTrue(all(set(r) == {"action", "resource", "effect"} for r in rules))
+
+    def test_v1_keys_that_would_void_or_widen_the_rules_are_absent(self):
+        front, _ = self.rules()
+        self.assertNotRegex(front, r"(?m)^name:")  # a named agent makes v2 ignore `permissions:` entirely
+        self.assertNotRegex(front, r"(?m)^permission:")
+        self.assertNotRegex(front, r"bash:")
+
+    def test_no_shell_allow_is_a_bare_wildcard_and_patterns_are_exact(self):
+        _, rules = self.rules()
+        for r in rules:
+            if r["action"] == "shell" and r["effect"] == "allow":
+                self.assertNotIn(r["resource"], ("*", "* *"))
+                self.assertFalse(re.search(r"[a-z]\*$", r["resource"]) and not r["resource"].startswith(("curl ", "az ")), r["resource"])
+                self.assertNotRegex(r["resource"], r"^[a-z-]+\*", r["resource"])
+
+    def test_every_deny_guard_comes_after_the_allows_it_overrides(self):
+        _, rules = self.rules()
+        shell = [r for r in rules if r["action"] == "shell"]
+        last_allow = max(i for i, r in enumerate(shell) if r["effect"] == "allow")
+        first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
+        self.assertLess(last_allow, first_guard)
+        resources = [r["resource"] for r in shell]
+        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "*-/*", "gh * -q*", "gh * -t*", "gh * -R*/*/*", "gh * --repo*/*/*", "gh api http*", "gh api *--verbose*", "*--a/*", "*--/*", "az rest*", "az *secret*", "az *token*",
+                      "fleet-switchboard handoff*", "fleet-switchboard decisions batch*"):
+            self.assertIn(guard, resources)
+
+    def test_edit_and_subagent_are_denied_and_the_denial_is_final(self):
+        _, rules = self.rules()
+        for action in ("edit", "subagent", "task", "handoff"):
+            self.assertEqual([r["effect"] for r in rules if r["action"] == action], ["deny"])
+
+    def test_az_reads_name_the_verb_position_and_nothing_a_write_could_hide_behind(self):
+        _, rules = self.rules()
+        allows = [r["resource"] for r in rules if r["action"] == "shell" and r["effect"] == "allow"]
+        for resource in allows:
+            if resource.startswith("az "):
+                self.assertRegex(resource, r"^az [a-z0-9-]+( [a-z0-9-]+)*( show| list| query| tail) \*$", resource)
+        self.assertFalse([a for a in allows if a.split()[0] in ("cat", "head", "tail", "wc", "grep")], "file reads go through the read tool, which sees the real path")
+        self.assertFalse([a for a in allows if a == "gh api repos/*"])
+        self.assertFalse([a for a in allows if a.startswith(("curl", "gh pr review", "fleet-switchboard decisions --", "fleet-switchboard orders --"))])
+        for wanted in ("fleet-switchboard decisions answer *", "fleet-switchboard decisions resolve *", "fleet-switchboard decisions escalate *",
+                       "fleet-switchboard decisions supersede *", "fleet-switchboard orders add *", "fleet-switchboard orders remove *"):
+            self.assertIn(wanted, allows)  # the CLI, not the pattern, keeps the Chief of Staff to its own tier and announces every order
+        for forbidden in ("fleet-switchboard handoff", "fleet-switchboard decisions batch", "gh api *"):
+            self.assertFalse([a for a in allows if a.startswith(forbidden)], forbidden)
+
+    def test_the_prose_matches_the_rules(self):
+        text = self.PATH.read_text()
+        self.assertIn("I don't have a problem with you using gh to write comments or close/merge PRs", text)
+        self.assertIn("route the work to the owning orchestrator", text)
+        self.assertNotIn("never merge,", text)
+        self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
 
 
 class TestAgentDefinitions(unittest.TestCase):
@@ -8510,12 +8587,17 @@ class TestAgentDefinitions(unittest.TestCase):
             text = path.read_text()
             with self.subTest(file=path.name):
                 self.assertTrue(text.startswith("---\n"))
-                self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
+                if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+                    self.assertNotRegex(text.split("\n---\n")[0], r"(?m)^name:")  # v2: a named agent loses its `permissions:` list
+                else:
+                    self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
                 self.assertRegex(text, r"(?m)^model: __(PROVIDER__/__MODEL_ID|MODEL_ID)__$")
 
     def test_the_role_files_do_not_grow(self):
         for path in AGENT_FILES:
             text = path.read_text()
+            if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+                text = text.split("\n---\n", 1)[1]  # the permissions list is configuration, not prompt: only the body counts
             role = role_of(path)
             with self.subTest(file=path.name):
                 self.assertLessEqual(len(text.splitlines()), ROLE_LINE_LIMITS[role])
@@ -20658,8 +20740,31 @@ class TestOrdersCLI(OrdersCase):
         self.as_agent("chief-of-staff")
         self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
         writes = [c for c in self.gh.calls if "--method" in c]
-        self.assertEqual(writes, [[FAKE_GH, "api", "repos/%s/issues/1" % FAKE_REPO, "--method", "PATCH",
-                                   "--input", "-"]])
+        self.assertEqual(writes, [[FAKE_GH, "api", "repos/%s/issues/1" % FAKE_REPO, "--method", "PATCH", "--input", "-"],
+                                  [FAKE_GH, "api", "repos/%s/issues/1/comments" % FAKE_REPO, "--method", "POST", "--input", "-"]])  # #105: and the announcement on the charter
+
+    def test_every_add_and_remove_is_announced_on_the_charter_and_in_the_owners_panel(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "approve deploys", "--by", "alice")
+        self.main("orders", "remove", "--charter", "1", "1")
+        notices = sb.read_order_notices(self.world.audit_path.parent)
+        self.assertEqual([(n["action"], n["from"], n["ordered_by"]) for n in notices],
+                         [("add", "chief-of-staff", "alice"), ("remove", "chief-of-staff", None)])
+        self.assertTrue(all("approve deploys" in n["text"] for n in notices))
+        entries, problems = sb.decisions_from_order_notices(types.SimpleNamespace(state_dir=self.world.audit_path.parent), notices[0]["created"] + 60)
+        self.assertEqual(problems, [])
+        self.assertEqual([(e["kind"], e["tier"]) for e in entries], [("notice", "human")] * 2)
+        self.assertIn("approve deploys", entries[0]["title"])
+        late, _ = sb.decisions_from_order_notices(types.SimpleNamespace(state_dir=self.world.audit_path.parent), notices[0]["created"] + sb.ORDER_NOTICE_TTL_SECONDS + 1)
+        self.assertEqual(late, [], "a heads-up drops after a day")
+        self.as_agent("orch")
+        code, _, err = self.main("notice", "ack", notices[0]["id"])
+        self.assertEqual(code, 2)
+        self.assertIn("fleet agent", err)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.main("notice", "ack", notices[0]["id"])[0], 0)
+        self.assertEqual([n["action"] for n in sb.read_order_notices(self.world.audit_path.parent)], ["remove"])
 
     def test_a_body_that_changed_in_between_is_read_again_once(self):
         self.as_agent("chief-of-staff")
@@ -21948,11 +22053,13 @@ class TestEscalateAndResolve(WriteWorld):
 
     def test_resolving_takes_both_labels_off(self):
         self.gh.issue(API, 3, "Both labels", labels=["me:awaiting-cos", "me:awaiting-user", "bug"])
-        code, out, err = self.main("decisions", "resolve", self.id_of("Both labels"), "--note", "the order says ship it")
+        with mock.patch.dict(os.environ):  # both labels is the owner's tier: you, in a plain shell, resolve it (the Chief of Staff may not)
+            os.environ.pop("HERDR_PANE_ID", None)
+            code, out, err = self.main("decisions", "resolve", self.id_of("Both labels"), "--note", "the order says ship it")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.gh.names(API, 3), ["bug"])
         self.assertEqual(self.gh.names(API, 2), ["bug", "me:awaiting-cos"], "no other issue is touched")
-        self.assertEqual(sb.signed_by_fleet(self.gh.comments[0]["body"]), "cos")
+        self.assertIsNone(sb.signed_by_fleet(self.gh.comments[0]["body"]))  # you, not an agent
         self.assertIn("the order says ship it", self.gh.comments[0]["body"])
 
     def test_resolving_an_issue_that_lost_one_label_already_still_works(self):
@@ -22515,7 +22622,7 @@ class TestSupersede(WriteWorld):
     def setUp(self):
         super().setUp()
         self.gh.issue(API, 2, "one api", labels=["me:awaiting-cos", "bug"])
-        self.gh.issue(WEB, 2, "one web", labels=["me:awaiting-user"])
+        self.gh.issue(WEB, 2, "one web", labels=["me:awaiting-cos"])
         self.gh.issue(API, 50, "the superseding issue")
         self.as_agent("cos")
 
@@ -22595,7 +22702,7 @@ class TestSupersede(WriteWorld):
         self.assertIn("refused", lines[2])
         self.assertIn("403", lines[2])
         self.assertEqual(self.gh.names(API, 2), ["bug"], "the first one was done before the others failed")
-        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-cos"])
 
     def test_the_same_id_twice_is_done_once(self):
         ident = self.id_of("one api")
@@ -24941,6 +25048,54 @@ class TestDecisionBaselineAnswered(BaselineWorld):
             with baseline_unreadable_inbox(self.world.sessions["bad"], failure):
                 out[failure] = self.fresh()
         baseline_golden(self, "report-unreadable-inbox", out)
+
+
+class TestCosAnswersOnlyItsOwnTier(BaselineWorld):
+    """#105: the native permissions let the Chief of Staff run answer, resolve, escalate and supersede; the CLI is what keeps it to the
+    decisions of its own (cos) tier and never the owner's (human) tier. One test per subcommand, each on both tiers."""
+
+    def ident(self, text):
+        found = [d["id"] for d in self.fresh()["decisions"] if text in d["title"]]
+        self.assertEqual(len(found), 1, "%r in %r" % (text, found))
+        return found[0]
+
+    def test_resolve_cos_tier_yes_human_tier_no(self):
+        self.gh.issue(API, 2, "mine", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 3, "theirs", labels=["me:awaiting-user"])
+        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        refused = self.cmd("cos", "decisions", "resolve", "api#3")
+        self.assertEqual(refused["code"], 2)
+        self.assertIn("owner's", refused["err"])
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#3")["code"], 0)
+
+    def test_supersede_cos_tier_yes_human_tier_no(self):
+        self.gh.issue(API, 2, "mine", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 3, "theirs", labels=["me:awaiting-user"])
+        self.gh.issue(API, 50, "the superseding issue")
+        done = self.cmd("cos", "decisions", "supersede", "api#2", "api#3", "--by", "acme/api#50")
+        self.assertEqual(done["code"], 1)
+        self.assertIn("api#2: done", done["out"])
+        self.assertIn("api#3: refused: api#3 is on the human tier", done["out"])
+
+    def test_answer_a_cos_tier_prompt_yes_an_escalated_one_no(self):
+        self.ask_permission("api-coder")
+        ident = self.ident("shell")
+        self.assertEqual(self.cmd("cos", "decisions", "escalate", ident)["code"], 0)
+        refused = self.cmd("cos", "decisions", "answer", ident, "allow")
+        self.assertEqual(refused["code"], 2)
+        self.assertIn("human tier", refused["err"])
+        self.assertEqual(self.cmd("you", "decisions", "answer", ident, "allow")["code"], 0)
+
+    def test_answer_a_cos_tier_prompt(self):
+        self.ask_permission("api-coder")
+        self.assertEqual(self.cmd("cos", "decisions", "answer", self.ident("shell"), "allow")["code"], 0)
+
+    def test_escalate_is_open_to_cos_and_a_human_tier_one_is_a_no_op(self):
+        self.gh.issue(API, 2, "mine", labels=["me:awaiting-cos"])
+        self.assertEqual(self.cmd("cos", "decisions", "escalate", "api#2")["code"], 0)
+        again = self.cmd("cos", "decisions", "escalate", "api#2")
+        self.assertEqual(again["code"], 0)
+        self.assertIn("already yours", again["out"])
 
 
 class TestDecisionBaselineWrites(BaselineWorld):
@@ -27414,7 +27569,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["floor"], "floor-c")
         # resolving withdraws it
-        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)  # escalated: the owner's tier, so you resolve it
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
 
@@ -27473,7 +27628,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.assertIn("external  down: the fake is down; outbox 2", self.cmd("you", "status")["out"])
         self.assertEqual(self.fake.calls, [])
         # local answering still works while it is down
-        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
         self.fake.up = True
         self.run_pass()
         self.run_pass()
@@ -27606,7 +27761,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.assertEqual([e["event"] for e in self.audit_events("external.orphan")], ["external.orphan"])
         self.assertEqual(len(self.gh.comments), before["comments"])
         # answered here first: a later outside answer finds it closed
-        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
         self.run_pass()
         self.event(ext, by="human")
         count = len(self.gh.comments)
@@ -28492,7 +28647,7 @@ class TestPermanentRefusals(ExternalWorld):
         self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
         self.run_pass()
         self.fake.refuse["withdraw"] = PermanentRefusal("409: already decided")
-        self.assertEqual(self.cmd("cos", "decisions", "resolve", "api#2")["code"], 0)
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
         for _ in range(4):
             self.run_pass(120)
         self.assertEqual(len([c for c in self.fake.calls if c[0] == "withdraw"]), 1)
