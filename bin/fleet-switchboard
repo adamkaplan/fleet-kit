@@ -3650,13 +3650,28 @@ def cmd_comment(args, runner, now):
 def cmd_whoami(args, runner, now):
     """The calling agent's fleet name: what the `gh` shim signs a comment with. Exit 1, silent on stdout,
     when the caller is not a fleet agent."""
-    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    engine, _, config = build_engine(runner, now, "cli", writable=False)
+    if getattr(args, "json", False):
+        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+        repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
+                         sort_keys=True))
+        return EXIT_OK
+    if getattr(args, "repo", False):
+        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+        repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        print(repo or _fleet_repo(fleet, config) or config.get("intent_repo") or "")
+        return EXIT_OK
     print(identify_caller(engine.herdr, engine.v2, os.environ))
     return EXIT_OK
 
 
 def add_foreground_parsers(sub):
-    sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
+    whoami = sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
+    whoami.add_argument("--json", action="store_true", help="Print {\"name\", \"repo\"} on one line: the gh shim's single "
+                        "lookup (name for the signature, repo for the account)")
+    whoami.add_argument("--repo", action="store_true", help="Print the repo of your resolved identity "
+                                       "(for the gh shim, which picks the account from it); empty when it has none")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
     comment.add_argument("--issue", type=issue_arg, required=True, help="The issue to comment on")
@@ -6076,11 +6091,13 @@ def decisions_caller(args, runner, now):
         if found is None:
             raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
         return found.fleet or {}
-    if not os.environ.get("HERDR_PANE_ID"):
+    if not os.environ.get("HERDR_PANE_ID") and not os.environ.get(SESSION_ENV):
         return {}
     try:
         engine, _, _ = build_engine(runner, now, "cli", writable=False)
         return caller_fleet(engine.herdr, engine.v2, os.environ)
+    except IdentityUncertain:
+        raise  # never the human's view: an uncertain identity is refused
     except (CallerError, ConfigError, V2Error, HerdrError):
         return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
 
@@ -9640,13 +9657,56 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     return report
 
 
+def identity_overview(discovery):
+    """{"sessions": [{"session", "name", "pane"}], "warnings": [...]}: the agent each live session resolves to, and
+    every place where the pane and the session disagree: one session shown in two panes, a name claimed by two sessions,
+    a pane whose herdr label is not the fleet name of its session. (The caller's own shell is `caller_identity`.)"""
+    sessions = [{"session": seen.session_id, "name": seen.name, "pane": seen.pane}
+                for seen in sorted(discovery.agents.values(), key=lambda o: o.name)]
+    warnings, panes, by_session = [], {}, {}
+    for seen in discovery.agents.values():
+        by_session[seen.session_id] = seen
+        if seen.conflict:
+            warnings.append("%s is claimed by more than one session (%s): an agent cannot be told from another"
+                            % (seen.name, ", ".join([seen.session_id] + seen.conflict)))
+    for entry in discovery.entries:
+        session, pane = agent_session(entry), entry.get("pane_id")
+        if session and isinstance(pane, str):
+            panes.setdefault(session, []).append(pane)
+            seen = by_session.get(session)
+            label = next((entry.get(k) for k in ("name", "agent_name", "label") if isinstance(entry.get(k), str)), None)
+            if seen is not None and label and label != seen.name:
+                warnings.append("pane %s is labelled %s in herdr but its session %s is the fleet agent %s"
+                                % (pane, label, session, seen.name))
+    for session, where in sorted(panes.items()):
+        if len(where) > 1 and session in by_session:
+            warnings.append("session %s (%s) is shown in %d panes (%s): the pane does not say who is calling"
+                            % (session, by_session[session].name, len(where), ", ".join(sorted(where))))
+    return {"sessions": sessions, "warnings": warnings}
+
+
+def caller_identity(herdr, v2, environ):
+    """What THIS shell resolves to, for `status`: the agent name, an `identity uncertain` refusal, or None for a shell
+    that names neither a pane nor a session (a person's)."""
+    if not environ.get("HERDR_PANE_ID") and not environ.get(SESSION_ENV):
+        return None
+    try:
+        return {"name": identify_caller(herdr, v2, environ)}
+    except CallerError as err:
+        return {"error": _one_line(str(err), 400)}
+    except (V2Error, HerdrError) as err:
+        return {"error": _one_line("cannot read: %s" % err, 200)}
+
+
 def fleet_overview(engine, entries):
     """Read-only: every fleet agent and every fact recipient, with the rule's answer for each."""
     discovery = engine.discover(engine.now(), entries)
     facts, problems = engine.collect_facts()
     names = sorted(set(discovery.agents) | {fact.recipient for fact in facts})
     overview = {"ok": True, "problems": discovery.problems + problems,
-                "list": [engine.pending(name, discovery, facts) for name in names]}
+                "list": [engine.pending(name, discovery, facts) for name in names],
+                "identity": identity_overview(discovery),
+                "caller": caller_identity(engine.herdr, engine.v2, os.environ)}
     overview.update(intent_gap_report(engine, discovery, facts))
     return overview
 
@@ -9659,6 +9719,21 @@ def _plan_line(entry):
     waiting = sum(1 for fact in plan["pending"] if fact.get("rider"))
     return "%d pending%s: %s (%s)" % (len(plan["pending"]), " (%d rider)" % waiting if waiting else "",
                                       plan["action"], plan["reason"])
+
+
+def identity_lines(agents):
+    """The `status` lines for identity: who each live session resolves to, a WARNING for every disagreement of pane and
+    session, and what this shell itself resolves to."""
+    identity = agents.get("identity") or {}
+    lines = []
+    if identity.get("sessions"):
+        lines.append("      identity   " + "; ".join("%s = %s (pane %s)" % (s["session"], s["name"], s["pane"] or "-")
+                                                      for s in identity["sessions"]))
+    lines.extend("      WARNING    identity: %s" % w for w in identity.get("warnings") or [])
+    caller = agents.get("caller")
+    if caller:
+        lines.append("      identity   this shell: %s" % (caller["name"] if "name" in caller else "WARNING " + caller["error"]))
+    return lines
 
 
 def _agent_line(entry):
@@ -9733,6 +9808,7 @@ def format_status(report):
         lines.append("      agents     %d fleet agent(s)" % len(listed))
         lines.extend("        " + _agent_line(entry) for entry in agents["list"])
         lines.extend("        problem: %s" % problem for problem in agents["problems"])
+        lines.extend(identity_lines(agents))
         lines.extend(intent_gap_lines(agents))
     else:
         lines.append("      agents     %s" % agents["error"])
@@ -9765,11 +9841,87 @@ class CallerError(Exception):
     """`send` cannot tell which fleet agent is calling."""
 
 
+class IdentityUncertain(CallerError):
+    """The caller's own session is not one the switchboard knows, so who is calling cannot be told. Refused, never
+    guessed, and NEVER read as "a person in a plain shell". (A session v2 knows that is not a fleet agent is a person's.)"""
+
+
+SESSION_ENV = "OPENCODE_SESSION_ID"   # the harness sets it per session, unique: the one thing the caller IS
+
+
+def _agent_label(v2, session_id):
+    try:
+        name = (_fleet_meta(v2.session_get(session_id)) or {}).get("name")
+    except (V2Error, HerdrError):
+        name = None
+    return name if isinstance(name, str) and name else "not a fleet agent"
+
+
+def session_identity(herdr, v2, environ):
+    """The caller's `metadata.fleet`, found from its OWN session (OPENCODE_SESSION_ID) in the switchboard's registry (v2's
+    session records and herdr's agent list), never from inherited environment variables (HERDR_PANE_ID, the role and
+    repo variables, the token), which a restart can leave belonging to another agent. None when no session is named.
+    Raises IdentityUncertain when v2 does not know the session, CallerError when it is known and not a fleet agent (a
+    person's). A HERDR_PANE_ID that names another agent's session is only a diagnostic, one warning line."""
+    own = environ.get(SESSION_ENV)
+    if not own:
+        return None
+    try:
+        info = v2.session_get(own)
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            raise IdentityUncertain("cannot tell who you are: session %s is not known to the switchboard's registry "
+                                    "(nothing was done)" % own) from None
+        raise
+    fleet = _fleet_meta(info)
+    if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
+        raise CallerError("session %s is not a fleet agent (no metadata.fleet.name)" % own)
+    warn_pane_disagrees(herdr, v2, environ, own, fleet["name"])
+    return fleet
+
+
+_WARNED_PANES = set()
+
+
+def warn_pane_disagrees(herdr, v2, environ, own, name):
+    """The diagnostic: HERDR_PANE_ID names a pane whose agent runs another session. The identity is taken from the
+    session; the warning says what is wrong with the environment, once per process."""
+    pane = environ.get("HERDR_PANE_ID")
+    if not pane or (pane, own) in _WARNED_PANES:
+        return
+    try:
+        theirs = agent_session(herdr.agent_get(pane))
+    except (HerdrError, V2Error):
+        return
+    if not theirs or theirs == own:
+        return
+    _WARNED_PANES.add((pane, own))
+    where = ""
+    try:
+        for entry in herdr.agent_list():
+            if agent_session(entry) == own and isinstance(entry.get("pane_id"), str):
+                where = "; this session runs in pane %s" % entry["pane_id"]
+                break
+    except (HerdrError, V2Error, AttributeError, TypeError):
+        pass
+    sys.stderr.write("%s: warning: HERDR_PANE_ID %s belongs to session %s (%s) but this session is %s (%s)%s: the "
+                     "identity is taken from the session, not from the pane; fix the environment (HERDR_PANE_ID, "
+                     "FLEET_SWITCHBOARD_ROLE, FLEET_SWITCHBOARD_REPO and the token travel together)\n"
+                     % (PROG, pane, theirs, _agent_label(v2, theirs), own, name, where))
+
+
+def no_pane_error(how):
+    return CallerError("cannot tell who you are: neither %s nor HERDR_PANE_ID is set: %s" % (SESSION_ENV, how))
+
+
 def identify_caller(herdr, v2, environ):
     """The caller's fleet name: HERDR_PANE_ID -> herdr agent -> v2 session -> metadata.fleet.name."""
+    fleet = session_identity(herdr, v2, environ)
+    if fleet is not None:
+        return fleet["name"]
     pane = environ.get("HERDR_PANE_ID")
     if not pane:
-        raise CallerError("HERDR_PANE_ID is not set: run send from a fleet agent's herdr pane")
+        raise no_pane_error("run send from a fleet agent's herdr pane")
     session_id = agent_session(herdr.agent_get(pane))
     if not session_id:
         raise CallerError("herdr pane %s shows no agent session" % pane)
@@ -10093,6 +10245,8 @@ def _notice_ack(args, engine, state):
         else:
             try:
                 caller = caller_fleet(engine.herdr, engine.v2, os.environ)["name"]
+            except IdentityUncertain:
+                raise
             except CallerError:
                 caller = None  # a plain shell: you
         if caller is not None:
@@ -10890,6 +11044,8 @@ def soft_caller(runner, now):
         return {}, watched_repos(config, {})
     try:
         return caller_fleet(engine.herdr, engine.v2, os.environ), watched
+    except IdentityUncertain:
+        raise
     except (CallerError, V2Error, HerdrError):
         return {}, watched
 
@@ -10916,9 +11072,12 @@ def cmd_intent(args, runner, now):
 
 def caller_fleet(herdr, v2, environ):
     """The caller's `metadata.fleet`: HERDR_PANE_ID -> herdr agent -> v2 session."""
+    fleet = session_identity(herdr, v2, environ)
+    if fleet is not None:
+        return fleet
     pane = environ.get("HERDR_PANE_ID")
     if not pane:
-        raise CallerError("HERDR_PANE_ID is not set: run intents from a fleet agent's herdr pane")
+        raise no_pane_error("run intents from a fleet agent's herdr pane")
     session_id = agent_session(herdr.agent_get(pane))
     fleet = _fleet_meta(v2.session_get(session_id)) if session_id else None
     if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
@@ -15958,6 +16117,8 @@ def decision_actor(engine, args):
         return name, role
     try:
         name, role, _ = orders_caller(engine, args)
+    except IdentityUncertain:
+        raise  # an agent whose identity is uncertain is not "you, in a plain shell"
     except CallerError:
         return None, None
     return name, role
