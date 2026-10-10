@@ -516,6 +516,26 @@ print(("FAIL\t" + "; ".join(bad)) if bad else "ok\t%d forwarder repo(s), none do
   fi
 fi
 
+# =========================================================== 8e. the waiting-on-the-person sweep (#117)
+# The daemon's last sweep (counts by kind) from `fleet-switchboard status --json`. WARN-only.
+if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
+  run_to 40 "$sb_real" status --json
+  sw=$(printf '%s' "$LAST_OUT" | python3 -c '
+import json,sys
+try:
+    d=json.loads(sys.stdin.read()).get("sweep")
+except Exception:
+    sys.exit(0)
+if not d:
+    print("ok\tno sweep recorded yet"); sys.exit(0)
+parts=", ".join("%s %d" % kv for kv in sorted(d["counts"].items())) or "none"
+mode="on" if d.get("enabled") else "shadow"
+print(("WARN\t" if d.get("total") else "ok\t") + "sweep (%s): %d finding(s): %s" % (mode, d.get("total", 0), parts))' 2>/dev/null)
+  if [ -n "$sw" ]; then
+    sw_tab=$(printf '\t'); LAST_OUT=""; emit "${sw%%"$sw_tab"*}" sweep "${sw#*"$sw_tab"}"
+  fi
+fi
+
 # =========================================================== 9. charter drift
 # Best effort, WARN-only, never FAIL. Unparseable charters are skipped quietly.
 if [ ! -f "$TMPDIR_FD/panes.txt" ] && [ -n "$FLEET_REPO" ]; then
