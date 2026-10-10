@@ -51,7 +51,7 @@ COMPARISON_WORDS = ("at least", "at most", "exactly", "equals", "equal to", "few
 COMPARISON_RE = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(w) for w in COMPARISON_WORDS))
 
 
-class PlanFormatError(Exception):
+class PlanFormatError(ValueError):
     """The plan cannot be read at all (no block, a malformed block, too large): the check cannot say pass or fail."""
 
 
@@ -68,8 +68,16 @@ def select_plan_text(body, comments):
         if HEADING_RE.match(first):
             chosen = comment
     if chosen is not None:
-        return chosen["body"], "comment %s" % chosen.get("id")
+        return chosen["body"], "comment %s%s" % (chosen.get("id"), comment_author(chosen))
     return body or "", "issue body"
+
+
+def comment_author(comment):
+    """` by <login>` for a GitHub comment ({"user": {"login": ...}}), else empty. Reported so a reader sees whose plan
+    the check read: the latest heading comment counts whoever wrote it."""
+    user = comment.get("user") if isinstance(comment, dict) else None
+    login = user.get("login") if isinstance(user, dict) else None
+    return " by %s" % login if isinstance(login, str) and re.match(r"^[A-Za-z0-9_.\[\]-]{1,60}$", login) else ""
 
 
 def fenced_blocks(text):
@@ -286,6 +294,9 @@ def parse_scenarios(lines):
 
 # ----------------------------------------------------------------------------------- the Done-when clauses
 
+PROSE_REF_RE = re.compile(r"\b(?:see|per|in|of|clause|item|section|and|or|with|to)\s*\(?\s*$", re.IGNORECASE)
+
+
 def clauses_of(done_when):
     """[clause text] from the ask's Done-when line: its numbered parts `(1) ... (2) ...`, in order, counting up from
     1 and stopping at the first gap. A line with no `(1)` is one clause. None or empty gives []."""
@@ -297,7 +308,8 @@ def clauses_of(done_when):
         found = None
         for candidate in re.finditer(r"(?:^|(?<=[\s;,.]))\(%d\)" % n, text[position:]):
             before = text[:position + candidate.start()]
-            if before.count("(") - before.count(")") == 0:   # a `(3)` inside an open parenthesis is prose, not a clause
+            # a `(3)` that is a reference in prose ("see (3)") is not a marker; an unbalanced "(" elsewhere is irrelevant
+            if not PROSE_REF_RE.search(before):
                 found = candidate
                 break
         if found is None:
@@ -324,9 +336,57 @@ def _plain_words(text):
     return " ".join(re.sub(r"[^a-z0-9 /'-]", " ", str(text).lower()).split())
 
 
+# Words that say nothing a wrong build could fail. A quoted literal made only of these is not an expected value.
+VAGUE_WORDS = {"works", "work", "working", "ok", "okay", "fine", "good", "correct", "correctly", "right", "pass", "passes",
+               "passed", "success", "succeeds", "succeeded", "done", "nice", "nicely", "well", "properly", "expected",
+               "everything", "something", "nothing", "true", "yes", "non-empty", "nonempty", "valid", "as", "it", "is"}
+UNITS = (r"ms|s|sec|secs|second|seconds|minute|minutes|min|mins|hour|hours|h|day|days|bytes?|kb|mb|gb|characters?|chars?|"
+         r"lines?|rows?|items?|agents?|files?|requests?|calls?|messages?|errors?|retries|times|entries|records|tests?|"
+         r"scenarios?|comments?|issues?|prs?|commits?|branches|fields?|results?|replies|reply|events?|attempts?")
+THRESHOLD = (r"(?:at least|at most|exactly|more than|fewer than|less than|greater than|no more than|no fewer than|"
+             r"under|over|within|above|below|up to)")
+STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|responds?|code)\s*(?:is|=|==|of|:)?\s*[1-5][0-9][0-9]\b",
+                       re.IGNORECASE)
+EXIT_RE = re.compile(r"\bexit (?:code|status)\s*(?:is|=|==|of|:)?\s*[0-9]+\b", re.IGNORECASE)
+UNIT_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?\s*(?:%%|percent|%s)(?![A-Za-z])" % UNITS, re.IGNORECASE)
+PERCENT_RE = re.compile(r"[0-9]\s*%")
+THRESHOLD_RE = re.compile(r"\b%s\s+[0-9]" % THRESHOLD, re.IGNORECASE)
+# an identifier (snake_case, camelCase, dotted, a path, or backticked) compared to a number or a non-vague quoted value
+IDENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*(?:[._/-][A-Za-z0-9_]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Za-z_][A-Za-z0-9_]*)"
+COMPARED_RE = re.compile(r"(%s)\s*(?:==|!=|>=|<=|=|<|>|\bis\b|\bequals\b|\bcontains\b|\bmatches\b)\s*(\"[^\"]+\"|'[^']+'|`[^`]+`|[0-9][0-9.]*)"
+                         % IDENT, re.IGNORECASE)
+STRONG_PHRASES = ("byte-identical", "identical to the stored", "identical to the fixture", "no diff", "diff is empty",
+                  "zero diff", "checksum", "sha256", "empty diff")
+QUOTED_RE = re.compile(r"[\"'`]([^\"'`]+)[\"'`]")
+
+
+def _vague_literal(text):
+    words = re.findall(r"[a-z0-9-]+", text.lower())
+    return not words or all(w in VAGUE_WORDS for w in words)
+
+
+def _has_observable(rule):
+    """True when the rule names something a wrong build could fail: a status or exit code, a number with a unit or a
+    threshold, an identifier compared to a number or a quoted literal, a quoted EXPECTED literal that is not itself a
+    vague word, or a strong comparison phrase (byte-identical, no diff). A bare digit, `=`, `after` or `before` is not."""
+    lowered = rule.lower()
+    if STATUS_RE.search(rule) or EXIT_RE.search(rule) or UNIT_RE.search(rule) or PERCENT_RE.search(rule) \
+            or THRESHOLD_RE.search(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
+        return True
+    for quoted in QUOTED_RE.findall(rule):
+        if not _vague_literal(quoted):
+            return True
+    for ident, value in COMPARED_RE.findall(rule):
+        if ident.lower() in VAGUE_WORDS or ident.lower() in ("it", "result", "output") and _vague_literal(value.strip("\"'`")):
+            continue
+        if not _vague_literal(value.strip("\"'`")):
+            return True
+    return False
+
+
 def pass_rule_problem(rule):
-    """Why a pass rule is vague, or None. It needs enough words and one concrete token: a number, a quoted value, a
-    comparison, or a status."""
+    """Why a pass rule is vague, or None. It needs a concrete OBSERVABLE (see _has_observable); filler such as `works`,
+    `correctly`, `matches the expectations` earns nothing."""
     rule = _normal(rule)
     if not rule:
         return "the pass rule is empty"
@@ -334,26 +394,58 @@ def pass_rule_problem(rule):
         return "the pass rule %r says nothing a wrong build could fail" % rule
     if len(rule) < MIN_PASS_CHARS:
         return "the pass rule is too short to be checkable (%d characters, at least %d)" % (len(rule), MIN_PASS_CHARS)
-    lowered = rule.lower()
-    concrete = (re.search(r"[0-9]", rule) or re.search(r"[\"'`][^\"'`]+[\"'`]", rule)
-                or re.search(r"[<>]=?|==|!=|=", rule) or COMPARISON_RE.search(lowered))
-    if not concrete:
-        return ("the pass rule has no concrete token: name a number, a status, a quoted value or a comparison "
-                "(%r)" % rule[:60])
+    if not _has_observable(rule):
+        return ("the pass rule names no concrete observable: give a status or exit code, a value with a unit or a "
+                "threshold, a quoted expected value, or an identifier compared to a value (%r)" % rule[:60])
     return None
+
+
+# Phrases that say "a wrong build fails" without saying what the wrong build does.
+META_WORDS = {"a", "an", "the", "this", "that", "it", "any", "wrong", "bad", "incorrect", "build", "builds", "version",
+              "implementation", "would", "will", "should", "could", "fail", "fails", "failing", "failed", "break",
+              "breaks", "and", "or", "of", "to", "be", "is", "are", "if", "when", "scenario", "test", "check", "so"}
+NEGATIVE_MARKERS = ("stub", "canned", "empty", "nothing", "missing", "without", "ignores", "ignore", "hard-coded",
+                    "hardcoded", "returns", "omits", "skips", "instead", "stale", "unchanged", "duplicate", "drops",
+                    "never", "not", "no", "zero", "diff", "differs", "mismatch", "extra", "reordered", "ordering",
+                    "changed", "old", "leaks", "crash", "crashes", "hangs", "times", "timeout", "denied", "refused",
+                    "rejects", "accepts", "wrong", "creates", "deletes", "overwrites", "different")
+OVERLAP_LIMIT = 0.6
+
+
+def _content_words(text):
+    return {w for w in re.findall(r"[a-z0-9]+", str(text).lower()) if len(w) > 2}
 
 
 def discriminates_problem(value, pass_rule):
     value = _normal(value)
     if not value:
-        return "`discriminates` is empty: name an observable a wrong build would fail"
+        return "`discriminates` is empty: name a concrete wrong build or negative case that this scenario would catch"
     if _plain_words(value) in VACUOUS_DISCRIMINATES:
-        return "`discriminates` is %r: name an observable a wrong build would fail" % value
+        return "`discriminates` is %r: name a concrete wrong build or negative case" % value
     if len(value) < MIN_DISCRIMINATES_CHARS:
-        return "`discriminates` is too short to name an observable (%d characters)" % len(value)
-    if value.lower() == _normal(pass_rule).lower():
-        return "`discriminates` repeats the pass rule: say what a WRONG build would show"
+        return "`discriminates` is too short to name a wrong build or negative case (%d characters)" % len(value)
+    words = re.findall(r"[a-z0-9-]+", value.lower())
+    rest = [w for w in words if w not in META_WORDS]
+    if len(rest) < 3:
+        return ("`discriminates` only says that a wrong build fails (%r): say what the wrong build does, for example "
+                "'a stub that returns an empty list'" % value[:60])
+    if not (any(w in NEGATIVE_MARKERS for w in words) or re.search(r"[0-9]", value) or QUOTED_RE.search(value)):
+        return "`discriminates` names no concrete wrong build or negative case (%r)" % value[:60]
+    ours, theirs = _content_words(value), _content_words(pass_rule)
+    if ours and len(ours & theirs) / len(ours) >= OVERLAP_LIMIT:
+        return "`discriminates` is nearly the pass rule reworded: say what a WRONG build would show instead"
     return None
+
+
+FILLER_REASON_WORDS = {"n/a", "na", "ok", "okay", "none", "tbd", "todo", "nothing", "no", "because", "reason", "same",
+                       "n", "a", "fine", "x", "yes"}
+MIN_UNCHANGED_REASON = 20
+
+
+def unchanged_reason_ok(reason):
+    reason = _normal(reason)
+    real = [w for w in re.findall(r"[a-z0-9/]+", reason.lower()) if w not in FILLER_REASON_WORDS]
+    return len(reason) >= MIN_UNCHANGED_REASON and len(real) >= 3
 
 
 def validate(scenarios, clauses, text=""):
@@ -418,7 +510,7 @@ def validate(scenarios, clauses, text=""):
         bad("-", "no-done-when", "the ask has no Done-when to cover: coverage cannot be checked")
     if not any(_normal(s.get("id", "")).startswith("U") for s in scenarios):
         reason = UNCHANGED_NONE_RE.search(text or "")
-        if not (reason and len(reason.group(1).strip()) >= 5):
+        if not (reason and unchanged_reason_ok(reason.group(1))):
             bad("-", "no-unchanged-scenario",
                 "no U (unchanged) scenario, and the plan does not say `unchanged: none because <reason>`")
     if len(scenarios) > GUIDANCE_SCENARIOS:
@@ -458,24 +550,43 @@ def content_hash(scenarios, clauses, text=""):
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def plan_hash(text):
+    """sha256 of the WHOLE plan text, whitespace collapsed. Approval (G0c) and consensus (G0b) bind to this one: an edit
+    to constraints, scope or risks changes it as well as an edit to a scenario."""
+    return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
+
+
 # ----------------------------------------------------------------------------------- the whole check
 
-def check(text, done_when):
-    """The result of checking `text` (the plan) against the ask's `done_when` line:
-    {"result": "pass"|"fail", "hash", "scenarios", "clauses", "defects", "warnings"}. Raises PlanFormatError when the
-    plan cannot be read."""
+def _clause_key(clause):
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", clause.lower()).split())
+
+
+def check(text, done_when, plan_done_when=None):
+    """The result of checking `text` (the plan) against the ask's `done_when` line (authoritative):
+    {"result": "pass"|"fail", "scenario_hash", "plan_hash", "scenarios", "clauses", "defects", "warnings"}.
+    `plan_done_when` is the Done-when the plan states for itself, when it does: it must be the same clauses (a plan never
+    weakens coverage by copying fewer). Raises PlanFormatError when the plan cannot be read."""
     scenarios = parse_scenarios(scenario_block(text))
     clauses = clauses_of(done_when)
     defects, warnings = validate(scenarios, clauses, text)
-    return {"result": "fail" if defects else "pass", "hash": content_hash(scenarios, clauses, text),
-            "scenarios": len(scenarios), "clauses": clauses, "defects": defects, "warnings": warnings}
+    if plan_done_when and clauses:
+        own = clauses_of(plan_done_when)
+        if [_clause_key(c) for c in own] != [_clause_key(c) for c in clauses]:
+            defects.append({"id": "-", "code": "done-when-differs",
+                            "message": "the plan states %d Done-when clause(s) but the ask has %d, or they differ: the ask's "
+                                       "Done-when is the authority, copy it exactly" % (len(own), len(clauses))})
+    return {"result": "fail" if defects else "pass", "scenario_hash": content_hash(scenarios, clauses, text),
+            "plan_hash": plan_hash(text), "scenarios": len(scenarios), "clauses": clauses, "defects": defects,
+            "warnings": warnings}
 
 
 def render(result, source):
     """The lines `plan check` prints."""
     lines = ["plan check: %s" % result["result"].upper(), "source: %s" % source,
              "scenarios: %d; Done-when clauses: %d" % (result["scenarios"], len(result["clauses"])),
-             "plan hash: %s" % result["hash"]]
+             "scenario hash: %s" % result["scenario_hash"],
+             "plan hash: %s (approval and consensus bind to this)" % result["plan_hash"]]
     lines.extend("DEFECT %s: %s" % (d["id"], d["message"]) for d in result["defects"])
     lines.extend("WARN: %s" % w["message"] for w in result["warnings"])
     return lines

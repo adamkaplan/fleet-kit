@@ -62,10 +62,12 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | `text` | missing or under 10 characters |
 | `proof`, `evaluator` | not one of the listed values |
 | proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam` |
-| `pass` | missing; a vague phrase (`works`, `ok`, `non-empty`, `it works`, `passes`, ...); under 15 characters; or no concrete token (a number, a status, a quoted value, a comparison) |
-| `discriminates` | missing, `n/a`/`none`/`tbd`, under 10 characters, or a copy of `pass` |
+| `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
+| `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 60 percent or more of its words are the pass rule's. Whether the named wrong build is the right one is for the plan review (G0b) |
+| evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
-| unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` |
+| unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
+| Done-when | `--ask` (or `--done-when`) is the **authority** for the clauses. If the plan states its own Done-when it must be the same clauses: fewer or different ones fail (`done-when-differs`). A plan can never weaken coverage |
 | size | warning (not a failure) over 30 scenarios: split the plan by slice |
 
 The Done-when clauses are the numbered parts `(1) ... (2) ...` of the ask's `Done when:` line (`DW-n` is clause n); a
@@ -74,9 +76,11 @@ line with no `(1)` is one clause.
 ### Output, hash, exit codes
 
 `fleet-switchboard plan check <owner/repo#N | issue URL | --file PATH> [--json]` prints `PASS` or `FAIL`, one `DEFECT
-<scenario id>: ...` line each, and the **plan hash**: sha256 of the canonical scenario block plus the clause list (sorted by
-id, whitespace collapsed, comments and quoting ignored), so a later gate can bind an approval to exactly this plan. Any
-change to a scenario or a clause changes it. Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
+<scenario id>: ...` line each, the source (for a comment, its id and author: the latest `Plan (scenarios)` comment counts
+whoever wrote it) and **two hashes**. The **scenario hash** is sha256 of the canonical scenario block plus the clause list
+(sorted by id, whitespace collapsed, comments and quoting ignored). The **plan hash** is sha256 of the whole plan text,
+whitespace collapsed. **Approval (G0c) and consensus (G0b) bind to the plan hash**: editing constraints, scope or risks
+changes it, as editing a scenario does; the scenario hash only says the scenarios are unchanged. Exit 0 pass, 1 fail, 2 unreadable (no block, a malformed block, a
 tab in the indentation, too large, GitHub unreadable). It only reads (GET); it never writes GitHub. `--ask` or
 `--done-when` supply the Done-when when the plan issue has none of its own.
 
@@ -122,6 +126,7 @@ scenarios:
 quoted value, a comparison.
 
 ```yaml
+scenarios:
   - id: S1
     covers: DW-1
     text: Given a project with no agents, when an owner commissions one, then it is listed
@@ -131,16 +136,18 @@ quoted value, a comparison.
     evaluator: ci
 ```
 
-**2. No discriminating observable.** `discriminates: n/a` (or a copy of `pass`) fails: nothing says what a wrong build
-would show, so a vacuous test would satisfy the scenario.
+**2. No discriminating observable.** `discriminates: a wrong build would fail this` (or `n/a`, or the pass rule reworded) fails:
+nothing says what the wrong build DOES, so a vacuous test would satisfy the scenario. Name the wrong build: "a stub that
+returns an empty list".
 
 ```yaml
+scenarios:
   - id: S1
     covers: DW-1
     text: Given a project with no agents, when an owner commissions one, then it is listed
     proof: test
     pass: the list call returns status 200 and exactly 1 agent named "alpha"
-    discriminates: n/a
+    discriminates: a wrong build would fail this
     evaluator: ci
 ```
 
