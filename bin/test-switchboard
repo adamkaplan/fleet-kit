@@ -14565,7 +14565,7 @@ class TestSweep(Base):
         self.hub.open = {n: sweep_issue(n, "x") for n in range(1, 151)}   # two pages of 100
         self.engine.config["github_repos"] = ["acme/a", "acme/b"]
         self.engine.discover(self.world.clock.now())
-        self.sweep()
+        self.sweep(calls_per_pass=6)
         self.assertEqual(len(self.engine.sweep.repos), 1)       # 2 + 1 pages used the budget the second repo needed
 
     def test_a_batch_issue_with_rows_and_no_section_is_not_an_s1b_finding(self):
@@ -14617,6 +14617,18 @@ class TestSweep(Base):
         self.hub.read_pages = slow
         self.sweep()
         self.assertEqual(len(self.engine.sweep.repos), 1)
+
+    def test_the_sweep_budget_is_a_config_value_with_a_cap(self):
+        self.assertEqual(sb.SWEEP_CALLS_PER_PASS, 12)
+        base = {"opencode": FAKE_OPENCODE}
+        self.assertEqual(sb.validate_config(dict(base, sweep={"calls_per_pass": 20}))["sweep"]["calls_per_pass"], 20)
+        for bad in (3, 101, "6", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, sweep={"calls_per_pass": bad}))
+        self.engine.config["github_repos"] = ["acme/r%d" % i for i in range(4)]
+        self.engine.discover(self.world.clock.now())
+        self.sweep(calls_per_pass=4)
+        self.assertLessEqual(self.calls(), 4)
 
     def test_config_is_validated_and_off_by_default(self):
         base = {"opencode": FAKE_OPENCODE}
@@ -14964,6 +14976,59 @@ class TestTriage(Base):
         self.assertEqual(count(), 2)
         self.assertGreaterEqual(self.engine.triage.summarised - first, 86400)
         self.assertIn("other-owner flags", [e for e in self.world.audit() if e["event"] == "triage.summary"][0]["detail"]["text"])
+
+    def seven_repos(self):
+        repos = ["acme/r%d" % i for i in range(7)]
+        for repo in repos:
+            self.hub.open[repo] = {1: tri_issue(self.now, 1, created=3, labels=["kind"], repo=repo)}   # unowned: a T1
+        self.engine.config["triage"]["repos"] = repos
+        return repos
+
+    def test_the_default_budget_covers_a_seven_repo_fleet_in_two_passes(self):
+        self.assertEqual(sb.TRIAGE_CALLS_PER_PASS, 30)
+        repos = self.seven_repos()
+        self.world.tick(1)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        first = len(self.hub.calls)
+        self.assertLessEqual(first, 30)
+        self.world.tick(1)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        read = {r for r, u in self.engine.triage.units if u == "issues"}
+        self.assertEqual(read, set(repos))                          # every repo's issues are in after two passes
+        self.assertTrue(all((r, u) in self.engine.triage.units for r in repos
+                            for u in ("issues", "comments", "closed:osuser:awaiting-user", "closed:osuser:awaiting-cos")))
+        self.assertLessEqual(len(self.hub.calls), 60)
+
+    def test_unchecked_reaches_zero_in_steady_state_and_the_cache_keeps_it_cheap(self):
+        self.seven_repos()
+        for _ in range(8):
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        current = sb.triage_summary(self.world.state)
+        self.assertEqual((current["unchecked"], current["unchecked_units"], current["counts"]), (0, {}, {"T1": 7}))
+        calls = len(self.hub.calls)
+        for _ in range(5):                                             # inside the 15-minute cache: no gh call at all
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.hub.calls), calls)
+
+    def test_the_budget_is_configurable_and_the_cap_is_enforced(self):
+        self.seven_repos()
+        worst = 0
+        for _ in range(6):
+            before = len(self.hub.calls)
+            self.world.tick(1)
+            self.go(passes=0)
+            self.engine.config["triage"]["calls_per_pass"] = 8
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+            worst = max(worst, len(self.hub.calls) - before)
+        self.assertLessEqual(worst, 8)
+        base = {"opencode": FAKE_OPENCODE}
+        self.assertEqual(sb.validate_config(dict(base, triage={"calls_per_pass": 100}))["triage"]["calls_per_pass"], 100)
+        for bad in ({"calls_per_pass": 101}, {"calls_per_pass": 3}, {"calls_per_pass": "30"}, {"pass_seconds": 0},
+                    {"pass_seconds": 61}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, triage=bad))
 
     def test_the_precision_sheet_is_local_deduplicated_and_summarised(self):
         import importlib.machinery, importlib.util
@@ -20682,7 +20747,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
     ITEMS = 1200
 
     def rig(self):
-        rig = GithubRig(self)
+        rig = GithubRig(self, config={"triage": False})  # the pass budget under test is the routing's; triage has its own (pass_seconds)
         self.calls = 0
         original = rig.gh.runner
 

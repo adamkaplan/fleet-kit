@@ -2209,7 +2209,7 @@ rather than by an agent's memory. The daemon runs a deterministic sweep (no mode
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
 writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
-fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"], the names the phrases look for).
+fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
 |---|---|
@@ -2243,7 +2243,7 @@ It grows the sweep: the same hub reads, call budget, fresh re-check, shadow defa
 `repos` (the tracked repos, `OWNER/REPO`; default: the repos the daemon already watches. The extra tracked repos that are not watched are named here in the local config, never in this public source; each is read with its existing per-repo account),
 `required_labels` (`{repo: [label or [alternatives], ...]}`; no entry, no T2), `sla` and `sla_overrides` (per repo; the
 numbers below are the defaults), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
-(true), `realarm_hours` (24), `max_findings` (30).
+(true), `realarm_hours` (24), `max_findings` (30), `calls_per_pass` (30), `pass_seconds` (10).
 
 | Rule | Finding | Default SLA |
 |---|---|---|
@@ -2264,8 +2264,15 @@ agent-worked and has no notice, is reported only as `OO` (other-owner, flag only
 comments); one the fresh read does not bear out is `triage.dismissed`; one that cannot be checked now is neither audited nor
 raised that pass. A repo the account cannot read is `unreadable`, audited once and shown in `status` and `fleet-doctor`,
 never findings. Reads: four units per repo (open issues, recent comments, closed issues per awaiting label), each at most 2
-pages, kept 15 minutes, at most 4 `gh` calls per pass (1 reserved for fresh checks), the stalest unit first across all repos,
-so none starves; units not yet read are listed as unchecked.
+pages (the closed lists 1), kept 15 minutes, the stalest unit first across all repos so none starves; units not yet read are listed as
+unchecked. The budget is a config value, `triage.calls_per_pass` (default 30, 4 to 100; a third is kept for the fresh re-checks of
+the pass's candidates) with `triage.pass_seconds` (default 10, 1 to 60: no new read starts after it, so a slow GitHub cannot hold the pass; the sweep has its own 8 seconds) as the time bound. The budget matters only on a cold cache:
+a full cycle over 7 repos is 28 calls with small lists (at most 42 with full pages), so it completes in two passes; after that a pass
+reads nothing until the 15-minute lists expire. Steady-state cost at the default for 7 repos: the lists once per 15 minutes, about
+112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
+counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
+count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache
+they use at most the sum.
 
 Reporting: one batched fact per pass (`triage: N findings: ref rule, ...`, refs and kinds only), each item re-raised at most
 once per `realarm_hours`; one summary line every 24 hours since the last one (counts by rule: found, other-owner flags, escalated, unchecked, unreadable repos), audited

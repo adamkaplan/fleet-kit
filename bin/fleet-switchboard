@@ -6152,9 +6152,10 @@ def finish_pass(engine, discovery, report):
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["Adam"]}
+                  "realarm_hours": 6, "person_names": ["Adam"], "calls_per_pass": 12}
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
-SWEEP_CALLS_PER_PASS = 6      # the most `gh` calls the sweep makes in one pass (pages and single reads alike)
+SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.calls_per_pass`: the most `gh` calls one pass makes
+SWEEP_CALLS_CAP = 100
 SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
 SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent this long in a pass
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
@@ -6193,6 +6194,9 @@ def validate_sweep_config(config, source):
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
+    calls = section["calls_per_pass"]
+    if not isinstance(calls, int) or isinstance(calls, bool) or not 4 <= calls <= SWEEP_CALLS_CAP:
+        raise ConfigError("%s.calls_per_pass' must be a whole number from 4 to %d, got %r" % (where, SWEEP_CALLS_CAP, calls))
     names = section["person_names"]
     if not isinstance(names, list) or not names or not all(isinstance(n, str) and re.fullmatch(r"[\w@ .-]{1,40}", n)
                                                            for n in names):
@@ -6577,7 +6581,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
     regex = sweep_phrase_re(cfg["person_names"])
     state.strong = sweep_strong_re(cfg["person_names"])
-    budget = [SWEEP_CALLS_PER_PASS]
+    budget = [cfg.get("calls_per_pass", SWEEP_CALLS_PER_PASS)]
     sweep_refresh(engine, state, repos, now, cfg, regex, budget)
     share = [(budget[0] + 1) // 2]  # the single reads are split: half for S4, the rest (and S4's unused) to verifying
     start = share[0]
@@ -6717,7 +6721,8 @@ class SweepFacts:
 # file) and the batched fact to the Chief of Staff. The fix rules of the plan stay unbuilt until he lifts the hold.
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
-                   "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30}
+                   "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
+                   "calls_per_pass": 30, "pass_seconds": 10}
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1, "t3_ask_days": 3, "t3_other_days": 14, "t5_days": 2, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 30}
 # (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
@@ -6726,9 +6731,10 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "OO": "other-owner (flag only)"}
 TRIAGE_TTL = 900               # seconds a unit read is kept
-TRIAGE_CALLS_PER_PASS = 4      # the most `gh` calls the triage makes in one pass (reads and fresh checks alike)
-TRIAGE_VERIFY_RESERVE = 1
-TRIAGE_PASS_SECONDS = 6
+TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
+TRIAGE_CALLS_CAP = 100
+TRIAGE_PASS_SECONDS = TRIAGE_DEFAULTS["pass_seconds"]       # default of `triage.pass_seconds`; cap TRIAGE_SECONDS_CAP
+TRIAGE_SECONDS_CAP = 60
 TRIAGE_LIST_PAGES = 2
 TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
 TRIAGE_UNREADABLE_RETRY = 3600
@@ -6769,6 +6775,12 @@ def validate_triage_config(config, source):
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
+    calls = section["calls_per_pass"]
+    if not isinstance(calls, int) or isinstance(calls, bool) or not 4 <= calls <= TRIAGE_CALLS_CAP:
+        raise ConfigError("%s.calls_per_pass' must be a whole number from 4 to %d, got %r" % (where, TRIAGE_CALLS_CAP, calls))
+    seconds = section["pass_seconds"]
+    if not _is_number(seconds) or not 1 <= seconds <= TRIAGE_SECONDS_CAP:
+        raise ConfigError("%s.pass_seconds' must be a number from 1 to %d, got %r" % (where, TRIAGE_SECONDS_CAP, seconds))
     for name in ("sla",):
         _check_sla(section[name], where + "." + name)
     overrides = section["sla_overrides"]
@@ -6942,7 +6954,7 @@ def triage_read_unit(hub, repo, unit, now, budget):
     return records, cut
 
 
-def triage_refresh(engine, state, repos, units, now, budget):
+def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=TRIAGE_PASS_SECONDS):
     """Read the stalest units (round-robin across every repo and unit, the least recently read first) while the pass's
     call budget (less the reserve for fresh checks) and time allow. A repo the account cannot read is `unreadable`, once."""
     hub = getattr(engine, "hub", None)
@@ -6957,7 +6969,7 @@ def triage_refresh(engine, state, repos, units, now, budget):
             if held is None or now - held["at"] >= TRIAGE_TTL:
                 todo.append(((held or {"at": 0})["at"], repo, unit))
     for _, repo, unit in sorted(todo):
-        if budget[0] - TRIAGE_VERIFY_RESERVE < 1 or engine.now() - state.started >= TRIAGE_PASS_SECONDS:
+        if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
             break
         try:
             records, cut = triage_read_unit(hub, repo, unit, now, budget)
@@ -7114,9 +7126,10 @@ def triage_pass(engine, decisions, now, errors=()):
         return  # nothing is tracked: nothing to read, nothing to say
     state = triage_state(engine)
     state.started = engine.now()
-    budget = [TRIAGE_CALLS_PER_PASS]
+    budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
+    seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
-    triage_refresh(engine, state, repos, units, now, budget)
+    triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked = [], 0
     for rule, ref, evidence in sorted(candidates, key=lambda c: (state.attempted.get((c[0], c[1]), 0), c[0], c[1])):
@@ -7124,7 +7137,7 @@ def triage_pass(engine, decisions, now, errors=()):
         if now - state.confirmed.get(pair, 0) < TRIAGE_TTL:
             findings.append((rule, ref, evidence))
             continue
-        if engine.now() - state.started >= TRIAGE_PASS_SECONDS:
+        if engine.now() - state.started >= seconds:
             unchecked += 1
             continue
         state.attempted[pair] = now
