@@ -14444,6 +14444,17 @@ class TestSweep(Base):
         self.assertEqual(refs, [("acme/api", 6), ("other/web", 7)])           # #5 is another sentence
         self.assertEqual(sb.sweep_strong_statement(strong, "Waiting on Adam", "acme/api", [])[1], [])
 
+    def test_a_comment_naming_a_ref_it_cannot_resolve_is_not_assumed_to_be_about_its_own_item(self):
+        self.hub.open = {210: sweep_issue(210, "x"), 211: sweep_issue(211, "x"), 212: sweep_issue(212, "x")}
+        self.hub.comments = [sweep_comment(210, "Waiting on Adam: web#4 plan", self.at(1)),             # short ref, no such repo
+                             sweep_comment(211, "Waiting on Adam: other/unwatched#9", self.at(1)),      # a repo not watched
+                             sweep_comment(212, "Waiting on Adam: #212 and web#4", self.at(1))]         # itself, and an unresolved one
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S3", "acme/api#212")])         # 210 and 211 are unattributed, 212 names itself
+        self.assertEqual(self.engine.sweep.current["unattributed"], 2)
+        self.assertIn("2 comment(s)", "\n".join(sb.sweep_status_lines(self.engine.sweep.current)))
+
     def test_a_comment_is_about_its_item_unless_its_sentence_names_other_refs(self):
         self.hub.open = {200: sweep_issue(200, "x"), 201: sweep_issue(201, "x"), 202: sweep_issue(202, "x"),
                          203: sweep_issue(203, "x")}

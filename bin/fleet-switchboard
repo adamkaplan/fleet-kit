@@ -6244,7 +6244,7 @@ def sweep_strong_statement(strong, text, default_repo, repos):
             continue
         fires = True
         for full, short, number in SWEEP_REF_RE.findall(text[start:sentence_end]):
-            repo = full or (decision_core.repo_of_tag(short, repos) if short else default_repo)
+            repo = full or ((decision_core.repo_of_tag(short, repos) or short) if short else default_repo)  # unresolved: kept as named
             if repo and (repo, int(number)) not in refs:
                 refs.append((repo, int(number)))
     return fires, refs
@@ -6430,7 +6430,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
 
     def ref_text(repo, number):
         return "%s#%d" % (repo, number)
-    s2 = set()
+    s2, unattributed = set(), 0
     for repo, picture in state.repos.items():
         for number, item in picture["items"].items():
             if not item["pr"]:
@@ -6449,8 +6449,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             if not item["latest_strong"]:
                 continue
             # a comment on an item is about that item, unless its sentence names other refs and not this one
-            named = [r for r in item.get("latest_refs", []) if r[0] in state.repos]
-            targets = [(repo, number)] if not named or (repo, number) in named else named
+            refs = item.get("latest_refs", [])
+            named = [r for r in refs if r[0] in state.repos]
+            targets = [(repo, number)] if not refs or (repo, number) in named else named
+            if refs and not named:
+                unattributed += 1   # it names only refs we cannot resolve to a watched item: not assumed to be about this one
             for target in targets:
                 if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
                     found.add(("S3", ref_text(*target)))
@@ -6468,6 +6471,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
         if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600):
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
+    state.unattributed = unattributed
     return sorted(found)
 
 
@@ -6623,7 +6627,8 @@ def sweep_decisions(engine, decisions, now, errors=()):
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings),
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
-                     "deferred": deferred, "unchecked": unchecked}
+                     "deferred": deferred, "unchecked": unchecked,
+                     "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
     if cfg["enabled"]:
         due = [(k, r) for k, r in findings
@@ -8987,6 +8992,9 @@ def sweep_status_lines(sweep):
         lines.append("      sweep      S3 %s for %s since %s: %s" % (
             "NOT deferred any more (overdue), running on the fresh check alone" if item.get("overdue") else "deferred",
             "every repo" if item["for"] == "*" else item["for"], item["since"], item["why"]))
+    if sweep.get("unattributed"):
+        lines.append("      sweep      %d comment(s) say it waits but name only refs outside the watched repos: not "
+                     "attributed to their own item" % sweep["unattributed"])
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
