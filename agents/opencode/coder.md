@@ -96,7 +96,7 @@ If you hit a decision only your principal can make — a product choice, a trade
 that changes what "done" means, an unexpected cost — **stop.** It goes up as
 `fleet-switchboard report question "..."` to your boss, and on the issue as the
 `<user>:awaiting-cos` label. NEVER apply `awaiting-user` yourself: the Chief of
-Staff escalates. Do not guess it or deliver something adjacent. The answer
+Staff escalates. A PR held for Adam starts with the line `MERGE: captain` as the first line of its body and gets a `fleet-switchboard notice pr`. Any other decision for Adam is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the awaiting label), never only words in a report: a report or comment saying something waits on Adam does not put it in his panel, the section and label do. The switchboard sweep (#117) flags mismatches to cos. Do not guess it or deliver something adjacent. The answer
 arrives as a switchboard message: act on it, then remove your `awaiting-cos`
 label.
 

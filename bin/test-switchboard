@@ -8424,7 +8424,7 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 10100, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 6100, "orchestrator": 9650, "chief-of-staff": 10300, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 

@@ -5138,6 +5138,8 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 - Never run `gh repo create`, `gh repo delete` or `gh repo edit --visibility`.
 - Never dispatch another orchestrator's coder: they are its own; talk to the orchestrator.
 - Never answer a `<user>:awaiting-user` question on your principal's behalf.
+- Escalate in the same turn: never tell your principal an item needs them without running `decisions escalate` in that same turn. The Decisions panel, not the chat, is the list of what waits on them: do not restate it in chat. "A news message stands alone" applies to news only.
+
 - No unsolicited prompts, keys or interrupts into panes you do not own.
 - Two failures on the same obstacle: stop and report. Never a third variant.
 
