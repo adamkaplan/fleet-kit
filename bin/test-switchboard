@@ -15291,7 +15291,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
     def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
-                    wedge=False, seconds=None):
+                    wedge=False, seconds=None, extra_env=None):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -15326,6 +15326,7 @@ class TestIdentityCheck(ReportBase):
                    "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
         if seconds is not None:
             environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(seconds)
+        environ.update(extra_env or {})
         if log.exists():
             log.unlink()
         started = time.monotonic()
@@ -15418,6 +15419,85 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         self.assertIn("warning: HERDR_PANE_ID", err)
+
+    # -- #138 regression: the daemon's own gh calls are never re-identified by the shim
+
+    FOREIGN = {"HERDR_PANE_ID": "wD:p9", "OPENCODE_SESSION_ID": "ses_foreignforeignforeign00",
+               "FLEET_SWITCHBOARD_ROLE": "orchestrator", "FLEET_SWITCHBOARD_REPO": "acme/api"}
+
+    def account_runner(self, tokens):
+        def runner(argv, **kwargs):
+            if argv[0] == "gh" and argv[1:3] == ["auth", "token"]:
+                token = tokens.get(argv[-1])
+                return subprocess.CompletedProcess(argv, 0 if token else 1, (token or "") + "\n", "")
+            return self.world.route(argv, **kwargs)
+        return runner
+
+    def accounts(self, tokens=None):
+        config = {"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops", "acme/*": "acct-personal"}}
+        return sb.GhAccounts(config, self.account_runner(tokens or {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}),
+                             lambda: 1.0, {"PATH": "/bin", "GH_TOKEN": "inherited"})
+
+    def test_a_daemon_started_from_an_agents_shell_carries_no_caller_identity(self):
+        shell = dict(self.FOREIGN, PATH="/usr/bin", GH_TOKEN="default-token", HERDR_PLUGIN_X="1", HERDR_SOCKET_PATH="/s")
+        env = sb.daemon_environment(shell)
+        for name in self.FOREIGN:
+            self.assertNotIn(name, env)
+        self.assertEqual((env["PATH"], env["GH_TOKEN"], env["HERDR_SOCKET_PATH"]), ("/usr/bin", "default-token", "/s"))
+        self.assertNotIn("HERDR_PLUGIN_X", env)
+        seen = []
+        with mock.patch.dict(os.environ, shell, clear=True):
+            sb.spawn_daemon(self.world.state, spawn=lambda argv, **kw: seen.append((argv, kw)))
+        self.assertTrue(all(name not in seen[0][1]["env"] for name in self.FOREIGN))      # what the daemon really starts with
+
+    def test_the_daemon_itself_drops_what_an_agents_shell_left_in_its_environment(self):
+        with mock.patch.dict(os.environ, self.FOREIGN):
+            with mock.patch.object(sb, "build_engine", side_effect=RuntimeError("stop")):
+                with self.assertRaises(RuntimeError):
+                    sb.cmd_run(types.SimpleNamespace(once=False, standby=False, json=False, poll=None),
+                               self.world.route, self.world.clock.now, lambda *a: None)
+            for name in self.FOREIGN:
+                self.assertNotIn(name, os.environ)
+
+    def shim_token(self, env, repo="acme/api"):
+        """The GH_TOKEN the real gh gets when the shim is run with `env` and the caller would resolve to `repo` (a mapped
+        repo of ANOTHER account than the call's own)."""
+        users = {"acme-ops/service": "acct-ops", "acme/*": "acct-personal"}
+        env = {k: v for k, v in env.items() if k != "PATH"}              # the harness keeps its own PATH
+        done, seen = self.run_gh_shim(repo, users, {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}, extra_env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return seen["token"]
+
+    def test_forwarders_intent_reads_and_sweep_triage_reads_keep_the_per_repo_account_through_the_shim(self):
+        accounts = self.accounts()
+        env_of = {
+            "the forwarder (hub.child_env)": sb.GitHubHub.child_env(types.SimpleNamespace(accounts=accounts), "acme-ops/service"),
+            "an intent read (IntentReader.env_for)": sb.IntentReader.env_for(types.SimpleNamespace(accounts=accounts),
+                                                                             "acme-ops/service"),
+            "a sweep or triage read (gh_api via child_env)": accounts.env_for("acme-ops/service"),
+        }
+        for label, env in env_of.items():
+            with self.subTest(label):
+                self.assertEqual((env["GH_TOKEN"], env[sb.OWN_GH_ENV]), ("tok-ops", "1"))
+                # the daemon's own env, with a foreign identity somewhere the shim could find it: the account stays
+                self.assertEqual(self.shim_token(dict(env, **self.FOREIGN)), "tok-ops")
+        # without the marker the same call WOULD be re-identified (the regression): the shim swaps in the caller's account
+        unmarked = {k: v for k, v in env_of["a sweep or triage read (gh_api via child_env)"].items() if k != sb.OWN_GH_ENV}
+        self.assertEqual(self.shim_token(unmarked), "tok-personal")
+
+    def test_a_default_account_call_of_the_daemon_is_not_re_identified_either(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(sb.OWN_GH_ENV, None)
+            sb.main(["version"])
+            self.assertEqual(os.environ.get(sb.OWN_GH_ENV), "1")             # every switchboard process is marked
+            inherited = {sb.OWN_GH_ENV: os.environ[sb.OWN_GH_ENV], "GH_TOKEN": "default-token"}
+        self.assertIsNone(self.accounts().env_for("elsewhere/repo"))          # no mapping: env None, the child inherits
+        self.assertEqual(self.shim_token(dict(inherited, **self.FOREIGN)), "default-token")
+
+    def test_a_real_agents_own_gh_call_is_still_re_identified(self):
+        # no marker in an agent's shell (a launch does not copy this process's environment): the #139 behaviour stays
+        self.assertEqual(self.shim_token({"GH_TOKEN": "stale-inherited"}, repo="acme-ops/service"), "tok-ops")
+        self.assertNotIn(sb.OWN_GH_ENV, sb.daemon_environment({}))
 
     # -- the judge, the hooks and status
 
