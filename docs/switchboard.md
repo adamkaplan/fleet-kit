@@ -2201,25 +2201,25 @@ for one repo shows that repo's notices; the Chief of Staff's and yours show all.
 ### The waiting-on-the-person sweep (#117)
 
 Everything waiting on the person should be in their Decisions panel, and nothing in it stale, kept true by the switchboard
-rather than by an agent's memory. The daemon runs a deterministic sweep (no model) over what GitHub shows. It runs only
-when the config has a `sweep` object (absent: it reads nothing and writes nothing, as before); `{}` is **shadow**:
+rather than by an agent's memory. The daemon runs a deterministic sweep (no model) over what GitHub shows. With no `sweep` key at all it runs in **shadow**, and so does `{}`:
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
-turns it on. Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
+is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
+writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
 fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"], the names the phrases look for).
 
 | Kind | Finding |
 |---|---|
 | S1a / S1b | an open issue with a `## Decision required` section and no awaiting label / an awaiting label and no such section |
-| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `needs <name>`, `for <name>'s review`; whole phrases, any case) and whose body does not start with `MERGE: captain` |
-| S3 | the same phrases in a comment of the last 7 days, or in a report's text, where no human-tier decision names that issue or PR |
-| S4 | a decision (issue, report or captain) whose issue or PR is closed or merged: **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
+| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and whose body does not start with `MERGE: captain` |
+| S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
+| S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged: **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
 | S5 | a cos-tier decision older than `aged_cos_hours` |
 
 S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N findings: <repo#n kind>, ... (+M more)`, only
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
 and the time slot, so a restart is one delivery. The sweep never edits GitHub and never changes a tier: the Chief of Staff
-resolves or escalates. Phrases inside code blocks or quotes still count: a false positive costs one line in a batched finding,
-a miss costs a stall. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (a `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
+resolves or escalates. Text in code blocks, inline code and quoted lines is ignored, and a negation just before the phrase (`not`, `no longer`, `never`, ...) cancels it.
+S1 also flags charters and other issues that carry the awaiting label, by design. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (a `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
 counts by kind and `fleet-doctor` warns when there are findings.
 
 ### Self-wakes
