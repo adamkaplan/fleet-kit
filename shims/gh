@@ -130,6 +130,8 @@ def account_env(gh, lookup=None):
     environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, the lookup deadline
     spent, any trouble. The token is only put in the child's environment: never printed, logged or put in argv."""
     try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
         if not users or not switchboard_binary():
             return None

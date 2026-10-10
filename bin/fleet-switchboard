@@ -2973,12 +2973,20 @@ def run_lock_held(state_dir):
         os.close(fd)
 
 
+# What names a CALLER (an agent's pane, its session, its role and repo): the daemon is nobody's agent, so it never carries them,
+# whichever shell started it, and neither do the processes it starts.
+CALLER_ENV_NAMES = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID",
+                    "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")
+OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # set in every switchboard process: its gh calls name their own account (GhAccounts);
+                                          # the gh shim leaves such a call's token alone and never re-identifies it
+
+
 def daemon_environment(environ):
-    """The environment for a daemon started from a hook: herdr's server env
-    minus the hook's own pane, which is whatever pane you had focused."""
+    """The environment for a daemon started from a hook: herdr's server env minus the hook's own pane (whatever pane you
+    had focused) and every other name of a caller (session, role, repo): started from an agent's shell, it would otherwise
+    BE that agent to the gh shim, which would swap the token of each of the daemon's own gh calls."""
     return {name: value for name, value in environ.items()
-            if not name.startswith("HERDR_PLUGIN_")
-            and name not in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID")}
+            if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES}
 
 
 def spawn_daemon(state_dir, spawn=subprocess.Popen):
@@ -9947,6 +9955,9 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
 
 
 def cmd_run(args, runner, now, wait):
+    if not args.once:   # the daemon: whoever started it, it is nobody's agent (see CALLER_ENV_NAMES)
+        for name in CALLER_ENV_NAMES:
+            os.environ.pop(name, None)
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
     if args.once:
@@ -10479,7 +10490,7 @@ class GhAccounts:
         account = self.account_for(repo) if repo else None
         if account is None:
             return None
-        return dict(self.environ, GH_TOKEN=self.token_for(account))
+        return dict(self.environ, GH_TOKEN=self.token_for(account), **{OWN_GH_ENV: "1"})
 
     def token_env(self, repo):
         """{"GH_TOKEN": token} for an agent working in `repo`, {} when the repo uses the default account."""
@@ -13818,6 +13829,7 @@ def build_parser():
 
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
+    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exit_:
