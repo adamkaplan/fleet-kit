@@ -2215,6 +2215,8 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"
 | S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged: **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
 | S5 | a cos-tier decision older than `aged_cos_hours` |
 
+**Precision.** A finding is raised only after a fresh single read of its issue or PR (and a fresh read of its last comments when comments raised it) bears it out, so a cached 15-minute list cannot raise it; one that does not hold is audited as `sweep.dismissed`, one that cannot be checked now (no call budget, a failed read) is neither raised nor audited that pass, and a verified finding is trusted for 15 minutes. Nothing that depends on the decision list or the labels (S1, S3, S5) is judged while any source of the list failed or is still unread, as in the first passes after a restart (`status` json shows `deferred`). `## Decision required` counts only as a real level-2 heading line of exactly that text: `Resolved (was: Decision required)`, inline mentions, deeper headings, code and quotes do not.
+
 S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N findings: <repo#n kind>, ... (+M more)`, only
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
 and the time slot, so a restart is one delivery. The sweep never edits GitHub and never changes a tier: the Chief of Staff

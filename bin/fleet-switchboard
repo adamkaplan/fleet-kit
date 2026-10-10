@@ -5859,7 +5859,7 @@ def publish_decisions(engine):
     now = engine.now()
     decisions, errors = derive_decisions(engine, now)
     try:
-        decisions = sweep_decisions(engine, decisions, now)  # #117: withdraws the stale, finds the rest; never raises
+        decisions = sweep_decisions(engine, decisions, now, errors)  # #117: withdraws the stale, finds the rest; never raises
     except Exception as err:
         engine._note("sweep.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
@@ -6221,7 +6221,16 @@ def sweep_says_waiting(regex, text):
     return False
 
 
-DECISION_SECTION_RE = re.compile(r"^#{1,6}[ \t]*decision required\b", re.I | re.M)
+DECISION_SECTION_RE = re.compile(r"^##[ \t]+decision required[ \t]*$", re.I | re.M)
+
+
+def sweep_has_section(body):
+    """True for a real `## Decision required` heading line (level 2, that text and nothing else on the line, any case;
+    not a longer heading such as `Resolved (was: Decision required)`, not an inline mention, not inside code or a quote),
+    or for a decision-rows block (a batch issue's decision)."""
+    if not isinstance(body, str):
+        return False
+    return bool(DECISION_SECTION_RE.search(SWEEP_QUOTED_RE.sub(" ", body))) or bool(parse_decision_rows(body))
 
 
 class SweepState:
@@ -6235,6 +6244,8 @@ class SweepState:
         self.withdrawn = set()   # refs already audited as withdrawn
         self.logged = set()      # (kind, ref, day): findings already audited today
         self.facts = {}          # key -> (summary, created): the pending cos facts, until they age out
+        self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
+        self.attempted = {}      # (kind, ref) -> when it was last tried (the oldest is tried first)
         self.current = {}        # the last run's counts
         self.started = 0         # when this pass's sweep began (the time budget)
 
@@ -6266,7 +6277,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget):
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         body = record.get("body")
         items[number] = {"pr": _is_pr(record), "labels": names,
-                         "section": bool(DECISION_SECTION_RE.search(body or "")) or bool(parse_decision_rows(body or "")),
+                         "section": sweep_has_section(body),
                          "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
@@ -6323,7 +6334,7 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
                 break
             budget[0] -= 1
             try:
-                data = hub._read_one(ref[0], "issues/%d" % ref[1], now)
+                data = hub._read_one(ref[0], "issues/%d" % ref[1], now, fresh=True)
             except GitHubUnavailable:
                 state.checked[ref] = (now, state.checked.get(ref, (0, False))[1])
                 continue
@@ -6333,8 +6344,10 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     return [d for d in decisions if id(d) not in drop], stale
 
 
-def sweep_findings(engine, state, decisions, home, now, cfg, regex):
-    """The S1, S2, S3 and S5 findings: {(kind, "repo#n")}, sorted. Reads nothing: it works on what the refresh kept."""
+def sweep_findings(engine, state, decisions, home, now, cfg, regex, complete=True):
+    """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
+    `complete` is whether the decision list for this pass is whole (no source failed or is still unread): without it
+    nothing that depends on the list or the labels (S1, S3, S5) is judged."""
     found = set()
     awaiting = {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
     human = {sweep_ref_of(d, home) for d in decisions if d.get("tier", "human") == "human" and d.get("kind") != "notice"}
@@ -6346,6 +6359,8 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex):
         for number, item in picture["items"].items():
             if not item["pr"]:
                 labelled = bool(item["labels"] & awaiting)
+                if not complete:
+                    continue
                 if item["section"] and not labelled:
                     found.add(("S1a", ref_text(repo, number)))
                 elif labelled and not item["section"]:
@@ -6353,11 +6368,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex):
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
-    for repo, picture in state.repos.items():
+    for repo, picture in (state.repos.items() if complete else ()):
         for number, item in picture["items"].items():
             if any(item["comments"][-SWEEP_PR_COMMENTS:]) and (repo, number) not in s2 and (repo, number) not in human:
                 found.add(("S3", ref_text(repo, number)))
-    for d in decisions:
+    for d in (decisions if complete else ()):
         ref = sweep_ref_of(d, home)
         if d.get("kind") == "report" and ref and ref[0] and ref not in human and ref not in s2 \
                 and sweep_says_waiting(regex, d.get("title")):
@@ -6369,7 +6384,58 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex):
     return sorted(found)
 
 
-def sweep_decisions(engine, decisions, now):
+def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
+    """Re-check one finding against a fresh read of its issue or PR (and, when comments raised it, a fresh read of its
+    last comments), so a cached copy cannot raise it. True: still holds. False: no longer (or never did). None: could not
+    be checked now (no budget, a failed or truncated read): it is neither raised nor audited this pass."""
+    if kind == "S5":
+        return True  # about the decision list derived this very pass
+    hub = getattr(engine, "hub", None)
+    repo, _, number = ref.rpartition("#")
+    if hub is None or not number.isdigit():
+        return None
+    number = int(number)
+    picture = (state.repos.get(repo) or {"items": {}})["items"].get(number) or {}
+    comments_raised = kind in ("S2", "S3") and any(picture.get("comments", [])[-SWEEP_PR_COMMENTS:])
+    if budget[0] < (2 if comments_raised else 1):
+        return None
+    budget[0] -= 1
+    try:
+        data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+    except GitHubUnavailable:
+        return None
+    if not isinstance(data, dict) or "number" not in data and "state" not in data:
+        return None
+    if data.get("state") != "open":
+        return False
+    names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
+    body, is_pr = data.get("body"), _is_pr(data)
+    labelled = bool(names & {awaiting_label(engine.config), awaiting_cos_label(engine.config)})
+    if kind in ("S1a", "S1b"):
+        section = sweep_has_section(body)
+        return (not is_pr) and ((section and not labelled) if kind == "S1a" else (labelled and not section))
+    waits_in_comments = False
+    if comments_raised:
+        budget[0] -= 1
+        since = iso(now - cfg["comment_window_days"] * 86400)
+        try:
+            recent, cut = hub.read_pages("repos/%s/issues/%d/comments?since=%s&per_page=100" % (repo, number, since),
+                                         cap=1)
+        except GitHubUnavailable:
+            return None
+        if cut:
+            return None  # the last comments are not on the first page: cannot say
+        waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
+    if kind == "S2":
+        return is_pr and not pr_is_captain(body) and (sweep_says_waiting(regex, body) or waits_in_comments)
+    if kind == "S3":
+        if awaiting_label(engine.config) in names:
+            return False  # it carries the person's label: a human-tier decision, whatever the list copy said
+        return waits_in_comments or not comments_raised
+    return None
+
+
+def sweep_decisions(engine, decisions, now, errors=()):
     """The list after the sweep (stale decisions removed when enabled), with the sweep's side effects: audit lines, the
     pending cos fact and sweep.json. Called once per pass with the freshly derived list."""
     cfg = engine.config.get("sweep", SWEEP_DEFAULTS)  # no key at all: shadow
@@ -6383,7 +6449,10 @@ def sweep_decisions(engine, decisions, now):
     regex = sweep_phrase_re(cfg["person_names"])
     budget = [SWEEP_CALLS_PER_PASS]
     sweep_refresh(engine, state, repos, now, cfg, regex, budget)
-    kept, stale = sweep_withdraw(engine, state, watched, home, now, cfg, budget)
+    share = [(budget[0] + 1) // 2]  # the single reads are split: half for S4, the rest (and S4's unused) to verifying
+    start = share[0]
+    kept, stale = sweep_withdraw(engine, state, watched, home, now, cfg, share)
+    budget[0] -= start - share[0]
     for ref in stale:
         text = "%s#%d" % ref
         if text not in state.withdrawn:
@@ -6392,7 +6461,31 @@ def sweep_decisions(engine, decisions, now):
             state.withdrawn.add(text)
             engine._note("sweep.withdrawn" if cfg["enabled"] else "sweep.finding", text,
                          {"kind": "S4", "ref": text, "applied": cfg["enabled"], "why": "its issue or PR is closed"})
-    findings = sweep_findings(engine, state, kept, home, now, cfg, regex)
+    complete = not errors  # a source still unread or failed (a restart's first passes): the list is not whole
+    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, complete)
+    findings, unchecked = [], 0
+    attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
+    for pair in attempts:
+        if now - state.confirmed.get(pair, 0) < SWEEP_TTL:
+            findings.append(pair)
+            continue
+        if engine.now() - state.started >= SWEEP_PASS_SECONDS:
+            unchecked += 1
+            continue
+        state.attempted[pair] = now
+        verdict = sweep_verify(engine, state, pair[0], pair[1], now, cfg, regex, budget)
+        if verdict:
+            state.confirmed[pair] = now
+            findings.append(pair)
+        elif verdict is None:
+            unchecked += 1
+        else:
+            state.confirmed.pop(pair, None)
+            if (pair, int(now // 86400)) not in state.logged:
+                state.logged.add((pair, int(now // 86400)))
+                engine._note("sweep.dismissed", pair[1], {"kind": pair[0], "ref": pair[1],
+                                                          "why": "a fresh read does not bear it out"})
+    findings.sort()
     day = int(now // 86400)
     for kind, ref in findings:
         if (kind, ref, day) not in state.logged:
@@ -6408,7 +6501,8 @@ def sweep_decisions(engine, decisions, now):
         counts["S4"] = len(stale)
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings),
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
-                     "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now)}
+                     "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
+                     "deferred": not complete, "unchecked": unchecked}
     sweep_write(engine, state)
     if cfg["enabled"]:
         due = [(k, r) for k, r in findings
@@ -8076,11 +8170,11 @@ class GitHubHub:
         parent = parent_of(data)
         return ([parent], [("issue", parent)]) if parent else ([], [])
 
-    def _read_one(self, repo, path, now):
+    def _read_one(self, repo, path, now, fresh=False):
         key = (repo, path)
         with self.lock:
             cached = self._cache.get(key)
-            if cached and now < cached[0]:
+            if cached and now < cached[0] and not fresh:
                 return cached[1]
             if now < self._retry.get(key, 0):
                 raise GitHubUnavailable("read of %s failed recently; trying again later" % path)
