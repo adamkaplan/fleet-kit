@@ -190,6 +190,15 @@ permissions:
     resource: "az vm show *"
     effect: allow
   - action: shell
+    resource: "az containerapp show *"
+    effect: allow
+  - action: shell
+    resource: "az containerapp list *"
+    effect: allow
+  - action: shell
+    resource: "az containerapp revision list *"
+    effect: allow
+  - action: shell
     resource: "az vm list *"
     effect: allow
   - action: shell
@@ -901,7 +910,28 @@ permissions:
     resource: "az *app-insights*"
     effect: deny
   - action: shell
-    resource: "az containerapp*"
+    resource: "az containerapp env*"
+    effect: deny
+  - action: shell
+    resource: "az * -q*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp exec*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp up*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp logs*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp revision *restart*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp ingress*"
+    effect: deny
+  - action: shell
+    resource: "az containerapp registry*"
     effect: deny
   - action: shell
     resource: "az webapp config*"

