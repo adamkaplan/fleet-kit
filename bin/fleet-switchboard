@@ -7162,25 +7162,33 @@ def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
         return None
     if facts["state"] != "open":
         return False
+    senders, noticed = set(), False
     try:
-        senders = set()
         for item in read_pr_notices(engine.state_dir):
             if item["repo"] == repo and item["number"] == number:
                 senders |= set(notice_senders(item))
+                noticed = True
     except (NoticeError, OSError, TypeError):
-        senders = set()
-    evidence = captain_evidence(facts, senders)
+        noticed = False
+    # A signed comment is review evidence only when the PR's notice is on file (its sender is then known and excluded):
+    # with none, the author's own signed comment would pass for a review. Without a notice only a formal review counts.
+    if noticed:
+        evidence = captain_evidence(facts, senders)
+    else:
+        evidence = facts["reviews"] if facts.get("reviews") is None else [dict(r, kind="review") for r in facts["reviews"]]
     if evidence is None:
         return None          # reviews or comments could not be read: no finding either way
     if evidence:
         return False         # reviewed at the exact head, in the fleet's own flow
+    note = {} if noticed else {"notice": "no notice on file"}
     if facts.get("reviews_older"):
         pushed = facts.get("head_at")
         hours = cfg and triage_sla(cfg, repo)["t7_ours_hours"]
         if pushed is None or now - pushed < hours * 3600:
             return False     # reviewed before the last push, and the push is not older than the SLA yet
-        state.enriched[("T7", "%s#%d" % (repo, number))] = {"review": "review at an older head",
-                                                            "since_push_hours": round((now - pushed) / 3600, 1)}
+        note.update(review="review at an older head", since_push_hours=round((now - pushed) / 3600, 1))
+    if note:
+        state.enriched[("T7", "%s#%d" % (repo, number))] = note
     return True
 
 

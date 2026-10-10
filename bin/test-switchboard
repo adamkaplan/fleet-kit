@@ -14827,6 +14827,8 @@ class TestTriage(Base):
         self.describe_pr(203, reviews=[("rev-wake", "APPROVED", TRI_HEAD_B)], pushed_hours_ago=9)  # review at an OLD head, old push
         self.describe_pr(204, body="MERGE: captain\nland it")                                 # a captain PR already in the list
         self.describe_pr(205)                                                                  # nobody reviewed it: fires
+        for n in (200, 201, 202, 203, 204, 205):                                               # our flow always notices
+            sb.record_pr_notice(self.world.state, "acme/api", n, "orch", "", self.now)
         self.add(204, created=0.4, pr=True, body="MERGE: captain\nland it")
         decisions = [{"id": "pr:api#204", "kind": "captain", "tier": "cos", "repo": "acme/api", "number": 204,
                       "since": sb.iso(self.now)}]
@@ -14837,6 +14839,31 @@ class TestTriage(Base):
         self.assertEqual(evidence["acme/api#203"]["review"], "review at an older head")
         self.assertGreaterEqual(evidence["acme/api#203"]["since_push_hours"], 9)
         self.assertNotIn("review", evidence["acme/api#205"])
+        self.assertNotIn("notice", evidence["acme/api#205"])
+
+    def test_with_no_notice_on_file_only_a_formal_review_counts_and_the_finding_says_so(self):
+        self.charter()
+        for n in (230, 231, 232):
+            self.add(n, created=0.4, pr=True)
+        self.describe_pr(230, comments=[("bot", "clean at " + TRI_HEAD_A)])                     # the author's own signed comment
+        self.describe_pr(231, comments=[("rev-wake", "clean at " + TRI_HEAD_A)])                # a reviewer's, but no notice
+        self.describe_pr(232, reviews=[("rev-wake", "APPROVED", TRI_HEAD_A)])                   # a formal review at the head
+        self.go()
+        self.assertEqual(self.only("T7"), ["acme/api#230", "acme/api#231"])
+        evidence = {e["detail"]["ref"]: e["detail"]["evidence"] for e in self.world.audit()
+                    if e["event"] == "triage.finding" and e["detail"]["rule"] == "T7"}
+        self.assertEqual({e["notice"] for e in evidence.values()}, {"no notice on file"})
+
+    def test_with_a_notice_a_different_signer_makes_it_reviewed_and_the_senders_own_comment_does_not(self):
+        self.charter()
+        self.add(240, created=0.4, pr=True)
+        self.add(241, created=0.4, pr=True)
+        self.describe_pr(240, comments=[("rev-wake", "clean at " + TRI_HEAD_A)])
+        self.describe_pr(241, comments=[("bot", "clean at " + TRI_HEAD_A)])
+        for n in (240, 241):
+            sb.record_pr_notice(self.world.state, "acme/api", n, "bot", "", self.now)
+        self.go()
+        self.assertEqual(self.only("T7"), ["acme/api#241"])                                     # 240 reviewed by another agent
 
     def test_a_signed_comment_from_the_notice_sender_or_the_author_is_not_a_review(self):
         self.charter()
