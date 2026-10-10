@@ -13,6 +13,7 @@ It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 --body-file/-F (a file, or - for stdin). Everything else, and anything it does
 not understand, runs the real gh unchanged: this must never block a command.
 """
+import json
 import os
 import re
 import subprocess
@@ -24,6 +25,8 @@ SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
 WHOAMI_SECONDS = 10
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
 def real_gh():
@@ -41,19 +44,64 @@ def real_gh():
     return None
 
 
-def my_name():
-    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+def switchboard_binary():
+    """The switchboard executable, or None. FLEET_SWITCHBOARD_BIN when set (a value that is SET wins, even a bad one), else
+    the one `install` linked, as the fleet-hooks plugin does: resolved, an executable file, nothing looked up on PATH."""
     binary = os.environ.get("FLEET_SWITCHBOARD_BIN")
     if not binary:
-        # Unset (an agent's shell rarely has it): the switchboard `install` linked, as the fleet-hooks plugin does.
-        # Resolved, and it must be an executable file; nothing is looked up on PATH. A value that is SET wins, even a bad one.
         try:
             binary = os.path.realpath(os.path.join(os.path.expanduser("~"), ".local", "bin", "fleet-switchboard"))
         except (OSError, ValueError):
-            return "agent"
+            return None
         if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-            return "agent"
-    if not os.path.isabs(binary):
+            return None
+    return binary if os.path.isabs(binary) else None
+
+
+def config_users():
+    """`gh_users` of the switchboard's config (repo or `owner/*` -> gh account), {} when there is none or it cannot be read."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            users = json.load(handle).get("gh_users")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return users if isinstance(users, dict) else {}
+
+
+def account_env(gh):
+    """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
+    identity (`fleet-switchboard whoami --repo`: its session, never an inherited variable), the same map and the same
+    `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
+    environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, any trouble. The token
+    is only put in the child's environment: never printed, logged or put in argv."""
+    try:
+        users = config_users()
+        binary = switchboard_binary()
+        if not users or not binary:
+            return None
+        done = subprocess.run([binary, "whoami", "--repo"], capture_output=True, text=True, timeout=WHOAMI_SECONDS)
+        repo = done.stdout.strip()
+        if done.returncode != 0 or not REPO_RE.match(repo):
+            return None
+        account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
+        if not isinstance(account, str) or not account:
+            return None
+        clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
+        got = subprocess.run([gh, "auth", "token", "--user", account], capture_output=True, text=True,
+                             timeout=WHOAMI_SECONDS, stdin=subprocess.DEVNULL, env=clean)
+        token = got.stdout.strip()
+        if got.returncode != 0 or not token:
+            return None
+        return dict(os.environ, GH_TOKEN=token)
+    except Exception:
+        return None
+
+
+def my_name():
+    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+    binary = switchboard_binary()
+    if not binary:
         return "agent"
     try:
         done = subprocess.run([binary, "whoami"], capture_output=True, text=True, timeout=WHOAMI_SECONDS)
@@ -134,11 +182,14 @@ def main(args):
         plan = signed_call(args, my_name()) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
+    env = account_env(gh)
     if plan is None:
+        if env is not None:
+            os.execve(gh, [gh] + args, env)
         os.execv(gh, [gh] + args)
     argv, stdin_text, temp = plan
     try:
-        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None)
+        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None, env=env)
         return done.returncode
     finally:
         if temp:

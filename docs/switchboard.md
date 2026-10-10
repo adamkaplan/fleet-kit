@@ -2281,6 +2281,32 @@ the last week's findings to a LOCAL sheet (it refuses a path inside a git workin
 TP/FP, and `triage-sample --summary FILE` computes precision per rule from the filled sheet (like `bin/judge-sample`); a rule
 under 80% is fixed or dropped first.
 
+### Who is calling (#138)
+
+An agent is never taken for another. The caller is identified by its OWN session, `OPENCODE_SESSION_ID` (the harness sets it
+per session and it is unique), looked up in the switchboard's own registry (v2's session record, whose `metadata.fleet` the
+launch wrote, and herdr's agent list): its name, role and repo come from there, **never from inherited environment
+variables** (`HERDR_PANE_ID`, `FLEET_SWITCHBOARD_ROLE`, `FLEET_SWITCHBOARD_REPO`, `GH_TOKEN`), which a server restart can leave
+belonging to another agent (the live case: an orchestrator's shell carried its own session id and a venue-ops coder's pane, role,
+repo and token, so every call was attributed to the coder). This covers `send`, `report`, `notice`, `remind`, `launch`,
+`handoff`, `comment`, `decisions`, `orders`, `intents` and `whoami`. Only an unknown session is refused, with
+`cannot tell who you are` and a non-zero exit, and it is never read as "a person in a plain shell" (a session v2 knows that is not a
+fleet agent is a person's, so a decision write from one is yours as before). A `HERDR_PANE_ID` that names another agent's session
+is kept as the diagnostic: one warning line, naming both agents and the pane this session runs in, saying the identity was taken
+from the session. With `OPENCODE_SESSION_ID` unset (a shell outside OpenCode) nothing changes: the pane identifies the caller, and
+with neither the answer is `cannot tell who you are`.
+
+The `gh` shim names the caller by `whoami` (falling back to `agent`, never blocking) and, when the config has `gh_users`, runs
+the real `gh` with `GH_TOKEN` set from the account that map gives for the repo of the caller's resolved identity
+(`fleet-switchboard whoami --repo`, resolved from its session): the same map and the same `gh auth token --user` the daemon uses,
+so an inherited token (a restart can leave an agent with another agent's, or the wrong account's) never decides who an agent
+acts as, in either direction. The token is put only in the child's environment: never printed, logged or in argv. With no `gh_users`,
+no mapping for the repo, no switchboard (or one too old to answer `whoami --repo`), no repo or no token it leaves the environment as
+it was, says nothing, and `gh` runs. The policy judge never reads the
+pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks` does the same. `status` lists the agent each live
+session resolves to, a `WARNING` for any disagreement (a session shown in two panes, a name claimed by two sessions, a pane labelled
+differently from its session's fleet name) and what the shell running `status` resolves to.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and

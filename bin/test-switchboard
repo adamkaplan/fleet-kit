@@ -145,7 +145,7 @@ class Base(unittest.TestCase):
         })
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID"):
+        for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
         self.config_file = self.home / "xdg-config" / "fleet-switchboard" / "config.json"
         self.state_dir = self.home / "xdg-state" / "fleet-switchboard"
@@ -15165,6 +15165,238 @@ class TestTriage(Base):
         self.engine.config["triage"] = False
         sb.triage_pass(self.engine, [], self.now, ())
         self.assertEqual((self.hub.calls, getattr(self.engine, "triage", None)), ([], None))
+
+
+# ======================================================================
+# #138: an agent is never taken for another. The caller is identified by its OWN session (OPENCODE_SESSION_ID, unique)
+# in the switchboard's registry, never by inherited variables; a pane that names another session is a diagnostic; the
+# gh shim sets GH_TOKEN from the account of the resolved identity. Live case: a restart left one agent's shell with
+# another agent's pane, role, repo and token.
+# ======================================================================
+class TestIdentityCheck(ReportBase):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ.pop(sb.SESSION_ENV, None)
+        sb._WARNED_PANES.clear()
+
+    def mix(self):
+        """The live case: the pane (and so the role, repo and token) of `coder`, the session of `platform`."""
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        os.environ[sb.SESSION_ENV] = self.world.sessions["platform"]
+
+    def call(self, *argv, runner=None):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=runner or self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_live_mix_is_taken_from_the_session_and_the_pane_is_only_a_warning(self):
+        self.mix()
+        code, out, err = self.call("whoami")
+        self.assertEqual((code, out.strip()), (0, "platform"))                       # NOT the coder of the pane
+        self.assertIn("warning: HERDR_PANE_ID %s belongs to session %s (coder)" % (self.world.panes["coder"], self.coder), err)
+        self.assertIn("but this session is %s (platform)" % self.world.sessions["platform"], err)
+        self.assertIn("this session runs in pane %s" % self.world.panes["platform"], err)
+        self.assertIn("identity is taken from the session", err)
+        code, err2 = self.call("whoami")[0], self.call("whoami")[2]
+        self.assertEqual((code, err2), (0, ""))                                      # one warning per process
+
+    def test_every_identity_bearing_command_acts_as_the_session_not_the_pane(self):
+        self.mix()
+        code, out, err = self.call("send", "coder", "--issue", "2", "hello")
+        self.assertEqual(code, 0, err)
+        (message,) = self.world.admissions("coder")
+        self.assertTrue(message["keys"][0].startswith("send:platform:"), message["keys"])   # from platform, never from coder
+        code, _, err = self.call("report", "done", "x")
+        self.assertIn("platform reports to nobody", err)                              # resolved as platform, which has no boss
+        code, _, err = self.call("remind", "coder", "5m", "later")
+        self.assertEqual(code, 0, err)
+        (reminder,) = sb.read_reminders(self.world.state)
+        self.assertEqual(reminder["from"], "platform")
+        engine = self.world.engine
+        self.assertEqual(sb.identify_caller(engine.herdr, engine.v2, os.environ), "platform")
+        self.assertEqual(sb.caller_fleet(engine.herdr, engine.v2, os.environ)["name"], "platform")
+        self.assertEqual(sb.decision_actor(engine, types.SimpleNamespace(sender=None))[0], "platform")
+
+    def test_a_session_the_registry_does_not_know_is_refused_everywhere_and_never_read_as_you(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme/api"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        os.environ[sb.SESSION_ENV] = "ses_unknownunknownunknown00"
+        cases = [("whoami",), ("send", "platform", "--issue", "2", "hello"), ("report", "done", "all done"),
+                 ("remind", "platform", "5m", "later"), ("notice", "pr", "acme/api#7"), ("notice", "withdraw", "acme/api#7"),
+                 ("notice", "ack", "x"), ("orders", "add", "--charter", "2", "do it"), ("orders", "remove", "--charter", "2", "1"),
+                 ("decisions", "resolve", "#1"), ("decisions", "escalate", "#1", "--reason", "r"),
+                 ("decisions", "answer", "#1", "yes"), ("decisions", "supersede", "#1", "--by", "2"), ("decisions",),
+                 ("intents",)]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                code, _, err = self.call(*argv)
+                self.assertNotEqual(code, 0, argv)
+                self.assertIn("cannot tell who you are", err)
+        self.assertEqual((self.world.admissions("platform"), self.world.admissions("coder")), ([], []))
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+        engine = self.world.engine
+        with self.assertRaises(sb.IdentityUncertain):
+            sb.decision_actor(engine, types.SimpleNamespace(sender=None))           # never (None, None): that is the person
+
+    def test_a_known_session_that_is_not_a_fleet_agent_is_a_person_and_a_missing_pane_is_no_obstacle(self):
+        engine = self.world.engine
+        person = self.world.v2.create_session({})                                   # a session of one's own TUI
+        os.environ[sb.SESSION_ENV] = person
+        self.assertEqual(sb.decision_actor(engine, types.SimpleNamespace(sender=None)), (None, None))
+        code, _, err = self.call("whoami")
+        self.assertNotEqual(code, 0)
+        self.assertIn("is not a fleet agent", err)
+        os.environ[sb.SESSION_ENV] = self.coder                                     # an agent that lost HERDR_PANE_ID
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.call("whoami")
+        self.assertEqual((code, out.strip()), (0, "coder"))                         # its session says who it is
+
+    def test_with_neither_session_nor_pane_it_cannot_tell_who_you_are(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, _, err = self.call("whoami")
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot tell who you are", err)
+        self.assertIn("HERDR_PANE_ID", err)
+
+    def test_a_matching_pair_and_an_unset_session_change_nothing(self):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        os.environ[sb.SESSION_ENV] = self.coder
+        code, out, err = self.call("whoami")
+        self.assertEqual((code, out.strip(), err), (0, "coder", ""))
+        os.environ.pop(sb.SESSION_ENV)                                              # today's behaviour: by the pane
+        code, out, err = self.call("whoami")
+        self.assertEqual((code, out.strip()), (0, "coder"))
+        code, _, err = self.call("report", "done", "from the pane")
+        self.assertEqual(code, 0, err)
+
+    # -- the gh shim: the name, and the token
+
+    def shim(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("gh_shim", str(REPO / "shims" / "gh"))
+        spec = importlib.util.spec_from_loader("gh_shim", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def test_the_gh_shim_falls_back_to_the_anonymous_name_and_never_blocks(self):
+        shim = self.shim()
+        fake = Path(self.home) / "sb-bin"
+        fake.write_text("#!/bin/sh\necho 'fleet-switchboard: cannot tell who you are' >&2\nexit 1\n")
+        fake.chmod(0o755)
+        os.environ["FLEET_SWITCHBOARD_BIN"] = str(fake)
+        self.assertEqual(shim.my_name(), "agent")
+        os.environ["FLEET_SWITCHBOARD_BIN"] = "relative/bin"
+        self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
+
+    def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", *args):
+        """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
+        (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
+        home = Path(self.home)
+        bindir = home / "shimbin"
+        bindir.mkdir(exist_ok=True)
+        log = home / "shim-log.json"
+        tokens = home / "tokens.json"
+        tokens.write_text(json.dumps(token_for or {}))
+        (bindir / "gh").write_text(
+            "#!/usr/bin/env python3\nimport json,os,sys\n"
+            "if sys.argv[1:3]==['auth','token']:\n"
+            "    t=json.load(open(%r)).get(sys.argv[4])\n"
+            "    if t is None: sys.stderr.write('no token\\n'); sys.exit(1)\n"
+            "    print(t); sys.exit(0)\n"
+            "json.dump({'argv': sys.argv[1:], 'token': os.environ.get('GH_TOKEN')}, open(%r,'w'))\nprint('gh ran')\n"
+            % (str(tokens), str(log)))
+        (bindir / "gh").chmod(0o755)
+        (bindir / "sb").write_text(
+            "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --repo ]; then [ %d -ne 0 ] && exit %d; echo %s; exit 0; fi\n"
+            "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n" % (who_repo_exit, who_repo_exit, repo))
+        (bindir / "sb").chmod(0o755)
+        config = home / "xdg-config" / "fleet-switchboard"
+        config.mkdir(parents=True, exist_ok=True)
+        (config / "config.json").write_text(json.dumps({"gh_users": users} if users is not None else {}))
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, bindir, SAFE_PATH), "HOME": str(home),
+                   "XDG_CONFIG_HOME": str(home / "xdg-config"), "FLEET_SWITCHBOARD_BIN": str(bindir / "sb"),
+                   "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
+        if log.exists():
+            log.unlink()
+        done = subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True,
+                              env=environ, timeout=60)
+        return done, (json.loads(log.read_text()) if log.exists() else None)
+
+    def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
+        users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops", "acct-personal": "tok-personal"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(seen["token"], "tok-ops")                                  # the personal token inherited is NOT used
+        self.assertNotIn("tok-ops", done.stdout + done.stderr)                      # never printed
+        self.assertNotIn("tok-ops", " ".join(seen["argv"]))                         # never in argv
+        done, seen = self.run_gh_shim("acme/api", users, {"acct-ops": "tok-ops", "acct-personal": "tok-personal"})
+        self.assertEqual(seen["token"], "tok-personal")                             # and the other direction: personal repo
+        done, seen = self.run_gh_shim("acme-ops/other", users, {"acct-ops-other": "tok-other"})
+        self.assertEqual(seen["token"], "tok-other")                                # the owner entry when no repo entry
+
+    def test_no_mapping_no_repo_no_token_or_an_old_switchboard_leave_the_environment_alone_and_silent(self):
+        users = {"acme-ops/service": "acct-ops"}
+        cases = [("no mapped repo", dict(repo="acme/api", users=users, token_for={"acct-ops": "tok-ops"})),
+                 ("no token for the account", dict(repo="acme-ops/service", users=users, token_for={})),
+                 ("no gh_users at all", dict(repo="acme-ops/service", users=None, token_for={"acct-ops": "tok-ops"})),
+                 ("a switchboard too old to answer", dict(repo="acme-ops/service", users=users, who_repo_exit=2,
+                                                          token_for={"acct-ops": "tok-ops"})),
+                 ("an identity with no repo", dict(repo="", users=users, token_for={"acct-ops": "tok-ops"}))]
+        for label, kwargs in cases:
+            with self.subTest(label):
+                done, seen = self.run_gh_shim(**kwargs)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], "inherited-personal-token")        # untouched: gh is never blocked
+                self.assertEqual(done.stderr, "")
+                self.assertNotIn("tok-ops", done.stdout)
+
+    def test_the_account_follows_the_session_when_the_pane_is_unset_and_the_repo_is_the_agents_own(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme/api"})
+        self.world.add_agent("ops", fleet={"role": "coder", "repo": "acme-ops/service", "issue": 5})
+        os.environ.pop("HERDR_PANE_ID", None)                                         # the reviewer shape: no pane id
+        os.environ[sb.SESSION_ENV] = self.world.sessions["ops"]
+        code, out, err = self.call("whoami", "--repo")
+        self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
+        code, out, err = self.call("whoami")
+        self.assertEqual((code, out.strip()), (0, "ops"))
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
+        code, out, err = self.call("whoami", "--repo")
+        self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
+        self.assertIn("warning: HERDR_PANE_ID", err)
+
+    # -- the judge, the hooks and status
+
+    def test_the_judge_keys_on_the_plugins_session_and_never_on_the_pane_environment(self):
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        start, end = text.index("def parse_policy_request"), text.index("def _guess_configured")
+        self.assertNotIn("HERDR_PANE_ID", text[start:end])
+        self.assertIn('data.get("sessionID")', text[start:end])
+        hooks = (REPO / "plugins" / "fleet-hooks" / "index.js").read_text()
+        self.assertNotIn("HERDR_PANE_ID", hooks)
+
+    def test_status_shows_each_sessions_identity_and_warns_where_pane_and_session_disagree(self):
+        engine = self.world.engine
+        overview = sb.fleet_overview(engine, None)
+        names = {s["name"]: s["session"] for s in overview["identity"]["sessions"]}
+        self.assertEqual(names, {"platform": self.world.sessions["platform"], "coder": self.coder})
+        self.assertEqual(overview["identity"]["warnings"], [])
+        pane = self.world.herdr.new_pane_id()                                       # a second pane for the coder's session
+        self.world.herdr.add(pane, self.coder)
+        overview = sb.fleet_overview(engine, None)
+        (warning,) = overview["identity"]["warnings"]
+        self.assertIn("is shown in 2 panes", warning)
+        text = "\n".join(sb.identity_lines(overview))
+        self.assertIn("%s = coder" % self.coder, text)
+        self.assertIn("WARNING    identity: session", text)
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        os.environ[sb.SESSION_ENV] = self.world.sessions["platform"]
+        shown = "\n".join(sb.identity_lines(sb.fleet_overview(engine, None)))
+        self.assertIn("this shell: platform", shown)
+        os.environ[sb.SESSION_ENV] = "ses_unknownunknownunknown00"
+        shown = "\n".join(sb.identity_lines(sb.fleet_overview(engine, None)))
+        self.assertIn("this shell: WARNING cannot tell who you are", shown)
 
 
 class TestRiders(ReportBase):
