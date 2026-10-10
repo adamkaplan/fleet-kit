@@ -4635,6 +4635,7 @@ def decisions_from_reports(engine, now):
                                 "issue": issue, "state": match.group(4), "text": match.group(5), "boss": boss,
                                 "repo": (repo_of_tag(match.group(2), repos)
                                          or (_fleet_repo(sender.fleet, engine.config) if sender else None)),
+                                "repo_known": repo_of_tag(match.group(2), repos) is not None,  # #126: else a guess
                                 "session": observation.session_id})
         # a withdrawal is a rider: no message has carried it into the transcript yet, but it already counts
         for item in (source.entries() if (source := _report_rider_source(engine)) is not None else []):
@@ -4667,6 +4668,7 @@ def decisions_from_reports(engine, now):
             above = _boss_of(discovery.agents[report["boss"]])  # PR 18: a boss that has no boss is the Chief of Staff
             items.append({"kind": "report", "title": title, "ask": report["issue"], "agent": report["sender"],
                           "repo": report["repo"], "tier": decision_core.report_tier(bool(above)),
+                          "repo_known": report.get("repo_known", True),
                           "since": report["at"][0], "bare": False, "boss": report["boss"],
                           "seed": "report:%s:%s:%d" % (report["session"], report["message"], report["at"][1]),
                           "considered": considered})

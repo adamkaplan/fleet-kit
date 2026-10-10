@@ -16090,6 +16090,49 @@ class TestDecisionHeadlines(unittest.TestCase):
                              self.report("api#5 is a different repo", agent="c3")])
         self.assertEqual(sorted(d["kind"] for d in found), ["issue", "issue", "report", "report", "report"])
 
+    @staticmethod
+    def guessed(text, ask, repo, agent="coder", since=EPOCH + 5):
+        """A report whose repo is only its sender's (the line named no repo the switchboard knows)."""
+        return dict(TestDecisionHeadlines.report(text, ask=ask, repo=repo, agent=agent, since=since), repo_known=False)
+
+    def test_a_report_with_a_guessed_repo_folds_into_the_one_human_issue_decision_with_its_number(self):
+        found = self.derive([self.issue(783, "Retire the legacy apps"), self.guessed("blocked: need your call", 783, "acme/api")])
+        (only,) = found
+        self.assertEqual((only["kind"], only["tier"], only["ask"]), ("issue", "human", 783))
+        self.assertEqual(only["reported_by"], ["coder"])
+        self.assertEqual(only["reported_text"], "blocked: need your call")         # the report's line stays reachable
+
+    def test_the_newest_folded_line_is_the_one_kept_and_the_issues_id_is_unchanged(self):
+        alone = self.derive([self.issue(783, "Retire")])
+        both = self.derive([self.issue(783, "Retire"), self.guessed("first", 783, "acme/api", "c1", EPOCH + 5),
+                            self.guessed("second", 783, "acme/api", "c2", EPOCH + 9)])
+        self.assertEqual((both[0]["id"], both[0]["reported_by"], both[0]["reported_text"]),
+                         (alone[0]["id"], ["c1", "c2"], "second"))
+
+    def test_a_guessed_repo_does_not_fold_when_the_number_is_ambiguous_or_the_issue_is_absent(self):
+        found = self.derive([self.issue(5, "web five"), self.issue(5, "api five", repo="acme/api"),
+                             self.guessed("which?", 5, "acme/other"), self.guessed("no such issue", 99, "acme/api")])
+        kinds = sorted((d["kind"], d["ask"]) for d in found)
+        self.assertEqual(kinds, [("issue", 5), ("issue", 5), ("report", 5), ("report", 99)])   # two #5s: not guessed; 99: no issue
+
+    def test_a_report_that_names_its_repo_never_folds_into_another_repos_issue(self):
+        found = self.derive([self.issue(783, "Retire"), self.report("other repo", ask=783, repo="acme/api")])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "report"])
+
+    def test_a_report_on_an_issue_that_is_only_cos_tier_still_folds_as_it_always_did(self):
+        found = self.derive([self.issue(7, "cos issue", tier="cos"), self.guessed("q", 7, "acme/api")])
+        self.assertEqual([(d["kind"], d["tier"]) for d in found], [("issue", "cos")])
+
+    def test_the_folded_reports_external_link_is_withdrawn_once_and_the_issue_is_not_double_raised(self):
+        core = sb.decision_core
+        links = {"report-key": {"kind": "report", "boss": "cos", "revision": 1, "digest": "d", "tier": "cos", "floor": "f"},
+                 "issue-key": {"kind": "issue", "revision": 1, "digest": "d", "tier": "human", "floor": "g"}}
+        desired = {"issue-key": {"payload": {}, "digest": "d", "tier": "human", "floor": "g", "kind": "issue", "thread": None}}
+        ops = core.plan_operations(desired, links, (), 0, ())
+        self.assertEqual([(o["op"], o["key"]) for o in ops], [("withdraw", "report-key")])
+        links["report-key"].update(withdrawn=True)
+        self.assertEqual(core.plan_operations(desired, links, (), 0, ()), [])      # once, and nothing raised twice
+
     def test_ids_are_the_ones_the_unfolded_list_assigns(self):
         both = self.derive([self.issue(5, "Storage choice"), self.report("Which database?", ask=5)])
         alone = self.derive([self.issue(5, "Storage choice")])

@@ -1153,7 +1153,11 @@ matched against a strict pattern, never from a title; control characters in a ti
 
 **One question, shown once.** A report and an issue decision with the same repo and issue number are one question:
 the report is folded into the issue's decision, which keeps the issue's id and gains `reported_by` (the reporting
-agents). A report with no issue number is folded in only when its text names exactly one open decision's issue
+agents) and `reported_text` (the newest folded report's own line, so what the worker said stays reachable). A report
+whose line named no repo the switchboard knows has only a guessed repo (its sender's): it folds into the one listed issue
+decision that has its number, in whatever repo (two such decisions, or none, leave it a report of its own); a report
+that names its repo never folds into another repo's issue. The issue's tier does not matter. The folded report's
+external link leaves the desired set and is withdrawn once by the existing path. A report with no issue number is folded in only when its text names exactly one open decision's issue
 (a short ref `repo#N` or an issue URL) in its own repo; naming none, two or another repo's issue leaves it a
 decision of its own. Ids are assigned before folding and never change.
 
