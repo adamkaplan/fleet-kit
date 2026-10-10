@@ -530,7 +530,13 @@ if not d:
     print("ok\tno sweep recorded yet"); sys.exit(0)
 parts=", ".join("%s %d" % kv for kv in sorted(d["counts"].items())) or "none"
 mode="on" if d.get("enabled") else "shadow"
-print(("WARN\t" if d.get("total") else "ok\t") + "sweep (%s): %d finding(s): %s" % (mode, d.get("total", 0), parts))' 2>/dev/null)
+late=[x for x in d.get("deferred") or [] if x.get("overdue")]
+note=""
+if d.get("deferred"):
+    note+="; S3 deferred for %s (%s)" % (", ".join(x["for"] for x in d["deferred"]), d["deferred"][0]["why"])
+if d.get("unchecked"):
+    note+="; %d finding(s) unchecked" % d["unchecked"]
+print(("WARN\t" if d.get("total") or late else "ok\t") + "sweep (%s): %d finding(s): %s%s" % (mode, d.get("total", 0), parts, note))' 2>/dev/null)
   if [ -n "$sw" ]; then
     sw_tab=$(printf '\t'); LAST_OUT=""; emit "${sw%%"$sw_tab"*}" sweep "${sw#*"$sw_tab"}"
   fi
