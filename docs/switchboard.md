@@ -2283,7 +2283,16 @@ under 80% is fixed or dropped first.
 
 ### Who is calling (#138)
 
-An agent is never taken for another. The caller is identified by its OWN session, `OPENCODE_SESSION_ID` (the harness sets it
+**What this is, plainly: a mistake-guard, not a security boundary.** `OPENCODE_SESSION_ID` is an environment variable the caller
+controls, exactly as `HERDR_PANE_ID` is, and every agent can read every other agent's session id from `herdr agent list`. An
+agent that sets the variable by hand to another agent's session id is taken for that agent, and through the `gh` shim it also gets
+that agent's account token (the token follows the resolved repo). Nothing here defends against that; it relies on the harness
+setting the variable per session and on the caller being cooperative (the one reaction to a forged id is the pane warning below, and
+only when the pane disagrees). What it fixes is the accident: stale or crossed inherited variables after a server restart, which
+used to make an agent act as another. Treat any claim below that "an agent is never taken for another" as covering mistakes, not
+adversaries.
+
+An agent is not taken for another by accident. The caller is identified by its OWN session, `OPENCODE_SESSION_ID` (the harness sets it
 per session and it is unique), looked up in the switchboard's own registry (v2's session record, whose `metadata.fleet` the
 launch wrote, and herdr's agent list): its name, role and repo come from there, **never from inherited environment
 variables** (`HERDR_PANE_ID`, `FLEET_SWITCHBOARD_ROLE`, `FLEET_SWITCHBOARD_REPO`, `GH_TOKEN`), which a server restart can leave
@@ -2302,7 +2311,9 @@ the real `gh` with `GH_TOKEN` set from the account that map gives for the repo o
 so an inherited token (a restart can leave an agent with another agent's, or the wrong account's) never decides who an agent
 acts as, in either direction. The token is put only in the child's environment: never printed, logged or in argv. With no `gh_users`,
 no mapping for the repo, no switchboard (or one too old to answer `whoami --repo`), no repo or no token it leaves the environment as
-it was, says nothing, and `gh` runs. The policy judge never reads the
+it was, says nothing, and `gh` runs. The whole lookup (who am I, which account, its token) is ONE `whoami --json` call plus at most one
+`gh auth token`, under one shared deadline of 3 seconds (`FLEET_SHIM_LOOKUP_SECONDS`, kept between 0.2 and 10): `gh` is never blocked,
+and a wedged daemon or v2 adds at most that, after which the call is signed `agent` and runs with the environment's token. The policy judge never reads the
 pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks` does the same. `status` lists the agent each live
 session resolves to, a `WARNING` for any disagreement (a session shown in two panes, a name claimed by two sessions, a pane labelled
 differently from its session's fleet name) and what the shell running `status` resolves to.

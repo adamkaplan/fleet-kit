@@ -15290,7 +15290,8 @@ class TestIdentityCheck(ReportBase):
         os.environ["FLEET_SWITCHBOARD_BIN"] = "relative/bin"
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
-    def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", *args):
+    def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
+                    wedge=False, seconds=None):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -15308,9 +15309,14 @@ class TestIdentityCheck(ReportBase):
             "json.dump({'argv': sys.argv[1:], 'token': os.environ.get('GH_TOKEN')}, open(%r,'w'))\nprint('gh ran')\n"
             % (str(tokens), str(log)))
         (bindir / "gh").chmod(0o755)
-        (bindir / "sb").write_text(
-            "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --repo ]; then [ %d -ne 0 ] && exit %d; echo %s; exit 0; fi\n"
-            "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n" % (who_repo_exit, who_repo_exit, repo))
+        if wedge:   # a daemon or v2 that never answers
+            (bindir / "sb").write_text("#!/bin/sh\nsleep 30\n")
+        else:
+            (bindir / "sb").write_text(
+                "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then [ %d -ne 0 ] && exit %d; "
+                "echo '{\"name\": \"api\", \"repo\": %s}'; exit 0; fi\n"
+                "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n"
+                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null"))
         (bindir / "sb").chmod(0o755)
         config = home / "xdg-config" / "fleet-switchboard"
         config.mkdir(parents=True, exist_ok=True)
@@ -15318,10 +15324,14 @@ class TestIdentityCheck(ReportBase):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, bindir, SAFE_PATH), "HOME": str(home),
                    "XDG_CONFIG_HOME": str(home / "xdg-config"), "FLEET_SWITCHBOARD_BIN": str(bindir / "sb"),
                    "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
+        if seconds is not None:
+            environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(seconds)
         if log.exists():
             log.unlink()
+        started = time.monotonic()
         done = subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True,
                               env=environ, timeout=60)
+        self.shim_seconds = time.monotonic() - started
         return done, (json.loads(log.read_text()) if log.exists() else None)
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
@@ -15335,6 +15345,47 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual(seen["token"], "tok-personal")                             # and the other direction: personal repo
         done, seen = self.run_gh_shim("acme-ops/other", users, {"acct-ops-other": "tok-other"})
         self.assertEqual(seen["token"], "tok-other")                                # the owner entry when no repo entry
+
+    def test_the_lookup_is_one_call_under_one_short_deadline_and_a_wedged_switchboard_never_blocks_gh(self):
+        users = {"acme-ops/service": "acct-ops"}
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, wedge=True, seconds=1,
+                                      args=("issue", "comment", "2", "--body", "hi"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertLess(self.shim_seconds, 6)                                          # not the 30 s the fake sleeps, nor 3 x 10 s
+        self.assertEqual(seen["token"], "inherited-personal-token")                    # untouched
+        self.assertIn("from=agent", seen["argv"][-1])                                  # signed anonymously: the name was not found
+        self.assertEqual(done.stderr, "")
+        shim = self.shim()
+        os.environ["FLEET_SHIM_LOOKUP_SECONDS"] = "99"
+        self.assertEqual(shim.lookup_seconds(), 10.0)                                  # clamped
+        os.environ["FLEET_SHIM_LOOKUP_SECONDS"] = "0"
+        self.assertEqual(shim.lookup_seconds(), 0.2)
+        os.environ["FLEET_SHIM_LOOKUP_SECONDS"] = "x"
+        self.assertEqual(shim.lookup_seconds(), 3.0)
+        os.environ.pop("FLEET_SHIM_LOOKUP_SECONDS")
+        self.assertEqual(shim.lookup_seconds(), 3.0)
+
+    def test_name_and_repo_come_from_one_whoami_call_and_a_signed_gh_call_replaces_the_token_too(self):
+        users = {"acme-ops/service": "acct-ops"}
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"},
+                                      args=("issue", "comment", "2", "--body", "hi"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("from=api", seen["argv"][-1])                                    # the name, from the same lookup
+        self.assertEqual(seen["token"], "tok-ops")
+        shim = self.shim()
+        calls = []
+        real = shim.subprocess.run
+
+        def counting(argv, **kwargs):
+            calls.append(list(argv))
+            return real(argv, **kwargs)
+        shim.subprocess.run = counting
+        lookup = shim.Lookup()
+        os.environ["FLEET_SWITCHBOARD_BIN"] = str(Path(self.home) / "shimbin" / "sb")
+        lookup.identity()
+        lookup.identity()
+        self.assertEqual(len(calls), 1)                                                # one subprocess, however often it is asked
+        self.assertEqual(calls[0][1:], ["whoami", "--json"])
 
     def test_no_mapping_no_repo_no_token_or_an_old_switchboard_leave_the_environment_alone_and_silent(self):
         users = {"acme-ops/service": "acct-ops"}
@@ -15359,6 +15410,8 @@ class TestIdentityCheck(ReportBase):
         os.environ[sb.SESSION_ENV] = self.world.sessions["ops"]
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service"}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
