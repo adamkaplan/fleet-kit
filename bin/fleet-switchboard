@@ -4565,6 +4565,20 @@ def mark_escalated(state_dir, key, when):
         write_escalated(state_dir, found)
 
 
+def captain_escalations_to_keep(engine):
+    """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
+    whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
+    no captain entry, so its key is not among the pending requests, and pruning on that would demote a decision the Chief of
+    Staff escalated. The key leaves when its notice does (the PR merged or closed), or by the head naming it never matching again.
+    None when the notices cannot be read: then nothing is pruned at all."""
+    try:
+        alive = {"%s#%d" % (n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+        escalated = read_escalated(engine.state_dir)
+    except (NoticeError, OSError, TypeError):
+        return None
+    return {k for k in escalated if k.startswith("captain:") and k[len("captain:"):].rpartition("@")[0] in alive}
+
+
 def prune_escalated(state_dir, pending):
     """Forget every escalation of a request that is no longer pending (the daemon's, once a pass)."""
     if pending is None or not (Path(state_dir) / ESCALATED_FILE).exists():
@@ -5218,7 +5232,10 @@ def decisions_from_notices(engine, now):
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
-    names = [r.split("/")[-1] for r in decision_repos(engine)] + [i["repo"].split("/")[-1] for i in items]
+    # The id's repo form is decided by the repos IN PLAY (the watched ones and the notices' own), counted once each: with
+    # more than one, every notice id names its repo in full (`pr:owner/repo#N`); with one, the short name. It used to count a
+    # repo twice when it was both watched and noticed, so the form flipped whenever the watch set did (a restart).
+    in_play = set(decision_repos(engine)) | {i["repo"] for i in items}
     entries, bad, any_ok = [], {}, False
     budget = [PR_NOTICE_PASS_BUDGET]
     order = lambda i: (i["created"], i["repo"], i["number"])
@@ -5246,8 +5263,7 @@ def decisions_from_notices(engine, now):
             if since is not None:
                 engine.notice_effects["unreadable"][key] = None
                 engine.notice_effects["observed"][key] = None
-        name = repo.split("/")[-1]
-        tag = repo if names.count(name) > 1 else name
+        tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold)
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
@@ -5949,7 +5965,8 @@ def publish_decisions(engine):
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
-        store.prune_escalated(engine.request_keys)
+        keep = captain_escalations_to_keep(engine)
+        store.prune_escalated(None if keep is None or engine.request_keys is None else set(engine.request_keys) | keep)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled

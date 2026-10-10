@@ -25784,6 +25784,66 @@ class TestCaptainPrs(DecisionsBase):
         self.answer(captain_pr(comments=comments))
         self.assertEqual(self.only()["kind"], "notice")
 
+    def restart(self):
+        """A daemon restart: a new engine with no memory (no cached PR facts), the same state directory."""
+        self.world.engine = self.world.new_engine()
+        self.world.engine.gh_runner = self.gh
+        return self.world.engine
+
+    def escalated_file(self):
+        return sb.read_escalated(self.world.state)
+
+    def test_an_escalation_survives_restarts_while_the_pr_cannot_be_read_and_returns_when_it_can(self):
+        entry = self.only()
+        sb.escalate_decision(self.world.engine, None, entry, "needs you", "cos")
+        (key,) = self.escalated_file()
+        self.assertEqual(key, "captain:acme/api#7@%s" % HEAD_A)
+        self.assertEqual(self.only()["tier"], "human")
+        # the restart, and the repo cannot be read (a 404 under the wrong account, an outage): no captain entry can be built
+        self.gh.answers[7] = (1, "", "HTTP 404: Not Found")
+        for _ in range(3):
+            self.restart()
+            self.world.tick(sb.PR_FACTS_TTL + 1)
+            self.world.engine.run_pass()
+            self.assertEqual(list(self.escalated_file()), [key])                     # NOT pruned: the escalation is kept
+            self.assertEqual([d["kind"] for d in self.listed() if d.get("number") == 7], ["notice"])   # only a heads-up for now
+        # readable again: the decision is back, and still the person's
+        self.gh.answers[7] = (0, captain_pr(reviews=[("rev-wake", "APPROVED", HEAD_A)]), "")
+        self.restart()
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["tier"]), ("captain", "human"))
+
+    def test_an_escalation_is_forgotten_once_its_pr_is_merged_and_the_notice_is_dropped(self):
+        sb.escalate_decision(self.world.engine, None, self.only(), "needs you", "cos")
+        self.assertEqual(len(self.escalated_file()), 1)
+        self.answer(captain_pr(state="MERGED", reviews=[("rev-wake", "APPROVED", HEAD_A)]))
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+        self.assertEqual(self.escalated_file(), {})
+
+    def test_an_escalation_of_an_older_head_does_not_make_a_new_head_the_persons(self):
+        sb.escalate_decision(self.world.engine, None, self.only(), "needs you", "cos")
+        self.answer(captain_pr(head=HEAD_B, reviews=[("rev-wake", "APPROVED", HEAD_B)]))
+        self.world.engine.run_pass()
+        self.assertEqual(self.only()["tier"], "cos")                                 # kept, but for the old head only
+
+    def test_the_id_form_does_not_flip_with_the_watch_set(self):
+        sb.record_pr_notice(self.world.state, "other/svc", 9, "platform", "", self.world.clock.now())
+        self.gh.answers[9] = (0, captain_pr(reviews=[("rev-wake", "APPROVED", HEAD_A)]), "")
+        def ids(watched):
+            with mock.patch.object(sb, "decision_repos", return_value=watched):
+                self.world.tick(1)
+                return sorted(d["id"] for d in self.listed() if d["kind"] in ("captain", "notice"))
+        for watched in ([], ["acme/api"], ["acme/api", "other/svc"], ["other/svc"]):
+            self.assertEqual(ids(watched), ["pr:acme/api#7", "pr:other/svc#9"], watched)   # full form, whatever is watched
+
+    def test_one_repo_in_play_keeps_the_short_id_whether_or_not_it_is_watched(self):
+        for watched in ([], ["acme/api"]):
+            with mock.patch.object(sb, "decision_repos", return_value=watched):
+                self.world.tick(1)
+                self.assertEqual([d["id"] for d in self.listed() if d.get("number") == 7], ["pr:api#7"])
+
     def test_resolve_and_answer_are_refused(self):
         entry = self.only()
         with self.assertRaises(sb.DecisionError):

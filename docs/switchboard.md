@@ -2196,6 +2196,14 @@ read, only the signature and the head token are looked at (never shown), and at 
 nothing stalls silently; a new head does not restart that clock, and a later review replaces the mark with normal
 evidence. Limit: only a PR that carries a notice is covered.
 
+**An escalation of a `MERGE: captain` PR survives a restart.** `decisions escalate` on a captain decision marks its PR and head in
+`escalated-requests.json`. The daemon prunes that file each pass to what is still pending, and a PR it cannot read (a restart's
+first passes, a 404 under the wrong account, an outage) derives no captain entry, so its marker used to be pruned and the decision
+came back at the cos tier. A captain marker now stays for as long as the PR's notice is on file; it leaves when the notice does
+(the PR merged or closed). A marker only ever matches the head it names, so a new head is not the person's until escalated again.
+Notice ids name their repo in full (`pr:owner/repo#N`) whenever more than one repo is in play (the watched repos and the notices'
+own, each counted once), and by the short name when there is one; the form no longer flips with the watch set.
+
 **The panel.** The `fleet-decisions-tui` plugin draws a `Heads-up (n)` section after `Waits on you` and before
 `Waits on cos`, grouped by repo like the others and visibly separated. Each entry is its headline (two lines at
 most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC` when set, and `(stale)`
