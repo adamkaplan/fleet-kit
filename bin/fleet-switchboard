@@ -4635,7 +4635,7 @@ def decisions_from_reports(engine, now):
                                 "issue": issue, "state": match.group(4), "text": match.group(5), "boss": boss,
                                 "repo": (repo_of_tag(match.group(2), repos)
                                          or (_fleet_repo(sender.fleet, engine.config) if sender else None)),
-                                "repo_known": repo_of_tag(match.group(2), repos) is not None,  # #126: else a guess
+                                "repo_known": bool(match.group(2)),  # #126: a repo NAMED in the line (watched or not) is not a guess
                                 "session": observation.session_id})
         # a withdrawal is a rider: no message has carried it into the transcript yet, but it already counts
         for item in (source.entries() if (source := _report_rider_source(engine)) is not None else []):

@@ -10,7 +10,9 @@
    "reported_by": [
     "api-orch"
    ],
-   "reported_text": "Which way for 12?",
+   "reported_lines": [
+    "api-orch: Which way for 12?"
+   ],
    "since": "2027-01-15T08:00:01Z",
    "tier": "human",
    "title": "The labelled issue"
@@ -27,7 +29,9 @@
    "reported_by": [
     "api-orch"
    ],
-   "reported_text": "Which way for 12?",
+   "reported_lines": [
+    "api-orch: Which way for 12?"
+   ],
    "since": "2027-01-15T07:59:00Z",
    "tier": "cos",
    "title": "The labelled issue"

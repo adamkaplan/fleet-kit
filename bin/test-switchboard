@@ -16100,14 +16100,24 @@ class TestDecisionHeadlines(unittest.TestCase):
         (only,) = found
         self.assertEqual((only["kind"], only["tier"], only["ask"]), ("issue", "human", 783))
         self.assertEqual(only["reported_by"], ["coder"])
-        self.assertEqual(only["reported_text"], "blocked: need your call")         # the report's line stays reachable
+        self.assertEqual(only["reported_lines"], ["coder: blocked: need your call"])   # the report's line stays reachable
 
-    def test_the_newest_folded_line_is_the_one_kept_and_the_issues_id_is_unchanged(self):
+    def test_every_folded_line_is_kept_up_to_three_clipped_and_the_issues_id_is_unchanged(self):
         alone = self.derive([self.issue(783, "Retire")])
-        both = self.derive([self.issue(783, "Retire"), self.guessed("first", 783, "acme/api", "c1", EPOCH + 5),
-                            self.guessed("second", 783, "acme/api", "c2", EPOCH + 9)])
-        self.assertEqual((both[0]["id"], both[0]["reported_by"], both[0]["reported_text"]),
-                         (alone[0]["id"], ["c1", "c2"], "second"))
+        reports = [self.guessed("line %d " % i + "x" * 400, 783, "acme/api", "c%d" % i, EPOCH + 5 + i) for i in range(5)]
+        both = self.derive([self.issue(783, "Retire")] + reports)
+        self.assertEqual((both[0]["id"], both[0]["reported_by"]), (alone[0]["id"], ["c0", "c1", "c2", "c3", "c4"]))
+        kept = both[0]["reported_lines"]
+        self.assertEqual([l.split(":")[0] for l in kept], ["c2", "c3", "c4"])          # the newest three, oldest first
+        self.assertTrue(all(len(l) <= len("c0: ") + 160 for l in kept))
+        two = self.derive([self.issue(783, "Retire"), reports[0], reports[1]])
+        self.assertEqual(len(two[0]["reported_lines"]), 2)                               # fewer than three: all of them
+
+    def test_a_named_repo_that_differs_never_folds_watched_or_not(self):
+        named = lambda repo: dict(self.report("other repo", ask=5, repo=repo), repo_known=True)
+        found = self.derive([self.issue(5, "web five"), named("acme/api"), named("elsewhere/other")])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "report", "report"])
+        self.assertNotIn("reported_lines", found[0])
 
     def test_a_guessed_repo_does_not_fold_when_the_number_is_ambiguous_or_the_issue_is_absent(self):
         found = self.derive([self.issue(5, "web five"), self.issue(5, "api five", repo="acme/api"),

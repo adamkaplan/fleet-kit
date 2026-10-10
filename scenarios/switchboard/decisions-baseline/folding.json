@@ -12,7 +12,10 @@
      "api-coder",
      "api-orch"
     ],
-    "reported_text": "a second reporter on the same issue",
+    "reported_lines": [
+     "api-orch: tagged on the issue: which engine?",
+     "api-coder: a second reporter on the same issue"
+    ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "cos",
     "title": "Which database?"
@@ -28,7 +31,10 @@
      "loner",
      "loner2"
     ],
-    "reported_text": "see https://github.com/acme/api/issues/3 for the plan",
+    "reported_lines": [
+     "loner: blocked on api#3 until you pick",
+     "loner2: see https://github.com/acme/api/issues/3 for the plan"
+    ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "cos",
     "title": "Second api issue"
@@ -43,7 +49,9 @@
     "reported_by": [
      "web-orch"
     ],
-    "reported_text": "tagged with the web repo's same number",
+    "reported_lines": [
+     "web-orch: tagged with the web repo's same number"
+    ],
     "since": "2027-01-15T07:59:00Z",
     "tier": "human",
     "title": "Same number, other repo"
