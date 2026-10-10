@@ -15,7 +15,8 @@ import re
 MAX_BYTES = 100000          # a plan block larger than this is refused
 MAX_LINE = 2000
 MAX_SCENARIOS = 200         # a hard limit; the guidance is about 30
-GUIDANCE_SCENARIOS = 30
+GUIDANCE_SCENARIOS = 30       # per slice, or in total when no scenario has a slice
+GUIDANCE_TOTAL_WITH_SLICES = 80
 
 PROOFS = ("test", "live", "measure", "screenshot")
 EVALUATORS = ("ci", "tester", "reviewer", "adam")
@@ -27,7 +28,7 @@ KNOWN = REQUIRED + OPTIONAL
 PROOF_EVALUATORS = {"test": ("ci",), "screenshot": ("reviewer", "adam"), "live": ("tester", "adam"),
                     "measure": ("tester", "adam")}
 
-ID_RE = re.compile(r"^[SU][0-9]+$")
+ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+.*plan\s*\(scenarios\)", re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
@@ -300,6 +301,9 @@ PROSE_REF_RE = re.compile(r"\b(?:see|per|in|of|clause|item|section|and|or|with|t
 def clauses_of(done_when):
     """[clause text] from the ask's Done-when line: its numbered parts `(1) ... (2) ...`, in order, counting up from
     1 and stopping at the first gap. A line with no `(1)` is one clause. None or empty gives []."""
+    listed = [re.match(r"^\s*([0-9]+)[.)]\s+(\S.*)$", line) for line in (done_when or "").splitlines() if line.strip()]
+    if len(listed) >= 2 and all(listed) and [int(m.group(1)) for m in listed] == list(range(1, len(listed) + 1)):
+        return [" ".join(m.group(2).split()) for m in listed]   # a numbered list, one clause per line
     text = " ".join((done_when or "").split())
     if not text:
         return []
@@ -326,6 +330,74 @@ def clauses_of(done_when):
     return clauses
 
 
+# ----------------------------------------------------------------------------------- declared clauses
+
+def declared_clauses(text):
+    """[clause text] from the plan's own `clauses:` block (a fenced yaml block, `DW-<n>: text` lines numbered from 1), or
+    None when the plan has none. A Done-when written as one sentence with several clauses cannot be split reliably, so the
+    plan declares them and `verify_declared` checks they say what the ask says. Raises PlanFormatError."""
+    found = []
+    for _, inner in fenced_blocks(text):
+        first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
+        if first is not None and first.strip() == "clauses:":
+            found.append(inner)
+    if not found:
+        return None
+    if len(found) > 1:
+        raise PlanFormatError("%d blocks start `clauses:`: a plan declares its clauses once" % len(found))
+    out, key_indent = [], None
+    started = False
+    for number, line in enumerate(found[0], 1):
+        body = line.strip()
+        if not body or body.startswith("#"):
+            continue
+        if re.match(r"^ *\t", line):
+            raise PlanFormatError("clauses line %d: a tab in the indentation: use spaces" % number)
+        if not started:
+            started = True
+            continue   # the `clauses:` line
+        indent = len(line) - len(line.lstrip(" "))
+        found_key = re.match(r"^DW-([0-9]+):(?:[ ]+(.*))?$", body)
+        if found_key and (key_indent is None or indent == key_indent):
+            key_indent = indent if key_indent is None else key_indent
+            if int(found_key.group(1)) != len(out) + 1:
+                raise PlanFormatError("clauses line %d: DW-%s is out of order: number the clauses 1, 2, 3 ..." % (number, found_key.group(1)))
+            out.append(_scalar(_strip_comment(found_key.group(2) or ""), "clauses line %d" % number))
+        elif key_indent is not None and indent > key_indent and out:
+            out[-1] = (out[-1] + " " + _strip_comment(body)).strip()   # a continuation line
+        else:
+            raise PlanFormatError("clauses line %d: expected `DW-<n>: text`, got %r" % (number, body[:60]))
+    if not out or not all(c.strip() for c in out):
+        raise PlanFormatError("the `clauses:` block is empty or has an empty clause")
+    return [" ".join(c.split()) for c in out]
+
+
+def _words(text):
+    return re.findall(r"[a-z0-9]+", re.sub(r"\([0-9]+\)", " ", str(text).lower()))
+
+
+def verify_declared(declared, done_when):
+    """True when the declared clauses, joined in order, reproduce the Done-when text (compared as words: whitespace, case,
+    punctuation and the `(n)` numbering are ignored, so the list may split on the Done-when's own separators)."""
+    return _words(" ".join(declared)) == _words(done_when)
+
+
+CONSTRAINT_RE = re.compile(r"(?m)^\s*(?:[-*]\s*)?\**PC-([0-9]+)\**\s*[:.)-]")
+
+
+def declared_constraints(text):
+    """The PC numbers the plan declares (a line `PC-<n>: ...` outside code fences), as a set."""
+    kept, inside = [], None
+    for line in (text or "").splitlines():
+        opened = FENCE_RE.match(line)
+        if opened:
+            inside = None if inside else opened.group(1)[0]
+            continue
+        if not inside:
+            kept.append(line)
+    return {int(n) for n in CONSTRAINT_RE.findall("\n".join(kept))}
+
+
 # ----------------------------------------------------------------------------------- validation
 
 def _normal(text):
@@ -342,7 +414,8 @@ VAGUE_WORDS = {"works", "work", "working", "ok", "okay", "fine", "good", "correc
                "everything", "something", "nothing", "true", "yes", "non-empty", "nonempty", "valid", "as", "it", "is"}
 UNITS = (r"ms|s|sec|secs|second|seconds|minute|minutes|min|mins|hour|hours|h|day|days|bytes?|kb|mb|gb|characters?|chars?|"
          r"lines?|rows?|items?|agents?|files?|requests?|calls?|messages?|errors?|retries|times|entries|records|tests?|"
-         r"scenarios?|comments?|issues?|prs?|commits?|branches|fields?|results?|replies|reply|events?|attempts?")
+         r"scenarios?|comments?|issues?|prs?|commits?|branches|fields?|results?|replies|reply|events?|attempts?|"
+         r"occurrences?|matches|hits|failures?|warnings?|defects?|violations?|dirs?|directories|modules?|functions?")
 THRESHOLD = (r"(?:at least|at most|exactly|more than|fewer than|less than|greater than|no more than|no fewer than|"
              r"under|over|within|above|below|up to)")
 STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|responds?|code)\s*(?:is|=|==|of|:)?\s*[1-5][0-9][0-9]\b",
@@ -350,6 +423,12 @@ STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|resp
 EXIT_RE = re.compile(r"\bexit (?:code|status)\s*(?:is|=|==|of|:)?\s*[0-9]+\b", re.IGNORECASE)
 UNIT_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?\s*(?:%%|percent|%s)(?![A-Za-z])" % UNITS, re.IGNORECASE)
 PERCENT_RE = re.compile(r"[0-9]\s*%")
+N_OF_N_RE = re.compile(r"\b([0-9]+)\s+of\s+(?:the\s+)?([0-9]+)\b", re.IGNORECASE)
+HEDGE_RE = re.compile(r"\b(?:maybe|somehow|or so|probably|perhaps|presumably|kind of|sort of|more or less|i guess|"
+                      r"yes fine|fine ok|ok fine|hopefully|roughly|about right|seems?|looks? (?:right|good|fine))\b", re.IGNORECASE)
+IDENTICAL_RE = re.compile(r"\b(?:identical|equal|same)\b(?:\s+\w+){0,3}?\s+(?:to|as)\s+(?:the\s+|a\s+)?([A-Za-z][\w-]*)", re.IGNORECASE)
+EQUALS_NUMBER_RE = re.compile(r"\b(?:equals?|==|is exactly|are exactly|is|are)\s+[0-9]+(?![0-9]*\s*(?:user|person|people)\b)", re.IGNORECASE)
+VAGUE_TARGETS = {"same", "expectations", "expectation", "expected", "it", "that", "this", "before", "good", "fine", "right", "ok"}
 THRESHOLD_RE = re.compile(r"\b%s\s+[0-9]" % THRESHOLD, re.IGNORECASE)
 # an identifier (snake_case, camelCase, dotted, a path, or backticked) compared to a number or a non-vague quoted value
 IDENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*(?:[._/-][A-Za-z0-9_]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Za-z_][A-Za-z0-9_]*)"
@@ -365,14 +444,25 @@ def _vague_literal(text):
     return not words or all(w in VAGUE_WORDS for w in words)
 
 
+def _equal_n_of_n(rule):
+    """`10 of 10 files`: a count out of the same total. `3 of 4 people like it` observes nothing in particular (and a
+    stated threshold, `at least 3 of 4`, is caught by THRESHOLD_RE)."""
+    return any(m.group(1) == m.group(2) for m in N_OF_N_RE.finditer(rule))
+
+
 def _has_observable(rule):
     """True when the rule names something a wrong build could fail: a status or exit code, a number with a unit or a
     threshold, an identifier compared to a number or a quoted literal, a quoted EXPECTED literal that is not itself a
     vague word, or a strong comparison phrase (byte-identical, no diff). A bare digit, `=`, `after` or `before` is not."""
     lowered = rule.lower()
     if STATUS_RE.search(rule) or EXIT_RE.search(rule) or UNIT_RE.search(rule) or PERCENT_RE.search(rule) \
-            or THRESHOLD_RE.search(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
+            or THRESHOLD_RE.search(rule) or _equal_n_of_n(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
         return True
+    named = IDENTICAL_RE.search(rule)
+    if named and named.group(1).lower() not in VAGUE_TARGETS and named.group(1).lower() not in VAGUE_WORDS:
+        return True  # identical to a NAMED thing (the baseline, the stored fixture)
+    if EQUALS_NUMBER_RE.search(rule) and re.search(r"[A-Za-z]{3,}", rule.split(" is ")[0] if " is " in rule else rule):
+        return True  # a count or value compared to a number: `count of Z equals 3`, `the total is 0`
     for quoted in QUOTED_RE.findall(rule):
         if not _vague_literal(quoted):
             return True
@@ -391,12 +481,19 @@ def pass_rule_problem(rule):
     if not rule:
         return "the pass rule is empty"
     if _plain_words(rule) in VAGUE_PASS:
-        return "the pass rule %r says nothing a wrong build could fail" % rule
+        return ("the pass rule %r says nothing a wrong build could fail: it names no observable, threshold, expected "
+                "literal or named comparison (for example `exit status is 0`)" % rule)
+    hedge = HEDGE_RE.search(rule)
+    if hedge:
+        return ("the pass rule %r hedges (%r): state what is observed, not what seems or is roughly so, for example "
+                "`exit status is 0` or `0 occurrences of X`" % (rule[:80], hedge.group(0)))
     if len(rule) < MIN_PASS_CHARS:
-        return "the pass rule is too short to be checkable (%d characters, at least %d)" % (len(rule), MIN_PASS_CHARS)
-    if not _has_observable(rule):
-        return ("the pass rule names no concrete observable: give a status or exit code, a value with a unit or a "
-                "threshold, a quoted expected value, or an identifier compared to a value (%r)" % rule[:60])
+        return ("the pass rule %r is too short to be checkable (%d characters, at least %d): say what is observed, for "
+                "example `exit status is 0` or `exactly 1 agent named \"alpha\"`" % (rule, len(rule), MIN_PASS_CHARS))
+    if not _has_observable(re.sub(r"\b[0-9]+\s+(?:users?|persons?|people)\b", " ", rule, flags=re.IGNORECASE)):
+        return ("the pass rule %r has no observable: it needs ONE of an exit code or status (`exit status is 0`), a count or a "
+                "threshold (`0 occurrences of X`, `10 of 10 files`, `within 5 s`), an expected literal in quotes "
+                "(`shows \"Ready\"`), or a named comparison (`identical to the baseline`, `count equals 3`)" % rule[:80])
     return None
 
 
@@ -419,18 +516,21 @@ def _content_words(text):
 def discriminates_problem(value, pass_rule):
     value = _normal(value)
     if not value:
-        return "`discriminates` is empty: name a concrete wrong build or negative case that this scenario would catch"
+        return ("`discriminates` is empty: name the wrong build and what it does, e.g. a stub that returns an empty list "
+                "(not that a wrong build 'fails')")
     if _plain_words(value) in VACUOUS_DISCRIMINATES:
-        return "`discriminates` is %r: name a concrete wrong build or negative case" % value
+        return "`discriminates` is %r: name the wrong build and what it does, e.g. a stub that returns an empty list" % value
     if len(value) < MIN_DISCRIMINATES_CHARS:
-        return "`discriminates` is too short to name a wrong build or negative case (%d characters)" % len(value)
+        return ("`discriminates` %r is too short to name a wrong build: say what it does, e.g. a stub that returns an "
+                "empty list" % value)
     words = re.findall(r"[a-z0-9-]+", value.lower())
     rest = [w for w in words if w not in META_WORDS]
     if len(rest) < 3:
         return ("`discriminates` only says that a wrong build fails (%r): say what the wrong build does, for example "
                 "'a stub that returns an empty list'" % value[:60])
     if not (any(w in NEGATIVE_MARKERS for w in words) or re.search(r"[0-9]", value) or QUOTED_RE.search(value)):
-        return "`discriminates` names no concrete wrong build or negative case (%r)" % value[:60]
+        return ("`discriminates` %r names no concrete wrong build or negative case: say what the wrong build does, e.g. a "
+                "stub that returns an empty list" % value[:60])
     ours, theirs = _content_words(value), _content_words(pass_rule)
     if ours and len(ours & theirs) / len(ours) >= OVERLAP_LIMIT:
         return "`discriminates` is nearly the pass rule reworded: say what a WRONG build would show instead"
@@ -469,16 +569,20 @@ def validate(scenarios, clauses, text=""):
         sid = _normal(scenario.get("id", ""))
         if sid:
             if not ID_RE.match(sid):
-                bad(ident, "bad-id", "id %r must look like S1 (behaviour) or U1 (unchanged)" % sid)
+                bad(ident, "bad-id", "id %r is not valid: the grammar is S<number> (behaviour) or U<number> (unchanged), with an "
+                    "optional lowercase letter to add one later, e.g. S1, U3, S11b" % sid)
             if sid in seen:
                 bad(ident, "duplicate-id", "id %s is used twice" % sid)
             seen[sid] = scenario
         covers = _normal(scenario.get("covers", ""))
         if covers and not COVERS_RE.match(covers):
-            bad(ident, "bad-covers", "covers %r must be DW-<n> (a Done-when clause) or PC-<n> (a plan constraint)" % covers)
+            bad(ident, "bad-covers", "covers %r is not valid: write DW-<n> (a Done-when clause, 1 to %d) or PC-<n> (a plan "
+                "constraint), exactly one, e.g. DW-1" % (covers, max(len(clauses), 1)))
         elif covers.startswith("DW-") and clauses and not 1 <= int(covers[3:]) <= len(clauses):
             bad(ident, "covers-unknown-clause",
-                "covers %s but the Done-when has %d clause(s)" % (covers, len(clauses)))
+                "covers %s but the Done-when has %d clause(s)%s" % (covers, len(clauses), " (a Done-when written as one "
+                "sentence counts as 1 clause: declare the clauses in a `clauses:` block, see docs/plan-template.md)"
+                if len(clauses) == 1 else ""))
         if _normal(scenario.get("text", "")) and len(_normal(scenario["text"])) < MIN_TEXT_CHARS:
             bad(ident, "short-text", "`text` is too short to say what the scenario is")
         proof, evaluator = _normal(scenario.get("proof", "")), _normal(scenario.get("evaluator", ""))
@@ -513,18 +617,43 @@ def validate(scenarios, clauses, text=""):
         if not (reason and unchanged_reason_ok(reason.group(1))):
             bad("-", "no-unchanged-scenario",
                 "no U (unchanged) scenario, and the plan does not say `unchanged: none because <reason>`")
-    if len(scenarios) > GUIDANCE_SCENARIOS:
+    constraints = declared_constraints(text)
+    covered_pc = {int(_normal(s_.get("covers", ""))[3:]) for s_ in scenarios if re.match(r"^PC-[0-9]+$", _normal(s_.get("covers", "")))}
+    if constraints:
+        for number in sorted(covered_pc - constraints):
+            bad("-", "covers-unknown-constraint", "a scenario covers PC-%d but the plan declares no such constraint "
+                "(PC-n is a plan constraint, a `PC-<n>: ...` line in the plan's constraints section)" % number)
+        for number in sorted(constraints - covered_pc):
+            bad("-", "uncovered-constraint", "PC-%d is declared in the plan but no scenario covers it (`covers: PC-%d`)" % (number, number))
+    elif covered_pc:
+        warnings.append({"id": "-", "code": "no-constraint-list",
+                         "message": "scenarios cover PC-%s but the plan declares no constraint list (`PC-<n>: ...` lines): "
+                                    "PC-n is a plan constraint, so what it covers cannot be checked" % ", PC-".join(str(n) for n in sorted(covered_pc))})
+    sliced = {}
+    for scenario in scenarios:
+        if _normal(scenario.get("slice", "")):
+            sliced[_normal(scenario["slice"])] = sliced.get(_normal(scenario["slice"]), 0) + 1
+    if sliced:
+        for name, count in sorted(sliced.items()):
+            if count > GUIDANCE_SCENARIOS:
+                warnings.append({"id": "-", "code": "many-scenarios", "message": "slice %r has %d scenarios (guidance: at "
+                                 "most %d per slice): split it" % (name, count, GUIDANCE_SCENARIOS)})
+        if len(scenarios) > GUIDANCE_TOTAL_WITH_SLICES:
+            warnings.append({"id": "-", "code": "many-scenarios", "message": "%d scenarios in total (guidance with slices: "
+                             "at most %d): split the plan" % (len(scenarios), GUIDANCE_TOTAL_WITH_SLICES)})
+    elif len(scenarios) > GUIDANCE_SCENARIOS:
         warnings.append({"id": "-", "code": "many-scenarios",
-                         "message": "%d scenarios (guidance: about %d): split the plan into sections by slice and say "
-                                    "which are claimed per PR" % (len(scenarios), GUIDANCE_SCENARIOS)})
+                         "message": "%d scenarios (guidance: about %d with no slices): give each scenario a `slice` and the "
+                                    "limit applies per slice" % (len(scenarios), GUIDANCE_SCENARIOS)})
     return defects, warnings
 
 
 # ----------------------------------------------------------------------------------- the content hash
 
 def _id_key(ident):
-    found = re.match(r"^([A-Za-z]*)([0-9]*)$", ident)
-    return (found.group(1), int(found.group(2) or 0), ident) if found else (ident, 0, ident)
+    """Display and hash order: letter, number, then the suffix (S11 < S11b < S12)."""
+    found = re.match(r"^([A-Za-z]*)([0-9]*)([a-z]?)$", ident)
+    return (found.group(1), int(found.group(2) or 0), found.group(3), ident) if found else (ident, 0, "", ident)
 
 
 def canonical(scenarios, clauses, text=""):
@@ -569,10 +698,33 @@ def check(text, done_when, plan_done_when=None):
     weakens coverage by copying fewer). Raises PlanFormatError when the plan cannot be read."""
     scenarios = parse_scenarios(scenario_block(text))
     clauses = clauses_of(done_when)
+    declared = declared_clauses(text)
+    extra = []
+    if declared is not None:
+        if len(clauses) > 1:
+            # the ask already has numbered parts: they are the authority, a declared list can only repeat them
+            if len(declared) != len(clauses) or not verify_declared(declared, done_when):
+                extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the "
+                              "ask: the ask has %d numbered clauses and the plan declares %d (a plan can never merge or drop "
+                              "clauses). The ask has: %r" % (len(clauses), len(declared), _normal(done_when)[:160])})
+        elif not _words(done_when):
+            extra.append({"id": "-", "code": "no-done-when", "message": "the plan declares clauses but the ask has no "
+                          "Done-when to check them against"})
+        elif verify_declared(declared, done_when):
+            clauses = declared   # the declared split of the ask's own text
+        else:
+            extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the ask: "
+                          "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
+                          "numbers are ignored). The ask has: %r" % _normal(done_when)[:160]})
     defects, warnings = validate(scenarios, clauses, text)
+    defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
+    if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
+        warnings.append({"id": "-", "code": "one-clause-many-parts", "message": "the Done-when counts as 1 clause but has %d "
+                         "commas or semicolons: if it holds several clauses, declare them in a `clauses:` block (see "
+                         "docs/plan-template.md), or the coverage check only asks for one" % len(re.findall(r"[;,]", clauses[0]))})
     if plan_done_when and clauses:
         own = clauses_of(plan_done_when)
-        if [_clause_key(c) for c in own] != [_clause_key(c) for c in clauses]:
+        if [_clause_key(c) for c in own] != [_clause_key(c) for c in clauses] and _words(plan_done_when) != _words(done_when):
             defects.append({"id": "-", "code": "done-when-differs",
                             "message": "the plan states %d Done-when clause(s) but the ask has %d, or they differ: the ask's "
                                        "Done-when is the authority, copy it exactly" % (len(own), len(clauses))})
@@ -581,12 +733,24 @@ def check(text, done_when, plan_done_when=None):
             "warnings": warnings}
 
 
+GROUP_LINES = 5   # defect lines shown per kind in the text output; --json has them all
+
+
 def render(result, source):
-    """The lines `plan check` prints."""
+    """The lines `plan check` prints: defects grouped by kind with counts, at most GROUP_LINES lines each."""
     lines = ["plan check: %s" % result["result"].upper(), "source: %s" % source,
              "scenarios: %d; Done-when clauses: %d" % (result["scenarios"], len(result["clauses"])),
              "scenario hash: %s" % result["scenario_hash"],
              "plan hash: %s (approval and consensus bind to this)" % result["plan_hash"]]
-    lines.extend("DEFECT %s: %s" % (d["id"], d["message"]) for d in result["defects"])
+    groups = {}
+    for defect in result["defects"]:
+        groups.setdefault(defect["code"], []).append(defect)
+    if groups:
+        lines.append("defects: %s" % ", ".join("%s x%d" % (code, len(items)) for code, items in groups.items()))
+    for code, items in groups.items():
+        lines.append("%s x%d" % (code, len(items)))
+        lines.extend("  DEFECT %s: %s" % (d["id"], d["message"]) for d in items[:GROUP_LINES])
+        if len(items) > GROUP_LINES:
+            lines.append("  ... and %d more (use --json for all)" % (len(items) - GROUP_LINES))
     lines.extend("WARN: %s" % w["message"] for w in result["warnings"])
     return lines
