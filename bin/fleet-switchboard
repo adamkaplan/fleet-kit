@@ -6029,8 +6029,9 @@ def finish_pass(engine, discovery, report):
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
                   "realarm_hours": 6, "person_names": ["Adam"]}
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
-SWEEP_REPOS_PER_PASS = 2      # repos read (two list reads each) in one pass: the read budget
-SWEEP_CONFIRMS_PER_PASS = 6   # single-issue reads (is this decision's issue closed?) in one pass
+SWEEP_CALLS_PER_PASS = 6      # the most `gh` calls the sweep makes in one pass (pages and single reads alike)
+SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
+SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
@@ -6110,12 +6111,18 @@ def sweep_state(engine):
     return state
 
 
-def sweep_read_repo(hub, repo, now, window_days, regex):
+def sweep_pages_used(records, truncated):
+    return SWEEP_LIST_PAGES if truncated else max(1, -(-len(records) // GITHUB_PAGE_SIZE))
+
+
+def sweep_read_repo(hub, repo, now, window_days, regex, budget):
     """One repo's open issues and PRs (one bounded list read: bodies and labels come with it) and the recent
-    comments (one bounded list read, newest first). Only reduced facts are kept: no text survives."""
+    comments (one bounded list read, newest first). Only reduced facts are kept: no text survives. `budget` is a
+    one-item list: the calls this pass may still make; each read is charged what it used."""
     since = iso(now - window_days * 86400)
     items, truncated = {}, False
-    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo)
+    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=SWEEP_LIST_PAGES)
+    budget[0] -= sweep_pages_used(records, cut)
     truncated = truncated or cut
     for record in records:
         number = _number(record)
@@ -6123,10 +6130,12 @@ def sweep_read_repo(hub, repo, now, window_days, regex):
             continue
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
         body = record.get("body")
-        items[number] = {"pr": _is_pr(record), "labels": names, "section": bool(DECISION_SECTION_RE.search(body or "")),
+        items[number] = {"pr": _is_pr(record), "labels": names,
+                         "section": bool(DECISION_SECTION_RE.search(body or "")) or bool(parse_decision_rows(body or "")),
                          "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
-                                   % (repo, since), older=("created_at", since))
+                                   % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
+    budget[0] -= sweep_pages_used(comments, cut)
     truncated = truncated or cut
     for comment in reversed(comments):  # oldest first, so the last N are the newest
         number = _url_number(comment.get("issue_url"))
@@ -6135,18 +6144,22 @@ def sweep_read_repo(hub, repo, now, window_days, regex):
     return {"at": now, "items": items, "truncated": truncated, "error": None}
 
 
-def sweep_refresh(engine, state, repos, now, cfg, regex):
-    """Read at most SWEEP_REPOS_PER_PASS stale repos this pass (the least recently read first). A failed read keeps the
-    old picture and is retried after SWEEP_TTL."""
+def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
+    """Read stale repos, the least recently read first, while the pass's call budget (less the reserve for the
+    single-issue reads) allows a whole repo (its two lists, up to SWEEP_LIST_PAGES pages each). Oldest first means
+    every repo is reached in turn: none starves. A failed read keeps the old picture and is retried after SWEEP_TTL."""
     hub = getattr(engine, "hub", None)
     if hub is None:
         return
     stale = sorted((r for r in repos if now - state.repos.get(r, {"at": 0})["at"] >= SWEEP_TTL),
                    key=lambda r: (state.repos.get(r, {"at": 0})["at"], r))
-    for repo in stale[:SWEEP_REPOS_PER_PASS]:
+    for repo in stale:
+        if budget[0] - SWEEP_CONFIRM_RESERVE < 2:
+            break
         try:
-            state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex)
+            state.repos[repo] = sweep_read_repo(hub, repo, now, cfg["comment_window_days"], regex, budget)
         except GitHubUnavailable as err:
+            budget[0] -= 1
             old = state.repos.get(repo) or {"items": {}, "truncated": False}
             state.repos[repo] = dict(old, at=now, error=_one_line(str(err), 160))
 
@@ -6158,9 +6171,9 @@ def sweep_ref_of(decision, home):
     return (decision.get("repo") or home, number)
 
 
-def sweep_withdraw(engine, state, decisions, home, now, cfg):
+def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     """(kept decisions, refs found stale): a decision whose issue or PR is closed or merged is stale. Closed state is read
-    one issue at a time, cached SWEEP_TTL, at most SWEEP_CONFIRMS_PER_PASS per pass (the least recently read first)."""
+    one issue at a time, cached SWEEP_TTL, within the pass's call budget (the least recently read first)."""
     hub = getattr(engine, "hub", None)
     candidates = {}
     for d in decisions:
@@ -6170,7 +6183,8 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg):
     if hub is not None:
         due = sorted((r for r in candidates if now - state.checked.get(r, (0, False))[0] >= SWEEP_TTL),
                      key=lambda r: (state.checked.get(r, (0, False))[0], r))
-        for ref in due[:SWEEP_CONFIRMS_PER_PASS]:
+        for ref in due[:max(0, budget[0])]:
+            budget[0] -= 1
             try:
                 data = hub._read_one(ref[0], "issues/%d" % ref[1], now)
             except GitHubUnavailable:
@@ -6229,8 +6243,9 @@ def sweep_decisions(engine, decisions, now):
     watched = [d for d in decisions]
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
     regex = sweep_phrase_re(cfg["person_names"])
-    sweep_refresh(engine, state, repos, now, cfg, regex)
-    kept, stale = sweep_withdraw(engine, state, watched, home, now, cfg)
+    budget = [SWEEP_CALLS_PER_PASS]
+    sweep_refresh(engine, state, repos, now, cfg, regex, budget)
+    kept, stale = sweep_withdraw(engine, state, watched, home, now, cfg, budget)
     for ref in stale:
         text = "%s#%d" % ref
         if text not in state.withdrawn:
@@ -8062,7 +8077,7 @@ class GitHubHub:
             with self.lock:
                 self._markers_dirty = True  # a cursor that could not be written is written next pass
 
-    def read_pages(self, path, key=None, timeout=None, older=None):
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         """One list read, at most GITHUB_PAGE_CAP pages of GITHUB_PAGE_SIZE. Returns (records, truncated). `older`
         is (field, since): a listing newest first stops at the first page that ends before `since`."""
         joiner = "&" if "?" in path else "?"
@@ -8077,7 +8092,7 @@ class GitHubHub:
                 return records, False
             if older and isinstance(page[-1].get(older[0]), str) and page[-1][older[0]] < older[1]:
                 return records, False
-            if bounded and number >= GITHUB_PAGE_CAP:
+            if bounded and number >= min(GITHUB_PAGE_CAP, cap or GITHUB_PAGE_CAP):
                 return records, True
 
     # -- gh api, and the catch-up read

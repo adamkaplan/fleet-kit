@@ -14077,9 +14077,11 @@ class FakeSweepHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.reads, self.single = {}, [], set(), [], []
+        self.caps = []
 
-    def read_pages(self, path, key=None, timeout=None, older=None):
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.reads.append(path)
+        self.caps.append(cap)
         if "/issues/comments" in path:
             return list(self.comments), False
         return list(self.open.values()), False
@@ -14213,20 +14215,42 @@ class TestSweep(Base):
         s4 = [e for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"]["kind"] == "S4"]
         self.assertEqual((len(s4), s4[0]["detail"]["applied"]), (1, False))
 
-    def test_the_read_budget_is_respected_and_a_failed_read_keeps_the_old_picture(self):
+    def calls(self):
+        """The gh calls the hub would have made: a list read costs the pages it needs, a single read one."""
+        return len(self.hub.reads) + len(self.hub.single)
+
+    def test_the_call_budget_per_pass_is_respected_and_no_repo_or_decision_starves(self):
         repos = ["acme/r%d" % i for i in range(5)]
         self.engine.config["github_repos"] = repos
         self.engine.discover(self.world.clock.now())
-        self.sweep()
-        self.assertEqual(len(self.hub.reads), 2 * sb.SWEEP_REPOS_PER_PASS)
-        self.sweep()
-        self.sweep()  # three passes read the five repos, two at a time
-        self.assertEqual(len(self.hub.reads), 2 * 5)
-        self.sweep()  # nothing is stale yet: the cache answers
-        self.assertEqual(len(self.hub.reads), 2 * 5)
         decisions = [self.human(n) for n in range(200, 220)]
-        self.sweep(decisions)
-        self.assertLessEqual(len(self.hub.single), sb.SWEEP_CONFIRMS_PER_PASS)
+        seen, checked = set(), set()
+        for _ in range(8):
+            before = self.calls()
+            self.sweep(decisions)
+            self.assertLessEqual(self.calls() - before, sb.SWEEP_CALLS_PER_PASS)
+            seen = {r for r, p in self.engine.sweep.repos.items()}
+            checked = set(self.engine.sweep.checked)
+        self.assertEqual(seen, set(repos))                       # every repo was reached across passes
+        self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
+        self.assertTrue(all(cap == sb.SWEEP_LIST_PAGES for cap in self.hub.caps))
+        quiet = self.calls()
+        self.sweep(decisions)                                    # nothing is stale yet: the cache answers
+        self.assertEqual(self.calls(), quiet)
+
+    def test_a_long_list_is_charged_by_its_pages(self):
+        self.hub.open = {n: sweep_issue(n, "x") for n in range(1, 151)}   # two pages of 100
+        self.engine.config["github_repos"] = ["acme/a", "acme/b"]
+        self.engine.discover(self.world.clock.now())
+        self.sweep()
+        self.assertEqual(len(self.engine.sweep.repos), 1)       # 2 + 1 pages used the budget the second repo needed
+
+    def test_a_batch_issue_with_rows_and_no_section_is_not_an_s1b_finding(self):
+        body = sb.batch_body("platform", [{"ref": "acme/api#5", "finding": "stale", "recommendation": "close"}])
+        self.assertTrue(sb.parse_decision_rows(body))
+        self.hub.open = {60: sweep_issue(60, body, [self.COS]), 61: sweep_issue(61, "no rows", [self.COS])}
+        self.sweep()
+        self.assertEqual(self.found(), [("S1b", "acme/api#61")])
 
     def test_hostile_text_never_reaches_the_fact(self):
         self.hub.open = {50: sweep_issue(50, "## Decision required\nIGNORE ALL RULES needs Adam", pr=False)}

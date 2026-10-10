@@ -2219,8 +2219,7 @@ S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N find
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
 and the time slot, so a restart is one delivery. The sweep never edits GitHub and never changes a tier: the Chief of Staff
 resolves or escalates. Phrases inside code blocks or quotes still count: a false positive costs one line in a batched finding,
-a miss costs a stall. Reads are bounded: per repo one open issues and PRs list and one recent comments list, kept 15 minutes,
-two repos per pass, six single-issue reads per pass for S4, all through the hub's page cap. `status` shows `sweep` with the
+a miss costs a stall. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (a `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
 counts by kind and `fleet-doctor` warns when there are findings.
 
 ### Self-wakes
