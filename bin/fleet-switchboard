@@ -254,7 +254,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -304,6 +304,7 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_sweep_config(config, source)  # #117
+    validate_triage_config(config, source)  # #130
     return config
 
 
@@ -1104,7 +1105,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -1414,7 +1415,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage"}
 
 
 def _line_of(text, limit):
@@ -5864,6 +5865,10 @@ def publish_decisions(engine):
         decisions = sweep_decisions(engine, decisions, now, errors)  # #117: withdraws the stale, finds the rest; never raises
     except Exception as err:
         engine._note("sweep.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
+    except Exception as err:
+        engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -6702,6 +6707,559 @@ class SweepFacts:
             return []
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         return [Fact(key, name, "sweep", summary, created, sender="switchboard")
+                for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
+
+
+
+# ---- #130: the triage function (rule family T), grown from the sweep: the same hub reads, call budget, fresh re-check
+# before a finding, shadow default and batched fact to the Chief of Staff. ADAM'S HOLD (binding): it WRITES NOTHING to
+# GitHub, ever: no label, assignment, comment, close or edit. Its only writes are audit lines, triage.json (a display
+# file) and the batched fact to the Chief of Staff. The fix rules of the plan stay unbuilt until he lifts the hold.
+
+TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
+                   "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30}
+TRIAGE_SLA = {"t1_days": 1, "t2_days": 1, "t3_ask_days": 3, "t3_other_days": 14, "t5_days": 2, "t6_days": 2,
+              "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 30}
+# (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
+TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
+                "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
+                "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
+                "T11": "orphan", "OO": "other-owner (flag only)"}
+TRIAGE_TTL = 900               # seconds a unit read is kept
+TRIAGE_CALLS_PER_PASS = 4      # the most `gh` calls the triage makes in one pass (reads and fresh checks alike)
+TRIAGE_VERIFY_RESERVE = 1
+TRIAGE_PASS_SECONDS = 6
+TRIAGE_LIST_PAGES = 2
+TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
+TRIAGE_UNREADABLE_RETRY = 3600
+TRIAGE_FILE = "triage.json"
+TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
+TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
+
+
+def validate_triage_config(config, source):
+    """`triage`: absent, null or {} runs in shadow (findings audited, nobody woken); `enabled` true adds only the wake of
+    the Chief of Staff; `false` turns it fully off. Nothing here can make it write to GitHub: there is no such code."""
+    if "triage" not in config:
+        return
+    raw = config["triage"]
+    if raw is False:
+        return
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'triage' must be an object or false, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(TRIAGE_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'triage' has key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)))
+    section = dict(TRIAGE_DEFAULTS, **raw)
+    where = "%s: 'triage" % source
+    for key in ("enabled", "daily_summary"):
+        if not isinstance(section[key], bool):
+            raise ConfigError("%s.%s' must be true or false, got %r" % (where, key, section[key]))
+    for key in ("repos", "our_logins"):
+        value = section[key]
+        if value is not None and not (isinstance(value, list) and all(isinstance(r, str) and r for r in value)):
+            raise ConfigError("%s.%s' must be a list of strings or null, got %r" % (where, key, value))
+    if section["repos"] is not None and not all(REPO_RE.match(r) for r in section["repos"]):
+        raise ConfigError("%s.repos' must be OWNER/REPO names, got %r" % (where, section["repos"]))
+    if not _is_number(section["realarm_hours"]) or section["realarm_hours"] <= 0:
+        raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
+    cap = section["max_findings"]
+    if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
+        raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
+    for name in ("sla",):
+        _check_sla(section[name], where + "." + name)
+    overrides = section["sla_overrides"]
+    if not isinstance(overrides, dict):
+        raise ConfigError("%s.sla_overrides' must map OWNER/REPO to an sla object, got %r" % (where, overrides))
+    for repo, sla in overrides.items():
+        _check_sla(sla, "%s.sla_overrides.%s" % (where, repo))
+    labels = section["required_labels"]
+    if not isinstance(labels, dict) or not all(
+            isinstance(repo, str) and isinstance(group, list) and all(
+                isinstance(l, str) or (isinstance(l, list) and l and all(isinstance(x, str) for x in l)) for l in group)
+            for repo, group in labels.items()):
+        raise ConfigError("%s.required_labels' must map OWNER/REPO to a list of labels (or lists of alternatives), "
+                          "got %r" % (where, labels))
+    config["triage"] = section
+
+
+def _check_sla(sla, where):
+    if not isinstance(sla, dict) or any(k not in TRIAGE_SLA or not _is_number(v) or v <= 0 for k, v in sla.items()):
+        raise ConfigError("%s' must be an object of positive numbers named among %s, got %r"
+                          % (where, ", ".join(TRIAGE_SLA), sla))
+
+
+def triage_sla(cfg, repo):
+    merged = dict(TRIAGE_SLA)
+    merged.update(cfg.get("sla") or {})
+    merged.update((cfg.get("sla_overrides") or {}).get(repo) or {})
+    return merged
+
+
+def triage_repos(engine, cfg):
+    if cfg.get("repos") is not None:
+        return list(cfg["repos"])
+    return sorted(set(decision_repos(engine)))
+
+
+def triage_our_logins(engine, cfg):
+    if cfg.get("our_logins") is not None:
+        return {l.lower() for l in cfg["our_logins"]}
+    config = engine.config
+    return {str(v).lower() for v in (config.get("gh_users") or {}).values()} | {l.lower() for l in config.get("owner_logins") or []}
+
+
+class TriageState:
+    """Memory only: rebuilt from GitHub and the decision list."""
+
+    def __init__(self):
+        self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
+        self.unreadable = {}     # repo -> reason, audited once
+        self.confirmed, self.attempted, self.alarmed = {}, {}, {}
+        self.logged, self.facts, self.current = set(), {}, {}
+        self.started, self.day, self.day_counts = 0, None, {}
+        self.summarised = None
+
+
+def triage_state(engine):
+    state = getattr(engine, "triage", None)
+    if state is None:
+        state = engine.triage = TriageState()
+    return state
+
+
+def _login_of(user):
+    return pr_login(user)
+
+
+def triage_norm(issue):
+    """One issue or PR record as the rules read it; None when it is not usable. Only reduced facts: no text is kept
+    except the booleans computed from the body."""
+    number = _number(issue)
+    created, updated = parse_iso(issue.get("created_at")), parse_iso(issue.get("updated_at"))
+    if number is None or created is None or updated is None:
+        return None
+    body = issue.get("body")
+    summary = issue.get("sub_issues_summary") if isinstance(issue.get("sub_issues_summary"), dict) else {}
+    total, done = summary.get("total"), summary.get("completed")
+    return {"number": number, "pr": _is_pr(issue), "draft": bool(issue.get("draft")), "state": issue.get("state", "open"),
+            "created": created, "updated": updated, "author": (_login_of(issue.get("user")) or "").lower(),
+            "assignees": [(_login_of(a) or "").lower() for a in issue.get("assignees") or [] if isinstance(a, dict)],
+            "labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
+            "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
+                SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
+            "open_sub": isinstance(total, int) and isinstance(done, int) and total > done, "captain": pr_is_captain(body)}
+
+
+def triage_comment_facts(records):
+    """[{"at", "next", "review"}] oldest first from comment records; no text kept."""
+    found = []
+    for c in records:
+        at = parse_iso(c.get("created_at")) if isinstance(c, dict) else None
+        text = SWEEP_QUOTED_RE.sub(" ", c.get("body") or "") if at is not None and isinstance(c.get("body"), str) else ""
+        if at is not None:
+            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": bool(TRIAGE_REVIEW_RE.search(text))})
+    return sorted(found, key=lambda c: c["at"])
+
+
+def triage_context(engine, repo, items, discovery):
+    """The charters, asks, work items and agent-owned numbers of one repo, from the agents list and the parent links the
+    issue list carries (`parent_issue_url`): no read of their own."""
+    owned, charters = set(), set()
+    for agent in (discovery.agents.values() if discovery else []):
+        fleet = agent.fleet or {}
+        if _fleet_repo(fleet, engine.config) != repo and fleet.get("repo") != repo:
+            continue
+        for field in ("issue", "charter"):
+            value = fleet.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                owned.add(value)
+                if field == "charter":
+                    charters.add(value)
+    charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
+    asks = {n for n, i in items.items() if i["parent"] in charters}
+    work = {n for n, i in items.items() if i["parent"] in asks}
+    return {"charters": charters, "asks": asks, "chain": charters | asks | work, "owned": owned}
+
+
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True):
+    """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
+    whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
+    Evidence holds only labels' names, ages in days and owner logins."""
+    number, found = item["number"], {}
+    chain = number in ctx["chain"]
+    ours = (item["author"] in ours_logins or any(a in ours_logins for a in item["assignees"]) or chain
+            or number in ctx["owned"] or number in notice_prs)
+    day = 86400.0
+    age_created, age_updated = (now - item["created"]) / day, (now - item["updated"]) / day
+    ask = number in ctx["asks"]
+    if not item["pr"]:
+        if not item["assignees"] and not chain and number not in ctx["owned"] and age_created >= sla["t1_days"]:
+            found["T1"] = {"created_days": round(age_created, 1)}
+        group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
+        if group_missing and age_created >= sla["t2_days"]:
+            found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
+                           "labels": sorted(item["labels"])[:8]}
+        awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
+        if comments is not None and not item["section"] and not awaiting and not item["next_body"] \
+                and not item["open_sub"] and not any(c["next"] for c in comments) \
+                and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
+            found["T3"] = {"quiet_days": round(age_updated, 1), "ask": ask}
+        if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
+            found["T8"] = {"quiet_days": round(age_updated, 1)}
+        if ask and "T3" not in found and age_updated >= sla["t9_days"]:
+            found["T9"] = {"quiet_days": round(age_updated, 1)}
+        if not chain and not item["assignees"] and "T1" not in found and age_updated >= sla["t11_days"]:
+            found["T11"] = {"quiet_days": round(age_updated, 1)}
+    elif not item["draft"] and comments is not None:
+        limit = sla["t7_ours_hours"] * 3600 if ours else sla["t7_other_days"] * day
+        if now - item["created"] >= limit and not any(c["review"] for c in comments):
+            if now - item["created"] <= TRIAGE_COMMENT_DAYS * day:   # older: the review may be outside the window
+                found["T7"] = {"waiting_hours": round((now - item["created"]) / 3600, 1)}
+    return found, ours
+
+
+def triage_read_unit(hub, repo, unit, now, budget):
+    """One unit's list read, charged what it used. Units: issues (open issues and PRs), comments (the last
+    TRIAGE_COMMENT_DAYS), closed:<label> (closed issues that still carry a label)."""
+    if unit == "issues":
+        path = "repos/%s/issues?state=open&per_page=100" % repo
+        records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+    elif unit == "comments":
+        since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
+        records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+                                      % (repo, since), older=("created_at", since), cap=TRIAGE_LIST_PAGES)
+    else:
+        label = unit.split(":", 1)[1]
+        records, cut = hub.read_pages("repos/%s/issues?state=closed&labels=%s&per_page=100" % (repo, quote(label, safe="")),
+                                      cap=1)
+    budget[0] -= sweep_pages_used(records, cut)
+    return records, cut
+
+
+def triage_refresh(engine, state, repos, units, now, budget):
+    """Read the stalest units (round-robin across every repo and unit, the least recently read first) while the pass's
+    call budget (less the reserve for fresh checks) and time allow. A repo the account cannot read is `unreadable`, once."""
+    hub = getattr(engine, "hub", None)
+    if hub is None:
+        return
+    todo = []
+    for repo in repos:
+        if repo in state.unreadable and now - state.unreadable[repo][1] < TRIAGE_UNREADABLE_RETRY:
+            continue
+        for unit in units:
+            held = state.units.get((repo, unit))
+            if held is None or now - held["at"] >= TRIAGE_TTL:
+                todo.append(((held or {"at": 0})["at"], repo, unit))
+    for _, repo, unit in sorted(todo):
+        if budget[0] - TRIAGE_VERIFY_RESERVE < 1 or engine.now() - state.started >= TRIAGE_PASS_SECONDS:
+            break
+        try:
+            records, cut = triage_read_unit(hub, repo, unit, now, budget)
+            state.units[(repo, unit)] = {"at": now, "data": records, "truncated": cut, "error": None}
+            state.unreadable.pop(repo, None)
+        except GitHubUnavailable as err:
+            budget[0] -= 1
+            reason = _one_line(str(err), 160)
+            if (repo, unit) in state.units:   # it was read before: a failed refresh keeps the old copy and tries later
+                state.units[(repo, unit)].update(at=now, error=reason)
+            else:
+                if repo not in state.unreadable:
+                    engine._note("triage.unreadable", repo, {"repo": repo, "unit": unit, "reason": reason})
+                state.unreadable[repo] = (reason, now)
+
+
+def triage_findings(engine, state, repos, decisions, cfg, now, errors):
+    """(candidates [(rule, ref, evidence)], unchecked {repo: [units missing]}, truncated repos). Reads nothing."""
+    discovery = getattr(engine, "discovery", None)
+    ours_logins = triage_our_logins(engine, cfg)
+    notice_prs = {}
+    try:
+        for n in read_pr_notices(engine.state_dir):
+            notice_prs.setdefault(n["repo"], set()).add(n["number"])
+    except (NoticeError, OSError, TypeError):
+        pass
+    out, unchecked, truncated = [], {}, []
+    for repo in repos:
+        issues_unit = state.units.get((repo, "issues"))
+        if issues_unit is None:
+            continue
+        if issues_unit["truncated"]:
+            truncated.append(repo)
+        items = {}
+        for record in issues_unit["data"]:
+            item = triage_norm(record)
+            if item is not None and item["state"] == "open":
+                items[item["number"]] = item
+        ctx = triage_context(engine, repo, items, discovery)
+        comments_unit = state.units.get((repo, "comments"))
+        by_number = {}
+        if comments_unit is not None:
+            for c in comments_unit["data"]:
+                n = _url_number(c.get("issue_url"))
+                if n is not None:
+                    by_number.setdefault(n, []).append(c)
+        sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
+        if comments_unit is None:
+            unchecked.setdefault(repo, []).append("comments")
+        for number, item in sorted(items.items()):
+            comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
+            found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()))
+            if not found:
+                continue
+            ref = "%s#%d" % (repo, number)
+            if ours:
+                out.extend((rule, ref, evidence) for rule, evidence in sorted(found.items()))
+            else:   # another person's or team's: only ever a flag, never counted as our violation
+                out.append(("OO", ref, {"would_be": sorted(found)}))
+        for unit in ("closed:" + l for l in sorted(triage_awaiting_labels(engine))):
+            held = state.units.get((repo, unit))
+            if held is None:
+                unchecked.setdefault(repo, []).append(unit)
+                continue
+            for record in held["data"]:
+                number = _number(record)
+                names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
+                if number is not None and record.get("state") == "closed" and unit.split(":", 1)[1] in names:
+                    out.append(("T10", "%s#%d" % (repo, number), {"label": unit.split(":", 1)[1]}))
+    if not errors:   # T5, T6 read only the decision list: judged only when it is whole
+        for d in decisions:
+            since = parse_iso(d.get("since"))
+            if d.get("tier") != "human" or d.get("kind") not in ("issue", "report", "captain") or since is None:
+                continue
+            ref = sweep_ref_of(d, engine.config.get("intent_repo"))
+            ident = "%s#%d" % ref if ref and ref[0] else (d.get("id") or "?")
+            days = (now - since) / 86400
+            if d.get("kind") == "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t6_days"]:
+                out.append(("T6", ident, {"waiting_days": round(days, 1)}))
+            elif d.get("kind") != "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t5_days"]:
+                out.append(("T5", ident, {"waiting_days": round(days, 1)}))
+    return out, unchecked, truncated
+
+
+def triage_awaiting_labels(engine):
+    return {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
+
+
+def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
+    """True when a FRESH read bears the finding out, False when it does not, None when it cannot be checked now. T5 and
+    T6 are about the decision list derived this very pass (no read)."""
+    if rule in ("T5", "T6"):
+        return True
+    hub = getattr(engine, "hub", None)
+    repo, _, number = ref.rpartition("#")
+    if hub is None or not number.isdigit():
+        return None
+    wants_comments = rule in ("T3", "T7") or (rule == "OO" and {"T3", "T7"} & set((evidence or {}).get("would_be", [])))
+    number, need = int(number), (2 if wants_comments else 1)
+    if budget[0] < need:
+        return None
+    budget[0] -= 1
+    try:
+        data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+    except GitHubUnavailable:
+        return None
+    if not isinstance(data, dict) or "number" not in data and "state" not in data:
+        return None
+    if rule == "T10":
+        names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
+        return data.get("state") == "closed" and any(l in names for l in triage_awaiting_labels(engine))
+    if data.get("state") != "open":
+        return False
+    item = triage_norm(data)
+    if item is None:
+        return None
+    comments = None
+    if need == 2:
+        budget[0] -= 1
+        since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
+        try:
+            recent, cut = hub.read_pages("repos/%s/issues/%d/comments?since=%s&per_page=100" % (repo, number, since), cap=1)
+        except GitHubUnavailable:
+            return None
+        if cut:
+            return None
+        comments = triage_comment_facts(recent)
+    issues_unit = state.units.get((repo, "issues"))
+    items = {}
+    for record in (issues_unit["data"] if issues_unit else []):
+        other = triage_norm(record)
+        if other is not None and other["state"] == "open":
+            items[other["number"]] = other
+    items[number] = item
+    ctx = triage_context(engine, repo, items, getattr(engine, "discovery", None))
+    notice_prs = set()
+    try:
+        notice_prs = {n["number"] for n in read_pr_notices(engine.state_dir) if n["repo"] == repo}
+    except (NoticeError, OSError, TypeError):
+        pass
+    found, ours = triage_rules(item, comments, ctx, triage_sla(cfg, repo), now, triage_our_logins(engine, cfg),
+                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs)
+    return (rule in found) if (ours and rule != "OO") else (rule == "OO" and bool(found))
+
+
+def triage_pass(engine, decisions, now, errors=()):
+    """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
+    and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
+    cfg = engine.config.get("triage", TRIAGE_DEFAULTS)
+    if cfg is False or cfg is None:
+        return
+    repos = triage_repos(engine, cfg)
+    if not repos:
+        return  # nothing is tracked: nothing to read, nothing to say
+    state = triage_state(engine)
+    state.started = engine.now()
+    budget = [TRIAGE_CALLS_PER_PASS]
+    units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    triage_refresh(engine, state, repos, units, now, budget)
+    candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
+    findings, unchecked = [], 0
+    for rule, ref, evidence in sorted(candidates, key=lambda c: (state.attempted.get((c[0], c[1]), 0), c[0], c[1])):
+        pair = (rule, ref)
+        if now - state.confirmed.get(pair, 0) < TRIAGE_TTL:
+            findings.append((rule, ref, evidence))
+            continue
+        if engine.now() - state.started >= TRIAGE_PASS_SECONDS:
+            unchecked += 1
+            continue
+        state.attempted[pair] = now
+        verdict = triage_verify(engine, state, rule, ref, cfg, now, budget, evidence)
+        if verdict:
+            state.confirmed[pair] = now
+            findings.append((rule, ref, evidence))
+        elif verdict is None:
+            unchecked += 1
+        else:
+            state.confirmed.pop(pair, None)
+            if (pair, "d", int(now // 86400)) not in state.logged:
+                state.logged.add((pair, "d", int(now // 86400)))
+                engine._note("triage.dismissed", ref, {"rule": rule, "ref": ref, "why": "a fresh read does not bear it out"})
+    findings.sort()
+    day = int(now // 86400)
+    if state.day != day:
+        state.day, state.day_counts = day, {}
+    counts = {}
+    for rule, ref, evidence in findings:
+        counts[rule] = counts.get(rule, 0) + 1
+        if (rule, ref, day) not in state.logged:
+            if len(state.logged) > 20000:
+                state.logged.clear()
+            state.logged.add((rule, ref, day))
+            engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
+                                                 "evidence": evidence, "woken": cfg["enabled"], "applied": False})
+    state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings), "at": iso(now),
+                     "unchecked": unchecked, "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
+                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
+    triage_write(engine, state)
+    due = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    if cfg["enabled"] and due:
+        triage_queue_fact(state, due, now, cfg)
+        for rule, _ in due:
+            state.day_counts[rule] = state.day_counts.get(rule, 0) + 1
+    triage_daily_summary(engine, state, cfg, now, day, repos)
+
+
+def triage_queue_fact(state, due, now, cfg):
+    shown = due[:cfg["max_findings"]]
+    digest = hashlib.sha256("|".join("%s:%s" % pair for pair in shown).encode()).hexdigest()[:10]
+    key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
+    kinds = sorted({r for r, _ in due})
+    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
+        " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
+        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    for pair in due:
+        state.alarmed[pair] = now
+    state.facts[key] = (summary, now)
+    for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
+        del state.facts[old]
+
+
+def triage_daily_summary(engine, state, cfg, now, day, repos):
+    """Once per 24 h (the key names the day, so a restart repeats nothing): found, escalated, unchecked and unreadable
+    counts by rule. Audited always; sent to the Chief of Staff only when enabled and `daily_summary`."""
+    if state.summarised == day or not state.current:
+        return
+    if not all((r, "issues") in state.units or r in state.unreadable for r in repos):
+        return   # not every repo has been read once yet (a restart's first passes): a summary of nothing says nothing
+    state.summarised = day
+    counts = state.current["counts"]
+    text = "triage summary: found %d (%s); escalated today %d; unchecked %d; unreadable repos %d%s" % (
+        state.current["total"], ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none",
+        sum(state.day_counts.values()), state.current["unchecked"], len(state.current["unreadable"]),
+        " (" + ", ".join(state.current["unreadable"][:5]) + ")" if state.current["unreadable"] else "")
+    engine._note("triage.summary", None, {"text": text, "counts": counts, "enabled": cfg["enabled"]})
+    if cfg["enabled"] and cfg["daily_summary"]:
+        state.facts["triage.summary:%d" % day] = (text, now)
+
+
+def triage_write(engine, state):
+    path = Path(engine.state_dir) / TRIAGE_FILE
+    body = json.dumps(state.current, sort_keys=True)
+    if getattr(state, "written", None) == body:
+        return
+    try:
+        temp = path.with_name(TRIAGE_FILE + ".tmp")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body + "\n")
+        os.replace(str(temp), str(path))
+        state.written = body
+    except OSError:
+        pass
+
+
+def triage_summary(state_dir):
+    try:
+        raw = json.loads((Path(state_dir) / TRIAGE_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) and isinstance(raw.get("counts"), dict) else None
+
+
+def triage_status_lines(triage):
+    if not triage:
+        return []
+    parts = ", ".join("%s %d" % (k, n) for k, n in sorted(triage["counts"].items())) or "none"
+    lines = ["      triage     %s: %s finding(s) (%s) over %s repo(s) as of %s" % (
+        "on (wakes the Chief of Staff; writes nothing to GitHub)" if triage.get("enabled") else "shadow (audit only; writes nothing to GitHub)",
+        triage.get("total", 0), parts, triage.get("repos", "?"), triage.get("at", "?"))]
+    if triage.get("unreadable"):
+        lines.append("      triage     unreadable repo(s), no findings from them: " + ", ".join(triage["unreadable"]))
+    if triage.get("unchecked_units"):
+        lines.append("      triage     unchecked units: " + "; ".join(
+            "%s (%s)" % (r, ", ".join(u)) for r, u in sorted(triage["unchecked_units"].items())))
+    if triage.get("unchecked"):
+        lines.append("      triage     %d finding(s) not checked this pass (call budget or a failed read): neither "
+                     "raised nor audited" % triage["unchecked"])
+    if triage.get("truncated"):
+        lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    return lines
+
+
+class TriageFacts:
+    """The triage's pending facts for the Chief of Staff (the batched findings and the daily summary), one per Chief of
+    Staff that runs; kept until delivered, then they age out of the triage's memory."""
+
+    __name__ = "triage_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        state = getattr(engine, "triage", None) if engine else None
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if not state or not state.facts or discovery is None or discovery.problems:
+            return []
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        return [Fact(key, name, "triage", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
 
 
@@ -8928,6 +9486,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["sweep"] = sweep_summary(state)  # #117
+        report["triage"] = triage_summary(state)  # #130
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -9047,6 +9606,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
+    lines.extend(triage_status_lines(report.get("triage")))  # #130
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"

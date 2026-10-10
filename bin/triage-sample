@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Write the last week's triage findings to a LOCAL sheet for hand-checking, and compute precision per rule from it.
+
+Read-only on the audit file. The sheet names real refs of private repos: it is a LOCAL file. Put it outside any git
+working tree; this tool refuses a path inside one. One JSON object per line:
+{"n", "ts", "rule", "ref", "what", "evidence", "label": null, "note": null}. A reviewer fills `label` with "TP" (the
+finding was right: the item really breaks the rule) or "FP" (it did not) and a short `note`.
+
+  triage-sample [--audit FILE] --out FILE [--days 7] [--rule T1 --rule T3 ...]     write the sheet
+  triage-sample --summary FILE                                                      precision per rule from a filled sheet
+
+Each (rule, ref) appears once, at its first finding in the window. The triage writes nothing to GitHub (Adam's hold), so
+the sheet is how its precision is measured before anything else is switched on.
+"""
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+DEFAULT_AUDIT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                             "fleet-switchboard", "audit.jsonl")
+
+
+def parse_time(text):
+    when = datetime.datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
+    return when.replace(tzinfo=datetime.timezone.utc) if when.tzinfo is None else when.astimezone(datetime.timezone.utc)
+
+
+def read_findings(path, since, rules=None):
+    """The first triage.finding of each (rule, ref) at or after `since`, oldest first. Unreadable lines are skipped."""
+    seen, rows = set(), []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if '"triage.finding"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+                detail = row["detail"]
+                at = parse_time(row["ts"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if row.get("event") != "triage.finding" or at < since or not isinstance(detail, dict):
+                continue
+            key = (detail.get("rule"), detail.get("ref"))
+            if key in seen or (rules and detail.get("rule") not in rules):
+                continue
+            seen.add(key)
+            rows.append({"n": len(rows) + 1, "ts": row["ts"], "rule": detail.get("rule"), "ref": detail.get("ref"),
+                         "what": detail.get("what"), "evidence": detail.get("evidence"), "label": None, "note": None})
+    return rows
+
+
+def inside_git_worktree(path):
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    while folder and not os.path.isdir(folder):
+        folder = os.path.dirname(folder)
+    try:
+        done = subprocess.run(["git", "-C", folder, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+    except OSError:
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "true"
+
+
+def summarise(path):
+    """{rule: {"TP", "FP", "unlabelled"}} from a filled sheet."""
+    table = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            entry = table.setdefault(row.get("rule"), {"TP": 0, "FP": 0, "unlabelled": 0})
+            label = str(row.get("label") or "").strip().upper()
+            entry[label if label in ("TP", "FP") else "unlabelled"] += 1
+    return table
+
+
+def format_summary(table):
+    lines = ["rule   TP   FP  unlabelled  precision"]
+    total_tp = total_fp = 0
+    for rule, c in sorted(table.items(), key=lambda kv: str(kv[0])):
+        judged = c["TP"] + c["FP"]
+        lines.append("%-5s %3d  %3d  %10d  %s" % (rule, c["TP"], c["FP"], c["unlabelled"],
+                                                 "%.0f%%" % (100.0 * c["TP"] / judged) if judged else "n/a"))
+        total_tp, total_fp = total_tp + c["TP"], total_fp + c["FP"]
+    judged = total_tp + total_fp
+    lines.append("all   %3d  %3d  %10s  %s" % (total_tp, total_fp, "", "%.0f%%" % (100.0 * total_tp / judged) if judged else "n/a"))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--audit", default=DEFAULT_AUDIT)
+    parser.add_argument("--out")
+    parser.add_argument("--days", type=float, default=7)
+    parser.add_argument("--rule", action="append")
+    parser.add_argument("--summary", metavar="FILE")
+    args = parser.parse_args(argv)
+    if args.summary:
+        print(format_summary(summarise(args.summary)))
+        return 0
+    if not args.out:
+        parser.error("--out FILE (a private path) or --summary FILE")
+    if inside_git_worktree(args.out):
+        sys.stderr.write("triage-sample: %s is inside a git working tree; the sheet names private refs, put it elsewhere\n"
+                         % args.out)
+        return 2
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.days)
+    rows = read_findings(args.audit, since, set(args.rule) if args.rule else None)
+    with open(args.out, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    os.chmod(args.out, 0o600)
+    counts = {}
+    for row in rows:
+        counts[row["rule"]] = counts.get(row["rule"], 0) + 1
+    print("wrote %d finding(s) to %s (%s)" % (len(rows), args.out, ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
