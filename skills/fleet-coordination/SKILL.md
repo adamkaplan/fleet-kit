@@ -52,7 +52,7 @@ answers it. A decision goes up a tier at a time: a worker's to its orchestrator,
 the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
-A PR held for Adam starts with the line `MERGE: captain` as the first line of its body and gets a `fleet-switchboard notice pr`. Any other decision for Adam is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the awaiting label), never only words in a report: a report or comment saying something waits on Adam does not put it in his panel, the section and label do. The switchboard sweep (#117) flags mismatches to cos.
+A PR held for Adam starts with the line `MERGE: captain` as the first line of its body and gets a `fleet-switchboard notice pr`. Any other decision for Adam is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on Adam does not put it in his panel, the section and label do. The switchboard sweep (#117) flags mismatches to cos.
 
 Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
 --title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
