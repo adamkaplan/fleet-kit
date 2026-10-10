@@ -44,7 +44,16 @@ def real_gh():
 def my_name():
     """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
     binary = os.environ.get("FLEET_SWITCHBOARD_BIN")
-    if not binary or not os.path.isabs(binary):
+    if not binary:
+        # Unset (an agent's shell rarely has it): the switchboard `install` linked, as the fleet-hooks plugin does.
+        # Resolved, and it must be an executable file; nothing is looked up on PATH. A value that is SET wins, even a bad one.
+        try:
+            binary = os.path.realpath(os.path.join(os.path.expanduser("~"), ".local", "bin", "fleet-switchboard"))
+        except (OSError, ValueError):
+            return "agent"
+        if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+            return "agent"
+    if not os.path.isabs(binary):
         return "agent"
     try:
         done = subprocess.run([binary, "whoami"], capture_output=True, text=True, timeout=WHOAMI_SECONDS)
