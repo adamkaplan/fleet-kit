@@ -970,7 +970,7 @@ plugin used to switch both hooks off unless `FLEET_SWITCHBOARD_BIN` and
 `FLEET_SWITCHBOARD_SHIMS` were in v2's service environment, and a service
 started by a TUI has neither, so nothing was ever judged. Now, when a variable
 is unset, the plugin uses `realpath(~/.local/bin/fleet-switchboard)` and
-`<checkout>/shims` beside it. A variable that is set wins, even a bad one.
+`<checkout>/shims` beside it. A variable that is set wins, even a bad one. The `gh` shim does the same for its signature: with `FLEET_SWITCHBOARD_BIN` unset it runs `whoami` through the resolved `~/.local/bin/fleet-switchboard` (an executable file, never looked up on PATH), so a signed comment names the real agent and not `agent`.
 `fleet-doctor` has two checks: `switchboard-path` says when that link resolves
 anywhere but the main checkout (`~/Code/fleet-kit`, or `$FLEET_KIT_MAIN`), so a
 stale worktree is named and never used silently; `judge-liveness` fails when

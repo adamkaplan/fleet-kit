@@ -9767,6 +9767,48 @@ class TestGhShim(Base):
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
         return done, seen
 
+    def link_switchboard(self, target=None, dangling=False):
+        link = self.home / ".local" / "bin"
+        link.mkdir(parents=True, exist_ok=True)
+        (link / "fleet-switchboard").symlink_to(self.home / "gone" if dangling else (target or self.who))
+
+    def test_unset_env_falls_back_to_the_linked_switchboard(self):
+        self.link_switchboard()
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", who=False)
+        self.assertIn("from=platform", seen["argv"][-1])
+
+    def test_the_env_var_wins_over_the_link(self):
+        self.link_switchboard()
+        other = self.home / "other-who"
+        other.write_text("#!/bin/sh\necho elsewhere\n")
+        other.chmod(0o755)
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env={"FLEET_SWITCHBOARD_BIN": str(other)})
+        self.assertIn("from=elsewhere", seen["argv"][-1])
+
+    def test_a_relative_env_var_is_agent_not_the_link(self):
+        self.link_switchboard()
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env={"FLEET_SWITCHBOARD_BIN": "rel/x"})
+        self.assertIn("from=agent", seen["argv"][-1])
+
+    def test_no_link_or_a_dangling_one_or_a_non_executable_is_agent(self):
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", who=False)
+        self.assertIn("from=agent", seen["argv"][-1])
+        self.link_switchboard(dangling=True)
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", who=False)
+        self.assertIn("from=agent", seen["argv"][-1])
+        (self.home / ".local" / "bin" / "fleet-switchboard").unlink()
+        plain = self.home / "plain"
+        plain.write_text("x")
+        self.link_switchboard(plain)
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", who=False)
+        self.assertIn("from=agent", seen["argv"][-1])
+
+    def test_a_failing_or_odd_whoami_through_the_link_is_agent(self):
+        self.link_switchboard()
+        for env in ({"FAKE_WHO_EXIT": "1"}, {"FAKE_WHO": "bad name!"}):
+            done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", who=False, env=env)
+            self.assertIn("from=agent", seen["argv"][-1])
+
     MARK = "<!-- fleet-switchboard:from=platform -->"
 
     def test_each_way_of_giving_a_body_is_signed(self):
