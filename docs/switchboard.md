@@ -3733,6 +3733,16 @@ such a worker), steering into a working turn, an answer's delivery to the worker
 a PR notice, and the reports listing. With no single registered agent of that role the name stays literal everywhere, so the behaviour is unchanged.
 `reports_to` as shown to a person is still the text the worker was launched with.
 
+## Plan check (#135)
+
+`fleet-switchboard plan check <owner/repo#N | issue URL | --file PATH> [--json]` is gate G0a of plan-driven development:
+it reads a plan (the latest `Plan (scenarios)` comment, else the issue body), parses its one `scenarios:` yaml block with a
+small strict parser (no yaml dependency, nothing evaluated), checks every scenario is well-formed and discriminating and
+every Done-when clause of the ask is covered by an S scenario, and prints PASS or FAIL, one line per defect and the
+the plan's two hashes (scenario hash and whole-plan hash; approval binds to the plan hash). Exit 0 pass, 1 fail, 2 unreadable. It reads only. The rules, the schema, a good example and three
+bad ones are in [docs/plan-template.md](plan-template.md); the checker is `bin/plan_check.py` (pure: text in, data out).
+The `fleet-planning` skill that teaches orchestrators to write plans is a later slice.
+
 ## Status speed (#86)
 
 `fleet-switchboard status` spent most of its time on the intent-gap check: one serial `gh api` read (about 0.4 s)
