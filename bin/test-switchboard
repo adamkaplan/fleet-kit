@@ -16306,6 +16306,23 @@ class TestPlanCheckFeedback(unittest.TestCase):
                 "  DW-2: ALIGNMENT is reviewed\n  DW-3: tools   fit\n```\n")
         self.assertEqual(sb.plan_check.check(text, done)["result"], "pass")
 
+    def test_a_declared_list_can_never_collapse_or_merge_the_asks_numbered_clauses(self):
+        done = "(1) plans are recorded; (2) alignment is reviewed; (3) tools fit"
+        scenarios = "```yaml\nscenarios:\n" + self.scenario(1, "DW-1") + self.scenario(9, "PC-1", ident="U1") + "```\n"
+        collapsed = scenarios + "```yaml\nclauses:\n  DW-1: plans are recorded; alignment is reviewed; tools fit\n```\n"
+        got = sb.plan_check.check(collapsed, done)
+        self.assertEqual(got["result"], "fail")
+        self.assertIn("declared-clauses-mismatch", [d["code"] for d in got["defects"]])
+        self.assertIn("uncovered-clause", [d["code"] for d in got["defects"]], "coverage still asks for all 3")
+        merged = scenarios.replace("covers: DW-1", "covers: DW-2", 1) + (
+            "```yaml\nclauses:\n  DW-1: plans are recorded\n  DW-2: alignment is reviewed; tools fit\n```\n")
+        self.assertIn("declared-clauses-mismatch", [d["code"] for d in sb.plan_check.check(merged, done)["defects"]])
+        three = "".join(self.scenario(n, "DW-%d" % n) for n in (1, 2, 3)) + self.scenario(9, "PC-1", ident="U1")
+        proper = "```yaml\nscenarios:\n" + three + "```\n```yaml\nclauses:\n  DW-1: plans are recorded\n  DW-2: alignment is reviewed\n  DW-3: tools fit\n```\n"
+        self.assertEqual(sb.plan_check.check(proper, done)["result"], "pass")
+        listed = "1. plans are recorded\n2. alignment is reviewed\n3. tools fit"
+        self.assertIn("declared-clauses-mismatch", [d["code"] for d in sb.plan_check.check(collapsed, listed)["defects"]])
+
     def test_the_clauses_block_is_strict(self):
         for block in ("clauses:\n  DW-2: out of order", "clauses:\n  DW-1: ok enough here\n  DW-3: skipped",
                       "clauses:\n  nonsense", "clauses:\n", "clauses:\n\tDW-1: tab"):
@@ -16360,7 +16377,8 @@ class TestPlanCheckFeedback(unittest.TestCase):
     FAIL_CORPUS = ("it works for 1 user", "works correctly after the change is applied", "output matches the expectations",
                    "'works'", '"works"', "result = ok and everything fine", "the feature behaves as intended by the team",
                    "everything is fine and the user is happy", "works", "ok", "it passes", "no errors", "non-empty",
-                   "output is identical to the expectations", "the system is in a good state afterwards",
+                   "output is identical to the expectations", "3 of 4 people like it", "the total is 1 user", "the thing equals 5 somehow maybe",
+                   "0 hits yes fine ok", "the result is 0 or so", "the output is identical to the same", "the system is in a good state afterwards",
                    "after the change, 1 thing is fine", "the thing works after 1 try", "looks right to the reviewer")
 
     def test_a_corpus_of_pass_rules_both_ways(self):

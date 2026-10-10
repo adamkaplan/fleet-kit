@@ -423,10 +423,12 @@ STATUS_RE = re.compile(r"\b(?:status(?: code)?|http|returns?|responds? with|resp
 EXIT_RE = re.compile(r"\bexit (?:code|status)\s*(?:is|=|==|of|:)?\s*[0-9]+\b", re.IGNORECASE)
 UNIT_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?\s*(?:%%|percent|%s)(?![A-Za-z])" % UNITS, re.IGNORECASE)
 PERCENT_RE = re.compile(r"[0-9]\s*%")
-N_OF_N_RE = re.compile(r"\b[0-9]+\s+of\s+(?:the\s+)?[0-9]+\b", re.IGNORECASE)
+N_OF_N_RE = re.compile(r"\b([0-9]+)\s+of\s+(?:the\s+)?([0-9]+)\b", re.IGNORECASE)
+HEDGE_RE = re.compile(r"\b(?:maybe|somehow|or so|probably|perhaps|presumably|kind of|sort of|more or less|i guess|"
+                      r"yes fine|fine ok|ok fine|hopefully|roughly|about right|seems?|looks? (?:right|good|fine))\b", re.IGNORECASE)
 IDENTICAL_RE = re.compile(r"\b(?:identical|equal|same)\b(?:\s+\w+){0,3}?\s+(?:to|as)\s+(?:the\s+|a\s+)?([A-Za-z][\w-]*)", re.IGNORECASE)
 EQUALS_NUMBER_RE = re.compile(r"\b(?:equals?|==|is exactly|are exactly|is|are)\s+[0-9]+(?![0-9]*\s*(?:user|person|people)\b)", re.IGNORECASE)
-VAGUE_TARGETS = {"expectations", "expectation", "expected", "it", "that", "this", "before", "good", "fine", "right", "ok"}
+VAGUE_TARGETS = {"same", "expectations", "expectation", "expected", "it", "that", "this", "before", "good", "fine", "right", "ok"}
 THRESHOLD_RE = re.compile(r"\b%s\s+[0-9]" % THRESHOLD, re.IGNORECASE)
 # an identifier (snake_case, camelCase, dotted, a path, or backticked) compared to a number or a non-vague quoted value
 IDENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*(?:[._/-][A-Za-z0-9_]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Za-z_][A-Za-z0-9_]*)"
@@ -442,13 +444,19 @@ def _vague_literal(text):
     return not words or all(w in VAGUE_WORDS for w in words)
 
 
+def _equal_n_of_n(rule):
+    """`10 of 10 files`: a count out of the same total. `3 of 4 people like it` observes nothing in particular (and a
+    stated threshold, `at least 3 of 4`, is caught by THRESHOLD_RE)."""
+    return any(m.group(1) == m.group(2) for m in N_OF_N_RE.finditer(rule))
+
+
 def _has_observable(rule):
     """True when the rule names something a wrong build could fail: a status or exit code, a number with a unit or a
     threshold, an identifier compared to a number or a quoted literal, a quoted EXPECTED literal that is not itself a
     vague word, or a strong comparison phrase (byte-identical, no diff). A bare digit, `=`, `after` or `before` is not."""
     lowered = rule.lower()
     if STATUS_RE.search(rule) or EXIT_RE.search(rule) or UNIT_RE.search(rule) or PERCENT_RE.search(rule) \
-            or THRESHOLD_RE.search(rule) or N_OF_N_RE.search(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
+            or THRESHOLD_RE.search(rule) or _equal_n_of_n(rule) or any(phrase in lowered for phrase in STRONG_PHRASES):
         return True
     named = IDENTICAL_RE.search(rule)
     if named and named.group(1).lower() not in VAGUE_TARGETS and named.group(1).lower() not in VAGUE_WORDS:
@@ -475,10 +483,14 @@ def pass_rule_problem(rule):
     if _plain_words(rule) in VAGUE_PASS:
         return ("the pass rule %r says nothing a wrong build could fail: it names no observable, threshold, expected "
                 "literal or named comparison (for example `exit status is 0`)" % rule)
+    hedge = HEDGE_RE.search(rule)
+    if hedge:
+        return ("the pass rule %r hedges (%r): state what is observed, not what seems or is roughly so, for example "
+                "`exit status is 0` or `0 occurrences of X`" % (rule[:80], hedge.group(0)))
     if len(rule) < MIN_PASS_CHARS:
         return ("the pass rule %r is too short to be checkable (%d characters, at least %d): say what is observed, for "
                 "example `exit status is 0` or `exactly 1 agent named \"alpha\"`" % (rule, len(rule), MIN_PASS_CHARS))
-    if not _has_observable(rule):
+    if not _has_observable(re.sub(r"\b[0-9]+\s+(?:users?|persons?|people)\b", " ", rule, flags=re.IGNORECASE)):
         return ("the pass rule %r has no observable: it needs ONE of an exit code or status (`exit status is 0`), a count or a "
                 "threshold (`0 occurrences of X`, `10 of 10 files`, `within 5 s`), an expected literal in quotes "
                 "(`shows \"Ready\"`), or a named comparison (`identical to the baseline`, `count equals 3`)" % rule[:80])
@@ -689,7 +701,13 @@ def check(text, done_when, plan_done_when=None):
     declared = declared_clauses(text)
     extra = []
     if declared is not None:
-        if not _words(done_when):
+        if len(clauses) > 1:
+            # the ask already has numbered parts: they are the authority, a declared list can only repeat them
+            if len(declared) != len(clauses) or not verify_declared(declared, done_when):
+                extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the "
+                              "ask: the ask has %d numbered clauses and the plan declares %d (a plan can never merge or drop "
+                              "clauses). The ask has: %r" % (len(clauses), len(declared), _normal(done_when)[:160])})
+        elif not _words(done_when):
             extra.append({"id": "-", "code": "no-done-when", "message": "the plan declares clauses but the ask has no "
                           "Done-when to check them against"})
         elif verify_declared(declared, done_when):
