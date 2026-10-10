@@ -14411,14 +14411,60 @@ class TestSweep(Base):
         self.sweep()
         self.assertEqual(self.engine.sweep.current["counts"].get("S3"), None)   # closed: not a finding
 
+    OWN_REPORT = "Waiting on Adam: #107 v3.3, #3055 plan"
+
+    def report_on(self, ask, title, tier="cos"):
+        return {"id": "r%d" % ask, "kind": "report", "tier": tier, "repo": "acme/api", "ask": ask, "since": self.at(),
+                "title": title}
+
+    def test_a_report_is_about_the_refs_it_names_not_about_its_own_ask(self):
+        self.hub.open = {117: sweep_issue(117, "x"), 107: sweep_issue(107, "## Decision required\nx", [self.USER]),
+                         3055: sweep_issue(3055, "x")}
+        self.sweep([self.report_on(117, self.OWN_REPORT), self.human(107)])
+        # the exact status line, tagged to ask 117: 117 is not accused; 107 is a human decision; 3055 is named and open
+        self.assertEqual(self.found(), [("S3", "acme/api#3055")])
+
+    def test_a_report_that_names_no_ref_raises_nothing(self):
+        self.hub.open = {117: sweep_issue(117, "x")}
+        self.sweep([self.report_on(117, "Waiting on Adam for the merge decision")])
+        self.assertEqual(self.found(), [])
+
+    def test_a_report_naming_only_human_tier_refs_raises_nothing(self):
+        self.hub.open = {107: sweep_issue(107, "## Decision required\nx", [self.USER]),
+                         108: sweep_issue(108, "## Decision required\nx", [self.USER])}
+        self.sweep([self.report_on(117, "Waiting on Adam: #107 v3.3, acme/api#108 plan"), self.human(107), self.human(108)])
+        self.assertEqual(self.found(), [])
+
+    def test_a_sentence_ends_at_a_full_stop_followed_by_space_so_a_version_number_does_not_cut_it(self):
+        strong = sb.sweep_strong_re(["Adam"])
+        fires, refs = sb.sweep_strong_statement(strong, self.OWN_REPORT, "acme/api", ["acme/api"])
+        self.assertEqual((fires, refs), (True, [("acme/api", 107), ("acme/api", 3055)]))
+        fires, refs = sb.sweep_strong_statement(strong, "Done with #5. Waiting on Adam for #6 and other/web#7",
+                                                "acme/api", ["acme/api", "other/web"])
+        self.assertEqual(refs, [("acme/api", 6), ("other/web", 7)])           # #5 is another sentence
+        self.assertEqual(sb.sweep_strong_statement(strong, "Waiting on Adam", "acme/api", [])[1], [])
+
+    def test_a_comment_is_about_its_item_unless_its_sentence_names_other_refs(self):
+        self.hub.open = {200: sweep_issue(200, "x"), 201: sweep_issue(201, "x"), 202: sweep_issue(202, "x"),
+                         203: sweep_issue(203, "x")}
+        self.hub.comments = [sweep_comment(200, "Waiting on Adam for the merge", self.at(1)),            # no refs: itself
+                             sweep_comment(201, "Waiting on Adam: #203 plan", self.at(1)),               # other ref only
+                             sweep_comment(202, "Waiting on Adam: #202 and #203", self.at(1))]           # itself and another
+        self.sweep()
+        self.sweep()          # the fresh checks are spread over passes by the call budget
+        self.assertEqual(self.found(), [("S3", "acme/api#200"), ("S3", "acme/api#202"), ("S3", "acme/api#203")])
+
     def test_s3_said_to_wait_but_not_in_the_human_tier(self):
         self.hub.open = {20: sweep_issue(20, "x"), 21: sweep_issue(21, "x"), 22: sweep_issue(22, "x")}
         self.hub.comments = [sweep_comment(20, "waiting on Adam", self.at(1)), sweep_comment(21, "waiting on Adam", self.at(1)),
                              sweep_comment(22, "waiting on Adam", self.at(9))]  # older than the window: not read
         self.sweep([self.human(21)])
         self.assertEqual(self.found(), [("S3", "acme/api#20")])
+        self.hub.open[23] = sweep_issue(23, "x")
         report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 23, "since": self.at(),
-                  "title": "worker: waits on Adam for the merge"}
+                  "title": "worker: waits on Adam for #23"}
+        self.engine.sweep.confirmed.clear()
+        self.world.tick(sb.SWEEP_TTL + 1)
         self.sweep([report])
         self.assertIn(("S3", "acme/api#23"), self.found())
 
