@@ -438,7 +438,7 @@ polled on a timer.
      when it records). A notice recorded before this field existed has no boss: a gone sender then leaves the PR
      unrouted.
   3. `reference`: for a PR that names no closing issue, a plain `#N` in its title or body, or, when there is
-     none, the number in its head branch name (`drift2137`). Accepted only when the PR names exactly one such
+     none, the number in its head branch name (`drift4242`). Accepted only when the PR names exactly one such
      number and that issue has an owner in the fleet (parents are climbed as for any issue); two or more stay
      unrouted. The PR's own number and `owner/repo#N` references do not count.
   4. `branch`: reserved. The launch metadata (`metadata.fleet`: name, role, reports_to, issue, charter, repo)
@@ -2196,6 +2196,14 @@ read, only the signature and the head token are looked at (never shown), and at 
 nothing stalls silently; a new head does not restart that clock, and a later review replaces the mark with normal
 evidence. Limit: only a PR that carries a notice is covered.
 
+**An escalation of a `MERGE: captain` PR survives a restart.** `decisions escalate` on a captain decision marks its PR and head in
+`escalated-requests.json`. The daemon prunes that file each pass to what is still pending, and a PR it cannot read (a restart's
+first passes, a 404 under the wrong account, an outage) derives no captain entry, so its marker used to be pruned and the decision
+came back at the cos tier. A captain marker now stays for as long as the PR's notice is on file; it leaves when the notice does
+(the PR merged or closed). A marker only ever matches the head it names, so a new head is not the person's until escalated again.
+Notice ids name their repo in full (`pr:owner/repo#N`) whenever more than one repo is in play (the watched repos and the notices'
+own, each counted once), and by the short name when there is one; the form no longer flips with the watch set.
+
 **The panel.** The `fleet-decisions-tui` plugin draws a `Heads-up (n)` section after `Waits on you` and before
 `Waits on cos`, grouped by repo like the others and visibly separated. Each entry is its headline (two lines at
 most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after HH:MM UTC` when set, and `(stale)`
@@ -2209,7 +2217,7 @@ rather than by an agent's memory. The daemon runs a deterministic sweep (no mode
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
 writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
-fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"], the names the phrases look for).
+fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
 |---|---|
@@ -2221,7 +2229,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"
 
 **Precision.** A finding is raised only after a fresh single read of its issue or PR (and a fresh read of its last comments when comments raised it) bears it out, so a cached 15-minute list cannot raise it; one that does not hold is audited as `sweep.dismissed`, one that cannot be checked now (no call budget, a failed read) is neither raised nor audited that pass, and a verified finding is trusted for 15 minutes. Only S3 waits for the decision list (a missing human-tier decision is the one thing that raises it falsely): it is deferred for a repo whose awaiting issues are unread or unreadable, or for every repo while the reports or requests source fails, as in the first passes after a restart. S1 reads only labels and bodies and S5 only the cos-tier decisions listed, so neither waits. A deferral lasts at most 30 minutes (`SWEEP_DEFER_SECONDS`); after that S3 runs on the fresh check alone and is marked overdue. `status` shows each deferral (repo, reason, since) and the number of findings not checked this pass, and `fleet-doctor` warns on an overdue deferral. A decision section is a line that STARTS with `## Decision required` (level 2, any case, CRLF included), followed by the end of the line or any suffix that does not continue the word (`## Decision required (re-verified 2026-10-09)`, `: pick`, `- x`). `## Resolved (was: Decision required)`, deeper headings, inline mentions, code and quotes are not. A decision-rows block stands for the section of a labelled batch (S1b) but never makes an unlabelled issue an S1a finding, so a resolved batch is not reported.
 
-**S3 is strict.** It fires only for an open issue or PR whose LATEST comment (not an older one a later comment superseded, not the body) or a report states it in a strong form (`waiting on`, `waits on`, `held for <name>`, `needs <name>'s decision|yes|answer|approval|review|OK`, `for <name>'s review`) in a sentence with no conditional or descriptive marker BEFORE the phrase (`if`, `would`, `may`, `could`, `proposal`, `option(s)`, `says`, `saying`, `said`; a hedge after it, as in `waiting on Adam, if you agree reply yes`, does not cancel it); code, quotes, negations and past tense (`was`, `were`, `had been`, `previously`, `formerly`) are ignored. **Attribution:** a report is about the refs its sentence names (`#N`, `repo#N`, `owner/repo#N`; a sentence ends at `.`, `!` or `?` followed by a space, or a line end), never about its own ask: one that names no ref raises nothing, and refs that are human-tier decisions (or closed, or not in a watched repo) raise nothing. A comment is about its own item only when its sentence names no ref, or names that item; when it names other refs and not the item, it is about those, and when every ref it names is one the switchboard cannot resolve to a watched item (`web#4` with no such repo, a repo that is not watched) it is not attributed to any item and is counted as unattributed in `status`. S2 keeps the wider phrase list over the body and the last 5 comments. The remaining false positives are a plain sentence that states a wait about something else (a status that quotes someone's plan without a marker word).
+**S3 is strict.** It fires only for an open issue or PR whose LATEST comment (not an older one a later comment superseded, not the body) or a report states it in a strong form (`waiting on`, `waits on`, `held for <name>`, `needs <name>'s decision|yes|answer|approval|review|OK`, `for <name>'s review`) in a sentence with no conditional or descriptive marker BEFORE the phrase (`if`, `would`, `may`, `could`, `proposal`, `option(s)`, `says`, `saying`, `said`; a hedge after it, as in `waiting on the owner, if you agree reply yes`, does not cancel it); code, quotes, negations and past tense (`was`, `were`, `had been`, `previously`, `formerly`) are ignored. **Attribution:** a report is about the refs its sentence names (`#N`, `repo#N`, `owner/repo#N`; a sentence ends at `.`, `!` or `?` followed by a space, or a line end), never about its own ask: one that names no ref raises nothing, and refs that are human-tier decisions (or closed, or not in a watched repo) raise nothing. A comment is about its own item only when its sentence names no ref, or names that item; when it names other refs and not the item, it is about those, and when every ref it names is one the switchboard cannot resolve to a watched item (`web#4` with no such repo, a repo that is not watched) it is not attributed to any item and is counted as unattributed in `status`. S2 keeps the wider phrase list over the body and the last 5 comments. The remaining false positives are a plain sentence that states a wait about something else (a status that quotes someone's plan without a marker word).
 
 S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N findings: <repo#n kind>, ... (+M more)`, only
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
@@ -2229,6 +2237,126 @@ and the time slot, so a restart is one delivery. The sweep never edits GitHub an
 resolves or escalates. Text in code blocks, inline code and quoted lines is ignored, and a negation just before the phrase (`not`, `no longer`, `never`, ...) cancels it.
 S1 also flags charters and other issues that carry the awaiting label, by design. Reads are bounded: per repo one open issues and PRs list and one recent comments list (at most 2 pages each, a longer one is shown as capped), kept 15 minutes. The sweep makes at most 6 `gh` calls per pass (a list costs its pages, a single-issue read for S4 costs one), 2 of them reserved for the S4 reads; stale repos and unchecked decisions are taken least recently read first, so across passes every one is reached and none starves. A batch issue (a `decision-rows` block) counts as having its decision section, so S1b does not fire for it. `status` shows `sweep` with the
 counts by kind and `fleet-doctor` warns when there are findings.
+
+### The triage function (#130, rule family T)
+
+**THE OWNER'S HOLD, stated plainly: the triage function writes NOTHING to GitHub. No label, no assignment, no comment, no
+close, no edit, ever, until the person has reviewed its shadow findings and says otherwise.** There is no code for any of
+it: the function only reads. Its only writes are audit lines (`triage.finding`, `triage.dismissed`, `triage.unreadable`,
+`triage.summary`), `triage.json` (what `status` shows) and, only when `enabled`, one batched fact to the Chief of Staff.
+The fix rules of the plan (a missing label, an assignment, a comment) stay unbuilt.
+
+It grows the sweep: the same hub reads, call budget, fresh re-check, shadow default and batched fact. Config key `triage`
+(absent, `null` or `{}` is shadow; `"enabled": true` adds only the wake of the Chief of Staff; `false` is fully off):
+`repos` (the tracked repos, `OWNER/REPO`; default: the repos the daemon already watches. The extra tracked repos that are not watched are named here in the local config, never in this public source; each is read with its existing per-repo account),
+`required_labels` (`{repo: [label or [alternatives], ...]}`; no entry, no T2), `sla` and `sla_overrides` (per repo; the
+numbers below are the defaults; every `_days` value is in days and may be a fraction, `2/24` is two hours), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
+(true), `realarm_hours` (24), `max_findings` (30), `calls_per_pass` (30), `pass_seconds` (10).
+
+| Rule | Finding | Default SLA |
+|---|---|---|
+| T1 | open issue with no assignee, not in a charter's chain (charter, ask, work item, by the parent links) and not worked by an agent | 1 day after creation |
+| T2 | a required label group missing (config only) | 1 hour (`1/24` day) |
+| T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 1 day, other issues 3 days |
+| T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | T5 2 hours (`2/24` day; at that age it goes to cos in the batched fact and cos reminds the person), T6 2 days |
+| T7 | an open non-draft PR of OURS with no review. Other teams use formal GitHub reviews, which the list reads do not show, so their PRs are never called unreviewed (no T7, not even a flag). The fresh re-check (one `gh pr view`) applies the captain decision's own evidence (`captain_evidence`, built on `pr_reviews_at` and `pr_signed_at`): a formal review by a non-author at the exact head, or a signed comment naming the head from a non-author agent that is not a sender of the PR's notice, means REVIEWED. A signed comment counts only when the PR's notice is on file (its sender is then known and excluded); with none, only a formal review at the head counts, and a finding says `no notice on file` (our flow always notices, so a PR without one is itself worth the flag). A `MERGE: captain` PR that is already in the decision list is T6's, not T7's (while the list is incomplete a captain PR waits). A review at an OLDER head only fires once the last push is older than the SLA, with the evidence `review at an older head` and the hours since the push | 4 hours; a PR older than 14 days is not judged |
+| T8 | a blocked ask (a `blocked` label) | 1 day quiet |
+| T9 | an ask with no activity (T3 takes precedence) | 3 days |
+| T10 | a closed issue still carrying an awaiting label | immediate |
+| T11 | an orphan: in no chain, no assignee, untouched (T1 takes precedence, so it covers items an agent works on) | 1 day |
+
+T4 and T12 are the sweep's S5 and the report fold; they are not repeated. **Another person's or team's issue or PR is never
+our violation:** an item whose author and assignees are none of ours (`our_logins`), that is in no chain, is not
+agent-worked and has no notice, is reported only as `OO` (other-owner, flag only), whatever rules it would break, with
+`would_be` listing them. An `OO` flag is audited but is not one of our findings (it is not in the counts or the total, shown as its own `other-owner` count) and never wakes the Chief of Staff on its own: when a wake happens anyway for real findings, the fact adds a count (`Also N other-owner flag(s)`), and the daily summary carries it. Precision: each candidate is re-read fresh before it is audited or raised (T3 and T7 also re-read the
+comments); one the fresh read does not bear out is `triage.dismissed`; one that cannot be checked now is neither audited nor
+raised that pass. A repo the account cannot read is `unreadable`, audited once and shown in `status` and `fleet-doctor`,
+never findings. Reads: four units per repo (open issues, recent comments, closed issues per awaiting label), each at most 2
+pages (the closed lists 1), kept 15 minutes, the stalest unit first across all repos so none starves; units not yet read are listed as
+unchecked. The budget is a config value, `triage.calls_per_pass` (default 30, 4 to 100; a third is kept for the fresh re-checks of
+the pass's candidates) with `triage.pass_seconds` (default 10, 1 to 60: no new read starts after it, so a slow GitHub cannot hold the pass; the sweep has its own 8 seconds) as the time bound. The budget matters only on a cold cache:
+a full cycle over 7 repos is 28 calls with small lists (at most 42 with full pages), so it completes in two passes; after that a pass
+reads nothing until the 15-minute lists expire. Steady-state cost at the default for 7 repos: the lists once per 15 minutes, about
+112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
+counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
+count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache
+they use at most the sum.
+
+Reporting: one batched fact per pass (`triage: N findings: ref rule, ...`, refs and kinds only), each item re-raised at most
+once per `realarm_hours`; one summary line every 24 hours since the last one (counts by rule: found, other-owner flags, escalated, unchecked, unreadable repos), audited
+always and sent only when enabled. `status` shows `triage shadow: N findings (T1 a, T3 b, ...)`. `bin/triage-sample` writes
+the last week's findings to a LOCAL sheet (it refuses a path inside a git working tree) with `label` and `note` columns for
+TP/FP, and `triage-sample --summary FILE` computes precision per rule from the filled sheet (like `bin/judge-sample`); a rule
+under 80% is fixed or dropped first.
+
+### Who is calling (#138)
+
+**What this is, plainly: a mistake-guard, not a security boundary.** `OPENCODE_SESSION_ID` is an environment variable the caller
+controls, exactly as `HERDR_PANE_ID` is, and every agent can read every other agent's session id from `herdr agent list`. An
+agent that sets the variable by hand to another agent's session id is taken for that agent, and through the `gh` shim it also gets
+that agent's account token (the token follows the resolved repo). Nothing here defends against that; it relies on the harness
+setting the variable per session and on the caller being cooperative (the one reaction to a forged id is the pane warning below, and
+only when the pane disagrees). What it fixes is the accident: stale or crossed inherited variables after a server restart, which
+used to make an agent act as another. Treat any claim below that "an agent is never taken for another" as covering mistakes, not
+adversaries.
+
+An agent is not taken for another by accident. The caller is identified by its OWN session, `OPENCODE_SESSION_ID` (the harness sets it
+per session and it is unique), looked up in the switchboard's own registry (v2's session record, whose `metadata.fleet` the
+launch wrote, and herdr's agent list): its name, role and repo come from there, **never from inherited environment
+variables** (`HERDR_PANE_ID`, `FLEET_SWITCHBOARD_ROLE`, `FLEET_SWITCHBOARD_REPO`, `GH_TOKEN`), which a server restart can leave
+belonging to another agent (the live case: an orchestrator's shell carried its own session id and a store-ops coder's pane, role,
+repo and token, so every call was attributed to the coder). This covers `send`, `report`, `notice`, `remind`, `launch`,
+`handoff`, `comment`, `decisions`, `orders`, `intents` and `whoami`. Only an unknown session is refused, with
+`cannot tell who you are` and a non-zero exit, and it is never read as "a person in a plain shell" (a session v2 knows that is not a
+fleet agent is a person's, so a decision write from one is yours as before). A `HERDR_PANE_ID` that names another agent's session
+is kept as the diagnostic: one warning line, naming both agents and the pane this session runs in, saying the identity was taken
+from the session. With `OPENCODE_SESSION_ID` unset (a shell outside OpenCode) nothing changes: the pane identifies the caller, and
+with neither the answer is `cannot tell who you are`.
+
+The `gh` shim names the caller by `whoami` (falling back to `agent`, never blocking) and, when the config has `gh_users`, runs
+the real `gh` with `GH_TOKEN` set from the account that map gives for the repo of the caller's resolved identity
+(`fleet-switchboard whoami --repo`, resolved from its session): the same map and the same `gh auth token --user` the daemon uses,
+so an inherited token (a restart can leave an agent with another agent's, or the wrong account's) never decides who an agent
+acts as, in either direction. The token is put only in the child's environment: never printed, logged or in argv. With no `gh_users`,
+no mapping for the repo, no switchboard (or one too old to answer `whoami --repo`), no repo or no token it leaves the environment as
+it was, says nothing, and `gh` runs. The whole lookup (who am I, which account, its token) is ONE `whoami --json` call plus at most one
+`gh auth token`, under one shared deadline of 3 seconds (`FLEET_SHIM_LOOKUP_SECONDS`, kept between 0.2 and 10): `gh` is never blocked,
+and a wedged daemon or v2 adds at most that, after which the call is signed `agent` and runs with the environment's token. **The daemon is nobody's agent.** The switchboard's own `gh` calls (the daemon's forwarders, intent reads, sweep and triage reads, a command's own reads) already name their account (`GhAccounts`); the shim must never swap it. So (1) every switchboard process sets `FLEET_SWITCHBOARD_OWN_GH=1`, `GhAccounts`' per-repo environments carry it, and the shim leaves the token of such a call alone; (2) the daemon never carries a caller's identity: `daemon_environment` (the hook and `ensure` start) and `run` itself drop `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `OPENCODE_SESSION_ID`, `FLEET_SWITCHBOARD_ROLE` and `FLEET_SWITCHBOARD_REPO`, whichever agent's shell started it (a daemon that inherited an agent's session would otherwise resolve as that agent, and its calls to every other organisation's repos would 404 under the wrong account). Real agents' own typed `gh` calls carry no marker and are re-identified as before.
+The policy judge never reads the
+pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks` does the same. `status` lists the agent each live
+session resolves to, a `WARNING` for any disagreement (a session shown in two panes, a name claimed by two sessions, a pane labelled
+differently from its session's fleet name) and what the shell running `status` resolves to.
+
+### Which program a pane runs
+
+A pane is held ("runs a different opencode") unless its process is the configured v2. The comparison is by **resolved binary**, not
+command text: both sides by realpath; and a pane started with the **bare command** (`opencode -s ses_...`, which the shell found on
+its own path) is the same program when that name resolves, on the daemon's PATH, to the same real file. When it resolves to a
+different file of the same name the two are still the same program if both answer `--version` with the same first line (a copy;
+asked at most 3 seconds, remembered per file and modification time). Anything that cannot be decided is held: a shell, a name not
+on the daemon's PATH, a relative path, a different binary or version, a pane that cannot be read. A program of any other name is
+never asked for its version.
+
+### Held for the owner: labels, not prose (#133)
+
+Whether a PR is held for the owner, and why, is state in **labels** the switchboard reads, namespaced like the awaiting labels
+(`<user>:...`, the OS user). `fleet-switchboard labels ensure` creates them in every watched repo (or `--repo`), idempotently and with
+each repo's own gh account: `<user>:merge-captain` (held for the owner), `<user>:merge-automatic` (merges on green CI and independent
+review), and the reasons a PR is held, one or more of `<user>:hold-security`, `hold-credential`, `hold-contract`, `hold-policy`,
+`hold-prod-config`, `hold-other-area` (an area owned by another team).
+
+**One rule, one helper.** `is_captain(pr)` (a dict with `labels` and `body`) is the only place that decides it, used by the PR facts
+(and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the
+transition window only, when its body's first non-empty line starts with `MERGE: captain`. **The label wins on disagreement:**
+`merge-captain` holds the PR whatever the line says, `merge-automatic` releases it whatever the line says, and the line is read only when
+there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` (2026-12-01, about 30 days after the labels landed); the
+one-line way to drop the marker is to set it to `None`, after telling the Chief of Staff. A captain decision lists its hold reasons
+(`holds`, from the `hold-*` labels, nothing from prose), and a T6 finding carries them too.
+
+**The sweep finishes the relabelling.** Two findings, both read-only: S6a, a PR whose first line says `MERGE: captain` but which has no
+merge label; S6b, a PR whose merge label and first line disagree (or which carries both merge labels: held, and said so). Like every
+sweep finding each is re-checked against a fresh read before it is raised. The sweep and the triage write nothing to GitHub: a person
+(or the owning orchestrator) adds the labels.
 
 ### Self-wakes
 
@@ -2273,14 +2401,14 @@ fleet cannot be read the reminder waits for the next pass. Reminders without a c
 **The daily friction wake.** Off unless enabled. Add to `config.json` (the section is validated like the other keys):
 
 ```json
-"friction_wake": {"enabled": true, "hour": 9, "to": "fleetkit", "text": null}
+"friction_wake": {"enabled": true, "hour": 9, "to": "cos", "text": null}
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | nothing happens, and nothing is read, unless `true` |
 | `hour` | `9` | local hour (0-23, the daemon's time zone) of the daily wake; `null` = every 24 h from the first wake |
-| `to` | `fleetkit` | the agent a proposal goes to; named only in the text, and never woken by this |
+| `to` | `cos` | the agent a proposal goes to; named only in the text, and never woken by this |
 | `text` | `null` | the wake's text; `null` is `Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send <to> a one-paragraph proposal: fleet-switchboard send <to> --issue <n> "<proposal>". If nothing, do nothing and say nothing.` |
 
 Each running agent whose fleet role is `orchestrator` (never the Chief of Staff, a coder, or the agent named by `to`) gets
@@ -3682,6 +3810,16 @@ such a worker), steering into a working turn, an answer's delivery to the worker
 a PR notice, and the reports listing. With no single registered agent of that role the name stays literal everywhere, so the behaviour is unchanged.
 `reports_to` as shown to a person is still the text the worker was launched with.
 
+## Plan check (#135)
+
+`fleet-switchboard plan check <owner/repo#N | issue URL | --file PATH> [--json]` is gate G0a of plan-driven development:
+it reads a plan (the latest `Plan (scenarios)` comment, else the issue body), parses its one `scenarios:` yaml block with a
+small strict parser (no yaml dependency, nothing evaluated), checks every scenario is well-formed and discriminating and
+every Done-when clause of the ask is covered by an S scenario, and prints PASS or FAIL, one line per defect and the
+the plan's two hashes (scenario hash and whole-plan hash; approval binds to the plan hash). Exit 0 pass, 1 fail, 2 unreadable. It reads only. The rules, the schema, a good example and three
+bad ones are in [docs/plan-template.md](plan-template.md); the checker is `bin/plan_check.py` (pure: text in, data out).
+A one-sentence Done-when with several clauses is declared in a `clauses:` block, which is verified against the ask's text. The `fleet-planning` skill that teaches orchestrators to write plans is a later slice.
+
 ## Status speed (#86)
 
 `fleet-switchboard status` spent most of its time on the intent-gap check: one serial `gh api` read (about 0.4 s)
@@ -3706,7 +3844,7 @@ instruction. The first rule is `* * deny`; allows follow (reads, `fleet-switchbo
 guards come last (redirects, `$()`, `gh api` writes, `--admin`/`--auto`, `gh repo|secret|variable|release|auth|extension|alias`, `gh workflow run`,
 `az` write verbs and secret values, `curl` to localhost, private ranges or with userinfo, secret-bearing paths). Last match wins and any deny
 denies. **Nothing asks**: a denial is hard ("Permission denied: shell") and the Chief of Staff routes the work to the owning orchestrator
-instead of blocking on a dialog. Principal's word (Adam): "I don't have a problem with you using gh to write comments or close/merge PRs";
+instead of blocking on a dialog. Principal's word (the owner): "I don't have a problem with you using gh to write comments or close/merge PRs";
 a questionable PR is still held and raised (instruction level, not enforceable by a pattern).
 
 Pitfalls found by `tools/cos-permissions-proof/` (read its README):
@@ -3756,7 +3894,7 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
 - `az` is allowed only as `az <group> [<sub>] show|list` (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
   `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|containerapp|appconfig|deployment|webapp config|app-insights`
   and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
-- `gh`: the owner's words cover comments and close/merge; Adam's later answers also covered reopen, edit, ready and review. `--approve` is denied
+- `gh`: the owner's words cover comments and close/merge; the owner's later answers also covered reopen, edit, ready and review. `--approve` is denied
   (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.
 - `curl` is denied (second review). `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
   inside a secret-looking filename that is not in a dot-directory (`id_\rsa`) is not caught.
