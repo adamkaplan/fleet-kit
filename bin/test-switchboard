@@ -27933,6 +27933,76 @@ console.log(JSON.stringify(out));
         baseline_golden(self, "plugin-views-styled", got)
 
 
+CAPTAIN_ROW_HARNESS = r"""
+import * as d from "%(url)s";
+const now = Date.parse("2026-01-10T12:00:00Z");
+const iso = (secs) => new Date(now - secs * 1000).toISOString();
+const issue = { id: "#41", kind: "issue", tier: "human", ask: 41, repo: "acme-org/widget-host", title: "Which database?", headline: "Which database?", since: iso(86400) };
+const captain = (extra = {}) => ({ id: "pr:acme-org/widget-host#132", kind: "captain", tier: "human", ask: null, repo: "acme-org/widget-host",
+  number: 132, title: "Fix the wake text", headline: "widget-host#132 Fix the wake text", since: iso(86400), ci: "green", review: "approved", ...extra });
+const snap = (decisions) => ({ status: "ok", decisions, errors: [] });
+const view = { kind: "human" };
+const out = {};
+const show = (list, opts) => { const rows = d.styledRows(snap(list), now, 34, view, opts); return { text: d.styledText(rows, 34), links: rows.filter((r) => r.url).map((r) => r.url), ids: rows.filter((r) => r.id).map((r) => r.id) }; };
+out.plain = show([issue, captain()]);
+out.v3 = show([issue, captain()], { v3: true });
+out.entry = d.buildView(snap([issue, captain()]), now, 34, view).groups.flatMap((g) => g.entries.map((e) => [e.head, e.url || null]));
+out.urls = [captain(), captain({ number: "0" }), captain({ number: -3 }), captain({ number: 1.5 }), captain({ repo: "bad repo" }),
+  captain({ repo: "../x" }), captain({ repo: "a/b?q=1" }), captain({ number: "12; rm" }), captain({ number: null })].map((x) => d.urlOf(x));
+out.safe = [d.safeUrl(d.urlOf(captain())), d.safeUrl("https://github.com/acme-org/widget-host/pull/132?x=1")];
+out.idOf = [d.idOf(captain()), d.idOf(captain(), () => true), d.idOf(captain({ repo: "bad repo" })), d.idOf(captain({ number: null })), d.idOf(issue),
+  d.idOf({ id: "pr:o/r#7", kind: "notice", repo: "o/r", number: 7 })];
+out.title = d.styledText(d.styledRows(snap([captain({ headline: "x\u001b]8;;http://evil\u0007y" })]), now, 34, view), 34).join("|");
+console.log(JSON.stringify(out));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestPanelCaptainRows(Base):
+    """A `MERGE: captain` PR row is linked and named like an issue row: its PR URL, a short ref, the age not cut off."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.home / "captain-harness.mjs"
+        script.write_text(CAPTAIN_ROW_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+        done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    PR = "https://github.com/acme-org/widget-host/pull/132"
+
+    def test_the_row_links_to_its_pull_request_like_an_issue_row_links_to_its_issue(self):
+        for mode in ("plain", "v3"):
+            with self.subTest(mode=mode):
+                links = self.r[mode]["links"]
+                self.assertIn(self.PR, links)
+                self.assertIn("https://github.com/acme-org/widget-host/issues/41", links)
+                self.assertNotIn("https://github.com/acme-org/widget-host/issues/132", links)
+        self.assertEqual(self.r["entry"][1], ["widget-host#132 1d", self.PR])
+
+    def test_the_id_is_the_short_ref_and_the_age_is_on_the_line(self):
+        for mode in ("plain", "v3"):
+            with self.subTest(mode=mode):
+                text = self.r[mode]["text"]
+                line = next(l for l in text if l.startswith("widget-host#132"))
+                self.assertTrue(line.rstrip().endswith("1d"), line)
+                self.assertLessEqual(len(line), 34)
+                self.assertFalse(any("pr:" in l for l in text), "the internal key is never shown")
+        self.assertEqual(self.r["idOf"], ["widget-host#132", "acme-org/widget-host#132", "pr:acme-org/widget-host#132",
+                                          "pr:acme-org/widget-host#132", "#41", "pr:o/r#7"])
+
+    def test_the_internal_key_stays_the_rows_id_for_the_panel(self):
+        self.assertIn("pr:acme-org/widget-host#132", self.r["plain"]["ids"])
+
+    def test_the_link_is_built_from_repo_and_number_with_the_same_checks(self):
+        self.assertEqual(self.r["urls"], [self.PR] + [None] * 8)
+        self.assertEqual(self.r["safe"], [self.PR, None])
+
+    def test_a_title_cannot_reach_the_terminal_through_the_row(self):
+        self.assertNotIn("\u001b", self.r["title"])
+        self.assertNotIn("\u0007", self.r["title"])
+
+
 STYLED_UNIT_HARNESS = r"""
 import * as d from "%(url)s";
 const now = Date.parse("2026-10-08T12:00:00Z");
