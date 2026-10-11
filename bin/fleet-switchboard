@@ -15729,27 +15729,66 @@ def _charter_body(reader, repo, charter):
     return body
 
 
-def edit_charter_orders(engine, repo, charter, event, detail, change):
-    """Edit the charter's orders: read the body, `change(body)` it, write it, read it back; once more
-    when the readback does not show the change (somebody edited in between); fail loudly when it still
-    does not. Audited before and after. Returns the orders after the change."""
+ORDERS_READBACK_WAITS = (0.0, 0.5, 1.5)  # seconds to wait before each look at the issue after a write (a read can lag the write it follows)
+
+
+def _sleep(seconds):
+    if seconds:
+        time.sleep(seconds)
+
+
+def edit_charter_orders(engine, repo, charter, event, detail, change, done):
+    """Edit the charter's orders safely. `change(body)` is the edit; `done(body)` says whether that edit is already in `body`
+    (an add: the exact bullet is there; a remove: that bullet's text has one occurrence fewer than before). Read the body; when
+    `done` already holds there is nothing to write. Otherwise read it AGAIN just before the write and refuse (nothing written)
+    if it moved since; write; then look at the issue (a few times: a read can lag a write). A write whose outcome is unknown is
+    never repeated blind: only after a fresh read still lacks the change is it made once more, from that fresh body.
+    Audited before and after. Returns the orders after the change."""
     reader = engine.intents
     body = _charter_body(reader, repo, charter)
+    if done(body):
+        reader.invalidate(charter, repo)
+        return parse_orders(body)  # already so (a retry, or the same order given twice): nothing to write
     new_body = change(body)  # an OrdersError here is a refusal: nothing is written, nothing audited as a write
     with engine._external(event, "charter:%s#%d" % (repo, charter), dict(detail, charter=charter, repo=repo)) as result:
         for attempt in (1, 2):
-            if attempt == 2:
+            if attempt == 1:
+                fresh = _charter_body(reader, repo, charter)
+                if fresh != body:
+                    raise OrdersError("#%d changed while this edit was being prepared; nothing was written. Run it again" % charter)
+            else:
                 body = _charter_body(reader, repo, charter)
+                if done(body):
+                    result["attempts"] = 1
+                    reader.invalidate(charter, repo)
+                    return parse_orders(body)  # the first write had landed after all: do not write again
                 new_body = change(body)
             write_issue_body(reader, repo, charter, new_body)
-            back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
-            got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
-            if got == new_body or section_orders(got) == section_orders(new_body):
-                result["attempts"] = attempt
-                reader.invalidate(charter, repo)
-                return parse_orders(got)
-        raise OrdersError("wrote #%d twice and read back the issue without the change: the Standing orders "
-                          "section there is not what was written. Look at the issue; nothing was recorded" % charter)
+            for wait in ORDERS_READBACK_WAITS:
+                _sleep(wait)
+                back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+                got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
+                if got == new_body or done(got):
+                    result["attempts"] = attempt
+                    reader.invalidate(charter, repo)
+                    return parse_orders(got)
+        raise OrdersError("wrote #%d and read the issue back without the change, twice: the Standing orders section there is "
+                          "not what was written, and whether a write landed is unknown. Look at the issue before running it "
+                          "again; nothing more was written" % charter)
+
+
+def order_bullet(text, by, date):
+    """The text of the bullet `add_order_to_body` writes (what `section_orders` returns for it)."""
+    return "%s (ordered by %s, %s)" % ((text or "").strip(), " ".join(str(by or "").split())[:60], date)
+
+
+def remove_order_text(body, text):
+    """`body` without the first order of the section whose text is `text` (the body unchanged when there is none)."""
+    found = _orders_section(body or "")
+    for number, (_, _, bullet) in enumerate(found["bullets"] if found else [], 1):
+        if bullet == text:
+            return remove_order_from_body(body, number)
+    return body
 
 
 def orders_caller(engine, args):
@@ -15829,15 +15868,22 @@ def orders_write(engine, args, caller, role, repo, charter):
             by = args.by or os_user()
             date = datetime.fromtimestamp(engine.now(), timezone.utc).strftime("%Y-%m-%d")
             detail = {"caller": caller, "by": by, "text": (args.text or "").strip()}
+            bullet = order_bullet(args.text, by, date)
             orders = edit_charter_orders(engine, repo, charter, "orders.add", detail,
-                                         lambda body: add_order_to_body(body, args.text, by, date))
+                                         lambda body: add_order_to_body(body, args.text, by, date),
+                                         lambda body: bullet in section_orders(body))  # the same order, by and day twice is one order
         else:
-            current = parse_orders(_charter_body(engine.intents, repo, charter))
+            now_body = _charter_body(engine.intents, repo, charter)
+            current = parse_orders(now_body)
             if not 1 <= args.number <= len(current):
                 raise OrdersError("no order %d: this charter has %d" % (args.number, len(current)))
-            detail = {"caller": caller, "number": args.number, "text": current[args.number - 1]}
+            remove_order_from_body(now_body, args.number)  # refuses the legacy `Standing authority:` line
+            target = current[args.number - 1]
+            detail = {"caller": caller, "number": args.number, "text": target}
+            before = section_orders(now_body).count(target)
             orders = edit_charter_orders(engine, repo, charter, "orders.remove", detail,
-                                         lambda body: remove_order_from_body(body, args.number))
+                                         lambda body: remove_order_text(body, target),  # by its text: a number can move under a retry
+                                         lambda body: section_orders(body).count(target) < before)
     except (OrdersError, IntentError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE if isinstance(err, OrdersError) else EXIT_ERROR
