@@ -14705,6 +14705,13 @@ class TestSweep(Base):
         self.assertEqual(len(self.sweep([report, self.human(33, "captain")])), 2)
         self.assertEqual(self.hub.single, [("acme/api", "issues/33")])
 
+    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_not_withdrawn(self):
+        self.hub.closed = {30, 31, 32}
+        closed_but_labelled = dict(self.human(30), closed=True)
+        kept = self.sweep([closed_but_labelled, self.human(31), self.human(32, "captain")])
+        self.assertEqual([d["ask"] for d in kept], [30], "only the one listed on purpose stays; the others are withdrawn as before")
+        self.assertNotIn(("acme/api", "issues/30"), self.hub.single, "no read is spent on it")
+
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
         decisions = [self.human(30), self.human(31)]
@@ -20406,12 +20413,17 @@ class TestDecisionsFromGitHub(Base):
         self.assertEqual(self.derive()[0], [])
         self.assertEqual(len(self.gh.api_calls), calls)
 
-    def test_a_closed_issue_is_not_a_decision(self):
+    def test_a_closed_issue_that_keeps_the_persons_label_stays_marked_closed_and_leaves_with_the_label(self):
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)
         self.assertEqual(len(self.derive()[0]), 1)
         issue["state"] = "closed"
         self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        (entry,) = self.derive()[0]
+        self.assertEqual((entry["tier"], entry.get("closed")), ("human", True))
+        self.assertTrue(entry["headline"].endswith("(closed)"))
+        issue["labels"] = []
+        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue)})
         self.assertEqual(self.derive()[0], [])
 
     def test_derivation_adds_no_gh_call_per_pass(self):
@@ -30635,6 +30647,42 @@ class TestDecisionBaselineSeams(BaselineWorld):
         baseline_golden(self, "seams-headline-known-issue-title",
                         [{"id": d["id"], "ask": d["ask"], "repo": d["repo"], "headline": d["headline"]}
                          for d in found["decisions"]])
+
+    def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        mine, cos = "me:awaiting-user", "me:awaiting-cos"
+        issue = lambda n, state, names: {"number": n, "title": "issue %d" % n, "state": state,
+                                         "labels": [{"name": x} for x in names], "updated_at": "2027-01-15T07:00:00Z"}
+        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: listed, closed
+        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: forgotten
+        hub.note_awaiting_issue(API, issue(22, "open", [mine]))                # open: as ever
+        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: the person's
+        got = {r["number"]: (r["tier"], r["closed"]) for r in hub.awaiting_listing()[0]}
+        self.assertEqual(got, {20: ("human", True), 22: ("human", False), 23: ("human", True)})
+        hub.note_awaiting_issue(API, issue(20, "closed", []))                  # the label comes off: it leaves
+        self.assertNotIn(20, {r["number"] for r in hub.awaiting_listing()[0]})
+
+    def test_the_closed_issue_shows_in_the_human_tier_with_its_report_folded_in(self):
+        entries = sb.decision_core.build_entries(
+            [{"kind": "issue", "title": "Won't-do: drop the legacy path", "ask": 7, "agent": None, "since": 100.0, "seed": "issue:acme/api#7",
+              "bare": True, "repo": "acme/api", "tier": "human", "closed": True},
+             {"kind": "issue", "title": "Open question", "ask": 8, "agent": None, "since": 100.0, "seed": "issue:acme/api#8",
+              "bare": True, "repo": "acme/api", "tier": "human"},
+             {"kind": "report", "title": "worker: closed it as won't-do", "ask": 7, "agent": "orch", "since": 200.0,
+              "seed": "report:1", "bare": False, "repo": "acme/api", "tier": "cos", "repo_known": True}],
+            ["d1", "d2", "d3"], "acme/api", lambda repo, number: None)
+        by = {e["ask"]: e for e in entries}
+        self.assertEqual(sorted(by), [7, 8], "the report folded into the issue's row: one row, not two")
+        self.assertEqual((by[7]["tier"], by[7]["closed"], by[7]["reported_by"]), ("human", True, ["orch"]))
+        self.assertTrue(by[7]["headline"].endswith("(closed)"))
+        self.assertNotIn("closed", by[8])
+        self.assertFalse(by[8]["headline"].endswith("(closed)"))
+        long_title = "x " * 120
+        got = sb.decision_core.build_entries([{"kind": "issue", "title": long_title, "ask": 9, "agent": None, "since": 1.0,
+                                               "seed": "i", "bare": True, "repo": "acme/api", "tier": "human", "closed": True}],
+                                              ["d9"], "acme/api", lambda r, n: None)
+        self.assertTrue(got[0]["headline"].endswith("(closed)"), "the suffix is never cut")
 
     def test_the_tier_of_an_issue_payload_with_both_labels(self):
         """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
