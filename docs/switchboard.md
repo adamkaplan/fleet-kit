@@ -2285,6 +2285,12 @@ unchecked. The budget is a config value, `triage.calls_per_pass` (default 30, 4 
 the pass's candidates) with `triage.pass_seconds` (default 10, 1 to 60: no new read starts after it, so a slow GitHub cannot hold the pass; the sweep has its own 8 seconds) as the time bound. The budget matters only on a cold cache:
 a full cycle over 7 repos is 28 calls with small lists (at most 42 with full pages), so it completes in two passes; after that a pass
 reads nothing until the 15-minute lists expire. Steady-state cost at the default for 7 repos: the lists once per 15 minutes, about
+Why `status` can show many findings "not checked this pass": after a daemon restart nothing is confirmed (the memory is rebuilt), and each
+finding needs one fresh read (two with comments); at about a second a read the 10 second bound lets a pass confirm roughly ten, so a list
+of a hundred drains over ten or more passes, then stays drained until a confirmation's 15 minutes pass. Most of the list is usually
+other-owner flags (not ours, never acted on). They are checked **after** our own findings, which are never kept waiting behind them, and
+within each group the least recently attempted comes first, so none starves. `status` names how many unchecked are other-owner flags and the
+age of the oldest unchecked finding (since its last answer, or since it was first seen).
 112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
 counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
 count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache

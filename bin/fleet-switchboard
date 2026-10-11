@@ -7193,6 +7193,8 @@ class TriageState:
         self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
         self.unreadable = {}     # repo -> reason, audited once
         self.confirmed, self.attempted, self.alarmed = {}, {}, {}
+        self.verified = {}       # (rule, ref) -> when a fresh read last gave an answer (true or false): the age of "unchecked"
+        self.first_seen = {}     # (rule, ref) -> when a pass first saw it as a candidate (the age of one never checked)
         self.enriched = {}       # (rule, ref) -> evidence the fresh read added
         self.logged, self.facts, self.current = set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
@@ -7549,27 +7551,41 @@ def triage_pass(engine, decisions, now, errors=()):
     units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
-    findings, unchecked = [], 0
-    for rule, ref, evidence in sorted(candidates, key=lambda c: (state.attempted.get((c[0], c[1]), 0), c[0], c[1])):
+    findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
+
+    def verify(rule, ref, evidence):
+        """True/False/None for one finding; keeps the confirmed, verified and attempted records."""
         pair = (rule, ref)
-        if now - state.confirmed.get(pair, 0) < TRIAGE_TTL:
-            findings.append((rule, ref, evidence))
-            continue
-        if engine.now() - state.started >= seconds:
-            unchecked += 1
-            continue
         state.attempted[pair] = now
         verdict = triage_verify(engine, state, rule, ref, cfg, now, budget, evidence)
+        if verdict is not None:
+            state.verified[pair] = now
         if verdict:
             state.confirmed[pair] = now
-            findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
-        elif verdict is None:
-            unchecked += 1
-        else:
+        elif verdict is False:
             state.confirmed.pop(pair, None)
             if (pair, "d", int(now // 86400)) not in state.logged:
                 state.logged.add((pair, "d", int(now // 86400)))
                 engine._note("triage.dismissed", ref, {"rule": rule, "ref": ref, "why": "a fresh read does not bear it out"})
+        return verdict
+
+    # Our own findings first, the other-owner flags (which nobody acts on) after them: they must not use the budget our findings
+    # need. Within each, the least recently attempted first, so every one is reached within a bounded number of passes.
+    for rule, ref, evidence in sorted(candidates, key=lambda c: (c[0] == "OO", state.attempted.get((c[0], c[1]), 0), c[0], c[1])):
+        pair = (rule, ref)
+        state.first_seen.setdefault(pair, now)
+        if now - state.confirmed.get(pair, 0) < TRIAGE_TTL:
+            findings.append((rule, ref, evidence))
+            continue
+        verdict = None
+        if engine.now() - state.started < seconds:
+            verdict = verify(rule, ref, evidence)
+        if verdict:
+            findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
+        elif verdict is None:
+            unchecked += 1
+            unchecked_other += rule == "OO"
+            oldest = max(oldest, now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
     day = int(now // 86400)
     counts, other_owner = {}, 0
@@ -7586,7 +7602,8 @@ def triage_pass(engine, decisions, now, errors=()):
                                                  "evidence": evidence, "woken": cfg["enabled"], "applied": False})
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": sum(counts.values()),
                      "other_owner": other_owner, "at": iso(now),
-                     "unchecked": unchecked, "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
+                     "unchecked": unchecked, "unchecked_other_owner": unchecked_other,
+                     "oldest_unchecked_seconds": int(oldest), "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
                      "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
     triage_write(engine, state)
     due_all = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
@@ -7678,8 +7695,13 @@ def triage_status_lines(triage):
         lines.append("      triage     unchecked units: " + "; ".join(
             "%s (%s)" % (r, ", ".join(u)) for r, u in sorted(triage["unchecked_units"].items())))
     if triage.get("unchecked"):
-        lines.append("      triage     %d finding(s) not checked this pass (call budget or a failed read): neither "
-                     "raised nor audited" % triage["unchecked"])
+        extra = ""
+        if triage.get("unchecked_other_owner"):
+            extra += " (%d of them other-owner flags)" % triage["unchecked_other_owner"]
+        if triage.get("oldest_unchecked_seconds") is not None:
+            extra += "; oldest unchecked for %s" % format_age(triage["oldest_unchecked_seconds"])
+        lines.append("      triage     %d finding(s) not checked this pass (call budget or a failed read)%s: neither "
+                     "raised nor audited" % (triage["unchecked"], extra))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     return lines
