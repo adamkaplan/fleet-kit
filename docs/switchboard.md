@@ -2359,6 +2359,15 @@ other-owner items: its author or an assignee is one of `our_logins`, or an agent
 sweep finding each is re-checked against a fresh read before it is raised. The sweep and the triage write nothing to GitHub: a person
 (or the owning orchestrator) adds the labels.
 
+**Finishing the relabelling: `labels apply-from-markers [--repo OWNER/REPO] [--dry-run | --apply]`.** A person's command (the daemon, the
+sweep and the triage never run it). It lists the open PRs and issues of the watched repos whose first non-empty body line says
+`MERGE: captain` or `MERGE: automatic` and which carry **no merge label**, and prints what would change; an item that already has a merge
+label is left alone (the label is the truth; a disagreement is S6b, not ours to rewrite), and so is a line that is not the first. The
+default is a dry run, the same as `--dry-run`; only `--apply` writes: it ensures the labels exist, then adds `<user>:merge-captain` or
+`<user>:merge-automatic` with the repo's own gh account, each add audited (`decisions.labels`). A repo that cannot be read is said and the
+others still run; a list longer than 1000 open items is said to be cut (run it again after labelling). Running it twice labels nothing
+the second time.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and
