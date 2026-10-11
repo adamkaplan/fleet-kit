@@ -2230,7 +2230,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | Kind | Finding |
 |---|---|
 | S1a / S1b | an open issue with a `## Decision required` section and no awaiting label / an awaiting label and no such section |
-| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and whose body does not start with `MERGE: captain` |
+| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label and, inside the transition window, no first line `MERGE: captain`; see #133) |
 | S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
 | S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged: **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
 | S5 | a cos-tier decision older than `aged_cos_hours` |

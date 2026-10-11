@@ -6489,7 +6489,7 @@ SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched f
 SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
-               "S2": "held for the person but not MERGE: captain", "S3": "said to wait on the person, not in their tier",
+               "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 

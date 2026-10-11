@@ -14407,6 +14407,10 @@ class TestSweep(Base):
         self.sweep()
         self.assertEqual(self.found(), [("S1a", "acme/api#1"), ("S1b", "acme/api#2")])
 
+    def test_the_s2_line_to_the_chief_of_staff_names_the_label_not_only_the_old_first_line(self):
+        self.assertIn("merge-captain label", sb.SWEEP_KINDS["S2"])
+        self.assertNotIn("MERGE: captain", sb.SWEEP_KINDS["S2"])
+
     def test_s2_a_pr_held_for_the_person_without_the_captain_mark(self):
         self.engine.config["triage"] = {"our_logins": ["bot"]}
         self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True),
