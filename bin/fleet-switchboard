@@ -4590,7 +4590,8 @@ def decisions_from_github(engine, now):
                       "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
-                      "rows": record.get("rows") or [], "raised_by": record.get("raised_by")})
+                      "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
+                      "parent": record.get("parent")})
     return items, problems
 
 
@@ -4931,6 +4932,38 @@ def cached_issue_title(engine, repo, number, listed):
     hit = reader._cache.get(("issue", repo, number)) if reader is not None and repo else None
     found = hit[1] if hit else None
     return (getattr(found, "title", None) or None)
+
+
+def cached_issue_parent(engine, repo, number):
+    """The parent (ask) of issue `repo#number` from the intent reader's cache, never a new `gh` read; None when unknown."""
+    reader = getattr(engine, "intents", None)
+    hit = reader._cache.get(("parent", repo, number)) if reader is not None and repo else None
+    value = hit[1] if hit else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+FOLD_PARENT_READS = 3   # at most this many parent reads in one daemon pass, each cached by the intent reader
+
+
+def chain_parent_lookup(engine):
+    """`known_parent(repo, number)` for the report fold: the cached parent; in the DAEMON (which holds the hub) up to
+    FOLD_PARENT_READS fresh reads per pass for a report whose issue has no cached parent, so the ask chain can be followed
+    (a report on a work item folds into its escalated ask). A command derivation (`decisions --fresh`) reads nothing."""
+    left = [FOLD_PARENT_READS if getattr(engine, "hub", None) is not None else 0]
+
+    def lookup(repo, number):
+        found = cached_issue_parent(engine, repo, number)
+        reader = getattr(engine, "intents", None)
+        if found is not None or reader is None or left[0] <= 0 or not repo:
+            return found
+        if ("parent", repo, number) in reader._cache:
+            return None   # asked recently: it has none
+        left[0] -= 1
+        try:
+            return reader.parent(number, repo)
+        except IntentError:
+            return None
+    return lookup
 
 
 def named_issues(text, repo, wanted):
@@ -5709,7 +5742,7 @@ def derive_decisions(engine, now):
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
     decisions = decision_core.build_entries(
         items, ids, home, lambda repo, number: cached_issue_title(engine, repo, number, {}),
-        tier_flat=fault("tier-flat"))
+        tier_flat=fault("tier-flat"), known_parent=chain_parent_lookup(engine))
     for source in (x for x in sources if x.entries):  # PR notices: information rather than decisions (never folded, never counted)
         found, problems = read_source(engine, source, now, errors)
         decisions.extend(found)
@@ -10295,6 +10328,7 @@ def cmd_launch(args, runner, now, socket_call=None):
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
     repo = launch_repo(args)
     brief = read_brief(args.brief_file, sys.stdin)
+    launch_gate_probe(engine, state, engine.config, args, brief, runner, now)   # #107 slice 3c: shadow only, never refuses
     launched = now()
     created = None
     if args.new_workspace:
@@ -10326,6 +10360,73 @@ def cmd_launch(args, runner, now, socket_call=None):
     if note and (brief or args.checkpoint or args.overdue):
         sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
+
+
+
+def launch_gate_probe(engine, state, config, args, brief, runner, now):
+    """Slice 3c, E4 of the gate engine design: SHADOW ONLY. Before a launch, check that the assignment's brief links a `PLAN:` whose
+    plan has a consensus record (G0b) at its CURRENT plan hash. It records `gate.would_refuse` and never refuses, whatever the
+    mode (refusing is a later step, and needs the plan review engine that writes the consensus record). Same opt-in, mode,
+    `enabled: false` and `plan-gates.off` handling as `gates-check`; fail-open: any trouble is `gate.fail_open` and the launch
+    goes on. It never raises. (It cannot tell a hotfix or the gate engine's own repair assignment: those are exempt in the
+    design, so a later enforcing slice needs a way to say so.)"""
+    try:
+        link = plan_ledger.PLAN_LINK_RE.search(brief or "")
+        try:
+            plan_repo = parse_plan_source(link.group(1).strip("<>.,"), config.get("intent_repo"))[0] if link else None
+        except PlanInputError:
+            plan_repo = None
+        repo = launch_repo(args) or plan_repo or config.get("intent_repo")
+        setting = plan_ledger.repo_setting(config, repo) if repo else None
+        if setting is None or not setting["enabled"]:
+            return
+        subject = "launch:%s" % args.name
+        if gates_off_path(state).exists():
+            _gates_audit(engine, "gate.killed", subject, {"for": "launch", "by": GATES_OFF_FILE})
+            return
+        box = {}
+
+        def work():
+            try:
+                plan = None
+                if link:
+                    ns = types.SimpleNamespace(source=link.group(1).strip("<>.,"), file=None, ask=None, done_when=None)
+                    try:
+                        text, label, result = load_plan(ns, runner, now)
+                        plan = dict(result, scenarios_parsed=[])
+                    except (PlanInputError, ValueError, ConfigError, IntentError):
+                        plan = None
+                entries, problem = plan_ledger.read_ledger(state)
+                box["findings"] = plan_ledger.launch_findings(brief, plan, entries)
+                box["problem"] = problem
+            except BaseException as err:
+                box["error"] = "%s: %s" % (type(err).__name__, _one_line(str(err), 150))
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        thread.join(setting["budget_ms"] / 1000.0)
+        if thread.is_alive():
+            raise TimeoutError("no answer within %d ms" % setting["budget_ms"])
+        if "error" in box:
+            raise RuntimeError(box["error"])
+        gates_note(state, now(), repo, "checks")
+        findings = box["findings"]
+        if box.get("problem") and not any(f["gate"] == "G0b" for f in findings):
+            findings.append({"gate": "G0b", "missing": ["the ledger is not trustworthy: %s" % box["problem"]]})
+        if findings:
+            why = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"])) for f in findings)
+            gates_note(state, now(), repo, "would_refuse")
+            _gates_audit(engine, "gate.would_refuse", subject, {"for": "launch", "mode": setting["mode"],
+                                                              "failed": [f["gate"] for f in findings], "reason": _one_line(why, 300)})
+            sys.stderr.write("%s: gates: a launch under this brief would be refused (shadow: %s): %s\n" % (PROG, setting["mode"], _one_line(why, 240)))
+    except BaseException as err:
+        if isinstance(err, (KeyboardInterrupt, SystemExit)):
+            raise
+        try:
+            first = gates_note(state, now(), repo, "fail_opens", alarm="fail-open:%s" % type(err).__name__) if repo else False
+            _gates_audit(engine, "gate.fail_open", "launch:%s" % getattr(args, "name", "?"),
+                         {"for": "launch", "reason": "%s: %s" % (type(err).__name__, _one_line(str(err), 200)), "first_today": first})
+        except BaseException:
+            pass
 
 
 def launch_repo(args):
@@ -11837,7 +11938,7 @@ def cmd_gates_check(args, runner, now):
             mode, downgraded = plan_ledger.effective_mode(config, setting)
             if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
                 _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
-            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode)
+            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode, setting.get("enforce_gates"))
             gates_note(state, now(), repo, "checks")
             payload = {"verdict": verdict, "mode": mode, "for": args.check_for, "failed": failed, "reason": why}
             if downgraded:
@@ -11850,10 +11951,12 @@ def cmd_gates_check(args, runner, now):
                 exit_code = plan_ledger.EXIT_REFUSE
             else:
                 exit_code = plan_ledger.EXIT_ALLOW
-                if failed:   # shadow: what enforcement would have refused
-                    gates_note(state, now(), repo, "would_refuse")
-                    _gates_audit(engine, "gate.would_refuse", pr, {"for": args.check_for, "failed": [f["gate"] for f in failed],
-                                                                    "reason": _one_line(why, 300)})
+                if failed:   # shadow: what enforcement would have refused (every gate); enforce: gates reported but not enforced
+                    kind = "gate.would_refuse" if mode == "shadow" else "gate.reported"
+                    gates_note(state, now(), repo, "would_refuse" if mode == "shadow" else "reported")
+                    _gates_audit(engine, kind, pr, {"for": args.check_for, "failed": [f["gate"] for f in failed],
+                                                    "enforced": [f["gate"] for f in failed if f["enforced"]],
+                                                    "reason": _one_line(why, 300)})
     except BaseException as err:
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise
@@ -11867,7 +11970,7 @@ def cmd_gates_check(args, runner, now):
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     elif payload["verdict"] == "refuse":
-        sys.stderr.write("%s: gates-check: refused for %s: %s\n" % (PROG, args.check_for, payload["reason"]))
+        sys.stderr.write("%s\n" % plan_ledger.refusal_message(PROG, args.check_for, args.pr, payload["failed"], repo))
     elif payload["verdict"] == "fail-open":
         sys.stderr.write("%s: gates-check: could not check (%s): allowed\n" % (PROG, payload["reason"]))
     return exit_code
@@ -11954,14 +12057,19 @@ def cmd_gates_switch(args, runner, now):
         return section
     _write_gates_config(edit)
     _gates_audit(engine, "gate.mode", repo, {"by": who, "mode": target})
-    print("plan gates: %s is now %s" % (repo, "off (kill switch)" if target == "off" else target))
+    shown = plan_ledger.repo_setting(load_config(), repo) if target != "off" else None
+    print("plan gates: %s is now %s%s" % (repo, "off (kill switch)" if target == "off" else target,
+                                          "; refuses on %s (others are reported)" % ", ".join(shown["enforce_gates"]) if shown and target == "enforce" else ""))
     return EXIT_OK
 
 
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
     blocking, notes = plan_ledger.preflight(config, args.pr)
+    setting = plan_ledger.repo_setting(config, args.pr)
     print("preflight for enforcing %s: %s" % (args.pr, "BLOCKED" if blocking else "nothing blocks it"))
+    print("  enforced gates: %s (others are reported, not enforced; set `enforce_gates` in plan_gates to change)"
+          % ", ".join((setting or {}).get("enforce_gates") or plan_ledger.DEFAULT_ENFORCED))
     for line in blocking:
         print("  blocking: %s" % line)
     for line in notes:
@@ -11989,6 +12097,8 @@ def plan_gates_status(config, state, now):
             if why:
                 label = "enforce REQUESTED but running as shadow (%s)" % why
         out["repos"][name] = dict(entry, counts=c)
+        if entry["enabled"] and entry["mode"] == "enforce":
+            label += " on " + ", ".join(entry.get("enforce_gates") or plan_ledger.DEFAULT_ENFORCED)
         out["lines"].append("plan gates %s: %s; today %d check(s), %d refusal(s), %d would-refuse, %d fail-open(s)" % (
             name, label, c.get("checks", 0), c.get("refusals", 0), c.get("would_refuse", 0), c.get("fail_opens", 0)))
     return out

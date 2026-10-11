@@ -1156,8 +1156,16 @@ the report is folded into the issue's decision, which keeps the issue's id and g
 agents) and `reported_lines` (the last 3 folded reports' own lines, `agent: text`, each clipped to 160 characters, so what the workers said stays reachable). A report
 whose line named no repo at all has only a guessed repo (its sender's): it folds into the one listed issue
 decision that has its number, in whatever repo (two such decisions, or none, leave it a report of its own); a report
-that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter. The folded report's
-external link leaves the desired set and is withdrawn once by the existing path. A report with no issue number is folded in only when its text names exactly one open decision's issue
+that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter for a direct match. The folded report's
+external link leaves the desired set and is withdrawn once by the existing path.
+
+**Reaching the decision from a different end (#126).** A report also folds into a decision that is the PERSON's (an escalated issue)
+when: it is about a work item whose ask is that decision, or about the ask of a work item that is (the parent link from the hub's
+picture or the intent reader's cache; the daemon makes at most 3 parent reads a pass, each cached, a command reads none); it has no
+issue number and its text names exactly one such decision; or its own issue is no decision (a status ask) but its text names exactly
+one. An issue is named as `repo#N`, `owner/repo#N`, an issue URL or a bare `#N` (the report's own repo); repos are compared without
+case. Two candidates are ambiguous and fold nowhere. A report on an issue that is only cos-tier, or naming nothing listed, stays its
+own entry. Nothing is stored: the escalation arriving after the report folds it on the next pass, and a restart derives the same list. A report with no issue number is folded in only when its text names exactly one open decision's issue
 (a short ref `repo#N` or an issue URL) in its own repo; naming none, two or another repo's issue leaves it a
 decision of its own. Ids are assigned before folding and never change.
 
@@ -4069,3 +4077,37 @@ when each part is allowed on its own, because each part is evaluated separately 
 Review of the redirect change: the first version enumerated the characters that may NOT follow `>&` and left gaps (`>& file`, `2>& file`, a tab, a non-ASCII name). A deny cannot carve an exception
 and a glob has no "anything but", so it is now decided by what follows each `>`: three or more characters (a space and a name, `&` and a name, a tab, `é file`) is always denied; one character is a file name and denied;
 exactly two are denied unless they are `&1`. Left open, and documented: a redirect to a one or two character non-ASCII file name at the very end of a segment, and (existing before this change) a redirect in the final segment of a pipeline.
+
+## `launch` checks the plan: shadow only (#107, slice 3c)
+
+`fleet-switchboard launch` now checks, before it creates the agent, that the assignment's brief links a plan that has been
+through consensus (E4 of [docs/plan-gate-engine-design.md](plan-gate-engine-design.md), gate G0b). **It records and never
+refuses**, in every mode, including a repo set to `enforce`: refusing needs the plan review engine that writes the consensus
+record, which is a later slice. The launch always goes on.
+
+The check reads the brief's `PLAN: <link>` line, fetches that plan, runs `plan check` on it (G0a) and looks in the ledger for a
+`consensus` entry that passed at the plan's **current plan hash** (G0b); editing the plan, even a constraint, voids it. Nothing writes
+a `consensus` entry yet, so while only this slice exists every launch under a plan in an opted-in repo records a `would_refuse`:
+that is the expected baseline, and the data is useful for what it says about briefs without a `PLAN:` line or with an unreadable or
+failing plan. What it records: `gate.would_refuse` with `for: launch` and the gate and reason (and one line on stderr), or
+`gate.fail_open` (a timeout past the repo's `budget_ms`, a crash, an unreadable plan source of GitHub) with the launch going on.
+
+It uses the same configuration as `gates-check`: only a repo listed under `plan_gates` (the launch's `--repo`, else the plan's repo, else
+the intent repo) is checked; `enabled: false` and the global `plan-gates.off` file (logged as `gate.killed`) switch it off; the
+counters in `status` include it. A `--resume` is not checked. The design exempts a hotfix and the gate engine's own repair
+assignments from the launch gate; the check cannot tell them apart yet, so the enforcing slice needs a way to say so.
+
+## Which gates a repo in `enforce` refuses on (`enforce_gates`, #107)
+
+`plan_gates.repos.<repo>.enforce_gates` is a list of the gates a repo in `enforce` **refuses** on: `G0a`, `G1`, `G4`, `G6`, default
+`["G0a", "G1"]` (a non-empty list of distinct gates; kept in gate order). `ready` requires G0a and G1, `merge` requires G0a, G1, G4 and G6;
+a required gate that is **not listed is reported and allowed**: it appears in the check's `failed` list with `enforced: false`, in the
+text as "(reported, not enforced)", and in the audit as `gate.reported`. So a repo in `enforce` with the default list refuses a merge for
+a G1 or G0a failure, and never for pending CI (G4) or a `MERGE: captain` PR (G6) until the repo lists them. In `shadow` nothing refuses
+and every failing gate is recorded as `gate.would_refuse`, listed or not. `gates preflight`, `gates mode ... enforce` and `status` show the
+list in force.
+
+**The refusal an agent sees** is one line: `fleet-switchboard: <ready|merge> of <repo#N> refused: missing <the enforced gates and what is
+missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive <repo#N> --gates ... --reason ...`; never for G6 or
+G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
+not named as the reason. (`waive` is not built yet: the line names the path the design defines.)
