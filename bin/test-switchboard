@@ -15187,6 +15187,22 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#311", "acme/api#312", "acme/api#313"])
 
+    def test_t1_a_placeholder_owner_is_not_an_owner(self):
+        self.charter()
+        for n, body in ((320, "Owner: TBD"), (321, "Owner: none"), (322, "owner: n/a"), (323, "Owned by unknown"), (324, "Owner: ?"),
+                        (325, "- **Owner:** N/A"), (326, "Owner: ops"), (327, "Owner: none\nOwner: ops")):
+            self.add(n, created=2, labels=["kind"], body=body)
+        self.go()
+        self.assertEqual(self.only("T1"), ["acme/api#320", "acme/api#321", "acme/api#322", "acme/api#323", "acme/api#324", "acme/api#325"])
+
+    def test_t7_a_review_that_is_not_approving_is_not_a_review(self):
+        self.charter()
+        for n, text in ((330, "not approved"), (331, "changes requested"), (332, "needs changes"), (333, "approved"), (334, "lgtm")):
+            self.add(n, created=0.4, pr=True)
+            self.describe_pr(n, comments=[("reviewer", "review of %s: %s %s" % (TRI_HEAD_A[:7], text, TRI_HEAD_A))])
+        self.go()
+        self.assertEqual(self.only("T7"), ["acme/api#330", "acme/api#331", "acme/api#332"])
+
     def test_t10_waits_ten_minutes_after_the_close(self):
         self.charter()
         fresh = dict(tri_issue(self.now, 101, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 240))
