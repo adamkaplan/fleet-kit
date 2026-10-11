@@ -43,10 +43,12 @@ There is deliberately **no command that writes a consensus record**. The engine 
 
 ## The lineage: what the cap and the escalation belong to
 
-A review belongs to the plan's **lineage**: the plan source (the issue and its chain of `Plan (scenarios)` comments, so every revision of one plan
-shares one lineage), not to a `start`. The round count (cap 3), the open objections and any escalation are keyed to the lineage and carried
-across reviews. So `start` cannot reset anything: it is **refused while the lineage has an undecided escalation, while a review of it is
-open (one open review per plan), and for a plan that already has a consensus at its current hash**; a `start` on a revised plan continues the
+A review belongs to the plan's **lineage**, and the lineage is keyed to **what the plan is for**: the ask or work item the plan serves (the
+`PLAN:` target's parent chain up to its ask), not to the plan source and not to a `start`. Every revision of a plan, and every plan issue
+opened for the same ask, shares one lineage, so replacing the plan issue changes nothing. The round count (cap 3), the open objections and any escalation are keyed to the lineage and carried
+across reviews. So `start` cannot reset anything: it is **refused while the lineage has an undecided escalation (a second plan issue for an ask
+with an undecided escalation is refused too), while a review of it is open (one open review per lineage), and for a plan that already has a
+consensus at its current hash**; a `start` on a revised plan continues the
 round count, and its lanes receive the lineage's open objections as inputs they must address.
 
 ## The loop
@@ -133,11 +135,25 @@ readable. Opt-in per repo uses the existing `plan_gates` list.
 
 | Slice | What | Notes |
 |---|---|---|
-| R1 | the pure core, `bin/plan_review.py`: tier minimum, the round and cap rules, the tally, consensus and escalation decisions, brief templates. No commands | fully unit tested, changes nothing live |
+| R1 | the pure core, `bin/plan_review.py`: tier minimum, the round and cap rules (keyed to the ask), the tally, consensus and escalation decisions, brief templates. No commands | fully unit tested, changes nothing live |
 | R2 | the new ledger kinds and `start`, `verdict`, `status`, `respond` with fake lane launching in tests | `enabled` false by default: inert until configured |
 | R3 | the `plan-reviewer` agent definitions (an allow-listed, proved permission set; one on the other model family), the lane charters and templates, real launching of lanes, the daemon's read of the lane's final message | **held for the owner** (a new permission surface) |
 | R4 | the closing round, escalation (message, deadline, reminder), `decide`, the override record and its visibility, stuck-lane handling | the owner-terminal rule is reused |
 | R5 | `report` and the consensus write that makes E4 stop saying would-refuse for reviewed plans | E4 stays shadow; enforcing it is a later, owner-held step |
+
+## Implementation notes under the slices (from the design review)
+
+- **R1 (tier)**: the paths a plan's slices name are the planner's list, so omitting a held path would lower the tier. The tier is re-checked **at the
+  end**: when a PR is opened or a launch happens under the plan and its actual changed paths hit the held-path list while the plan was reviewed
+  below `full`, the gate (G0b) shows the mismatch and requires the full review.
+- **R2 (messages to lanes)**: the switchboard's own `send` refuses a recipient that is a lane of an open review unless the sender is the switchboard,
+  so "the planner has no way to message a lane" is enforced and not only a charter rule. The lane's findings reach the planner only through the
+  `lane` entries.
+- **R4 (closing round after an accept)**: a revision made after `decide --accept` has a new hash and **needs its own closing round**; that closing
+  round does **not** count toward the "at most 2 more rounds after an escalation" (those count only rounds that re-review objections).
+- **R2/R3 (verdict format)**: a lane's `approve` is parsed from a **strict format**: a fenced verdict block that **echoes the plan hash it was
+  given**, then the verdict and one line per objection id with its state. A lane that does not echo the exact hash (it reviewed stale text, or was
+  fed something else) is refused, and free text is never parsed for an approval.
 
 ## Tests
 
