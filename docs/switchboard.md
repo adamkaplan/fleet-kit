@@ -438,7 +438,7 @@ polled on a timer.
      when it records). A notice recorded before this field existed has no boss: a gone sender then leaves the PR
      unrouted.
   3. `reference`: for a PR that names no closing issue, a plain `#N` in its title or body, or, when there is
-     none, the number in its head branch name (`drift2137`). Accepted only when the PR names exactly one such
+     none, the number in its head branch name (`drift4242`). Accepted only when the PR names exactly one such
      number and that issue has an owner in the fleet (parents are climbed as for any issue); two or more stay
      unrouted. The PR's own number and `owner/repo#N` references do not count.
   4. `branch`: reserved. The launch metadata (`metadata.fleet`: name, role, reports_to, issue, charter, repo)
@@ -2217,7 +2217,7 @@ rather than by an agent's memory. The daemon runs a deterministic sweep (no mode
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
 writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
-fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
+fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
 |---|---|
@@ -2229,7 +2229,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["Adam"
 
 **Precision.** A finding is raised only after a fresh single read of its issue or PR (and a fresh read of its last comments when comments raised it) bears it out, so a cached 15-minute list cannot raise it; one that does not hold is audited as `sweep.dismissed`, one that cannot be checked now (no call budget, a failed read) is neither raised nor audited that pass, and a verified finding is trusted for 15 minutes. Only S3 waits for the decision list (a missing human-tier decision is the one thing that raises it falsely): it is deferred for a repo whose awaiting issues are unread or unreadable, or for every repo while the reports or requests source fails, as in the first passes after a restart. S1 reads only labels and bodies and S5 only the cos-tier decisions listed, so neither waits. A deferral lasts at most 30 minutes (`SWEEP_DEFER_SECONDS`); after that S3 runs on the fresh check alone and is marked overdue. `status` shows each deferral (repo, reason, since) and the number of findings not checked this pass, and `fleet-doctor` warns on an overdue deferral. A decision section is a line that STARTS with `## Decision required` (level 2, any case, CRLF included), followed by the end of the line or any suffix that does not continue the word (`## Decision required (re-verified 2026-10-09)`, `: pick`, `- x`). `## Resolved (was: Decision required)`, deeper headings, inline mentions, code and quotes are not. A decision-rows block stands for the section of a labelled batch (S1b) but never makes an unlabelled issue an S1a finding, so a resolved batch is not reported.
 
-**S3 is strict.** It fires only for an open issue or PR whose LATEST comment (not an older one a later comment superseded, not the body) or a report states it in a strong form (`waiting on`, `waits on`, `held for <name>`, `needs <name>'s decision|yes|answer|approval|review|OK`, `for <name>'s review`) in a sentence with no conditional or descriptive marker BEFORE the phrase (`if`, `would`, `may`, `could`, `proposal`, `option(s)`, `says`, `saying`, `said`; a hedge after it, as in `waiting on Adam, if you agree reply yes`, does not cancel it); code, quotes, negations and past tense (`was`, `were`, `had been`, `previously`, `formerly`) are ignored. **Attribution:** a report is about the refs its sentence names (`#N`, `repo#N`, `owner/repo#N`; a sentence ends at `.`, `!` or `?` followed by a space, or a line end), never about its own ask: one that names no ref raises nothing, and refs that are human-tier decisions (or closed, or not in a watched repo) raise nothing. A comment is about its own item only when its sentence names no ref, or names that item; when it names other refs and not the item, it is about those, and when every ref it names is one the switchboard cannot resolve to a watched item (`web#4` with no such repo, a repo that is not watched) it is not attributed to any item and is counted as unattributed in `status`. S2 keeps the wider phrase list over the body and the last 5 comments. The remaining false positives are a plain sentence that states a wait about something else (a status that quotes someone's plan without a marker word).
+**S3 is strict.** It fires only for an open issue or PR whose LATEST comment (not an older one a later comment superseded, not the body) or a report states it in a strong form (`waiting on`, `waits on`, `held for <name>`, `needs <name>'s decision|yes|answer|approval|review|OK`, `for <name>'s review`) in a sentence with no conditional or descriptive marker BEFORE the phrase (`if`, `would`, `may`, `could`, `proposal`, `option(s)`, `says`, `saying`, `said`; a hedge after it, as in `waiting on the owner, if you agree reply yes`, does not cancel it); code, quotes, negations and past tense (`was`, `were`, `had been`, `previously`, `formerly`) are ignored. **Attribution:** a report is about the refs its sentence names (`#N`, `repo#N`, `owner/repo#N`; a sentence ends at `.`, `!` or `?` followed by a space, or a line end), never about its own ask: one that names no ref raises nothing, and refs that are human-tier decisions (or closed, or not in a watched repo) raise nothing. A comment is about its own item only when its sentence names no ref, or names that item; when it names other refs and not the item, it is about those, and when every ref it names is one the switchboard cannot resolve to a watched item (`web#4` with no such repo, a repo that is not watched) it is not attributed to any item and is counted as unattributed in `status`. S2 keeps the wider phrase list over the body and the last 5 comments. The remaining false positives are a plain sentence that states a wait about something else (a status that quotes someone's plan without a marker word).
 
 S1, S2, S3 and S5 become ONE batched fact for the Chief of Staff, `sweep: N findings: <repo#n kind>, ... (+M more)`, only
 refs and kinds (no text from GitHub reaches it), re-raised for an item at most once per `realarm_hours`; its key names the set
@@ -2240,7 +2240,7 @@ counts by kind and `fleet-doctor` warns when there are findings.
 
 ### The triage function (#130, rule family T)
 
-**ADAM'S HOLD, stated plainly: the triage function writes NOTHING to GitHub. No label, no assignment, no comment, no
+**THE OWNER'S HOLD, stated plainly: the triage function writes NOTHING to GitHub. No label, no assignment, no comment, no
 close, no edit, ever, until the person has reviewed its shadow findings and says otherwise.** There is no code for any of
 it: the function only reads. Its only writes are audit lines (`triage.finding`, `triage.dismissed`, `triage.unreadable`,
 `triage.summary`), `triage.json` (what `status` shows) and, only when `enabled`, one batched fact to the Chief of Staff.
@@ -2304,7 +2304,7 @@ An agent is not taken for another by accident. The caller is identified by its O
 per session and it is unique), looked up in the switchboard's own registry (v2's session record, whose `metadata.fleet` the
 launch wrote, and herdr's agent list): its name, role and repo come from there, **never from inherited environment
 variables** (`HERDR_PANE_ID`, `FLEET_SWITCHBOARD_ROLE`, `FLEET_SWITCHBOARD_REPO`, `GH_TOKEN`), which a server restart can leave
-belonging to another agent (the live case: an orchestrator's shell carried its own session id and a venue-ops coder's pane, role,
+belonging to another agent (the live case: an orchestrator's shell carried its own session id and a store-ops coder's pane, role,
 repo and token, so every call was attributed to the coder). This covers `send`, `report`, `notice`, `remind`, `launch`,
 `handoff`, `comment`, `decisions`, `orders`, `intents` and `whoami`. Only an unknown session is refused, with
 `cannot tell who you are` and a non-zero exit, and it is never read as "a person in a plain shell" (a session v2 knows that is not a
@@ -2380,14 +2380,14 @@ fleet cannot be read the reminder waits for the next pass. Reminders without a c
 **The daily friction wake.** Off unless enabled. Add to `config.json` (the section is validated like the other keys):
 
 ```json
-"friction_wake": {"enabled": true, "hour": 9, "to": "fleetkit", "text": null}
+"friction_wake": {"enabled": true, "hour": 9, "to": "cos", "text": null}
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | nothing happens, and nothing is read, unless `true` |
 | `hour` | `9` | local hour (0-23, the daemon's time zone) of the daily wake; `null` = every 24 h from the first wake |
-| `to` | `fleetkit` | the agent a proposal goes to; named only in the text, and never woken by this |
+| `to` | `cos` | the agent a proposal goes to; named only in the text, and never woken by this |
 | `text` | `null` | the wake's text; `null` is `Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send <to> a one-paragraph proposal: fleet-switchboard send <to> --issue <n> "<proposal>". If nothing, do nothing and say nothing.` |
 
 Each running agent whose fleet role is `orchestrator` (never the Chief of Staff, a coder, or the agent named by `to`) gets
@@ -3823,7 +3823,7 @@ instruction. The first rule is `* * deny`; allows follow (reads, `fleet-switchbo
 guards come last (redirects, `$()`, `gh api` writes, `--admin`/`--auto`, `gh repo|secret|variable|release|auth|extension|alias`, `gh workflow run`,
 `az` write verbs and secret values, `curl` to localhost, private ranges or with userinfo, secret-bearing paths). Last match wins and any deny
 denies. **Nothing asks**: a denial is hard ("Permission denied: shell") and the Chief of Staff routes the work to the owning orchestrator
-instead of blocking on a dialog. Principal's word (Adam): "I don't have a problem with you using gh to write comments or close/merge PRs";
+instead of blocking on a dialog. Principal's word (the owner): "I don't have a problem with you using gh to write comments or close/merge PRs";
 a questionable PR is still held and raised (instruction level, not enforceable by a pattern).
 
 Pitfalls found by `tools/cos-permissions-proof/` (read its README):
@@ -3873,7 +3873,7 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
 - `az` is allowed only as `az <group> [<sub>] show|list` (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
   `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|containerapp|appconfig|deployment|webapp config|app-insights`
   and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
-- `gh`: the owner's words cover comments and close/merge; Adam's later answers also covered reopen, edit, ready and review. `--approve` is denied
+- `gh`: the owner's words cover comments and close/merge; the owner's later answers also covered reopen, edit, ready and review. `--approve` is denied
   (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.
 - `curl` is denied (second review). `git log -p|-S|-G` and `git show *:*` are denied; `git show HEAD`/`git diff` can still show a committed secret. A backslash
   inside a secret-looking filename that is not in a dot-directory (`id_\rsa`) is not caught.

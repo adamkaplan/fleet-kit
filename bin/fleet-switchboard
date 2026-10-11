@@ -6299,7 +6299,7 @@ def finish_pass(engine, discovery, report):
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["Adam"], "calls_per_pass": 12}
+                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
 SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.calls_per_pass`: the most `gh` calls one pass makes
 SWEEP_CALLS_CAP = 100
@@ -6385,7 +6385,7 @@ def sweep_strong_statement(strong, text, default_repo, repos):
     """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
     person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
     `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
-    so `v3.3, #3055` stays one sentence. No refs means the statement names nothing by itself."""
+    so `v3.3, #9101` stays one sentence. No refs means the statement names nothing by itself."""
     if not isinstance(text, str):
         return False, []
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6414,7 +6414,7 @@ def sweep_says_waiting_strong(strong, text):
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
     for match in strong.finditer(text):
         start = max(text.rfind(c, 0, match.start()) for c in ".!?\n") + 1
-        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on Adam, if you agree" fires
+        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on the owner, if you agree" fires
         if SWEEP_HEDGE_RE.search(clause) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
             continue
         return True
@@ -6428,7 +6428,7 @@ SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
 
 def sweep_says_waiting(regex, text):
     """True when the text, outside code blocks, inline code and quoted lines, says an item waits on the person and does
-    not negate it ("not waiting on Adam", "no longer needs Adam"). Quoted text is somebody else's sentence."""
+    not negate it ("not waiting on the owner", "no longer needs the owner"). Quoted text is somebody else's sentence."""
     if not isinstance(text, str):
         return False
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6863,7 +6863,7 @@ class SweepFacts:
 
 
 # ---- #130: the triage function (rule family T), grown from the sweep: the same hub reads, call budget, fresh re-check
-# before a finding, shadow default and batched fact to the Chief of Staff. ADAM'S HOLD (binding): it WRITES NOTHING to
+# before a finding, shadow default and batched fact to the Chief of Staff. THE OWNER'S HOLD (binding): it WRITES NOTHING to
 # GitHub, ever: no label, assignment, comment, close or edit. Its only writes are audit lines, triage.json (a display
 # file) and the batched fact to the Chief of Staff. The fix rules of the plan stay unbuilt until he lifts the hold.
 
@@ -7496,7 +7496,7 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
                  "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
                  "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
                  "If nothing, do nothing and say nothing.")
-FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
+FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 
@@ -8081,7 +8081,7 @@ PLAIN_REF_RE = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
 
 def reference_numbers(pr, own):
     """PR 52: the issue numbers a PR that closes nothing points at, for the weak link: the plain `#N` in its title
-    and body, else the numbers in its head branch name (`drift2137`). Empty when the PR names a closing issue; the
+    and body, else the numbers in its head branch name (`drift4242`). Empty when the PR names a closing issue; the
     PR's own number is never a candidate. The caller accepts only exactly one."""
     if not isinstance(pr, dict) or closing_numbers(pr.get("body")) or pr.get("linked_issues"):
         return []
