@@ -127,7 +127,22 @@ permissions:
     resource: "fleet-switchboard gates"
     effect: allow
   - action: "shell"
-    resource: "fleet-switchboard gates *"
+    resource: "fleet-switchboard gates status"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates preflight *"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates off"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates mode * shadow"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates mode * off"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates *#*"
     effect: allow
   - action: "shell"
     resource: "fleet-switchboard waive *"
@@ -1843,30 +1858,6 @@ permissions:
     resource: "timeout * fleet-switchboard decisions batch*"
     effect: deny
   - action: "shell"
-    resource: "fleet-switchboard gates on*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * fleet-switchboard gates on*"
-    effect: deny
-  - action: "shell"
-    resource: "fleet-switchboard waive *G6*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * fleet-switchboard waive *G6*"
-    effect: deny
-  - action: "shell"
-    resource: "fleet-switchboard waive *G8*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * fleet-switchboard waive *G8*"
-    effect: deny
-  - action: "shell"
-    resource: "fleet-switchboard waive *--gates*G6*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * fleet-switchboard waive *--gates*G6*"
-    effect: deny
-  - action: "shell"
     resource: "fleet-switchboard launch *--agent chief-of-staff*"
     effect: deny
   - action: "shell"
@@ -1961,6 +1952,894 @@ permissions:
     effect: deny
   - action: "shell"
     resource: "timeout * herdr config*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enforce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enforce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enForce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enForce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *enFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *enFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNforce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNforce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNForce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNForce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *eNFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *eNFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *Enforce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *Enforce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnForce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnForce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *EnFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *EnFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENforce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENforce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENforcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENforCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENforCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENfORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENForce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENForce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENForcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENForCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENForCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFoRce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFoRcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFoRCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFoRCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFOrce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFOrcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFOrCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFOrCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFORce*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFORcE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFORCe*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ENFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ENFORCE*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates on"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates on"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *on"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *on"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates on *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates on *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates * on *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates * on *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates On"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates On"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *On"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *On"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates On *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates On *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates * On *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates * On *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates oN"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates oN"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *oN"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *oN"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates oN *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates oN *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates * oN *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates * oN *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates ON"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates ON"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates *ON"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates *ON"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates ON *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates ON *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates * ON *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates * ON *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *G6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *G6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *g6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *g6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *G8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *G8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *g8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *g8*"
     effect: deny
   - action: "shell"
     resource: "fleet-switchboard launch*"

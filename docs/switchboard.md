@@ -1156,8 +1156,16 @@ the report is folded into the issue's decision, which keeps the issue's id and g
 agents) and `reported_lines` (the last 3 folded reports' own lines, `agent: text`, each clipped to 160 characters, so what the workers said stays reachable). A report
 whose line named no repo at all has only a guessed repo (its sender's): it folds into the one listed issue
 decision that has its number, in whatever repo (two such decisions, or none, leave it a report of its own); a report
-that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter. The folded report's
-external link leaves the desired set and is withdrawn once by the existing path. A report with no issue number is folded in only when its text names exactly one open decision's issue
+that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter for a direct match. The folded report's
+external link leaves the desired set and is withdrawn once by the existing path.
+
+**Reaching the decision from a different end (#126).** A report also folds into a decision that is the PERSON's (an escalated issue)
+when: it is about a work item whose ask is that decision, or about the ask of a work item that is (the parent link from the hub's
+picture or the intent reader's cache; the daemon makes at most 3 parent reads a pass, each cached, a command reads none); it has no
+issue number and its text names exactly one such decision; or its own issue is no decision (a status ask) but its text names exactly
+one. An issue is named as `repo#N`, `owner/repo#N`, an issue URL or a bare `#N` (the report's own repo); repos are compared without
+case. Two candidates are ambiguous and fold nowhere. A report on an issue that is only cos-tier, or naming nothing listed, stays its
+own entry. Nothing is stored: the escalation arriving after the report folds it on the next pass, and a restart derives the same list. A report with no issue number is folded in only when its text names exactly one open decision's issue
 (a short ref `repo#N` or an issue URL) in its own repo; naming none, two or another repo's issue leaves it a
 decision of its own. Ids are assigned before folding and never change.
 
@@ -4081,6 +4089,21 @@ assignments from the launch gate; the check cannot tell them apart yet, so the e
 ### The Chief of Staff and the plan gates
 
 Allowed for the Chief of Staff (and its subagent): `fleet-switchboard gates` (read, `gates mode <repo> shadow|enforce|off`, `gates off`, `gates preflight <repo>`, `gates status`) and `fleet-switchboard waive <repo#N> ...`.
-Denied: `gates on` (re-enabling every repo stays the owner's), a `waive` naming G6 or G8, and any write to the switchboard config or state files (the config dirs are read-only for it).
-The CLI is the lock, as for `decisions`: `gates mode <repo> enforce` is refused unless the preflight passes (tested for the chief-of-staff role), a mode change is audited, and the design's `waive`
+Denied: turning gates ON, i.e. `gates mode <repo> enforce` and `gates on` in any casing, spacing or flag placement (the shapes are allowed one by one, then `enforce` and `on` are guarded), a `waive` naming G6 or G8 in any casing, and any write to the switchboard config or state files (the config dirs are read-only for it).
+The CLI is the lock, as for `decisions`: `gates mode <repo> enforce` is also refused by the CLI unless the preflight passes (a second lock; tested for the chief-of-staff role), a mode change is audited, and the design's `waive`
 (logged, reason of at least 20 characters, never G6 or G8, only the chief of staff) is specified in `docs/plan-gate-engine-design.md`; the `waive` subcommand itself is not in the CLI yet, so allowing it here only prepares the permission.
+
+## Which gates a repo in `enforce` refuses on (`enforce_gates`, #107)
+
+`plan_gates.repos.<repo>.enforce_gates` is a list of the gates a repo in `enforce` **refuses** on: `G0a`, `G1`, `G4`, `G6`, default
+`["G0a", "G1"]` (a non-empty list of distinct gates; kept in gate order). `ready` requires G0a and G1, `merge` requires G0a, G1, G4 and G6;
+a required gate that is **not listed is reported and allowed**: it appears in the check's `failed` list with `enforced: false`, in the
+text as "(reported, not enforced)", and in the audit as `gate.reported`. So a repo in `enforce` with the default list refuses a merge for
+a G1 or G0a failure, and never for pending CI (G4) or a `MERGE: captain` PR (G6) until the repo lists them. In `shadow` nothing refuses
+and every failing gate is recorded as `gate.would_refuse`, listed or not. `gates preflight`, `gates mode ... enforce` and `status` show the
+list in force.
+
+**The refusal an agent sees** is one line: `fleet-switchboard: <ready|merge> of <repo#N> refused: missing <the enforced gates and what is
+missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive <repo#N> --gates ... --reason ...`; never for G6 or
+G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
+not named as the reason. (`waive` is not built yet: the line names the path the design defines.)

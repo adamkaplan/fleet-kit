@@ -35,7 +35,7 @@ def build(subagent=False):
         allow("shell", "fleet-switchboard %s *" % nouns)
     # the plan gates (docs/plan-gate-engine-design.md): look at them, soft-switch a repo, kill all, waive G0 to G5 on a hotfix. The CLI is the lock:
     # `enforce` is refused without a passing preflight, G6 and G8 are never waivable, `waive` is logged and needs a reason. `gates on` stays the owner's.
-    for shape in ("gates", "gates *", "waive *"):
+    for shape in ("gates", "gates status", "gates preflight *", "gates off", "gates mode * shadow", "gates mode * off", "gates *#*", "waive *"):
         allow("shell", "fleet-switchboard " + shape)
     if not subagent:
         allow("shell", "fleet-switchboard handoff *")
@@ -107,11 +107,22 @@ def build(subagent=False):
     for pattern in ("az rest*", "az login*", "az account get-access-token*", "az * --debug*", "az containerapp*"):
         guard(pattern)
     # the switchboard: the Chief of Staff does not raise orchestrators' batches, nor launches itself or its delegate
-    for pattern in ("fleet-switchboard decisions batch*", "fleet-switchboard gates on*", "fleet-switchboard waive *G6*", "fleet-switchboard waive *G8*", "fleet-switchboard waive *--gates*G6*",  "fleet-switchboard launch *--agent chief-of-staff*", "fleet-switchboard launch *--agent cos-subagent*"):
+    for pattern in ("fleet-switchboard decisions batch*",  "fleet-switchboard launch *--agent chief-of-staff*", "fleet-switchboard launch *--agent cos-subagent*"):
         guard(pattern)
     for pattern in ("herdr agent prompt*", "herdr agent start*", "herdr agent stop*", "herdr pane send*", "herdr pane input*", "herdr pane close*", "herdr pane split*",
                     "herdr * close*", "herdr * stop*", "herdr * start*", "herdr * send-keys*", "herdr server*", "herdr update*", "herdr config*"):
         guard(pattern)
+    # turning gates ON is the owner's: `enforce` (any casing) and `on`, whatever the spacing or flags in between. cos may read, set shadow or off, kill, and waive G0 to G5.
+    import itertools
+    for spelling in ("".join(c) for c in itertools.product(*[(ch.lower(), ch.upper()) for ch in "enforce"])):
+        guard("fleet-switchboard gates *%s*" % spelling)
+    for spelling in ("on", "On", "oN", "ON"):
+        guard("fleet-switchboard gates %s" % spelling)
+        guard("fleet-switchboard gates *%s" % spelling)
+        guard("fleet-switchboard gates %s *" % spelling)
+        guard("fleet-switchboard gates * %s *" % spelling)
+    for gate in ("G6", "g6", "G8", "g8"):
+        guard("fleet-switchboard waive *%s*" % gate)
     if subagent:
         guard("fleet-switchboard launch*")
     # reading outside the job: other folders of the laptop, credentials, the switchboard's own config

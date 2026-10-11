@@ -330,6 +330,8 @@ DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
 REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6")}
+DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
+ENFORCEABLE = ("G0a", "G1", "G4", "G6")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
 
 
@@ -356,7 +358,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -370,7 +372,11 @@ def validate_plan_gates(raw, source):
         if not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
             raise ValueError("%s: 'plan_gates.repos.%s.budget_ms' must be a whole number from %d to %d"
                              % (source, name, *BUDGET_RANGE))
-        repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget}
+        gates = entry.get("enforce_gates", list(DEFAULT_ENFORCED))
+        if not (isinstance(gates, list) and gates and all(g in ENFORCEABLE for g in gates) and len(set(gates)) == len(gates)):
+            raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
+                             "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
+        repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
     return {"repos": repos}
 
 
@@ -411,18 +417,22 @@ def effective_mode(config, setting):
     return "enforce", None
 
 
-def decide(report, check_for, mode):
-    """(verdict, failed, why): verdict is "allow" or "refuse". `report` is evaluate_gates' output. In `shadow` a failing check
-    is still reported (failed is not empty) but the verdict is always "allow". A gate that is not tracked or does not apply
-    never fails a check."""
+def decide(report, check_for, mode, enforce_gates=None):
+    """(verdict, failed, why): verdict is "allow" or "refuse". `report` is evaluate_gates' output. `failed` lists EVERY required
+    gate that is not satisfied, each marked `enforced` (it is in `enforce_gates`, default G0a and G1). In `enforce` only an
+    enforced failure refuses; a failure of a gate that is not listed is reported and allowed (G4 and G6 are reported until the
+    repo lists them). In `shadow` nothing refuses and every failure is the would-refuse record. A gate that is not tracked or
+    does not apply never fails a check."""
+    listed = set(enforce_gates or DEFAULT_ENFORCED)
     failed = []
     for row in report["gates"]:
         if row["gate"] in REQUIRED_FOR[check_for] and row["status"] in ("missing", "waiting"):
-            failed.append({"gate": row["gate"], "missing": row["missing"][:3]})
+            failed.append({"gate": row["gate"], "missing": row["missing"][:3], "enforced": row["gate"] in listed})
     if report.get("ledger_problem") and not any(f["gate"] == "G1" for f in failed):
-        failed.append({"gate": "G1", "missing": ["the ledger is not trustworthy: %s" % report["ledger_problem"]]})
-    verdict = "refuse" if failed and mode == "enforce" else "allow"
-    why = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied") for f in failed)
+        failed.append({"gate": "G1", "missing": ["the ledger is not trustworthy: %s" % report["ledger_problem"]], "enforced": "G1" in listed})
+    verdict = "refuse" if mode == "enforce" and any(f["enforced"] for f in failed) else "allow"
+    why = "; ".join("%s: %s%s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied", "" if f["enforced"] else " (reported, not enforced)")
+                    for f in failed)
     return verdict, failed, why
 
 
@@ -449,3 +459,13 @@ def launch_findings(brief, plan, entries):
     if consensus_at(entries, plan["plan_hash"]) is None:
         found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
     return found
+
+
+def refusal_message(prog, check_for, pr, failed, repo):
+    """The ONE line an agent sees when a ready or merge is refused: what is missing, and the two ways out. Only the gates that
+    are enforced are named as the reason; gates that are only reported are not."""
+    gates = [f for f in failed if f.get("enforced", True)]
+    what = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied") for f in gates)[:260]
+    return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
+            "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
+            % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))

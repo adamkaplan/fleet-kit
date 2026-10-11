@@ -245,6 +245,7 @@ HEADLINE_LINES = 2
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 _GITHUB_REF = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(?:issues|pull)/(\d+)(?:[/?#].*)?$")
 _ISSUE_URL = re.compile(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)(?![\w])")
+_BARE_REF = re.compile(r"(?<![\w/&.#-])#(\d+)(?!\w)")
 _SHORT_REF = re.compile(r"(?<![\w/.-])((?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)#(\d+)(?!\w)")
 
 
@@ -328,6 +329,9 @@ def named_issues(text, repo, wanted):
         if match.group(1) == repo and int(match.group(2)) in wanted:
             found.add(int(match.group(2)))
     bare = _URL.sub(" ", text)
+    for match in _BARE_REF.finditer(bare):   # a bare `#N` is an issue of the report's own repo
+        if repo and int(match.group(1)) in wanted:
+            found.add(int(match.group(1)))
     for match in _SHORT_REF.finditer(bare):
         name = match.group(1)
         if repo and (name == repo or name == repo.split("/")[-1]) and int(match.group(2)) in wanted:
@@ -409,41 +413,68 @@ FOLDED_LINES_KEPT = 3    # the newest folded report lines an issue decision keep
 FOLDED_LINE_MAX = 160    # characters of each
 
 
-def build_entries(items, ids, home, known_title, tier_flat=False):
+def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=None):
     """The decisions (as list entries) the source `items` become, not yet ordered and without notices.
 
     `items` are what the sources found (dicts with kind, title, ask, repo, agent, since, seed, bare, tier, and
-    optionally rows, raised_by, considered, session, request, repo_known); `ids` are their display ids, in the same order
+    optionally rows, raised_by, considered, session, request, repo_known, parent); `ids` are their display ids, in the same order
     (assign_ids); `home` is the repo a bare issue belongs to (or None); `known_title(repo, number)` is a lookup of
-    an issue's title the caller already holds, never a read (None when unknown). `tier_flat` is the Lab's
-    `tier-flat` fault.
+    an issue's title the caller already holds, never a read (None when unknown); `known_parent(repo, number)` likewise gives an
+    issue's parent (its ask, for a work item) or None. `tier_flat` is the Lab's `tier-flat` fault.
 
     One question, shown once: a report on an issue that is itself a decision (same repo and number) is folded into
-    the issue's decision (its newest lines stay in the entry as `reported_lines`); a report whose repo is only a guess
-    (`repo_known` false: no repo was named at all) folds into the one listed issue decision with its number; so is an untagged report whose text names exactly one such issue in its repo. A report
-    about an issue the Chief of Staff escalated is the human's too."""
-    yours = {(item["repo"] or home, item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
-    listed = {(item["repo"] or home, item["ask"]): item["title"] for item in items if item["kind"] == "issue"}
-    wanted = {}
+    the issue's decision (its newest lines stay in the entry as `reported_lines`). Repos are compared without case. A report
+    whose repo is only a guess (`repo_known` false) folds into the one listed issue decision with its number. A report with no
+    issue number folds into the one open issue decision its text names (`repo#N`, an issue URL, or a bare `#N` in its own repo).
+    Into a decision of the PERSON's tier (an escalated issue) a report also folds when it is about the same piece of work seen from
+    the other end of the ask chain (a work item whose ask is that decision, or the ask of a work item that is) and when its issue
+    number is not itself a decision but its text names exactly one such decision. A report on an issue that is only cos-tier,
+    or names nothing listed, stays its own entry. A report about an issue the Chief of Staff escalated is the human's too."""
+    def key(repo, number):
+        return ((repo or home or "").lower(), number)
+    yours = {key(item["repo"], item["ask"]) for item in items if item["kind"] == "issue" and item["tier"] == "human"}
+    listed = {key(item["repo"], item["ask"]): item["title"] for item in items if item["kind"] == "issue"}
+    parents = {key(item["repo"], item["ask"]): item.get("parent") for item in items if item["kind"] == "issue"}
+    wanted, wanted_yours = {}, {}
     for repo, number in listed:
         wanted.setdefault(repo, set()).add(number)
+        if (repo, number) in yours:
+            wanted_yours.setdefault(repo, set()).add(number)
     ids = dict(zip((id(item) for item in items), ids))
     folded = {}
     for item in items:
         if item["kind"] != "report":
             continue
-        repo, number = item["repo"] or home, item["ask"]
+        repo, number = (item["repo"] or home or "").lower(), item["ask"]
+        title = str(item["title"]).lower()
         if not number:
-            named = named_issues(str(item["title"]), repo, wanted.get(repo, set()))
+            named = named_issues(title, repo, wanted.get(repo, set()))
             number = named.pop() if len(named) == 1 else None
         if number and (repo, number) in listed:
             folded[id(item)] = (repo, number)
-        elif number and item.get("repo_known") is False:
+            continue
+        if number and item.get("repo_known") is False:
             # #126: the report named no repo the switchboard knows, so its repo is a guess (its sender's). The same
             # number on exactly one listed issue decision is that issue: one question, shown once
-            same = [key for key in listed if key[1] == number]
+            same = [k for k in listed if k[1] == number]
             if len(same) == 1:
                 folded[id(item)] = same[0]
+                continue
+        mine = wanted_yours.get(repo, set())
+        if number and mine:
+            # the ask chain: a work item whose ask is the person's decision, or the ask of a work item that is
+            up = known_parent(item["repo"] or home, number) if known_parent else None
+            below = [n for n in mine if parents.get((repo, n)) == number]
+            if up in mine:
+                folded[id(item)] = (repo, up)
+                continue
+            if len(below) == 1:
+                folded[id(item)] = (repo, below[0])
+                continue
+            # the report's own issue is no decision (a status ask, say) but its text names exactly one that is the person's
+            named = named_issues(title, repo, mine)
+            if len(named) == 1:
+                folded[id(item)] = (repo, named.pop())
     reporters, lines = {}, {}
     for item in sorted((i for i in items if id(i) in folded), key=lambda i: (i["since"], i["seed"])):
         reporters.setdefault(folded[id(item)], []).append(item["agent"])
@@ -453,23 +484,23 @@ def build_entries(items, ids, home, known_title, tier_flat=False):
         if id(item) in folded:
             continue
         ident, tier = ids[id(item)], item["tier"]
-        if item["kind"] == "report" and item["ask"] and (item["repo"] or home, item["ask"]) in yours:
+        if item["kind"] == "report" and item["ask"] and key(item["repo"], item["ask"]) in yours:
             tier = "human"  # the Chief of Staff escalated its issue: the report that raised it is yours too
         repo = item.get("repo")
         extra = {}
         about = None
         if item["kind"] == "report" and item["ask"]:
-            key = (item["repo"] or home, item["ask"])
-            about = (listed[key] or None) if key in listed else known_title(*key)
+            at = key(item["repo"], item["ask"])
+            about = (listed[at] or None) if at in listed else known_title(item["repo"] or home, item["ask"])
         headline = headline_of(item, about)
         if item.get("rows"):  # a batch: one decision, one row each
             extra["rows"] = item["rows"]
             headline = batch_headline(item["title"], len(item["rows"]))
             if item.get("raised_by"):
                 extra["raised_by"] = item["raised_by"]
-        if item["kind"] == "issue" and (item["repo"] or home, item["ask"]) in reporters:
-            extra["reported_by"] = sorted(set(reporters[(item["repo"] or home, item["ask"])]))
-            extra["reported_lines"] = lines[(item["repo"] or home, item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
+        if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
+            extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
+            extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):

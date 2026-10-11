@@ -8527,7 +8527,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         for command in ("make build", "git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az vm delete -n x",
                         "cat /home/a/.ssh/id_rsa", "cat /home/a/.config/gh/hosts.yml", "ls /home/a/Documents", "cat /etc/passwd", "gh pr merge 5 --admin",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "echo x > notes.md", "cat > /home/a/Code/x/f <<EOF\nx\nEOF",
-                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "fleet-switchboard gates on", "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "echo {} > /home/a/.config/fleet-switchboard/config.json", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
+                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "fleet-switchboard gates on", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard waive acme/app#5 --gates g6 --reason x", "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "echo {} > /home/a/.config/fleet-switchboard/config.json", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
     def test_the_subagent_has_the_focus_list_without_handoff_or_launch(self):
@@ -17323,7 +17323,7 @@ class TestPlanGatesCheck(LedgerBase):
         self.assertIn("gate.refused", [e["event"] for e in self.world.audit()])
         code, text, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready")
         self.assertEqual(code, 10)
-        self.assertIn("refused for ready", err)
+        self.assertIn("ready of acme/app#9 refused: missing G1", err)
 
     def test_enforce_allows_when_the_gates_it_needs_are_satisfied(self):
         self.all_proven()
@@ -17335,7 +17335,7 @@ class TestPlanGatesCheck(LedgerBase):
     def test_each_check_requires_its_own_gates(self):
         self.all_proven()
         self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
-        self.set_gates({"acme/app": {"mode": "enforce"}})
+        self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4", "G6"]}})
         self.assertEqual(self.check("ready")[0], 0, "CI is not a ready gate")
         code, out, _ = self.check("merge")
         self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G4"]))
@@ -17343,6 +17343,60 @@ class TestPlanGatesCheck(LedgerBase):
         self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         code, out, _ = self.check("merge")
         self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6"]))
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 0, "G4 and G6 are enforced only when listed")
+        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False)])
+
+    def test_a_repo_in_enforce_with_the_default_list_reports_g4_and_g6_but_never_refuses_on_them(self):
+        self.all_proven()
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]   # G4 fails
+        self.pr["labels"] = [{"name": "tester:merge-captain"}]                              # G6 waits
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, err = self.check("merge")
+        self.assertEqual((code, out["verdict"]), (0, "allow"))
+        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False)])
+        self.assertIn("reported, not enforced", out["reason"])
+        (event,) = self.events("gate.reported")
+        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6"], []))
+        self.assertEqual(self.events("gate.refused") + self.events("gate.would_refuse"), [])
+        self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4"]}})
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 10)
+        self.assertEqual([f["gate"] for f in out["failed"] if f["enforced"]], ["G4"], "G6 is still only reported")
+
+    def test_a_g1_failure_still_refuses_with_the_default_list_and_shadow_records_every_gate(self):
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 10)
+        self.assertIn("G1", [f["gate"] for f in out["failed"] if f["enforced"]])
+        self.assertIn("G4", [f["gate"] for f in out["failed"] if not f["enforced"]])
+        self.set_gates({"acme/app": {"mode": "shadow"}})
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 0)
+        (event,) = self.events("gate.would_refuse")
+        self.assertIn("G4", event["detail"]["failed"], "shadow records would-refuse for all gates")
+
+    def test_the_refusal_is_one_line_naming_the_gates_and_the_way_out(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, text, err = self.run_as("coder", "gates-check", self.PR, "--for", "merge")
+        self.assertEqual(code, 10)
+        lines = [l for l in err.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1, err)
+        for fragment in ("merge of acme/app#9 refused: missing G1", "logged waiver", "never for G6 or G8", "waive acme/app#9",
+                         "gates mode acme/app shadow"):
+            self.assertIn(fragment, lines[0])
+        self.assertNotIn("G4", lines[0].split("Way out")[0], "a gate that is only reported is not named as the reason")
+
+    def test_preflight_gates_mode_and_status_show_the_enforced_gates(self):
+        self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4"]}})
+        self.assertIn("enforced gates: G0a, G1, G4", self.run_as(None, "gates", "preflight", "acme/app")[1])
+        self.assertIn("enforce on G0a, G1, G4;", self.run_as(None, "status")[1])
+        self.set_gates({"acme/app": {"mode": "shadow"}})
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 0, err)
+        self.assertIn("refuses on G0a, G1 (others are reported)", out)
 
     def test_untracked_gates_never_refuse(self):
         self.all_proven()
@@ -17555,10 +17609,15 @@ class TestPlanGatesCheck(LedgerBase):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         self.assertNotIn("plan_gates", sb.validate_config(dict(base)))
         good = sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {}}}))["plan_gates"]
-        self.assertEqual(good["repos"]["a/b"], {"mode": "shadow", "enabled": True, "budget_ms": 3000})
+        self.assertEqual(good["repos"]["a/b"], {"mode": "shadow", "enabled": True, "budget_ms": 3000,
+                                                 "enforce_gates": ["G0a", "G1"]})
+        self.assertEqual(sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {"enforce_gates": ["G6", "G1"]}}}))
+                         ["plan_gates"]["repos"]["a/b"]["enforce_gates"], ["G1", "G6"], "kept in gate order")
         for bad in ([], {"repo": {}}, {"repos": {"nope": {}}}, {"repos": {"a/b": {"mode": "off"}}}, {"repos": {"a/b": {"enabled": "yes"}}},
                     {"repos": {"a/b": {"budget_ms": 5}}}, {"repos": {"a/b": {"budget_ms": True}}}, {"repos": {"a/b": {"x": 1}}},
-                    {"repos": {"a/b": "shadow"}}):
+                    {"repos": {"a/b": "shadow"}}, {"repos": {"a/b": {"enforce_gates": []}}},
+                    {"repos": {"a/b": {"enforce_gates": ["G2"]}}}, {"repos": {"a/b": {"enforce_gates": ["G1", "G1"]}}},
+                    {"repos": {"a/b": {"enforce_gates": "G1"}}}):
             with self.subTest(bad=bad):
                 with self.assertRaises(sb.ConfigError):
                     sb.validate_config(dict(base, plan_gates=bad))
@@ -19215,6 +19274,107 @@ class TestDecisionHeadlines(unittest.TestCase):
         both = self.derive([self.issue(5, "Storage choice"), self.report("Which database?", ask=5)])
         alone = self.derive([self.issue(5, "Storage choice")])
         self.assertEqual(both[0]["id"], alone[0]["id"])
+
+
+class TestReportFoldVariants(unittest.TestCase):
+    """#126 from first principles: a report about an issue that is already the person's decision must not sit beside it as a
+    second, cos-tier entry, however the report names the issue or reaches it. Synthetic names; 4-digit issue numbers."""
+
+    HOME = "acme-org/widget-service"
+
+    def derive(self, items, parents=None, hub=None):
+        cache = {("parent", self.HOME, n): (0, p) for n, p in (parents or {}).items()}
+        engine = types.SimpleNamespace(config={"intent_repo": self.HOME}, discovery=None, _note=lambda *a, **k: None,
+                                       hub=hub, intents=types.SimpleNamespace(_cache=cache, parent=lambda n, repo=None: None))
+        found = list(items)
+        with mock.patch.object(sb, "decision_repos", return_value=[self.HOME]), \
+                mock.patch.object(sb, "decisions_from_github", lambda e, n: ([x for x in found if x["kind"] == "issue"], [])), \
+                mock.patch.object(sb, "decisions_from_requests", lambda e, n: ([], [])), \
+                mock.patch.object(sb, "decisions_from_reports", lambda e, n: ([x for x in found if x["kind"] == "report"], [])):
+            decisions, _ = sb.derive_decisions(engine, EPOCH + 60)
+        return decisions
+
+    def issue(self, n, tier="human", parent=None, repo=None):
+        return {"kind": "issue", "title": "Issue %d" % n, "ask": n, "agent": "orch", "since": EPOCH, "seed": "i%d" % n,
+                "bare": True, "repo": repo or self.HOME, "tier": tier, "parent": parent}
+
+    def report(self, text, ask=None, repo=None, known=True, agent="coder", tier="cos"):
+        return {"kind": "report", "title": text, "ask": ask, "agent": agent, "since": EPOCH + 10, "seed": "r%s%s" % (ask, text),
+                "bare": False, "repo": repo or self.HOME, "tier": tier, "repo_known": known}
+
+    def shape(self, found):
+        return sorted((d["kind"], d["tier"], d["ask"]) for d in found)
+
+    def only_the_decision(self, found, ask=1234):
+        self.assertEqual(self.shape(found), [("issue", "human", ask)])
+        return found[0]
+
+    def test_the_same_ask_by_number(self):
+        self.only_the_decision(self.derive([self.issue(1234), self.report("q", 1234)]))
+
+    def test_the_issue_named_by_a_short_ref_a_full_ref_a_url_or_a_bare_number(self):
+        for text in ("blocked on widget-service#1234", "see acme-org/widget-service#1234",
+                     "see https://github.com/acme-org/widget-service/issues/1234", "blocked on #1234"):
+            with self.subTest(text=text):
+                self.only_the_decision(self.derive([self.issue(1234), self.report(text)]))
+
+    def test_a_report_tagged_to_another_ask_but_naming_the_escalated_issue_folds_in(self):
+        for text in ("blocked on widget-service#1234", "see #1234", "see acme-org/widget-service#1234 please"):
+            with self.subTest(text=text):
+                found = self.derive([self.issue(1234), self.report(text, ask=1000)])
+                entry = self.only_the_decision(found)
+                self.assertEqual(entry["reported_by"], ["coder"])
+                self.assertIn(text, entry["reported_lines"][0])                       # the text stays reachable
+
+    def test_the_ask_chain_in_both_directions(self):
+        # the report is about WORK ITEM 1240 whose ASK 1234 is the escalated decision (the parent is known)
+        entry = self.only_the_decision(self.derive([self.issue(1234), self.report("q", 1240)], parents={1240: 1234}))
+        self.assertEqual(entry["reported_by"], ["coder"])
+        # the report is about the ASK 1234; the escalated decision is its work item 1240
+        entry = self.only_the_decision(self.derive([self.issue(1240, parent=1234), self.report("q", 1234)]), ask=1240)
+        self.assertEqual(entry["reported_by"], ["coder"])
+
+    def test_the_repo_spelling_does_not_matter(self):
+        self.only_the_decision(self.derive([self.issue(1234), self.report("q", 1234, repo="Acme-Org/Widget-Service")]))
+        self.only_the_decision(self.derive([self.issue(1234, repo="ACME-ORG/widget-service"), self.report("q", 1234)]))
+
+    def test_a_report_on_an_issue_that_is_only_cos_tier_or_unrelated_stays_its_own_entry(self):
+        found = self.derive([self.issue(1234, tier="cos"), self.report("blocked on #1234", ask=1000)])
+        self.assertEqual(self.shape(found), [("issue", "cos", 1234), ("report", "cos", 1000)])      # cos-tier: no chain/text fold
+        found = self.derive([self.issue(1234), self.report("nothing named here", ask=1000),
+                             self.report("q", 1240)], parents={1240: 9999})
+        self.assertEqual(self.shape(found), [("issue", "human", 1234), ("report", "cos", 1000), ("report", "cos", 1240)])
+        found = self.derive([self.issue(1234), self.report("blocked on other-repo#1234", ask=1000),
+                             self.report("see #1234", ask=1001, repo="acme-org/other-service", known=True)])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "report", "report"])           # another repo's #1234 is not ours
+
+    def test_two_escalated_issues_named_is_ambiguous_and_two_work_items_of_the_ask_are_too(self):
+        found = self.derive([self.issue(1234), self.issue(1235), self.report("blocked on #1234 and #1235", ask=1000)])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "issue", "report"])
+        found = self.derive([self.issue(1240, parent=1234), self.issue(1241, parent=1234), self.report("q", 1234)])
+        self.assertEqual(sorted(d["kind"] for d in found), ["issue", "issue", "report"])
+
+    def test_the_escalation_arriving_after_the_report_folds_it_on_the_next_pass_and_nothing_is_stored(self):
+        report = self.report("blocked on #1234", ask=1000)
+        before = self.derive([self.issue(1234, tier="cos"), report])                 # not escalated yet: two entries
+        self.assertEqual(self.shape(before), [("issue", "cos", 1234), ("report", "cos", 1000)])
+        after = self.derive([self.issue(1234, tier="human"), report])                # escalated: the next pass folds it
+        self.only_the_decision(after)
+        again = self.derive([self.issue(1234, tier="human"), report])                # a restart: the same derivation, no memory
+        self.only_the_decision(again)
+        self.assertEqual(after[0]["id"], again[0]["id"])
+
+    def test_the_daemon_follows_the_chain_with_a_bounded_read_and_a_command_reads_nothing(self):
+        reads = []
+        engine = types.SimpleNamespace(hub=object(), intents=types.SimpleNamespace(
+            _cache={}, parent=lambda n, repo=None: reads.append(n) or 1234))
+        lookup = sb.chain_parent_lookup(engine)
+        self.assertEqual([lookup(self.HOME, n) for n in (1240, 1241, 1242, 1243, 1244)], [1234, 1234, 1234, None, None])
+        self.assertEqual(reads, [1240, 1241, 1242])                                  # FOLD_PARENT_READS = 3 per pass
+        quiet = types.SimpleNamespace(hub=None, intents=types.SimpleNamespace(_cache={}, parent=lambda n, repo=None: reads.append(n)))
+        self.assertIsNone(sb.chain_parent_lookup(quiet)(self.HOME, 1250))
+        self.assertEqual(reads, [1240, 1241, 1242])                                  # no read without the hub
+
 
 
 class TestDecisionsFromGitHub(Base):
