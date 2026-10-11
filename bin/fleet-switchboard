@@ -11953,6 +11953,20 @@ def _gates_audit(engine, event, subject, detail):
             pass
 
 
+COS_DEFINITION_ENV = "FLEET_COS_DEFINITION"
+
+
+def cos_ready_check():
+    """"" when the installed chief-of-staff definition allows `waive` and `gates mode * shadow` (the way out of a refusal), else
+    what it lacks. The file is the one the installer puts in ~/.config/opencode/agents; FLEET_COS_DEFINITION overrides the path."""
+    path = os.environ.get(COS_DEFINITION_ENV) or str(Path.home() / ".config" / "opencode" / "agents" / "chief-of-staff.md")
+    try:
+        text = Path(path).read_text()
+    except (OSError, UnicodeError):
+        text = None
+    return plan_ledger.cos_lacking(text)
+
+
 def cmd_gates_check(args, runner, now):
     """`gates-check <pr> --for ready|merge`. Read-only (state counters aside). 0 allow, 10 refuse, 3 fail-open."""
     exit_code, payload = plan_ledger.EXIT_FAIL_OPEN, {"verdict": "fail-open"}
@@ -11995,7 +12009,7 @@ def cmd_gates_check(args, runner, now):
             report = box["report"]
             if box.get("unreadable"):
                 raise RuntimeError("GitHub unreadable: %s" % box["unreadable"])   # an unknown is not a refusal
-            mode, downgraded = plan_ledger.effective_mode(config, setting, lambda: ci_recorder_proven(state, now()))
+            mode, downgraded = plan_ledger.effective_mode(config, setting, lambda: ci_recorder_proven(state, now()), cos_ready_check)
             if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
                 _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
             verdict, failed, why = plan_ledger.decide(report, args.check_for, mode, setting.get("enforce_gates"))
@@ -12193,7 +12207,7 @@ def cmd_gates_switch(args, runner, now):
         raise LedgerCommandError("usage: gates mode <owner/repo> shadow|enforce|off")
     repo, target = args.rest
     if target == "enforce":
-        blocking, notes = plan_ledger.preflight(config, repo, lambda: ci_recorder_proven(state, now()))
+        blocking, notes = plan_ledger.preflight(config, repo, lambda: ci_recorder_proven(state, now()), cos_ready_check)
         if blocking:
             raise LedgerCommandError("refused: %s not switched to enforce: %s" % (repo, "; ".join(blocking)))
         for note in notes:
@@ -12379,7 +12393,7 @@ def ci_record_pass(engine, now):
 
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
-    blocking, notes = plan_ledger.preflight(config, args.pr, lambda: ci_recorder_proven(ensure_state_dir(), now()))
+    blocking, notes = plan_ledger.preflight(config, args.pr, lambda: ci_recorder_proven(ensure_state_dir(), now()), cos_ready_check)
     setting = plan_ledger.repo_setting(config, args.pr)
     print("preflight for enforcing %s: %s" % (args.pr, "BLOCKED" if blocking else "nothing blocks it"))
     print("  enforced gates: %s (others are reported, not enforced; set `enforce_gates` in plan_gates to change)"

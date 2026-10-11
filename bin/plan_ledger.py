@@ -457,7 +457,7 @@ CI_RECORDER = "switchboard"   # the reserved name of the built-in `ci` recorder 
 CI_RECORD_FRESH_SECONDS = 7 * 86400
 
 
-def preflight(config, repo, ci_proven=None):
+def preflight(config, repo, ci_proven=None, cos_ready=None):
     """(blocking, notes) for switching `repo` to enforce. Blocking: a `ci` recorder must be registered AND able to record. The
     reserved name `switchboard` (the built-in recorder) is accepted only when `ci_proven()` says it has actually recorded
     recently (a successful `gates ci-record` in the audit within CI_RECORD_FRESH_SECONDS); an agent name is accepted as
@@ -471,23 +471,50 @@ def preflight(config, repo, ci_proven=None):
     elif CI_RECORDER in ci and not any(n != CI_RECORDER for n in ci) and not (ci_proven() if callable(ci_proven) else ci_proven):
         blocking.append("the built-in `ci` recorder is listed but has not recorded recently: run `fleet-switchboard gates ci-record <repo#N>` "
                         "on a PR whose CI is green (a successful record within 7 days proves it works)")
+    if callable(cos_ready):
+        lacking = cos_ready()
+        if lacking:
+            blocking.append("the chief of staff cannot yet turn enforcement off: %s (the cos permission change, #163, must be merged and "
+                            "installed before enforcement is switched on)" % lacking)
     notes.append("`owner` verdicts are recorded only from the owner's own terminal (no agent session), never by an agent")
     for kind in ("reviewer", "tester"):
         if not evaluators.get(kind):
             notes.append("no agent is registered for `%s`: a plan that names it cannot get a verdict (register it under "
                          "plan_evaluators.%s)" % (kind, kind))
-    notes.append("manual: the chief of staff must be allowed `gates mode`/`gates off` and `waive` (a permission change held "
-                 "for the owner) before enforcement is switched on: cos is the one who can turn it off")
+    if not callable(cos_ready):
+        notes.append("manual: the chief of staff must be allowed `gates mode`/`gates off` and `waive` (a permission change held "
+                     "for the owner) before enforcement is switched on: cos is the one who can turn it off")
     return blocking, notes
 
 
-def effective_mode(config, setting, ci_proven=None):
+COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")
+
+
+def cos_lacking(text):
+    """What the installed chief-of-staff definition (its text, or None when unreadable) does not yet allow of COS_NEEDS: the
+    way out of a refusal. "" when both are allowed. A later `deny` of the same resource does not count as allowed."""
+    if text is None:
+        return "the installed chief-of-staff definition could not be read"
+    state = {}
+    resource = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("resource:"):
+            resource = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("effect:") and resource is not None:
+            state[resource] = line.split(":", 1)[1].strip().strip('"')
+            resource = None
+    missing = [need for need in COS_NEEDS if state.get(need) != "allow"]
+    return "it does not allow `%s`" % "`, `".join(missing) if missing else ""
+
+
+def effective_mode(config, setting, ci_proven=None, cos_ready=None):
     """(mode, why): the mode a check really runs in. `enforce` runs only when its preflight passes, wherever the mode is
     read (the config file can be edited by hand, so the switch command is not the only way in); otherwise it runs as
     `shadow` and `why` says what blocks it. A repo that is not enforcing has no `why`."""
     if setting["mode"] != "enforce":
         return setting["mode"], None
-    blocking, _ = preflight(config, setting.get("name") or "", ci_proven)
+    blocking, _ = preflight(config, setting.get("name") or "", ci_proven, cos_ready)
     if blocking:
         return "shadow", "enforce is not active: " + "; ".join(blocking)
     return "enforce", None

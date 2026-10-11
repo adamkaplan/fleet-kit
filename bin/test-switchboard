@@ -130,6 +130,10 @@ def remove_tree_patiently(tmp, tries=20, pause=0.1):
             time.sleep(pause)
 
 
+COS_ALLOWING = "".join('  - action: "shell"\n    resource: "%s"\n    effect: allow\n' % r
+                       for r in ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow"))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -142,9 +146,12 @@ class Base(unittest.TestCase):
             # A test that forgets to inject a fake must fail, not reach the
             # machine's real herdr or OpenCode: neither lives in these.
             "PATH": SAFE_PATH,
+            # the installed chief-of-staff definition: one that allows the way out of a refusal (the gate preflight reads it)
+            sb.COS_DEFINITION_ENV: str(self.home / "cos-definition.md"),
         })
         patcher.start()
         self.addCleanup(patcher.stop)
+        (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
         self.config_file = self.home / "xdg-config" / "fleet-switchboard" / "config.json"
@@ -9860,7 +9867,10 @@ class TestGhShimGateProbe(Base):
         self.bin.mkdir()
         self.log = self.home / "gh-log.json"
         fake = self.bin / "gh"
-        fake.write_text("#!/usr/bin/env python3\nimport json,sys\njson.dump({'argv': sys.argv[1:]}, open(%r,'w'))\n"
+        fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "if sys.argv[1:3] == ['repo', 'view']:\n    v = os.environ.get('FAKE_REPO')\n    print(v or ''); sys.exit(0 if v else 1)\n"
+                        "if sys.argv[1:3] == ['pr', 'view']:\n    v = os.environ.get('FAKE_PRURL')\n    print(v or ''); sys.exit(0 if v else 1)\n"
+                        "json.dump({'argv': sys.argv[1:]}, open(%r,'w'))\n"
                         "print('real gh out'); sys.exit(7)\n" % str(self.log))
         fake.chmod(0o755)
         self.calls_log = self.home / "gates-calls.log"
@@ -9907,7 +9917,7 @@ class TestGhShimGateProbe(Base):
             with self.subTest(args=args):
                 if self.calls_log.exists():
                     self.calls_log.unlink()
-                done, seen = self.run_shim(*args)
+                done, seen = self.run_shim(*args, env={"FAKE_REPO": "acme/app"})
                 self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), "the real gh's exit code and output pass through")
                 self.assertEqual(seen["argv"], list(args))
                 (call,) = self.gate_calls()
@@ -9922,7 +9932,7 @@ class TestGhShimGateProbe(Base):
         self.write_gates({"acme/app": {"mode": "enforce"}})
         for args in (("pr", "merge", "12", "-R", "acme/app"), ("pr", "ready", "12", "-R", "acme/app")):
             with self.subTest(args=args):
-                done, seen = self.run_shim(*args, env={"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "message": self.REFUSAL})})
+                done, seen = self.run_shim(*args, env={"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})})
                 self.assertEqual(done.returncode, 10)
                 self.assertIsNone(seen, "the real gh did not run")
                 self.assertEqual(done.stdout, "")
@@ -9930,7 +9940,7 @@ class TestGhShimGateProbe(Base):
                 self.assertEqual(self.spool()[-1]["event"], "refused")
 
     def test_a_refusal_with_no_message_still_stops(self):
-        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10"})
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"mode": "enforce"})})
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertIn("refused", done.stderr)
 
@@ -9967,6 +9977,75 @@ class TestGhShimGateProbe(Base):
                                    env={"FAKE_GATE_JSON": json.dumps({"verdict": "allow", "mode": "shadow", "head": self.HEAD})})
         self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app", "--auto"], "shadow never refuses and never rewrites")
 
+    ENFORCE = {"FAKE_GATE_JSON": json.dumps({"verdict": "allow", "mode": "enforce", "head": "a" * 40})}
+
+    def test_the_head_binding_cannot_be_dodged_by_how_the_flag_is_spelled(self):
+        head = "a" * 40
+        for extra, want in ((["--match-head-commit", ""], []), (["--match-head-commit="], []), (["--match-head-commit"], []),
+                            (["--match-head-commit", head.upper()], []), (["--match-head-commit=" + head, "--match-head-commit", ""], []),
+                            (["--match-head-commit", "", "--match-head-commit", head], [])):
+            with self.subTest(extra=extra):
+                done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", *extra, env=self.ENFORCE)
+                self.assertEqual(done.returncode, 7)
+                self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app", "--match-head-commit", head])
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", "--match-head-commit", "a", env=self.ENFORCE)
+        self.assertEqual((done.returncode, seen), (10, None), "a prefix is not the head")
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", "--match-head-commit", "b" * 40, "--match-head-commit=" + head, env=self.ENFORCE)
+        self.assertEqual((done.returncode, seen), (10, None), "every given value must be the checked head")
+
+    def test_a_bare_pr_number_uses_the_repo_the_real_gh_would(self):
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, FAKE_REPO="other/place"))
+        self.assertEqual(self.gate_calls(), [], "the directory's repo is not listed: not asked, not rewritten")
+        self.assertEqual(seen["argv"], ["pr", "merge", "5"])
+        done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, FAKE_REPO="acme/app"))
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+        self.assertEqual(seen["argv"][-2:], ["--match-head-commit", "a" * 40])
+        done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, GH_REPO="acme/app"))
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1", "GH_REPO is honoured")
+        self.calls_log.unlink()
+        done, seen = self.run_shim("pr", "merge", "5", env=self.ENFORCE)   # the real gh cannot say which repo: never guess the fleet repo
+        self.assertEqual((done.returncode, self.gate_calls()), (7, []))
+        self.assertIn("could not resolve the repo", self.spool()[-1]["detail"])
+
+    def test_ordinary_spellings_are_understood(self):
+        head = "a" * 40
+        for args in (("pr", "merge", "-sd", "5", "-R", "acme/app"), ("pr", "merge", "5", "-R", "acme/app", "-sd"),
+                     ("pr", "merge", "5", "--squash=true", "-R", "acme/app"), ("pr", "merge", "5", "-Racme/app"),
+                     ("pr", "merge", "5", "--repo=acme/app", "--delete-branch=false"),
+                     ("pr", "merge", "https://github.com/acme/app/pull/5/files")):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args, env=self.ENFORCE)
+                self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+                self.assertEqual(seen["argv"], list(args) + ["--match-head-commit", head])
+        for args in (("pr", "merge", "5", "-R", "acme/app", "--auto=true"), ("pr", "merge", "5", "-R", "acme/app", "-sd", "--auto")):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args, env=self.ENFORCE)
+                self.assertEqual((done.returncode, seen), (10, None))
+        done, seen = self.run_shim("pr", "merge", "5", "-R", "acme/app", "--auto=false", env=self.ENFORCE)
+        self.assertEqual(seen["argv"][-2:], ["--match-head-commit", head], "--auto=false is not auto")
+
+    def test_no_argument_and_a_branch_name_are_resolved_by_the_real_gh_or_recorded(self):
+        for args in (("pr", "merge"), ("pr", "merge", "my-branch", "-R", "acme/app"), ("pr", "ready")):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args, env=dict(self.ENFORCE, FAKE_PRURL="https://github.com/acme/app/pull/8"))
+                self.assertEqual(self.gate_calls()[-1].split()[1], "acme/app#8")
+                self.assertEqual(seen["argv"][:len(args)], list(args))
+        self.calls_log.unlink()
+        done, seen = self.run_shim("pr", "merge", env=self.ENFORCE)
+        self.assertEqual((done.returncode, self.gate_calls()), (7, []))
+        self.assertIn("could not resolve the PR", self.spool()[-1]["detail"])
+        done, seen = self.run_shim("pr", "ready", "12", "--undo", "-R", "acme/app", env=self.ENFORCE)
+        self.assertIn("shape not understood", self.spool()[-1]["detail"])
+
+    def test_a_refusal_is_printed_without_control_characters_and_only_for_an_enforce_reply(self):
+        reply = json.dumps({"mode": "enforce", "message": "bad \x1b]0;title\x07 \x1b[2Jtext"})
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": reply})
+        self.assertEqual((done.returncode, done.stderr), (10, "bad ]0;title [2Jtext\n"))
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app",
+                                   env={"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"mode": "shadow", "message": "x"})})
+        self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app"], "exit 10 from a shadow reply does not refuse")
+
     def test_a_check_that_hangs_costs_at_most_the_bound_and_the_command_still_runs(self):
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "1"})
         self.assertEqual(seen["argv"], ["pr", "ready", "12", "-R", "acme/app"])
@@ -9993,7 +10072,8 @@ class TestGhShimGateProbe(Base):
                      ("pr", "merge", "https://example.com/acme/app/pull/12")):
             with self.subTest(args=args):
                 done, seen = self.run_shim(*args)
-                self.assertEqual(seen["argv"][:2], list(args)[:2])
+                if args[1] != "view":
+                    self.assertEqual(seen["argv"][:2], list(args)[:2])
                 self.assertEqual(self.gate_calls(), [])
 
     def test_a_repo_not_listed_is_not_probed_and_the_match_ignores_case(self):
@@ -17830,10 +17910,28 @@ class TestPlanGatesCheck(LedgerBase):
         self.assertIn("blocking:", out)
         self.assertIn("`tester`", out)
 
-    def test_preflight_notes_the_manual_permission_precondition(self):
+    def test_enforce_is_blocked_until_the_installed_cos_definition_allows_the_way_out(self):
+        cos = self.home / "cos-definition.md"
+        for text, lacks in ((None, "could not be read"), ("", "waive"), (COS_ALLOWING.replace("allow", "deny"), "waive"),
+                            (COS_ALLOWING.replace("gates mode * shadow", "gates mode * off"), "gates mode * shadow"),
+                            (COS_ALLOWING.replace("waive *", "waive"), "waive *")):
+            with self.subTest(lacks=lacks):
+                cos.unlink(missing_ok=True)
+                if text is not None:
+                    cos.write_text(text)
+                self.set_gates({"acme/app": {"mode": "shadow"}})
+                code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
+                self.assertIn("chief of staff cannot yet turn enforcement off", out + err)
+                self.assertIn(lacks, out + err)
+                self.assertNotEqual(code, 0)
+                code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+                self.assertNotEqual(code, 0, "the mode switch is refused")
+                self.set_gates({"acme/app": {"mode": "enforce"}})
+                code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "merge", "--json")
+                self.assertEqual((code, json.loads(out)["mode"]), (0, "shadow"), "set by hand, it still runs as shadow")
+        cos.write_text(COS_ALLOWING)
         code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
-        self.assertEqual(code, 0)
-        self.assertIn("must be allowed `gates mode`", out)
+        self.assertNotIn("cannot yet turn enforcement off", out + err)
 
     def test_a_bad_mode_or_usage_is_refused(self):
         for argv in (("mode", "acme/app", "loud"), ("mode", "acme/app"), ("mode",)):
