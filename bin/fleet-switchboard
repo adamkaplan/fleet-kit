@@ -1206,6 +1206,7 @@ STATUS = {"working": "working", "idle": "idle", "done": "idle", "blocked": "bloc
 READ_LIMIT = 200    # transcript messages per read, newest first
 SINCE_SLACK = 60    # seconds read back beyond the oldest fact, for clock skew
 MESSAGE_CAP = 4000  # characters in one delivered message
+SEND_TEXT_MAX = 3500  # characters a sender may give `send`: the rest of MESSAGE_CAP is the header and the issue tag
 HELD_TOAST_AFTER = 15 * 60  # seconds an item is held before you get a toast
 
 
@@ -10642,6 +10643,10 @@ def cmd_send(args, runner, now):
     text = " ".join(args.text).strip()
     if not text:
         sys.stderr.write("%s: nothing to send\n" % PROG)
+        return EXIT_USAGE
+    if len(text) > SEND_TEXT_MAX:  # never cut silently: the sender hears it now, and nothing is delivered
+        sys.stderr.write("%s: message is %d characters, the limit is %d: nothing was sent. Write it to a file in the opencode "
+                         "temp dir and send the path\n" % (PROG, len(text), SEND_TEXT_MAX))
         return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)

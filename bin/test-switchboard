@@ -2847,6 +2847,20 @@ class TestSteerToWorking(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
 
+    def test_a_message_over_the_limit_is_refused_to_the_sender_and_nothing_is_delivered(self):
+        self.work()
+        before = len(self.world.v2.interrupts)
+        with captured() as (out, err):
+            code = sb.main(["send", "--from", "cos", "platform", "x" * 6000], runner=self.world.route,
+                           now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, sb.EXIT_USAGE)
+        self.assertIn("message is 6000 characters, the limit is %d" % sb.SEND_TEXT_MAX, err.getvalue())
+        self.assertIn("nothing was sent", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(self.world.v2.interrupts), before)
+        self.world.tick(1)
+        self.assertNotIn("xxxx", json.dumps(self.world.v2.__dict__, default=str))  # nothing reached the recipient
+
 
 # ------------------------------------------------------------------- the CLI
 
