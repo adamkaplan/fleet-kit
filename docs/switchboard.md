@@ -4100,3 +4100,56 @@ list in force.
 missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive <repo#N> --gates ... --reason ...`; never for G6 or
 G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
 not named as the reason. (`waive` is not built yet: the line names the path the design defines.)
+
+## The owner's verdict and the built-in `ci` recorder (#107)
+
+**The `owner` verdict** (a scenario whose evaluator is `owner`, or the old personal spelling, which is an alias) is recorded only from
+the **owner's own terminal**: a caller with **no agent session at all** (no `OPENCODE_SESSION_ID`, no herdr pane; or a session v2 knows is not
+a fleet agent). `verdict <scenario> --pr <repo#N> --as owner --result ... --evidence ...` from there is accepted and recorded as
+`by: owner`. A caller **with an agent session, registered or not, the chief of staff included, is refused**, and so is an uncertain identity
+(a session the switchboard does not know: #138 refuses it, never reads it as a person); the refusal is audited. All agents share one GitHub
+login, so the login cannot be the test; it is the session identity, which is a guard against mistakes and not a boundary (an agent that
+unsets its own session and pane variables looks like a person). There is no `plan_evaluators.owner` registry: the list is not consulted.
+
+**The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
+check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
+verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
+failing, pending or missing run it records nothing; a second run at the same head and plan records nothing twice; a push or a plan change
+voids it like any verdict. Any caller may run it, because the verdict says only what GitHub's checks say, whoever asked. It does not know
+whether the checks actually exercise the scenario: that is the plan's author's and the reviewers' concern. `verdict --as ci` is still available to an
+agent registered under `plan_evaluators.ci`, but nobody can use the name `switchboard`.
+
+**The preflight checks the recorder is real.** `plan_evaluators.ci` may list `switchboard` (the built-in recorder) or agent names. `enforce` is
+**refused** (by `gates mode ... enforce`, and a hand-edited `enforce` runs as `shadow`) when `ci` is empty, **or when it lists only `switchboard` and the audit
+holds no successful `gate.ci_record` in the last 7 days**: run `gates ci-record` on a PR whose CI is green to prove it, and run it again from time to
+time (a daemon pass that does so is a later step). A failed record, or one older than a week, proves nothing. `gates preflight` says which.
+
+**How "the owner's own terminal" is established (hardening of the owner verdict, #107).** No agent session is not enough: an agent that
+unsets `OPENCODE_SESSION_ID` and `HERDR_PANE_ID` has none either. So the check requires, besides no session, that (a) standard input and
+standard output are a **controlling terminal** (an agent's tool shell runs on pipes) **and** (b) **no ancestor** in the caller's process chain, walked up
+to 25 parents with `ps`, is an `opencode`, `fleet-opencode` or `copilot` process. If either cannot be established (no `ps`, an unreadable
+parent, a chain that does not end) the answer is a refusal with the reason, never a yes; the reason is printed and audited
+(`plan.verdict.refused`). The same check guards `gates mode` and `gates off|on` for a person; the chief of staff, an agent session, needs none.
+
+**What this is, plainly: a strong mistake guard, not a boundary against a determined agent that holds the owner's account.** All agents and
+the owner share one GitHub login and one user account on the machine. An agent that is determined to impersonate the owner could still
+allocate a pseudo-terminal (`script`, `expect`, a `pty` library) and detach itself from its agent ancestors (a double fork, `setsid`, a daemon
+that the init process adopts), after which both checks pass; or write the ledger, the config and the kill file directly. None of that is provable
+from inside the process. What the checks do stop is the honest mistakes and the cheap tricks: a tool shell on pipes, unsetting two variables, and a
+verdict recorded by the agent that ran into the gate. Real separation of the owner's verdicts needs something an agent cannot reach (a separate account, a hardware
+confirmation, or a required check on GitHub); this slice does not provide it.
+
+**One place.** The owner-in-person check is a single function, `gates_caller_kind` (it wraps `owner_terminal_problem`), and every command that is "only the
+owner, at a terminal" must ask it and nothing else: today `verdict --as owner`, `gates mode` and `gates off|on`. A new such command (a later waiver by the
+owner, for instance) uses the same function so the rule cannot drift between commands; a test pins that it is called from exactly one place.
+
+**The process table is read with a trusted `ps` only.** The check runs `ps` from a fixed path (`/bin/ps`, then `/usr/bin/ps`; never found on `PATH`, so a
+`ps` placed earlier on `PATH` cannot decide who is a person), only if that file is a regular executable owned by root and not writable by others, and with a
+scrubbed environment (`PATH=/usr/bin:/bin`, `LC_ALL=C`, nothing else). With no such `ps` the chain cannot be read and the check refuses. Tests put a fake `ps`
+first on `PATH` and show it is never run.
+
+**Two things stay unprovable, and they are why this is a mistake guard and not a boundary.** (1) **A pty that is double-forked or reparented.** An agent that
+allocates a pseudo-terminal and detaches the process that holds it (a double fork, `setsid`, adoption by init) has no agent among its ancestors and a real terminal;
+nothing in the process can tell it from the owner's shell. (2) **A harness that is not on the list.** Ancestors are matched against `opencode`, `fleet-opencode`
+and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
+that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.

@@ -16862,12 +16862,14 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
+    terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
+
     def run_as(self, who, *argv):
         if who is None:
             os.environ.pop("HERDR_PANE_ID", None)
         else:
             os.environ["HERDR_PANE_ID"] = self.world.panes[who]
-        with captured() as (out, err):
+        with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
             code = sb.main(list(argv), runner=self.route, now=self.world.clock.now,
                            wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
@@ -16995,10 +16997,36 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual(code, 2)
         self.assertIn("an author cannot record a verdict", err)
 
+    def test_the_owner_records_an_owner_verdict_from_their_own_terminal_and_no_agent_can(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        args = ("verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "I read the screenshot")
+        code, out, err = self.run_as(None, *args)          # no agent session, no pane: the owner's terminal
+        self.assertEqual(code, 0, err)
+        entry = self.ledger()[-1]
+        self.assertEqual((entry["kind"], entry["evaluator"], entry["by"]), ("verdict", "owner", "owner"))
+        self.ledger_before = len(self.ledger())
+        for who in ("coder", "rev", "own"):                # an agent session, registered or not, is refused
+            with self.subTest(who=who):
+                code, out, err = self.run_as(who, *args)
+                self.assertEqual(code, 2)
+                self.assertIn("only the owner, from the owner's own terminal", err)
+        self.assertEqual(len(self.ledger()), self.ledger_before)
+        self.assertIn("plan.verdict.refused", [e["event"] for e in self.world.audit()])
+
+    def test_an_uncertain_identity_cannot_record_an_owner_verdict(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        os.environ["OPENCODE_SESSION_ID"] = "ses_nosuchsession"
+        try:
+            code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "x")
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+        self.assertEqual(code, 2)
+        self.assertIn("not known", err)
+
     def test_a_scenario_that_names_the_old_personal_evaluator_is_judged_by_the_owner(self):
         self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: adam")
         self.assertEqual(self.prove("coder", "S3")[0], 0)
-        code, out, err = self.verdict("own", "S3", "owner")
+        code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "read it")
         self.assertEqual(code, 0, err)
 
     # -- the chain
@@ -17753,6 +17781,241 @@ class TestLaunchGate(LedgerBase):
         self.assertIsNone(problem)
         self.assertIsNotNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "a" * 64))
         self.assertIsNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "b" * 64))
+
+
+class TestCiRecorder(LedgerBase):
+    """The built-in `ci` recorder: `gates ci-record <pr>`, and the preflight that refuses the reserved name until it has worked."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_default_gates()
+
+    def set_default_gates(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
+
+    def record(self, *more):
+        return self.run_as(None, "gates", "ci-record", self.PR, *more)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def verdicts(self):
+        return [(e["scenario"], e["by"], e["head"]) for e in self.ledger() if e["kind"] == "verdict"]
+
+    def test_green_ci_records_a_ci_verdict_for_each_scenario_that_names_ci_at_the_head_and_plan_hash(self):
+        code, out, err = self.record()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.verdicts(), [("S1", "switchboard", LEDGER_HEAD), ("U1", "switchboard", LEDGER_HEAD)])
+        entry = self.ledger()[0]
+        self.assertEqual((entry["evaluator"], entry["result"]), ("ci", "pass"))
+        self.assertRegex(entry["plan_hash"], r"^sha256:[0-9a-f]{64}$")
+        (event,) = self.events("gate.ci_record")
+        self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
+
+    def test_it_records_nothing_for_a_failing_pending_or_missing_run(self):
+        for rollup, word in (([{"conclusion": "FAILURE", "status": "COMPLETED"}], "failing"),
+                             ([{"status": "IN_PROGRESS", "conclusion": ""}], "pending"), ([], "none")):
+            with self.subTest(ci=word):
+                self.pr["statusCheckRollup"] = rollup
+                code, out, err = self.record()
+                self.assertEqual(code, 2)
+                self.assertIn("CI is %s" % word, err)
+        self.assertEqual(self.verdicts(), [])
+        self.assertTrue(all(e["detail"]["ok"] is False for e in self.events("gate.ci_record")))
+
+    def test_it_is_bound_to_the_exact_head_and_a_push_voids_it(self):
+        self.record()
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual(len(self.verdicts()), 2, "a second run records nothing twice")
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual([v[2] for v in self.verdicts()], [LEDGER_HEAD] * 2 + [LEDGER_NEW_HEAD] * 2)
+
+    def test_it_is_bound_to_the_plan_hash(self):
+        self.record()
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly 2 agents named")
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual(len({e["plan_hash"] for e in self.ledger()}), 2)
+
+    def test_a_plan_with_no_ci_scenario_or_a_failing_plan_records_nothing(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("proof: test", "proof: live").replace("evaluator: ci", "evaluator: tester")
+        code, out, err = self.record()
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to record", out)
+        self.assertEqual(self.verdicts(), [])
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        self.assertEqual(self.record()[0], 2)
+
+    def test_the_recorded_verdict_satisfies_g1_for_those_scenarios_and_no_agent_can_use_the_recorders_name(self):
+        self.assertEqual(self.record()[0], 0)
+        code, report, _ = self.gates_json()
+        g1 = next(r for r in report["gates"] if r["gate"] == "G1")
+        self.assertFalse(any("S1: ci verdict" in m or "U1: ci verdict" in m for m in g1["missing"]), g1["missing"])
+        self.assertTrue(any(m.startswith("S2:") for m in g1["missing"]), "the tester and reviewer scenarios still need theirs")
+        ok, why = sb.plan_ledger.may_record_verdict("ci", "switchboard", {"ci": ["switchboard"]}, set())
+        self.assertFalse(ok)
+        self.assertIn("built-in recorder's name", why)
+
+    def gates_json(self):
+        code, out, err = self.run_as("coder", "gates", self.PR, "--json")
+        return code, json.loads(out), err
+
+    # -- the preflight
+
+    def test_the_reserved_name_is_refused_until_the_recorder_has_recorded(self):
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("has not recorded recently", err)
+        self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
+        self.assertEqual(self.record()[0], 0)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 0, err)
+
+    def test_a_failed_record_does_not_prove_the_recorder(self):
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.record()
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 2)
+
+    def test_a_stale_record_does_not_prove_it(self):
+        self.record()
+        self.world.clock.t += sb.plan_ledger.CI_RECORD_FRESH_SECONDS + 3600
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 2)
+
+    def test_a_hand_edited_enforce_runs_as_shadow_until_the_recorder_is_proven(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["mode"], "shadow")
+        self.assertIn("has not recorded recently", json.loads(out)["downgraded"])
+        self.record()
+        code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready", "--json")
+        self.assertEqual((code, json.loads(out)["mode"]), (10, "enforce"))
+
+    def test_an_agent_registered_for_ci_still_passes_the_preflight_and_none_does_not(self):
+        self.configure(evaluators={"ci": ["cibot"]})
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 0)
+        self.configure(evaluators={})
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "shadow")[0], 0)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("no `ci` recorder is registered", err)
+
+    def test_preflight_says_owner_verdicts_come_only_from_the_owners_terminal(self):
+        self.assertIn("only from the owner's own terminal", self.run_as(None, "gates", "preflight", "acme/app")[1])
+
+
+class TestOwnerTerminal(LedgerBase):
+    """The owner's own terminal is established, not assumed: a controlling TTY and no agent process among the ancestors."""
+
+    class Tty:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    def chain(self, table):
+        """A fake `ps`: {pid: (ppid, command)}; None for a pid it does not know."""
+        return lambda pid: table.get(pid)
+
+    def problem(self, table, start=100, tty=True, **kw):
+        return sb.owner_terminal_problem(self.Tty(tty), self.Tty(tty), self.chain(table), start, **kw)
+
+    def test_a_terminal_with_no_agent_ancestor_is_the_owners(self):
+        table = {100: (90, "-zsh"), 90: (80, "/Applications/Term.app/Contents/MacOS/Term"), 80: (1, "/sbin/launchd")}
+        self.assertIsNone(self.problem(table))
+
+    def test_pipes_are_not_a_terminal(self):
+        table = {100: (1, "-zsh")}
+        for stdin, stdout in ((False, True), (True, False), (False, False)):
+            with self.subTest(stdin=stdin, stdout=stdout):
+                got = sb.owner_terminal_problem(self.Tty(stdin), self.Tty(stdout), self.chain(table), 100)
+                self.assertIn("not a terminal", got)
+
+    def test_an_agent_ancestor_anywhere_in_the_chain_refuses(self):
+        for command in ("/home/u/.local/bin/opencode --agent coder", "/opt/bin/fleet-opencode -s ses_1", "node /opt/lib/opencode/cli.js run",
+                        "/usr/local/bin/copilot --agent x"):
+            with self.subTest(command=command):
+                table = {100: (90, "-zsh"), 90: (80, "sh -c run"), 80: (70, command), 70: (1, "/sbin/launchd")}
+                self.assertIn("an agent process is an ancestor", self.problem(table))
+
+    def test_a_chain_that_cannot_be_read_or_does_not_end_refuses(self):
+        self.assertIn("cannot be read", self.problem({100: (90, "-zsh")}))          # 90 is unknown
+        loop = {n: (n + 1, "-zsh") for n in range(100, 140)}
+        self.assertIn("deeper than 5", self.problem(loop, depth=5))
+        self.assertIn("cannot be established", sb.owner_terminal_problem(object(), object(), self.chain({}), 100))
+
+    def test_a_fake_ps_earlier_on_path_is_never_run(self):
+        fake_dir = self.home / "fakebin"
+        fake_dir.mkdir()
+        marker = self.home / "fake-ps-ran"
+        fake = fake_dir / "ps"
+        fake.write_text("#!/bin/sh\ntouch %s\necho '1 -zsh'\n" % marker)
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": "%s:/usr/bin:/bin" % fake_dir}):
+            got = sb._ps_line(os.getpid())
+        self.assertFalse(marker.exists(), "a ps found on PATH decided nothing")
+        self.assertIsNotNone(got, "the fixed-path ps answered")
+
+    def test_a_ps_that_is_not_the_expected_binary_is_refused(self):
+        mine = self.home / "ps"
+        mine.write_text("#!/bin/sh\necho '1 -zsh'\n")
+        mine.chmod(0o755)   # owned by the test user, not root
+        with mock.patch.object(sb, "PS_CANDIDATES", (str(mine), str(self.home / "nope"))):
+            self.assertIsNone(sb._trusted_ps())
+            self.assertIsNone(sb._ps_line(os.getpid()), "no trusted ps: the chain cannot be read, so the caller refuses")
+            self.assertIn("cannot be read", sb.owner_terminal_problem(self.Tty(True), self.Tty(True), None, os.getpid()))
+
+    def test_the_child_runs_with_a_scrubbed_environment(self):
+        self.assertEqual(sb.PS_ENV["PATH"], "/usr/bin:/bin")
+        self.assertNotIn("HOME", sb.PS_ENV)
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen.update(argv=argv, env=kw.get("env"))
+            return real(argv, **kw)
+        with mock.patch.object(sb.subprocess, "run", spy):
+            sb._ps_line(os.getpid())
+        self.assertEqual(seen["env"], dict(sb.PS_ENV))
+        self.assertIn(seen["argv"][0], sb.PS_CANDIDATES)
+
+    def test_a_real_ps_unreadable_pid_is_refused_not_guessed(self):
+        self.assertIsNone(sb._ps_line(2 ** 22 + 12345), "no such process: None, which the caller turns into a refusal")
+
+    def test_an_agent_without_its_session_variables_is_refused_for_the_owner_verdict_and_the_reason_is_logged(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        self.terminal_problem = "an agent process is an ancestor of this command (opencode)"
+        code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("not established as the owner's own terminal", err)
+        self.assertIn("an agent process is an ancestor", err)
+        (event,) = [e for e in self.world.audit() if e["event"] == "plan.verdict.refused"]
+        self.assertIn("an agent process is an ancestor", event["detail"]["why"])
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_same_check_guards_mode_changes_and_the_kill_file(self):
+        self.terminal_problem = "standard input and output are not a terminal (an agent's tool shell runs on pipes)"
+        before = self.config_file.read_text()
+        self.assertEqual(self.run_as(None, "gates", "off")[0], 2)
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "off")[0], 2)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.terminal_problem = None
+        self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
+
+    def test_the_terminal_check_is_one_function_used_by_every_owner_only_command(self):
+        text = SWITCHBOARD.read_text()
+        self.assertEqual(text.count("owner_terminal_problem()"), 1, "the check is called from exactly one place")
+        for name in ("gates_caller_may_switch", "cmd_verdict"):
+            self.assertIn("gates_caller_kind(", inspect.getsource(getattr(sb, name)), name)
+        self.assertIn("THE ONE human-terminal check", inspect.getsource(sb.gates_caller_kind))
+
+    def test_the_chief_of_staff_session_does_not_need_a_terminal(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.terminal_problem = "not a terminal"
+        self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
 
 
 class TestJudgeEval(Base):
