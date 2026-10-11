@@ -15248,6 +15248,25 @@ class TestTriage(Base):
         self.go(passes=2)
         self.assertEqual(self.only("T10"), ["acme/api#102"])
 
+    def test_t10_a_close_by_one_of_ours_gets_no_grace_and_one_by_another_or_unnamed_keeps_it(self):
+        self.charter()
+        cases = {103: {"login": "bot"}, 104: {"login": "someone-else"}, 105: None}   # ours, another's, not named
+        issues = []
+        for n, closer in cases.items():
+            record = dict(tri_issue(self.now, n, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 240))
+            if closer:
+                record["closed_by"] = closer
+            issues.append(record)
+        self.hub.closed["acme/api"] = {self.USER: issues}
+        self.go(passes=2)
+        self.assertEqual(self.only("T10"), ["acme/api#103"])
+        for record in issues[1:]:   # after the grace the others are findings too
+            record["closed_at"] = sb.iso(self.now - 1200)
+        self.engine.triage.units.clear()
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=2)
+        self.assertEqual(self.only("T10"), ["acme/api#103", "acme/api#104", "acme/api#105"])
+
     def test_t10_a_closed_issue_still_labelled_awaiting_is_immediate(self):
         self.charter()
         closed = tri_issue(self.now, 100, created=9, labels=[self.USER, "kind"], state="closed")

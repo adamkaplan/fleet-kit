@@ -7277,6 +7277,19 @@ def triage_our_logins(engine, cfg):
     return {str(v).lower() for v in (config.get("gh_users") or {}).values()} | {l.lower() for l in config.get("owner_logins") or []}
 
 
+def triage_t10_graced(engine, cfg, record, now):
+    """True when a close is too recent for T10: inside TRIAGE_T10_GRACE of `closed_at`, UNLESS the closer (`closed_by`, when the
+    record names one) is one of ours: our own agents take the label off in the same sweep as the close, so a label still set is
+    their miss and no grace is given (the owner's panel shows a closed-but-labelled issue meanwhile). A closer the record does
+    not name, or one that is not ours, keeps the grace."""
+    if not sweep_within(parse_iso(record.get("closed_at")), now, TRIAGE_T10_GRACE):
+        return False
+    closer = record.get("closed_by")
+    login = (_login_of(closer) or "").lower() if isinstance(closer, dict) else ""
+    tcfg = cfg if isinstance(cfg, dict) else {}
+    return not (login and login in triage_our_logins(engine, tcfg))
+
+
 class TriageState:
     """Memory only: rebuilt from GitHub and the decision list."""
 
@@ -7504,9 +7517,8 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             for record in held["data"]:
                 number = _number(record)
                 names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
-                closed_at = parse_iso(record.get("closed_at"))
                 if (number is not None and record.get("state") == "closed" and unit.split(":", 1)[1] in names
-                        and not sweep_within(closed_at, now, TRIAGE_T10_GRACE)):   # the label usually comes off minutes after the close
+                        and not triage_t10_graced(engine, cfg, record, now)):   # the label usually comes off minutes after the close
                     out.append(("T10", "%s#%d" % (repo, number), {"label": unit.split(":", 1)[1]}))
     if not errors:   # T5, T6 read only the decision list: judged only when it is whole
         for d in decisions:
@@ -7555,7 +7567,7 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
     if rule == "T10":
         names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
         return (data.get("state") == "closed" and any(l in names for l in triage_awaiting_labels(engine))
-                and not sweep_within(parse_iso(data.get("closed_at")), now, TRIAGE_T10_GRACE))
+                and not triage_t10_graced(engine, cfg, data, now))
     if data.get("state") != "open":
         return False
     item = triage_norm(data)
