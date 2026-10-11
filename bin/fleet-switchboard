@@ -6384,7 +6384,7 @@ SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent 
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
-SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label", "S6b": "merge label and first-line marker disagree",
+SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not MERGE: captain", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged"}
@@ -6584,6 +6584,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
                          "captain": is_captain({"labels": names, "body": body}),
                          "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
+                         "author": (pr_login(record.get("user")) or "").lower(),
+                         "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False, "latest_refs": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
@@ -6654,6 +6656,20 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     return [d for d in decisions if id(d) not in drop], stale
 
 
+def sweep_ours(engine, repo, number, author, assignees, notices=None):
+    """Whether a PR is OURS (a fleet agent's), by the rule the triage uses to tell ours from other-owner items: its author or an
+    assignee is one of `our_logins` (the triage's key, else the `gh_users` accounts and `owner_logins`), or an agent of ours recorded a
+    notice for it. Another team's PR is not ours: the sweep only flags what our own fleet should have labelled."""
+    tcfg = engine.config.get("triage")
+    mine = triage_our_logins(engine, tcfg if isinstance(tcfg, dict) else {})
+    if notices is None:
+        try:
+            notices = {(n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+        except (NoticeError, OSError, TypeError):
+            notices = set()
+    return (author in mine or any(a in mine for a in assignees or []) or (repo, number) in notices)
+
+
 def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
@@ -6666,6 +6682,10 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     def ref_text(repo, number):
         return "%s#%d" % (repo, number)
     s2, unattributed = set(), 0
+    try:
+        notices = {(n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+    except (NoticeError, OSError, TypeError):
+        notices = set()
     for repo, picture in state.repos.items():
         for number, item in picture["items"].items():
             if not item["pr"]:
@@ -6678,8 +6698,9 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
             if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
-                if "marker-without-label" in item["captain_findings"]:
-                    found.add(("S6a", ref_text(repo, number)))
+                if "marker-without-label" in item["captain_findings"] and sweep_ours(
+                        engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
+                    found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
                 if "disagree" in item["captain_findings"]:
                     found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
@@ -6745,6 +6766,9 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     labelled = bool(names & {awaiting_label(engine.config), awaiting_cos_label(engine.config)})
     if kind in ("S6a", "S6b"):
         want = "marker-without-label" if kind == "S6a" else "disagree"
+        if kind == "S6a" and not sweep_ours(engine, repo, number, (pr_login(data.get("user")) or "").lower(),
+                                            [(pr_login(a) or "").lower() for a in data.get("assignees") or [] if isinstance(a, dict)]):
+            return False
         return is_pr and want in pr_marker_state(names, body)["findings"]
     if kind in ("S1a", "S1b"):
         if is_pr:
