@@ -125,19 +125,20 @@ def build(subagent=False):
     printable = "".join(chr(i) for i in range(33, 127) if chr(i) not in "*?")  # `*` and `?` are the glob characters themselves: they cannot be named
 
     def redirects(command):
-        """Deny every redirect except the stream merge `2>&1` (`>&1` and nothing after it): `>file`, `>>file`, `&>file`, `>&file`.
-        A glob cannot say "anything but", so the character after `>` (and after `>&1`) is enumerated."""
+        """Deny every redirect except the stream merge `2>&1` ending the command (the scanner has already split `;`, `&&` and `|`, so in practice it does).
+        A deny cannot carve an exception and a glob has no "anything but", so this goes by what follows each `>` (R): R of three or more characters is
+        always a target (`> file`, `>& file`, `>\tfile`, `>é file`), R of one is a filename, and R of exactly two is denied unless it is `&1`: its first
+        character is enumerated (ASCII), and for `>&x` the second. Left open: a redirect to a one or two character NON-ASCII file name at the very end."""
         guard("%s *&>*" % command)
         guard("%s *>" % command)
-        for ch in printable:
-            if ch != "&":
-                guard("%s *>%s*" % (command, ch))
-            elif True:
-                for after in printable.replace("1", ""):
-                    guard("%s *>&%s*" % (command, after))
-        guard("%s *> *" % command)
-        for after in printable:
-            guard("%s *>&1%s*" % (command, after))
+        guard("%s *>?" % command)
+        guard("%s *>???*" % command)
+        for first in printable + " \t":
+            if first != "&":
+                guard("%s *>%s?" % (command, first))
+        for second in printable + " \t":
+            if second != "1":
+                guard("%s *>&%s" % (command, second))
 
     # writes: a redirect to anywhere but the message temp dir (the cat > temp form above is the one allowed redirect)
     for command in ("ls", "grep", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "jq", "echo", "printf", "date", "git", "gh pr view", "gh pr list",

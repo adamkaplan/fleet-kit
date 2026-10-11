@@ -4065,3 +4065,7 @@ unchanged.
 `fleet-switchboard decisions 2>&1; fleet-switchboard decisions --all 2>&1`: the blanket redirect guard (`*>*`) matched `2>&1`. The redirect guards now deny every redirect
 except the stream merge `2>&1` (the character after `>` is enumerated, `>&` only followed by `1`, `&>`, `>>`, `>file`, `2>file` still denied). `;` between two commands is fine
 when each part is allowed on its own, because each part is evaluated separately (`...; rm x` and `...; make build` stay denied). Limit: `*` and `?` are the glob characters, so `>*` and `>?` cannot be named and are not denied.
+
+Review of the redirect change: the first version enumerated the characters that may NOT follow `>&` and left gaps (`>& file`, `2>& file`, a tab, a non-ASCII name). A deny cannot carve an exception
+and a glob has no "anything but", so it is now decided by what follows each `>`: three or more characters (a space and a name, `&` and a name, a tab, `é file`) is always denied; one character is a file name and denied;
+exactly two are denied unless they are `&1`. Left open, and documented: a redirect to a one or two character non-ASCII file name at the very end of a segment, and (existing before this change) a redirect in the final segment of a pipeline.
