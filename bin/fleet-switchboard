@@ -113,6 +113,33 @@ def load_plan_check():
     return module
 
 
+def load_plan_ledger():
+    """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py")
+    held = sys.modules.get("plan_ledger")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("plan_ledger", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["plan_ledger"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("plan_ledger", None)
+        raise
+    return module
+
+
+class _LazyPlanLedger:
+    """`plan_ledger`, loaded on first use: a missing module stops only `prove`, `verdict` and `gates`."""
+
+    def __getattr__(self, name):
+        return getattr(load_plan_ledger(), name)
+
+
+plan_ledger = _LazyPlanLedger()
+
+
 class _LazyPlanCheck:
     """`plan_check`, loaded on first use: a missing or broken bin/plan_check.py must never stop the daemon or any other
     command, only `plan check` itself, with a clear message."""
@@ -282,7 +309,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -333,7 +360,29 @@ def validate_config(raw, source="config"):
     validate_friction_config(config, source)
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
+    validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     return config
+
+
+PLAN_EVALUATOR_KINDS = ("ci", "tester", "reviewer", "owner")
+
+
+def validate_plan_evaluators(config, source):
+    """`plan_evaluators`: absent or {} means no agent may record any verdict (the safe default). Otherwise an object
+    of evaluator (ci|tester|reviewer|owner) -> a list of fleet agent names."""
+    raw = config.get("plan_evaluators")
+    if raw is None:
+        config.pop("plan_evaluators", None)
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'plan_evaluators' must be an object of evaluator -> agent names, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(PLAN_EVALUATOR_KINDS))
+    if unknown:
+        raise ConfigError("%s: 'plan_evaluators' names no evaluator %s (known: %s)" % (source, ", ".join(map(repr, unknown)),
+                                                                                    ", ".join(PLAN_EVALUATOR_KINDS)))
+    for kind, names in raw.items():
+        if not isinstance(names, list) or not all(isinstance(n, str) and NAME_RE.match(n) for n in names):
+            raise ConfigError("%s: 'plan_evaluators.%s' must be a list of fleet agent names" % (source, kind))
 
 
 def validate_external_config(config, source):
@@ -5254,6 +5303,11 @@ def pr_facts_from(data):
 def read_pr_facts(engine, repo, number, extra_fields=""):
     """ONE `gh pr view` of the PR, with the repo's configured account (gh_users). The hub's picture holds the PR's
     title, size and state only (not checks or review), so it cannot answer this on its own. Raises NoticeError."""
+    return pr_facts_from(read_pr_json(engine, repo, number, extra_fields))
+
+
+def read_pr_json(engine, repo, number, extra_fields=""):
+    """The raw object of ONE `gh pr view --json` (what read_pr_facts reduces). Raises NoticeError."""
     config = engine.config
     accounts = getattr(engine, "accounts", None) or GhAccounts(config, engine.gh_runner or subprocess.run, engine.now)
     try:
@@ -5274,7 +5328,7 @@ def read_pr_facts(engine, repo, number, extra_fields=""):
         why = "gh pr view %s#%d failed: %s" % (repo, number, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode)
         raise (NoticeNotFound if _PR_NOT_FOUND.search(done.stderr or "") else NoticeError)(why)
     try:
-        return pr_facts_from(json.loads(done.stdout or ""))
+        return json.loads(done.stdout or "")
     except ValueError:
         raise NoticeError("gh pr view %s#%d answered something that is not JSON" % (repo, number)) from None
 
@@ -11395,6 +11449,50 @@ def fetch_plan(reader, repo, number, comment_id=None):
     return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1]
 
 
+def load_plan(args, runner, now):
+    """(text, source label, result) of the plan `args` names (source, file, ask, done_when), checked. Raises
+    PlanInputError, ValueError (an unreadable block) or the readers' errors."""
+    try:
+        plan_check.MAX_BYTES
+    except Exception as err:  # the module is missing or broken: say so, never a traceback
+        raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
+    done_when = args.done_when
+    plan_own = None
+    if args.file:
+        if args.source:
+            raise PlanInputError("give a plan source or --file, not both")
+        try:
+            with open(args.file, "r", encoding="utf-8") as handle:
+                text = handle.read(plan_check.MAX_BYTES * 4 + 1)
+        except (OSError, UnicodeDecodeError) as err:
+            raise PlanInputError("cannot read %s: %s" % (args.file, getattr(err, "strerror", None) or err)) from None
+        if len(text) > plan_check.MAX_BYTES * 4:
+            raise PlanInputError("%s is larger than %d bytes" % (args.file, plan_check.MAX_BYTES * 4))
+        source = "file %s" % args.file
+        plan_own = parse_intent(text)[1]
+        done_when = done_when or plan_own
+        plan_own = plan_own if done_when != plan_own else None
+    else:
+        if not args.source:
+            raise PlanInputError("give a plan: owner/repo#N, an issue URL, or --file PATH")
+        config = load_config()
+        repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
+        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
+                              accounts=GhAccounts(config, runner, now))
+        text, source, issue_done = fetch_plan(reader, repo, number, comment_id)
+        if args.ask and not done_when:
+            ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
+            done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
+            plan_own = issue_done
+        elif done_when:
+            plan_own = issue_done if issue_done and issue_done != done_when else None
+        else:
+            done_when = issue_done
+    if args.ask and args.file and not args.done_when:
+        raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
+    return text, source, plan_check.check(text, done_when, plan_own)
+
+
 def cmd_plan_check(args, runner, now):
     """`plan check`: read a plan, check it, print PASS or FAIL with one line per defect and the content hash. Exit 0
     pass, 1 fail, 2 unreadable. Reads only; never writes GitHub."""
@@ -11408,49 +11506,235 @@ def cmd_plan_check(args, runner, now):
         return code
 
     try:
-        try:
-            plan_check.MAX_BYTES
-        except Exception as err:  # the module is missing or broken: say so, never a traceback
-            raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
-        done_when = args.done_when
-        plan_own = None
-        if args.file:
-            if args.source:
-                raise PlanInputError("give a plan source or --file, not both")
-            try:
-                with open(args.file, "r", encoding="utf-8") as handle:
-                    text = handle.read(plan_check.MAX_BYTES * 4 + 1)
-            except (OSError, UnicodeDecodeError) as err:
-                raise PlanInputError("cannot read %s: %s" % (args.file, getattr(err, "strerror", None) or err)) from None
-            if len(text) > plan_check.MAX_BYTES * 4:
-                raise PlanInputError("%s is larger than %d bytes" % (args.file, plan_check.MAX_BYTES * 4))
-            source = "file %s" % args.file
-            plan_own = parse_intent(text)[1]
-            done_when = done_when or plan_own
-            plan_own = plan_own if done_when != plan_own else None
-        else:
-            if not args.source:
-                raise PlanInputError("give a plan: owner/repo#N, an issue URL, or --file PATH")
-            config = load_config()
-            repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
-            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
-                                  accounts=GhAccounts(config, runner, now))
-            text, source, issue_done = fetch_plan(reader, repo, number, comment_id)
-            if args.ask and not done_when:
-                ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
-                done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
-                plan_own = issue_done
-            elif done_when:
-                plan_own = issue_done if issue_done and issue_done != done_when else None
-            else:
-                done_when = issue_done
-        if args.ask and args.file and not args.done_when:
-            raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
-        result = plan_check.check(text, done_when, plan_own)
+        text, source, result = load_plan(args, runner, now)
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
     result["source"] = source
     return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source))
+
+
+# ---------------------------------------------------------------- `prove`, `verdict`, `gates` (#107): the evidence ledger
+
+PLAN_LINE_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
+LEDGER_PR_PATTERN = r"owner/repo#N or the PR's URL"
+
+
+class LedgerCommandError(Exception):
+    """A `prove`, `verdict` or `gates` command that cannot go on (exit 2): a usage problem, said in one line."""
+
+
+def pr_picture(engine, repo, number, state):
+    """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
+    try:
+        raw = read_pr_json(engine, repo, number)
+        facts = pr_facts_from(raw)
+    except (NoticeError, AttributeError) as err:
+        return None, "", [], _one_line(str(err), 160)
+    body = raw.get("body") if isinstance(raw.get("body"), str) else ""
+    item = next((i for i in read_pr_notices(state) if i["repo"] == repo and i["number"] == number), None)
+    return facts, body, notice_senders(item) if item else [], None
+
+
+def authoritative_plan(entries, pr, body):
+    """(source, where) of the plan a PR is under, which its writer does not choose: the `PLAN:` line of the PR body, else
+    the plan of the PR's FIRST ledger entry. (None, None) when neither exists yet."""
+    found = PLAN_LINE_RE.search(body or "")
+    if found:
+        return found.group(1).strip("<>.,"), "the PR body's PLAN: line"
+    for entry in entries:
+        if entry.get("pr") == pr and entry.get("plan_ref"):
+            return entry["plan_ref"], "the PR's first ledger entry"
+    return None, None
+
+
+def _same_plan(a, b, default_repo):
+    try:
+        return parse_plan_source(a, default_repo) == parse_plan_source(b, default_repo)
+    except PlanInputError:
+        return a == b
+
+
+def plan_source_for(explicit, entries, pr, body, default_repo=None):
+    """The plan to use: the authoritative one. `--plan` may only repeat it, or name the first plan when there is none yet;
+    a different one is refused (LedgerCommandError), so the writer cannot swap the plan its own work is judged against."""
+    source, where = authoritative_plan(entries, pr, body)
+    if explicit and source and not _same_plan(explicit, source, default_repo):
+        raise LedgerCommandError("--plan %s is not the PR's plan: %s names %s. Change the PR body's PLAN: line to change the "
+                                 "plan (that voids the earlier entries), not the command" % (explicit, where, source))
+    return source or explicit
+
+
+def checked_plan(engine_config, source, ask, runner, now):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+    ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
+    text, label, result = load_plan(ns, runner, now)
+    parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+    return dict(result, scenarios_parsed=parsed, source=label)
+
+
+def _ledger_pr(args):
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        raise LedgerCommandError(str(err)) from None
+    return repo, number, "%s#%d" % (repo, number)
+
+
+def _ledger_context(args, runner, now, writable):
+    """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan."""
+    engine, state, config = build_engine(runner, now, "cli", writable=writable)
+    repo, number, pr = _ledger_pr(args)
+    entries, problem = plan_ledger.read_ledger(state)
+    facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
+    facts = dict(facts or {}, body=body, notice_senders=senders)
+    source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
+    plan, plan_problem = None, None
+    if source:
+        try:
+            plan = checked_plan(config, source, args.ask, runner, now)
+        except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+            plan_problem = _one_line(str(err), 200)
+    return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries,
+                                 problem=problem, facts=facts, unreadable=unreadable, source=source, plan=plan,
+                                 plan_problem=plan_problem)
+
+
+def _scenario_of(ctx, sid):
+    if ctx.plan is None:
+        raise LedgerCommandError("no plan to bind to: %s" % (ctx.plan_problem or "pass --plan <owner/repo#N>, or put "
+                                                              "`PLAN: <link>` in the PR body"))
+    if ctx.plan["result"] != "pass":
+        raise LedgerCommandError("the plan fails `plan check` (%d defect(s)): fix it first, nothing was recorded" % len(ctx.plan["defects"]))
+    found = next((x for x in ctx.plan["scenarios_parsed"] if x.get("id") == sid), None)
+    if found is None:
+        raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
+    if (found.get("claim") or "pr") != "pr":
+        raise LedgerCommandError("%s is claimed at the epic, not per PR: it is proven at the epic's integrated head" % sid)
+    return found
+
+
+def _head_of(ctx, args):
+    known = (ctx.facts or {}).get("head")
+    head = args.head or known
+    if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
+        raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
+    if not head or not re.fullmatch(r"[0-9a-f]{7,40}", head):
+        raise LedgerCommandError("the PR head is unknown (%s): pass --head <sha>" % (ctx.unreadable or "not a sha"))
+    return head
+
+
+def _record(ctx, args, now, entry):
+    stored = plan_ledger.append_entry(ctx.state, entry, now())
+    if ctx.engine.audit is not None:
+        ctx.engine.audit.append(ctx.engine.actor, "plan.%s" % entry["kind"], ctx.pr,
+                                {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"],
+                                 "chain": stored["hash"]})
+    return stored
+
+
+def _evidence(args):
+    text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
+    if not text:
+        raise LedgerCommandError("--evidence is required: a link, or what you ran and saw")
+    return text
+
+
+def cmd_prove(args, runner, now):
+    """`prove <scenario> --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for a scenario of the
+    PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict."""
+    ctx = _ledger_context(args, runner, now, True)
+    caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+    scenario = _scenario_of(ctx, args.scenario)
+    entry = {"kind": "proof", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
+             "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
+             "evidence": _evidence(args), "command": plan_ledger.clip(redact_command_text(args.command or "")),
+             "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
+    stored = _record(ctx, args, now, entry)
+    print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], args.scenario, args.result,
+                                                                      entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
+    return EXIT_OK
+
+
+def cmd_verdict(args, runner, now):
+    """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
+    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
+    ctx = _ledger_context(args, runner, now, True)
+    caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+    scenario = _scenario_of(ctx, args.scenario)
+    named = plan_ledger.evaluator_of(scenario)
+    if args.evaluator != named:
+        raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (args.scenario, named, args.evaluator))
+    senders = ctx.facts.get("notice_senders") or ()
+    if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
+                                 "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
+    ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
+                                             plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
+    if not ok:
+        if ctx.engine.audit is not None:
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
+                                    {"scenario": args.scenario, "by": caller, "evaluator": named, "why": why})
+        raise LedgerCommandError("refused: %s" % why)
+    entry = {"kind": "verdict", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
+             "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
+             "evaluator": named, "evidence": _evidence(args)}
+    stored = _record(ctx, args, now, entry)
+    print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, stored["seq"], args.scenario, args.result,
+                                                                         entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
+    return EXIT_OK
+
+
+def cmd_gates(args, runner, now):
+    """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
+    tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
+    ctx = _ledger_context(args, runner, now, False)
+    plan = ctx.plan
+    report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
+    report["plan_problem"] = ctx.plan_problem
+    report["pr_unreadable"] = ctx.unreadable
+    first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
+    report["plan_source"] = ctx.source
+    if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
+        report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        lines = plan_ledger.render_gates(report, ctx.pr)
+        if ctx.unreadable:
+            lines.append("PR not read: %s" % ctx.unreadable)
+        if ctx.plan_problem:
+            lines.append("plan not read: %s" % ctx.plan_problem)
+        if report.get("plan_changed"):
+            lines.append("PLAN CHANGED: %s" % report["plan_changed"])
+        print("\n".join(lines))
+    return EXIT_OK if report["ready"] else EXIT_ERROR
+
+
+def add_ledger_parsers(sub):
+    def common(p, scenario=True):
+        if scenario:
+            p.add_argument("scenario", help="The scenario id in the plan (S1, U2, ...)")
+            p.add_argument("--pr", required=True, help="The pull request: owner/repo#N or its URL")
+        else:
+            p.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+        p.add_argument("--plan", help="The plan: owner/repo#N or an issue URL (default: the one the PR's ledger entries "
+                                      "name, else the `PLAN:` line of the PR body)")
+        p.add_argument("--ask", help="The ask whose Done-when the plan must cover (as `plan check --ask`)")
+        p.add_argument("--head", help="The PR head sha (default: read from GitHub)")
+    prove = sub.add_parser("prove", help="Record proof for a plan scenario of a PR, at its head, bound to the plan's hash")
+    common(prove)
+    prove.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
+    prove.add_argument("--result", choices=("pass", "fail"), default="pass")
+    prove.add_argument("--command", help="The command you ran, if any")
+    verdict = sub.add_parser("verdict", help="Record an evaluator's verdict for a scenario (only the evaluator the "
+                                             "scenario names, never a writer of the PR)")
+    common(verdict)
+    verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
+    verdict.add_argument("--result", choices=("pass", "fail"), required=True)
+    verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it")
+    common(gates, scenario=False)
+    gates.add_argument("--json", action="store_true")
 
 
 def add_plan_parsers(sub):
@@ -14003,6 +14287,7 @@ def build_parser():
     add_foreground_parsers(sub)  # PR 8
     add_policy_parsers(sub)  # PR 9
     add_plan_parsers(sub)    # #135
+    add_ledger_parsers(sub)  # #107
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
     add_orders_parsers(sub)  # PR 17
@@ -14056,6 +14341,12 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_report(args, runner, now)
         if args.action == "notice":
             return cmd_notice(args, runner, now)
+        if args.action in ("prove", "verdict", "gates"):  # #107: state and GETs only; never ensures the daemon
+            try:
+                return {"prove": cmd_prove, "verdict": cmd_verdict, "gates": cmd_gates}[args.action](args, runner, now)
+            except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
+                sys.stderr.write("%s: %s: %s\n" % (PROG, args.action, _one_line(str(err), 400)))
+                return EXIT_USAGE
         if args.action == "decisions":
             return cmd_decisions(args, runner, now)
         if args.action == "comment":
