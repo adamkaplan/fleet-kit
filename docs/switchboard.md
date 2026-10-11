@@ -4200,3 +4200,9 @@ keep the `ci_record` settings when it rewrites the config.
 ### Self-wakes: the overdue wake without `--reports-to`
 
 `launch` made the overdue-checkpoint reminder only when `--reports-to` named someone. A launch from a fleet agent's pane with a CHECKPOINT (flags or brief) but no `--reports-to` now wakes the launching agent at the overdue time (only if the worker has not reported, as before); the worker's own metadata is unchanged. From a plain shell nothing changes (no one to wake, and the launch says so).
+
+### Parked items (#130)
+
+A deliberately deferred issue carries the label `<user>:parked` (made by `fleet-switchboard labels ensure`, idempotent, with each repo's own account) AND one line `Parked until: YYYY-MM-DD` in its body. Triage rule T3 ("no next step") skips it until the end of that day (UTC) and fires again after.
+Strict on purpose: the label without a date, a date without the label, a malformed or impossible date (`2027-02-31`), two dates, a quoted or code-fenced line, or a past date all mean "not parked".
+Parking never exempts anything waiting on the owner (an item with `awaiting-user` or `awaiting-cos` is judged as before) or a held PR (T3 does not judge PRs; the captain rules are separate). Shadow only, like the rest of the triage: it records, it does not act.

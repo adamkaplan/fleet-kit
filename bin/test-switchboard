@@ -8428,8 +8428,9 @@ ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "c
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
 # escalation line in the chief of staff): coder +500, orchestrator +500, chief-of-staff +100
 # #133: a held PR is held by LABELS (merge-captain and a hold-<reason>), the first line only for a dated window: coder +250, orchestrator +250, chief-of-staff +250
+# #130: +200 B each for the parked sentence
 # #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
-ROLE_BYTE_LIMITS = {"coder": 6500, "orchestrator": 10350, "chief-of-staff": 11350, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 6700, "orchestrator": 10550, "chief-of-staff": 11550, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -14981,6 +14982,31 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T3"), ["acme/api#30", "acme/api#32"])
         self.assertNotIn(("T9", "acme/api#30"), self.found())                              # T3 takes precedence over T9
+
+    def test_t3_a_parked_item_is_exempt_only_with_the_label_and_a_valid_future_date(self):
+        self.charter()
+        PARKED = "osuser:parked"
+        quiet = dict(created=20, updated=15, assignees=["bot"])   # every one of these is a T3 unless parked
+        self.add(60, labels=["kind", PARKED], body="Parked until: 2027-01-20", **quiet)          # parked: exempt
+        self.add(61, labels=["kind", PARKED], body="Parked until: 2027-01-15", **quiet)          # today: parked through its end
+        self.add(62, labels=["kind", PARKED], body="Parked until: 2027-01-14", **quiet)          # past: fires again
+        self.add(63, labels=["kind", PARKED], body="no date here", **quiet)                      # no date: not parked
+        self.add(64, labels=["kind", PARKED], body="Parked until: 2027-02-31", **quiet)          # impossible date
+        self.add(65, labels=["kind", PARKED], body="Parked until: 20-1-2027", **quiet)           # malformed
+        self.add(66, labels=["kind"], body="Parked until: 2027-01-20", **quiet)                  # the line without the label
+        self.add(67, labels=["kind", PARKED], body="Parked until: 2027-01-20\nParked until: 2027-01-30", **quiet)  # two dates: not read
+        self.add(68, labels=["kind", PARKED], body="> Parked until: 2027-01-20", **quiet)        # quoted: not a statement
+        self.add(69, labels=["kind", PARKED, self.USER], body="Parked until: 2027-01-20", **quiet)  # owner-wait is never exempted by parking
+        self.go()
+        self.assertEqual(self.only("T3"), ["acme/api#62", "acme/api#63", "acme/api#64", "acme/api#65", "acme/api#66", "acme/api#67", "acme/api#68"])
+
+    def test_parked_needs_its_own_label_and_is_read_to_the_end_of_the_day(self):
+        self.assertIsNone(sb.parked_until("Parked until: 2027-01-20", ["osuser:merge-captain"]))
+        self.assertEqual(sb.parked_until("Parked until: 2027-01-20", ["osuser:parked"]), 1800489600.0)  # 2027-01-21T00:00Z: the day is parked through its end
+
+    def test_labels_ensure_creates_the_parked_label(self):
+        self.assertIn("parked", [k for k, _, _ in sb.LABEL_SPECS])
+        self.assertTrue(sb.label_names({})["parked"].endswith(":parked"))
 
     def test_t5_and_t6_wait_two_days_and_only_for_a_whole_list(self):
         old = sb.iso(self.now - 3 * 86400)
@@ -27325,7 +27351,7 @@ class TestSupersede(WriteWorld):
 
 
 class TestLabelsEnsure(WriteWorld):
-    NEW = ("merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
+    NEW = ("parked", "merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
            "hold-prod-config", "hold-other-area")
     WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()]
                   + ["%s:%s" % (sb.orchestrator_label().split(":")[0], k) for k in NEW])
