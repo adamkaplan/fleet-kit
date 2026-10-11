@@ -96,6 +96,40 @@ command refuses them.
 
 A waiver covers the head it was recorded at; a push after it needs a new one (the same rule as a verdict).
 
+## Who is the author: what the engine can and cannot know
+
+All agents in a fleet act on GitHub under **one account**, so the login GitHub reports for a PR's author names that account,
+never an agent: it can never match an agent name. (The ledger of #153 also excludes the GitHub author; that only matters for
+a repo whose reviewer or tester agents act under a different login, and is otherwise a no-op.) The engine therefore identifies
+the author **agent** from what the switchboard itself recorded, in this order:
+
+1. **The signed marker.** Every PR a fleet agent creates through the shim carries `<!-- fleet-switchboard:from=<agent> -->`
+   in its body, put there by the shim from the caller's session. The engine reads the marker of the PR body (and of the first
+   commit-message-free PR description) as the authoring agent. A body edited by another agent can change the marker, so the
+   engine reads the **first recorded** one: the creation is recorded as a ledger entry (`pr_created`, by the session identity,
+   at the shim's `gh pr create`) and that record wins over the live body.
+2. **The ledger.** Whoever recorded a proof for the PR, and the sender of its `notice pr`, are writers.
+3. **The session registry** (#138): the identity of every `prove`, `verdict` and `waive` is the caller's own session
+   (`OPENCODE_SESSION_ID` looked up in the switchboard's registry), never an inherited pane variable.
+
+The ban is: an agent in that writer set cannot record a verdict, nor a waiver, for the PR. The set is the union of 1 to 3.
+
+**What stays unprovable**, and is accepted:
+
+- An agent that **wrote code for the PR without any record**: it pushed to the branch, recorded no proof and sent no notice,
+  and did not create the PR. Nothing the switchboard holds names it. (Mitigation, not proof: a verdict is refused until some
+  writer is known, as in #153; the commit authors cannot help, because every commit is authored by the same account.)
+- A caller that **sets another agent's session variable** records as that agent. The session identity is a guard against
+  mistakes, not against an agent that tampers with its own environment.
+- A PR created **outside the shim** (absolute-path `gh`, the web UI, another clone) has no marker and no creation record; its
+  author is unknown until a proof or notice names one.
+- **Two agents that coordinate**: one writes, the other reviews, and the writer records nothing. The engine sees two
+  unrelated agents. Independence of the reviewer is a property of who the fleet assigns, not something the gate can prove.
+
+So the gate can show that **the recorded writers did not judge their own work**, never that the reviewer is independent of
+everyone who touched it. The design says "recorded writer" everywhere for that reason, and `gates` prints the writer set it
+used next to each verdict so a reader can see who was excluded.
+
 ## What is deliberately not here
 
 - **Tier S** (at most 100 changed lines, 3 scenarios, no held path): classified by the switchboard from the diff. It needs the
@@ -120,6 +154,7 @@ gated: only ready and merge are.
 | E3 | `merge` refused without G1 to G4, or with G6 open; allowed when satisfied; a draft refused; a push after ready voids the verdicts and the merge is refused again |
 | E4 | `launch` refused for a `PLAN:` with no consensus at its current hash; allowed with one; an edited plan voids it; no `PLAN:` allowed in shadow |
 | shim | each argument shape: `--repo`, a URL, a number from the current repo, `--` handling, an unreadable shape is allowed; the real gh runs unchanged when allowed; exit code and stdout of the real gh are passed through |
+| author identity | the creation record wins over an edited body marker; a writer from the ledger, the notice or the marker cannot record a verdict or a waiver; a PR created outside the shim has no writer until a proof names one; `gates` prints the writer set |
 | fail-open | timeout, crash, missing binary, daemon down, unreadable GitHub, broken ledger, bad config: each allows and records; N in an hour raises one alarm; a spool line is read by the daemon |
 | waiver | only a chief-of-staff caller; G6 and G8 refused; a short reason refused; due date and the overdue alarm; a push voids it; `gates` shows `waived`, not `ok` |
 | no regression | the shim still signs comments exactly as before; `gates` stays read-only |
