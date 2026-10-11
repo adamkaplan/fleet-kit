@@ -301,13 +301,13 @@ permissions:
     resource: "herdr pane process-info *"
     effect: allow
   - action: "shell"
+    resource: "git status *"
+    effect: allow
+  - action: "shell"
     resource: "git log *"
     effect: allow
   - action: "shell"
     resource: "git show *"
-    effect: allow
-  - action: "shell"
-    resource: "git status *"
     effect: allow
   - action: "shell"
     resource: "git diff *"
@@ -316,16 +316,1285 @@ permissions:
     resource: "git rev-parse *"
     effect: allow
   - action: "shell"
-    resource: "git grep *"
+    resource: "git rev-list *"
     effect: allow
   - action: "shell"
-    resource: "git branch *"
+    resource: "git for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git merge-base *"
     effect: allow
   - action: "shell"
     resource: "git blame *"
     effect: allow
   - action: "shell"
+    resource: "git describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git cat-file *"
+    effect: allow
+  - action: "shell"
     resource: "git ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git remote"
+    effect: allow
+  - action: "shell"
+    resource: "git remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git tag"
+    effect: allow
+  - action: "shell"
+    resource: "git tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* reflog"
     effect: allow
   - action: "shell"
     resource: "ls *"
@@ -1045,100 +2314,1540 @@ permissions:
     resource: "timeout * gh *--jq=env*"
     effect: deny
   - action: "shell"
-    resource: "git push*"
+    resource: "git push"
     effect: deny
   - action: "shell"
-    resource: "timeout * git push*"
+    resource: "timeout * git push"
     effect: deny
   - action: "shell"
-    resource: "git commit*"
+    resource: "git push *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git commit*"
+    resource: "timeout * git push *"
     effect: deny
   - action: "shell"
-    resource: "git add*"
+    resource: "git * push *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git add*"
+    resource: "timeout * git * push *"
     effect: deny
   - action: "shell"
-    resource: "git checkout*"
+    resource: "git * push"
     effect: deny
   - action: "shell"
-    resource: "timeout * git checkout*"
+    resource: "timeout * git * push"
     effect: deny
   - action: "shell"
-    resource: "git switch*"
+    resource: "git commit"
     effect: deny
   - action: "shell"
-    resource: "timeout * git switch*"
+    resource: "timeout * git commit"
     effect: deny
   - action: "shell"
-    resource: "git reset*"
+    resource: "git commit *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git reset*"
+    resource: "timeout * git commit *"
     effect: deny
   - action: "shell"
-    resource: "git clone*"
+    resource: "git * commit *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git clone*"
+    resource: "timeout * git * commit *"
     effect: deny
   - action: "shell"
-    resource: "git fetch*"
+    resource: "git * commit"
     effect: deny
   - action: "shell"
-    resource: "timeout * git fetch*"
+    resource: "timeout * git * commit"
     effect: deny
   - action: "shell"
-    resource: "git pull*"
+    resource: "git add"
     effect: deny
   - action: "shell"
-    resource: "timeout * git pull*"
+    resource: "timeout * git add"
     effect: deny
   - action: "shell"
-    resource: "git merge*"
+    resource: "git add *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git merge*"
+    resource: "timeout * git add *"
     effect: deny
   - action: "shell"
-    resource: "git rebase*"
+    resource: "git * add *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git rebase*"
+    resource: "timeout * git * add *"
     effect: deny
   - action: "shell"
-    resource: "git stash*"
+    resource: "git * add"
     effect: deny
   - action: "shell"
-    resource: "timeout * git stash*"
+    resource: "timeout * git * add"
     effect: deny
   - action: "shell"
-    resource: "git tag*"
+    resource: "git rm"
     effect: deny
   - action: "shell"
-    resource: "timeout * git tag*"
+    resource: "timeout * git rm"
     effect: deny
   - action: "shell"
-    resource: "git config*"
+    resource: "git rm *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git config*"
+    resource: "timeout * git rm *"
     effect: deny
   - action: "shell"
-    resource: "git remote*"
+    resource: "git * rm *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git remote*"
+    resource: "timeout * git * rm *"
     effect: deny
   - action: "shell"
-    resource: "git worktree*"
+    resource: "git * rm"
     effect: deny
   - action: "shell"
-    resource: "timeout * git worktree*"
+    resource: "timeout * git * rm"
+    effect: deny
+  - action: "shell"
+    resource: "git mv"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mv"
+    effect: deny
+  - action: "shell"
+    resource: "git mv *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mv *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mv *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mv *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mv"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mv"
+    effect: deny
+  - action: "shell"
+    resource: "git checkout"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git checkout"
+    effect: deny
+  - action: "shell"
+    resource: "git checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "git * checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "git * checkout"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * checkout"
+    effect: deny
+  - action: "shell"
+    resource: "git switch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git switch"
+    effect: deny
+  - action: "shell"
+    resource: "git switch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git switch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * switch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * switch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * switch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * switch"
+    effect: deny
+  - action: "shell"
+    resource: "git restore"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git restore"
+    effect: deny
+  - action: "shell"
+    resource: "git restore *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git restore *"
+    effect: deny
+  - action: "shell"
+    resource: "git * restore *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * restore *"
+    effect: deny
+  - action: "shell"
+    resource: "git * restore"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * restore"
+    effect: deny
+  - action: "shell"
+    resource: "git reset"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reset"
+    effect: deny
+  - action: "shell"
+    resource: "git reset *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reset *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reset *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reset *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reset"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reset"
+    effect: deny
+  - action: "shell"
+    resource: "git revert"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git revert"
+    effect: deny
+  - action: "shell"
+    resource: "git revert *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git revert *"
+    effect: deny
+  - action: "shell"
+    resource: "git * revert *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * revert *"
+    effect: deny
+  - action: "shell"
+    resource: "git * revert"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * revert"
+    effect: deny
+  - action: "shell"
+    resource: "git cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "git cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "git * cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "git * cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "git merge"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git merge"
+    effect: deny
+  - action: "shell"
+    resource: "git merge *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git merge *"
+    effect: deny
+  - action: "shell"
+    resource: "git * merge *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * merge *"
+    effect: deny
+  - action: "shell"
+    resource: "git * merge"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * merge"
+    effect: deny
+  - action: "shell"
+    resource: "git rebase"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git rebase"
+    effect: deny
+  - action: "shell"
+    resource: "git rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "git * rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "git * rebase"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * rebase"
+    effect: deny
+  - action: "shell"
+    resource: "git stash"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git stash"
+    effect: deny
+  - action: "shell"
+    resource: "git stash *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git stash *"
+    effect: deny
+  - action: "shell"
+    resource: "git * stash *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * stash *"
+    effect: deny
+  - action: "shell"
+    resource: "git * stash"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * stash"
+    effect: deny
+  - action: "shell"
+    resource: "git apply"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git apply"
+    effect: deny
+  - action: "shell"
+    resource: "git apply *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git apply *"
+    effect: deny
+  - action: "shell"
+    resource: "git * apply *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * apply *"
+    effect: deny
+  - action: "shell"
+    resource: "git * apply"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * apply"
+    effect: deny
+  - action: "shell"
+    resource: "git am"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git am"
+    effect: deny
+  - action: "shell"
+    resource: "git am *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git am *"
+    effect: deny
+  - action: "shell"
+    resource: "git * am *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * am *"
+    effect: deny
+  - action: "shell"
+    resource: "git * am"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * am"
+    effect: deny
+  - action: "shell"
+    resource: "git fetch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fetch"
+    effect: deny
+  - action: "shell"
+    resource: "git fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fetch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fetch"
+    effect: deny
+  - action: "shell"
+    resource: "git pull"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pull"
+    effect: deny
+  - action: "shell"
+    resource: "git pull *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pull *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pull *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pull *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pull"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pull"
+    effect: deny
+  - action: "shell"
+    resource: "git clone"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clone"
+    effect: deny
+  - action: "shell"
+    resource: "git clone *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clone *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clone *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clone *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clone"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clone"
+    effect: deny
+  - action: "shell"
+    resource: "git init"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git init"
+    effect: deny
+  - action: "shell"
+    resource: "git init *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git init *"
+    effect: deny
+  - action: "shell"
+    resource: "git * init *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * init *"
+    effect: deny
+  - action: "shell"
+    resource: "git * init"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * init"
+    effect: deny
+  - action: "shell"
+    resource: "git submodule"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git submodule"
+    effect: deny
+  - action: "shell"
+    resource: "git submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "git * submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "git * submodule"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * submodule"
+    effect: deny
+  - action: "shell"
+    resource: "git update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "git gc"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git gc"
+    effect: deny
+  - action: "shell"
+    resource: "git gc *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git gc *"
+    effect: deny
+  - action: "shell"
+    resource: "git * gc *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * gc *"
+    effect: deny
+  - action: "shell"
+    resource: "git * gc"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * gc"
+    effect: deny
+  - action: "shell"
+    resource: "git prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git prune"
+    effect: deny
+  - action: "shell"
+    resource: "git prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * prune"
+    effect: deny
+  - action: "shell"
+    resource: "git clean"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clean"
+    effect: deny
+  - action: "shell"
+    resource: "git clean *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clean *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clean *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clean *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clean"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clean"
+    effect: deny
+  - action: "shell"
+    resource: "git replace"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git replace"
+    effect: deny
+  - action: "shell"
+    resource: "git replace *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git replace *"
+    effect: deny
+  - action: "shell"
+    resource: "git * replace *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * replace *"
+    effect: deny
+  - action: "shell"
+    resource: "git * replace"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * replace"
+    effect: deny
+  - action: "shell"
+    resource: "git notes"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git notes"
+    effect: deny
+  - action: "shell"
+    resource: "git notes *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git notes *"
+    effect: deny
+  - action: "shell"
+    resource: "git * notes *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * notes *"
+    effect: deny
+  - action: "shell"
+    resource: "git * notes"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * notes"
+    effect: deny
+  - action: "shell"
+    resource: "git bisect"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bisect"
+    effect: deny
+  - action: "shell"
+    resource: "git bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bisect"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bisect"
+    effect: deny
+  - action: "shell"
+    resource: "git maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "git maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "git * maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "git * maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "git repack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git repack"
+    effect: deny
+  - action: "shell"
+    resource: "git repack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git repack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * repack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * repack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * repack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * repack"
+    effect: deny
+  - action: "shell"
+    resource: "git pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "git pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "git symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git update-index"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-index"
+    effect: deny
+  - action: "shell"
+    resource: "git update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-index"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-index"
+    effect: deny
+  - action: "shell"
+    resource: "git write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "git hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "git * hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "git * hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "git mktag"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mktag"
+    effect: deny
+  - action: "shell"
+    resource: "git mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mktag"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mktag"
+    effect: deny
+  - action: "shell"
+    resource: "git format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "git format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "git send-email"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git send-email"
+    effect: deny
+  - action: "shell"
+    resource: "git send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "git * send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "git * send-email"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * send-email"
+    effect: deny
+  - action: "shell"
+    resource: "git archive"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git archive"
+    effect: deny
+  - action: "shell"
+    resource: "git archive *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git archive *"
+    effect: deny
+  - action: "shell"
+    resource: "git * archive *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * archive *"
+    effect: deny
+  - action: "shell"
+    resource: "git * archive"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * archive"
+    effect: deny
+  - action: "shell"
+    resource: "git bundle"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bundle"
+    effect: deny
+  - action: "shell"
+    resource: "git bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bundle"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bundle"
+    effect: deny
+  - action: "shell"
+    resource: "git fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "git fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "git unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "git unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "git * unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "git * unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "git index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "git index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "git remote add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote add"
+    effect: deny
+  - action: "shell"
+    resource: "git remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote add"
+    effect: deny
+  - action: "shell"
+    resource: "git remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "git remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "git remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "git remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "git remote update"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote update"
+    effect: deny
+  - action: "shell"
+    resource: "git remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote update"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote update"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog delete"
     effect: deny
   - action: "shell"
     resource: "git * --output*"
@@ -1177,16 +3886,1510 @@ permissions:
     resource: "timeout * git grep *--open-files-in-pager*"
     effect: deny
   - action: "shell"
+    resource: "git *ext::*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *ext::*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --upload-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --upload-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --receive-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --receive-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --exec*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --exec*"
+    effect: deny
+  - action: "shell"
+    resource: "git *--config-env*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *--config-env*"
+    effect: deny
+  - action: "shell"
+    resource: "git --exec-path*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --exec-path*"
+    effect: deny
+  - action: "shell"
+    resource: "git -p *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -p *"
+    effect: deny
+  - action: "shell"
     resource: "git -c *"
     effect: deny
   - action: "shell"
     resource: "timeout * git -c *"
     effect: deny
   - action: "shell"
-    resource: "git -C *"
+    resource: "git -C * -c *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git -C *"
+    resource: "timeout * git -C * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git --no-pager -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --no-pager -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git --git-dir=* -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --git-dir=* -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git * --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "git --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "git --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--rename-section*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--rename-section*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--remove-section*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--remove-section*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "git config * -e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config * -e"
+    effect: deny
+  - action: "shell"
+    resource: "git config * -e *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config * -e *"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--file*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--global*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--global*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--system*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--system*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--local*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--local*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -d"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -d"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -D"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -D"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -m"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -m"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -M"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -M"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -c"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -c"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -C"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -C"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -f"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -f"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -u"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -u"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --move"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --move"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --force"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --force"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --force"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --force"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -a *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -a *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -a"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -s *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -s *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -s"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -F *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -F *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -F"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --annotate *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --annotate *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --annotate"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --annotate"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --sign *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --sign *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --sign"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --sign"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --file *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --file *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --file"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --file"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --create-reflog *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --create-reflog *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --create-reflog"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --create-reflog"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --track"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --track"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --recurse-submodules *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --recurse-submodules *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --recurse-submodules"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --recurse-submodules"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --recurse-submodules*"
     effect: deny
   - action: "shell"
     resource: "az * create"
@@ -3713,6 +7916,204 @@ permissions:
     effect: deny
   - action: "shell"
     resource: "timeout * git log *secrets*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */etc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */etc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */private/etc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */private/etc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */root*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */root*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */var/root*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */var/root*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.ssh*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.ssh*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.aws*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.aws*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.azure*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.azure*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.gnupg*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.gnupg*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/gh*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/gh*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/git*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/git*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/gcloud*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/gcloud*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.kube*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.kube*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.docker*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.docker*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.netrc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.netrc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.npmrc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.npmrc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.zsh_history*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.zsh_history*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.bash_history*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.bash_history*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.local/share*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.local/share*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Documents*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Documents*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Desktop*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Desktop*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Downloads*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Downloads*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Pictures*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Pictures*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Movies*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Movies*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Music*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Music*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Library*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Library*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.env*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.env*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *id_rsa*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *id_rsa*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *id_ed25519*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *id_ed25519*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.pem*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.pem*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.p12*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.p12*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *auth.json*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *auth.json*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *credentials*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *credentials*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *secrets*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *secrets*"
     effect: deny
   - action: "shell"
     resource: "cat /*/etc*"
@@ -24681,7 +29082,7 @@ A long-running agent runs the definition it began with. **Verify a policy agains
 - Never run `gh repo create`, `gh repo delete` or `gh repo edit --visibility`.
 - Never dispatch another orchestrator's coder: they are its own; talk to the orchestrator.
 - Never answer a `<user>:awaiting-user` question on your principal's behalf.
-- Escalate in the same turn: never tell your principal an item needs them without running `decisions escalate` in that same turn. The Decisions panel, not the chat, is the list of what waits on them: do not restate it in chat. A PR held for the owner carries `<user>:merge-captain` and a `<user>:hold-<reason>` label (the switchboard reads labels; the body's first line `MERGE: captain` stays only in repos whose own checks read it and until 2026-11-10); ask its orchestrator to label one that lacks them. "A news message stands alone" applies to news only.
+- Escalate in the same turn: never tell your principal an item needs them without running `decisions escalate` in that same turn. The Decisions panel, not the chat, is the list of what waits on them: do not restate it in chat. A PR held for the owner carries `<user>:merge-captain` and a `<user>:hold-<reason>` label (the switchboard reads labels; the body's first line `MERGE: captain` stays only in repos whose own checks read it and until 2026-11-10); ask its orchestrator to label one that lacks them. "A news message stands alone" applies to news only. An item labelled `<user>:parked` with a `Parked until: <YYYY-MM-DD>` line is deliberately deferred and exempt from the no-next-step flag until that date; it never exempts an owner wait or a held PR.
 - No unsolicited prompts, keys or interrupts into panes you do not own. `herdr` is for looking (workspace, tab, pane and agent list, get, read; `api snapshot`; rename and focus a workspace or tab): never `agent prompt`, `pane send`, send-keys, start, stop or close; messages go through `fleet-switchboard`.
 - Two failures on the same obstacle: stop and report. Never a third variant.
 

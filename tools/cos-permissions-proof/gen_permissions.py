@@ -45,8 +45,22 @@ def build(subagent=False):
             allow("shell", "herdr %s %s *" % (noun, verb))
     for shape in ("api snapshot", "workspace rename *", "tab rename *", "workspace focus *", "tab focus *", "pane current", "pane layout *", "pane process-info *"):
         allow("shell", "herdr " + shape)
-    for command in ("git log", "git show", "git status", "git diff", "git rev-parse", "git grep", "git branch", "git blame", "git ls-files"):
-        allow("shell", command + " *")
+    # git: every READ-ONLY command in any form. Global options are allowed only as `-C <path>`, `--no-pager`, `--git-dir=<path>` (any order of the
+    # first two); `-c k=v` is denied entirely: whether a key executes something (core.pager, core.sshCommand, alias.*, credential.helper, ...) cannot
+    # be told from the text, and a deny cannot carve an exception. Subcommands that only read take any arguments; the ones with read AND write forms
+    # (branch, remote, worktree, tag, config, reflog) are allowed by exact read shapes only.
+    git_prefixes = ("", "-C * ", "--no-pager ", "--git-dir=* ", "--no-pager -C * ", "-C * --no-pager ", "--no-pager --git-dir=* ", "-C * --git-dir=* ")
+    git_reads = ("status", "log", "show", "diff", "rev-parse", "rev-list", "for-each-ref", "merge-base", "blame", "describe", "shortlog", "cat-file",
+                 "ls-files", "ls-tree", "show-ref", "diff-tree", "name-rev", "whatchanged", "count-objects", "grep", "ls-remote", "reflog show")
+    git_exact = ("branch", "branch -v", "branch -vv", "branch -a", "branch -r", "branch -av", "branch -avv", "branch -rv", "branch --show-current",
+                 "branch --list *", "branch -l *", "branch --contains *", "branch --merged*", "branch --no-merged*", "branch --sort=*", "branch -a --list *",
+                 "remote", "remote -v", "remote show *", "remote get-url *", "worktree list", "worktree list *", "tag", "tag -l*", "tag --list*",
+                 "config --get *", "config --get-all *", "config --get-regexp *", "config --list", "config -l", "config --list *", "reflog")
+    for prefix in git_prefixes:
+        for sub in git_reads:
+            allow("shell", "git %s%s *" % (prefix, sub))
+        for sub in git_exact:
+            allow("shell", "git %s%s" % (prefix, sub))
     readers = ("ls", "cat", "head", "tail", "wc", "grep", "cut", "sort", "uniq", "tr", "jq", "echo", "printf")
     for command in readers:
         allow("shell", command + " *")
@@ -87,10 +101,37 @@ def build(subagent=False):
                     "gh api *--raw-field*", "gh api *--input*", "gh api *--hostname*", "gh api graphql*", "gh api *--paginate --slurp*",
                     "gh * -R*/*/*", "gh * --repo*/*/*", "gh * --body-file*", "gh * -F *", "gh *--output*", "gh *-q env*", "gh *--jq env*", "gh *-qenv*", "gh *--jq=env*"):
         guard(pattern)
-    for pattern in ("git push*", "git commit*", "git add*", "git checkout*", "git switch*", "git reset*", "git clone*", "git fetch*", "git pull*", "git merge*",
-                    "git rebase*", "git stash*", "git tag*", "git config*", "git remote*", "git worktree*", "git * --output*", "git * --no-index*", "git *--ext-diff*",
-                    "git *--textconv*", "git grep *-O*", "git grep *--open-files-in-pager*", "git -c *", "git -C *"):
+    # git writes: a write verb as a standalone word anywhere after `git` (so `git -C x push` and `git log push` are both caught; a read that
+    # names such a word as an argument, e.g. `git log --grep push`, is denied too: say it another way)
+    for verb in ("push", "commit", "add", "rm", "mv", "checkout", "switch", "restore", "reset", "revert", "cherry-pick", "merge", "rebase", "stash", "apply",
+                 "am", "fetch", "pull", "clone", "init", "submodule", "update-ref", "filter-branch", "filter-repo", "gc", "prune", "clean", "replace", "notes",
+                 "bisect", "maintenance", "repack", "pack-refs", "symbolic-ref", "update-index", "write-tree", "commit-tree", "hash-object", "mktag", "format-patch",
+                 "send-email", "archive", "bundle", "fast-import", "unpack-objects", "index-pack", "remote add", "remote remove", "remote rm", "remote rename",
+                 "remote set-url", "remote set-head", "remote set-branches", "remote prune", "remote update", "worktree add", "worktree remove", "worktree prune",
+                 "worktree move", "worktree lock", "worktree unlock", "worktree repair", "reflog expire", "reflog delete"):
+        guard("git %s" % verb)
+        guard("git %s *" % verb)
+        guard("git * %s *" % verb)
+        guard("git * %s" % verb)
+    # flags that write or execute, on the subcommands that otherwise only read
+    for pattern in ("git * --output*", "git * --no-index*", "git *--ext-diff*", "git *--textconv*", "git grep *-O*", "git grep *--open-files-in-pager*",
+                    "git *ext::*", "git * --upload-pack*", "git * --receive-pack*", "git * --exec*", "git *--config-env*", "git --exec-path*", "git -p *",
+                    "git -c *", "git -C * -c *", "git --no-pager -c *", "git --git-dir=* -c *", "git * --paginate*", "git --paginate*", "git --work-tree*", "git * --work-tree*",
+                    "git config *--unset*", "git config *--add*", "git config *--replace-all*", "git config *--rename-section*", "git config *--remove-section*",
+                    "git config *--edit*", "git config * -e", "git config * -e *", "git config *--file*", "git config *--global*", "git config *--system*", "git config *--local*",
+                    "git * config *--unset*", "git * config *--add*", "git * config *--edit*", "git * config *--replace-all*"):
         guard(pattern)
+    for flag in ("-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "--delete", "--move", "--copy", "--force", "--set-upstream", "--set-upstream-to", "--unset-upstream",
+                 "--edit-description", "-a", "-s", "-F", "--annotate", "--sign", "--file", "--create-reflog", "--track", "--no-track", "--recurse-submodules"):
+        for cmd in ("branch", "tag"):
+            if cmd == "branch" and flag in ("-a",):
+                continue   # `git branch -a` is the read form
+            if cmd == "branch" and flag in ("-c", "-C", "-f", "-u") or cmd == "tag" or flag in ("-d", "-D", "-m", "-M", "--delete", "--move", "--copy", "--force", "--set-upstream", "--set-upstream-to", "--unset-upstream", "--edit-description", "--track", "--no-track"):
+                guard("git %s %s*" % (cmd, flag))
+                guard("git * %s * %s*" % (cmd, flag))
+                guard("git %s * %s *" % (cmd, flag))
+                guard("git %s * %s" % (cmd, flag))
+                guard("git * %s %s*" % (cmd, flag))
     # az: writes, and secret VALUES
     for verb in ("create", "delete", "update", "set", "invoke", "deploy", "start", "stop", "restart", "add", "remove", "purge", "import", "restore", "scale",
                  "swap", "login", "logout", "run-command", "up", "exec", "assign", "grant", "revoke", "regenerate", "rotate", "upload", "copy", "enable",
@@ -114,7 +155,7 @@ def build(subagent=False):
     places = ("/etc", "/private/etc", "/root", "/var/root", "/.ssh", "/.aws", "/.azure", "/.gnupg", "/.config/gh", "/.config/git", "/.config/gcloud", "/.kube",
               "/.docker", "/.netrc", "/.npmrc", "/.zsh_history", "/.bash_history", "/.local/share", "/Documents", "/Desktop", "/Downloads", "/Pictures", "/Movies",
               "/Music", "/Library", ".env", "id_rsa", "id_ed25519", ".pem", ".p12", "auth.json", "credentials", "secrets")
-    for command in ("head", "tail", "grep", "wc", "ls", "cut", "sort", "uniq", "tr", "jq", "git show", "git diff", "git grep", "git log"):
+    for command in ("head", "tail", "grep", "wc", "ls", "cut", "sort", "uniq", "tr", "jq", "git show", "git diff", "git grep", "git log", "git -C"):
         for place in places:
             guard("%s *%s*" % (command, place))
     for place in places:  # `cat`: only when its first argument is a path, so the text of a `cat > file <<EOF` message is never matched

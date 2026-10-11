@@ -6,7 +6,7 @@
   "comments": [
    "Escalated to the owner: the owner must pick: it costs money\n\n<!-- fleet-switchboard:from=cos -->"
   ],
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "gh_writes": [
    "POST repos/acme/api/issues/2/labels",
    "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
@@ -24,14 +24,14 @@
   "argv": "decisions escalate api#2",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "out": "api#2 is already yours: nothing changed\n"
  },
  {
   "argv": "decisions escalate web#3",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "out": "web#3 is already yours: nothing changed\n"
  },
  {
@@ -62,7 +62,7 @@
   "argv": "decisions escalate api#2hv --reason needs the owner",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "escalated_requests": [
    "ses_fake000004:per_fake000010"
   ],
@@ -82,7 +82,7 @@
   "comments": [
    "Resolved by the Chief of Staff: settled by the standing order\n\n<!-- fleet-switchboard:from=cos -->"
   ],
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "gh_writes": [
    "DELETE repos/acme/api/issues/4/labels/me%3Aawaiting-cos",
    "DELETE repos/acme/api/issues/4/labels/me%3Aawaiting-user",
@@ -106,7 +106,7 @@
   "argv": "decisions resolve api#5",
   "as": "you",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "gh_writes": [
    "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-cos",
    "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-user"

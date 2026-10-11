@@ -46,7 +46,7 @@ that changes nothing for you: do not report, do not answer at length.
 
 When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
-turn: you are woken then, free while idle. Never poll.
+turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 
 ## Skills
 
@@ -89,7 +89,7 @@ If you hit a decision only your principal can make — a product choice, a trade
 that changes what "done" means, an unexpected cost — **stop.** It goes up as
 `fleet-switchboard report question "..."` to your boss, and on the issue as the
 `<user>:awaiting-cos` label. NEVER apply `awaiting-user` yourself: the Chief of
-Staff escalates. Do not guess it or deliver something adjacent. The answer
+Staff escalates. A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR). Do not guess an answer or deliver something adjacent. The answer
 arrives as a switchboard message: act on it, then remove your `awaiting-cos`
 label. Asking and waiting is a good outcome. Guessing is not.
 
