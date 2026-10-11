@@ -178,6 +178,7 @@ UNTRACKED_WHY = {
     "G7": "an epic gate: it applies at the integration branch, not to one PR",
     "G8": "a deploy gate: it applies at deploy, not to one PR",
 }
+PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
 CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
 
 
@@ -256,7 +257,15 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr):
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
-                if bad:
+                none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
+                if not claimed:
+                    # G1 never passes vacuously: no per-PR scenario needs an explicit, reasoned statement
+                    if none_because and len(none_because.group(1).strip()) >= 20:
+                        row.update(status="n/a", detail="no per-PR scenarios: %s (the epic gate applies)" % none_because.group(1).strip()[:80])
+                    else:
+                        row.update(status="missing", missing=["no scenario is claimed per PR: state `per-pr scenarios: none because "
+                                                              "<reason>` in the plan, or claim one"])
+                elif bad:
                     row.update(status="missing", missing=["%s: %s" % (s["id"], "; ".join(s["missing"])) for s in bad])
                 else:
                     row["status"] = "ok"
@@ -307,3 +316,98 @@ def render_gates(report, pr):
     if report["untracked"]:
         lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))
     return lines
+
+
+# ----------------------------------------------------------------------------------- the gate engine's decision (slice 3a)
+#
+# `gates-check` asks this module one question: given a PR's gate report, the repo's mode and what the check is for, allow
+# or refuse? Nothing here reads GitHub, a file or the clock. Nothing calls it from a shim yet and nothing is enforced.
+
+MODES = ("shadow", "enforce")
+CHECK_FOR = ("ready", "merge")
+DEFAULT_BUDGET_MS = 3000
+BUDGET_RANGE = (500, 30000)
+# the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
+REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6")}
+EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
+
+
+def normal_repo(name):
+    return str(name or "").strip().lower()
+
+
+def validate_plan_gates(raw, source):
+    """The `plan_gates` section checked and completed: {"repos": {"owner/repo": {"mode", "enabled", "budget_ms"}}}.
+    Raises ValueError naming the key. A repo is matched case-insensitively; two entries that differ only by case are refused."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("%s: 'plan_gates' must be an object, got %s" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - {"repos"})
+    if unknown:
+        raise ValueError("%s: 'plan_gates' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+    repos, seen = {}, {}
+    for name, entry in (raw.get("repos") or {}).items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", name):
+            raise ValueError("%s: 'plan_gates.repos' key %r is not owner/repo" % (source, name))
+        if normal_repo(name) in seen:
+            raise ValueError("%s: 'plan_gates.repos' lists %s twice (repos match without regard to case)" % (source, name))
+        seen[normal_repo(name)] = name
+        if not isinstance(entry, dict):
+            raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms"})
+        if extra:
+            raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
+        mode = entry.get("mode", "shadow")
+        if mode not in MODES:
+            raise ValueError("%s: 'plan_gates.repos.%s.mode' must be shadow or enforce (to switch a repo off, set enabled: false), got %r"
+                             % (source, name, mode))
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("%s: 'plan_gates.repos.%s.enabled' must be true or false" % (source, name))
+        budget = entry.get("budget_ms", DEFAULT_BUDGET_MS)
+        if not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
+            raise ValueError("%s: 'plan_gates.repos.%s.budget_ms' must be a whole number from %d to %d"
+                             % (source, name, *BUDGET_RANGE))
+        repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget}
+    return {"repos": repos}
+
+
+def repo_setting(config, repo):
+    """The repo's {"mode", "enabled", "budget_ms"} from the validated config, or None when it is not opted in."""
+    for name, entry in ((config.get("plan_gates") or {}).get("repos") or {}).items():
+        if normal_repo(name) == normal_repo(repo):
+            return dict(entry, name=name)
+    return None
+
+
+def preflight(config, repo):
+    """(blocking, notes) for switching `repo` to enforce. Blocking: a recorder for `ci` must be registered (a machine's verdict
+    needs a defined recorder). Notes are what the check cannot know: other evaluators are listed when unregistered, and the
+    permission change that lets cos use the escape hatch is a manual precondition."""
+    evaluators = config.get("plan_evaluators") or {}
+    blocking, notes = [], []
+    if not evaluators.get("ci"):
+        blocking.append("no agent is registered to record `ci` verdicts: list its names under plan_evaluators.ci")
+    for kind in ("reviewer", "tester", "owner"):
+        if not evaluators.get(kind):
+            notes.append("no agent is registered for `%s`: a plan that names it cannot get a verdict (register it under "
+                         "plan_evaluators.%s)" % (kind, kind))
+    notes.append("manual: the chief of staff must be allowed `gates mode`/`gates off` and `waive` (a permission change held "
+                 "for the owner) before enforcement is switched on: cos is the one who can turn it off")
+    return blocking, notes
+
+
+def decide(report, check_for, mode):
+    """(verdict, failed, why): verdict is "allow" or "refuse". `report` is evaluate_gates' output. In `shadow` a failing check
+    is still reported (failed is not empty) but the verdict is always "allow". A gate that is not tracked or does not apply
+    never fails a check."""
+    failed = []
+    for row in report["gates"]:
+        if row["gate"] in REQUIRED_FOR[check_for] and row["status"] in ("missing", "waiting"):
+            failed.append({"gate": row["gate"], "missing": row["missing"][:3]})
+    if report.get("ledger_problem") and not any(f["gate"] == "G1" for f in failed):
+        failed.append({"gate": "G1", "missing": ["the ledger is not trustworthy: %s" % report["ledger_problem"]]})
+    verdict = "refuse" if failed and mode == "enforce" else "allow"
+    why = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied") for f in failed)
+    return verdict, failed, why

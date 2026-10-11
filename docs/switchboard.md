@@ -3998,3 +3998,41 @@ proof and a passing verdict from its evaluator, at this plan hash and this head)
 body has a `canon:` line: what was updated, or `canon: n/a <reason>` with a reason), **G6** (waiting while the PR is held for the
 owner). Listed but **not tracked yet, and not counted**: G0b (consensus), G0c (approval) and G2/G3 (alignment and code review),
 whose records are later slices; G7 and G8 are epic and deploy gates and show `n/a` for one PR.
+
+## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
+
+This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
+nothing is enforced**: it is the decision, the configuration and the switches, so they can be tried and measured first.
+
+`fleet-switchboard gates-check <repo#N> --for ready|merge [--json]` answers "is this allowed?" and only reads (plus counters
+in the state directory). **Exit 0 allow, 10 refuse, 3 fail-open; only 10 refuses**, and a Python exception exits 3, never 10.
+`ready` requires G0a and G1; `merge` requires G0a, G1, G4 and G6. G0b, G0c and G2/G3 are untracked and cannot refuse.
+
+**Config `plan_gates`:** `{"repos": {"acme/app": {"mode": "shadow", "enabled": true, "budget_ms": 3000}}}`. A repo not listed is
+not opted in (allowed, no output); repos match without regard to case. `mode` is `shadow` (the default: the check is computed and
+recorded as `gate.would_refuse`, and the answer is always allow) or `enforce` (refuse with exit 10). `enabled: false` is the
+per-repo kill switch: it takes effect at the next command, no restart. The global kill switch is the file `plan-gates.off` in the
+state directory: while it exists every repo is allowed, each such check is logged (`gate.killed`) and `status` says so loudly.
+`budget_ms` (default 3000, 500 to 30000) bounds one check; past it the check fails open. **Worst case for one gated command** is
+the budget plus the shim's own identity lookup (up to 3 s).
+
+**Fail-open.** A timeout, a crash, an unreadable GitHub, a missing config all answer 3 and record `gate.fail_open` (the first of
+each kind per repo per day is marked `first_today`). A refusal is `gate.refused`: the two are different events. **A broken ledger**
+refuses G1 in `enforce` (and says why) and alarms once a day per repo (`gate.ledger_broken`), never per command.
+
+**Changing a mode** (`gates mode <owner/repo> shadow|enforce|off`, `gates off`, `gates on`, `gates preflight <repo>`) is allowed
+for the chief of staff and for a person at a shell with no fleet identity; any other agent is refused and the refusal is audited
+(`gate.mode.refused`). It is the session-identity guard of #138, a guard against mistakes, and any local process can still create
+the kill file. Switching a repo to `enforce` is **refused until a recorder is registered for `ci`** (`plan_evaluators.ci`);
+`preflight` also lists the evaluators nobody is registered for (a plan that names one cannot get its verdict) and the manual
+precondition that the chief of staff be allowed `gates mode` and `waive` before enforcement is switched on, a permission change
+held for the owner. The check looks at registered evaluators, not at open PRs' plans, so a later plan naming a newly used
+evaluator can still block: the message for a missing verdict names exactly what to register.
+
+**G1 does not pass vacuously.** A plan with no scenario claimed per PR no longer satisfies G1 unless it states
+`per-pr scenarios: none because <reason>` (at least 20 characters); then G1 reads `n/a` and the epic gate applies. (The check that
+an epic claim names its integration branch is a later `plan check` change.)
+
+`status` prints each opted-in repo's mode with today's counts of checks, refusals, would-refuse and fail-opens. `merge --auto` is
+not treated here: when the shim is built, `--auto` is refused in `enforce`, which also stops any flow that auto-merges
+`merge-automatic` PRs; that cost is named in the design review and decided with the shim.
