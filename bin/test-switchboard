@@ -18118,6 +18118,41 @@ class TestOwnerTerminal(LedgerBase):
         self.assertIn("deeper than 5", self.problem(loop, depth=5))
         self.assertIn("cannot be established", sb.owner_terminal_problem(object(), object(), self.chain({}), 100))
 
+    def test_a_fake_ps_earlier_on_path_is_never_run(self):
+        fake_dir = self.home / "fakebin"
+        fake_dir.mkdir()
+        marker = self.home / "fake-ps-ran"
+        fake = fake_dir / "ps"
+        fake.write_text("#!/bin/sh\ntouch %s\necho '1 -zsh'\n" % marker)
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": "%s:/usr/bin:/bin" % fake_dir}):
+            got = sb._ps_line(os.getpid())
+        self.assertFalse(marker.exists(), "a ps found on PATH decided nothing")
+        self.assertIsNotNone(got, "the fixed-path ps answered")
+
+    def test_a_ps_that_is_not_the_expected_binary_is_refused(self):
+        mine = self.home / "ps"
+        mine.write_text("#!/bin/sh\necho '1 -zsh'\n")
+        mine.chmod(0o755)   # owned by the test user, not root
+        with mock.patch.object(sb, "PS_CANDIDATES", (str(mine), str(self.home / "nope"))):
+            self.assertIsNone(sb._trusted_ps())
+            self.assertIsNone(sb._ps_line(os.getpid()), "no trusted ps: the chain cannot be read, so the caller refuses")
+            self.assertIn("cannot be read", sb.owner_terminal_problem(self.Tty(True), self.Tty(True), None, os.getpid()))
+
+    def test_the_child_runs_with_a_scrubbed_environment(self):
+        self.assertEqual(sb.PS_ENV["PATH"], "/usr/bin:/bin")
+        self.assertNotIn("HOME", sb.PS_ENV)
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen.update(argv=argv, env=kw.get("env"))
+            return real(argv, **kw)
+        with mock.patch.object(sb.subprocess, "run", spy):
+            sb._ps_line(os.getpid())
+        self.assertEqual(seen["env"], dict(sb.PS_ENV))
+        self.assertIn(seen["argv"][0], sb.PS_CANDIDATES)
+
     def test_a_real_ps_unreadable_pid_is_refused_not_guessed(self):
         self.assertIsNone(sb._ps_line(2 ** 22 + 12345), "no such process: None, which the caller turns into a refusal")
 

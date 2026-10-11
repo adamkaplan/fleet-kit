@@ -4156,3 +4156,14 @@ confirmation, or a required check on GitHub); this slice does not provide it.
 **One place.** The owner-in-person check is a single function, `gates_caller_kind` (it wraps `owner_terminal_problem`), and every command that is "only the
 owner, at a terminal" must ask it and nothing else: today `verdict --as owner`, `gates mode` and `gates off|on`. A new such command (a later waiver by the
 owner, for instance) uses the same function so the rule cannot drift between commands; a test pins that it is called from exactly one place.
+
+**The process table is read with a trusted `ps` only.** The check runs `ps` from a fixed path (`/bin/ps`, then `/usr/bin/ps`; never found on `PATH`, so a
+`ps` placed earlier on `PATH` cannot decide who is a person), only if that file is a regular executable owned by root and not writable by others, and with a
+scrubbed environment (`PATH=/usr/bin:/bin`, `LC_ALL=C`, nothing else). With no such `ps` the chain cannot be read and the check refuses. Tests put a fake `ps`
+first on `PATH` and show it is never run.
+
+**Two things stay unprovable, and they are why this is a mistake guard and not a boundary.** (1) **A pty that is double-forked or reparented.** An agent that
+allocates a pseudo-terminal and detaches the process that holds it (a double fork, `setsid`, adoption by init) has no agent among its ancestors and a real terminal;
+nothing in the process can tell it from the owner's shell. (2) **A harness that is not on the list.** Ancestors are matched against `opencode`, `fleet-opencode`
+and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
+that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.
