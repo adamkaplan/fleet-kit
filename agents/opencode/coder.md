@@ -60,6 +60,7 @@ turn: you are woken then, free while idle. Never poll. If you were launched with
 
 **Before your first report, load the `fleet-coordination` skill.** It carries the
 report shape your orchestrator expects and the acknowledgment it is waiting for.
+If your brief asks you to write or revise a plan, load the `fleet-planning` skill first.
 
 ## The worktree is your boundary
 

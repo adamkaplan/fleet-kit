@@ -85,6 +85,7 @@ turn: you are woken then, free while idle. Never poll. `launch` reads the brief'
   completion — load the `fleet-charter` skill.
 - **Before you brief a coder**, load the `fleet-coordination` skill. It carries
   the brief fields and the report shape.
+- **Before you write or revise a plan**, load the `fleet-planning` skill.
 
 Load them as a real first action, every session. When they disagree, the skill wins.
 
