@@ -15266,6 +15266,61 @@ class TestTriage(Base):
         self.assertGreaterEqual(self.engine.triage.summarised - first, 86400)
         self.assertIn("other-owner flags", [e for e in self.world.audit() if e["event"] == "triage.summary"][0]["detail"]["text"])
 
+    def many_unowned(self, count, other=0):
+        for n in range(100, 100 + count):
+            self.add(n, created=3, labels=["kind"])                 # ours (bot) and unowned: a T1
+        for n in range(500, 500 + other):
+            self.add(n, created=3, labels=["kind"], author="someone-else")   # not ours: an other-owner flag
+
+    def run_minutes(self, minutes, step=15):
+        seen = []
+        for _ in range(int(minutes * 60 // step)):
+            self.world.tick(step)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+            seen.append(sb.triage_summary(self.world.state))
+        return seen
+
+    def test_after_a_restart_our_findings_are_confirmed_before_any_other_owner_flag_and_it_drains(self):
+        self.charter()
+        self.many_unowned(40, other=60)
+        real = self.hub._read_one
+
+        def slow(repo, path, now, fresh=False):   # each fresh read takes a second: the pass's 10 s bound, not the call budget, is the limit
+            self.world.tick(1)
+            return real(repo, path, now, fresh)
+        self.hub._read_one = slow
+        seen = self.run_minutes(20)
+        ours = seen[-1]["total"]   # each unowned issue is a T1 and a T3 (no next step)
+        first_all_ours = next(c for c in seen if c["total"] >= ours)
+        self.assertGreaterEqual(first_all_ours["unchecked_other_owner"], 50, "ours were done while the flags still waited")
+        self.assertEqual(first_all_ours["unchecked"], first_all_ours["unchecked_other_owner"])
+        self.assertEqual(seen[-1]["unchecked"], 0, "and the whole list drains within a bounded number of passes")
+        unchecked = [c["unchecked"] for c in seen]
+        self.assertEqual(unchecked[unchecked.index(0):], [0] * (len(unchecked) - unchecked.index(0)), "and stays drained at the TTL")
+
+    def test_our_findings_are_checked_before_the_other_owner_flags(self):
+        self.charter()
+        self.many_unowned(10, other=60)
+        self.engine.config["triage"]["calls_per_pass"] = 40
+        first = None
+        for _ in range(4):
+            self.world.tick(15)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+            first = first or sb.triage_summary(self.world.state)
+        self.assertEqual(first["counts"].get("T1"), 10, "all ten of ours checked in the very first pass, ahead of 60 flags")
+        self.assertGreater(first["unchecked_other_owner"], 0)
+        self.assertEqual(first["unchecked"], first["unchecked_other_owner"])
+
+    def test_every_finding_is_reached_within_a_bounded_number_of_passes_and_the_oldest_age_is_reported(self):
+        self.charter()
+        self.many_unowned(10, other=80)
+        self.engine.config["triage"]["calls_per_pass"] = 10
+        seen = self.run_minutes(20)
+        self.assertEqual(seen[-1]["unchecked"], 0)
+        self.assertTrue(any(c["oldest_unchecked_seconds"] > 0 for c in seen))
+        lines = "\n".join(sb.triage_status_lines(dict(seen[0], unchecked=5, unchecked_other_owner=3, oldest_unchecked_seconds=185)))
+        self.assertIn("5 finding(s) not checked this pass (call budget or a failed read) (3 of them other-owner flags); oldest unchecked for 3m", lines)
+
     def seven_repos(self):
         repos = ["acme/r%d" % i for i in range(7)]
         for repo in repos:
