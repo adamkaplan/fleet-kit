@@ -10358,7 +10358,13 @@ def cmd_launch(args, runner, now, socket_call=None):
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
     print(json.dumps(done, sort_keys=True))
-    note = set_checkpoint_reminders(engine, state, args.name, args.reports_to, None if args.issue is None
+    boss = args.reports_to
+    if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
+        try:  # a launch with no --reports-to: the launching agent is who an overdue checkpoint should wake (the worker's metadata is unchanged)
+            boss = identify_caller(engine.herdr, engine.v2, os.environ)
+        except Exception:
+            boss = None  # launched from a plain shell: no one to wake, as before
+    note = set_checkpoint_reminders(engine, state, args.name, boss, None if args.issue is None
                                     else int(args.issue), repo, brief, getattr(args, "checkpoint", None),
                                     getattr(args, "overdue", None), launched, now())
     if note and (brief or args.checkpoint or args.overdue):

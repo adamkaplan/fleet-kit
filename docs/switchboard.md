@@ -4190,3 +4190,7 @@ noted (`ci_record.unreadable`) and the old list kept; a PR that fails to read is
 Each PR is charged 4 calls up front. A simulated 5-second loop makes a handful of reads in 15 minutes, not one per pass. The pass is off while the global `plan-gates.off` file
 exists. This slice also fixes `gates preflight`, which did not consult the recorder's proof (so it said BLOCKED even after a successful record) and made `gates mode`
 keep the `ci_record` settings when it rewrites the config.
+
+### Self-wakes: the overdue wake without `--reports-to`
+
+`launch` made the overdue-checkpoint reminder only when `--reports-to` named someone. A launch from a fleet agent's pane with a CHECKPOINT (flags or brief) but no `--reports-to` now wakes the launching agent at the overdue time (only if the worker has not reported, as before); the worker's own metadata is unchanged. From a plain shell nothing changes (no one to wake, and the launch says so).

@@ -21679,6 +21679,25 @@ class TestLaunchSetsCheckpointReminders(TwoRepoCase):
         self.assertEqual(sb.read_reminders(self.world.state), [])
         self.assertEqual(len([l for l in err.splitlines() if "no checkpoint reminders" in l]), 1)
 
+    def test_without_reports_to_the_launching_agent_gets_the_overdue_wake(self):
+        self.as_agent("web-orch")
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        code, _, err = self.main("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder",
+                                 "--issue", "acme/web#2", "--checkpoint", "30m", "--overdue", "60m")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({r["to"] for r in sb.read_reminders(self.world.state)}, {"web-new", "web-orch"})
+
+    def test_without_reports_to_from_a_plain_shell_there_is_no_overdue_wake_as_before(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        work = self.home / "checkout"
+        work.mkdir(exist_ok=True)
+        code, _, err = self.main("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder",
+                                 "--issue", "acme/web#2", "--checkpoint", "30m", "--overdue", "60m")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({r["to"] for r in sb.read_reminders(self.world.state)}, {"web-new"})
+        self.assertIn("no overdue reminder", err)
+
     def test_no_brief_and_no_flags_is_silent(self):
         code, _, err = self.launch()
         self.assertEqual((code, err, sb.read_reminders(self.world.state)), (0, "", []))
