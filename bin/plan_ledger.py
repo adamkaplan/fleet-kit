@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 LEDGER_FILE = "plan-ledger.jsonl"
+HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
 KINDS = ("proof", "verdict")
 RESULTS = ("pass", "fail")
@@ -69,7 +70,30 @@ def read_ledger(state_dir):
             return entries, "entry %d does not follow from the one before it: the ledger was edited" % (len(entries) + 1)
         entries.append(entry)
         prev = entry["hash"]
+    pointer = _read_head(state_dir)
+    if pointer is not None and (len(entries) < pointer["seq"] or entries[pointer["seq"] - 1]["hash"] != pointer["hash"]):
+        return entries, ("the ledger ends before entry %d, where its head pointer says it should (entries were cut off or the "
+                         "file was rewritten)" % pointer["seq"])
     return entries, None
+
+
+def _read_head(state_dir):
+    try:
+        data = json.loads((Path(state_dir) / HEAD_FILE).read_text(encoding="utf-8"))
+        return data if isinstance(data.get("seq"), int) and isinstance(data.get("hash"), str) and data["seq"] > 0 else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _write_head(state_dir, entry):
+    path = Path(state_dir) / HEAD_FILE
+    temp = path.with_name("%s.%d.tmp" % (HEAD_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps({"seq": entry["seq"], "hash": entry["hash"]}) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(str(temp), str(path))
 
 
 def append_entry(state_dir, entry, now):
@@ -88,6 +112,7 @@ def append_entry(state_dir, entry, now):
         stored["hash"] = entry_hash(stored)
         os.write(fd, (json.dumps(stored, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
         os.fsync(fd)
+        _write_head(state_dir, stored)
     finally:
         os.close(fd)
     return stored
@@ -100,12 +125,19 @@ def evaluator_of(scenario):
     return EVALUATOR_ALIASES.get(name, name)
 
 
-def authors_of(entries, pr, notice_senders=()):
-    """The agents that wrote this PR: whoever recorded a PROOF for it, and the senders of its notice. An evaluator
-    can never be one of them."""
+def authors_of(entries, pr, notice_senders=(), github_author=None):
+    """The writers of this PR: the author GitHub reports for it (not a field the writer sets), whoever recorded a PROOF
+    for it, and the senders of its notice. An evaluator can never be one of them."""
     names = {e.get("by") for e in entries if e.get("pr") == pr and e.get("kind") == "proof"}
     names.update(notice_senders)
+    names.add(github_author)
     return {n for n in names if n}
+
+
+def known_writers(entries, pr, notice_senders=()):
+    """True when the switchboard knows at least one agent that wrote this PR (a proof or a notice): until then a verdict is
+    refused, because a writer that has declared nothing could otherwise register as its own evaluator."""
+    return bool(authors_of(entries, pr, notice_senders))
 
 
 def may_record_verdict(evaluator, caller, allowed, authors):
@@ -197,7 +229,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr):
     Returns {"gates", "ready", "untracked", "scenarios", "head", "plan_hash", "ledger_problem"}. `ready` is true when
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
-    authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or ())
+    authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
@@ -259,7 +291,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr):
 def render_gates(report, pr):
     """The lines `gates` prints."""
     lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8],
-                                          "READY (every tracked gate is satisfied)" if report["ready"] else "NOT READY"),
+                                          "READY on the gates it tracks (this is not approval: see the untracked list)"
+                                          if report["ready"] else "NOT READY"),
              "plan hash: %s" % (report.get("plan_hash") or "none")]
     if report.get("ledger_problem"):
         lines.append("LEDGER: %s" % report["ledger_problem"])

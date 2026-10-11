@@ -11535,15 +11535,33 @@ def pr_picture(engine, repo, number, state):
     return facts, body, notice_senders(item) if item else [], None
 
 
-def plan_source_for(explicit, entries, pr, body):
-    """The plan a PR is under: `--plan`, else the one its latest ledger entry named, else its body's `PLAN:` line."""
-    if explicit:
-        return explicit
-    for entry in reversed(entries):
-        if entry.get("pr") == pr and entry.get("plan_ref"):
-            return entry["plan_ref"]
+def authoritative_plan(entries, pr, body):
+    """(source, where) of the plan a PR is under, which its writer does not choose: the `PLAN:` line of the PR body, else
+    the plan of the PR's FIRST ledger entry. (None, None) when neither exists yet."""
     found = PLAN_LINE_RE.search(body or "")
-    return found.group(1).strip("<>.,") if found else None
+    if found:
+        return found.group(1).strip("<>.,"), "the PR body's PLAN: line"
+    for entry in entries:
+        if entry.get("pr") == pr and entry.get("plan_ref"):
+            return entry["plan_ref"], "the PR's first ledger entry"
+    return None, None
+
+
+def _same_plan(a, b, default_repo):
+    try:
+        return parse_plan_source(a, default_repo) == parse_plan_source(b, default_repo)
+    except PlanInputError:
+        return a == b
+
+
+def plan_source_for(explicit, entries, pr, body, default_repo=None):
+    """The plan to use: the authoritative one. `--plan` may only repeat it, or name the first plan when there is none yet;
+    a different one is refused (LedgerCommandError), so the writer cannot swap the plan its own work is judged against."""
+    source, where = authoritative_plan(entries, pr, body)
+    if explicit and source and not _same_plan(explicit, source, default_repo):
+        raise LedgerCommandError("--plan %s is not the PR's plan: %s names %s. Change the PR body's PLAN: line to change the "
+                                 "plan (that voids the earlier entries), not the command" % (explicit, where, source))
+    return source or explicit
 
 
 def checked_plan(engine_config, source, ask, runner, now):
@@ -11569,7 +11587,7 @@ def _ledger_context(args, runner, now, writable):
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     facts = dict(facts or {}, body=body, notice_senders=senders)
-    source = plan_source_for(args.plan, entries, pr, body)
+    source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
     if source:
         try:
@@ -11596,7 +11614,10 @@ def _scenario_of(ctx, sid):
 
 
 def _head_of(ctx, args):
-    head = args.head or (ctx.facts or {}).get("head")
+    known = (ctx.facts or {}).get("head")
+    head = args.head or known
+    if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
+        raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
     if not head or not re.fullmatch(r"[0-9a-f]{7,40}", head):
         raise LedgerCommandError("the PR head is unknown (%s): pass --head <sha>" % (ctx.unreadable or "not a sha"))
     return head
@@ -11606,7 +11627,8 @@ def _record(ctx, args, now, entry):
     stored = plan_ledger.append_entry(ctx.state, entry, now())
     if ctx.engine.audit is not None:
         ctx.engine.audit.append(ctx.engine.actor, "plan.%s" % entry["kind"], ctx.pr,
-                                {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"]})
+                                {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"],
+                                 "chain": stored["hash"]})
     return stored
 
 
@@ -11642,8 +11664,12 @@ def cmd_verdict(args, runner, now):
     named = plan_ledger.evaluator_of(scenario)
     if args.evaluator != named:
         raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (args.scenario, named, args.evaluator))
+    senders = ctx.facts.get("notice_senders") or ()
+    if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
+                                 "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
     ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
-                                             plan_ledger.authors_of(ctx.entries, ctx.pr, ctx.facts.get("notice_senders") or ()))
+                                             plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
@@ -11651,7 +11677,7 @@ def cmd_verdict(args, runner, now):
         raise LedgerCommandError("refused: %s" % why)
     entry = {"kind": "verdict", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
              "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
-             "evaluator": named, "evidence": plan_ledger.clip(redact_command_text(args.evidence or ""), plan_ledger.EVIDENCE_LIMIT)}
+             "evaluator": named, "evidence": _evidence(args)}
     stored = _record(ctx, args, now, entry)
     print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, stored["seq"], args.scenario, args.result,
                                                                          entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
@@ -11666,6 +11692,10 @@ def cmd_gates(args, runner, now):
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
+    report["plan_source"] = ctx.source
+    if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
+        report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     if args.json:
         print(json.dumps(report, sort_keys=True))
     else:
@@ -11674,6 +11704,8 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        if report.get("plan_changed"):
+            lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
     return EXIT_OK if report["ready"] else EXIT_ERROR
 
@@ -11699,7 +11731,7 @@ def add_ledger_parsers(sub):
     common(verdict)
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
-    verdict.add_argument("--evidence", help="A link, or the evaluator's own artefact")
+    verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it")
     common(gates, scenario=False)
     gates.add_argument("--json", action="store_true")

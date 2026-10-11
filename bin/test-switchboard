@@ -16722,7 +16722,8 @@ class TestPlanLedger(Base):
         return self.run_as(who, "prove", sid, "--pr", self.PR, "--evidence", "ran the suite: 12 passed", "--result", result, *more)
 
     def verdict(self, who, sid, evaluator, result="pass", *more):
-        return self.run_as(who, "verdict", sid, "--pr", self.PR, "--as", evaluator, "--result", result, *more)
+        return self.run_as(who, "verdict", sid, "--pr", self.PR, "--as", evaluator, "--result", result,
+                           "--evidence", "judged it: matches the scenario", *more)
 
     def gates(self, *more):
         code, out, err = self.run_as("coder", "gates", self.PR, "--json", *more)
@@ -16808,6 +16809,7 @@ class TestPlanLedger(Base):
         self.assertEqual(len(self.ledger()), 2)
 
     def test_only_a_registered_agent_may_record_and_by_default_nobody_may(self):
+        self.assertEqual(self.prove("coder", "S3")[0], 0)
         code, out, err = self.verdict("other", "S3", "reviewer")
         self.assertEqual(code, 2)
         self.assertIn("not registered to record reviewer", err)
@@ -16816,7 +16818,7 @@ class TestPlanLedger(Base):
         self.assertEqual(code, 2)
         self.assertIn("no agent is registered to record reviewer", err)
         self.assertIn("plan.verdict.refused", [e["event"] for e in self.world.audit()])
-        self.assertEqual(self.ledger(), [])
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof"])
 
     def test_the_author_of_the_pr_cannot_record_a_verdict_on_its_own_work(self):
         self.assertEqual(self.prove("coder", "S1")[0], 0)
@@ -16837,10 +16839,103 @@ class TestPlanLedger(Base):
 
     def test_a_scenario_that_names_the_old_personal_evaluator_is_judged_by_the_owner(self):
         self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: adam")
+        self.assertEqual(self.prove("coder", "S3")[0], 0)
         code, out, err = self.verdict("own", "S3", "owner")
         self.assertEqual(code, 0, err)
 
     # -- the chain
+
+    def test_the_github_author_of_the_pr_can_never_record_a_verdict(self):
+        self.assertEqual(self.run_as("other", "notice", "pr", self.PR, "ready")[0], 0)   # a writer is known
+        self.pr["author"] = {"login": "rev"}   # GitHub says rev wrote it, whatever rev recorded
+        code, out, err = self.verdict("rev", "S3", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("an author cannot record a verdict", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+        self.pr["author"] = {"login": "shared"}
+        self.assertEqual(self.verdict("rev", "S3", "reviewer")[0], 0)
+
+    def test_a_verdict_needs_a_known_writer_so_a_silent_author_cannot_be_its_own_evaluator(self):
+        code, out, err = self.verdict("rev", "S3", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("no writer of", err)
+        self.assertEqual(self.ledger(), [])
+
+    def test_the_plan_is_the_prs_not_the_writers(self):
+        other = dict(self.plan_issue, number=8, body=LEDGER_PLAN.replace("Commissioning works.", "Another plan."))
+        base = self.route
+
+        def route(argv, **kw):
+            if argv[0] == FAKE_GH and re.search(r"/issues/8$", argv[2]):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(other), "")
+            return base(argv, **kw)
+        self.route = route
+        code, out, err = self.prove("coder", "S1", "--plan", "acme/app#8")
+        self.assertEqual(code, 2)
+        self.assertIn("is not the PR's plan", err)
+        self.assertIn("PLAN: line", err)
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual(self.prove("coder", "S1", "--plan", "https://github.com/acme/app/issues/7")[0], 0, "repeating it is fine")
+        self.pr["body"] = "no plan line"           # the body names none: the first recorded plan is the authority
+        code, out, err = self.prove("coder", "S2", "--plan", "acme/app#8")
+        self.assertEqual(code, 2)
+        self.assertIn("first ledger entry", err)
+        code, out, err = self.run_as("coder", "gates", self.PR, "--plan", "acme/app#8")
+        self.assertEqual(code, 2)
+
+    def test_changing_the_plan_line_voids_earlier_entries_and_gates_says_so(self):
+        self.all_proven()
+        self.assertEqual(self.gates()[0], 0)
+        other = dict(self.plan_issue, number=8, body=LEDGER_PLAN.replace("exactly 1 agent", "exactly 2 agents"))
+        base = self.route
+
+        def route(argv, **kw):
+            if argv[0] == FAKE_GH and re.search(r"/issues/8$", argv[2]):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(other), "")
+            return base(argv, **kw)
+        self.route = route
+        self.pr["body"] = "PLAN: acme/app#8\ncanon: updated the docs"
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 1)
+        self.assertIn("PLAN CHANGED", out)
+
+    def test_a_head_that_is_not_the_prs_is_refused(self):
+        code, out, err = self.prove("coder", "S1", "--head", "c" * 40)
+        self.assertEqual(code, 2)
+        self.assertIn("is not the PR's head", err)
+
+    def test_a_verdict_needs_evidence(self):
+        self.assertEqual(self.prove("coder", "S3")[0], 0)
+        code, out, err = self.run_as("rev", "verdict", "S3", "--pr", self.PR, "--as", "reviewer", "--result", "pass")
+        self.assertNotEqual(code, 0)
+
+    def test_cutting_off_the_end_of_the_ledger_is_found_by_the_head_pointer(self):
+        for sid in ("S1", "S2", "S3"):
+            self.assertEqual(self.prove("coder", sid)[0], 0)
+        path = self.world.state / "plan-ledger.jsonl"
+        lines = path.read_text().splitlines()
+        path.write_text("\n".join(lines[:2]) + "\n")
+        _, problem = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertIn("ends before entry 3", problem)
+        code, out, err = self.prove("coder", "U1")
+        self.assertEqual(code, 2)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.world.state / "plan-ledger.head")).st_mode), 0o600)
+
+    def test_a_full_rewrite_disagrees_with_the_head_pointer_and_the_audit(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        path = self.world.state / "plan-ledger.jsonl"
+        (entry,) = self.ledger()
+        forged = dict(entry, result="fail")
+        forged["hash"] = sb.plan_ledger.entry_hash(forged)   # hashes recomputed: the chain alone cannot tell
+        path.write_text(json.dumps(forged, sort_keys=True) + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.world.state)[1], "the head pointer holds the old end")
+        audited = [e["detail"]["chain"] for e in self.world.audit() if e["event"] == "plan.proof"]
+        self.assertEqual(audited, [entry["hash"]], "the audit line carries the chain's head too")
+
+    def test_ready_does_not_read_as_approval(self):
+        self.all_proven()
+        out = self.run_as("coder", "gates", self.PR)[1]
+        self.assertIn("this is not approval", out)
 
     def test_each_entry_chains_to_the_one_before_and_an_edit_is_found(self):
         self.assertEqual(self.prove("coder", "S1")[0], 0)

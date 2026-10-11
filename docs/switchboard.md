@@ -3966,8 +3966,7 @@ anything yet**: no gate refuses a ready or a merge, and the `gh` shim is unchang
 
 **The ledger** is `plan-ledger.jsonl` in the state directory (mode 0600), append-only. Each entry carries the hash of the
 one before it, so an edit, a deletion or a reordering is found when the file is read, and a ledger whose chain is broken
-takes no new entry. It is tamper-**evident**, not tamper-proof: a process that can write the state directory can rewrite the
-whole chain. Entries are bound to the plan's **plan hash** (from `plan check`: editing the plan, even a constraint, voids
+takes no new entry. It is tamper-**evident**, not tamper-proof. The chain finds an edit, a deletion or a reordering. A second file, `plan-ledger.head`, holds the sequence number and hash of the newest entry, so cutting entries off the end is found too; and every `plan.*` audit line carries the chain hash it produced, so a full rewrite with recomputed hashes disagrees with the audit. A process that can write the whole state directory (the ledger, the head file and the audit log) can still forge all three. Entries are bound to the plan's **plan hash** (from `plan check`: editing the plan, even a constraint, voids
 them) and to the PR's **head** (a push voids them; the view shows them as void, with the reason, rather than hiding them).
 
 | Command | What it records |
@@ -3976,13 +3975,12 @@ them) and to the PR's **head** (a push voids them; the view shows them as void, 
 | `fleet-switchboard verdict <scenario> --pr <repo#N> --as ci\|tester\|reviewer\|owner --result pass\|fail` | a VERDICT, only as the evaluator the scenario names, only by an agent listed for it in the config key `plan_evaluators`, and never by a writer of the PR |
 | `fleet-switchboard gates <repo#N> [--json]` | nothing: it reads |
 
-The plan is `--plan`, else the one the PR's earlier ledger entries named, else the `PLAN: <link>` line of the PR body.
+**The plan is the PR's, not the writer's:** the `PLAN: <link>` line of the PR body, else the plan of the PR's first ledger entry. `--plan` may only repeat it (or name the first plan when there is none yet); a different one is refused. Change the plan by changing the PR body's `PLAN:` line, which voids the earlier entries (the view says `PLAN CHANGED`). The plan's hash is computed from the GitHub text at that link.
 
 **Who may be an evaluator is configuration, and the default is nobody.** `plan_evaluators` maps an evaluator to fleet agent
 names, for example `{"reviewer": ["reviewer-1"], "tester": ["tester-1"]}`. An evaluator with no names cannot be recorded
-for, which keeps a fresh install from accepting verdicts nobody was trusted to give. An **author** of a PR is anyone who
-recorded a proof for it or sent its `notice pr`; an author's verdict is refused when recorded, and ignored by `gates` if it is
-in the file anyway. A scenario that still names the old personal evaluator spelling is judged by `owner`.
+for, which keeps a fresh install from accepting verdicts nobody was trusted to give. The **writers** of a PR are the author GitHub reports for it, anyone who recorded a proof for it, and the sender of its `notice pr`; a verdict is refused until at least one writer is known, so a writer that declared nothing cannot be its own evaluator; an author's verdict is refused when recorded, and ignored by `gates` if it is
+in the file anyway. The caller's identity is the session-based one, a guard against mistakes: it does not stop an agent that sets another agent's session variable. `verdict` requires `--evidence` like `prove`, and `--head` must be the PR's head. A scenario that still names the old personal evaluator spelling is judged by `owner`.
 
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
 it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is
