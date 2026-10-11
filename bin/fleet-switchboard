@@ -16812,7 +16812,69 @@ def ensure_labels(engine, runner, repo):
     return made
 
 
+MARKER_PAGES = 10   # pages of 100 open items read per repo; a longer list is said to be cut
+
+
+def read_open_items(engine, runner, repo):
+    """([{"number", "pr", "body", "labels", "author"}], cut): the open issues and PRs of `repo` from `gh api`, read with the
+    repo's own account (GET only). IntentError when a read fails."""
+    items = []
+    for page in range(1, MARKER_PAGES + 1):
+        done = _gh_write(engine, runner, repo, "repos/%s/issues?state=open&per_page=100&page=%d" % (repo, page), "GET")
+        try:
+            records = json.loads(done.stdout or "[]")
+        except ValueError:
+            raise IntentError("gh", "the list of %s was not JSON" % repo) from None
+        if not isinstance(records, list):
+            raise IntentError("gh", "the list of %s was not a list" % repo)
+        for record in records:
+            number = _number(record) if isinstance(record, dict) else None
+            if number is None:
+                continue
+            items.append({"number": number, "pr": _is_pr(record), "body": record.get("body"),
+                          "labels": {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []},
+                          "author": pr_login(record.get("user")) or "?"})
+        if len(records) < 100:
+            return items, False
+    return items, True
+
+
+def markers_to_label(engine, items):
+    """[(item, label)]: the items whose first line says MERGE: captain|automatic and which carry NO merge label (an item that
+    has one is left alone: the label is the truth, a disagreement is the sweep's finding, not ours to rewrite)."""
+    names = label_names(engine.config)
+    todo = []
+    for item in items:
+        if _label_kind(item["labels"], CAPTAIN_MERGE_LABELS):
+            continue
+        marker = pr_marker(item["body"])
+        if marker is not None:
+            todo.append((item, names["merge-" + marker]))
+    return todo
+
+
+def apply_from_markers(engine, runner, repo, apply):
+    """(lines, changed, cut) for one repo. With `apply` it first ensures the labels exist (idempotent), then adds each missing
+    merge label to its item, each audited (`decisions.labels`). Never run by the daemon: only `labels apply-from-markers`."""
+    items, cut = read_open_items(engine, runner, repo)
+    todo = markers_to_label(engine, items)
+    if apply and todo:
+        ensure_labels(engine, runner, repo)
+    lines, changed = [], 0
+    for item, label in todo:
+        what = "%s#%d  %s  by %s  + %s" % (repo, item["number"], "PR" if item["pr"] else "issue", item["author"], label)
+        if apply:
+            change_issue_labels(engine, runner, repo, item["number"], add=[label])
+            changed += 1
+            lines.append("applied  " + what)
+        else:
+            lines.append("would add  " + what)
+    return lines, changed, cut
+
+
 def cmd_labels(args, runner, now):
+    if args.labels_action == "apply-from-markers":
+        return cmd_labels_apply(args, runner, now)
     engine, _, _ = build_engine(runner, now, "cli")
     if args.repo is not None and not REPO_RE.match(args.repo):
         sys.stderr.write("%s: --repo must be OWNER/REPO, got %r\n" % (PROG, args.repo))
@@ -16831,6 +16893,32 @@ def cmd_labels(args, runner, now):
             continue
         for label, what in made.items():
             print("%s  %s  %s" % (repo, label, what))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def cmd_labels_apply(args, runner, now):
+    engine, _, _ = build_engine(runner, now, "cli", writable=bool(args.apply))
+    if args.repo is not None and not REPO_RE.match(args.repo):
+        sys.stderr.write("%s: --repo must be OWNER/REPO, got %r\n" % (PROG, args.repo))
+        return EXIT_USAGE
+    repos = [args.repo] if args.repo else decision_repos(engine)
+    if not repos:
+        sys.stderr.write("%s: no repo is watched: name one with --repo OWNER/REPO, or add it to github_repos\n" % PROG)
+        return EXIT_USAGE
+    failed, total = False, 0
+    for repo in repos:
+        try:
+            lines, changed, cut = apply_from_markers(engine, runner, repo, bool(args.apply))
+        except IntentError as err:
+            sys.stderr.write("%s: %s: %s\n" % (PROG, repo, _one_line(str(err), 300)))
+            failed = True
+            continue
+        total += len(lines)
+        for line in lines:
+            print(line)
+        if cut:
+            sys.stderr.write("%s: %s: the open list was cut after %d pages; run again after labelling\n" % (PROG, repo, MARKER_PAGES))
+    print("%s: %d item(s) %s" % (PROG, total, "labelled" if args.apply else "would be labelled (a dry run: nothing was written; add --apply)"))
     return EXIT_ERROR if failed else EXIT_OK
 
 
@@ -16917,6 +17005,18 @@ def add_decision_parsers(sub):
     actions = labels.add_subparsers(dest="labels_action", required=True)
     ensure = actions.add_parser("ensure", help="Create the missing labels (every watched repo by default)")
     ensure.add_argument("--repo", metavar="OWNER/REPO", help="Only this repo")
+    apply = actions.add_parser(
+        "apply-from-markers", help="Label the open PRs and issues whose first body line says MERGE: captain|automatic "
+                                   "(a person's command; a dry run unless --apply)",
+        description="Lists the open PRs and issues of the watched repos (or --repo) whose first non-empty body line says "
+                    "`MERGE: captain` or `MERGE: automatic` and which carry NO merge label, and prints what would change. "
+                    "Without --apply nothing is written (the default, same as --dry-run). With --apply it ensures the labels "
+                    "exist and adds `<user>:merge-captain` / `<user>:merge-automatic` with the repo's own gh account, audited. "
+                    "It is a person's command: the daemon never runs it, and the sweep and triage still write nothing.")
+    apply.add_argument("--repo", metavar="OWNER/REPO", help="Only this repo")
+    mode = apply.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Print what would change and write nothing (the default)")
+    mode.add_argument("--apply", action="store_true", help="Add the labels")
 
 
 def add_decision_list_flags(parser, suppress=False):

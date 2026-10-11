@@ -24086,11 +24086,15 @@ class LabelGh:
         self.calls, self.envs, self.down, self.fail = [], [], False, set()
         self.fail_writes = set()   # repos whose writes (not reads) fail
 
-    def issue(self, repo, number, title="an issue", labels=(), body=None):
+    def issue(self, repo, number, title="an issue", labels=(), body=None, pr=False, author=None):
         self.issues[(repo, number)] = {"number": number, "title": title, "state": "open", "labels": list(labels),
                                        "updated_at": sb.iso(self.clock.now() - 60)}
         if body is not None:
             self.issues[(repo, number)]["body"] = body
+        if pr:
+            self.issues[(repo, number)]["pull_request"] = {"url": "x"}
+        if author:
+            self.issues[(repo, number)]["user"] = {"login": author}
 
     def names(self, repo, number):
         return sorted(self.issues[(repo, number)]["labels"])
@@ -24116,9 +24120,9 @@ class LabelGh:
         found = re.match(r"^repos/([^/]+/[^/?]+)/issues\?(.*)$", path)
         if found and method == "GET":
             query = dict(pair.partition("=")[::2] for pair in found.group(2).split("&"))
-            label = urllib.parse.unquote(query["labels"])
+            label = urllib.parse.unquote(query["labels"]) if "labels" in query else None
             rows = [dict(i, labels=[{"name": n} for n in i["labels"]]) for (repo, _), i in sorted(self.issues.items())
-                    if repo == found.group(1) and label in i["labels"] and i["state"] == "open"]
+                    if repo == found.group(1) and (label is None or label in i["labels"]) and i["state"] == "open"]
             page = int(query.get("page", "1"))
             return subprocess.CompletedProcess(argv, 0, json.dumps(rows if page == 1 else []), "")
         found = re.match(r"^repos/([^/]+/[^/]+)/issues$", path)
@@ -25376,6 +25380,98 @@ class TestLabelsEnsure(WriteWorld):
                 sb.build_parser().parse_args(["labels", "--help"])
         for word in ("ensure", "awaiting-cos", "awaiting-user", "orchestrator"):
             self.assertIn(word, out.getvalue())
+
+
+
+class TestLabelsApplyFromMarkers(WriteWorld):
+    """`labels apply-from-markers`: a person's command; a dry run unless --apply; never the daemon's. Neutral names."""
+
+    CAPTAIN = "%s:merge-captain" % sb.orchestrator_label().split(":")[0]
+    AUTOMATIC = "%s:merge-automatic" % sb.orchestrator_label().split(":")[0]
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 7, labels=[], body="MERGE: captain\nHeld for the owner.", pr=True, author="coder-bot")
+        self.gh.issue(API, 8, labels=[], body="MERGE: automatic\nGreen and reviewed.", pr=True, author="coder-bot")
+        self.gh.issue(API, 9, labels=[self.CAPTAIN], body="MERGE: captain\nalready labelled", pr=True)
+        self.gh.issue(API, 10, labels=["bug"], body="a plain issue")
+        self.gh.issue(API, 11, labels=[self.AUTOMATIC], body="MERGE: captain\nthe label disagrees", pr=True)   # left alone
+        self.gh.issue(API, 12, labels=[], body="intro\nMERGE: captain\nnot the first line", pr=True)
+        self.gh.issue(WEB, 3, labels=[], body="MERGE: captain\nother repo", pr=True, author="other-author")
+
+    def writes(self):
+        return [c for c in self.gh.calls if "--method" in c and c[c.index("--method") + 1] != "GET"]
+
+    def test_the_default_is_a_dry_run_that_lists_and_writes_nothing(self):
+        code, out, err = self.main("labels", "apply-from-markers", "--repo", API)
+        self.assertEqual(code, 0, err)
+        self.assertIn("would add  %s#7  PR  by coder-bot  + %s" % (API, self.CAPTAIN), out)
+        self.assertIn("would add  %s#8  PR  by coder-bot  + %s" % (API, self.AUTOMATIC), out)
+        for ref in ("#9", "#10", "#11", "#12"):
+            self.assertNotIn("%s%s " % (API, ref), out)            # labelled, plain, disagreeing, not-the-first-line: untouched
+        self.assertIn("2 item(s) would be labelled (a dry run", out)
+        self.assertEqual(self.writes(), [])
+        code, out2, _ = self.main("labels", "apply-from-markers", "--repo", API, "--dry-run")
+        self.assertEqual(out2, out)
+
+    def test_apply_ensures_the_labels_then_adds_them_with_the_repos_own_account_audited(self):
+        code, out, err = self.main("labels", "apply-from-markers", "--repo", API, "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertIn("applied  %s#7" % API, out)
+        self.assertEqual(self.gh.names(API, 7), [self.CAPTAIN])
+        self.assertEqual(self.gh.names(API, 8), [self.AUTOMATIC])
+        self.assertEqual(self.gh.names(API, 11), [self.AUTOMATIC])      # a disagreement is the sweep's finding: not rewritten
+        self.assertEqual(self.gh.names(API, 12), [])
+        self.assertIn(self.CAPTAIN, self.gh.labels[API])                 # the labels were ensured first
+        events = self.audit_events("decisions.labels")
+        self.assertEqual(sorted(e["detail"]["issue"] for e in events if e["phase"] == "intent"), [7, 8])
+        self.assertIn("2 item(s) labelled", out)
+        code, out, err = self.main("labels", "apply-from-markers", "--repo", API, "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertIn("0 item(s) labelled", out)                         # idempotent: nothing left to label
+        self.assertEqual(len(self.audit_events("decisions.labels")), 4)  # and nothing written twice (2 x intent+result)
+
+    def test_every_watched_repo_by_default_each_with_its_own_account(self):
+        self.ACCOUNTS = {API: "bot-a", WEB: "bot-b"}
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "github_repos": [API, WEB],
+                           "gh_users": self.ACCOUNTS, **TIER_LABELS})
+        self.world.config = sb.validate_config(json.loads(self.config_file.read_text()))
+        code, out, err = self.main("labels", "apply-from-markers", "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(WEB, 3), [self.CAPTAIN])
+        tokens = {(c[2].split("/issues")[0], (e or {}).get("GH_TOKEN")) for c, e in zip(self.gh.calls, self.gh.envs)
+                  if "--method" in c and c[c.index("--method") + 1] == "POST"}
+        self.assertEqual({t for r, t in tokens if r == "repos/%s" % WEB or r == "repos/%s/labels" % WEB}, {"tok-bbbbbbbb"})
+        self.assertEqual({t for r, t in tokens if API in r}, {"tok-aaaaaaaa"})
+
+    def test_a_repo_that_cannot_be_read_is_said_and_the_others_still_run(self):
+        self.gh.fail = {WEB}
+        code, out, err = self.main("labels", "apply-from-markers")
+        self.assertEqual(code, 1)
+        self.assertIn(WEB, err)
+        self.assertIn("%s#7" % API, out)
+
+    def test_a_bad_repo_flag_is_refused_and_both_modes_at_once_are_a_usage_error(self):
+        self.assertEqual(self.main("labels", "apply-from-markers", "--repo", "x")[0], 2)
+        self.assertEqual(self.main("labels", "apply-from-markers", "--apply", "--dry-run")[0], 2)
+
+    def test_it_is_a_persons_command_never_the_daemons_nor_the_sweeps_nor_the_triages(self):
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        callers = [l.strip() for l in text.splitlines() if "apply_from_markers(" in l and "def " not in l]
+        self.assertEqual(len(callers), 1)                                  # the one call is inside cmd_labels_apply
+        start, end = text.index("def cmd_labels_apply"), text.index("# ---- orders --cos")
+        self.assertIn("apply_from_markers(", text[start:end])
+        for part in ("def sweep_decisions", "def triage_pass", "def run_daemon"):
+            i = text.index(part)
+            self.assertNotIn("apply_from_markers", text[i:i + 6000], part)
+
+    def test_help_says_it_is_a_dry_run_unless_apply(self):
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["labels", "apply-from-markers", "--help"])
+        flat = " ".join(out.getvalue().split())
+        for word in ("--apply", "--dry-run", "MERGE: captain", "the daemon never runs it"):
+            self.assertIn(word, flat)
 
 
 class TestLabelsEnsureUsesEachReposAccount(WriteWorld):
