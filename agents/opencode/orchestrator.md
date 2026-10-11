@@ -76,7 +76,7 @@ that changes nothing for you: do not report, do not answer at length.
 
 When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
-turn: you are woken then, free while idle. Never poll.
+turn: you are woken then, free while idle. Never poll. `launch` reads the brief's CHECKPOINT (or `--checkpoint 30m --overdue 60m`) and arms the reminders for that checkpoint itself: the worker is reminded at the checkpoint, and you are woken at the overdue time unless the worker has reported or sent anything since the launch, so set none of your own for it. Always pass `--reports-to <your name>` so the overdue wake has someone to wake; a CHECKPOINT line it cannot read arms nothing, and `launch` says so.
 
 ## Skills
 

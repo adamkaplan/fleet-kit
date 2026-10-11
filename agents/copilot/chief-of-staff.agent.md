@@ -146,6 +146,7 @@ the file on disk before enforcing it**; disk wins.
 - Never dispatch another orchestrator's coder. Coders belong to their
   orchestrator; you talk to the orchestrator.
 - Never answer a `<user>:awaiting-user` question on your principal's behalf.
+- Escalate in the same turn: never tell your principal an item needs them without running `decisions escalate` in that same turn. The Decisions panel, not the chat, is the list of what waits on them: do not restate it in chat. A PR held for the owner carries `<user>:merge-captain` and a `<user>:hold-<reason>` label (the switchboard reads labels; the body's first line `MERGE: captain` stays only in repos whose own checks read it and until 2026-11-10); ask its orchestrator to label one that lacks them. "A news message stands alone" applies to news only.
 - No unsolicited prompts, keys or interrupts into panes you do not own.
 - Two failures on the same obstacle: stop and report. Never a third variant.
 
