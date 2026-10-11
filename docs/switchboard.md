@@ -4086,6 +4086,21 @@ the intent repo) is checked; `enabled: false` and the global `plan-gates.off` fi
 counters in `status` include it. A `--resume` is not checked. The design exempts a hotfix and the gate engine's own repair
 assignments from the launch gate; the check cannot tell them apart yet, so the enforcing slice needs a way to say so.
 
+## Which gates a repo in `enforce` refuses on (`enforce_gates`, #107)
+
+`plan_gates.repos.<repo>.enforce_gates` is a list of the gates a repo in `enforce` **refuses** on: `G0a`, `G1`, `G4`, `G6`, default
+`["G0a", "G1"]` (a non-empty list of distinct gates; kept in gate order). `ready` requires G0a and G1, `merge` requires G0a, G1, G4 and G6;
+a required gate that is **not listed is reported and allowed**: it appears in the check's `failed` list with `enforced: false`, in the
+text as "(reported, not enforced)", and in the audit as `gate.reported`. So a repo in `enforce` with the default list refuses a merge for
+a G1 or G0a failure, and never for pending CI (G4) or a `MERGE: captain` PR (G6) until the repo lists them. In `shadow` nothing refuses
+and every failing gate is recorded as `gate.would_refuse`, listed or not. `gates preflight`, `gates mode ... enforce` and `status` show the
+list in force.
+
+**The refusal an agent sees** is one line: `fleet-switchboard: <ready|merge> of <repo#N> refused: missing <the enforced gates and what is
+missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive <repo#N> --gates ... --reason ...`; never for G6 or
+G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
+not named as the reason. (`waive` is not built yet: the line names the path the design defines.)
+
 ## The owner's verdict and the built-in `ci` recorder (#107)
 
 **The `owner` verdict** (a scenario whose evaluator is `owner`, or the old personal spelling, which is an alias) is recorded only from
