@@ -2847,19 +2847,31 @@ class TestSteerToWorking(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
 
-    def test_a_message_over_the_limit_is_refused_to_the_sender_and_nothing_is_delivered(self):
+    def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
-        before = len(self.world.v2.interrupts)
-        with captured() as (out, err):
-            code = sb.main(["send", "--from", "cos", "platform", "x" * 6000], runner=self.world.route,
-                           now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+
+        def send(*argv):
+            with captured() as (out, err):
+                code = sb.main(["send", "--from", "cos", "platform"] + list(argv), runner=self.world.route,
+                               now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+            return code, out.getvalue(), err.getvalue()
+        before = len(self.world.v2.__dict__.get("sent", [])) if hasattr(self.world.v2, "sent") else 0
+        code, out, err = send("x" * 6000)
         self.assertEqual(code, sb.EXIT_USAGE)
-        self.assertIn("message is 6000 characters, the limit is %d" % sb.SEND_TEXT_MAX, err.getvalue())
-        self.assertIn("nothing was sent", err.getvalue())
-        self.assertEqual(out.getvalue(), "")
-        self.assertEqual(len(self.world.v2.interrupts), before)
+        self.assertIn("message is 6000 characters", err)
+        self.assertIn("nothing was sent", err)
+        self.assertEqual(out, "")
+        allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
+        self.assertTrue(0 < allowed < sb.MESSAGE_CAP)
+        self.assertNotIn("xxxx", json.dumps(self.world.v2.__dict__, default=str))   # nothing reached the recipient
+        code, _, err = send("x" * (allowed + 1))                                   # one over the stated length is refused
+        self.assertEqual(code, sb.EXIT_USAGE)
         self.world.tick(1)
-        self.assertNotIn("xxxx", json.dumps(self.world.v2.__dict__, default=str))  # nothing reached the recipient
+        code, _, err = send("y" * allowed)                                         # exactly the stated length is delivered whole
+        self.assertEqual(code, 0, err)
+        self.world.tick(1)
+        code, _, err = send("short")
+        self.assertEqual(code, 0, err)
 
 
 # ------------------------------------------------------------------- the CLI
@@ -8279,6 +8291,20 @@ class TestIntentSend(IntentCase):
         self.assertEqual(code, 0, err)
         (admitted,) = self.world.admissions("platform")
         self.assertIn("Ask #2 Intent: Fix the agents\nDone when: both answer\nWork item #3", admitted["text"])
+
+    def test_with_an_issue_the_ask_sections_count_toward_the_allowed_length(self):
+        os.environ[sb.LAB_ENV] = "1"
+        code, _, err = self.main("send", "platform", "--from", "coder", "--issue", "3", "x" * 3950)
+        self.assertEqual(code, sb.EXIT_USAGE)
+        allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
+        self.assertLess(allowed, 3900)                      # the Intent block and the header are not free
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.world.tick(1)
+        code, _, err = self.main("send", "platform", "--from", "coder", "--issue", "3", "y" * allowed)
+        self.assertEqual(code, 0, err)
+        (admitted,) = self.world.admissions("platform")
+        self.assertNotIn("[cut at", admitted["text"])
+        self.assertIn("y" * allowed, admitted["text"])
 
     def test_intent_required_false_turns_the_refusal_off(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH,
