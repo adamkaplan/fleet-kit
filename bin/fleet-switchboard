@@ -6375,7 +6375,7 @@ def finish_pass(engine, discovery, report):
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["Adam"], "calls_per_pass": 12}
+                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
 SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.calls_per_pass`: the most `gh` calls one pass makes
 SWEEP_CALLS_CAP = 100
@@ -6462,7 +6462,7 @@ def sweep_strong_statement(strong, text, default_repo, repos):
     """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
     person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
     `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
-    so `v3.3, #3055` stays one sentence. No refs means the statement names nothing by itself."""
+    so `v3.3, #9101` stays one sentence. No refs means the statement names nothing by itself."""
     if not isinstance(text, str):
         return False, []
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6491,7 +6491,7 @@ def sweep_says_waiting_strong(strong, text):
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
     for match in strong.finditer(text):
         start = max(text.rfind(c, 0, match.start()) for c in ".!?\n") + 1
-        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on Adam, if you agree" fires
+        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on the owner, if you agree" fires
         if SWEEP_HEDGE_RE.search(clause) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
             continue
         return True
@@ -6505,7 +6505,7 @@ SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
 
 def sweep_says_waiting(regex, text):
     """True when the text, outside code blocks, inline code and quoted lines, says an item waits on the person and does
-    not negate it ("not waiting on Adam", "no longer needs Adam"). Quoted text is somebody else's sentence."""
+    not negate it ("not waiting on the owner", "no longer needs the owner"). Quoted text is somebody else's sentence."""
     if not isinstance(text, str):
         return False
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6974,7 +6974,7 @@ class SweepFacts:
 
 
 # ---- #130: the triage function (rule family T), grown from the sweep: the same hub reads, call budget, fresh re-check
-# before a finding, shadow default and batched fact to the Chief of Staff. ADAM'S HOLD (binding): it WRITES NOTHING to
+# before a finding, shadow default and batched fact to the Chief of Staff. THE OWNER'S HOLD (binding): it WRITES NOTHING to
 # GitHub, ever: no label, assignment, comment, close or edit. Its only writes are audit lines, triage.json (a display
 # file) and the batched fact to the Chief of Staff. The fix rules of the plan stay unbuilt until he lifts the hold.
 
@@ -7612,7 +7612,7 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
                  "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
                  "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
                  "If nothing, do nothing and say nothing.")
-FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
+FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 
@@ -8197,7 +8197,7 @@ PLAIN_REF_RE = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
 
 def reference_numbers(pr, own):
     """PR 52: the issue numbers a PR that closes nothing points at, for the weak link: the plain `#N` in its title
-    and body, else the numbers in its head branch name (`drift2137`). Empty when the PR names a closing issue; the
+    and body, else the numbers in its head branch name (`drift4242`). Empty when the PR names a closing issue; the
     PR's own number is never a candidate. The caller accepts only exactly one."""
     if not isinstance(pr, dict) or closing_numbers(pr.get("body")) or pr.get("linked_issues"):
         return []
@@ -15845,27 +15845,73 @@ def _charter_body(reader, repo, charter):
     return body
 
 
-def edit_charter_orders(engine, repo, charter, event, detail, change):
-    """Edit the charter's orders: read the body, `change(body)` it, write it, read it back; once more
-    when the readback does not show the change (somebody edited in between); fail loudly when it still
-    does not. Audited before and after. Returns the orders after the change."""
+ORDERS_READBACK_WAITS = (0.0, 0.5, 1.5)  # seconds to wait before each look at the issue after a write (a read can lag the write it follows)
+
+
+def _sleep(seconds):
+    if seconds:
+        time.sleep(seconds)
+
+
+def edit_charter_orders(engine, repo, charter, event, detail, change, done):
+    """Edit the charter's orders safely. `change(body)` is the edit; `done(body)` says whether that edit is already in `body`
+    (an add: the exact bullet is there; a remove: that bullet's text has one occurrence fewer than before). Read the body; when
+    `done` already holds there is nothing to write. Otherwise read it AGAIN just before the write and refuse (nothing written)
+    if it moved since; write; then look at the issue (a few times: a read can lag a write). A write whose outcome is unknown is
+    never repeated blind: only after a fresh read still lacks the change is it made once more, from that fresh body.
+    Audited before and after. Returns the orders after the change."""
     reader = engine.intents
     body = _charter_body(reader, repo, charter)
+    if done(body):
+        reader.invalidate(charter, repo)
+        return parse_orders(body)  # already so (a retry, or the same order given twice): nothing to write
     new_body = change(body)  # an OrdersError here is a refusal: nothing is written, nothing audited as a write
     with engine._external(event, "charter:%s#%d" % (repo, charter), dict(detail, charter=charter, repo=repo)) as result:
         for attempt in (1, 2):
-            if attempt == 2:
+            if attempt == 1:
+                fresh = _charter_body(reader, repo, charter)
+                if fresh != body:
+                    raise OrdersError("#%d changed while this edit was being prepared; nothing was written. Run it again" % charter)
+            else:
                 body = _charter_body(reader, repo, charter)
+                if done(body):
+                    result["attempts"] = 1
+                    reader.invalidate(charter, repo)
+                    return parse_orders(body)  # the first write had landed after all: do not write again
                 new_body = change(body)
-            write_issue_body(reader, repo, charter, new_body)
-            back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
-            got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
-            if got == new_body or section_orders(got) == section_orders(new_body):
-                result["attempts"] = attempt
-                reader.invalidate(charter, repo)
-                return parse_orders(got)
-        raise OrdersError("wrote #%d twice and read back the issue without the change: the Standing orders "
-                          "section there is not what was written. Look at the issue; nothing was recorded" % charter)
+            try:
+                write_issue_body(reader, repo, charter, new_body)
+            except IntentError as err:
+                if err.reason != "unavailable":
+                    raise  # gh answered with a refusal: the write did not happen
+                raise OrdersError("the write to #%d ended without an answer (%s): it MAY HAVE LANDED. Run `%s orders list "
+                                  "--charter %d` first and only repeat the command if the change is not there" % (
+                                      charter, _one_line(str(err), 120), PROG, charter)) from None
+            for wait in ORDERS_READBACK_WAITS:
+                _sleep(wait)
+                back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+                got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
+                if got == new_body or done(got):
+                    result["attempts"] = attempt
+                    reader.invalidate(charter, repo)
+                    return parse_orders(got)
+        raise OrdersError("wrote #%d and read the issue back without the change, twice: the Standing orders section there is "
+                          "not what was written, and whether a write landed is unknown. Run `%s orders list --charter %d` before "
+                          "running it again; nothing more was written" % (charter, PROG, charter))
+
+
+def order_bullet(text, by, date):
+    """The text of the bullet `add_order_to_body` writes (what `section_orders` returns for it)."""
+    return "%s (ordered by %s, %s)" % ((text or "").strip(), " ".join(str(by or "").split())[:60], date)
+
+
+def remove_order_text(body, text):
+    """`body` without the first order of the section whose text is `text` (the body unchanged when there is none)."""
+    found = _orders_section(body or "")
+    for number, (_, _, bullet) in enumerate(found["bullets"] if found else [], 1):
+        if bullet == text:
+            return remove_order_from_body(body, number)
+    return body
 
 
 def orders_caller(engine, args):
@@ -15945,15 +15991,22 @@ def orders_write(engine, args, caller, role, repo, charter):
             by = args.by or os_user()
             date = datetime.fromtimestamp(engine.now(), timezone.utc).strftime("%Y-%m-%d")
             detail = {"caller": caller, "by": by, "text": (args.text or "").strip()}
+            bullet = order_bullet(args.text, by, date)
             orders = edit_charter_orders(engine, repo, charter, "orders.add", detail,
-                                         lambda body: add_order_to_body(body, args.text, by, date))
+                                         lambda body: add_order_to_body(body, args.text, by, date),
+                                         lambda body: bullet in section_orders(body))  # the same order, by and day twice is one order
         else:
-            current = parse_orders(_charter_body(engine.intents, repo, charter))
+            now_body = _charter_body(engine.intents, repo, charter)
+            current = parse_orders(now_body)
             if not 1 <= args.number <= len(current):
                 raise OrdersError("no order %d: this charter has %d" % (args.number, len(current)))
-            detail = {"caller": caller, "number": args.number, "text": current[args.number - 1]}
+            remove_order_from_body(now_body, args.number)  # refuses the legacy `Standing authority:` line
+            target = current[args.number - 1]
+            detail = {"caller": caller, "number": args.number, "text": target}
+            before = section_orders(now_body).count(target)
             orders = edit_charter_orders(engine, repo, charter, "orders.remove", detail,
-                                         lambda body: remove_order_from_body(body, args.number))
+                                         lambda body: remove_order_text(body, target),  # by its text: a number can move under a retry
+                                         lambda body: section_orders(body).count(target) < before)
     except (OrdersError, IntentError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE if isinstance(err, OrdersError) else EXIT_ERROR

@@ -1,6 +1,6 @@
 {
  "allowed": [
-  "fleet-switchboard send venue-ops --issue acme/api#2 'the answer is in'",
+  "fleet-switchboard send store-ops --issue acme/api#2 'the answer is in'",
   "fleet-switchboard send coder-a hello there",
   "fleet-switchboard report working 'still on it'",
   "fleet-switchboard remind coder-a 15m 'look at it'",
@@ -631,7 +631,7 @@
   "az extension add -n x",
   "az vm list > out.txt",
   "gh repo view acme/api",
-  "timeout 60 fleet-switchboard send venue-ops --issue 5 'x'",
+  "timeout 60 fleet-switchboard send store-ops --issue 5 'x'",
   "gh release list --repo acme/api",
   "timeout 40 gh api repos/acme/api/issues/3/comments",
   "timeout 60 az vm list",

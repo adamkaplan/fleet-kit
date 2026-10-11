@@ -9,7 +9,7 @@ finding was right: the item really breaks the rule) or "FP" (it did not) and a s
   triage-sample [--audit FILE] --out FILE [--days 7] [--rule T1 --rule T3 ...]     write the sheet
   triage-sample --summary FILE                                                      precision per rule from a filled sheet
 
-Each (rule, ref) appears once, at its first finding in the window. The triage writes nothing to GitHub (Adam's hold), so
+Each (rule, ref) appears once, at its first finding in the window. The triage writes nothing to GitHub (the owner's hold), so
 the sheet is how its precision is measured before anything else is switched on.
 """
 import argparse
