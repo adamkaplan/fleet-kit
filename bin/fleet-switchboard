@@ -5302,7 +5302,7 @@ def pr_signed_at(comments, head, review_only=False):
         mark = FLEET_MARK.search(body)
         if mark is None or mark.group(1).lower() in PLACEHOLDER_SIGNERS:
             continue
-        if review_only and not TRIAGE_REVIEW_RE.search(body):
+        if review_only and not triage_says_reviewed(body):
             continue
         if any(head.lower().startswith(t) for t in re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])", body.lower())):
             found.add(mark.group(1))
@@ -7155,6 +7155,9 @@ TRIAGE_LIST_PAGES = 2
 TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
 TRIAGE_UNREADABLE_RETRY = 3600
 TRIAGE_FILE = "triage.json"
+TRIAGE_OWNER_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*|__)?(?:owner|owned by)(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*([A-Za-z0-9@_`\"'\[(][^\n]*)$", re.I | re.M)
+TRIAGE_OWNER_PLACEHOLDER_RE = re.compile(r"^[\W_]*(?:tbd|tbc|none|n/?a|na|nobody|no one|unknown|unassigned|unowned|todo|\?+)[\W_]*$", re.I)
+TRIAGE_NOT_APPROVING_RE = re.compile(r"\b(?:not\s+(?:yet\s+)?(?:approved|lgtm)|changes\s+requested|needs?\s+changes|request(?:s|ed)?\s+changes)\b", re.I)
 PARKED_UNTIL_RE = re.compile(r"^[ \t]*Parked until:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*\r?$", re.M)  # ASCII digits only; a CRLF body is read
 PARKED_MAX_DAYS = 366   # a park reaches at most this far ahead of the moment it is judged: `9999-12-31` does not park forever
 
@@ -7173,11 +7176,22 @@ def parked_until(body, labels):
     except ValueError:
         return None
     return day.timestamp() + 86400.0
-
-
-TRIAGE_OWNER_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*|__)?(?:owner|owned by)(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*[A-Za-z0-9@_`\"'\[(][^\n]*$", re.I | re.M)
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
+
+
+def triage_says_reviewed(text):
+    """A comment that reads as an approving review: it says review/approved/lgtm and does not say `not approved`, `changes
+    requested` or `needs changes`. (A review that asks for changes is not a reason to call the PR reviewed.)"""
+    return bool(isinstance(text, str) and TRIAGE_REVIEW_RE.search(text) and not TRIAGE_NOT_APPROVING_RE.search(text))
+
+
+def triage_names_owner(body):
+    """True when a line of the body (outside code and quotes) says `Owner: <name>` or `owned by <name>` with a real name: a
+    placeholder (TBD, none, n/a, unknown, ?) is not an owner."""
+    if not isinstance(body, str):
+        return False
+    return any(not TRIAGE_OWNER_PLACEHOLDER_RE.match(m.group(1)) for m in TRIAGE_OWNER_RE.finditer(SWEEP_QUOTED_RE.sub(" ", body)))
 
 
 def validate_triage_config(config, source):
@@ -7304,7 +7318,7 @@ def triage_norm(issue):
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
-            "owner_body": bool(isinstance(body, str) and TRIAGE_OWNER_RE.search(SWEEP_QUOTED_RE.sub(" ", body))),
+            "owner_body": triage_names_owner(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
                                    "body": body})}
@@ -7317,7 +7331,7 @@ def triage_comment_facts(records):
         at = parse_iso(c.get("created_at")) if isinstance(c, dict) else None
         text = SWEEP_QUOTED_RE.sub(" ", c.get("body") or "") if at is not None and isinstance(c.get("body"), str) else ""
         if at is not None:
-            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": bool(TRIAGE_REVIEW_RE.search(text))})
+            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
 
 
