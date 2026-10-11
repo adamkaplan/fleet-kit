@@ -1156,8 +1156,16 @@ the report is folded into the issue's decision, which keeps the issue's id and g
 agents) and `reported_lines` (the last 3 folded reports' own lines, `agent: text`, each clipped to 160 characters, so what the workers said stays reachable). A report
 whose line named no repo at all has only a guessed repo (its sender's): it folds into the one listed issue
 decision that has its number, in whatever repo (two such decisions, or none, leave it a report of its own); a report
-that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter. The folded report's
-external link leaves the desired set and is withdrawn once by the existing path. A report with no issue number is folded in only when its text names exactly one open decision's issue
+that names a repo, watched or not, never folds into a different repo's issue. The issue's tier does not matter for a direct match. The folded report's
+external link leaves the desired set and is withdrawn once by the existing path.
+
+**Reaching the decision from a different end (#126).** A report also folds into a decision that is the PERSON's (an escalated issue)
+when: it is about a work item whose ask is that decision, or about the ask of a work item that is (the parent link from the hub's
+picture or the intent reader's cache; the daemon makes at most 3 parent reads a pass, each cached, a command reads none); it has no
+issue number and its text names exactly one such decision; or its own issue is no decision (a status ask) but its text names exactly
+one. An issue is named as `repo#N`, `owner/repo#N`, an issue URL or a bare `#N` (the report's own repo); repos are compared without
+case. Two candidates are ambiguous and fold nowhere. A report on an issue that is only cos-tier, or naming nothing listed, stays its
+own entry. Nothing is stored: the escalation arriving after the report folds it on the next pass, and a restart derives the same list. A report with no issue number is folded in only when its text names exactly one open decision's issue
 (a short ref `repo#N` or an issue URL) in its own repo; naming none, two or another repo's issue leaves it a
 decision of its own. Ids are assigned before folding and never change.
 

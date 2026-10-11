@@ -4590,7 +4590,8 @@ def decisions_from_github(engine, now):
                       "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
-                      "rows": record.get("rows") or [], "raised_by": record.get("raised_by")})
+                      "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
+                      "parent": record.get("parent")})
     return items, problems
 
 
@@ -4931,6 +4932,38 @@ def cached_issue_title(engine, repo, number, listed):
     hit = reader._cache.get(("issue", repo, number)) if reader is not None and repo else None
     found = hit[1] if hit else None
     return (getattr(found, "title", None) or None)
+
+
+def cached_issue_parent(engine, repo, number):
+    """The parent (ask) of issue `repo#number` from the intent reader's cache, never a new `gh` read; None when unknown."""
+    reader = getattr(engine, "intents", None)
+    hit = reader._cache.get(("parent", repo, number)) if reader is not None and repo else None
+    value = hit[1] if hit else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+FOLD_PARENT_READS = 3   # at most this many parent reads in one daemon pass, each cached by the intent reader
+
+
+def chain_parent_lookup(engine):
+    """`known_parent(repo, number)` for the report fold: the cached parent; in the DAEMON (which holds the hub) up to
+    FOLD_PARENT_READS fresh reads per pass for a report whose issue has no cached parent, so the ask chain can be followed
+    (a report on a work item folds into its escalated ask). A command derivation (`decisions --fresh`) reads nothing."""
+    left = [FOLD_PARENT_READS if getattr(engine, "hub", None) is not None else 0]
+
+    def lookup(repo, number):
+        found = cached_issue_parent(engine, repo, number)
+        reader = getattr(engine, "intents", None)
+        if found is not None or reader is None or left[0] <= 0 or not repo:
+            return found
+        if ("parent", repo, number) in reader._cache:
+            return None   # asked recently: it has none
+        left[0] -= 1
+        try:
+            return reader.parent(number, repo)
+        except IntentError:
+            return None
+    return lookup
 
 
 def named_issues(text, repo, wanted):
@@ -5709,7 +5742,7 @@ def derive_decisions(engine, now):
     home = engine.config.get("intent_repo") or (watched[0] if len(watched) == 1 else None)  # a bare issue's repo
     decisions = decision_core.build_entries(
         items, ids, home, lambda repo, number: cached_issue_title(engine, repo, number, {}),
-        tier_flat=fault("tier-flat"))
+        tier_flat=fault("tier-flat"), known_parent=chain_parent_lookup(engine))
     for source in (x for x in sources if x.entries):  # PR notices: information rather than decisions (never folded, never counted)
         found, problems = read_source(engine, source, now, errors)
         decisions.extend(found)
