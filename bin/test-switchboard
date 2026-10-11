@@ -14237,7 +14237,7 @@ class TestSweep(Base):
                          12: sweep_issue(12, "fine", pr=True), 13: sweep_issue(13, "x", pr=True)}
         self.hub.comments = [sweep_comment(12, "waiting on adam", self.at(1)), sweep_comment(13, "chat", self.at(1))]
         self.sweep()
-        self.assertEqual(self.found(), [("S2", "acme/api#10"), ("S2", "acme/api#12")])
+        self.assertEqual(self.found(), [("S2", "acme/api#10"), ("S2", "acme/api#12"), ("S6a", "acme/api#11")])  # 11: the line, no label
 
     def test_phrases_are_whole_and_case_insensitive_and_cover_the_common_wordings(self):
         regex = sb.sweep_phrase_re(["Adam", "@the-owner"])
@@ -15530,6 +15530,122 @@ class TestIdentityCheck(ReportBase):
         os.environ[sb.SESSION_ENV] = "ses_unknownunknownunknown00"
         shown = "\n".join(sb.identity_lines(sb.fleet_overview(engine, None)))
         self.assertIn("this shell: WARNING cannot tell who you are", shown)
+
+
+# ======================================================================
+# #133: held-for-the-owner state as labels. Neutral names only: acme-org/widget-service, the owner.
+# ======================================================================
+class TestCaptainLabels(Base):
+    U = "tester"   # the `<user>:` prefix of the labels
+
+    def labels(self, *kinds):
+        return ["%s:%s" % (self.U, k) for k in kinds]
+
+    def window(self, until):
+        return mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", until)
+
+    def test_the_label_makes_a_pr_captain_with_no_first_line_at_all(self):
+        self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "Adds the widget."}))
+        self.assertTrue(sb.is_captain({"labels": [{"name": self.labels("merge-captain")[0]}], "body": None}))   # label dicts too
+        self.assertFalse(sb.is_captain({"labels": self.labels("hold-security"), "body": "x"}))          # a hold alone is not a merge class
+        self.assertFalse(sb.is_captain({"labels": ["bug", "merge-captain-ish", "x:merge-captain-not"], "body": "x"}))
+        self.assertFalse(sb.is_captain(None))
+
+    def test_the_first_line_marker_counts_only_inside_the_dated_window_and_only_without_a_merge_label(self):
+        pr = {"labels": [], "body": "\n\nMERGE: captain\nrest"}
+        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() + 86400
+        self.assertTrue(sb.is_captain(pr, now=end - 60))                      # the last minute of the window
+        self.assertFalse(sb.is_captain(pr, now=end + 60))                     # the day after: the line is no longer read
+        with self.window(None):                                               # the one-line way to drop the marker
+            self.assertFalse(sb.is_captain(pr))
+            self.assertTrue(sb.is_captain(dict(pr, labels=self.labels("merge-captain"))))
+        for body in ("see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
+            self.assertFalse(sb.is_captain({"labels": [], "body": body}, now=end - 60), body)
+
+    def test_the_label_wins_when_it_disagrees_with_the_line(self):
+        auto = {"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}
+        self.assertFalse(sb.is_captain(auto))                                  # the label says automatic: not held
+        held = {"labels": self.labels("merge-captain"), "body": "MERGE: automatic\nx"}
+        self.assertTrue(sb.is_captain(held))
+        self.assertEqual(sb.pr_marker_state(auto["labels"], auto["body"])["findings"], ["disagree"])
+        self.assertEqual(sb.pr_marker_state(held["labels"], held["body"])["findings"], ["disagree"])
+        both = sb.pr_marker_state(self.labels("merge-captain", "merge-automatic"), "x")
+        self.assertEqual((both["captain"], both["findings"]), (True, ["disagree"]))   # two merge labels: held, and said so
+        agree = sb.pr_marker_state(self.labels("merge-captain"), "MERGE: captain\nx")
+        self.assertEqual((agree["captain"], agree["findings"]), (True, []))
+        line_only = sb.pr_marker_state([], "MERGE: captain\nx")
+        self.assertEqual((line_only["captain"], line_only["findings"]), (True, ["marker-without-label"]))
+
+    def test_hold_reasons_come_from_the_hold_labels_only_and_sorted(self):
+        self.assertEqual(sb.pr_hold_reasons(self.labels("hold-security", "merge-captain", "hold-contract", "hold-other-area")),
+                         ["contract", "other-area", "security"])
+        self.assertEqual(sb.pr_hold_reasons(["bug", None, 5]), [])
+
+    def test_the_pr_facts_use_the_labels_and_carry_the_holds(self):
+        data = dict(json.loads(pr_view_json()), body="plain", headRefOid="a" * 40, author={"login": "coder-bot"},
+                    labels=[{"name": n} for n in self.labels("merge-captain", "hold-credential")])
+        facts = sb.pr_facts_from(data)
+        self.assertEqual((facts["captain"], facts["holds"], facts["captain_findings"]), (True, ["credential"], []))
+        self.assertIn("labels", sb.PR_VIEW_FIELDS)
+        old = sb.pr_facts_from(dict(data, labels=[], body="MERGE: captain\nx"))
+        self.assertEqual((old["captain"], old["captain_findings"]), (True, ["marker-without-label"]))     # still works in the window
+        self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
+
+    def test_every_caller_reads_the_one_helper(self):
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        callers = [l for l in text.splitlines() if "pr_is_captain(" in l and not l.lstrip().startswith(("def ", "return pr_marker"))]
+        self.assertEqual(callers, [], "a caller still reads the first line alone: %r" % callers)
+
+
+class TestCaptainSweepFindings(TestSweep):
+    """The sweep's captain handling: S2 reads the helper; S6a and S6b finish the relabelling; nothing is written."""
+
+    def test_s2_does_not_fire_for_a_pr_held_by_its_label_and_s6_says_nothing_when_they_agree(self):
+        self.hub.open = {30: sweep_issue(30, "Held for the owner", [self.USER.replace("awaiting-user", "merge-captain")], pr=True),
+                         31: sweep_issue(31, "MERGE: captain\nHeld for the owner",
+                                         [self.USER.replace("awaiting-user", "merge-captain")], pr=True)}
+        self.sweep()
+        self.assertEqual(self.found(), [])
+
+    def test_s6a_a_marker_without_the_label_and_s6b_a_disagreement(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        automatic = self.USER.replace("awaiting-user", "merge-automatic")
+        self.hub.open = {40: sweep_issue(40, "MERGE: captain\nx", pr=True),                       # line, no label
+                         41: sweep_issue(41, "MERGE: captain\nx", [automatic], pr=True),           # the label disagrees
+                         42: sweep_issue(42, "MERGE: automatic\nx", [captain], pr=True),           # and the other way
+                         43: sweep_issue(43, "MERGE: captain\nx", [captain], pr=True),             # they agree
+                         44: sweep_issue(44, "x", pr=True)}                                         # neither
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_a_finding_is_dropped_when_a_fresh_read_shows_the_label_was_added(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True)}
+        self.hub.live = {50: sweep_issue(50, "MERGE: captain\nx", [captain], pr=True)}
+        self.sweep()
+        self.assertEqual(self.found(), [])
+
+    def test_the_sweep_writes_nothing_to_github(self):
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        start, end = text.index("def sweep_read_repo"), text.index("class SweepFacts")
+        for forbidden in ("--method", "-X ", "issue edit", "issue comment", "add-label", "POST", "PATCH", "DELETE"):
+            self.assertNotIn(forbidden, text[start:end], forbidden)
+
+
+class TestCaptainTriage(TestTriage):
+    def test_t6_shows_the_hold_reasons_and_a_label_held_pr_is_not_t7(self):
+        self.charter()
+        old = sb.iso(self.now - 3 * 86400)
+        decisions = [{"id": "pr:acme/api#60", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 60,
+                      "since": old, "holds": ["security"]}]
+        self.add(60, created=0.4, pr=True, labels=["tester:merge-captain"])
+        self.describe_pr(60)
+        self.go(decisions)
+        self.assertEqual(self.only("T6"), ["acme/api#60"])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T6"][0]
+        self.assertEqual(row["detail"]["evidence"]["holds"], ["security"])
+        self.assertEqual(self.only("T7"), [])                                    # held by its label: T6's, not T7's
 
 
 class TestRiders(ReportBase):
@@ -24938,18 +25054,21 @@ class TestSupersede(WriteWorld):
 
 
 class TestLabelsEnsure(WriteWorld):
-    WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()])
+    NEW = ("merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
+           "hold-prod-config", "hold-other-area")
+    WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()]
+                  + ["%s:%s" % (sb.orchestrator_label().split(":")[0], k) for k in NEW])
 
-    def test_it_creates_the_three_labels_in_every_watched_repo_and_is_idempotent(self):
+    def test_it_creates_every_label_in_every_watched_repo_and_is_idempotent(self):
         code, out, err = self.main("labels", "ensure")
         self.assertEqual(code, 0, err)
         for repo in (API, WEB):
             self.assertEqual(sorted(self.gh.labels[repo]), self.WANT)
-        self.assertEqual(out.count("created"), 6)
+        self.assertEqual(out.count("created"), 2 * len(self.WANT))
         creates = len([c for c in self.gh.calls if "POST" in c])
         code, out, err = self.main("labels", "ensure")
         self.assertEqual(code, 0, err)
-        self.assertEqual(out.count("already there"), 6)
+        self.assertEqual(out.count("already there"), 2 * len(self.WANT))
         self.assertEqual(len([c for c in self.gh.calls if "POST" in c]), creates, "nothing is written twice")
 
     def test_one_repo_only_with_the_flag(self):
@@ -24961,7 +25080,7 @@ class TestLabelsEnsure(WriteWorld):
         self.main("labels", "ensure", "--repo", API)
         del self.gh.labels[API]["me:awaiting-cos"]
         code, out, err = self.main("labels", "ensure", "--repo", API)
-        self.assertEqual((out.count("created"), out.count("already there")), (1, 2))
+        self.assertEqual((out.count("created"), out.count("already there")), (1, len(self.WANT) - 1))
 
     def test_a_bad_repo_flag_and_no_repo_at_all_are_refused(self):
         self.assertEqual(self.main("labels", "ensure", "--repo", "x")[0], 2)
@@ -25917,6 +26036,33 @@ class TestCaptainPrs(DecisionsBase):
             sb.resolve_decision(self.world.engine, None, entry, "", None)
         with self.assertRaises(sb.DecisionError):
             sb.answer_decision(self.world.engine, entry, "yes", "", None)
+
+
+class TestCaptainDecisionFromLabels(TestCaptainPrs):
+    """A PR held by its LABEL (no first line) is a captain decision, with its hold reasons shown."""
+
+    def labelled(self, *kinds, body="Adds the widget.", **more):
+        return captain_pr(body=body, labels=[{"name": "tester:%s" % k} for k in kinds],
+                          reviews=[("rev-wake", "APPROVED", HEAD_A)], **more)
+
+    def test_a_label_only_pr_is_a_captain_decision_with_its_hold_reasons(self):
+        self.answer(self.labelled("merge-captain", "hold-security", "hold-contract"))
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["tier"]), ("captain", "cos"))
+        self.assertEqual(entry["holds"], ["contract", "security"])
+
+    def test_a_marker_only_pr_still_works_in_the_window_and_not_after(self):
+        self.answer(self.labelled(body="MERGE: captain\nland it"))
+        self.assertEqual(self.only()["kind"], "captain")
+        self.assertNotIn("holds", self.only())
+        with mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", None):
+            self.answer(self.labelled(body="MERGE: captain\nland it", head=HEAD_A))
+            self.world.tick(sb.PR_FACTS_TTL + 1)
+            self.assertEqual(self.only()["kind"], "notice")
+
+    def test_a_merge_automatic_label_beats_the_line(self):
+        self.answer(self.labelled("merge-automatic", body="MERGE: captain\nx"))
+        self.assertEqual(self.only()["kind"], "notice")
 
 
 class TestPrNotices(DecisionsBase):
