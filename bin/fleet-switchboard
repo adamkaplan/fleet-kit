@@ -4591,7 +4591,7 @@ def decisions_from_github(engine, now):
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
-                      "parent": record.get("parent")})
+                      "parent": record.get("parent"), "closed": bool(record.get("closed"))})
     return items, problems
 
 
@@ -6774,6 +6774,8 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     candidates = {}
     for d in decisions:
         ref = sweep_ref_of(d, home)
+        if d.get("closed"):
+            continue   # a closed issue that still carries the person's label: listed on purpose (marked closed), not stale
         if d.get("kind") in ("issue", "captain") and ref and ref[0]:  # a report's question may outlive its closed ask
             candidates.setdefault(ref, []).append(d)
     if hub is not None:
@@ -9452,7 +9454,9 @@ class GitHubHub:
         """One issue as a webhook payload or a read shows it: listed when it is open and carries a label,
         forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
         when (the issue's `updated_at`), and a read can only say when the issue last changed. PR 18: the tier
-        is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only."""
+        is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only. A CLOSED issue that
+        still carries your label stays listed, marked `closed` (a decision can outlive the issue: it was closed as won't-do and
+        the person's question is still unanswered); it leaves when the label is removed. A closed cos-tier issue is forgotten."""
         number = _number(issue)
         if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
             return
@@ -9460,7 +9464,8 @@ class GitHubHub:
         key = (repo, number)
         tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
-            if tier is not None and issue.get("state", "open") == "open":
+            closed = issue.get("state", "open") == "closed"
+            if tier is not None and (issue.get("state", "open") == "open" or (closed and tier == "human")):
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
                 since = known["since"] if known else (stamp if stamp is not None else when or self.now())
@@ -9469,7 +9474,7 @@ class GitHubHub:
                 raised = signed_by_fleet(issue["body"]) if "body" in issue and rows else (known or {}).get("raised_by")
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
                                       "parent": parent_of(issue), "tier": tier, "rows": rows,
-                                      "raised_by": raised if rows else None}
+                                      "raised_by": raised if rows else None, "closed": closed}
             else:
                 self.awaiting.pop(key, None)
 
@@ -9486,7 +9491,10 @@ class GitHubHub:
         wanted = (("awaiting-user", awaiting_label(self.config)), ("awaiting-cos", awaiting_cos_label(self.config)))
         found = {}
         for name, label in wanted:
-            path = "repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, quote(label, safe=""))
+            # your label is read with the closed issues too (a closed issue that still carries it still waits on you); the
+            # Chief of Staff's label only open ones
+            path = "repos/%s/issues?labels=%s&state=%s&per_page=100" % (repo, quote(label, safe=""),
+                                                                       "all" if name == "awaiting-user" else "open")
             try:
                 records, truncated = self.read_pages(path)
             except GitHubUnavailable as err:
@@ -9501,7 +9509,8 @@ class GitHubHub:
             self.awaiting = {key: value for key, value in self.awaiting.items() if key[0] != repo}
         for name, label in reversed(wanted):  # your label last: an issue with both is yours
             for record in found[name]:
-                self.note_awaiting_issue(repo, dict(record, state="open", labels=[{"name": label}]), now)
+                self.note_awaiting_issue(repo, dict(record, state="closed" if record.get("state") == "closed" else "open",
+                                                    labels=[{"name": label}]), now)
                 known = old.get((repo, _number(record)))
                 if known:
                     with self.lock:
@@ -9515,7 +9524,7 @@ class GitHubHub:
         with self.lock:
             records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
                         "parent": entry["parent"], "tier": entry["tier"], "rows": entry.get("rows", []),
-                        "raised_by": entry.get("raised_by")}
+                        "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed"))}
                        for (repo, number), entry in sorted(self.awaiting.items())]
             errors = []
             for repo in sorted(self.watches):
