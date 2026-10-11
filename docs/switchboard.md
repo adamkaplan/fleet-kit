@@ -4085,3 +4085,26 @@ It uses the same configuration as `gates-check`: only a repo listed under `plan_
 the intent repo) is checked; `enabled: false` and the global `plan-gates.off` file (logged as `gate.killed`) switch it off; the
 counters in `status` include it. A `--resume` is not checked. The design exempts a hotfix and the gate engine's own repair
 assignments from the launch gate; the check cannot tell them apart yet, so the enforcing slice needs a way to say so.
+
+## The owner's verdict and the built-in `ci` recorder (#107)
+
+**The `owner` verdict** (a scenario whose evaluator is `owner`, or the old personal spelling, which is an alias) is recorded only from
+the **owner's own terminal**: a caller with **no agent session at all** (no `OPENCODE_SESSION_ID`, no herdr pane; or a session v2 knows is not
+a fleet agent). `verdict <scenario> --pr <repo#N> --as owner --result ... --evidence ...` from there is accepted and recorded as
+`by: owner`. A caller **with an agent session, registered or not, the chief of staff included, is refused**, and so is an uncertain identity
+(a session the switchboard does not know: #138 refuses it, never reads it as a person); the refusal is audited. All agents share one GitHub
+login, so the login cannot be the test; it is the session identity, which is a guard against mistakes and not a boundary (an agent that
+unsets its own session and pane variables looks like a person). There is no `plan_evaluators.owner` registry: the list is not consulted.
+
+**The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
+check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
+verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
+failing, pending or missing run it records nothing; a second run at the same head and plan records nothing twice; a push or a plan change
+voids it like any verdict. Any caller may run it, because the verdict says only what GitHub's checks say, whoever asked. It does not know
+whether the checks actually exercise the scenario: that is the plan's author's and the reviewers' concern. `verdict --as ci` is still available to an
+agent registered under `plan_evaluators.ci`, but nobody can use the name `switchboard`.
+
+**The preflight checks the recorder is real.** `plan_evaluators.ci` may list `switchboard` (the built-in recorder) or agent names. `enforce` is
+**refused** (by `gates mode ... enforce`, and a hand-edited `enforce` runs as `shadow`) when `ci` is empty, **or when it lists only `switchboard` and the audit
+holds no successful `gate.ci_record` in the last 7 days**: run `gates ci-record` on a PR whose CI is green to prove it, and run it again from time to
+time (a daemon pass that does so is a later step). A failed record, or one older than a week, proves nothing. `gates preflight` says which.

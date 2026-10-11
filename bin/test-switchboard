@@ -16995,10 +16995,36 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual(code, 2)
         self.assertIn("an author cannot record a verdict", err)
 
+    def test_the_owner_records_an_owner_verdict_from_their_own_terminal_and_no_agent_can(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        args = ("verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "I read the screenshot")
+        code, out, err = self.run_as(None, *args)          # no agent session, no pane: the owner's terminal
+        self.assertEqual(code, 0, err)
+        entry = self.ledger()[-1]
+        self.assertEqual((entry["kind"], entry["evaluator"], entry["by"]), ("verdict", "owner", "owner"))
+        self.ledger_before = len(self.ledger())
+        for who in ("coder", "rev", "own"):                # an agent session, registered or not, is refused
+            with self.subTest(who=who):
+                code, out, err = self.run_as(who, *args)
+                self.assertEqual(code, 2)
+                self.assertIn("only the owner, from the owner's own terminal", err)
+        self.assertEqual(len(self.ledger()), self.ledger_before)
+        self.assertIn("plan.verdict.refused", [e["event"] for e in self.world.audit()])
+
+    def test_an_uncertain_identity_cannot_record_an_owner_verdict(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        os.environ["OPENCODE_SESSION_ID"] = "ses_nosuchsession"
+        try:
+            code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "x")
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+        self.assertEqual(code, 2)
+        self.assertIn("not known", err)
+
     def test_a_scenario_that_names_the_old_personal_evaluator_is_judged_by_the_owner(self):
         self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: adam")
         self.assertEqual(self.prove("coder", "S3")[0], 0)
-        code, out, err = self.verdict("own", "S3", "owner")
+        code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "read it")
         self.assertEqual(code, 0, err)
 
     # -- the chain
@@ -17694,6 +17720,129 @@ class TestLaunchGate(LedgerBase):
         self.assertIsNone(problem)
         self.assertIsNotNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "a" * 64))
         self.assertIsNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "b" * 64))
+
+
+class TestCiRecorder(LedgerBase):
+    """The built-in `ci` recorder: `gates ci-record <pr>`, and the preflight that refuses the reserved name until it has worked."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_default_gates()
+
+    def set_default_gates(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
+
+    def record(self, *more):
+        return self.run_as(None, "gates", "ci-record", self.PR, *more)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def verdicts(self):
+        return [(e["scenario"], e["by"], e["head"]) for e in self.ledger() if e["kind"] == "verdict"]
+
+    def test_green_ci_records_a_ci_verdict_for_each_scenario_that_names_ci_at_the_head_and_plan_hash(self):
+        code, out, err = self.record()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.verdicts(), [("S1", "switchboard", LEDGER_HEAD), ("U1", "switchboard", LEDGER_HEAD)])
+        entry = self.ledger()[0]
+        self.assertEqual((entry["evaluator"], entry["result"]), ("ci", "pass"))
+        self.assertRegex(entry["plan_hash"], r"^sha256:[0-9a-f]{64}$")
+        (event,) = self.events("gate.ci_record")
+        self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
+
+    def test_it_records_nothing_for_a_failing_pending_or_missing_run(self):
+        for rollup, word in (([{"conclusion": "FAILURE", "status": "COMPLETED"}], "failing"),
+                             ([{"status": "IN_PROGRESS", "conclusion": ""}], "pending"), ([], "none")):
+            with self.subTest(ci=word):
+                self.pr["statusCheckRollup"] = rollup
+                code, out, err = self.record()
+                self.assertEqual(code, 2)
+                self.assertIn("CI is %s" % word, err)
+        self.assertEqual(self.verdicts(), [])
+        self.assertTrue(all(e["detail"]["ok"] is False for e in self.events("gate.ci_record")))
+
+    def test_it_is_bound_to_the_exact_head_and_a_push_voids_it(self):
+        self.record()
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual(len(self.verdicts()), 2, "a second run records nothing twice")
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual([v[2] for v in self.verdicts()], [LEDGER_HEAD] * 2 + [LEDGER_NEW_HEAD] * 2)
+
+    def test_it_is_bound_to_the_plan_hash(self):
+        self.record()
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly 2 agents named")
+        self.assertEqual(self.record()[0], 0)
+        self.assertEqual(len({e["plan_hash"] for e in self.ledger()}), 2)
+
+    def test_a_plan_with_no_ci_scenario_or_a_failing_plan_records_nothing(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("proof: test", "proof: live").replace("evaluator: ci", "evaluator: tester")
+        code, out, err = self.record()
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to record", out)
+        self.assertEqual(self.verdicts(), [])
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        self.assertEqual(self.record()[0], 2)
+
+    def test_the_recorded_verdict_satisfies_g1_for_those_scenarios_and_no_agent_can_use_the_recorders_name(self):
+        self.assertEqual(self.record()[0], 0)
+        code, report, _ = self.gates_json()
+        g1 = next(r for r in report["gates"] if r["gate"] == "G1")
+        self.assertFalse(any("S1: ci verdict" in m or "U1: ci verdict" in m for m in g1["missing"]), g1["missing"])
+        self.assertTrue(any(m.startswith("S2:") for m in g1["missing"]), "the tester and reviewer scenarios still need theirs")
+        ok, why = sb.plan_ledger.may_record_verdict("ci", "switchboard", {"ci": ["switchboard"]}, set())
+        self.assertFalse(ok)
+        self.assertIn("built-in recorder's name", why)
+
+    def gates_json(self):
+        code, out, err = self.run_as("coder", "gates", self.PR, "--json")
+        return code, json.loads(out), err
+
+    # -- the preflight
+
+    def test_the_reserved_name_is_refused_until_the_recorder_has_recorded(self):
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("has not recorded recently", err)
+        self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
+        self.assertEqual(self.record()[0], 0)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 0, err)
+
+    def test_a_failed_record_does_not_prove_the_recorder(self):
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.record()
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 2)
+
+    def test_a_stale_record_does_not_prove_it(self):
+        self.record()
+        self.world.clock.t += sb.plan_ledger.CI_RECORD_FRESH_SECONDS + 3600
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 2)
+
+    def test_a_hand_edited_enforce_runs_as_shadow_until_the_recorder_is_proven(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["mode"], "shadow")
+        self.assertIn("has not recorded recently", json.loads(out)["downgraded"])
+        self.record()
+        code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready", "--json")
+        self.assertEqual((code, json.loads(out)["mode"]), (10, "enforce"))
+
+    def test_an_agent_registered_for_ci_still_passes_the_preflight_and_none_does_not(self):
+        self.configure(evaluators={"ci": ["cibot"]})
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 0)
+        self.configure(evaluators={})
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "shadow")[0], 0)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("no `ci` recorder is registered", err)
+
+    def test_preflight_says_owner_verdicts_come_only_from_the_owners_terminal(self):
+        self.assertIn("only from the owner's own terminal", self.run_as(None, "gates", "preflight", "acme/app")[1])
 
 
 class TestJudgeEval(Base):

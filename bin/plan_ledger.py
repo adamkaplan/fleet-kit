@@ -145,6 +145,8 @@ def may_record_verdict(evaluator, caller, allowed, authors):
     verdicts; an evaluator with no names is one nobody may record for yet (the default). The caller must not be a
     writer of the PR."""
     names = (allowed or {}).get(evaluator) or []
+    if caller == CI_RECORDER:
+        return False, "`%s` is the built-in recorder's name, not an agent: `ci` verdicts are recorded by `gates ci-record`" % CI_RECORDER
     if caller in authors:
         return False, ("%s wrote this PR (recorded its proof or sent its notice): an author cannot record a verdict "
                        "on its own work" % caller)
@@ -382,15 +384,26 @@ def repo_setting(config, repo):
     return None
 
 
-def preflight(config, repo):
-    """(blocking, notes) for switching `repo` to enforce. Blocking: a recorder for `ci` must be registered (a machine's verdict
-    needs a defined recorder). Notes are what the check cannot know: other evaluators are listed when unregistered, and the
-    permission change that lets cos use the escape hatch is a manual precondition."""
+CI_RECORDER = "switchboard"   # the reserved name of the built-in `ci` recorder (`gates ci-record`); not an agent
+CI_RECORD_FRESH_SECONDS = 7 * 86400
+
+
+def preflight(config, repo, ci_proven=None):
+    """(blocking, notes) for switching `repo` to enforce. Blocking: a `ci` recorder must be registered AND able to record. The
+    reserved name `switchboard` (the built-in recorder) is accepted only when `ci_proven()` says it has actually recorded
+    recently (a successful `gates ci-record` in the audit within CI_RECORD_FRESH_SECONDS); an agent name is accepted as
+    registered (it records through `verdict --as ci`). Notes are what the check cannot know: other evaluators are listed when
+    unregistered, and the permission change that lets cos use the escape hatch is a manual precondition."""
     evaluators = config.get("plan_evaluators") or {}
     blocking, notes = [], []
-    if not evaluators.get("ci"):
-        blocking.append("no agent is registered to record `ci` verdicts: list its names under plan_evaluators.ci")
-    for kind in ("reviewer", "tester", "owner"):
+    ci = evaluators.get("ci") or []
+    if not ci:
+        blocking.append("no `ci` recorder is registered: list `%s` (the built-in recorder) or an agent under plan_evaluators.ci" % CI_RECORDER)
+    elif CI_RECORDER in ci and not any(n != CI_RECORDER for n in ci) and not (ci_proven() if callable(ci_proven) else ci_proven):
+        blocking.append("the built-in `ci` recorder is listed but has not recorded recently: run `fleet-switchboard gates ci-record <repo#N>` "
+                        "on a PR whose CI is green (a successful record within 7 days proves it works)")
+    notes.append("`owner` verdicts are recorded only from the owner's own terminal (no agent session), never by an agent")
+    for kind in ("reviewer", "tester"):
         if not evaluators.get(kind):
             notes.append("no agent is registered for `%s`: a plan that names it cannot get a verdict (register it under "
                          "plan_evaluators.%s)" % (kind, kind))
@@ -399,13 +412,13 @@ def preflight(config, repo):
     return blocking, notes
 
 
-def effective_mode(config, setting):
+def effective_mode(config, setting, ci_proven=None):
     """(mode, why): the mode a check really runs in. `enforce` runs only when its preflight passes, wherever the mode is
     read (the config file can be edited by hand, so the switch command is not the only way in); otherwise it runs as
     `shadow` and `why` says what blocks it. A repo that is not enforcing has no `why`."""
     if setting["mode"] != "enforce":
         return setting["mode"], None
-    blocking, _ = preflight(config, setting.get("name") or "")
+    blocking, _ = preflight(config, setting.get("name") or "", ci_proven)
     if blocking:
         return "shadow", "enforce is not active: " + "; ".join(blocking)
     return "enforce", None
