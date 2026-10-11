@@ -31,16 +31,16 @@ engine writes consensus records (nothing does yet).
    is refused without it), and the agents that may record `reviewer`, `tester` and `owner` verdicts for the scenarios the repo's plans
    name. By default nobody is registered, so no verdict can be recorded: enabling enforcement without this deadlocks every merge.
    Who is registered is the owner's decision (a config edit; the chief of staff cannot do it).
-2. **A `ci` recorder exists in practice**, not only on paper: an agent that reads the PR's CI result at the head and records the `ci`
-   verdict (`verdict <scenario> --as ci`). Until one is running, plans that name `ci` scenarios cannot reach G1.
+2. **The `ci` recorder works in practice**, and the preflight checks it: list `"ci": ["switchboard"]` and run `gates ci-record <repo#N>` on a PR whose CI is green. The preflight refuses the reserved name until the audit holds a successful record from the last 7 days, so listing it on paper is not enough; plans that name `ci` scenarios reach G1 only through this recorder (or an agent registered for `ci`).
 3. **The way out for the chief of staff** (a separate, held PR; see section 5): `gates` (for `gates mode` and `gates off`) and `waive` in cos's
    allowed commands, in the permission generator and in the permission corpus. **Changes to cos's permissions are held for the owner**, so
    this plan only names them. Enforcement is not switched on before this PR is merged and live: cos is the one who can turn it off.
 4. **The shim is live** on the machine (the owner fast-forwards the main checkout), and `plan_gates` lists the repo (section 3, step 2:
    first in `shadow`, for the rehearsal of the way back) so the shim starts probing.
 5. **The switchboard binary the shim uses** is the main checkout's (the doctor's `switchboard-path` check).
-6. **Review becomes a recorded verdict.** Enforcing in fleet-kit changes how reviews are given: a review comment is not a `reviewer` verdict, so each independent review agent must be registered and must run `verdict <scenario> --as reviewer --result ... --evidence ...` for each scenario it judges. That is a cost on every PR; it is the point of the gate, and the decision in section 9 is made knowingly.
-7. **Plans exist for the work**: in `enforce` a PR with no `PLAN:` link fails G0a, so agents must already be writing plans. (There is no shadow week to measure how often that is not so; expect refusals at first, and the way out in section 4.)
+6. **An `owner` scenario needs the owner at a terminal.** A plan scenario that names `owner` (or the old personal spelling, an alias) is judged only by a verdict recorded from the owner's own terminal, so each such scenario holds its PR until the owner does it; plans should name `owner` sparingly.
+7. **Review becomes a recorded verdict.** Enforcing in fleet-kit changes how reviews are given: a review comment is not a `reviewer` verdict, so each independent review agent must be registered and must run `verdict <scenario> --as reviewer --result ... --evidence ...` for each scenario it judges. That is a cost on every PR; it is the point of the gate, and the decision in section 9 is made knowingly.
+8. **Plans exist for the work**: in `enforce` a PR with no `PLAN:` link fails G0a, so agents must already be writing plans. (There is no shadow week to measure how often that is not so; expect refusals at first, and the way out in section 4.)
 
 ## 3. Order of switching on
 
@@ -53,7 +53,7 @@ engine writes consensus records (nothing does yet).
    for the plans the repo actually has: an unregistered evaluator deadlocks that scenario at merge. Enforcement is refused while `ci` has no recorder.
 4. **Flip:** `gates mode <owner>/fleet-kit enforce`. It is refused unless the preflight passes, and a config edited by hand to `enforce` runs as `shadow` until it does
    (logged as `gate.enforce_downgraded`).
-5. **Watch**: `status` shows the day's checks, refusals and fail-opens per repo; the first fail-open of each kind per repo per day alarms cos. A gate that refuses
+5. **Watch (a first-day look replaces the shadow phase's measured timeout rate)**: cos reads `status` (checks, refusals and fail-opens per repo) at the end of the first day and again after the first week; a repo whose fail-opens come mostly from timeouts needs a larger `budget_ms`. `status` shows the day's checks, refusals and fail-opens per repo; the first fail-open of each kind per repo per day alarms cos. A gate that refuses
    something it should not is a rollback (section 4), then a fix.
 
 ## 4. Rollback
@@ -93,7 +93,7 @@ argument shapes pass through, a broken ledger refuses G1 only in enforce, a hand
 
 - **The `enforce_gates` list** (a repo in `enforce` must not refuse for G4 or G6 unless listed): its own small PR, built next.
 - **`waive`** (the logged cos waiver for G0 to G5, with its due date and overdue alarm).
-- **The built-in `ci` recorder** (the switchboard reading the head's check runs through `gh` and writing the `ci` verdict itself): section 9.
+- **A daemon pass that runs `gates ci-record`** on open PRs (today it is a command; someone or something must run it, and run it again within 7 days so the preflight stays satisfied). The recorder itself, the owner-terminal verdict and the preflight that refuses an unproven recorder are built (the owner/ci PR).
 - **The plan review engine** and its **consensus record** (G0b): nothing writes a `consensus` entry, so the launch check always records `would_refuse` and cannot
   enforce.
 - **Plan approval records** (G0c) and the **alignment review record** (G2/G3): untracked, so they cannot block.
@@ -121,8 +121,7 @@ with the configuration below, and rule that the engine's own repository may be e
 "plan_evaluators": {
   "ci":       ["switchboard"],
   "reviewer": ["<independent-review-agent-1>", "<independent-review-agent-2>"],
-  "tester":   ["<coder-agent-a>", "<coder-agent-b>", "<coder-agent-c>"],
-  "owner":    ["<the-owner's-registered-terminal-identity>"]
+  "tester":   ["<coder-agent-a>", "<coder-agent-b>", "<coder-agent-c>"]
 }
 ```
 
@@ -130,17 +129,17 @@ with the configuration below, and rule that the engine's own repository may be e
 
 | Evaluator | Who | Why |
 |---|---|---|
-| `ci` | **the switchboard itself**, reading the head's check runs through `gh` (a built-in recorder, written as the reserved name `switchboard`), not an agent | a machine's verdict should come from the machine; no agent can claim CI passed |
+| `ci` | **the switchboard itself**, reading the head's check runs through `gh`: `gates ci-record <repo#N>` records the verdict (reserved name `switchboard`) only at the exact head and plan hash and only for a complete, green run; not an agent | a machine's verdict should come from the machine; no agent can claim CI passed. The preflight refuses `["switchboard"]` until the audit holds a successful `ci-record` from the last 7 days |
 | `reviewer` | **the independent review agents** (the ones that review PRs today), never the PR's writers | independence is the point; the existing author exclusion applies |
 | `tester` | **coder sessions other than the PR's author** | a second pair of hands runs the live scenarios. Today the config takes agent names, so each standing coder name is listed; a role-based entry (`role:coder`) is a small build if names change often |
-| `owner` | **the owner only** (a person's terminal: no fleet identity) | the owner's verdicts are the owner's |
+| `owner` | **the owner only, from the owner's own terminal**: a caller with no agent session at all. An agent session, registered or not (the chief of staff included), is refused. There is no registry entry for it | the owner's verdicts are the owner's. All agents share one GitHub login, so the login is not the test; the session identity is (a guard against mistakes, not a boundary) |
 
 **The mandatory CI recorder, and a merge while GitHub Actions is down or blocked.** Enforcement is refused while `ci` has no recorder. If Actions is
 blocked or down, the `ci` scenarios cannot pass and `ci` has no verdict to record. **Decision (recommended): use the logged chief-of-staff waiver, with a local
 run as its evidence.** A tester who is not the PR's author runs the repository's full suite locally at the head and gives the result (the output's last lines and
 the head) to cos; cos waives G1 for that PR with `waive <repo#N> --gates G1 --reason "Actions unavailable: full suite run locally at <head> by <tester>: <result>"`. The waiver is logged, bound to that head
 (a push voids it), and carries the one-day retroactive-plan due date. A tester **verdict** cannot stand in for the `ci` verdict, because a `verdict --as ci` is accepted only from the `ci`
-recorder. The judgement that the local run is good enough is cos's, not the machine's, and is said so in the waiver. G6 and G8 are never waived.
+recorder. The judgement that the local run is good enough is cos's, not the machine's, and is said so in the waiver. G6 and G8 are never waived. When G4 is later added to `enforce_gates` (section 6) the same outage blocks G4, so the waiver must name `G1,G4`.
 
 **Rollback** (who runs what; each takes effect at the next command, no restart):
 
@@ -161,7 +160,7 @@ reach of the agent that must use it.
 fleet-switchboard: merge of acme/app#12 refused: missing G1: S2: proof (`prove S2`); tester verdict (`verdict S2 --as tester`). Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive acme/app#12 --gates G1 --reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode acme/app shadow`).
 ```
 
-(`ready` reads the same with `ready of ...`.) The agent's next step is to record the missing proof and verdict, or to report to its orchestrator and cos; it does not try to get around the gate.
+(`ready` reads the same with `ready of ...`.) `waive` is **not built yet** and the permission that lets cos run it is held for the owner: until both exist the waiver half of this line is a path that errors, which is one more reason the enforcement flip waits for them (section 3, step 1). The agent's next step is to record the missing proof and verdict, or to report to its orchestrator and cos; it does not try to get around the gate.
 
 **What the owner is asked to rule on:** the enforcement of fleet-kit with the configuration above; the evaluator registry (who, by name); the CI-down procedure (cos waiver with a non-author local run as evidence);
 and that the engine's own repository is enforced, with the global off file as the escape.
