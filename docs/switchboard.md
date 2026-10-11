@@ -4167,3 +4167,26 @@ allocates a pseudo-terminal and detaches the process that holds it (a double for
 nothing in the process can tell it from the owner's shell. (2) **A harness that is not on the list.** Ancestors are matched against `opencode`, `fleet-opencode`
 and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
 that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.
+
+## The ci recorder's daemon pass (#107)
+
+`gates ci-record` made the switchboard the `ci` recorder, but someone had to run it, so a push would leave every `proof: test` scenario without its
+verdict until a person did, and the preflight's 7-day proof would lapse. **The daemon now runs the same logic itself.** In every pass, after the decisions
+are derived, `ci_record_pass` looks at the open PRs of the repos listed in `plan_gates` (and not `enabled: false`) that carry a `PLAN: <link>` in their
+body (drafts are skipped), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
+verdict for the per-PR scenarios that name `ci`: bound to that exact head and to the plan's current hash, never for a failing, pending or missing run,
+never twice (an identical verdict already in the ledger is left alone), and audited as `gate.ci_record`. Because those records are real, the preflight's
+"recorded successfully in the last 7 days" comes for free while any such PR exists. (A record where the plan has no `ci` scenario is audited with `ok: false`
+and does **not** count as proof: nothing was recorded.)
+
+**Shadow-safe.** It only writes verdicts into the ledger and audit lines. It refuses nothing, and it writes **nothing to GitHub**: it makes GET reads only (the
+open-PR list through the hub, each PR through `gh pr view`, the plan through the issue and its comments). It never raises into the pass: an unreadable repo list is
+noted (`ci_record.unreadable`) and the old list kept; a PR that fails to read is noted (`ci_record.error`) and the next one still runs.
+
+**Budgeted like the triage.** `plan_gates.ci_record` takes `enabled` (default true), `calls_per_pass` (default 30, 4 to 100) and `pass_seconds` (default 10, 1 to
+60). Each repo's open-PR list is cached for **15 minutes** (so a push is noticed within a quarter of an hour; `gates ci-record <pr>` records at once), a PR is due again only 15 minutes after it was last **checked**
+(the skip keys on when it was checked, not on what the check found); one that is **unreadable** is retried after 5 minutes, doubling to at most 30 (`ci_record.error` carries
+`retry_in`); one whose **head moved since the list** is checked again at the next list refresh, not every pass; a head the refreshed list shows differently is due at once.
+Each PR is charged 4 calls up front. A simulated 5-second loop makes a handful of reads in 15 minutes, not one per pass. The pass is off while the global `plan-gates.off` file
+exists. This slice also fixes `gates preflight`, which did not consult the recorder's proof (so it said BLOCKED even after a successful record) and made `gates mode`
+keep the `ci_record` settings when it rewrites the config.

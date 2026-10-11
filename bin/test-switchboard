@@ -18189,6 +18189,250 @@ class TestOwnerTerminal(LedgerBase):
         self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
 
 
+class FakeHub:
+    """The daemon's GitHub reader, for the ci recorder's pass: `read_pages` answers a list of open PRs per repo and counts reads."""
+
+    def __init__(self, prs):
+        self.prs, self.reads, self.down = prs, [], False
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        self.reads.append(path)
+        if self.down:
+            raise sb.GitHubUnavailable("network unreachable")
+        repo = re.match(r"repos/([^/]+/[^/]+)/pulls", path).group(1)
+        return list(self.prs.get(repo, [])), False
+
+
+class TestCiRecordPass(LedgerBase):
+    """The daemon pass of the ci recorder: open PRs under a plan, in repos listed in `plan_gates`, get their `ci` verdict when the
+    checks at the CURRENT head are green. Records only; never refuses; GETs only."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
+        self.hub = FakeHub({"acme/app": [self.listed(9)]})
+        self.t = 100000.0
+
+    def listed(self, number, head=LEDGER_HEAD, body="PLAN: acme/app#7", draft=False):
+        return {"number": number, "head": {"sha": head}, "body": body, "draft": draft}
+
+    def engine(self):
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = self.hub, self.route
+        engine.config = sb.load_config()
+        engine.state_dir = self.world.state
+        return engine
+
+    def run_pass(self, engine=None, advance=0):
+        self.t += advance
+        engine = engine or self.engine_cached
+        sb.ci_record_pass(engine, self.t)
+        return engine
+
+    def go(self, advance=0):
+        if not hasattr(self, "engine_cached"):
+            self.engine_cached = self.engine()
+        return self.run_pass(self.engine_cached, advance)
+
+    def verdicts(self):
+        return [(e["pr"], e["scenario"], e["by"], e["head"]) for e in self.ledger() if e["kind"] == "verdict"]
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_green_ci_at_the_current_head_records_the_ci_verdicts_without_anyone_running_a_command(self):
+        self.go()
+        self.assertEqual(self.verdicts(), [("acme/app#9", "S1", "switchboard", LEDGER_HEAD), ("acme/app#9", "U1", "switchboard", LEDGER_HEAD)])
+        (event,) = self.events("gate.ci_record")
+        self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
+
+    def test_the_preflights_seven_day_proof_comes_for_free(self):
+        self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
+        self.go()
+        self.assertIn("nothing blocks it", self.run_as(None, "gates", "preflight", "acme/app")[1])
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "enforce")[0], 0)
+
+    def test_a_failing_pending_or_missing_run_records_nothing_and_does_not_fill_the_audit(self):
+        for rollup in ([{"conclusion": "FAILURE", "status": "COMPLETED"}], [{"status": "IN_PROGRESS", "conclusion": ""}], []):
+            with self.subTest(rollup=rollup):
+                self.pr["statusCheckRollup"] = rollup
+                self.go(advance=1000)
+        self.assertEqual((self.verdicts(), self.events("gate.ci_record")), ([], []))
+
+    def test_pr_without_a_plan_link_or_a_draft_is_not_read_at_all(self):
+        self.hub.prs["acme/app"] = [self.listed(9, body="no plan here"), self.listed(10, draft=True), {"number": "x"}, "junk"]
+        calls = []
+        base = self.route
+
+        def watch(argv, **kw):
+            calls.append(argv)
+            return base(argv, **kw)
+        self.route = watch
+        self.go()
+        self.assertEqual([c for c in calls if c[0] == FAKE_GH], [])
+        self.assertEqual(self.verdicts(), [])
+
+    def test_it_is_idempotent_within_the_cache_and_after_it(self):
+        self.go()
+        reads = len(self.hub.reads)
+        self.go(advance=60)
+        self.assertEqual((len(self.verdicts()), len(self.hub.reads)), (2, reads), "inside 15 minutes nothing is read again")
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertEqual(len(self.verdicts()), 2, "the same head and plan record nothing twice")
+
+    def view_calls(self):
+        calls = []
+        base = self.route
+
+        def watch(argv, **kw):
+            if argv[0] == FAKE_GH and argv[1] == "pr":
+                calls.append(argv[3])
+            return base(argv, **kw)
+        self.route = watch
+        return calls
+
+    def simulate(self, minutes=15, step=5):
+        for _ in range(int(minutes * 60 / step)):
+            self.go(advance=step)
+
+    def test_an_unreadable_pr_backs_off_and_is_not_re_read_every_pass(self):
+        calls = self.view_calls()
+        self.gh_down = True
+        self.simulate(minutes=16)      # a 5 s daemon loop for 16 minutes: 192 passes
+        self.assertLessEqual(len(calls), 4, calls)
+        self.assertGreaterEqual(len(calls), 2, "it is retried, with a delay that doubles (5, 10, 20, then 30 minutes)")
+        errors = [e["detail"]["retry_in"] for e in self.world.audit() if e["event"] == "ci_record.error"]
+        self.assertEqual(errors[:3], [300, 600, 1200])
+        self.gh_down = False
+        self.go(advance=3600)
+        self.assertEqual(len(self.verdicts()), 2, "and it recovers once it can be read")
+
+    def test_a_pr_whose_head_moved_since_the_list_is_re_checked_at_the_next_list_refresh_not_every_pass(self):
+        calls = self.view_calls()
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD            # the list still says LEDGER_HEAD
+        self.simulate(minutes=16)
+        self.assertLessEqual(len(calls), 3, calls)
+        self.assertEqual(len(self.hub.reads), 1 + 1, "the list is read at the start and once more after 15 minutes")
+        self.hub.prs["acme/app"] = [self.listed(9, head=LEDGER_NEW_HEAD)]
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertTrue(all(v[3] == LEDGER_NEW_HEAD for v in self.verdicts()))
+
+    def test_a_steady_pr_is_checked_about_once_per_cache_interval_and_stays_inside_the_budget(self):
+        calls = self.view_calls()
+        self.simulate(minutes=60)
+        self.assertLessEqual(len(calls), 5, "one check per 15 minutes for an hour")
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}, "ci_record": {"calls_per_pass": 5}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        del self.engine_cached
+        self.hub.prs["acme/app"] = [self.listed(n) for n in range(20, 30)]
+        calls.clear()
+        self.go()
+        self.assertLessEqual(len(calls), 1, "a budget of 5 calls: the list read and at most one PR")
+
+    def test_a_push_is_picked_up_after_the_list_cache_and_recorded_at_the_new_head(self):
+        self.go()
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.hub.prs["acme/app"] = [self.listed(9, head=LEDGER_NEW_HEAD)]
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertEqual({v[3] for v in self.verdicts()}, {LEDGER_HEAD, LEDGER_NEW_HEAD})
+
+    def test_a_plan_change_records_again_at_the_new_hash(self):
+        self.go()
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly 2 agents named")
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertEqual(len({e["plan_hash"] for e in self.ledger()}), 2)
+
+    def test_only_listed_enabled_repos_and_never_while_the_kill_file_exists_or_the_pass_is_off(self):
+        self.hub.prs["acme/other"] = [self.listed(3)]
+        self.go()
+        self.assertTrue(all("acme/other" not in r for r in self.hub.reads))
+        for edit in ("disabled", "ci_record_off", "kill_file"):
+            with self.subTest(edit=edit):
+                for path in (self.world.state / "plan-ledger.jsonl", self.world.state / "plan-ledger.head"):
+                    if path.exists():
+                        path.unlink()
+                self.hub.reads.clear()
+                if hasattr(self, "engine_cached"):
+                    del self.engine_cached
+                if edit == "disabled":
+                    self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow", "enabled": False}}}}
+                elif edit == "ci_record_off":
+                    self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}, "ci_record": {"enabled": False}}}
+                else:
+                    self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+                    (self.world.state / "plan-gates.off").write_text("")
+                self.configure(evaluators={"ci": ["switchboard"]})
+                self.go()
+                self.assertEqual((self.hub.reads, self.verdicts()), ([], []))
+
+    def test_the_call_budget_and_the_list_cache_bound_the_work(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}, "ci_record": {"calls_per_pass": 4}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        self.hub.prs["acme/app"] = [self.listed(9), self.listed(11)]
+        calls = []
+        base = self.route
+
+        def watch(argv, **kw):
+            if argv[0] == FAKE_GH and argv[1] == "pr":
+                calls.append(argv[3])
+            return base(argv, **kw)
+        self.route = watch
+        self.go()
+        self.assertEqual(len(calls), 0, "4 calls: the list read takes one and no PR then fits the per-PR cost of 4")
+        self.go(advance=1)
+        self.assertEqual(len(calls), 1, "a later pass has its whole budget for the PRs (the list is cached)")
+        self.assertEqual(len(self.hub.reads), 1, "the list is read once per 15 minutes")
+
+    def test_an_unreadable_list_is_noted_and_does_not_stop_the_pass_or_the_daemon(self):
+        self.hub.down = True
+        self.go()
+        self.assertEqual(self.verdicts(), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "ci_record.unreadable"])
+        self.hub.down = False
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertEqual(len(self.verdicts()), 2)
+
+    def test_a_pr_that_fails_to_read_is_noted_and_the_next_one_still_runs(self):
+        self.hub.prs["acme/app"] = [self.listed(9), self.listed(11)]
+        base = self.route
+
+        def flaky(argv, **kw):
+            if argv[0] == FAKE_GH and argv[1] == "pr" and argv[3] == "9":
+                raise RuntimeError("boom")
+            return base(argv, **kw)
+        self.route = flaky
+        self.go()
+        self.assertEqual({v[0] for v in self.verdicts()}, {"acme/app#11"})
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "ci_record.error"])
+
+    def test_a_plan_with_no_ci_scenario_does_not_prove_the_recorder(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("proof: test", "proof: live").replace("evaluator: ci", "evaluator: tester")
+        self.go()
+        self.assertEqual(self.verdicts(), [])
+        self.assertFalse(sb.ci_recorder_proven(self.world.state, self.t))
+        self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
+
+    def test_it_never_writes_to_github_and_the_pass_is_part_of_the_publish_step(self):
+        self.go()   # the route refuses any write: reaching here is the proof
+        self.assertIn("ci_record_pass(engine, now)", inspect.getsource(sb.publish_decisions))
+        self.assertNotIn("--method", inspect.getsource(sb.ci_record_pass))
+
+    def test_the_ci_record_config_is_checked_and_kept_when_a_mode_is_changed(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        good = sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {}}}))["plan_gates"]["ci_record"]
+        self.assertEqual(good, {"enabled": True, "calls_per_pass": 30, "pass_seconds": 10})
+        for bad in ({"enabled": "yes"}, {"calls_per_pass": 3}, {"calls_per_pass": 101}, {"pass_seconds": 0}, {"pass_seconds": 61},
+                    {"x": 1}, []):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {}}, "ci_record": bad}))
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}, "ci_record": {"calls_per_pass": 12}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "off")[0], 0)
+        self.assertEqual(json.loads(self.config_file.read_text())["plan_gates"]["ci_record"], {"calls_per_pass": 12})
+
+
 class TestJudgeEval(Base):
     """#106: the evaluation harness, on SYNTHETIC rows only (the real labelled rows are private)."""
 

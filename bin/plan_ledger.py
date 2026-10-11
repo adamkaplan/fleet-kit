@@ -401,7 +401,7 @@ def validate_plan_gates(raw, source):
         return None
     if not isinstance(raw, dict):
         raise ValueError("%s: 'plan_gates' must be an object, got %s" % (source, type(raw).__name__))
-    unknown = sorted(set(raw) - {"repos"})
+    unknown = sorted(set(raw) - {"repos", "ci_record"})
     if unknown:
         raise ValueError("%s: 'plan_gates' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
     repos, seen = {}, {}
@@ -432,7 +432,17 @@ def validate_plan_gates(raw, source):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
-    return {"repos": repos}
+    record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
+    if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
+        raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
+    enabled, calls, seconds = record.get("enabled", True), record.get("calls_per_pass", 30), record.get("pass_seconds", 10)
+    if not isinstance(enabled, bool):
+        raise ValueError("%s: 'plan_gates.ci_record.enabled' must be true or false" % source)
+    if not (isinstance(calls, int) and not isinstance(calls, bool) and 4 <= calls <= 100):
+        raise ValueError("%s: 'plan_gates.ci_record.calls_per_pass' must be a whole number from 4 to 100" % source)
+    if not (isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 1 <= seconds <= 60):
+        raise ValueError("%s: 'plan_gates.ci_record.pass_seconds' must be a number from 1 to 60" % source)
+    return {"repos": repos, "ci_record": {"enabled": enabled, "calls_per_pass": calls, "pass_seconds": seconds}}
 
 
 def repo_setting(config, repo):
