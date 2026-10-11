@@ -17567,6 +17567,135 @@ class TestPlanGatesCheck(LedgerBase):
         self.assertNotIn("gates-check", sb.ENSURE_ON_USE_COMMANDS)
 
 
+class TestLaunchGate(LedgerBase):
+    """Slice 3c (E4): `launch` checks the brief's PLAN: link for a consensus record at the plan's current hash. SHADOW ONLY."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "work"
+        self.work.mkdir()
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure()
+
+    def launch(self, brief="Do the thing.\nPLAN: acme/app#7\n", name="newcoder", *more):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        os.environ.pop("HERDR_PANE_ID", None)
+        argv = ["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "coder", "--reports-to", "own",
+                "--issue", "7", "--brief-file", "-", *more]
+        with captured() as (out, err), mock.patch.object(sys, "stdin", io.StringIO(brief)):
+            code = sb.main(argv, runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def plan_hash(self):
+        ns = types.SimpleNamespace(source="acme/app#7", file=None, ask=None, done_when=None)
+        with mock.patch.object(sb, "load_config", return_value=sb.load_config()):
+            return sb.load_plan(ns, self.route, self.world.clock.now)[2]["plan_hash"]
+
+    def record_consensus(self, plan_hash):
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-",
+                                                       "plan_hash": plan_hash, "by": "reviewer-engine"}, 5)
+
+    def test_a_launch_without_consensus_is_recorded_as_would_refuse_and_still_launches(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(json.loads(out)), ["name", "pane", "session", "tab"], "the launch went ahead")
+        (event,) = self.events("gate.would_refuse")
+        self.assertEqual((event["subject"], event["detail"]["for"], event["detail"]["failed"]), ("launch:newcoder", "launch", ["G0b"]))
+        self.assertIn("no consensus record", event["detail"]["reason"])
+        self.assertIn("would be refused (shadow", err)
+
+    def test_a_consensus_record_at_the_current_hash_makes_it_quiet(self):
+        self.record_consensus(self.plan_hash())
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.events("gate.would_refuse"), [])
+        self.assertNotIn("would be refused", err)
+
+    def test_editing_the_plan_voids_the_consensus(self):
+        self.record_consensus(self.plan_hash())
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a new constraint.")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.events("gate.would_refuse")), 1)
+
+    def test_a_brief_with_no_plan_link_is_recorded_and_launches(self):
+        code, out, err = self.launch(brief="Just do it, no plan\n")
+        self.assertEqual(code, 0, err)
+        (event,) = self.events("gate.would_refuse")
+        self.assertIn("no `PLAN:` link", event["detail"]["reason"])
+
+    def test_a_plan_that_fails_the_check_or_cannot_be_read_is_recorded(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        self.assertEqual(self.launch(name="c1")[0], 0)
+        self.assertIn("fails `plan check`", self.events("gate.would_refuse")[-1]["detail"]["reason"])
+        self.assertEqual(self.launch(brief="PLAN: acme/app#99\n", name="c2")[0], 0)
+        self.assertIn("could not be read", self.events("gate.would_refuse")[-1]["detail"]["reason"])
+
+    def test_it_never_refuses_even_in_enforce(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.events("gate.would_refuse")[0]["detail"]["mode"], "enforce")
+        self.assertEqual(self.events("gate.refused"), [])
+
+    def test_not_opted_in_disabled_and_the_kill_file_each_stay_quiet(self):
+        for n, repos in enumerate(({}, {"acme/other": {"mode": "shadow"}}, {"acme/app": {"mode": "shadow", "enabled": False}})):
+            with self.subTest(repos=repos):
+                self.extra_config = {"plan_gates": {"repos": repos}} if repos else {}
+                self.configure()
+                self.assertEqual(self.launch(name="q%d" % n)[0], 0)
+                self.assertEqual(self.events("gate.would_refuse"), [])
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure()
+        (self.world.state / "plan-gates.off").write_text("")
+        self.assertEqual(self.launch(name="c9")[0], 0)
+        self.assertEqual(self.events("gate.would_refuse"), [])
+        self.assertEqual(len(self.events("gate.killed")), 1)
+
+    def test_trouble_is_a_fail_open_and_the_launch_goes_on(self):
+        with mock.patch.object(sb.plan_ledger, "launch_findings", side_effect=ValueError("boom")):
+            code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        (event,) = self.events("gate.fail_open")
+        self.assertEqual((event["detail"]["for"], event["detail"]["first_today"]), ("launch", True))
+        self.assertIn("boom", event["detail"]["reason"])
+
+    def test_a_check_that_outruns_its_budget_fails_open_and_does_not_hold_the_launch(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow", "budget_ms": 500}}}}
+        self.configure()
+        base = self.route
+
+        def slow(argv, **kw):
+            if argv[0] == FAKE_GH:
+                time.sleep(1.5)
+            return base(argv, **kw)
+        self.route = slow
+        started = time.time()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertIn("no answer within 500 ms", self.events("gate.fail_open")[0]["detail"]["reason"])
+        self.assertLess(time.time() - started, 3.5)
+
+    def test_a_resume_is_not_checked(self):
+        session = self.world.sessions["coder"]
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err):
+            sb.main(["launch", "coder9", "--resume", session], runner=self.route, now=self.world.clock.now,
+                    socket_call=self.world.herdr.socket)
+        self.assertEqual(self.events("gate.would_refuse"), [])
+
+    def test_a_consensus_entry_is_a_ledger_kind_and_counts_only_for_its_hash(self):
+        self.record_consensus("sha256:" + "a" * 64)
+        entries, problem = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertIsNone(problem)
+        self.assertIsNotNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "a" * 64))
+        self.assertIsNone(sb.plan_ledger.consensus_at(entries, "sha256:" + "b" * 64))
+
+
 class TestJudgeEval(Base):
     """#106: the evaluation harness, on SYNTHETIC rows only (the real labelled rows are private)."""
 
