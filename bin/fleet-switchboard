@@ -1382,6 +1382,10 @@ class Discovery:
 
 # ------------------------------------------------------------ the decision
 
+class MessageTooLong(Exception):
+    """A message that would be cut at the delivery cap: refused to the sender, nothing delivered."""
+
+
 class InterruptRefused(Exception):
     """`send --interrupt` from anyone but the recipient's boss."""
 
@@ -1972,6 +1976,15 @@ class Switchboard:
         repos = self.repos_in_play()
         text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
                                 repos=repos)
+        sent = next((fact for fact in carried if fact.kind == "send"), None)
+        if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
+            whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
+                               repos=repos)
+            allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
+            raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
+                                 "ask sections are added; the allowed text for this message is %d characters: nothing was "
+                                 "sent. Write it to a file in the opencode temp dir and send the path"
+                                 % (len(sent.summary), MESSAGE_CAP, allowed))
         keys = [fact.key for fact in carried]
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
@@ -10652,6 +10665,9 @@ def cmd_send(args, runner, now):
         outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
     except InterruptRefused as err:
         sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    except MessageTooLong as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
