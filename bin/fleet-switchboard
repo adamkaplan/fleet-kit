@@ -17925,7 +17925,8 @@ def cmd_decision_write(args, action, runner, now):
             return EXIT_USAGE
         if action == "supersede":
             code = cmd_decision_supersede(args, engine, decisions, name, runner, role)
-            finish_decision_write(action, list(args.ids))
+            if code == EXIT_OK:  # a failed write has nothing to wait for
+                finish_decision_write(action, list(args.ids))
             return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:

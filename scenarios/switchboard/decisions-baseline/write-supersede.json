@@ -6,7 +6,7 @@
   "comments": [
    "Superseded by acme/api#50: folded in\n\n<!-- fleet-switchboard:from=cos -->"
   ],
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "gh_writes": [
    "POST repos/acme/api/issues/2/comments",
    "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
@@ -39,28 +39,28 @@
   "argv": "decisions supersede web-orch-161 --by api#50",
   "as": "cos",
   "code": 1,
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "out": "web-orch-161: refused: is a report that names no issue: a send would clear every question of its worker. Answer it with `fleet-switchboard send`\n"
  },
  {
   "argv": "decisions supersede api#2hv --by api#50",
   "as": "cos",
   "code": 1,
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "out": "api#2hv: refused: is a permission: answer it with `fleet-switchboard decisions answer api#2hv ...`\n"
  },
  {
   "argv": "decisions supersede pr:api#7 --by api#50",
   "as": "cos",
   "code": 1,
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "out": "pr:api#7: refused: no decision pr:api#7 is waiting\n"
  },
  {
   "argv": "decisions supersede nope-1 nope-1 --by api#50",
   "as": "cos",
   "code": 1,
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "out": "nope-1: refused: no decision nope-1 is waiting\n"
  },
  {
@@ -91,7 +91,7 @@
   "comments": [
    "Superseded by acme/api#50\n\n<!-- fleet-switchboard:from=cos -->"
   ],
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "gh_writes": [
    "POST repos/acme/api/issues/2/comments",
    "DELETE repos/acme/api/issues/2/labels/me%3Aawaiting-cos",
@@ -107,7 +107,7 @@
   "argv": "decisions supersede api#2 --by api#50",
   "as": "you",
   "code": 1,
-  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
+  "err": "",
   "out": "api#2: refused: no decision api#2 is waiting\n"
  },
  {

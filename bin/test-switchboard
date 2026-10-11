@@ -20341,6 +20341,18 @@ class TestDecisionWriteWaitsForTheList(Base):
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(err.getvalue().count("later"), 2)
 
+    def test_a_failed_supersede_neither_waits_nor_claims_a_change(self):
+        args = mock.Mock(ids=["api#7"], id=None)
+        for code, expect in ((sb.EXIT_ERROR, 0), (sb.EXIT_OK, 1)):
+            with self.subTest(code=code):
+                calls = []
+                with mock.patch.object(sb, "fresh_engine_decisions", lambda *a, **k: (mock.Mock(), [], None)), \
+                        mock.patch.object(sb, "decision_actor", lambda *a: (None, None)), \
+                        mock.patch.object(sb, "cmd_decision_supersede", lambda *a: code), \
+                        mock.patch.object(sb, "finish_decision_write", lambda a, i: calls.append((a, i))):
+                    self.assertEqual(sb.cmd_decision_write(args, "supersede", None, 0), code)
+                self.assertEqual(len(calls), expect)
+
     def test_nothing_in_it_can_raise_into_the_command(self):
         with mock.patch.object(sb, "send_poke", side_effect=RuntimeError("boom")):
             with captured() as (out, err):
