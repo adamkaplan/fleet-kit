@@ -3,7 +3,7 @@
 A plan says **what** the work must achieve, never gratuitous **how**. It is written by the orchestrator before work
 starts, checked mechanically (`fleet-switchboard plan check`, gate G0a), reviewed, and approved. Every worker
 assignment carries `PLAN: <link>`. This page is the template and the rules `plan check` enforces. The planning skill
-(`fleet-planning`) is a later slice; until then use this page.
+(`fleet-planning`) is the short path to this page; this page stays the full reference.
 
 ## What "what, not how" means
 

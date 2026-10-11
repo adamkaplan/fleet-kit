@@ -8590,6 +8590,36 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
 
 
+class TestPlanningSkill(unittest.TestCase):
+    """skills/fleet-planning: short, installed like the other skills, and its own example passes `plan check`."""
+    SKILL = REPO / "skills" / "fleet-planning" / "SKILL.md"
+
+    def test_it_is_a_short_skill_with_the_frontmatter_the_others_have(self):
+        text = self.SKILL.read_text()
+        self.assertTrue(text.startswith("---\nname: fleet-planning\ndescription: "))
+        self.assertLessEqual(len(text.split()), 1100, "the skill must be cheap to load")
+        for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
+            self.assertIn(phrase, text)
+        self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
+
+    def test_it_is_installed_with_the_kits_other_skills_and_named_in_the_install_guide(self):
+        self.assertIn("fleet-planning", sb.kit_skill_names(REPO))
+        self.assertIn('ln -s "$PWD/skills/fleet-planning"', (REPO / "INSTALL.md").read_text())
+
+    def test_its_example_passes_the_check_it_teaches(self):
+        text = self.SKILL.read_text()
+        block = re.search(r"```yaml\n(scenarios:.*?)```", text, re.S).group(1)
+        done = "(1) a project with no agents lists none, and after commissioning lists exactly one"
+        plan = "## Plan\n\nDone when: %s\n\nPC-1: existing projects keep their listing\n\n```yaml\n%s```\n" % (done, block)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plan.md"
+            path.write_text(plan)
+            out = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", done],
+                                 capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("plan check: PASS", out.stdout)
+
+
 class TestAgentDefinitions(unittest.TestCase):
     def test_there_are_eight_role_files(self):
         self.assertEqual(sorted(role_of(p) for p in AGENT_FILES),
