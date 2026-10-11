@@ -11938,7 +11938,7 @@ def cmd_gates_check(args, runner, now):
             mode, downgraded = plan_ledger.effective_mode(config, setting)
             if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
                 _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
-            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode)
+            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode, setting.get("enforce_gates"))
             gates_note(state, now(), repo, "checks")
             payload = {"verdict": verdict, "mode": mode, "for": args.check_for, "failed": failed, "reason": why}
             if downgraded:
@@ -11951,10 +11951,12 @@ def cmd_gates_check(args, runner, now):
                 exit_code = plan_ledger.EXIT_REFUSE
             else:
                 exit_code = plan_ledger.EXIT_ALLOW
-                if failed:   # shadow: what enforcement would have refused
-                    gates_note(state, now(), repo, "would_refuse")
-                    _gates_audit(engine, "gate.would_refuse", pr, {"for": args.check_for, "failed": [f["gate"] for f in failed],
-                                                                    "reason": _one_line(why, 300)})
+                if failed:   # shadow: what enforcement would have refused (every gate); enforce: gates reported but not enforced
+                    kind = "gate.would_refuse" if mode == "shadow" else "gate.reported"
+                    gates_note(state, now(), repo, "would_refuse" if mode == "shadow" else "reported")
+                    _gates_audit(engine, kind, pr, {"for": args.check_for, "failed": [f["gate"] for f in failed],
+                                                    "enforced": [f["gate"] for f in failed if f["enforced"]],
+                                                    "reason": _one_line(why, 300)})
     except BaseException as err:
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise
@@ -11968,7 +11970,7 @@ def cmd_gates_check(args, runner, now):
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     elif payload["verdict"] == "refuse":
-        sys.stderr.write("%s: gates-check: refused for %s: %s\n" % (PROG, args.check_for, payload["reason"]))
+        sys.stderr.write("%s\n" % plan_ledger.refusal_message(PROG, args.check_for, args.pr, payload["failed"], repo))
     elif payload["verdict"] == "fail-open":
         sys.stderr.write("%s: gates-check: could not check (%s): allowed\n" % (PROG, payload["reason"]))
     return exit_code
@@ -12055,14 +12057,19 @@ def cmd_gates_switch(args, runner, now):
         return section
     _write_gates_config(edit)
     _gates_audit(engine, "gate.mode", repo, {"by": who, "mode": target})
-    print("plan gates: %s is now %s" % (repo, "off (kill switch)" if target == "off" else target))
+    shown = plan_ledger.repo_setting(load_config(), repo) if target != "off" else None
+    print("plan gates: %s is now %s%s" % (repo, "off (kill switch)" if target == "off" else target,
+                                          "; refuses on %s (others are reported)" % ", ".join(shown["enforce_gates"]) if shown and target == "enforce" else ""))
     return EXIT_OK
 
 
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
     blocking, notes = plan_ledger.preflight(config, args.pr)
+    setting = plan_ledger.repo_setting(config, args.pr)
     print("preflight for enforcing %s: %s" % (args.pr, "BLOCKED" if blocking else "nothing blocks it"))
+    print("  enforced gates: %s (others are reported, not enforced; set `enforce_gates` in plan_gates to change)"
+          % ", ".join((setting or {}).get("enforce_gates") or plan_ledger.DEFAULT_ENFORCED))
     for line in blocking:
         print("  blocking: %s" % line)
     for line in notes:
@@ -12090,6 +12097,8 @@ def plan_gates_status(config, state, now):
             if why:
                 label = "enforce REQUESTED but running as shadow (%s)" % why
         out["repos"][name] = dict(entry, counts=c)
+        if entry["enabled"] and entry["mode"] == "enforce":
+            label += " on " + ", ".join(entry.get("enforce_gates") or plan_ledger.DEFAULT_ENFORCED)
         out["lines"].append("plan gates %s: %s; today %d check(s), %d refusal(s), %d would-refuse, %d fail-open(s)" % (
             name, label, c.get("checks", 0), c.get("refusals", 0), c.get("would_refuse", 0), c.get("fail_opens", 0)))
     return out
