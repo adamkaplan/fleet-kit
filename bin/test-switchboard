@@ -17970,6 +17970,13 @@ class TestOwnerTerminal(LedgerBase):
         self.terminal_problem = None
         self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
 
+    def test_the_terminal_check_is_one_function_used_by_every_owner_only_command(self):
+        text = SWITCHBOARD.read_text()
+        self.assertEqual(text.count("owner_terminal_problem()"), 1, "the check is called from exactly one place")
+        for name in ("gates_caller_may_switch", "cmd_verdict"):
+            self.assertIn("gates_caller_kind(", inspect.getsource(getattr(sb, name)), name)
+        self.assertIn("THE ONE human-terminal check", inspect.getsource(sb.gates_caller_kind))
+
     def test_the_chief_of_staff_session_does_not_need_a_terminal(self):
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
         self.terminal_problem = "not a terminal"

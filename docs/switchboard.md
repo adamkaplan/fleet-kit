@@ -4138,3 +4138,7 @@ that the init process adopts), after which both checks pass; or write the ledger
 from inside the process. What the checks do stop is the honest mistakes and the cheap tricks: a tool shell on pipes, unsetting two variables, and a
 verdict recorded by the agent that ran into the gate. Real separation of the owner's verdicts needs something an agent cannot reach (a separate account, a hardware
 confirmation, or a required check on GitHub); this slice does not provide it.
+
+**One place.** The owner-in-person check is a single function, `gates_caller_kind` (it wraps `owner_terminal_problem`), and every command that is "only the
+owner, at a terminal" must ask it and nothing else: today `verdict --as owner`, `gates mode` and `gates off|on`. A new such command (a later waiver by the
+owner, for instance) uses the same function so the rule cannot drift between commands; a test pins that it is called from exactly one place.

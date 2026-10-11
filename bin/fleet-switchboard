@@ -12041,7 +12041,10 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 
 def gates_caller_kind(runner, now):
-    """(kind, who): "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
+    """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` (a later `waive` is the chief of staff's, an
+    agent session, and does not use it; anything that is "only the owner" must). Returns (kind, who[, role]).
+    "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
     it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
     session identity. A mistake-guard, not a boundary: an agent that unsets its own session and pane variables looks like a person."""
