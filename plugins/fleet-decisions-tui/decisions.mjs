@@ -413,7 +413,7 @@ export function factsSegments(d, width) {
   return lines
 }
 
-// The styled panel as lines (issue 67, iteration 2, the layout Adam picked), built by subtraction: what needs you is two
+// The styled panel as lines (issue 67, iteration 2, the layout the owner picked), built by subtraction: what needs you is two
 // lines (headline, then a quiet id + age line); a heads-up is one line (headline cut, its PR number coloured by state,
 // age flush right); a repo header once per group; no rules, only blank lines; no empty sections; stats (+A/-D) only when
 // large; in the Chief of Staff's view the cos tier folds to one line per repo (count and oldest). `snapshot` is what loadSnapshot returns.

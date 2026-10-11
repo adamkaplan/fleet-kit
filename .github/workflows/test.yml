@@ -1,4 +1,4 @@
-# Offline test suites. No secrets, no network beyond checkout, read-only token.
+# Offline test suites. No network beyond checkout, read-only token; one optional secret (PRIVATE_NAMES) for the public-names check.
 name: test
 
 on:
@@ -27,6 +27,13 @@ jobs:
           fetch-depth: 0
 
       - run: python3 --version
+
+      # This repo is public: refuse private names. The list lives in the repository secret PRIVATE_NAMES (never in the
+      # tree); without it (a fork's pull request has no secrets) the check prints a "skipped" note and passes.
+      - name: bin/check-public-names
+        env:
+          FLEET_PRIVATE_NAMES: ${{ secrets.PRIVATE_NAMES }}
+        run: python3 bin/check-public-names
 
       # Each suite exits non-zero on failure; the grep also fails the step if
       # the last RESULT line is anything other than PASS.

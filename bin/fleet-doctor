@@ -544,7 +544,7 @@ fi
 
 # =========================================================== 8f. the triage function (#130)
 # The daemon's last triage pass (counts by rule) from `fleet-switchboard status --json`. WARN on unreadable repos or units
-# that could not be checked; findings alone are information, not a doctor problem. It writes nothing to GitHub (Adam's hold).
+# that could not be checked; findings alone are information, not a doctor problem. It writes nothing to GitHub (the owner's hold).
 if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
   run_to 40 "$sb_real" status --json
   tr=$(printf '%s' "$LAST_OUT" | python3 -c '

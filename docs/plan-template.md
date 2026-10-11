@@ -32,7 +32,7 @@ Recorded as an issue, or a section of one, **in the repo the work concerns**. Re
 9. **The integration-branch decision** (stay on main, or `integration/<epic-slug>`).
 
 Approvers: a work item's plan by its orchestrator (cos if it touches a held-PR area); an ask's by cos; an epic or
-workspace plan by cos, then Adam.
+workspace plan by cos, then the owner.
 
 ## The scenarios block
 
@@ -47,7 +47,7 @@ scenarios:
     proof: test       # test | live | measure | screenshot
     pass: the list call returns status 200 and exactly 1 agent named "alpha"
     discriminates: a build that creates nothing returns an empty list and fails this
-    evaluator: ci     # ci | tester | reviewer | adam
+    evaluator: ci     # ci | tester | reviewer | owner
     claim: pr         # optional: pr (default) = proven per PR; epic = proven at the epic's integrated head
 ```
 
@@ -61,10 +61,11 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | `covers` | not exactly one `DW-<n>` or `PC-<n>`; or a `DW-n` beyond the ask's Done-when clauses. **`DW-n` is the ask's clause n; `PC-n` is a plan constraint** (a `PC-<n>: ...` line in the plan's constraints section). If the plan lists its constraints, every `PC-n` must be covered by a scenario and a scenario may only cover a listed one (`uncovered-constraint`, `covers-unknown-constraint`); with no list it is a warning. **`U<n>` scenarios are unchanged-behaviour scenarios**: they say what must still hold, and they do not count towards covering a Done-when clause |
 | `text` | missing or under 10 characters |
 | `proof`, `evaluator` | not one of the listed values |
-| proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam` |
+| proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `live` and `measure` need `tester` or `owner` |
 | `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). Zero, or an exact number, of ANY noun (`sends 0 accepts`, `received 0 responses`, `exactly 3 retries`: the number, up to two words, then a noun); a status class (`a 4xx`, `5xx`); `byte equal`, `byte for byte` and `byte-identical`; a count (including zero: `0 occurrences of X in the tree`), `n of n` with equal numbers (`10 of 10 files contain Y`; `3 of 4 people like it` is not one), identical-to-a-named-thing (`identical per file to the baseline`) and a named identifier compared to a value (`count of Z equals 3`) are observables. Hedges (`maybe`, `somehow`, `or so`, `yes fine`, `seems`) fail whatever else the rule says. A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
 | `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 80 percent or more of its words are the pass rule's (the pass rule reworded). A wrong build is recognised by structure: `a build that <does X> ... <an observable outcome>` (`a build that skips the dedupe step finds two rows for one key`), not by a list of verbs. Sharing 60 to 80 percent of the pass rule's words only warns (`discriminates-overlap`): a wrong build is often the right one with one thing changed. Whether the named wrong build is the right one is for the plan review (G0b) |
-| evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `adam`; `live` and `measure` need `tester` or `adam`. (A rule of this checker, written here because plan v3.3 does not state it.) |
+| evaluator alias | `adam` (an older plan's spelling) is still accepted as `owner`, with a warning to rename it; it is hashed as written |
+| evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `live` and `measure` need `tester` or `owner`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
 | Done-when | `--ask` (or `--done-when`) is the **authority** for the clauses. If the plan states its own Done-when it must be the same clauses: fewer or different ones fail (`done-when-differs`). A plan can never weaken coverage |
