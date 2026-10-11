@@ -4214,3 +4214,6 @@ keep the `ci_record` settings when it rewrites the config.
 A deliberately deferred issue carries the label `<user>:parked` (made by `fleet-switchboard labels ensure`, idempotent, with each repo's own account) AND one line `Parked until: YYYY-MM-DD` in its body. Triage rule T3 ("no next step") skips it until the end of that day (UTC) and fires again after.
 Strict on purpose: the label without a date, a date without the label, a malformed or impossible date (`2027-02-31`), two dates, a quoted or code-fenced line, or a past date all mean "not parked".
 Parking never exempts anything waiting on the owner (an item with `awaiting-user` or `awaiting-cos` is judged as before) or a held PR (T3 does not judge PRs; the captain rules are separate). Shadow only, like the rest of the triage: it records, it does not act.
+
+Parked items, follow-ups: a park reaches at most 366 days ahead (`9999-12-31` is not a park); the date is ASCII digits only (fullwidth digits are not read); a body with CRLF line endings is read. **Only T3 is exempted**, as specified:
+a parked ASK can still raise T9 (an ask idle for 3 days); whether parking should exempt T9 too is a decision for the Chief of Staff and is not made here.

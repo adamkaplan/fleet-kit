@@ -15062,8 +15062,12 @@ class TestTriage(Base):
         self.add(67, labels=["kind", PARKED], body="Parked until: 2027-01-20\nParked until: 2027-01-30", **quiet)  # two dates: not read
         self.add(68, labels=["kind", PARKED], body="> Parked until: 2027-01-20", **quiet)        # quoted: not a statement
         self.add(69, labels=["kind", PARKED, self.USER], body="Parked until: 2027-01-20", **quiet)  # owner-wait is never exempted by parking
+        self.add(70, labels=["kind", PARKED], body="Parked until: 9999-12-31", **quiet)           # too far ahead: not a park
+        self.add(71, labels=["kind", PARKED], body="Parked until: \uff12\uff10\uff12\uff17-\uff10\uff11-\uff12\uff10", **quiet)  # fullwidth digits
+        self.add(72, labels=["kind", PARKED], body="intro\r\nParked until: 2027-01-20\r\n", **quiet)   # a CRLF body is read: parked
+        self.add(73, labels=["kind", PARKED], body="Parked until: 2028-01-10", **quiet)          # 360 days ahead: parked
         self.go()
-        self.assertEqual(self.only("T3"), ["acme/api#62", "acme/api#63", "acme/api#64", "acme/api#65", "acme/api#66", "acme/api#67", "acme/api#68"])
+        self.assertEqual(self.only("T3"), ["acme/api#62", "acme/api#63", "acme/api#64", "acme/api#65", "acme/api#66", "acme/api#67", "acme/api#68", "acme/api#70", "acme/api#71"])
 
     def test_parked_needs_its_own_label_and_is_read_to_the_end_of_the_day(self):
         self.assertIsNone(sb.parked_until("Parked until: 2027-01-20", ["osuser:merge-captain"]))
