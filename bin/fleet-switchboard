@@ -7155,6 +7155,25 @@ TRIAGE_LIST_PAGES = 2
 TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
 TRIAGE_UNREADABLE_RETRY = 3600
 TRIAGE_FILE = "triage.json"
+PARKED_UNTIL_RE = re.compile(r"^[ \t]*Parked until:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$", re.M)
+
+
+def parked_until(body, labels):
+    """The epoch second a `<user>:parked` item is parked until, or None. It counts ONLY with the label AND one line
+    `Parked until: YYYY-MM-DD` in the body (outside quotes and code); a missing, malformed or impossible date is None, and the day
+    is parked through its end (UTC). Strict by design: a deferral that cannot be read is not a deferral."""
+    if not any(isinstance(l, str) and l.endswith(":parked") for l in labels or ()) or not isinstance(body, str):
+        return None
+    found = PARKED_UNTIL_RE.findall(SWEEP_QUOTED_RE.sub(" ", body))
+    if len(found) != 1:
+        return None
+    try:
+        day = datetime.strptime(found[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return day.timestamp() + 86400.0
+
+
 TRIAGE_OWNER_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*|__)?(?:owner|owned by)(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*[A-Za-z0-9@_`\"'\[(][^\n]*$", re.I | re.M)
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
@@ -7283,6 +7302,7 @@ def triage_norm(issue):
             "labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
+            "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
             "owner_body": bool(isinstance(body, str) and TRIAGE_OWNER_RE.search(SWEEP_QUOTED_RE.sub(" ", body))),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
@@ -7340,7 +7360,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        if comments is not None and not item["section"] and not awaiting and not item["next_body"] \
+        parked = item.get("parked_until") is not None and now < item["parked_until"] and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
+        if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
@@ -17883,6 +17904,7 @@ LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing
                ("awaiting-cos", "fbca04", "Waiting on the Chief of Staff: it resolves or escalates"),
                ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"),
                # #133: held-for-the-owner state as labels (read by the switchboard, the sweep and the triage)
+               ("parked", "c5def5", "Deliberately deferred: exempt from the no-next-step flag until its `Parked until: YYYY-MM-DD` line"),
                ("merge-captain", "b60205", "A PR held for the owner: it is not merged until the owner says so"),
                ("merge-automatic", "0e8a16", "A PR that merges on green CI and independent review"),
                ("hold-security", "d93f0b", "Held: a security boundary"),
