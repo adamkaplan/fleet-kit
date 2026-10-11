@@ -8428,7 +8428,8 @@ ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "c
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
 # escalation line in the chief of staff): coder +500, orchestrator +500, chief-of-staff +100
 # #133: a held PR is held by LABELS (merge-captain and a hold-<reason>), the first line only for a dated window: coder +250, orchestrator +250, chief-of-staff +250
-ROLE_BYTE_LIMITS = {"coder": 6350, "orchestrator": 9900, "chief-of-staff": 11350, "cos-subagent": 3500}
+# #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
+ROLE_BYTE_LIMITS = {"coder": 6500, "orchestrator": 10350, "chief-of-staff": 11350, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 

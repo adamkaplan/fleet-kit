@@ -54,7 +54,7 @@ changes nothing for you: do not report, do not answer at length.
 
 When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
-turn: you are woken then, free while idle. Never poll.
+turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 
 ## Skills
 
