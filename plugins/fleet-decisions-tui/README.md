@@ -65,3 +65,5 @@ a terminal wide enough to show it.
 
 `decisions.mjs` holds the pure functions (read the file, staleness, the rows) and is tested by
 `bin/test-switchboard` with node. `tui.tsx` is the thin layer over them and is checked in the Lab.
+
+A `MERGE: captain` PR row is linked and named like an issue row: it links to its pull request (built from its repo and number with the same checks as an issue link) and shows the short ref `repo#N` (the repo's full name when another repo shares the short one), never the internal key `pr:org/repo#N`, so its age stays on the line.

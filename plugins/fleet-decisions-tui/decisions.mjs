@@ -32,6 +32,9 @@ export function viewOf(env) {
 
 // A PR notice (kind "notice") is information, not a decision: it is never counted or listed with decisions.
 export const isNotice = (d) => d.kind === "notice"
+// A row about a pull request: a heads-up, or a `MERGE: captain` PR waiting on a decision (its id is the internal key
+// `pr:org/repo#N`). Its link is the PR's, built from its repo and number like a heads-up's.
+export const isPrRow = (d) => d.kind === "notice" || d.kind === "captain"
 
 // The decisions a view shows. A decision with no tier (a file an older daemon wrote) is the human's.
 export function selectFor(decisions, view) {
@@ -56,10 +59,10 @@ const NUMBER_PATTERN = /^[1-9][0-9]{0,8}$/
 // The issue (a decision) or PR (a heads-up) URL of an entry, or null.
 export function urlOf(d) {
   if (!d || typeof d.repo !== "string" || !REPO_PATTERN.test(d.repo) || d.repo.split("/").some((p) => p === "." || p === "..")) return null
-  const raw = isNotice(d) ? d.number : d.ask
+  const raw = isPrRow(d) ? d.number : d.ask
   const n = typeof raw === "number" || typeof raw === "string" ? String(raw) : ""
   if (!NUMBER_PATTERN.test(n)) return null
-  return `https://github.com/${d.repo}/${isNotice(d) ? "pull" : "issues"}/${n}`
+  return `https://github.com/${d.repo}/${isPrRow(d) ? "pull" : "issues"}/${n}`
 }
 
 // Text safe to put on a line the terminal draws: every control character except tab and line breaks (which wrap
@@ -208,6 +211,16 @@ export function wrapText(text, width, maxLines = WRAP_MAX_LINES) {
   return lines
 }
 
+// What a row calls itself. An issue row's id is already short (`#41`). A captain PR's id is the internal key
+// `pr:org/repo#N`, which would push the age off the line: it is shown as the short ref `repo#N` (or `org/repo#N` when
+// another repo has the same name, `ambiguous`), from its repo and number, never from the key.
+export function idOf(d, ambiguous = () => false) {
+  if (d.kind === "captain" && typeof d.repo === "string" && REPO_PATTERN.test(d.repo) && Number.isInteger(d.number) && d.number > 0) {
+    return `${ambiguous(d.repo) ? d.repo : shortRepo(d.repo)}#${d.number}`
+  }
+  return d.id
+}
+
 // One decision: its first line `<id> <age>`, then the daemon's headline (the title, for an older file with none) wrapped to `width` and cut to HEADLINE_LINES lines, the last ending in an ellipsis if cut.
 export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const since = Date.parse(decision.since)
@@ -215,7 +228,7 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = stripControls(typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title)
-  const entry = { key: decision.id, head: oneLine(`${decision.id} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  const entry = { key: decision.id, head: oneLine(`${idOf(decision)} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
   // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
   if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
@@ -484,7 +497,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
         const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
         const age = ageSeg(d)
         const full = section.need
-            const idText = isNotice(d) && Number.isInteger(d.number) ? `#${d.number}` : d.id
+            const idText = isNotice(d) && Number.isInteger(d.number) ? `#${d.number}` : idOf(d, known.ambiguous)
         if (full) {
           if (ei) out.push(blank())
           // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
