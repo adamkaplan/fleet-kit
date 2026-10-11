@@ -17864,6 +17864,53 @@ def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
     return EXIT_ERROR if failed else EXIT_OK
 
 
+DECISION_REFRESH_SECONDS = 6.0    # how long a decision write waits for the daemon's next write of decisions.json
+DECISION_REFRESH_STEP = 0.25
+_refresh_clock = {"sleep": time.sleep, "monotonic": time.monotonic}   # replaced in tests
+
+
+def decision_shows_new_state(decisions, action, ident):
+    """True when `decisions` (the list as the file shows it) already shows the result of `action` on `ident`: an escalated decision is
+    the owner's tier or gone; a resolved, answered or superseded one is gone."""
+    found = next((d for d in decisions if d.get("id") == ident), None)
+    if found is None:
+        return True
+    return action == "escalate" and found.get("tier") == "human"
+
+
+def refreshed_or_honest_line(action, idents, poked, state_dir=None):
+    """After a decision write: poke the daemon (done by the caller: `poked`), then wait up to DECISION_REFRESH_SECONDS for the file the
+    daemon owns to show the new state of every decision in `idents`, reading it only (the daemon is the one writer: nothing here races it).
+    Returns None when the list shows the new state; else ONE honest line saying the change is applied at the next pass, so the person is
+    never told the list is current when it is not."""
+    state_dir = state_dir or state_dir_path()
+    if not poked:
+        return ("the change is written; the daemon is not running, so the decision list shows it after the next pass "
+                "(start it with `%s ensure`)" % PROG)
+    clock = _refresh_clock
+    deadline = clock["monotonic"]() + DECISION_REFRESH_SECONDS
+    while True:
+        report = decisions_report(state_dir, time.time())
+        if not report["stale"] and all(decision_shows_new_state(report["decisions"], action, i) for i in idents):
+            return None
+        if clock["monotonic"]() >= deadline:
+            return ("the change is written and applied at the next pass (about a minute at most): the decision list may still "
+                    "show the old state until then")
+        clock["sleep"](DECISION_REFRESH_STEP)
+
+
+def finish_decision_write(action, idents):
+    """Poke the daemon, wait (bounded) for the list to show the new state, and say so honestly when it does not. Never raises."""
+    poked = False
+    try:
+        poked = send_poke(state_dir_path())  # the daemon looks again now; a miss is harmless
+        line = refreshed_or_honest_line(action, [i for i in idents if i], poked)
+    except Exception:
+        line = None
+    if line:
+        sys.stderr.write("%s: %s\n" % (PROG, line))
+
+
 def cmd_decision_write(args, action, runner, now):
     """`decisions escalate|resolve|answer|supersede`: the caller is its pane's fleet agent (`--from` in the Lab) or you."""
     if action == "batch":
@@ -17880,10 +17927,8 @@ def cmd_decision_write(args, action, runner, now):
             return EXIT_USAGE
         if action == "supersede":
             code = cmd_decision_supersede(args, engine, decisions, name, runner, role)
-            try:
-                send_poke(state_dir_path())
-            except Exception:
-                pass
+            if code == EXIT_OK:  # a failed write has nothing to wait for
+                finish_decision_write(action, list(args.ids))
             return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
@@ -17907,10 +17952,7 @@ def cmd_decision_write(args, action, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
     print(line)
-    try:
-        send_poke(state_dir_path())  # the daemon looks again now; a miss is harmless
-    except Exception:
-        pass
+    finish_decision_write(action, [getattr(args, "id", None)])
     return EXIT_OK
 
 

@@ -2390,6 +2390,15 @@ default is a dry run, the same as `--dry-run`; only `--apply` writes: it ensures
 others still run; a list longer than 1000 open items is said to be cut (run it again after labelling). Running it twice labels nothing
 the second time.
 
+### A decision write leaves the list current (#130)
+
+`decisions escalate`, `resolve`, `answer` and `supersede` change GitHub (a label, a comment) or a marker, and the list the person and the
+Chief of Staff read is the daemon's `decisions.json`. After a write the command pokes the daemon and then **waits, up to 6 seconds, for the
+file to show the new state** (an escalated decision is the owner's tier, or gone; a resolved, answered or superseded one is gone). It only
+reads the file: the daemon is the one writer, so nothing races it. If the file shows it, the command is silent about the list. If not, it
+prints ONE honest line on stderr, `the change is written and applied at the next pass (about a minute at most): the decision list may
+still show the old state until then`; with no daemon running the line says so and names `ensure`. A write never fails because of this wait.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and
