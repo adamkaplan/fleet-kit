@@ -2327,6 +2327,16 @@ pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks`
 session resolves to, a `WARNING` for any disagreement (a session shown in two panes, a name claimed by two sessions, a pane labelled
 differently from its session's fleet name) and what the shell running `status` resolves to.
 
+### Which program a pane runs
+
+A pane is held ("runs a different opencode") unless its process is the configured v2. The comparison is by **resolved binary**, not
+command text: both sides by realpath; and a pane started with the **bare command** (`opencode -s ses_...`, which the shell found on
+its own path) is the same program when that name resolves, on the daemon's PATH, to the same real file. When it resolves to a
+different file of the same name the two are still the same program if both answer `--version` with the same first line (a copy;
+asked at most 3 seconds, remembered per file and modification time). Anything that cannot be decided is held: a shell, a name not
+on the daemon's PATH, a relative path, a different binary or version, a pane that cannot be read. A program of any other name is
+never asked for its version.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and
