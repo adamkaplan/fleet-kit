@@ -219,6 +219,137 @@ def signed_call(args, name):
     return new, None, temp
 
 
+# ---- the gate probe (plan-driven development, slice 3b: SHADOW ONLY). docs/plan-gate-engine-design.md, E1 and E3.
+#
+# Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with
+# its own time bound, and writes down what the answer was. It NEVER blocks: the real gh always runs, whatever the answer, the
+# switchboard is missing, the check hangs or the arguments are a shape it does not understand. (Refusing is a later slice.)
+# `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
+# not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
+GATE_SECONDS = 3.0
+GATE_SPOOL = "gate-failopen.jsonl"
+GATE_SPOOL_LIMIT = 262144
+BOOL_FLAGS = {"pr merge": {"-d", "--delete-branch", "--admin", "--auto", "--disable-auto", "-m", "--merge", "-r", "--rebase",
+                           "-s", "--squash"}, "pr ready": set()}
+VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-A", "--author-email", "-t", "--subject",
+               "--match-head-commit"}
+PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)/?$")
+
+
+def gate_seconds():
+    try:
+        return min(10.0, max(0.2, float(os.environ.get("FLEET_SHIM_GATE_SECONDS", GATE_SECONDS))))
+    except ValueError:
+        return GATE_SECONDS
+
+
+def gate_target(args):
+    """(check kind, repo or None, number) for a `pr ready` or `pr merge` whose shape is understood, else None. Anything else
+    (no PR given, a branch name, an unknown flag, more than one positional, `ready --undo`, `pr create`) is not probed."""
+    if len(args) < 3 or args[0] != "pr" or args[1] not in ("ready", "merge"):
+        return None
+    verb = "pr " + args[1]
+    repo, positional, i = None, [], 2
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return None
+        if arg.startswith("-"):
+            name, eq, inline = arg.partition("=")
+            if name in ("-R", "--repo"):
+                value = inline if eq else (args[i + 1] if i + 1 < len(args) else None)
+                if not value or not REPO_RE.match(value):
+                    return None
+                repo = value
+                i += 1 if eq else 2
+                continue
+            if name in VALUE_FLAGS:
+                i += 1 if eq else 2
+                continue
+            if arg in BOOL_FLAGS[verb]:
+                i += 1
+                continue
+            return None   # an unknown flag (ready --undo among them): not understood, not probed
+        positional.append(arg)
+        i += 1
+    if len(positional) != 1:
+        return None
+    ref = positional[0]
+    url = PR_URL_RE.match(ref)
+    if url:
+        return args[1], url.group(1), int(url.group(2))
+    if ref.isdigit() and int(ref) >= 1:
+        return args[1], repo, int(ref)
+    return None   # a branch name or something else
+
+
+def gate_repos():
+    """The lower-cased repos listed under `plan_gates.repos` in the switchboard config; {} when none (then nothing is probed)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            repos = (json.load(handle).get("plan_gates") or {}).get("repos")
+    except (OSError, ValueError, AttributeError):
+        return set()
+    return {str(name).lower() for name in repos} if isinstance(repos, dict) else set()
+
+
+def gate_spool(event, repo, number, check, detail):
+    """One line for the daemon to read later (best effort, never fails the command). The file is writable by any local
+    process, so the daemon treats it as untrusted text: clipped, data only."""
+    state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+    path = os.path.join(state, GATE_SPOOL)
+    try:
+        if os.path.isdir(state) and (not os.path.exists(path) or os.path.getsize(path) < GATE_SPOOL_LIMIT):
+            line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo, number), "for": check,
+                               "detail": str(detail)[:200]}, sort_keys=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+    except OSError:
+        pass
+
+
+def gate_probe(args, lookup):
+    """Ask the switchboard whether this ready or merge would be allowed, and write the answer down. Never raises, never blocks:
+    the caller runs the real gh whatever happens here."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return
+        target = gate_target(args)
+        if target is None:
+            return
+        check, repo, number = target
+        listed = gate_repos()
+        if not listed:
+            return
+        binary = switchboard_binary()
+        if repo is None:
+            repo = lookup.identity().get("repo") if binary else None
+        if not repo or repo.lower() not in listed:
+            return
+        if not binary:
+            gate_spool("fail_open", repo, number, check, "no switchboard to ask")
+            return
+        try:
+            done = subprocess.run([binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"],
+                                  capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
+                                  env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+        except subprocess.TimeoutExpired:
+            gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
+            return
+        except (OSError, subprocess.SubprocessError) as err:
+            gate_spool("fail_open", repo, number, check, "could not run gates-check: %s" % err)
+            return
+        if done.returncode == 10:
+            gate_spool("would_refuse", repo, number, check, done.stdout.strip() or "refused (shadow: not enforced here)")
+        elif done.returncode != 0:
+            gate_spool("fail_open", repo, number, check, "gates-check exited %d" % done.returncode)
+    except Exception:
+        pass   # a probe must never stop a command
+
+
 def main(args):
     gh = real_gh()
     if gh is None:
@@ -230,6 +361,7 @@ def main(args):
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
+    gate_probe(args, lookup)   # shadow only: records, never blocks
     env = account_env(gh, lookup)
     if plan is None:
         if env is not None:

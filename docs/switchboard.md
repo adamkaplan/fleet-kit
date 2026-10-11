@@ -4034,3 +4034,27 @@ an epic claim names its integration branch is a later `plan check` change.)
 `status` prints each opted-in repo's mode with today's counts of checks, refusals, would-refuse and fail-opens. `merge --auto` is
 not treated here: when the shim is built, `--auto` is refused in `enforce`, which also stops any flow that auto-merges
 `merge-automatic` PRs; that cost is named in the design review and decided with the shim.
+
+## The `gh` shim's gate probe: shadow only (#107, slice 3b)
+
+The `gh` shim now asks `gates-check` before `gh pr ready` and `gh pr merge` (E1 and E3 of
+[docs/plan-gate-engine-design.md](plan-gate-engine-design.md)) and writes the answer down. **It never blocks**: the real `gh`
+always runs, with its own exit code and output, whatever the answer is, the switchboard is missing, the check hangs, or the
+arguments are a shape the shim does not understand. Refusing is a later slice.
+
+What it does: for a PR whose repo is listed under `plan_gates.repos` in the switchboard config (matched without regard to case;
+with no `plan_gates`, or another repo, nothing is probed and the cost is zero), it runs
+`fleet-switchboard gates-check <repo#N> --for ready|merge --json` with a bound of **3 seconds** (`FLEET_SHIM_GATE_SECONDS`, kept
+between 0.2 and 10), after which the child is killed and the command goes on. The check itself records `gate.would_refuse` in the
+audit (shadow) and its own `gate.fail_open`. What the shim adds is a line in `gate-failopen.jsonl` in the state directory (mode
+0600, at most 256 KB) for the cases only the shim can see: `would_refuse` (the check exited 10), `fail_open` (it timed out, could not
+run or exited with anything else, or there is no switchboard). **The file is written by any local process, so the daemon must read it as
+untrusted text** (clipped, data only); nothing reads it yet.
+
+Shapes it probes: `pr ready <n>` and `pr merge <n>` with a number, `-R/--repo owner/repo`, or a PR URL
+(`https://github.com/owner/repo/pull/N`); a bare number uses the caller's own repo from `whoami --json` (the #138 identity, unchanged).
+Shapes it does **not** probe, and passes through: no PR argument (the current branch), a branch name, more than one positional, an
+unknown flag, `ready --undo`, `--`, and `pr create` (a new PR has no number before the command runs, so it is checked after
+creation in a later slice). A PR URL of a fork is another repo: not listed, not probed. The switchboard's own `gh` calls
+(`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
+unchanged.
