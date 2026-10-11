@@ -18,3 +18,5 @@ python3 tools/cos-permissions-proof/run.py [--only allowed|hostile] [--out resul
 
 Needs `opencode` v2 on PATH and python3. About 20 seconds for the whole corpus with 3 jobs.
 Note: an agent definition with a `name:` key makes OpenCode v2 ignore the whole `permissions:` list; the proof would show everything running.
+
+Update (focus principle): the corpus is now the job's real shapes (`allowed`) and a short out-of-job list (`hostile`); `@TEMP@` stands for the opencode temp dir. The rules are written by `gen_permissions.py`.
