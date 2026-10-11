@@ -11808,6 +11808,46 @@ def cmd_verdict(args, runner, now):
     return EXIT_OK
 
 
+def cmd_waive(args, runner, now):
+    """`waive <repo#N> --gates G0a,G1 --reason "..."`: the logged override of G0 to G5 for ONE PR at ITS CURRENT HEAD, for a hotfix.
+    The chief of staff or a person at a shell only (an unknown session is refused, never read as a person: #138); never G6, G7 or
+    G8; a reason of at least WAIVER_REASON_MIN characters; never by a writer of the PR. A ledger entry (kind `waiver`, hash-chained)
+    and an audit line. It lasts WAIVER_SECONDS (the due date of the retroactive plan) and covers the head it was recorded at: a push
+    needs a new one. `gates` shows the gate as `waived`, never as passed."""
+    engine, state, config = build_engine(runner, now, "cli")
+    kind = gates_caller_kind(runner, now)   # THE shared check: a person path needs the owner's own terminal (#164), no second copy
+    ok = kind[0] == "person" or (kind[0] == "agent" and kind[2] == "chief-of-staff")
+    who = kind[1]
+    gates, why = plan_ledger.parse_waiver_gates(args.gates)
+    if ok and why is None and len(" ".join((args.reason or "").split())) < plan_ledger.WAIVER_REASON_MIN:
+        why = "a reason of at least %d characters is required: say why this PR may skip the gates" % plan_ledger.WAIVER_REASON_MIN
+    if not ok or why is not None:
+        _gates_audit(engine, "gate.waiver.refused", args.pr, {"by": who, "gates": args.gates, "why": why or "the caller may not waive"})
+        raise LedgerCommandError("refused: %s" % (why or "%s may not waive gates (the chief of staff, or a person at a shell, may)" % who))
+    repo, number, pr = _ledger_pr(args)
+    entries, problem = plan_ledger.read_ledger(state)
+    if problem:
+        _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "the ledger is not trustworthy"})
+        raise LedgerCommandError("refused: the ledger is not trustworthy, nothing was recorded: %s" % problem)
+    facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
+    ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=unreadable)
+    head = _head_of(ctx, args)
+    writers = plan_ledger.authors_of(entries, pr, senders, (facts or {}).get("author"))
+    if who in writers:
+        _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "a writer of the PR"})
+        raise LedgerCommandError("refused: %s wrote this PR (recorded its proof or sent its notice): a writer cannot waive its own gates" % who)
+    reason = plan_ledger.clip(redact_command_text(" ".join(args.reason.split())), plan_ledger.FIELD_LIMIT)
+    expires = int(now()) + plan_ledger.WAIVER_SECONDS
+    entry = {"kind": "waiver", "pr": pr, "head": head, "gates": gates, "reason": reason, "by": who, "result": "pass",
+             "expires": expires, "evidence": reason}
+    stored = plan_ledger.append_entry(state, entry, now())
+    _gates_audit(engine, "plan.waiver", pr, {"gates": gates, "head": head, "by": who, "reason": reason, "expires": iso(expires),
+                                              "seq": stored["seq"], "chain": stored["hash"]})
+    print("recorded waiver #%d: %s of %s at %s by %s, until %s (the retroactive plan is due then); `gates` shows it as waived, not passed"
+          % (stored["seq"], ",".join(gates), pr, head[:8], who, iso(expires)))
+    return EXIT_OK
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -11821,7 +11861,8 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     ctx = _ledger_context(args, runner, now, False)
     plan = ctx.plan
-    report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
+    report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
+                                        now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -11933,7 +11974,8 @@ def cmd_gates_check(args, runner, now):
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
                     ctx = _ledger_context(ns, runner, now, False)
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
-                                                                ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
+                                                                ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
+                                                                now=now())
                     box["unreadable"] = ctx.unreadable
                 except BaseException as err:  # the answer must reach the caller as a fail-open, not a traceback
                     box["error"] = "%s: %s" % (type(err).__name__, _one_line(str(err), 150))
@@ -12063,8 +12105,8 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 def gates_caller_kind(runner, now):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
-    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` (a later `waive` is the chief of staff's, an
-    agent session, and does not use it; anything that is "only the owner" must). Returns (kind, who[, role]).
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` and `waive` (its chief-of-staff caller is an agent
+    session; its person path asks this function like the rest). Returns (kind, who[, role]).
     "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
     it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
@@ -12283,6 +12325,16 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    waive = sub.add_parser("waive", help="The chief of staff's logged override of gates G0 to G5 for one PR at its head (a hotfix); "
+                                         "never G6, G7 or G8, never by a writer of the PR",
+                           description="Waive gates G0 to G5 for ONE PR at its CURRENT head, for a hotfix: the chief of staff (or a "
+                                       "person at a shell) only, with a reason of at least 20 characters, never G6, G7 or G8 and never "
+                                       "by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive "
+                                       "plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed.")
+    waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5")
+    waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
+    waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
                                          "`gates preflight <repo>`")
@@ -14902,9 +14954,10 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_report(args, runner, now)
         if args.action == "notice":
             return cmd_notice(args, runner, now)
-        if args.action in ("prove", "verdict", "gates", "gates-check"):  # #107: state and GETs only; never ensures the daemon
+        if args.action in ("prove", "verdict", "waive", "gates", "gates-check"):  # #107: state and GETs only; never ensures the daemon
             try:
-                return {"prove": cmd_prove, "verdict": cmd_verdict, "gates": cmd_gates, "gates-check": cmd_gates_check}[args.action](args, runner, now)
+                return {"prove": cmd_prove, "verdict": cmd_verdict, "waive": cmd_waive, "gates": cmd_gates,
+                        "gates-check": cmd_gates_check}[args.action](args, runner, now)
             except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
                 sys.stderr.write("%s: %s: %s\n" % (PROG, args.action, _one_line(str(err), 400)))
                 return EXIT_USAGE

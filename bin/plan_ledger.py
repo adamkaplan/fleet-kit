@@ -16,12 +16,13 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
-KINDS = ("proof", "verdict", "consensus")   # a consensus entry is written by the plan review engine (a later slice); read here
+KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice); read here
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -100,7 +101,7 @@ def append_entry(state_dir, entry, now):
     """Add `entry` to the ledger under an exclusive lock: seq, time, prev and hash are set here. Refuses when the
     existing chain is broken (a tampered ledger takes no new entry). Returns the stored entry."""
     if entry.get("kind") not in KINDS or entry.get("result") not in RESULTS:
-        raise LedgerError("an entry is a proof or a verdict with a result of pass or fail")
+        raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail")
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -156,6 +157,47 @@ def may_record_verdict(evaluator, caller, allowed, authors):
                            "in the switchboard config" % (evaluator, evaluator))
         return False, "%s is not registered to record %s verdicts" % (caller, evaluator)
     return True, None
+
+
+# ----------------------------------------------------------------------------------- waivers
+
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5")   # G0 to G5: what the chief of staff may waive for a hotfix
+NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
+WAIVER_REASON_MIN = 20
+WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
+
+
+def parse_waiver_gates(text):
+    """([gate ids], error): `G0a,G1,G4` (G2 or G3 mean the one `G2/G3` gate). The error names what was refused and why."""
+    chosen = []
+    for raw in (text or "").replace(" ", "").split(","):
+        if not raw:
+            continue
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3"}.get(raw, raw[:1].upper() + raw[1:])
+        if gate in NEVER_WAIVABLE:
+            return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
+        if gate not in WAIVABLE:
+            return [], "%r is not a gate that can be waived (%s)" % (raw, ", ".join(WAIVABLE))
+        if gate not in chosen:
+            chosen.append(gate)
+    return (chosen, None) if chosen else ([], "name the gates to waive: --gates G0a,G1,...")
+
+
+def valid_waivers(entries, pr, head, now):
+    """{gate: waiver entry}: the waivers of this PR recorded AT THIS HEAD that have not expired at `now`, newest first win. A
+    waiver for another head, for another PR or past its expiry is not here; neither is a gate that can never be waived."""
+    found = {}
+    if not head:
+        return found
+    for entry in entries:
+        if entry.get("kind") != "waiver" or entry.get("pr") != pr or entry.get("head") != head:
+            continue
+        if not isinstance(entry.get("expires"), (int, float)) or entry["expires"] <= now:
+            continue
+        for gate in entry.get("gates") or ():
+            if gate in WAIVABLE:
+                found[gate] = entry
+    return found
 
 
 # ----------------------------------------------------------------------------------- the gates
@@ -226,7 +268,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
-def evaluate_gates(plan, entries, ledger_problem, facts, pr):
+def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
 
@@ -294,8 +336,18 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr):
         for row in rows:
             if row["gate"] == "G1" and row["status"] == "ok":
                 row.update(status="missing", missing=["the ledger is not trustworthy: %s" % ledger_problem])
-    ready = all(r["status"] in ("ok", "n/a", "untracked") for r in rows)
-    return {"gates": rows, "ready": ready, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
+    waived = []
+    if now is not None and head and not ledger_problem:   # an untrustworthy ledger honours no waiver
+        waivers = valid_waivers(entries, pr, head, now)
+        for row in rows:
+            entry = waivers.get(row["gate"])
+            if entry is not None and row["status"] == "missing":
+                row.update(status="waived", was_missing=row["missing"], missing=[],
+                           detail="waived (by %s, %s, due %s)" % (entry.get("by") or "?", entry.get("reason") or "no reason",
+                                                                time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(entry["expires"]))))
+                waived.append(row["gate"])
+    ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
+    return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
             "ledger_problem": ledger_problem}
 
@@ -304,7 +356,8 @@ def render_gates(report, pr):
     """The lines `gates` prints."""
     lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8],
                                           "READY on the gates it tracks (this is not approval: see the untracked list)"
-                                          if report["ready"] else "NOT READY"),
+                                          if report["ready"] else "NOT READY") + (
+                 "; WAIVED (not passed): %s" % ", ".join(report["waived"]) if report.get("waived") else ""),
              "plan hash: %s" % (report.get("plan_hash") or "none")]
     if report.get("ledger_problem"):
         lines.append("LEDGER: %s" % report["ledger_problem"])
