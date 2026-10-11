@@ -18281,6 +18281,55 @@ class TestCiRecordPass(LedgerBase):
         self.go(advance=sb.CI_RECORD_TTL + 1)
         self.assertEqual(len(self.verdicts()), 2, "the same head and plan record nothing twice")
 
+    def view_calls(self):
+        calls = []
+        base = self.route
+
+        def watch(argv, **kw):
+            if argv[0] == FAKE_GH and argv[1] == "pr":
+                calls.append(argv[3])
+            return base(argv, **kw)
+        self.route = watch
+        return calls
+
+    def simulate(self, minutes=15, step=5):
+        for _ in range(int(minutes * 60 / step)):
+            self.go(advance=step)
+
+    def test_an_unreadable_pr_backs_off_and_is_not_re_read_every_pass(self):
+        calls = self.view_calls()
+        self.gh_down = True
+        self.simulate(minutes=16)      # a 5 s daemon loop for 16 minutes: 192 passes
+        self.assertLessEqual(len(calls), 4, calls)
+        self.assertGreaterEqual(len(calls), 2, "it is retried, with a delay that doubles (5, 10, 20, then 30 minutes)")
+        errors = [e["detail"]["retry_in"] for e in self.world.audit() if e["event"] == "ci_record.error"]
+        self.assertEqual(errors[:3], [300, 600, 1200])
+        self.gh_down = False
+        self.go(advance=3600)
+        self.assertEqual(len(self.verdicts()), 2, "and it recovers once it can be read")
+
+    def test_a_pr_whose_head_moved_since_the_list_is_re_checked_at_the_next_list_refresh_not_every_pass(self):
+        calls = self.view_calls()
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD            # the list still says LEDGER_HEAD
+        self.simulate(minutes=16)
+        self.assertLessEqual(len(calls), 3, calls)
+        self.assertEqual(len(self.hub.reads), 1 + 1, "the list is read at the start and once more after 15 minutes")
+        self.hub.prs["acme/app"] = [self.listed(9, head=LEDGER_NEW_HEAD)]
+        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.assertTrue(all(v[3] == LEDGER_NEW_HEAD for v in self.verdicts()))
+
+    def test_a_steady_pr_is_checked_about_once_per_cache_interval_and_stays_inside_the_budget(self):
+        calls = self.view_calls()
+        self.simulate(minutes=60)
+        self.assertLessEqual(len(calls), 5, "one check per 15 minutes for an hour")
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}, "ci_record": {"calls_per_pass": 5}}}
+        self.configure(evaluators={"ci": ["switchboard"]})
+        del self.engine_cached
+        self.hub.prs["acme/app"] = [self.listed(n) for n in range(20, 30)]
+        calls.clear()
+        self.go()
+        self.assertLessEqual(len(calls), 1, "a budget of 5 calls: the list read and at most one PR")
+
     def test_a_push_is_picked_up_after_the_list_cache_and_recorded_at_the_new_head(self):
         self.go()
         self.pr["headRefOid"] = LEDGER_NEW_HEAD

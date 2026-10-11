@@ -4184,7 +4184,9 @@ open-PR list through the hub, each PR through `gh pr view`, the plan through the
 noted (`ci_record.unreadable`) and the old list kept; a PR that fails to read is noted (`ci_record.error`) and the next one still runs.
 
 **Budgeted like the triage.** `plan_gates.ci_record` takes `enabled` (default true), `calls_per_pass` (default 30, 4 to 100) and `pass_seconds` (default 10, 1 to
-60). Each repo's open-PR list is cached for **15 minutes** (so a push is noticed within a quarter of an hour; `gates ci-record <pr>` records at once), a PR already
-checked at its current head is not read again within 15 minutes, and each PR is charged 4 calls up front. The pass is off while the global `plan-gates.off` file
+60). Each repo's open-PR list is cached for **15 minutes** (so a push is noticed within a quarter of an hour; `gates ci-record <pr>` records at once), a PR is due again only 15 minutes after it was last **checked**
+(the skip keys on when it was checked, not on what the check found); one that is **unreadable** is retried after 5 minutes, doubling to at most 30 (`ci_record.error` carries
+`retry_in`); one whose **head moved since the list** is checked again at the next list refresh, not every pass; a head the refreshed list shows differently is due at once.
+Each PR is charged 4 calls up front. A simulated 5-second loop makes a handful of reads in 15 minutes, not one per pass. The pass is off while the global `plan-gates.off` file
 exists. This slice also fixes `gates preflight`, which did not consult the recorder's proof (so it said BLOCKED even after a successful record) and made `gates mode`
 keep the `ci_record` settings when it rewrites the config.
