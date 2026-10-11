@@ -4241,5 +4241,5 @@ of Staff's label is still forgotten, and the triage's **T10** (closed but still 
 asks for the close-out. What the owner sees in the window: an issue the fleet closed and forgot to unlabel appears in the panel as
 `<title> (closed)` from the next pass until the label is removed. T10 comes after the 10 minute grace that follows the close
 (`TRIAGE_T10_GRACE`) plus up to 15 minutes for the cached closed-issue list, so the owner can see such a row for roughly 10 to 25
-minutes before T10 exists as a finding, and T10 wakes the Chief of Staff only when `triage.enabled` is true (in shadow it is audited
+minutes before T10 exists as a finding (a close by one of OUR logins, `closed_by` in the issue record, gets no grace: our agents unlabel in the same sweep, so a label still set is their miss and T10 is a finding at once; a closer the record does not name keeps the grace), and T10 wakes the Chief of Staff only when `triage.enabled` is true (in shadow it is audited
 only). The panel is read-only: nothing is written to GitHub.
