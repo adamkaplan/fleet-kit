@@ -4077,3 +4077,10 @@ It uses the same configuration as `gates-check`: only a repo listed under `plan_
 the intent repo) is checked; `enabled: false` and the global `plan-gates.off` file (logged as `gate.killed`) switch it off; the
 counters in `status` include it. A `--resume` is not checked. The design exempts a hotfix and the gate engine's own repair
 assignments from the launch gate; the check cannot tell them apart yet, so the enforcing slice needs a way to say so.
+
+### The Chief of Staff and the plan gates
+
+Allowed for the Chief of Staff (and its subagent): `fleet-switchboard gates` (read, `gates mode <repo> shadow|enforce|off`, `gates off`, `gates preflight <repo>`, `gates status`) and `fleet-switchboard waive <repo#N> ...`.
+Denied: `gates on` (re-enabling every repo stays the owner's), a `waive` naming G6 or G8, and any write to the switchboard config or state files (the config dirs are read-only for it).
+The CLI is the lock, as for `decisions`: `gates mode <repo> enforce` is refused unless the preflight passes (tested for the chief-of-staff role), a mode change is audited, and the design's `waive`
+(logged, reason of at least 20 characters, never G6 or G8, only the chief of staff) is specified in `docs/plan-gate-engine-design.md`; the `waive` subcommand itself is not in the CLI yet, so allowing it here only prepares the permission.

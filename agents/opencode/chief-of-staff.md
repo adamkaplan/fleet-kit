@@ -124,6 +124,15 @@ permissions:
     resource: "fleet-switchboard launch *"
     effect: allow
   - action: "shell"
+    resource: "fleet-switchboard gates"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard gates *"
+    effect: allow
+  - action: "shell"
+    resource: "fleet-switchboard waive *"
+    effect: allow
+  - action: "shell"
     resource: "fleet-switchboard handoff *"
     effect: allow
   - action: "shell"
@@ -1835,6 +1844,30 @@ permissions:
     effect: deny
   - action: "shell"
     resource: "timeout * fleet-switchboard decisions batch*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard gates on*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard gates on*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *G6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *G6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *G8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *G8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard waive *--gates*G6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard waive *--gates*G6*"
     effect: deny
   - action: "shell"
     resource: "fleet-switchboard launch *--agent chief-of-staff*"

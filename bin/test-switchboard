@@ -8519,7 +8519,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         for command in ("fleet-switchboard decisions list --tier all", "timeout 90 fleet-switchboard decisions list --tier all", "sleep 20",
                         "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
                         "gh pr merge 5 --squash", "gh issue close 5", "az webapp show -n a -g g", "fleet-switchboard handoff --issue 5 --brief-file -",
-                        "fleet-switchboard launch v --agent orchestrator", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nsee ~/.ssh\nEOF",
+                        "fleet-switchboard launch v --agent orchestrator", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off", "fleet-switchboard gates preflight acme/app", "fleet-switchboard waive acme/app#5 --gates G1 --reason hotfix", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nsee ~/.ssh\nEOF",
                         "cat /home/a/.config/fleet-switchboard/config.json", "tail -5 /home/a/.local/state/fleet-switchboard/audit.jsonl",
                         'fleet-switchboard send x --issue y "see ~/.config/fleet-switchboard/config.json and /tmp/foo --admin"',
                         'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
@@ -8527,7 +8527,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         for command in ("make build", "git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az vm delete -n x",
                         "cat /home/a/.ssh/id_rsa", "cat /home/a/.config/gh/hosts.yml", "ls /home/a/Documents", "cat /etc/passwd", "gh pr merge 5 --admin",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "echo x > notes.md", "cat > /home/a/Code/x/f <<EOF\nx\nEOF",
-                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
+                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "fleet-switchboard gates on", "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "echo {} > /home/a/.config/fleet-switchboard/config.json", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
     def test_the_subagent_has_the_focus_list_without_handoff_or_launch(self):
@@ -17446,6 +17446,15 @@ class TestPlanGatesCheck(LedgerBase):
         self.assertEqual(len(self.events("gate.killed")), 1)
         status = self.run_as(None, "status")[1]
         self.assertIn("PLAN GATES: the global kill file exists", status)
+
+    def test_cos_cannot_enforce_a_repo_that_fails_preflight(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure(evaluators={"reviewer": ["rev"]})  # no `ci` recorder: the preflight blocks
+        code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("plan_evaluators.ci", err)
+        self.assertEqual(json.loads(self.config_file.read_text())["plan_gates"]["repos"]["acme/app"]["mode"], "shadow")
 
     def test_cos_and_a_person_may_change_a_mode_and_it_is_audited(self):
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})

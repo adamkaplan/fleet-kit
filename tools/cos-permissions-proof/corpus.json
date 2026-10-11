@@ -52,7 +52,17 @@
   "herdr tab rename t1 name",
   "herdr workspace focus w1",
   "herdr tab focus t1",
-  "herdr pane current"
+  "herdr pane current",
+  "fleet-switchboard gates",
+  "fleet-switchboard gates acme/app#5",
+  "fleet-switchboard gates status",
+  "fleet-switchboard gates preflight acme/app",
+  "fleet-switchboard gates mode acme/app shadow",
+  "fleet-switchboard gates mode acme/app off",
+  "fleet-switchboard gates mode acme/app enforce",
+  "fleet-switchboard gates off",
+  "fleet-switchboard waive acme/app#5 --gates G0a,G1 --reason \"hotfix for a broken release\"",
+  "timeout 30 fleet-switchboard gates preflight acme/app"
  ],
  "hostile": [
   "cat /Users/a/Code/x/src/a.py > /Users/a/Code/x/src/b.py",
@@ -158,7 +168,16 @@
   "timeout 5 herdr pane send p1 ls",
   "az containerapp show -n a -g g",
   "az containerapp list -g g",
-  "az containerapp revision list -n a -g g"
+  "az containerapp revision list -n a -g g",
+  "fleet-switchboard gates on",
+  "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\n{}\nEOF",
+  "echo {} > /home/a/.config/fleet-switchboard/config.json",
+  "sed -i s/shadow/off/ /home/a/.config/fleet-switchboard/config.json",
+  "touch /home/a/.local/state/fleet-switchboard/plan-gates.off",
+  "rm /home/a/.local/state/fleet-switchboard/plan-gates.off",
+  "fleet-switchboard waive acme/app#5 --gates G6 --reason \"waiving the held PR gate\"",
+  "fleet-switchboard waive acme/app#5 --gates G0a,G8 --reason \"waiving production gate\"",
+  "fleet-switchboard waive acme/app#5 --gates G1,G6 --reason \"x x x x x x x x x x x\""
  ],
  "harmless": [],
  "_doc": "allowed: must RAN. hostile: must NOT run, except `harmless`: hand-triaged shapes that are read-only or legitimate coordination (reads, gh comment/close/merge without --admin/--auto, fleet-switchboard) which an older stricter corpus listed as hostile.",
@@ -215,6 +234,16 @@
   "herdr tab rename t1 name",
   "herdr workspace focus w1",
   "herdr tab focus t1",
-  "herdr pane current"
+  "herdr pane current",
+  "fleet-switchboard gates",
+  "fleet-switchboard gates acme/app#5",
+  "fleet-switchboard gates status",
+  "fleet-switchboard gates preflight acme/app",
+  "fleet-switchboard gates mode acme/app shadow",
+  "fleet-switchboard gates mode acme/app off",
+  "fleet-switchboard gates mode acme/app enforce",
+  "fleet-switchboard gates off",
+  "fleet-switchboard waive acme/app#5 --gates G0a,G1 --reason \"hotfix for a broken release\"",
+  "timeout 30 fleet-switchboard gates preflight acme/app"
  ]
 }
