@@ -322,13 +322,13 @@ permissions:
     resource: "herdr pane process-info *"
     effect: allow
   - action: "shell"
+    resource: "git status *"
+    effect: allow
+  - action: "shell"
     resource: "git log *"
     effect: allow
   - action: "shell"
     resource: "git show *"
-    effect: allow
-  - action: "shell"
-    resource: "git status *"
     effect: allow
   - action: "shell"
     resource: "git diff *"
@@ -337,16 +337,1285 @@ permissions:
     resource: "git rev-parse *"
     effect: allow
   - action: "shell"
-    resource: "git grep *"
+    resource: "git rev-list *"
     effect: allow
   - action: "shell"
-    resource: "git branch *"
+    resource: "git for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git merge-base *"
     effect: allow
   - action: "shell"
     resource: "git blame *"
     effect: allow
   - action: "shell"
+    resource: "git describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git cat-file *"
+    effect: allow
+  - action: "shell"
     resource: "git ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git remote"
+    effect: allow
+  - action: "shell"
+    resource: "git remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git tag"
+    effect: allow
+  - action: "shell"
+    resource: "git tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --git-dir=* reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager -C * reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --no-pager reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git --no-pager --git-dir=* reflog"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* status *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* log *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* diff *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* rev-parse *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* rev-list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* for-each-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* merge-base *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* blame *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* describe *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* shortlog *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* cat-file *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-files *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* show-ref *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* diff-tree *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* name-rev *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* whatchanged *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* count-objects *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* grep *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* ls-remote *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* reflog show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -vv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -a"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -r"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -av"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -avv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -rv"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --show-current"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -l *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --contains *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --no-merged*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch --sort=*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* branch -a --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote -v"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote show *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* remote get-url *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* worktree list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* worktree list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag -l*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* tag --list*"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get-all *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --get-regexp *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --list"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config -l"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* config --list *"
+    effect: allow
+  - action: "shell"
+    resource: "git -C * --git-dir=* reflog"
     effect: allow
   - action: "shell"
     resource: "ls *"
@@ -1066,100 +2335,1540 @@ permissions:
     resource: "timeout * gh *--jq=env*"
     effect: deny
   - action: "shell"
-    resource: "git push*"
+    resource: "git push"
     effect: deny
   - action: "shell"
-    resource: "timeout * git push*"
+    resource: "timeout * git push"
     effect: deny
   - action: "shell"
-    resource: "git commit*"
+    resource: "git push *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git commit*"
+    resource: "timeout * git push *"
     effect: deny
   - action: "shell"
-    resource: "git add*"
+    resource: "git * push *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git add*"
+    resource: "timeout * git * push *"
     effect: deny
   - action: "shell"
-    resource: "git checkout*"
+    resource: "git * push"
     effect: deny
   - action: "shell"
-    resource: "timeout * git checkout*"
+    resource: "timeout * git * push"
     effect: deny
   - action: "shell"
-    resource: "git switch*"
+    resource: "git commit"
     effect: deny
   - action: "shell"
-    resource: "timeout * git switch*"
+    resource: "timeout * git commit"
     effect: deny
   - action: "shell"
-    resource: "git reset*"
+    resource: "git commit *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git reset*"
+    resource: "timeout * git commit *"
     effect: deny
   - action: "shell"
-    resource: "git clone*"
+    resource: "git * commit *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git clone*"
+    resource: "timeout * git * commit *"
     effect: deny
   - action: "shell"
-    resource: "git fetch*"
+    resource: "git * commit"
     effect: deny
   - action: "shell"
-    resource: "timeout * git fetch*"
+    resource: "timeout * git * commit"
     effect: deny
   - action: "shell"
-    resource: "git pull*"
+    resource: "git add"
     effect: deny
   - action: "shell"
-    resource: "timeout * git pull*"
+    resource: "timeout * git add"
     effect: deny
   - action: "shell"
-    resource: "git merge*"
+    resource: "git add *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git merge*"
+    resource: "timeout * git add *"
     effect: deny
   - action: "shell"
-    resource: "git rebase*"
+    resource: "git * add *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git rebase*"
+    resource: "timeout * git * add *"
     effect: deny
   - action: "shell"
-    resource: "git stash*"
+    resource: "git * add"
     effect: deny
   - action: "shell"
-    resource: "timeout * git stash*"
+    resource: "timeout * git * add"
     effect: deny
   - action: "shell"
-    resource: "git tag*"
+    resource: "git rm"
     effect: deny
   - action: "shell"
-    resource: "timeout * git tag*"
+    resource: "timeout * git rm"
     effect: deny
   - action: "shell"
-    resource: "git config*"
+    resource: "git rm *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git config*"
+    resource: "timeout * git rm *"
     effect: deny
   - action: "shell"
-    resource: "git remote*"
+    resource: "git * rm *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git remote*"
+    resource: "timeout * git * rm *"
     effect: deny
   - action: "shell"
-    resource: "git worktree*"
+    resource: "git * rm"
     effect: deny
   - action: "shell"
-    resource: "timeout * git worktree*"
+    resource: "timeout * git * rm"
+    effect: deny
+  - action: "shell"
+    resource: "git mv"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mv"
+    effect: deny
+  - action: "shell"
+    resource: "git mv *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mv *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mv *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mv *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mv"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mv"
+    effect: deny
+  - action: "shell"
+    resource: "git checkout"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git checkout"
+    effect: deny
+  - action: "shell"
+    resource: "git checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "git * checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * checkout *"
+    effect: deny
+  - action: "shell"
+    resource: "git * checkout"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * checkout"
+    effect: deny
+  - action: "shell"
+    resource: "git switch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git switch"
+    effect: deny
+  - action: "shell"
+    resource: "git switch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git switch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * switch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * switch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * switch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * switch"
+    effect: deny
+  - action: "shell"
+    resource: "git restore"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git restore"
+    effect: deny
+  - action: "shell"
+    resource: "git restore *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git restore *"
+    effect: deny
+  - action: "shell"
+    resource: "git * restore *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * restore *"
+    effect: deny
+  - action: "shell"
+    resource: "git * restore"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * restore"
+    effect: deny
+  - action: "shell"
+    resource: "git reset"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reset"
+    effect: deny
+  - action: "shell"
+    resource: "git reset *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reset *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reset *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reset *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reset"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reset"
+    effect: deny
+  - action: "shell"
+    resource: "git revert"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git revert"
+    effect: deny
+  - action: "shell"
+    resource: "git revert *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git revert *"
+    effect: deny
+  - action: "shell"
+    resource: "git * revert *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * revert *"
+    effect: deny
+  - action: "shell"
+    resource: "git * revert"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * revert"
+    effect: deny
+  - action: "shell"
+    resource: "git cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "git cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "git * cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * cherry-pick *"
+    effect: deny
+  - action: "shell"
+    resource: "git * cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * cherry-pick"
+    effect: deny
+  - action: "shell"
+    resource: "git merge"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git merge"
+    effect: deny
+  - action: "shell"
+    resource: "git merge *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git merge *"
+    effect: deny
+  - action: "shell"
+    resource: "git * merge *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * merge *"
+    effect: deny
+  - action: "shell"
+    resource: "git * merge"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * merge"
+    effect: deny
+  - action: "shell"
+    resource: "git rebase"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git rebase"
+    effect: deny
+  - action: "shell"
+    resource: "git rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "git * rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * rebase *"
+    effect: deny
+  - action: "shell"
+    resource: "git * rebase"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * rebase"
+    effect: deny
+  - action: "shell"
+    resource: "git stash"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git stash"
+    effect: deny
+  - action: "shell"
+    resource: "git stash *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git stash *"
+    effect: deny
+  - action: "shell"
+    resource: "git * stash *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * stash *"
+    effect: deny
+  - action: "shell"
+    resource: "git * stash"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * stash"
+    effect: deny
+  - action: "shell"
+    resource: "git apply"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git apply"
+    effect: deny
+  - action: "shell"
+    resource: "git apply *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git apply *"
+    effect: deny
+  - action: "shell"
+    resource: "git * apply *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * apply *"
+    effect: deny
+  - action: "shell"
+    resource: "git * apply"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * apply"
+    effect: deny
+  - action: "shell"
+    resource: "git am"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git am"
+    effect: deny
+  - action: "shell"
+    resource: "git am *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git am *"
+    effect: deny
+  - action: "shell"
+    resource: "git * am *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * am *"
+    effect: deny
+  - action: "shell"
+    resource: "git * am"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * am"
+    effect: deny
+  - action: "shell"
+    resource: "git fetch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fetch"
+    effect: deny
+  - action: "shell"
+    resource: "git fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fetch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fetch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fetch"
+    effect: deny
+  - action: "shell"
+    resource: "git pull"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pull"
+    effect: deny
+  - action: "shell"
+    resource: "git pull *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pull *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pull *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pull *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pull"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pull"
+    effect: deny
+  - action: "shell"
+    resource: "git clone"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clone"
+    effect: deny
+  - action: "shell"
+    resource: "git clone *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clone *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clone *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clone *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clone"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clone"
+    effect: deny
+  - action: "shell"
+    resource: "git init"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git init"
+    effect: deny
+  - action: "shell"
+    resource: "git init *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git init *"
+    effect: deny
+  - action: "shell"
+    resource: "git * init *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * init *"
+    effect: deny
+  - action: "shell"
+    resource: "git * init"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * init"
+    effect: deny
+  - action: "shell"
+    resource: "git submodule"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git submodule"
+    effect: deny
+  - action: "shell"
+    resource: "git submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "git * submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * submodule *"
+    effect: deny
+  - action: "shell"
+    resource: "git * submodule"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * submodule"
+    effect: deny
+  - action: "shell"
+    resource: "git update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-branch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-branch"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "git filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-repo *"
+    effect: deny
+  - action: "shell"
+    resource: "git * filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * filter-repo"
+    effect: deny
+  - action: "shell"
+    resource: "git gc"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git gc"
+    effect: deny
+  - action: "shell"
+    resource: "git gc *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git gc *"
+    effect: deny
+  - action: "shell"
+    resource: "git * gc *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * gc *"
+    effect: deny
+  - action: "shell"
+    resource: "git * gc"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * gc"
+    effect: deny
+  - action: "shell"
+    resource: "git prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git prune"
+    effect: deny
+  - action: "shell"
+    resource: "git prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * prune"
+    effect: deny
+  - action: "shell"
+    resource: "git clean"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clean"
+    effect: deny
+  - action: "shell"
+    resource: "git clean *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git clean *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clean *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clean *"
+    effect: deny
+  - action: "shell"
+    resource: "git * clean"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * clean"
+    effect: deny
+  - action: "shell"
+    resource: "git replace"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git replace"
+    effect: deny
+  - action: "shell"
+    resource: "git replace *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git replace *"
+    effect: deny
+  - action: "shell"
+    resource: "git * replace *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * replace *"
+    effect: deny
+  - action: "shell"
+    resource: "git * replace"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * replace"
+    effect: deny
+  - action: "shell"
+    resource: "git notes"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git notes"
+    effect: deny
+  - action: "shell"
+    resource: "git notes *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git notes *"
+    effect: deny
+  - action: "shell"
+    resource: "git * notes *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * notes *"
+    effect: deny
+  - action: "shell"
+    resource: "git * notes"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * notes"
+    effect: deny
+  - action: "shell"
+    resource: "git bisect"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bisect"
+    effect: deny
+  - action: "shell"
+    resource: "git bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bisect *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bisect"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bisect"
+    effect: deny
+  - action: "shell"
+    resource: "git maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "git maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "git * maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * maintenance *"
+    effect: deny
+  - action: "shell"
+    resource: "git * maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * maintenance"
+    effect: deny
+  - action: "shell"
+    resource: "git repack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git repack"
+    effect: deny
+  - action: "shell"
+    resource: "git repack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git repack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * repack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * repack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * repack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * repack"
+    effect: deny
+  - action: "shell"
+    resource: "git pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "git pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pack-refs *"
+    effect: deny
+  - action: "shell"
+    resource: "git * pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * pack-refs"
+    effect: deny
+  - action: "shell"
+    resource: "git symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * symbolic-ref *"
+    effect: deny
+  - action: "shell"
+    resource: "git * symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * symbolic-ref"
+    effect: deny
+  - action: "shell"
+    resource: "git update-index"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-index"
+    effect: deny
+  - action: "shell"
+    resource: "git update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-index *"
+    effect: deny
+  - action: "shell"
+    resource: "git * update-index"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * update-index"
+    effect: deny
+  - action: "shell"
+    resource: "git write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * write-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * write-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * commit-tree *"
+    effect: deny
+  - action: "shell"
+    resource: "git * commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * commit-tree"
+    effect: deny
+  - action: "shell"
+    resource: "git hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "git hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "git * hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * hash-object *"
+    effect: deny
+  - action: "shell"
+    resource: "git * hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * hash-object"
+    effect: deny
+  - action: "shell"
+    resource: "git mktag"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mktag"
+    effect: deny
+  - action: "shell"
+    resource: "git mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mktag *"
+    effect: deny
+  - action: "shell"
+    resource: "git * mktag"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * mktag"
+    effect: deny
+  - action: "shell"
+    resource: "git format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "git format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * format-patch *"
+    effect: deny
+  - action: "shell"
+    resource: "git * format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * format-patch"
+    effect: deny
+  - action: "shell"
+    resource: "git send-email"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git send-email"
+    effect: deny
+  - action: "shell"
+    resource: "git send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "git * send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * send-email *"
+    effect: deny
+  - action: "shell"
+    resource: "git * send-email"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * send-email"
+    effect: deny
+  - action: "shell"
+    resource: "git archive"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git archive"
+    effect: deny
+  - action: "shell"
+    resource: "git archive *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git archive *"
+    effect: deny
+  - action: "shell"
+    resource: "git * archive *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * archive *"
+    effect: deny
+  - action: "shell"
+    resource: "git * archive"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * archive"
+    effect: deny
+  - action: "shell"
+    resource: "git bundle"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bundle"
+    effect: deny
+  - action: "shell"
+    resource: "git bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bundle *"
+    effect: deny
+  - action: "shell"
+    resource: "git * bundle"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * bundle"
+    effect: deny
+  - action: "shell"
+    resource: "git fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "git fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fast-import *"
+    effect: deny
+  - action: "shell"
+    resource: "git * fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * fast-import"
+    effect: deny
+  - action: "shell"
+    resource: "git unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "git unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "git * unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * unpack-objects *"
+    effect: deny
+  - action: "shell"
+    resource: "git * unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * unpack-objects"
+    effect: deny
+  - action: "shell"
+    resource: "git index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "git index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * index-pack *"
+    effect: deny
+  - action: "shell"
+    resource: "git * index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * index-pack"
+    effect: deny
+  - action: "shell"
+    resource: "git remote add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote add"
+    effect: deny
+  - action: "shell"
+    resource: "git remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote add"
+    effect: deny
+  - action: "shell"
+    resource: "git remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "git remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote remove"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rm *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rm"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "git remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rename *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote rename"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-url *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-url"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-head *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-head"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "git remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-branches *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote set-branches"
+    effect: deny
+  - action: "shell"
+    resource: "git remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "git remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote prune"
+    effect: deny
+  - action: "shell"
+    resource: "git remote update"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote update"
+    effect: deny
+  - action: "shell"
+    resource: "git remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote update *"
+    effect: deny
+  - action: "shell"
+    resource: "git * remote update"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * remote update"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree add *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree add"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree remove *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree remove"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree prune *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree prune"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree move *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree move"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree lock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree lock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree unlock *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree unlock"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "git worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree repair *"
+    effect: deny
+  - action: "shell"
+    resource: "git * worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * worktree repair"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog expire *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog expire"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "git reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git * reflog delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * reflog delete"
     effect: deny
   - action: "shell"
     resource: "git * --output*"
@@ -1198,16 +3907,1510 @@ permissions:
     resource: "timeout * git grep *--open-files-in-pager*"
     effect: deny
   - action: "shell"
+    resource: "git *ext::*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *ext::*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --upload-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --upload-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --receive-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --receive-pack*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --exec*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --exec*"
+    effect: deny
+  - action: "shell"
+    resource: "git *--config-env*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *--config-env*"
+    effect: deny
+  - action: "shell"
+    resource: "git --exec-path*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --exec-path*"
+    effect: deny
+  - action: "shell"
+    resource: "git -p *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -p *"
+    effect: deny
+  - action: "shell"
     resource: "git -c *"
     effect: deny
   - action: "shell"
     resource: "timeout * git -c *"
     effect: deny
   - action: "shell"
-    resource: "git -C *"
+    resource: "git -C * -c *"
     effect: deny
   - action: "shell"
-    resource: "timeout * git -C *"
+    resource: "timeout * git -C * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git --no-pager -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --no-pager -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git --git-dir=* -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --git-dir=* -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git * --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "git --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --paginate*"
+    effect: deny
+  - action: "shell"
+    resource: "git --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "git * --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * --work-tree*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--rename-section*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--rename-section*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--remove-section*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--remove-section*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "git config * -e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config * -e"
+    effect: deny
+  - action: "shell"
+    resource: "git config * -e *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config * -e *"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--file*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--global*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--global*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--system*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--system*"
+    effect: deny
+  - action: "shell"
+    resource: "git config *--local*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git config *--local*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--unset*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--add*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--edit*"
+    effect: deny
+  - action: "shell"
+    resource: "git * config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * config *--replace-all*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -d"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -d *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -d"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -d*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -D"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -D *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -D"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -D*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -m"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -m *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -m"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -m*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -M"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -M *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -M"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -M*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -c"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -c *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -c"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -c*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -C"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -C *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -C"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -C*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -f"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -f *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -f"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -f*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * -u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * -u"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -u *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -u"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -u*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --delete *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --delete"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --delete*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --move"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --move *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --move"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --move"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --move*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --copy *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --copy"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --copy*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --force"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --force"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --force *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --force"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --force"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --force*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --set-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream-to *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --set-upstream-to"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --set-upstream-to*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --unset-upstream *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --unset-upstream"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --unset-upstream*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --edit-description *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --edit-description"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --edit-description*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -a *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -a *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -a"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -a*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -s *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -s *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -s"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -s*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -F *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -F *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * -F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * -F"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag -F*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --annotate *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --annotate *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --annotate"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --annotate"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --annotate*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --sign *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --sign *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --sign"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --sign"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --sign*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --file *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --file *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --file"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --file"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --file*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --create-reflog *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --create-reflog *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --create-reflog"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --create-reflog"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --create-reflog*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --track"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --track *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --track"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "git branch * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git branch * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "git * branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * branch --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --no-track *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --no-track"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --no-track*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag * --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag * --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --recurse-submodules *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --recurse-submodules *"
+    effect: deny
+  - action: "shell"
+    resource: "git tag * --recurse-submodules"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git tag * --recurse-submodules"
+    effect: deny
+  - action: "shell"
+    resource: "git * tag --recurse-submodules*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git * tag --recurse-submodules*"
     effect: deny
   - action: "shell"
     resource: "az * create"
@@ -4630,6 +8833,204 @@ permissions:
     resource: "timeout * git log *secrets*"
     effect: deny
   - action: "shell"
+    resource: "git -C */etc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */etc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */private/etc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */private/etc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */root*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */root*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */var/root*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */var/root*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.ssh*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.ssh*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.aws*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.aws*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.azure*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.azure*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.gnupg*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.gnupg*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/gh*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/gh*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/git*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/git*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.config/gcloud*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.config/gcloud*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.kube*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.kube*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.docker*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.docker*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.netrc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.netrc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.npmrc*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.npmrc*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.zsh_history*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.zsh_history*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.bash_history*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.bash_history*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */.local/share*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */.local/share*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Documents*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Documents*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Desktop*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Desktop*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Downloads*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Downloads*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Pictures*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Pictures*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Movies*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Movies*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Music*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Music*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C */Library*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C */Library*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.env*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.env*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *id_rsa*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *id_rsa*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *id_ed25519*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *id_ed25519*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.pem*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.pem*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *.p12*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *.p12*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *auth.json*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *auth.json*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *credentials*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *credentials*"
+    effect: deny
+  - action: "shell"
+    resource: "git -C *secrets*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git -C *secrets*"
+    effect: deny
+  - action: "shell"
     resource: "cat /*/etc*"
     effect: deny
   - action: "shell"
@@ -5104,106 +9505,19384 @@ permissions:
     resource: "jq *env*"
     effect: deny
   - action: "shell"
-    resource: "ls *>*"
+    resource: "ls *&>*"
     effect: deny
   - action: "shell"
-    resource: "grep *>*"
+    resource: "ls *>"
     effect: deny
   - action: "shell"
-    resource: "head *>*"
+    resource: "ls *>?"
     effect: deny
   - action: "shell"
-    resource: "tail *>*"
+    resource: "ls *>???*"
     effect: deny
   - action: "shell"
-    resource: "wc *>*"
+    resource: "ls *>!?"
     effect: deny
   - action: "shell"
-    resource: "cut *>*"
+    resource: "ls *>\"?"
     effect: deny
   - action: "shell"
-    resource: "sort *>*"
+    resource: "ls *>#?"
     effect: deny
   - action: "shell"
-    resource: "uniq *>*"
+    resource: "ls *>$?"
     effect: deny
   - action: "shell"
-    resource: "tr *>*"
+    resource: "ls *>%?"
     effect: deny
   - action: "shell"
-    resource: "jq *>*"
+    resource: "ls *>'?"
     effect: deny
   - action: "shell"
-    resource: "echo *>*"
+    resource: "ls *>(?"
     effect: deny
   - action: "shell"
-    resource: "printf *>*"
+    resource: "ls *>)?"
     effect: deny
   - action: "shell"
-    resource: "date *>*"
+    resource: "ls *>+?"
     effect: deny
   - action: "shell"
-    resource: "git *>*"
+    resource: "ls *>,?"
     effect: deny
   - action: "shell"
-    resource: "timeout * git *>*"
+    resource: "ls *>-?"
     effect: deny
   - action: "shell"
-    resource: "gh pr view *>*"
+    resource: "ls *>.?"
     effect: deny
   - action: "shell"
-    resource: "timeout * gh pr view *>*"
+    resource: "ls *>/?"
     effect: deny
   - action: "shell"
-    resource: "gh pr list *>*"
+    resource: "ls *>0?"
     effect: deny
   - action: "shell"
-    resource: "timeout * gh pr list *>*"
+    resource: "ls *>1?"
     effect: deny
   - action: "shell"
-    resource: "gh issue view *>*"
+    resource: "ls *>2?"
     effect: deny
   - action: "shell"
-    resource: "timeout * gh issue view *>*"
+    resource: "ls *>3?"
     effect: deny
   - action: "shell"
-    resource: "gh issue list *>*"
+    resource: "ls *>4?"
     effect: deny
   - action: "shell"
-    resource: "timeout * gh issue list *>*"
+    resource: "ls *>5?"
     effect: deny
   - action: "shell"
-    resource: "gh api *>*"
+    resource: "ls *>6?"
     effect: deny
   - action: "shell"
-    resource: "timeout * gh api *>*"
+    resource: "ls *>7?"
     effect: deny
   - action: "shell"
-    resource: "az *>*"
+    resource: "ls *>8?"
     effect: deny
   - action: "shell"
-    resource: "timeout * az *>*"
+    resource: "ls *>9?"
     effect: deny
   - action: "shell"
-    resource: "fleet-switchboard status *>*"
+    resource: "ls *>:?"
     effect: deny
   - action: "shell"
-    resource: "timeout * fleet-switchboard status *>*"
+    resource: "ls *>;?"
     effect: deny
   - action: "shell"
-    resource: "fleet-switchboard pending *>*"
+    resource: "ls *><?"
     effect: deny
   - action: "shell"
-    resource: "timeout * fleet-switchboard pending *>*"
+    resource: "ls *>=?"
     effect: deny
   - action: "shell"
-    resource: "fleet-switchboard decisions *>*"
+    resource: "ls *>>?"
     effect: deny
   - action: "shell"
-    resource: "timeout * fleet-switchboard decisions *>*"
+    resource: "ls *>@?"
     effect: deny
   - action: "shell"
-    resource: "timeout *>*"
+    resource: "ls *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&("
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&."
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&="
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&["
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "ls *>& "
+    effect: deny
+  - action: "shell"
+    resource: "ls *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "grep *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *><?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&("
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&."
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&="
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&["
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "grep *>& "
+    effect: deny
+  - action: "shell"
+    resource: "grep *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "head *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "head *>"
+    effect: deny
+  - action: "shell"
+    resource: "head *>?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "head *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "head *><?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "head *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "head *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&("
+    effect: deny
+  - action: "shell"
+    resource: "head *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&."
+    effect: deny
+  - action: "shell"
+    resource: "head *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&="
+    effect: deny
+  - action: "shell"
+    resource: "head *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&["
+    effect: deny
+  - action: "shell"
+    resource: "head *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "head *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "head *>& "
+    effect: deny
+  - action: "shell"
+    resource: "head *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "tail *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *><?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&("
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&."
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&="
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&["
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "tail *>& "
+    effect: deny
+  - action: "shell"
+    resource: "tail *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "wc *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *><?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&("
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&."
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&="
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&["
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "wc *>& "
+    effect: deny
+  - action: "shell"
+    resource: "wc *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "cut *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *><?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&("
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&."
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&="
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&["
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "cut *>& "
+    effect: deny
+  - action: "shell"
+    resource: "cut *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "sort *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *><?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&("
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&."
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&="
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&["
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "sort *>& "
+    effect: deny
+  - action: "shell"
+    resource: "sort *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *><?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&("
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&."
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&="
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&["
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>& "
+    effect: deny
+  - action: "shell"
+    resource: "uniq *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "tr *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *><?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&("
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&."
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&="
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&["
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "tr *>& "
+    effect: deny
+  - action: "shell"
+    resource: "tr *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "jq *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *><?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&("
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&."
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&="
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&["
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "jq *>& "
+    effect: deny
+  - action: "shell"
+    resource: "jq *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "echo *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *><?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&("
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&."
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&="
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&["
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "echo *>& "
+    effect: deny
+  - action: "shell"
+    resource: "echo *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "printf *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *><?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&("
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&."
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&="
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&["
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "printf *>& "
+    effect: deny
+  - action: "shell"
+    resource: "printf *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "date *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "date *>"
+    effect: deny
+  - action: "shell"
+    resource: "date *>?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "date *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "date *><?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "date *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "date *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&("
+    effect: deny
+  - action: "shell"
+    resource: "date *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&."
+    effect: deny
+  - action: "shell"
+    resource: "date *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&="
+    effect: deny
+  - action: "shell"
+    resource: "date *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&["
+    effect: deny
+  - action: "shell"
+    resource: "date *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "date *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "date *>& "
+    effect: deny
+  - action: "shell"
+    resource: "date *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "git *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "git *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>"
+    effect: deny
+  - action: "shell"
+    resource: "git *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "git *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "git *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *><?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "git *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "git *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&("
+    effect: deny
+  - action: "shell"
+    resource: "git *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&."
+    effect: deny
+  - action: "shell"
+    resource: "git *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&="
+    effect: deny
+  - action: "shell"
+    resource: "git *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&["
+    effect: deny
+  - action: "shell"
+    resource: "git *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "git *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "git *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>& "
+    effect: deny
+  - action: "shell"
+    resource: "git *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * git *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *><?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&("
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&."
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&="
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&["
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>& "
+    effect: deny
+  - action: "shell"
+    resource: "gh pr view *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr view *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *><?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&("
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&."
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&="
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&["
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>& "
+    effect: deny
+  - action: "shell"
+    resource: "gh pr list *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh pr list *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *><?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&("
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&."
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&="
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&["
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>& "
+    effect: deny
+  - action: "shell"
+    resource: "gh issue view *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue view *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *><?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&("
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&."
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&="
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&["
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>& "
+    effect: deny
+  - action: "shell"
+    resource: "gh issue list *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh issue list *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *><?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&("
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&."
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&="
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&["
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>& "
+    effect: deny
+  - action: "shell"
+    resource: "gh api *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * gh api *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "az *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "az *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>"
+    effect: deny
+  - action: "shell"
+    resource: "az *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "az *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "az *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *><?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "az *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "az *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&("
+    effect: deny
+  - action: "shell"
+    resource: "az *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&."
+    effect: deny
+  - action: "shell"
+    resource: "az *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&="
+    effect: deny
+  - action: "shell"
+    resource: "az *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&["
+    effect: deny
+  - action: "shell"
+    resource: "az *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "az *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "az *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>& "
+    effect: deny
+  - action: "shell"
+    resource: "az *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * az *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *><?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&("
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&."
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&="
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&["
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>& "
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard status *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard status *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *><?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&("
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&."
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&="
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&["
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>& "
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard pending *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard pending *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *><?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&("
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&."
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&="
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&["
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>& "
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions *>&\t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *&>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>???*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>!?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>\"?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>#?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>$?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>%?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>'?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>(?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>)?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>+?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>,?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>-?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>.?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>/?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>0?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>1?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>2?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>3?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>4?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>5?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>6?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>7?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>8?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>9?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>:?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>;?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *><?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>=?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>>?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>@?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>A?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>B?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>C?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>D?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>E?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>F?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>G?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>H?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>I?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>J?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>K?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>L?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>M?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>N?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>O?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>P?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>Q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>R?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>S?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>T?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>U?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>V?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>W?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>X?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>Y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>Z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>[?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>\\?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>]?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>^?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>_?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>`?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>a?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>b?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>c?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>d?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>e?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>f?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>g?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>h?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>i?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>j?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>k?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>l?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>m?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>n?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>o?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>p?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>q?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>r?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>s?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>u?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>v?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>w?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>x?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>y?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>z?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>{?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>|?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>}?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>~?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *> ?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>\t?"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&!"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&\""
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&#"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&$"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&%"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&&"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&'"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&("
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&)"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&+"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&,"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&-"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&."
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&/"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&0"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&2"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&3"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&4"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&5"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&6"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&7"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&8"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&9"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&:"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&;"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&<"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&="
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&>"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&@"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&A"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&B"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&C"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&D"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&E"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&F"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&G"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&H"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&I"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&J"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&K"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&L"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&M"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&N"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&O"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&P"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&Q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&R"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&S"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&T"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&U"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&V"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&W"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&X"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&Y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&Z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&["
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&\\"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&]"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&^"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&_"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&`"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&a"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&b"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&c"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&d"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&e"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&f"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&g"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&h"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&i"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&j"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&k"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&l"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&m"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&n"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&o"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&p"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&q"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&r"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&s"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&t"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&u"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&v"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&w"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&x"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&y"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&z"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&{"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&|"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&}"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&~"
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>& "
+    effect: deny
+  - action: "shell"
+    resource: "timeout *>&\t"
     effect: deny
   - action: "shell"
     resource: "cat <*"

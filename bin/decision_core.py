@@ -312,6 +312,13 @@ def headline_of(item, issue_title):
     return fit_lines(first + ": " + text, HEADLINE_WIDTH, HEADLINE_LINES) if room > 8 else fit_lines(text)
 
 
+def suffixed_headline(text, suffix):
+    """`text` with `suffix` after it, the suffix always whole: the text is cut to leave room when both do not fit."""
+    if wrap_count((text + suffix).split(), HEADLINE_WIDTH) <= HEADLINE_LINES:
+        return text + suffix
+    return fit_lines(text, HEADLINE_WIDTH, 1) + suffix
+
+
 def batch_headline(title, count):
     """`<title> (n rows)`: the title is cut to leave the count whole."""
     suffix = " (%d row%s)" % (count, "" if count == 1 else "s")
@@ -501,6 +508,9 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
         if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
             extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
+        if item["kind"] == "issue" and item.get("closed"):
+            extra["closed"] = True   # the issue is closed but still carries the person's label: it still waits, and cos tidies the label
+            headline = suffixed_headline(headline, " (closed)")
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):

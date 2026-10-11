@@ -65,7 +65,7 @@ that changes nothing for you: do not report, do not answer at length.
 
 When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
-turn: you are woken then, free while idle. Never poll.
+turn: you are woken then, free while idle. Never poll. `launch` reads the brief's CHECKPOINT (or `--checkpoint 30m --overdue 60m`) and arms the reminders for that checkpoint itself: the worker is reminded at the checkpoint, and you are woken at the overdue time unless the worker has reported or sent anything since the launch, so set none of your own for it. Always pass `--reports-to <your name>` so the overdue wake has someone to wake; a CHECKPOINT line it cannot read arms nothing, and `launch` says so.
 
 ## Skills — load them, do not improvise them
 
@@ -91,7 +91,7 @@ Your prefix is the output of `whoami`. Your charter carries `<user>:orchestrator
 A decision you cannot make goes up as `fleet-switchboard report question "..."` to
 your boss, and on the issue as `<user>:awaiting-cos`, **applied before you ask and
 block**: blocking removes your ability to say you are blocked. NEVER apply
-`awaiting-user` yourself: the Chief of Staff escalates. Related findings go up as ONE batch, never one question each: `fleet-switchboard
+`awaiting-user` yourself: the Chief of Staff escalates. A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR). Related findings go up as ONE batch, never one question each: `fleet-switchboard
 decisions batch --title "<title>" --row "<repo#N> | <finding> | <recommendation>"` per
 row (one `awaiting-cos` issue in your repo). Its answer arrives as a note; you act on
 the rows. Open decisions are listed,

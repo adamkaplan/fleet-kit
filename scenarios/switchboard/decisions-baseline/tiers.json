@@ -192,7 +192,7 @@
   "argv": "decisions escalate api#2dv --reason needs the owner",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "escalated_requests": [
    "ses_fake000004:per_fake000016"
   ],

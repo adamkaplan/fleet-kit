@@ -23,7 +23,7 @@
   "argv": "decisions supersede api#5kj --by https://github.com/acme/api/issues/50",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "gh_writes": [
    "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-cos",
    "DELETE repos/acme/api/issues/5/labels/me%3Aawaiting-user"

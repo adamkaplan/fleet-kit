@@ -16,12 +16,13 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
-KINDS = ("proof", "verdict", "consensus")   # a consensus entry is written by the plan review engine (a later slice); read here
+KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice); read here
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -100,7 +101,7 @@ def append_entry(state_dir, entry, now):
     """Add `entry` to the ledger under an exclusive lock: seq, time, prev and hash are set here. Refuses when the
     existing chain is broken (a tampered ledger takes no new entry). Returns the stored entry."""
     if entry.get("kind") not in KINDS or entry.get("result") not in RESULTS:
-        raise LedgerError("an entry is a proof or a verdict with a result of pass or fail")
+        raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail")
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -145,6 +146,8 @@ def may_record_verdict(evaluator, caller, allowed, authors):
     verdicts; an evaluator with no names is one nobody may record for yet (the default). The caller must not be a
     writer of the PR."""
     names = (allowed or {}).get(evaluator) or []
+    if caller == CI_RECORDER:
+        return False, "`%s` is the built-in recorder's name, not an agent: `ci` verdicts are recorded by `gates ci-record`" % CI_RECORDER
     if caller in authors:
         return False, ("%s wrote this PR (recorded its proof or sent its notice): an author cannot record a verdict "
                        "on its own work" % caller)
@@ -154,6 +157,47 @@ def may_record_verdict(evaluator, caller, allowed, authors):
                            "in the switchboard config" % (evaluator, evaluator))
         return False, "%s is not registered to record %s verdicts" % (caller, evaluator)
     return True, None
+
+
+# ----------------------------------------------------------------------------------- waivers
+
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5")   # G0 to G5: what the chief of staff may waive for a hotfix
+NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
+WAIVER_REASON_MIN = 20
+WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
+
+
+def parse_waiver_gates(text):
+    """([gate ids], error): `G0a,G1,G4` (G2 or G3 mean the one `G2/G3` gate). The error names what was refused and why."""
+    chosen = []
+    for raw in (text or "").replace(" ", "").split(","):
+        if not raw:
+            continue
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3"}.get(raw, raw[:1].upper() + raw[1:])
+        if gate in NEVER_WAIVABLE:
+            return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
+        if gate not in WAIVABLE:
+            return [], "%r is not a gate that can be waived (%s)" % (raw, ", ".join(WAIVABLE))
+        if gate not in chosen:
+            chosen.append(gate)
+    return (chosen, None) if chosen else ([], "name the gates to waive: --gates G0a,G1,...")
+
+
+def valid_waivers(entries, pr, head, now):
+    """{gate: waiver entry}: the waivers of this PR recorded AT THIS HEAD that have not expired at `now`, newest first win. A
+    waiver for another head, for another PR or past its expiry is not here; neither is a gate that can never be waived."""
+    found = {}
+    if not head:
+        return found
+    for entry in entries:
+        if entry.get("kind") != "waiver" or entry.get("pr") != pr or entry.get("head") != head:
+            continue
+        if not isinstance(entry.get("expires"), (int, float)) or entry["expires"] <= now:
+            continue
+        for gate in entry.get("gates") or ():
+            if gate in WAIVABLE:
+                found[gate] = entry
+    return found
 
 
 # ----------------------------------------------------------------------------------- the gates
@@ -224,7 +268,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
-def evaluate_gates(plan, entries, ledger_problem, facts, pr):
+def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
 
@@ -292,8 +336,18 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr):
         for row in rows:
             if row["gate"] == "G1" and row["status"] == "ok":
                 row.update(status="missing", missing=["the ledger is not trustworthy: %s" % ledger_problem])
-    ready = all(r["status"] in ("ok", "n/a", "untracked") for r in rows)
-    return {"gates": rows, "ready": ready, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
+    waived = []
+    if now is not None and head and not ledger_problem:   # an untrustworthy ledger honours no waiver
+        waivers = valid_waivers(entries, pr, head, now)
+        for row in rows:
+            entry = waivers.get(row["gate"])
+            if entry is not None and row["status"] == "missing":
+                row.update(status="waived", was_missing=row["missing"], missing=[],
+                           detail="waived (by %s, %s, due %s)" % (entry.get("by") or "?", entry.get("reason") or "no reason",
+                                                                time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(entry["expires"]))))
+                waived.append(row["gate"])
+    ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
+    return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
             "ledger_problem": ledger_problem}
 
@@ -302,7 +356,8 @@ def render_gates(report, pr):
     """The lines `gates` prints."""
     lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8],
                                           "READY on the gates it tracks (this is not approval: see the untracked list)"
-                                          if report["ready"] else "NOT READY"),
+                                          if report["ready"] else "NOT READY") + (
+                 "; WAIVED (not passed): %s" % ", ".join(report["waived"]) if report.get("waived") else ""),
              "plan hash: %s" % (report.get("plan_hash") or "none")]
     if report.get("ledger_problem"):
         lines.append("LEDGER: %s" % report["ledger_problem"])
@@ -346,7 +401,7 @@ def validate_plan_gates(raw, source):
         return None
     if not isinstance(raw, dict):
         raise ValueError("%s: 'plan_gates' must be an object, got %s" % (source, type(raw).__name__))
-    unknown = sorted(set(raw) - {"repos"})
+    unknown = sorted(set(raw) - {"repos", "ci_record"})
     if unknown:
         raise ValueError("%s: 'plan_gates' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
     repos, seen = {}, {}
@@ -377,7 +432,17 @@ def validate_plan_gates(raw, source):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
-    return {"repos": repos}
+    record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
+    if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
+        raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
+    enabled, calls, seconds = record.get("enabled", True), record.get("calls_per_pass", 30), record.get("pass_seconds", 10)
+    if not isinstance(enabled, bool):
+        raise ValueError("%s: 'plan_gates.ci_record.enabled' must be true or false" % source)
+    if not (isinstance(calls, int) and not isinstance(calls, bool) and 4 <= calls <= 100):
+        raise ValueError("%s: 'plan_gates.ci_record.calls_per_pass' must be a whole number from 4 to 100" % source)
+    if not (isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 1 <= seconds <= 60):
+        raise ValueError("%s: 'plan_gates.ci_record.pass_seconds' must be a number from 1 to 60" % source)
+    return {"repos": repos, "ci_record": {"enabled": enabled, "calls_per_pass": calls, "pass_seconds": seconds}}
 
 
 def repo_setting(config, repo):
@@ -388,15 +453,26 @@ def repo_setting(config, repo):
     return None
 
 
-def preflight(config, repo):
-    """(blocking, notes) for switching `repo` to enforce. Blocking: a recorder for `ci` must be registered (a machine's verdict
-    needs a defined recorder). Notes are what the check cannot know: other evaluators are listed when unregistered, and the
-    permission change that lets cos use the escape hatch is a manual precondition."""
+CI_RECORDER = "switchboard"   # the reserved name of the built-in `ci` recorder (`gates ci-record`); not an agent
+CI_RECORD_FRESH_SECONDS = 7 * 86400
+
+
+def preflight(config, repo, ci_proven=None):
+    """(blocking, notes) for switching `repo` to enforce. Blocking: a `ci` recorder must be registered AND able to record. The
+    reserved name `switchboard` (the built-in recorder) is accepted only when `ci_proven()` says it has actually recorded
+    recently (a successful `gates ci-record` in the audit within CI_RECORD_FRESH_SECONDS); an agent name is accepted as
+    registered (it records through `verdict --as ci`). Notes are what the check cannot know: other evaluators are listed when
+    unregistered, and the permission change that lets cos use the escape hatch is a manual precondition."""
     evaluators = config.get("plan_evaluators") or {}
     blocking, notes = [], []
-    if not evaluators.get("ci"):
-        blocking.append("no agent is registered to record `ci` verdicts: list its names under plan_evaluators.ci")
-    for kind in ("reviewer", "tester", "owner"):
+    ci = evaluators.get("ci") or []
+    if not ci:
+        blocking.append("no `ci` recorder is registered: list `%s` (the built-in recorder) or an agent under plan_evaluators.ci" % CI_RECORDER)
+    elif CI_RECORDER in ci and not any(n != CI_RECORDER for n in ci) and not (ci_proven() if callable(ci_proven) else ci_proven):
+        blocking.append("the built-in `ci` recorder is listed but has not recorded recently: run `fleet-switchboard gates ci-record <repo#N>` "
+                        "on a PR whose CI is green (a successful record within 7 days proves it works)")
+    notes.append("`owner` verdicts are recorded only from the owner's own terminal (no agent session), never by an agent")
+    for kind in ("reviewer", "tester"):
         if not evaluators.get(kind):
             notes.append("no agent is registered for `%s`: a plan that names it cannot get a verdict (register it under "
                          "plan_evaluators.%s)" % (kind, kind))
@@ -405,13 +481,13 @@ def preflight(config, repo):
     return blocking, notes
 
 
-def effective_mode(config, setting):
+def effective_mode(config, setting, ci_proven=None):
     """(mode, why): the mode a check really runs in. `enforce` runs only when its preflight passes, wherever the mode is
     read (the config file can be edited by hand, so the switch command is not the only way in); otherwise it runs as
     `shadow` and `why` says what blocks it. A repo that is not enforcing has no `why`."""
     if setting["mode"] != "enforce":
         return setting["mode"], None
-    blocking, _ = preflight(config, setting.get("name") or "")
+    blocking, _ = preflight(config, setting.get("name") or "", ci_proven)
     if blocking:
         return "shadow", "enforce is not active: " + "; ".join(blocking)
     return "enforce", None

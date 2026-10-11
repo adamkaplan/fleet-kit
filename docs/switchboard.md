@@ -2230,10 +2230,10 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | Kind | Finding |
 |---|---|
 | S1a / S1b | an open issue with a `## Decision required` section and no awaiting label / an awaiting label and no such section |
-| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and whose body does not start with `MERGE: captain` |
+| S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label and, inside the transition window, no first line `MERGE: captain`; see #133) |
 | S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
-| S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged: **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
-| S5 | a cos-tier decision older than `aged_cos_hours` |
+| S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged (EXCEPT an issue that is closed but still carries the person's awaiting label: it stays listed, marked `(closed)`, see below): **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
+| S5 | a cos-tier decision older than `aged_cos_hours` that is NOT already in the owner's tier: an entry whose issue or PR also has a human-tier decision (a duplicate, or the escalation of the same ref, however the repo or the `pr:` id is spelled: case, `pr:owner/repo#N` or `pr:repo#N`) is not stale for cos and is not raised |
 
 **Precision.** A finding is raised only after a fresh single read of its issue or PR (and a fresh read of its last comments when comments raised it) bears it out, so a cached 15-minute list cannot raise it; one that does not hold is audited as `sweep.dismissed`, one that cannot be checked now (no call budget, a failed read) is neither raised nor audited that pass, and a verified finding is trusted for 15 minutes. Only S3 waits for the decision list (a missing human-tier decision is the one thing that raises it falsely): it is deferred for a repo whose awaiting issues are unread or unreadable, or for every repo while the reports or requests source fails, as in the first passes after a restart. S1 reads only labels and bodies and S5 only the cos-tier decisions listed, so neither waits. A deferral lasts at most 30 minutes (`SWEEP_DEFER_SECONDS`); after that S3 runs on the fresh check alone and is marked overdue. `status` shows each deferral (repo, reason, since) and the number of findings not checked this pass, and `fleet-doctor` warns on an overdue deferral. A decision section is a line that STARTS with `## Decision required` (level 2, any case, CRLF included), followed by the end of the line or any suffix that does not continue the word (`## Decision required (re-verified 2026-10-09)`, `: pick`, `- x`). `## Resolved (was: Decision required)`, deeper headings, inline mentions, code and quotes are not. A decision-rows block stands for the section of a labelled batch (S1b) but never makes an unlabelled issue an S1a finding, so a resolved batch is not reported.
 
@@ -2285,6 +2285,20 @@ unchecked. The budget is a config value, `triage.calls_per_pass` (default 30, 4 
 the pass's candidates) with `triage.pass_seconds` (default 10, 1 to 60: no new read starts after it, so a slow GitHub cannot hold the pass; the sweep has its own 8 seconds) as the time bound. The budget matters only on a cold cache:
 a full cycle over 7 repos is 28 calls with small lists (at most 42 with full pages), so it completes in two passes; after that a pass
 reads nothing until the 15-minute lists expire. Steady-state cost at the default for 7 repos: the lists once per 15 minutes, about
+Why `status` can show many findings "not checked this pass": after a daemon restart nothing is confirmed (the memory is rebuilt), and each
+finding needs one fresh read (two with comments); at about a second a read the 10 second bound lets a pass confirm roughly ten, so a list
+of a hundred drains over ten or more passes, then stays drained until a confirmation's 15 minutes pass. Most of the list is usually
+other-owner flags (not ours, never acted on). They are checked **after** our own findings, which are never kept waiting behind them, and
+within each group the least recently attempted comes first, so none starves. `status` names how many unchecked are other-owner flags and the
+age of the oldest unchecked finding (since its last answer, or since it was first seen).
+
+Precision rules (from the owners' hand-checks; the sweep and the triage still only report, in shadow, and write nothing to GitHub):
+- **T1 and T11** count an explicit `Owner: <name>` or `owned by <name>` line in the body as an owner, besides an assignee or a parent (a quoted or code line does not count, nor an empty `Owner:` or a placeholder: TBD, none, n/a, unknown, `?`).
+- **T7** (no review): our agents share one GitHub account that cannot approve its own PR, so a review lives in a signed comment. With the PR's notice on file a head-naming signed comment of another agent counts (as before); with none, a signed comment by another signer that names the exact head AND says it is a review (`review of <sha>`, approved, changes requested, lgtm) counts too. The PR author's own login never counts, and a comment that says `not approved`, `changes requested` or `needs changes` is not an approving review (for the list pass too).
+- **S6a** (marker without label) is not raised for a PR opened less than 15 minutes ago (`SWEEP_S6A_GRACE`): the label is applied after it opens.
+- **S1a** (decision section without an awaiting label) is not raised while the issue changed less than 10 minutes ago (`SWEEP_S1A_GRACE`): cos removes one label and the person's label follows.
+- **T10** (closed but still labelled awaiting) waits 10 minutes after the close (`TRIAGE_T10_GRACE`): the label comes off minutes later.
+- **S3** (said to wait on the person) ignores a sentence that names a future gate before the phrase (`when`, `once`, `before`, `after`, `later`, `deferred`, `parked`, `not started`) or `deferred`, `parked`, `not started`, `when picked up` after it.
 112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
 counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
 count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache
@@ -2375,6 +2389,15 @@ default is a dry run, the same as `--dry-run`; only `--apply` writes: it ensures
 `<user>:merge-automatic` with the repo's own gh account, each add audited (`decisions.labels`). A repo that cannot be read is said and the
 others still run; a list longer than 1000 open items is said to be cut (run it again after labelling). Running it twice labels nothing
 the second time.
+
+### A decision write leaves the list current (#130)
+
+`decisions escalate`, `resolve`, `answer` and `supersede` change GitHub (a label, a comment) or a marker, and the list the person and the
+Chief of Staff read is the daemon's `decisions.json`. After a write the command pokes the daemon and then **waits, up to 6 seconds, for the
+file to show the new state** (an escalated decision is the owner's tier, or gone; a resolved, answered or superseded one is gone). It only
+reads the file: the daemon is the one writer, so nothing races it. If the file shows it, the command is silent about the list. If not, it
+prints ONE honest line on stderr, `the change is written and applied at the next pass (about a minute at most): the decision list may
+still show the old state until then`; with no daemon running the line says so and names `ensure`. A write never fails because of this wait.
 
 ### Self-wakes
 
@@ -4007,6 +4030,20 @@ body has a `canon:` line: what was updated, or `canon: n/a <reason>` with a reas
 owner). Listed but **not tracked yet, and not counted**: G0b (consensus), G0c (approval) and G2/G3 (alignment and code review),
 whose records are later slices; G7 and G8 are epic and deploy gates and show `n/a` for one PR.
 
+## `waive`: the logged override of G0 to G5 (#107)
+
+`fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
+for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or the owner at a terminal (the one shared check of `gates mode` and
+`verdict --as owner`, `gates_caller_kind`: an unknown session is refused, never read as a person, and a no-session caller must be on a
+controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
+**G6 (a held PR: the owner's hold), G7 and G8 are refused**, and a hand-written ledger entry naming them is ignored. A **writer of the PR**
+(one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
+waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`
+audit line. It is bound to **the head it was recorded at** (a push needs a new one) and **expires after 24 hours**, the due date of the
+retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
+the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
+and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
@@ -4067,6 +4104,17 @@ creation in a later slice). A PR URL of a fork is another repo: not listed, not 
 (`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
 unchanged.
 
+### `2>&1` and jq interpolation for the Chief of Staff
+
+`gh ... --jq '<filter with string interpolation>'` already runs (checked on the real v2 harness); a filter is not a command. The denial seen in practice was
+`fleet-switchboard decisions 2>&1; fleet-switchboard decisions --all 2>&1`: the blanket redirect guard (`*>*`) matched `2>&1`. The redirect guards now deny every redirect
+except the stream merge `2>&1` (the character after `>` is enumerated, `>&` only followed by `1`, `&>`, `>>`, `>file`, `2>file` still denied). `;` between two commands is fine
+when each part is allowed on its own, because each part is evaluated separately (`...; rm x` and `...; make build` stay denied). Limit: `*` and `?` are the glob characters, so `>*` and `>?` cannot be named and are not denied.
+
+Review of the redirect change: the first version enumerated the characters that may NOT follow `>&` and left gaps (`>& file`, `2>& file`, a tab, a non-ASCII name). A deny cannot carve an exception
+and a glob has no "anything but", so it is now decided by what follows each `>`: three or more characters (a space and a name, `&` and a name, a tab, `é file`) is always denied; one character is a file name and denied;
+exactly two are denied unless they are `&1`. Left open, and documented: a redirect to a one or two character non-ASCII file name at the very end of a segment, and (existing before this change) a redirect in the final segment of a pipeline.
+
 ## `launch` checks the plan: shadow only (#107, slice 3c)
 
 `fleet-switchboard launch` now checks, before it creates the agent, that the assignment's brief links a plan that has been
@@ -4107,3 +4155,115 @@ list in force.
 missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive <repo#N> --gates ... --reason ...`; never for G6 or
 G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
 not named as the reason. (`waive` is not built yet: the line names the path the design defines.)
+
+## The owner's verdict and the built-in `ci` recorder (#107)
+
+**The `owner` verdict** (a scenario whose evaluator is `owner`, or the old personal spelling, which is an alias) is recorded only from
+the **owner's own terminal**: a caller with **no agent session at all** (no `OPENCODE_SESSION_ID`, no herdr pane; or a session v2 knows is not
+a fleet agent). `verdict <scenario> --pr <repo#N> --as owner --result ... --evidence ...` from there is accepted and recorded as
+`by: owner`. A caller **with an agent session, registered or not, the chief of staff included, is refused**, and so is an uncertain identity
+(a session the switchboard does not know: #138 refuses it, never reads it as a person); the refusal is audited. All agents share one GitHub
+login, so the login cannot be the test; it is the session identity, which is a guard against mistakes and not a boundary (an agent that
+unsets its own session and pane variables looks like a person). There is no `plan_evaluators.owner` registry: the list is not consulted.
+
+**The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
+check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
+verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
+failing, pending or missing run it records nothing; a second run at the same head and plan records nothing twice; a push or a plan change
+voids it like any verdict. Any caller may run it, because the verdict says only what GitHub's checks say, whoever asked. It does not know
+whether the checks actually exercise the scenario: that is the plan's author's and the reviewers' concern. `verdict --as ci` is still available to an
+agent registered under `plan_evaluators.ci`, but nobody can use the name `switchboard`.
+
+**The preflight checks the recorder is real.** `plan_evaluators.ci` may list `switchboard` (the built-in recorder) or agent names. `enforce` is
+**refused** (by `gates mode ... enforce`, and a hand-edited `enforce` runs as `shadow`) when `ci` is empty, **or when it lists only `switchboard` and the audit
+holds no successful `gate.ci_record` in the last 7 days**: run `gates ci-record` on a PR whose CI is green to prove it, and run it again from time to
+time (a daemon pass that does so is a later step). A failed record, or one older than a week, proves nothing. `gates preflight` says which.
+
+**How "the owner's own terminal" is established (hardening of the owner verdict, #107).** No agent session is not enough: an agent that
+unsets `OPENCODE_SESSION_ID` and `HERDR_PANE_ID` has none either. So the check requires, besides no session, that (a) standard input and
+standard output are a **controlling terminal** (an agent's tool shell runs on pipes) **and** (b) **no ancestor** in the caller's process chain, walked up
+to 25 parents with `ps`, is an `opencode`, `fleet-opencode` or `copilot` process. If either cannot be established (no `ps`, an unreadable
+parent, a chain that does not end) the answer is a refusal with the reason, never a yes; the reason is printed and audited
+(`plan.verdict.refused`). The same check guards `gates mode` and `gates off|on` for a person; the chief of staff, an agent session, needs none.
+
+**What this is, plainly: a strong mistake guard, not a boundary against a determined agent that holds the owner's account.** All agents and
+the owner share one GitHub login and one user account on the machine. An agent that is determined to impersonate the owner could still
+allocate a pseudo-terminal (`script`, `expect`, a `pty` library) and detach itself from its agent ancestors (a double fork, `setsid`, a daemon
+that the init process adopts), after which both checks pass; or write the ledger, the config and the kill file directly. None of that is provable
+from inside the process. What the checks do stop is the honest mistakes and the cheap tricks: a tool shell on pipes, unsetting two variables, and a
+verdict recorded by the agent that ran into the gate. Real separation of the owner's verdicts needs something an agent cannot reach (a separate account, a hardware
+confirmation, or a required check on GitHub); this slice does not provide it.
+
+**One place.** The owner-in-person check is a single function, `gates_caller_kind` (it wraps `owner_terminal_problem`), and every command that is "only the
+owner, at a terminal" must ask it and nothing else: today `verdict --as owner`, `gates mode` and `gates off|on`. A new such command (a later waiver by the
+owner, for instance) uses the same function so the rule cannot drift between commands; a test pins that it is called from exactly one place.
+
+**The process table is read with a trusted `ps` only.** The check runs `ps` from a fixed path (`/bin/ps`, then `/usr/bin/ps`; never found on `PATH`, so a
+`ps` placed earlier on `PATH` cannot decide who is a person), only if that file is a regular executable owned by root and not writable by others, and with a
+scrubbed environment (`PATH=/usr/bin:/bin`, `LC_ALL=C`, nothing else). With no such `ps` the chain cannot be read and the check refuses. Tests put a fake `ps`
+first on `PATH` and show it is never run.
+
+**Two things stay unprovable, and they are why this is a mistake guard and not a boundary.** (1) **A pty that is double-forked or reparented.** An agent that
+allocates a pseudo-terminal and detaches the process that holds it (a double fork, `setsid`, adoption by init) has no agent among its ancestors and a real terminal;
+nothing in the process can tell it from the owner's shell. (2) **A harness that is not on the list.** Ancestors are matched against `opencode`, `fleet-opencode`
+and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
+that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.
+
+## The ci recorder's daemon pass (#107)
+
+`gates ci-record` made the switchboard the `ci` recorder, but someone had to run it, so a push would leave every `proof: test` scenario without its
+verdict until a person did, and the preflight's 7-day proof would lapse. **The daemon now runs the same logic itself.** In every pass, after the decisions
+are derived, `ci_record_pass` looks at the open PRs of the repos listed in `plan_gates` (and not `enabled: false`) that carry a `PLAN: <link>` in their
+body (drafts are skipped), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
+verdict for the per-PR scenarios that name `ci`: bound to that exact head and to the plan's current hash, never for a failing, pending or missing run,
+never twice (an identical verdict already in the ledger is left alone), and audited as `gate.ci_record`. Because those records are real, the preflight's
+"recorded successfully in the last 7 days" comes for free while any such PR exists. (A record where the plan has no `ci` scenario is audited with `ok: false`
+and does **not** count as proof: nothing was recorded.)
+
+**Shadow-safe.** It only writes verdicts into the ledger and audit lines. It refuses nothing, and it writes **nothing to GitHub**: it makes GET reads only (the
+open-PR list through the hub, each PR through `gh pr view`, the plan through the issue and its comments). It never raises into the pass: an unreadable repo list is
+noted (`ci_record.unreadable`) and the old list kept; a PR that fails to read is noted (`ci_record.error`) and the next one still runs.
+
+**Budgeted like the triage.** `plan_gates.ci_record` takes `enabled` (default true), `calls_per_pass` (default 30, 4 to 100) and `pass_seconds` (default 10, 1 to
+60). Each repo's open-PR list is cached for **15 minutes** (so a push is noticed within a quarter of an hour; `gates ci-record <pr>` records at once), a PR is due again only 15 minutes after it was last **checked**
+(the skip keys on when it was checked, not on what the check found); one that is **unreadable** is retried after 5 minutes, doubling to at most 30 (`ci_record.error` carries
+`retry_in`); one whose **head moved since the list** is checked again at the next list refresh, not every pass; a head the refreshed list shows differently is due at once.
+Each PR is charged 4 calls up front. A simulated 5-second loop makes a handful of reads in 15 minutes, not one per pass. The pass is off while the global `plan-gates.off` file
+exists. This slice also fixes `gates preflight`, which did not consult the recorder's proof (so it said BLOCKED even after a successful record) and made `gates mode`
+keep the `ci_record` settings when it rewrites the config.
+
+### Self-wakes: the overdue wake without `--reports-to`
+
+`launch` made the overdue-checkpoint reminder only when `--reports-to` named someone. A launch from a fleet agent's pane with a CHECKPOINT (flags or brief) but no `--reports-to` now wakes the launching agent at the overdue time (only if the worker has not reported, as before); the worker's own metadata is unchanged. From a plain shell nothing changes (no one to wake, and the launch says so).
+
+### Parked items (#130)
+
+A deliberately deferred issue carries the label `<user>:parked` (made by `fleet-switchboard labels ensure`, idempotent, with each repo's own account) AND one line `Parked until: YYYY-MM-DD` in its body. Triage rule T3 ("no next step") skips it until the end of that day (UTC) and fires again after.
+Strict on purpose: the label without a date, a date without the label, a malformed or impossible date (`2027-02-31`), two dates, a quoted or code-fenced line, or a past date all mean "not parked".
+Parking never exempts anything waiting on the owner (an item with `awaiting-user` or `awaiting-cos` is judged as before) or a held PR (T3 does not judge PRs; the captain rules are separate). Shadow only, like the rest of the triage: it records, it does not act.
+
+Parked items, follow-ups: a park reaches at most 366 days ahead (`9999-12-31` is not a park); the date is ASCII digits only (fullwidth digits are not read); a body with CRLF line endings is read. **Only T3 is exempted**, as specified:
+a parked ASK can still raise T9 (an ask idle for 3 days); whether parking should exempt T9 too is a decision for the Chief of Staff and is not made here.
+
+
+## A closed issue that still carries your label stays in your tier (#117)
+
+An ISSUE closed as won't-do (another crew's, say) that still carries the person's `awaiting-user` label is still a question
+for them, so it is no longer dropped: the decision list keeps it in the human tier, marked `closed: true` with `(closed)` after its
+headline, and a report about it (a Chief of Staff escalation) folds into that row (`reported_by`) rather than standing alone as a
+cos row with no human row. It leaves when the label is removed. The catch-up read asks for that label with `state=all`
+(the Chief of Staff's label still only open issues); a webhook for a closed issue keeps it listed too.
+
+What does not change: a closed or merged PR or captain decision is still withdrawn (S4), a closed issue that carries only the Chief
+of Staff's label is still forgotten, and the triage's **T10** (closed but still labelled awaiting) remains the hygiene finding that
+asks for the close-out. What the owner sees in the window: an issue the fleet closed and forgot to unlabel appears in the panel as
+`<title> (closed)` from the next pass until the label is removed. T10 comes after the 10 minute grace that follows the close
+(`TRIAGE_T10_GRACE`) plus up to 15 minutes for the cached closed-issue list, so the owner can see such a row for roughly 10 to 25
+minutes before T10 exists as a finding (a close by one of OUR logins, `closed_by` in the issue record, gets no grace: our agents unlabel in the same sweep, so a label still set is their miss and T10 is a finding at once; a closer the record does not name keeps the grace), and T10 wakes the Chief of Staff only when `triage.enabled` is true (in shadow it is audited
+only). The panel is read-only: nothing is written to GitHub.
+
+### The Chief of Staff and git: every read, no write
+
+Allowed in any form `git [-C <path>] [--no-pager] [--git-dir=<path>] <read>`: `status log show diff rev-parse rev-list for-each-ref merge-base blame describe shortlog cat-file ls-files ls-tree show-ref diff-tree name-rev whatchanged count-objects grep ls-remote reflog show`, and the READ shapes of the mixed commands: `branch` (bare, `-v -vv -a -r`, `--list --contains --merged --no-merged --show-current --sort`), `remote` (bare, `-v`, `show`, `get-url`), `worktree list`, `tag` (bare, `-l`, `--list`), `config` (`--get --get-all --get-regexp --list -l`), `reflog`. They go in pipes and chains like the other reads.
+Denied: every write verb as a standalone word anywhere after `git` (push commit add rm mv checkout switch restore reset revert cherry-pick merge rebase stash apply am fetch pull clone init submodule update-ref filter-* gc prune clean ... and `remote add|remove|set-url|prune|update`, `worktree add|remove|prune|move`, `reflog expire|delete`); branch and tag create, delete, move and `-D -m -u` flags; `config` writes, `--unset --add -e --global --file`; `--output`, `--exec`, `--upload-pack`, `ext::`, `--work-tree`; and **`git -c` in every position**: whether a key executes something (`core.pager`, `core.sshCommand`, `alias.*`, `credential.helper`) cannot be told from the text and a deny cannot carve an exception, so none is allowed.
+`fetch` and `pull` stay denied (they change local refs): the owner can say otherwise. Known limits: a read that names a write verb as a plain argument (`git log --grep push`) is denied; a redirect in the final segment of a pipeline is not seen by the rules (existing gap); `2>&1` is denied on main until the redirect change lands. Built on main; it conflicts with the held gates change in `gen_permissions.py`, to be rebased if that merges first.
