@@ -23082,10 +23082,27 @@ class OrdersCase(IntentCase):
         self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1})
         self.world.add_agent("worker", fleet={"role": "coder", "issue": 3, "charter": 1})
         self.gh.bodies = {1: ORDERS_CHARTER_BODY}
+        patcher = mock.patch.object(sb, "ORDERS_READBACK_WAITS", (0, 0, 0))  # no real waiting between the looks at the issue
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.stale = None   # {"reads": n, "body": b}: after the first write, the next n reads of charter 1 show `b` (a read that lags the write)
+        self.on_read = None  # a hook run before each read of charter 1, with its 1-based count
 
     def main(self, *argv):
+        reads = []
+
         def route(argv, **kwargs):
-            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+            if argv[0] != FAKE_GH:
+                return self.world.route(argv, **kwargs)
+            if len(argv) == 3 and argv[2].endswith("/issues/1"):
+                reads.append(argv)
+                if self.on_read:
+                    self.on_read(len(reads))
+                if self.stale and self.stale["reads"] > 0 and getattr(self.gh, "patches", []):
+                    self.stale["reads"] -= 1
+                    record = self.gh.record(1)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(dict(record, body=self.stale["body"])), "")
+            return self.gh(argv, **kwargs)
         with captured() as (out, err):
             code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False,
                            socket_call=self.world.herdr.socket)
@@ -23237,10 +23254,76 @@ class TestOrdersCLI(OrdersCase):
         self.gh.drop_patches = 5
         code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
         self.assertNotEqual(code, 0)
-        self.assertIn("read back", err)
+        self.assertIn("read the issue back", err)
         self.assertEqual(len(self.gh.patches), 2)  # once, and the one retry
         failed = [e for e in self.world.audit() if e["event"] == "orders.add" and e.get("phase") == "result"]
         self.assertFalse(failed[0]["ok"])
+
+    def test_a_read_that_lags_the_write_never_makes_a_second_add(self):
+        # the root of fleet-kit#34: the readback after a write showed the old body, the retry re-read the NEW body and added again
+        self.as_agent("chief-of-staff")
+        self.stale = {"reads": 3, "body": self.gh.body(1)}
+        code, _, err = self.main("orders", "add", "--charter", "1", "approve deploys", "--by", "alice")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.patches), 1, "a write whose outcome was unknown is not written again once a fresh read shows it")
+        self.assertEqual([o for o in self.orders_in_github() if "approve deploys" in o].__len__(), 1)
+
+    def test_a_read_that_lags_the_write_never_removes_a_second_order(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "first", "--by", "alice")
+        self.main("orders", "add", "--charter", "1", "second", "--by", "alice")
+        before = self.orders_in_github()
+        self.gh.patches = []
+        self.stale = {"reads": 3, "body": self.gh.body(1)}
+        code, _, err = self.main("orders", "remove", "--charter", "1", str(len(before) - 1))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.patches), 1)
+        self.assertEqual(len(self.orders_in_github()), len(before) - 1, "exactly one order is gone")
+
+    def test_the_same_order_given_twice_is_one_order_and_one_write(self):
+        self.as_agent("chief-of-staff")
+        self.main("orders", "add", "--charter", "1", "once", "--by", "alice")
+        before = len(self.gh.patches)
+        code, out, err = self.main("orders", "add", "--charter", "1", "once", "--by", "alice")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.patches), before, "nothing is written for an order that is already there")
+        self.assertEqual(len([o for o in self.orders_in_github() if o.startswith("once")]), 1)
+
+    def test_a_body_that_moved_before_the_write_is_refused_and_nothing_is_written(self):
+        self.as_agent("chief-of-staff")
+        moved = self.gh.body(1) + "\nsomebody edited this\n"
+
+        def edit(count):
+            if count == 2:  # the read just before the write
+                self.gh.bodies[1] = moved
+        self.on_read = edit
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertEqual(code, 2)
+        self.assertIn("changed while this edit was being prepared", err)
+        self.assertEqual(getattr(self.gh, "patches", []), [])
+
+    def test_a_lost_write_is_written_once_more_from_a_fresh_read_and_never_twice_more(self):
+        self.as_agent("chief-of-staff")
+        self.gh.drop_patches = 1
+        code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.patches), 2)
+        self.assertEqual(len([o for o in self.orders_in_github() if o.startswith("x ")]), 1)
+
+    def test_a_write_that_ends_without_an_answer_says_it_may_have_landed_and_to_list_first(self):
+        self.as_agent("chief-of-staff")
+        with mock.patch.object(sb, "write_issue_body", side_effect=sb.IntentError("unavailable", "gh did not answer within 5s")):
+            code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertEqual(code, 2)
+        self.assertIn("MAY HAVE LANDED", err)
+        self.assertIn("orders list --charter 1", err)
+        self.assertNotIn("again", err.replace("only repeat", ""))
+
+    def test_the_unknown_readback_error_also_says_to_list_first(self):
+        self.as_agent("chief-of-staff")
+        self.gh.drop_patches = 5
+        _, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertIn("orders list --charter 1", err)
 
     def test_an_unreachable_github_is_an_error_not_a_silent_success(self):
         self.as_agent("chief-of-staff")
