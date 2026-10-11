@@ -5056,11 +5056,11 @@ CAPTAIN_MARK = "MERGE: captain"
 CAPTAIN_MERGE_LABELS = ("merge-captain", "merge-automatic")
 CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hold-policy", "hold-prod-config",
                        "hold-other-area")
-# TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, about 30
-# days after the labels landed) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
+# TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, 30
+# days after the labels landed on 2026-10-11) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
 # TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
 # to finish the relabelling before then.
-CAPTAIN_MARKER_UNTIL = "2026-12-01"
+CAPTAIN_MARKER_UNTIL = "2026-11-10"
 
 
 def marker_window_open(now=None):

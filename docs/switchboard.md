@@ -2349,7 +2349,7 @@ review), and the reasons a PR is held, one or more of `<user>:hold-security`, `h
 (and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the
 transition window only, when its body's first non-empty line starts with `MERGE: captain`. **The label wins on disagreement:**
 `merge-captain` holds the PR whatever the line says, `merge-automatic` releases it whatever the line says, and the line is read only when
-there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` (2026-12-01, about 30 days after the labels landed); the
+there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` (2026-11-10, 30 days after the labels landed on 2026-10-11); the
 one-line way to drop the marker is to set it to `None`, after telling the Chief of Staff. A captain decision lists its hold reasons
 (`holds`, from the `hold-*` labels, nothing from prose), and a T6 finding carries them too.
 

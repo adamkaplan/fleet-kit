@@ -15603,6 +15603,16 @@ class TestCaptainLabels(Base):
         for body in ("see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
             self.assertFalse(sb.is_captain({"labels": [], "body": body}, now=end - 60), body)
 
+    def test_the_window_ends_30_days_after_the_labels_landed_on_2026_10_11(self):
+        self.assertEqual(sb.CAPTAIN_MARKER_UNTIL, "2026-11-10")           # what the definitions tell agents and the owner approved
+        landed = datetime.datetime(2026, 10, 11, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+        self.assertEqual((end - landed).days, 30)
+        pr = {"labels": [], "body": "MERGE: captain\nx"}
+        day = lambda y, m, d, h=12: datetime.datetime(y, m, d, h, tzinfo=datetime.timezone.utc).timestamp()
+        self.assertTrue(sb.is_captain(pr, now=day(2026, 11, 10)))          # the last day still reads the line
+        self.assertFalse(sb.is_captain(pr, now=day(2026, 11, 11, 1)))      # the day after it does not
+
     def test_the_label_wins_when_it_disagrees_with_the_line(self):
         auto = {"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}
         self.assertFalse(sb.is_captain(auto))                                  # the label says automatic: not held
