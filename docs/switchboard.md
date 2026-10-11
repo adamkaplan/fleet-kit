@@ -4010,8 +4010,9 @@ whose records are later slices; G7 and G8 are epic and deploy gates and show `n/
 ## `waive`: the logged override of G0 to G5 (#107)
 
 `fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
-for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or a person at a shell (the identity rule of `gates mode`:
-an unknown session is refused, never read as a person; a mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
+for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or the owner at a terminal (the one shared check of `gates mode` and
+`verdict --as owner`, `gates_caller_kind`: an unknown session is refused, never read as a person, and a no-session caller must be on a
+controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
 **G6 (a held PR: the owner's hold), G7 and G8 are refused**, and a hand-written ledger entry naming them is ignored. A **writer of the PR**
 (one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
 waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`

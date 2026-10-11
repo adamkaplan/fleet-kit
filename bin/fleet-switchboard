@@ -11815,7 +11815,9 @@ def cmd_waive(args, runner, now):
     and an audit line. It lasts WAIVER_SECONDS (the due date of the retroactive plan) and covers the head it was recorded at: a push
     needs a new one. `gates` shows the gate as `waived`, never as passed."""
     engine, state, config = build_engine(runner, now, "cli")
-    ok, who = gates_caller_may_switch(runner, now)
+    kind = gates_caller_kind(runner, now)   # THE shared check: a person path needs the owner's own terminal (#164), no second copy
+    ok = kind[0] == "person" or (kind[0] == "agent" and kind[2] == "chief-of-staff")
+    who = kind[1]
     gates, why = plan_ledger.parse_waiver_gates(args.gates)
     if ok and why is None and len(" ".join((args.reason or "").split())) < plan_ledger.WAIVER_REASON_MIN:
         why = "a reason of at least %d characters is required: say why this PR may skip the gates" % plan_ledger.WAIVER_REASON_MIN
@@ -12082,8 +12084,8 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 def gates_caller_kind(runner, now):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
-    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` (a later `waive` is the chief of staff's, an
-    agent session, and does not use it; anything that is "only the owner" must). Returns (kind, who[, role]).
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` and `waive` (its chief-of-staff caller is an agent
+    session; its person path asks this function like the rest). Returns (kind, who[, role]).
     "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
     it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the

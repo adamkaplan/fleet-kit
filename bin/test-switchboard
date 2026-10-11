@@ -17420,6 +17420,32 @@ class TestWaive(LedgerBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.ledger()[0]["by"], "a person at a shell")
 
+    def test_an_agent_that_unsets_its_session_variables_on_a_pipe_is_not_a_person_and_cannot_waive(self):
+        # `env -u OPENCODE_SESSION_ID -u HERDR_PANE_ID fleet-switchboard waive ...` from an agent's tool shell: no session, no pane,
+        # but standard input and output are pipes (and an agent process is an ancestor): the shared check refuses
+        for problem in ("standard input and output are not a terminal (an agent's tool shell runs on pipes)",
+                        "an agent process is an ancestor of this command (opencode)",
+                        "the process chain cannot be read (process 1234): refused, not guessed"):
+            with self.subTest(problem=problem):
+                self.terminal_problem = problem
+                code, out, err = self.waive(who=None)
+                self.assertEqual(code, 2)
+                self.assertIn("not established as the owner's own terminal", err)
+                self.assertEqual(self.ledger(), [])
+        self.assertEqual(len(self.events("gate.waiver.refused")), 3)
+        self.terminal_problem = "not a terminal"
+        self.assertEqual(self.waive(who="cos")[0], 0)                                # the chief of staff is a session, not this path
+        self.terminal_problem = None
+        self.assertEqual(self.waive(who=None)[0], 0)                                 # the owner's own terminal still may
+
+    def test_waive_asks_the_one_shared_terminal_check_and_has_no_copy_of_it(self):
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        body = text[text.index("def cmd_waive"):text.index("def cmd_gates(args")]
+        self.assertIn("gates_caller_kind(", body)
+        self.assertNotIn("isatty", body)
+        self.assertNotIn("owner_terminal_problem(", body)
+        self.assertEqual(text.count("owner_terminal_problem()"), 1, "the check is called from exactly one place")
+
     def test_a_writer_of_the_pr_cannot_waive_its_own_gates(self):
         sb.record_pr_notice(self.world.state, "acme/app", 9, "cos", "", self.world.clock.now())
         code, out, err = self.waive()
