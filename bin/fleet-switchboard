@@ -6188,6 +6188,10 @@ def publish_decisions(engine):
         triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
+    except Exception as err:
+        engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -11695,9 +11699,10 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
-def _ledger_context(args, runner, now, writable):
-    """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan."""
-    engine, state, config = build_engine(runner, now, "cli", writable=writable)
+def _ledger_context(args, runner, now, writable, parts=None):
+    """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
+    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
+    engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
@@ -12146,7 +12151,7 @@ def _write_gates_config(raw_edit):
     except (OSError, ValueError) as err:
         raise ConfigError("cannot read %s to edit it: %s" % (path, _one_line(str(err), 100))) from None
     section = raw.get("plan_gates") if isinstance(raw.get("plan_gates"), dict) else {}
-    section = {"repos": dict(section.get("repos") or {})}
+    section = dict(section, repos=dict(section.get("repos") or {}))   # every other key (ci_record) is kept
     raw["plan_gates"] = raw_edit(section)
     validate_config(raw, str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -12211,60 +12216,151 @@ def ci_recorder_proven(state, now_ts):
     """True when the audit holds a successful `gate.ci_record` within the last week: the built-in `ci` recorder has really run."""
     for entry in reversed(_audit_tail(state)):
         detail = entry.get("detail") or {}
-        if entry.get("event") == "gate.ci_record" and detail.get("ok") is True:
+        if entry.get("event") == "gate.ci_record" and detail.get("ok") is True and (detail.get("recorded") or detail.get("already")):
             at = detail.get("at")   # the switchboard's own clock when it recorded (the audit line's ts is the wall clock)
             if isinstance(at, (int, float)) and now_ts - at <= plan_ledger.CI_RECORD_FRESH_SECONDS:
                 return True
     return False
 
 
-def cmd_gates_ci_record(args, runner, now):
-    """`gates ci-record <repo#N>`: the switchboard itself records the `ci` verdict. It reads the PR's check runs at its CURRENT head
-    through `gh` (the repo's account) and, only when they are all complete and green, records a passing `ci` verdict, by
-    `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. It records
-    nothing for a failing, pending or missing run, and never for a head other than the PR's. Any caller may run it: the
-    verdict says only what GitHub's checks say, whoever asked."""
-    ns = types.SimpleNamespace(pr=args.pr, plan=getattr(args, "plan", None), ask=getattr(args, "ask", None), head=None)
-    ctx = _ledger_context(ns, runner, now, True)
+def ci_record_core(ctx, now, quiet=False):
+    """The ci recorder's one piece of logic, for the command and for the daemon pass. Returns {"status", "head", "ci", "scenarios",
+    "recorded", "already", "why"}; status is "recorded" (at least one verdict written or already there at this head and plan),
+    "nothing" (CI is green but no per-PR scenario names `ci`), "not-green", "unreadable", "no-plan" or "no-head". It records
+    only for a complete, green run at the PR's CURRENT head and the plan's CURRENT hash, never twice, and writes nothing to GitHub.
+    `quiet` leaves the audit alone for everything but a real record (the pass runs this for many PRs: a failing run is not news)."""
+    out = {"status": None, "head": None, "ci": None, "scenarios": [], "recorded": [], "already": [], "why": None}
     if ctx.unreadable:
-        raise LedgerCommandError("the PR could not be read, so nothing was recorded: %s" % ctx.unreadable)
+        return dict(out, status="unreadable", why="the PR could not be read: %s" % ctx.unreadable)
     head = (ctx.facts or {}).get("head")
     ci = (ctx.facts or {}).get("ci")
+    out.update(head=head, ci=ci)
     if ctx.plan is None or ctx.plan["result"] != "pass":
-        raise LedgerCommandError("no passing plan for the PR (%s): nothing was recorded" % (ctx.plan_problem or "run `plan check`"))
+        return dict(out, status="no-plan", why="no passing plan for the PR (%s)" % (ctx.plan_problem or "run `plan check`"))
     wanted = [x for x in ctx.plan["scenarios_parsed"] if (x.get("claim") or "pr") == "pr" and plan_ledger.evaluator_of(x) == "ci"]
-    detail = {"head": head, "ci": ci, "scenarios": [x["id"] for x in wanted], "at": int(now())}
+    out["scenarios"] = [x["id"] for x in wanted]
+    detail = {"head": head, "ci": ci, "scenarios": out["scenarios"], "at": int(now())}
     if not head:
-        raise LedgerCommandError("the PR's head is unknown: nothing was recorded")
+        return dict(out, status="no-head", why="the PR's head is unknown")
     if ci != "green":
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
-        raise LedgerCommandError("CI is %s at %s (only a complete, green run is recorded): nothing was recorded" % (ci, head[:8]))
+        if not quiet:
+            _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
+        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)" % (ci, head[:8]))
     if not wanted:
-        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, why="no scenario names ci"))
-        print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % head[:8])
-        return EXIT_OK
-    done, skipped = [], []
+        if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
+            _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
+        return dict(out, status="nothing")
     for scenario in wanted:
         fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
                  and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
                  and e.get("result") == "pass" and e.get("by") == plan_ledger.CI_RECORDER]
         if fresh:
-            skipped.append(scenario["id"])
+            out["already"].append(scenario["id"])
             continue
         plan_ledger.append_entry(ctx.state, {"kind": "verdict", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
                                              "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass",
                                              "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
                                              "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
-        done.append(scenario["id"])
-    _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=done, already=skipped))
-    print("CI is green at %s: recorded %s%s" % (head[:8], ", ".join(done) or "nothing new",
-                                               " (already recorded: %s)" % ", ".join(skipped) if skipped else ""))
+        out["recorded"].append(scenario["id"])
+    if out["recorded"] or not quiet:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
+    return dict(out, status="recorded")
+
+
+def cmd_gates_ci_record(args, runner, now):
+    """`gates ci-record <repo#N>`: the switchboard itself records the `ci` verdict (see ci_record_core). Any caller may run it: the
+    verdict says only what GitHub's checks say, whoever asked. The daemon runs the same logic for open PRs (ci_record_pass)."""
+    ns = types.SimpleNamespace(pr=args.pr, plan=getattr(args, "plan", None), ask=getattr(args, "ask", None), head=None)
+    ctx = _ledger_context(ns, runner, now, True)
+    got = ci_record_core(ctx, now)
+    if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
+        raise LedgerCommandError("%s: nothing was recorded" % got["why"])
+    if got["status"] == "nothing":
+        print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
+        return EXIT_OK
+    print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
+                                               " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
     return EXIT_OK
+
+
+# ---- the daemon pass of the ci recorder (#107): so a push does not leave `proof: test` scenarios waiting for a hand-run command.
+# Shadow-safe by construction: it only records `ci` verdicts into the ledger and audit lines. It refuses nothing and writes NOTHING to
+# GitHub (GET reads only). Budgeted like the triage: `calls_per_pass`, `pass_seconds`, a 15 minute cache of each repo's open-PR list.
+
+CI_RECORD_TTL = 900
+CI_RECORD_PR_COST = 4   # calls one PR may use: its view, the plan issue and its comments (charged up front)
+
+
+class CiRecordState:
+    def __init__(self):
+        self.lists = {}     # normalised repo -> (read at, records)
+        self.checked = {}   # (normalised repo, number) -> {"head", "at"}
+
+
+def ci_record_pass(engine, now):
+    """Run the ci recorder over the open PRs of the repos listed in `plan_gates` that carry a `PLAN:` link in their body, within the
+    call and time budget. Never raises. See the comment above for what it does and does not do."""
+    section = engine.config.get("plan_gates")
+    if not section or not section.get("repos") or engine.state_dir is None or engine.audit is None:
+        return
+    cfg = section.get("ci_record") or {}
+    if cfg.get("enabled") is False or gates_off_path(engine.state_dir).exists():
+        return
+    hub = getattr(engine, "hub", None)
+    if hub is None:
+        return
+    repos = [name for name, entry in sorted(section["repos"].items()) if entry.get("enabled", True)]
+    if not repos:
+        return
+    state = engine.__dict__.setdefault("ci_record_state", CiRecordState())
+    started, seconds = engine.now(), cfg.get("pass_seconds", 10)
+    budget = [cfg.get("calls_per_pass", 30)]
+    stale = sorted(((state.lists.get(plan_ledger.normal_repo(r), (0, []))[0], r) for r in repos
+                    if now - state.lists.get(plan_ledger.normal_repo(r), (0, []))[0] >= CI_RECORD_TTL))
+    for _, repo in stale:
+        if budget[0] < 2 or engine.now() - started >= seconds:
+            break
+        key = plan_ledger.normal_repo(repo)
+        try:
+            records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
+            budget[0] -= sweep_pages_used(records, cut)
+            state.lists[key] = (now, records)
+        except GitHubUnavailable as err:
+            budget[0] -= 1
+            state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
+            engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
+    todo = []
+    for repo in repos:
+        key = plan_ledger.normal_repo(repo)
+        for record in state.lists.get(key, (0, []))[1]:
+            number = record.get("number") if isinstance(record, dict) else None
+            head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
+            body = record.get("body") if isinstance(record, dict) and isinstance(record.get("body"), str) else ""
+            if not isinstance(number, int) or isinstance(number, bool) or record.get("draft") or not plan_ledger.PLAN_LINK_RE.search(body):
+                continue
+            held = state.checked.get((key, number))
+            if held and held["head"] == head and now - held["at"] < CI_RECORD_TTL:
+                continue
+            todo.append(((held or {"at": 0})["at"], repo, number))
+    runner = getattr(engine, "gh_runner", None) or subprocess.run
+    for _, repo, number in sorted(todo):
+        if budget[0] < CI_RECORD_PR_COST or engine.now() - started >= seconds:
+            break
+        budget[0] -= CI_RECORD_PR_COST
+        key = (plan_ledger.normal_repo(repo), number)
+        try:
+            ns = types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None, head=None)
+            ctx = _ledger_context(ns, runner, engine.now, True, parts=(engine, engine.state_dir, engine.config))
+            got = ci_record_core(ctx, engine.now, quiet=True)
+            state.checked[key] = {"head": got["head"], "at": now}
+        except Exception as err:
+            state.checked[key] = {"head": None, "at": now}
+            engine._note("ci_record.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
 
 
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
-    blocking, notes = plan_ledger.preflight(config, args.pr)
+    blocking, notes = plan_ledger.preflight(config, args.pr, lambda: ci_recorder_proven(ensure_state_dir(), now()))
     setting = plan_ledger.repo_setting(config, args.pr)
     print("preflight for enforcing %s: %s" % (args.pr, "BLOCKED" if blocking else "nothing blocks it"))
     print("  enforced gates: %s (others are reported, not enforced; set `enforce_gates` in plan_gates to change)"
