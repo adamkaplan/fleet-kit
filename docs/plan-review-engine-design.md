@@ -178,3 +178,18 @@ a consensus with its reason and `status` and the gate show `overridden`; an esca
 - Cost per plan is an estimate until the harness records tokens. Open: whether a lane's token count can be read from the session.
 - Open: the lane timeout and the wave size (proposed 15 minutes and 3).
 - Rollback: set `plan_review.enabled` false or create the kill file; the ledger entries stay and E4 is unaffected.
+
+## Build status
+
+R1 (the pure core, `bin/plan_review.py`) is built: the tier, the lanes of a tier, the lineage's round cap and escalation rules, the tally
+(consensus, pending or escalate, with the closing round), who may override, the strict verdict-block parser and the lane brief text, all as pure
+functions with unit tests. Nothing imports it yet; R2 adds the commands.
+
+R1 rules fixed by its review: held-path globs match dotfiles and dot-directories (only a literal leading `./` is stripped); an objection that
+survives the last round escalates (never `pending` forever); the round, post-escalation and closing counts run **since the last consensus**, so
+an edited plan can be reviewed again with a fresh bounded count (the carry-over is only an undecided escalation and open objections); a closing
+round runs once per final hash, only with no open blocking objection and no undecided escalation, at most 3 since the last consensus; a lane
+counts by its latest entry at the final hash; a work item under an ask whose own plan has no consensus inherits the ask's full review
+(`ask_has_consensus` is read from the ledger by the caller); an `abandoned` entry (cos or the owner) clears a stalled open review without
+buying fresh rounds; `iterate` and `reject` need at least one objection; a lane's brief shows only its own earlier objections; an escalation
+message cuts the objection and the response to 600 characters each.
