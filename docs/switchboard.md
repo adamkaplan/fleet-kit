@@ -2337,6 +2337,27 @@ asked at most 3 seconds, remembered per file and modification time). Anything th
 on the daemon's PATH, a relative path, a different binary or version, a pane that cannot be read. A program of any other name is
 never asked for its version.
 
+### Held for the owner: labels, not prose (#133)
+
+Whether a PR is held for the owner, and why, is state in **labels** the switchboard reads, namespaced like the awaiting labels
+(`<user>:...`, the OS user). `fleet-switchboard labels ensure` creates them in every watched repo (or `--repo`), idempotently and with
+each repo's own gh account: `<user>:merge-captain` (held for the owner), `<user>:merge-automatic` (merges on green CI and independent
+review), and the reasons a PR is held, one or more of `<user>:hold-security`, `hold-credential`, `hold-contract`, `hold-policy`,
+`hold-prod-config`, `hold-other-area` (an area owned by another team).
+
+**One rule, one helper.** `is_captain(pr)` (a dict with `labels` and `body`) is the only place that decides it, used by the PR facts
+(and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the
+transition window only, when its body's first non-empty line starts with `MERGE: captain`. **The label wins on disagreement:**
+`merge-captain` holds the PR whatever the line says, `merge-automatic` releases it whatever the line says, and the line is read only when
+there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` (2026-12-01, about 30 days after the labels landed); the
+one-line way to drop the marker is to set it to `None`, after telling the Chief of Staff. A captain decision lists its hold reasons
+(`holds`, from the `hold-*` labels, nothing from prose), and a T6 finding carries them too.
+
+**The sweep finishes the relabelling.** Two findings, both read-only: S6a, a PR whose first line says `MERGE: captain` but which has no
+merge label; S6b, a PR whose merge label and first line disagree (or which carries both merge labels: held, and said so). Like every
+sweep finding each is re-checked against a fresh read before it is raised. The sweep and the triage write nothing to GitHub: a person
+(or the owning orchestrator) adds the labels.
+
 ### Self-wakes
 
 Three ways an agent is woken by time, at **zero tokens while idle**: the daemon already passes every few seconds and

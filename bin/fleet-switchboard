@@ -4884,7 +4884,7 @@ PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are 
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
 PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
 PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
 
@@ -5053,14 +5053,88 @@ def pr_ci_of(rollup):
 
 
 CAPTAIN_MARK = "MERGE: captain"
+CAPTAIN_MERGE_LABELS = ("merge-captain", "merge-automatic")
+CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hold-policy", "hold-prod-config",
+                       "hold-other-area")
+# TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, about 30
+# days after the labels landed) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
+# TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
+# to finish the relabelling before then.
+CAPTAIN_MARKER_UNTIL = "2026-12-01"
+
+
+def marker_window_open(now=None):
+    """True while the first-line marker is still read: CAPTAIN_MARKER_UNTIL is set and `now` (epoch seconds, default the clock) is
+    before the end of that day (UTC)."""
+    if not CAPTAIN_MARKER_UNTIL:
+        return False
+    try:
+        end = datetime.strptime(CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
+    except ValueError:
+        return False
+    return (time.time() if now is None else now) < end
+
+
+def pr_marker(body):
+    """`captain` or `automatic` when the body's FIRST non-empty line starts with `MERGE: captain` / `MERGE: automatic`, else None.
+    Nothing else of the body is read."""
+    if not isinstance(body, str):
+        return None
+    first = next((l.strip() for l in body.splitlines() if l.strip()), "")
+    for word in ("captain", "automatic"):
+        mark = "MERGE: " + word
+        if first.startswith(mark) and not re.match(r"\w", first[len(mark):len(mark) + 1]):
+            return word
+    return None
 
 
 def pr_is_captain(body):
     """True when the body's FIRST non-empty line starts with `MERGE: captain`. Nothing else of the body is read."""
-    if not isinstance(body, str):
-        return False
-    first = next((l.strip() for l in body.splitlines() if l.strip()), "")
-    return first.startswith(CAPTAIN_MARK) and not re.match(r"\w", first[len(CAPTAIN_MARK):len(CAPTAIN_MARK) + 1])
+    return pr_marker(body) == "captain"
+
+
+def _label_kind(names, kinds):
+    """The kinds of `kinds` (`merge-captain`, `hold-security`, ...) among label names written `<prefix>:<kind>`."""
+    found = []
+    for name in names or ():
+        text = name.get("name") if isinstance(name, dict) else name
+        if isinstance(text, str) and ":" in text and text.rsplit(":", 1)[1] in kinds and text.rsplit(":", 1)[1] not in found:
+            found.append(text.rsplit(":", 1)[1])
+    return found
+
+
+def pr_hold_reasons(labels):
+    """The reasons a PR is held, from its `hold-*` labels: ['security', 'contract'] (sorted)."""
+    return sorted(k[len("hold-"):] for k in _label_kind(labels, CAPTAIN_HOLD_LABELS))
+
+
+def pr_marker_state(labels, body, now=None):
+    """{"captain": bool, "label": 'captain'|'automatic'|None, "marker": 'captain'|'automatic'|None, "findings": [...]}: what holds
+    a PR for the person. THE LABEL IS THE SOURCE OF TRUTH: `merge-captain` makes it captain, `merge-automatic` makes it not,
+    whatever the body says; only with no merge label is the first-line marker read, and only inside the transition window.
+    `findings` are `marker-without-label` (the line says captain, no merge label: finish the relabelling) and `disagree` (the
+    label and the line say different things; the label won)."""
+    kinds = _label_kind(labels, CAPTAIN_MERGE_LABELS)
+    label = "captain" if "merge-captain" in kinds else "automatic" if "merge-automatic" in kinds else None
+    marker = pr_marker(body)
+    findings = []   # both merge labels at once: held (the cautious reading) and a disagreement, below
+    if label is None:
+        captain = marker == "captain" and marker_window_open(now)
+        if marker == "captain":
+            findings.append("marker-without-label")
+    else:
+        captain = label == "captain"
+        if marker is not None and marker != label:
+            findings.append("disagree")
+        if "merge-captain" in kinds and "merge-automatic" in kinds:
+            findings.append("disagree")
+    return {"captain": captain, "label": label, "marker": marker, "findings": findings}
+
+
+def is_captain(pr, now=None):
+    """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
+    see `pr_marker_state` for the rule (label first, the first-line marker only inside the transition window)."""
+    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
 
 
 def pr_login(user):
@@ -5162,7 +5236,9 @@ def pr_facts_from(data):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else None
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
-            "captain": pr_is_captain(data.get("body")), "author": pr_login(data.get("author")),
+            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"],
+            "holds": pr_hold_reasons(data.get("labels")), "captain_findings": pr_marker_state(data.get("labels"), data.get("body"))["findings"],
+            "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
@@ -6308,7 +6384,8 @@ SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent 
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
-SWEEP_KINDS = {"S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
+SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label", "S6b": "merge label and first-line marker disagree",
+               "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not MERGE: captain", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
@@ -6505,7 +6582,9 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         body = record.get("body")
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
-                         "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": [],
+                         "captain": is_captain({"labels": names, "body": body}),
+                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
+                         "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False, "latest_refs": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
@@ -6598,6 +6677,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
+            if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
+                if "marker-without-label" in item["captain_findings"]:
+                    found.add(("S6a", ref_text(repo, number)))
+                if "disagree" in item["captain_findings"]:
+                    found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
             continue
@@ -6659,6 +6743,9 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
     body, is_pr = data.get("body"), _is_pr(data)
     labelled = bool(names & {awaiting_label(engine.config), awaiting_cos_label(engine.config)})
+    if kind in ("S6a", "S6b"):
+        want = "marker-without-label" if kind == "S6a" else "disagree"
+        return is_pr and want in pr_marker_state(names, body)["findings"]
     if kind in ("S1a", "S1b"):
         if is_pr:
             return False
@@ -6679,7 +6766,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         else:
             waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
     if kind == "S2":
-        return is_pr and not pr_is_captain(body) and (sweep_says_waiting(regex, body) or waits_in_comments)
+        return is_pr and not is_captain({"labels": names, "body": body}) and (sweep_says_waiting(regex, body) or waits_in_comments)
     if kind == "S3":
         if awaiting_label(engine.config) in names:
             return False  # it carries the person's label: a human-tier decision, whatever the list copy said
@@ -7012,7 +7099,9 @@ def triage_norm(issue):
             "labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
-            "open_sub": isinstance(total, int) and isinstance(done, int) and total > done, "captain": pr_is_captain(body)}
+            "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
+            "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
+                                   "body": body})}
 
 
 def triage_comment_facts(records):
@@ -7201,7 +7290,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             ident = "%s#%d" % ref if ref and ref[0] else (d.get("id") or "?")
             days = (now - since) / 86400
             if d.get("kind") == "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t6_days"]:
-                out.append(("T6", ident, {"waiting_days": round(days, 2), "waiting_hours": round(days * 24, 1)}))
+                evidence = {"waiting_days": round(days, 2), "waiting_hours": round(days * 24, 1)}
+                if d.get("holds"):
+                    evidence["holds"] = list(d["holds"])   # the hold-* labels: why it is held
+                out.append(("T6", ident, evidence))
             elif d.get("kind") != "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t5_days"]:
                 out.append(("T5", ident, {"waiting_days": round(days, 2), "waiting_hours": round(days * 24, 1)}))
     return out, unchecked, truncated
@@ -16603,16 +16695,29 @@ def cmd_decision_write(args, action, runner, now):
 
 LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing job"),
                ("awaiting-cos", "fbca04", "Waiting on the Chief of Staff: it resolves or escalates"),
-               ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"))
+               ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"),
+               # #133: held-for-the-owner state as labels (read by the switchboard, the sweep and the triage)
+               ("merge-captain", "b60205", "A PR held for the owner: it is not merged until the owner says so"),
+               ("merge-automatic", "0e8a16", "A PR that merges on green CI and independent review"),
+               ("hold-security", "d93f0b", "Held: a security boundary"),
+               ("hold-credential", "d93f0b", "Held: a credential or secret"),
+               ("hold-contract", "d93f0b", "Held: a shared contract or interface"),
+               ("hold-policy", "d93f0b", "Held: a policy or permission rule"),
+               ("hold-prod-config", "d93f0b", "Held: production configuration"),
+               ("hold-other-area", "d93f0b", "Held: an area owned by another team"))
 
 
 def label_names(config):
-    return {"orchestrator": orchestrator_label(config), "awaiting-cos": awaiting_cos_label(config),
-            "awaiting-user": awaiting_label(config)}
+    names = {"orchestrator": orchestrator_label(config), "awaiting-cos": awaiting_cos_label(config),
+             "awaiting-user": awaiting_label(config)}
+    for key, _, _ in LABEL_SPECS:
+        names.setdefault(key, "%s:%s" % (getpass.getuser(), key))   # the same `<user>:` namespace as the awaiting labels
+    return names
 
 
 def ensure_labels(engine, runner, repo):
-    """Create the three labels the fleet uses in `repo`, each with the repo's own gh account, unless they exist.
+    """Create the labels the fleet uses in `repo` (the three awaiting/orchestrator labels and the merge-class and hold labels),
+    each with the repo's own gh account, unless they exist.
     Returns {label: "created" | "already there"}. Idempotent."""
     names = label_names(engine.config)
     made = {}
