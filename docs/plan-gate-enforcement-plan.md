@@ -97,7 +97,7 @@ argument shapes pass through, a broken ledger refuses G1 only in enforce, a hand
 - **The plan review engine** and its **consensus record** (G0b): nothing writes a `consensus` entry, so the launch check always records `would_refuse` and cannot
   enforce.
 - **Plan approval records** (G0c) and the **alignment review record** (G2/G3): untracked, so they cannot block.
-- **Enforcement in the shim**: the shim only records; no code path exits non-zero on a refusal yet. That is the enforcement PR itself, and it must add
+- **Enforcement in the shim**: built in the shim enforcement PR (refuse on exit 10, `--match-head-commit`, `--auto` refused). Still open: post-creation checks for `gh pr create`. It had to add
   `--match-head-commit` to the real merge, refuse `--auto` in enforce, and post-creation checks for `gh pr create`.
 - **`plan check`**: an epic claim must name its integration branch (`epic-claim-without-branch`).
 - **A reader for the shim's spool** (`gate-failopen.jsonl`): the shim writes it; no daemon code reads it.

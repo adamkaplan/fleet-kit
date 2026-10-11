@@ -219,11 +219,12 @@ def signed_call(args, name):
     return new, None, temp
 
 
-# ---- the gate probe (plan-driven development, slice 3b: SHADOW ONLY). docs/plan-gate-engine-design.md, E1 and E3.
+# ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
 #
 # Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with
-# its own time bound, and writes down what the answer was. It NEVER blocks: the real gh always runs, whatever the answer, the
-# switchboard is missing, the check hangs or the arguments are a shape it does not understand. (Refusing is a later slice.)
+# its own time bound. Exit 10 (a refusal that applies in the repo's mode) stops the command: the one-line reason goes to stderr and
+# the real gh does not run. Everything else (fail-open, timeout, a missing switchboard, a shape not understood, the kill switches,
+# a valid waiver, a shadow repo) runs the real gh. In an enforcing repo a merge is bound to the checked head and --auto is refused.
 # `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
 # not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
 GATE_SECONDS = 3.0
@@ -312,42 +313,82 @@ def gate_spool(event, repo, number, check, detail):
 
 
 def gate_probe(args, lookup):
-    """Ask the switchboard whether this ready or merge would be allowed, and write the answer down. Never raises, never blocks:
-    the caller runs the real gh whatever happens here."""
+    """Ask the switchboard whether this ready or merge is allowed. Returns None (run the real gh as given), ("refuse", line)
+    (print the line, exit non-zero, do not run gh) or ("args", new_args) (run gh with these). Never raises: every doubt is a
+    fail-open. `gates-check` exits 10 only for a refusal that applies in the repo's mode, so a shadow repo never refuses here."""
     try:
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return
+            return None
         target = gate_target(args)
         if target is None:
-            return
+            return None
         check, repo, number = target
         listed = gate_repos()
         if not listed:
-            return
+            return None
         binary = switchboard_binary()
         if repo is None:
             repo = lookup.identity().get("repo") if binary else None
         if not repo or repo.lower() not in listed:
-            return
+            return None
         if not binary:
             gate_spool("fail_open", repo, number, check, "no switchboard to ask")
-            return
+            return None
         try:
             done = subprocess.run([binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"],
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
                                   env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
         except subprocess.TimeoutExpired:
             gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
-            return
+            return None
         except (OSError, subprocess.SubprocessError) as err:
             gate_spool("fail_open", repo, number, check, "could not run gates-check: %s" % err)
-            return
+            return None
+        try:
+            payload = json.loads(done.stdout)
+            if not isinstance(payload, dict):
+                payload = {}
+        except ValueError:
+            payload = {}
         if done.returncode == 10:
-            gate_spool("would_refuse", repo, number, check, done.stdout.strip() or "refused (shadow: not enforced here)")
-        elif done.returncode != 0:
+            message = payload.get("message")
+            if not isinstance(message, str) or not message.strip():
+                message = "fleet-switchboard: %s of %s#%d refused by the plan gates (no detail given)." % (check, repo, number)
+            gate_spool("refused", repo, number, check, message)
+            return ("refuse", message.strip().splitlines()[0][:600])
+        if done.returncode != 0:
             gate_spool("fail_open", repo, number, check, "gates-check exited %d" % done.returncode)
+            return None
+        if check == "merge" and payload.get("mode") == "enforce":
+            return gate_bind_merge(args, repo, number, payload)
+        return None
     except Exception:
-        pass   # a probe must never stop a command
+        return None   # a probe must never stop a command
+
+
+def gate_bind_merge(args, repo, number, payload):
+    """In an enforcing repo the merge is bound to the head that was checked (a push between the check and the merge makes the
+    real merge fail), and `--auto` is refused: it merges later, at a head nobody checked."""
+    ref = "%s#%d" % (repo, number)
+    if any(a == "--auto" for a in args):
+        return ("refuse", "fleet-switchboard: merge of %s refused: --auto merges later at a head nobody checked while this repo enforces "
+                          "the plan gates. Way out: merge when ready, with --match-head-commit <sha>." % ref)
+    head = payload.get("head")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        gate_spool("fail_open", repo, number, "merge", "no head to bind the merge to")
+        return None
+    given = None
+    for i, a in enumerate(args):
+        if a == "--match-head-commit" and i + 1 < len(args):
+            given = args[i + 1]
+        elif a.startswith("--match-head-commit="):
+            given = a.split("=", 1)[1]
+    if given is not None:
+        if given.lower() != head and not head.startswith(given.lower()):
+            return ("refuse", "fleet-switchboard: merge of %s refused: --match-head-commit %s is not the head the gates were checked at (%s). "
+                              "Way out: re-run with the current head." % (ref, given[:40], head))
+        return None
+    return ("args", list(args) + ["--match-head-commit", head])
 
 
 def main(args):
@@ -361,7 +402,12 @@ def main(args):
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
-    gate_probe(args, lookup)   # shadow only: records, never blocks
+    verdict = gate_probe(args, lookup)
+    if verdict is not None and verdict[0] == "refuse":
+        sys.stderr.write(verdict[1] + "\n")
+        return 10
+    if verdict is not None:
+        args = verdict[1]
     env = account_env(gh, lookup)
     if plan is None:
         if env is not None:

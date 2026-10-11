@@ -11982,6 +11982,7 @@ def cmd_gates_check(args, runner, now):
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
                     box["unreadable"] = ctx.unreadable
+                    box["head"] = (ctx.facts or {}).get("head")
                 except BaseException as err:  # the answer must reach the caller as a fail-open, not a traceback
                     box["error"] = "%s: %s" % (type(err).__name__, _one_line(str(err), 150))
             thread = threading.Thread(target=work, daemon=True)
@@ -12002,6 +12003,10 @@ def cmd_gates_check(args, runner, now):
             payload = {"verdict": verdict, "mode": mode, "for": args.check_for, "failed": failed, "reason": why}
             if downgraded:
                 payload["downgraded"] = downgraded
+            if isinstance(box.get("head"), str) and box["head"]:
+                payload["head"] = box["head"]   # the head these gates were checked at: the shim binds a merge to it
+            if verdict == "refuse":
+                payload["message"] = plan_ledger.refusal_message(PROG, args.check_for, args.pr, failed, repo)
             if report.get("ledger_problem") and gates_note(state, now(), repo, "ledger_broken", alarm="ledger.broken"):
                 _gates_audit(engine, "gate.ledger_broken", pr, {"problem": report["ledger_problem"]})   # once a day per repo
             if verdict == "refuse":
