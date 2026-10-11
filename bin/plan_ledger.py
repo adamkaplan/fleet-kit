@@ -21,7 +21,7 @@ from pathlib import Path
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
-KINDS = ("proof", "verdict")
+KINDS = ("proof", "verdict", "consensus")   # a consensus entry is written by the plan review engine (a later slice); read here
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -179,6 +179,7 @@ UNTRACKED_WHY = {
     "G8": "a deploy gate: it applies at deploy, not to one PR",
 }
 PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
+PLAN_LINK_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
 
 
@@ -423,3 +424,28 @@ def decide(report, check_for, mode):
     verdict = "refuse" if failed and mode == "enforce" else "allow"
     why = "; ".join("%s: %s" % (f["gate"], "; ".join(f["missing"]) or "not satisfied") for f in failed)
     return verdict, failed, why
+
+
+def consensus_at(entries, plan_hash):
+    """The newest `consensus` entry of the ledger that passed at exactly `plan_hash` (G0b), or None. A record for an earlier
+    hash does not count: editing the plan voids it."""
+    for entry in reversed(entries):
+        if entry.get("kind") == "consensus" and entry.get("plan_hash") == plan_hash and entry.get("result") == "pass":
+            return entry
+    return None
+
+
+def launch_findings(brief, plan, entries):
+    """What a launch under this brief lacks, as [{"gate", "missing": [...]}] (E4 of the gate engine design): a `PLAN:` link, a
+    plan that passes `plan check` (G0a), and a consensus record at its CURRENT plan hash (G0b). `plan` is the checked plan or
+    None. Empty when nothing is lacking."""
+    if not PLAN_LINK_RE.search(brief or ""):
+        return [{"gate": "G0b", "missing": ["the brief has no `PLAN:` link"]}]
+    found = []
+    if plan is None:
+        return [{"gate": "G0a", "missing": ["the plan the brief links could not be read"]}]
+    if plan["result"] != "pass":
+        found.append({"gate": "G0a", "missing": ["the plan fails `plan check` (%d defect(s))" % len(plan["defects"])]})
+    if consensus_at(entries, plan["plan_hash"]) is None:
+        found.append({"gate": "G0b", "missing": ["no consensus record at the plan's current hash %s" % plan["plan_hash"][:19]]})
+    return found

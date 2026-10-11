@@ -4058,3 +4058,22 @@ unknown flag, `ready --undo`, `--`, and `pr create` (a new PR has no number befo
 creation in a later slice). A PR URL of a fork is another repo: not listed, not probed. The switchboard's own `gh` calls
 (`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
 unchanged.
+
+## `launch` checks the plan: shadow only (#107, slice 3c)
+
+`fleet-switchboard launch` now checks, before it creates the agent, that the assignment's brief links a plan that has been
+through consensus (E4 of [docs/plan-gate-engine-design.md](plan-gate-engine-design.md), gate G0b). **It records and never
+refuses**, in every mode, including a repo set to `enforce`: refusing needs the plan review engine that writes the consensus
+record, which is a later slice. The launch always goes on.
+
+The check reads the brief's `PLAN: <link>` line, fetches that plan, runs `plan check` on it (G0a) and looks in the ledger for a
+`consensus` entry that passed at the plan's **current plan hash** (G0b); editing the plan, even a constraint, voids it. Nothing writes
+a `consensus` entry yet, so while only this slice exists every launch under a plan in an opted-in repo records a `would_refuse`:
+that is the expected baseline, and the data is useful for what it says about briefs without a `PLAN:` line or with an unreadable or
+failing plan. What it records: `gate.would_refuse` with `for: launch` and the gate and reason (and one line on stderr), or
+`gate.fail_open` (a timeout past the repo's `budget_ms`, a crash, an unreadable plan source of GitHub) with the launch going on.
+
+It uses the same configuration as `gates-check`: only a repo listed under `plan_gates` (the launch's `--repo`, else the plan's repo, else
+the intent repo) is checked; `enabled: false` and the global `plan-gates.off` file (logged as `gate.killed`) switch it off; the
+counters in `status` include it. A `--resume` is not checked. The design exempts a hotfix and the gate engine's own repair
+assignments from the launch gate; the check cannot tell them apart yet, so the enforcing slice needs a way to say so.
