@@ -34000,23 +34000,34 @@ class TestPlanReviewCore(unittest.TestCase):
     def test_an_ask_epic_or_cos_ask_is_always_full_and_a_request_only_raises(self):
         for kind in ("ask", "epic", "cos_ask"):
             self.assertEqual(plan_review.compute_tier(kind, [], self.HELD, tiny_under_reviewed=True)[0], "full")
-        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD)[0], "normal")
-        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD, requested="full")[0], "full")
-        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD, requested="light")[0], "normal")
+        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD, ask_has_consensus=True)[0], "normal")
+        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD, requested="full", ask_has_consensus=True)[0], "full")
+        self.assertEqual(plan_review.compute_tier("work_item", [], self.HELD, requested="light", ask_has_consensus=True)[0], "normal")
         self.assertEqual(plan_review.compute_tier("ask", [], self.HELD, requested="light")[0], "full")
 
     def test_light_needs_a_tiny_item_under_a_reviewed_section_and_no_held_path(self):
-        self.assertEqual(plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, tiny_under_reviewed=True)[0], "light")
-        self.assertEqual(plan_review.compute_tier("work_item", ["shims/gh"], self.HELD, tiny_under_reviewed=True)[0], "full")
-        self.assertEqual(plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, held_labels=True, tiny_under_reviewed=True)[0], "full")
+        ok = dict(tiny_under_reviewed=True, ask_has_consensus=True)
+        self.assertEqual(plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, **ok)[0], "light")
+        self.assertEqual(plan_review.compute_tier("work_item", ["shims/gh"], self.HELD, **ok)[0], "full")
+        self.assertEqual(plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, held_labels=True, **ok)[0], "full")
+
+    def test_a_work_item_under_an_ask_with_no_consensus_inherits_the_asks_full_review(self):
+        tier, why = plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, tiny_under_reviewed=True)
+        self.assertEqual(tier, "full")
+        self.assertIn("ask's own plan has no consensus", why)
+        self.assertEqual(plan_review.compute_tier("work_item", ["docs/x.md"], self.HELD, ask_has_consensus=True)[0], "normal")
 
     def test_the_held_area_is_computed_from_paths_so_a_prose_claim_changes_nothing_and_splitting_hides_nothing(self):
         # the unit is every work item under one ask: one item names a held path, so the whole unit is full
         unit = ["docs/a.md"] + ["bin/plan_ledger.py"] + ["docs/b.md"]
-        self.assertEqual(plan_review.compute_tier("work_item", unit, self.HELD)[0], "full")
+        self.assertEqual(plan_review.compute_tier("work_item", unit, self.HELD, ask_has_consensus=True)[0], "full")
         self.assertEqual(plan_review.path_hits(["./shims/gh", "shims/x/y", "docs/shims.md", "plugins/fleet-hooks/a/b.js"], self.HELD),
                          ["./shims/gh", "plugins/fleet-hooks/a/b.js", "shims/x/y"])
         self.assertEqual(plan_review.path_hits(["bin/plan_ledger.pyc", "bin/x/plan_ledger.py"], self.HELD), [])
+        dots = [".github/workflows/ci.yml", ".env", ".opencode/agents/x.md", "./.env", "/.github/a", "github/workflows/x", "docs/.env.md"]
+        self.assertEqual(plan_review.path_hits(dots, [".github/**", ".env", ".opencode/**"]),
+                         sorted(["./.env", "/.github/a", ".env", ".github/workflows/ci.yml", ".opencode/agents/x.md"]))
+        self.assertEqual(plan_review.path_hits(["a/.github/x", ".hidden"], ["**/.github/**", ".hidden"]), [".hidden", "a/.github/x"])
         self.assertNotIn("areas", inspect.signature(plan_review.compute_tier).parameters, "no parameter for the planner's prose")
 
     def test_the_tier_is_rechecked_against_the_paths_actually_changed(self):
@@ -34148,6 +34159,88 @@ class TestPlanReviewCore(unittest.TestCase):
         self.assertEqual(plan_review.can_override("L2", False, boss, True), (True, None))
         self.assertFalse(plan_review.can_override("L2", False, boss, False)[0])
 
+
+    # -- the review's repairs (#185 review)
+
+    def test_after_a_consensus_an_edited_plan_can_be_reviewed_again_with_a_fresh_bounded_count(self):
+        entries = self.rounds(3) + [{"kind": "consensus", "plan_hash": self.H1}]
+        state = plan_review.lineage_state(entries, self.H2)
+        self.assertEqual((state["rounds"], state["open_review"]), (0, False))
+        self.assertEqual(plan_review.may_start(state, self.H2), (True, None))
+        after = plan_review.lineage_state(entries + self.rounds(3), self.H2)
+        after["open_review"] = False
+        self.assertFalse(plan_review.may_start(after, self.H2)[0], "still bounded: 3 rounds since the consensus")
+        self.assertEqual(plan_review.lineage_state(self.rounds(1) + [{"kind": "consensus", "plan_hash": self.H1}])["rounds"], 0)
+
+    def test_an_unresolved_escalation_survives_only_until_a_consensus_and_open_objections_do_not_carry_past_one(self):
+        entries = (self.rounds(3) + [self.lane("L2", "iterate", self.H1, [self.obj("O1")]), {"kind": "escalation", "objection": "L2/O1"}]
+                   + [{"kind": "decision", "objection": "L2/O1", "action": "override"}, {"kind": "consensus", "plan_hash": self.H1,
+                                                                                         "overridden_by": "owner"}])
+        state = plan_review.lineage_state(entries)
+        self.assertEqual((state["open_blocking"], state["undecided"], state["escalated"]), ([], [], False))
+        self.assertEqual(state["overridden"], {self.H1: "owner"})
+        undecided = plan_review.lineage_state(self.rounds(3) + [self.lane("L2", "iterate", self.H1, [self.obj("O1")]),
+                                                                {"kind": "escalation", "objection": "L2/O1"}])
+        self.assertEqual((undecided["open_blocking"], undecided["undecided"]), (["L2/O1"], ["L2/O1"]))
+
+    def test_a_closing_round_is_bounded_once_per_hash_and_never_with_open_objections_or_an_undecided_escalation(self):
+        clean = plan_review.lineage_state([{"kind": "round", "closing": False}])
+        self.assertEqual(plan_review.may_open_round(clean, closing=True, plan_hash=self.H1), (True, None))
+        once = plan_review.lineage_state([{"kind": "round", "closing": True, "plan_hash": self.H1}])
+        self.assertIn("already ran", plan_review.may_open_round(once, closing=True, plan_hash=self.H1)[1])
+        self.assertEqual(plan_review.may_open_round(once, closing=True, plan_hash=self.H2), (True, None))
+        many = plan_review.lineage_state([{"kind": "round", "closing": True, "plan_hash": "sha256:%064d" % i} for i in range(3)])
+        self.assertIn("closing rounds allowed", plan_review.may_open_round(many, closing=True, plan_hash=self.H2)[1])
+        blocking = plan_review.lineage_state([self.lane("L2", "iterate", self.H1, [self.obj("O1")])])
+        self.assertIn("still open", plan_review.may_open_round(blocking, closing=True, plan_hash=self.H2)[1])
+        escalated = plan_review.lineage_state([{"kind": "escalation", "objection": "L2/O1"}])
+        self.assertIn("undecided", plan_review.may_open_round(escalated, closing=True, plan_hash=self.H2)[1])
+        done = plan_review.lineage_state([{"kind": "consensus", "plan_hash": self.H1}], self.H1)
+        self.assertIn("already has a consensus", plan_review.may_open_round(done, closing=True, plan_hash=self.H1)[1])
+
+    def test_an_objection_that_survives_the_last_round_escalates_it_is_never_left_pending(self):
+        lanes = ["L1", "L2"]
+        entries = [self.lane("L2", "iterate", self.H1, [self.obj("O1")]), self.lane("L1", "approve", self.H2),
+                   self.lane("L2", "approve", self.H2)]   # an old-hash objection, then a silent lane-wide approve
+        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H2)[0], "pending", "with rounds left it waits")
+        verdict, why = plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=False)
+        self.assertEqual(verdict, "escalate")
+        self.assertIn("L2/O1", why)
+        verdict, why = plan_review.decide_consensus([self.lane("L1", "approve", self.H2)], lanes, self.H2, rounds_left=False)
+        self.assertEqual(verdict, "pending", "a lane that has not answered yet is not a dissent: a closing round is how it is asked")
+        verdict, why = plan_review.decide_consensus([self.lane("L1", "approve", self.H2), self.lane("L2", "reject", self.H2,
+                                                    [self.obj("O2", severity="advisory")])], lanes, self.H2, rounds_left=False)
+        self.assertEqual(verdict, "escalate")
+        self.assertIn("L2", why)
+
+    def test_a_lanes_latest_entry_at_the_final_hash_counts_a_later_reject_undoes_an_approve(self):
+        entries = [self.lane("L1", "approve", self.H1), self.lane("L1", "reject", self.H1, [self.obj("O1", severity="advisory")])]
+        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1)[0], "pending")
+        entries.append(self.lane("L1", "approve", self.H1))
+        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1)[0], "consensus")
+
+    def test_an_abandoned_review_clears_the_open_review_and_the_count_continues(self):
+        entries = self.rounds(2) + [{"kind": "abandoned", "by": "cos", "reason": "the ask was withdrawn"}]
+        state = plan_review.lineage_state(entries)
+        self.assertEqual((state["open_review"], state["rounds"]), (False, 2))
+        self.assertEqual(plan_review.may_start(state, self.H1), (True, None))
+        full = plan_review.lineage_state(self.rounds(3) + [{"kind": "abandoned", "by": "cos", "reason": "x"}])
+        self.assertFalse(plan_review.may_start(full, self.H1)[0], "abandoning does not buy fresh rounds")
+
+    def test_the_escalation_message_cuts_long_texts(self):
+        text = plan_review.escalation_message("x#1", {"id": "O1", "lane": "L1", "text": "o" * 5000}, "r" * 5000)
+        self.assertLess(len(text), 1500)
+        self.assertIn("\u2026", text)
+
+    def test_a_verdict_with_nothing_to_resolve_is_refused(self):
+        for verdict in ("iterate", "reject"):
+            text = "```verdict\nlane: L2\nplan_hash: %s\nverdict: %s\n```\n" % (self.H1, verdict)
+            got, why = plan_review.parse_verdict_block(text, self.H1, "L2")
+            self.assertIsNone(got)
+            self.assertIn("at least 1 objection", why)
+        text = "```verdict\nlane: L2\nplan_hash: %s\nverdict: approve\n```\n" % self.H1
+        self.assertEqual(plan_review.parse_verdict_block(text, self.H1, "L2")[0]["verdict"], "approve")
+
     # -- the strict verdict block
 
     def block(self, lane="L2", plan_hash=None, verdict="iterate", lines=("- id: O1; severity: blocking; state: open; text: a stub passes",)):
@@ -34183,10 +34276,11 @@ class TestPlanReviewCore(unittest.TestCase):
 
     def test_a_lane_brief_carries_the_snapshot_the_charter_and_the_untrusted_warning_and_takes_no_planner_reasoning(self):
         brief = plan_review.lane_brief("L2", "acme/app#9", self.H1, "THE PLAN TEXT", "an intent", "a done when",
-                                       carried=[{"id": "O1", "lane": "L2", "text": "carried one"}], closing=True)
+                                       carried=[{"id": "O1", "lane": "L2", "text": "carried one"}, {"id": "O7", "lane": "L3", "text": "another lanes words"}], closing=True)
         for needle in ("lane L2", "UNTRUSTED", self.H1, "THE PLAN TEXT", "an intent", "a done when", "bad build that passes",
-                       "CLOSING", "O1 (L2): carried one", "plan_hash: " + self.H1):
+                       "CLOSING", "- O1: carried one", "plan_hash: " + self.H1):
             self.assertIn(needle, brief)
+        self.assertNotIn("another lanes words", brief, "never another lane's output")
         names = set(inspect.signature(plan_review.lane_brief).parameters)
         self.assertEqual(names, {"lane", "plan_ref", "plan_hash", "plan_text", "intent", "done_when", "carried", "closing"},
                          "no parameter for the planner's reasoning or another lane's output")

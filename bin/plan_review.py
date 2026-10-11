@@ -6,7 +6,7 @@ tally (consensus, pending or escalate), who may override, and the text of a lane
 by the switchboard yet (R2 adds the commands that call it), so it changes nothing live.
 
 An entry is a dict. The kinds read here: `round` (review, closing, plan_hash), `lane` (review, lane, verdict, plan_hash, objections),
-`escalation` (objection, lane), `decision` (objection, action), `consensus` (plan_hash, overridden_by). The tally is computed from
+`escalation` (objection, lane), `decision` (objection, action), `abandoned` (by, reason), `consensus` (plan_hash, overridden_by). The tally is computed from
 these entries alone; nothing an agent says decides it.
 """
 
@@ -24,6 +24,8 @@ LANES = {
 RISK_LANE = "L3"
 CAP_ROUNDS = 3                 # rounds that re-review objections, per lineage (a closing round is outside the cap)
 POST_ESCALATION_ROUNDS = 2     # more such rounds after an escalation, then the owner decides
+MAX_CLOSING_ROUNDS = 3         # closing rounds (outside the cap) per lineage since its last consensus, one per final hash
+TEXT_CAP = 600                 # an objection or a response is cut to this before it is composed into a message
 FULL_KINDS = ("ask", "epic", "cos_ask")   # a plan for one of these is always a full review
 VERDICTS = ("approve", "iterate", "reject")
 CLOSED_STATES = ("resolved", "rejection_accepted")
@@ -56,10 +58,19 @@ def _glob_regex(glob):
     return re.compile("^" + out + "$")
 
 
+def _norm_path(path):
+    """A path as repo-relative text: only a literal leading `./` (repeated) and one leading `/` are removed, never a dot that is part of a
+    name (`.github/ci.yml`, `.env`, `.opencode/x` keep theirs)."""
+    path = str(path)
+    while path.startswith("./"):
+        path = path[2:]
+    return path[1:] if path.startswith("/") else path
+
+
 def path_hits(paths, held_globs):
     """The paths that match any held-path glob (`**` across directories, `*` within a name). Deterministic."""
     compiled = [_glob_regex(g) for g in held_globs or ()]
-    return sorted({str(p) for p in paths or () if any(c.match(str(p).lstrip("./")) for c in compiled)})
+    return sorted({str(p) for p in paths or () if any(c.match(_norm_path(p)) for c in compiled)})
 
 
 def lanes_for_tier(tier, held_area=False):
@@ -71,16 +82,20 @@ def lanes_for_tier(tier, held_area=False):
     return sorted(LANES)
 
 
-def compute_tier(kind, unit_paths, held_globs, held_labels=False, tiny_under_reviewed=False, requested=None):
+def compute_tier(kind, unit_paths, held_globs, held_labels=False, tiny_under_reviewed=False, requested=None, ask_has_consensus=False):
     """(tier, why): the tier from facts the plan's author does not write. `kind` is the linked issue's kind (ask, epic, cos_ask or
     work_item); `unit_paths` is the union of the planned paths of the whole review unit (every work item under the same ask), so
     splitting an ask cannot hide a held path; `held_labels` is true when the linked issue carries a held-area label. A request can
-    raise the tier, never lower it. `light` needs a tiny item under an already-reviewed section and no held path."""
+    raise the tier, never lower it. `ask_has_consensus` is a fact the caller reads from the ledger: the ask's OWN plan has a consensus at
+    its current hash. A work item under an ask without one inherits the ask's tier (full): an ask cut into work-item plans is still
+    reviewed in full. With it, a work item is `normal`, or `light` for a tiny item under a reviewed section and no held path."""
     hits = path_hits(unit_paths, held_globs)
     if kind in FULL_KINDS:
         tier, why = "full", "a plan for %s is always reviewed in full" % kind
     elif hits or held_labels:
         tier, why = "full", "it touches a held-PR area (%s)" % (", ".join(hits[:3]) or "a held-area label")
+    elif not ask_has_consensus:
+        tier, why = "full", "its ask's own plan has no consensus yet, so it inherits the ask's full review"
     elif tiny_under_reviewed:
         tier, why = "light", "a tiny item under an already-reviewed plan section"
     else:
@@ -105,35 +120,43 @@ def _undecided(entries):
 
 
 def lineage_state(entries, plan_hash=None):
-    """The lineage's state from its entries (every review of the ask, oldest first): rounds used toward the cap, rounds after an
-    escalation, the open review, undecided escalations, the blocking objections still open (carried forward), the consensus hashes."""
-    rounds, post, escalated, open_review = 0, 0, False, False
-    latest, consensus, overridden = {}, [], {}
+    """The lineage's state from its entries (every review of the ask, oldest first). Rounds, rounds after an escalation and closing
+    rounds are counted SINCE THE LAST CONSENSUS (a consensus ends that window: an edited plan can be reviewed again, with a fresh bounded
+    count); the carry-over is only what is unresolved: an undecided escalation and the blocking objections still open. An `abandoned`
+    entry clears the open review (the count continues)."""
+    rounds, post, closing, escalated, open_review = 0, 0, 0, False, False
+    closing_hashes, latest, consensus, overridden = set(), {}, [], {}
     for entry in entries:
         kind = entry.get("kind")
         if kind == "round":
             open_review = True
-            if not entry.get("closing"):
-                if escalated:
-                    post += 1
-                else:
-                    rounds += 1
+            if entry.get("closing"):
+                closing += 1
+                closing_hashes.add(entry.get("plan_hash"))
+            elif escalated:
+                post += 1
+            else:
+                rounds += 1
         elif kind == "lane":
             for obj in entry.get("objections") or []:
                 if obj.get("id"):
                     latest[(entry.get("lane"), obj["id"])] = obj
         elif kind == "escalation":
             escalated = True
+        elif kind == "abandoned":
+            open_review = False
         elif kind == "consensus":
             consensus.append(entry.get("plan_hash"))
             open_review = False
             if entry.get("overridden_by"):
                 overridden[entry.get("plan_hash")] = entry["overridden_by"]
+            rounds, post, closing, escalated = 0, 0, 0, False
+            closing_hashes, latest = set(), {}
     open_blocking = sorted("%s/%s" % key for key, o in latest.items()
                            if o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES)
-    return {"rounds": rounds, "post_escalation_rounds": post, "escalated": escalated, "open_review": open_review,
-            "undecided": _undecided(entries), "open_blocking": open_blocking, "consensus_hashes": consensus,
-            "overridden": overridden, "consensus_at": bool(plan_hash) and plan_hash in consensus}
+    return {"rounds": rounds, "post_escalation_rounds": post, "closing_rounds": closing, "closing_hashes": sorted(closing_hashes),
+            "escalated": escalated, "open_review": open_review, "undecided": _undecided(entries), "open_blocking": open_blocking,
+            "consensus_hashes": consensus, "overridden": overridden, "consensus_at": bool(plan_hash) and plan_hash in consensus}
 
 
 def _rounds_left(state):
@@ -156,10 +179,22 @@ def may_start(state, plan_hash):
     return True, None
 
 
-def may_open_round(state, closing=False):
-    """(ok, why not) for the next round of the open review. A closing round is outside the cap. After the cap (CAP_ROUNDS) only the
-    rounds that follow an escalation, at most POST_ESCALATION_ROUNDS, then the owner decides."""
+def may_open_round(state, closing=False, plan_hash=None):
+    """(ok, why not) for the next round of the open review. A closing round is outside the cap but bounded: only with no open blocking
+    objection and no undecided escalation, no consensus at that hash, once per final hash, and at most MAX_CLOSING_ROUNDS since the last
+    consensus. After the cap (CAP_ROUNDS) a normal round is only one that follows an escalation, at most POST_ESCALATION_ROUNDS, then the
+    owner decides."""
     if closing:
+        if state["undecided"]:
+            return False, "an escalation is undecided"
+        if state["open_blocking"]:
+            return False, "blocking objections are still open: a closing round confirms a text nobody objects to"
+        if plan_hash is not None and (state["consensus_at"] or plan_hash in state["consensus_hashes"]):
+            return False, "this plan already has a consensus at its current hash"
+        if plan_hash is not None and plan_hash in state["closing_hashes"]:
+            return False, "a closing round already ran for this exact text"
+        if state["closing_rounds"] >= MAX_CLOSING_ROUNDS:
+            return False, "the %d closing rounds allowed since the last consensus are spent" % MAX_CLOSING_ROUNDS
         return True, None
     if state["undecided"]:
         return False, "an escalation is undecided"
@@ -201,21 +236,36 @@ def survivors(lane_entries):
                   if o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES)
 
 
-def decide_consensus(lane_entries, tier_lanes, final_hash):
-    """(verdict, why): "consensus", "pending" or "escalate", from the lane entries alone (all rounds, oldest first).
-    Consensus needs, for EVERY lane of the tier, an `approve` entry whose plan hash equals the final hash, and no blocking objection
-    left open. A blocking objection raised on the final text (an entry at the final hash that is not an approve) escalates: it cannot
-    start another round. A revision changed after a lane approved has no approval at its hash, so it stays pending."""
-    at_final = [e for e in lane_entries if e.get("plan_hash") == final_hash]
-    raised = [e for e in at_final if e.get("verdict") != "approve"
+def decide_consensus(lane_entries, tier_lanes, final_hash, rounds_left=True):
+    """(verdict, why): "consensus", "pending" or "escalate", from the lane entries alone (all rounds, oldest first). Each lane counts by
+    its LATEST entry at the final hash (a later reject undoes an earlier approve).
+    Consensus needs, for EVERY lane of the tier, an `approve` as that latest entry, and no blocking objection left open.
+    A blocking objection raised on the final text escalates (it cannot start another round). With no round left (`rounds_left` false)
+    any unresolved blocking objection, or a lane whose latest entry on the final text is not an approve, ESCALATES with its ids:
+    an objection that survives the rounds is never dropped and never left pending. A revision changed after a lane approved has no
+    approval at its hash, so it stays pending until a closing round."""
+    final = {}
+    for entry in lane_entries:
+        if entry.get("plan_hash") == final_hash:
+            final[entry.get("lane")] = entry
+    raised = [e for e in final.values() if e.get("verdict") != "approve"
               and any(o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES for o in e.get("objections") or [])]
     if raised:
-        return "escalate", "lane %s raised a blocking objection on the final text" % raised[-1].get("lane")
-    approved = {e.get("lane") for e in at_final if e.get("verdict") == "approve"}
+        return "escalate", "lane %s raised a blocking objection on the final text" % sorted(e.get("lane") for e in raised)[0]
+    left = survivors(lane_entries)
+    if not rounds_left:
+        dissent = sorted(l for l, e in final.items() if e.get("verdict") != "approve")
+        if left or dissent:
+            parts = []
+            if left:
+                parts.append("blocking objections open: " + ", ".join("%s/%s" % k for k in left))
+            if dissent:
+                parts.append("no approval from " + ", ".join(dissent))
+            return "escalate", "the rounds are spent with " + "; ".join(parts)
+    approved = {l for l, e in final.items() if e.get("verdict") == "approve"}
     missing = [lane for lane in tier_lanes if lane not in approved]
     if missing:
         return "pending", "no approval at the final hash from %s (no closing round, no consensus)" % ", ".join(missing)
-    left = survivors(lane_entries)
     if left:
         return "pending", "blocking objections still open: %s" % ", ".join("%s/%s" % k for k in left)
     return "consensus", "every lane of the tier approved the final hash"
@@ -275,6 +325,8 @@ def parse_verdict_block(text, plan_hash, lane):
         return None, "the verdict must be one of %s" % ", ".join(VERDICTS)
     if head["verdict"] == "approve" and any(o["severity"] == "blocking" and o["state"] not in CLOSED_STATES for o in objections):
         return None, "an approve cannot carry an open blocking objection"
+    if head["verdict"] in ("iterate", "reject") and not objections:
+        return None, "%s needs at least 1 objection: a verdict with nothing to resolve is refused" % head["verdict"]
     return {"lane": lane, "plan_hash": plan_hash, "verdict": head["verdict"], "objections": objections}, None
 
 
@@ -297,8 +349,8 @@ VERDICT_FORMAT = ("End your final message with exactly one fenced block:\n```ver
 
 
 def lane_brief(lane, plan_ref, plan_hash, plan_text, intent, done_when, carried=(), closing=False):
-    """The brief the switchboard builds for a lane: the snapshot, the ask's Intent and Done-when, the lane's charter, the objections the
-    lineage carries, and the verdict format. It takes no planner reasoning and no other lane's output, by construction: there is no
+    """The brief the switchboard builds for a lane: the snapshot, the ask's Intent and Done-when, the lane's charter, this lane's own objections the
+    lineage carries (never another lane's), and the verdict format. It takes no planner reasoning and no other lane's output, by construction: there is no
     parameter for them."""
     parts = [
         "You are reviewer lane %s (%s) of a plan review. You are read-only: you review, you do not edit anything or message anyone."
@@ -310,9 +362,10 @@ def lane_brief(lane, plan_ref, plan_hash, plan_text, intent, done_when, carried=
     ]
     if closing:
         parts.append("This is the CLOSING round: confirm (approve) this exact final text, or raise a new blocking objection.")
-    if carried:
-        parts.append("Open objections carried from earlier rounds; say for each whether it is resolved, its rejection is accepted, or it "
-                     "is escalated:\n" + "\n".join("- %s (%s): %s" % (o["id"], o.get("lane", "?"), o.get("text", "")) for o in carried))
+    own = [o for o in carried if o.get("lane") == lane]   # only THIS lane's own objections: never another lane's output
+    if own:
+        parts.append("Your open objections from earlier rounds; say for each whether it is resolved, its rejection is accepted, or it "
+                     "is escalated:\n" + "\n".join("- %s: %s" % (o["id"], o.get("text", "")) for o in own))
     parts.append(VERDICT_FORMAT % {"lane": lane, "plan_hash": plan_hash})
     parts.append("--- PLAN SNAPSHOT (untrusted) ---\n%s" % plan_text)
     return "\n\n".join(parts)
@@ -320,6 +373,9 @@ def lane_brief(lane, plan_ref, plan_hash, plan_text, intent, done_when, carried=
 
 def escalation_message(lineage, objection, response):
     """The message to the boss: the objection and the planner's response side by side."""
+    def cut(text):
+        text = " ".join(str(text or "").split())
+        return text if len(text) <= TEXT_CAP else text[:TEXT_CAP - 1] + "\u2026"
     return ("Plan review escalation for %s: objection %s from lane %s is still open after the rounds.\nTHE OBJECTION: %s\n"
             "THE PLANNER'S RESPONSE: %s\nDecide with `fleet-switchboard plan review decide`."
-            % (lineage, objection.get("id"), objection.get("lane"), objection.get("text", ""), response or "(none recorded)"))
+            % (lineage, objection.get("id"), objection.get("lane"), cut(objection.get("text")), cut(response) or "(none recorded)"))
