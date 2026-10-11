@@ -178,3 +178,9 @@ a consensus with its reason and `status` and the gate show `overridden`; an esca
 - Cost per plan is an estimate until the harness records tokens. Open: whether a lane's token count can be read from the session.
 - Open: the lane timeout and the wave size (proposed 15 minutes and 3).
 - Rollback: set `plan_review.enabled` false or create the kill file; the ledger entries stay and E4 is unaffected.
+
+## Build status
+
+R1 (the pure core, `bin/plan_review.py`) is built: the tier, the lanes of a tier, the lineage's round cap and escalation rules, the tally
+(consensus, pending or escalate, with the closing round), who may override, the strict verdict-block parser and the lane brief text, all as pure
+functions with unit tests. Nothing imports it yet; R2 adds the commands.
