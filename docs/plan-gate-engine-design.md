@@ -24,6 +24,25 @@ are later slices; until they exist their gates stay "not tracked" and cannot blo
 4. **Drafts carry no gate.** Converting back to draft is allowed. A draft cannot be merged.
 5. **Verdicts come from the switchboard's record**, never from a worker's comment.
 
+## G1 never passes vacuously
+
+A plan can claim every scenario at the epic (`claim: epic`) and so have nothing to prove per PR. The #153 view then reports
+"0 of 0 proven" as satisfied, which would make the gate decorative. This slice changes that, in `gates` and so in every
+enforcement point:
+
+- **G1 is not satisfied when zero scenarios are claimed per PR**, unless the plan says so explicitly in a line
+  `per-pr scenarios: none because <reason>` (at least 20 characters, the same rule as `unchanged: none because`). With that
+  line the gate reports `n/a (no per-PR scenarios: <reason>)` and the PR falls under the epic gate (G7), which is not
+  enforced here.
+- **An epic claim needs an epic**: a scenario with `claim: epic` is accepted only when the plan names its integration branch
+  (an `integration/<epic-slug>` line in the plan's integration-branch decision); otherwise `plan check` reports it as a
+  defect (`epic-claim-without-branch`).
+- **A move from `pr` to `epic` is visible**: when a plan revision changes a scenario's claim, `gates` prints
+  `PLAN CHANGED: S3 claim pr -> epic`, as it already prints a changed plan source. A change to any scenario's claim is
+  "substantive" in the sense of plan section 6 (it needs consensus at the new hash), so it cannot be slipped in.
+- Tests: a plan whose only scenario is epic-claimed does not pass G1; with the explicit statement it is `n/a`; an epic claim with
+  no integration branch fails `plan check`; moving a claim shows in `gates`.
+
 ## Configuration
 
 One new config key, `plan_gates`:
@@ -58,11 +77,20 @@ polarity named differently.
 | E3 | `gh pr merge <pr>` | G1 to G4 and G6 resolved at the head; a draft cannot be merged | the `gh` shim |
 | E4 | `fleet-switchboard launch` (an assignment under a plan) | the brief's `PLAN:` link has a **consensus record at its current plan hash** (G0b); no `PLAN:` is refused only in `enforce` | `launch` itself |
 
+**Merge: the head checked is the head merged.** `gh pr merge` checks the head at the moment of the command, then the real `gh`
+merges whatever the head is by then. The shim therefore reads the head SHA once, checks the gates **at that SHA**, and runs the
+real `gh pr merge` with `--match-head-commit <that SHA>` added, so a push between the check and the merge makes the merge fail
+instead of merging an unchecked head. `--auto` merges later, at a head nobody checked: in `enforce` it is **refused** (or
+given the same flag and re-checked when it fires, which GitHub does not do), and in `shadow` it is recorded as would-refuse.
+
 How the shim asks: it runs `fleet-switchboard gates-check <pr> --for ready|merge` (a new, thin, read-only subcommand over the
 existing `gates` logic) with a **3 s** limit and reads one of three outcomes from the exit code: `0` allow, `10` refuse (the
 one-line reason on stderr is printed, naming the missing gates and the waiver path), anything else (a timeout, a crash, a
 missing binary, the daemon down) is treated as **allow** and recorded as a fail-open (see below). The real `gh` then runs
-unchanged. The shim never parses what it does not understand: an argument shape it cannot read is allowed, as signing is
+unchanged. The shapes the shim must handle, each with a test: `gh pr merge` with no argument (the current branch's PR), a PR URL
+for another repository or a fork, `--repo` with a different case of the owner or name (opt-in matching is case-insensitive and
+follows a renamed repository, or a listed repo is silently "not opted in"), `gh pr create --draft=false` and `-d`, `--web`,
+`gh pr ready --undo` (back to draft: allowed), and `--auto` (above). The shim never parses what it does not understand: an argument shape it cannot read is allowed, as signing is
 today.
 
 `gates-check` first resolves the repository and mode: not opted in, killed, or `shadow` all end in "allow", and shadow
@@ -70,16 +98,66 @@ records `gate.would_refuse` with the gates that failed.
 
 ## Failure mode: fail-open, with an alarm
 
-| Failure | What happens | Recorded |
-|---|---|---|
-| the check times out or crashes | allow | `gate.fail_open` with the reason; counted |
-| GitHub unreadable (head, CI, body) | allow (an unknown is not a refusal) | `gate.fail_open` |
-| the ledger chain is broken | allow, and the broken ledger is the alarm | `gate.fail_open`, `ledger.tampered` |
-| the switchboard binary is missing | the shim allows | a spool line the daemon reads (`gate-failopen.jsonl`), since the shim has no audit |
-| config unreadable | allow, all repos treated as not opted in | `gate.fail_open` |
+**Only one exit code refuses.** `gates-check` exits `10` to refuse and nothing else refuses: any other exit (a crash, a Python
+exception exits 1, a timeout, a missing binary, a signal) is **allow**. A refusal and a fail-open must be distinguishable in
+the logs: a refusal writes `gate.refused` and prints its reason; a fail-open writes `gate.fail_open` with a reason. A
+self-test runs both and checks the two records differ.
 
-More than N fail-opens in an hour (default 3) raises one alarm to cos, using the existing alarm path (a fact, batched). A
-fail-open is never silent and never a refusal.
+| Failure | `shadow` | `enforce` | Recorded |
+|---|---|---|---|
+| the check times out or crashes | allow | allow | `gate.fail_open`, counted per repo |
+| GitHub unreadable (head, CI, body) | allow | allow (an unknown is not a refusal) | `gate.fail_open` |
+| the ledger chain is broken | allow, **alarm at once** | **refuse the gates that need the ledger (G1)** and alarm at once; the rest are checked normally | `ledger.broken`, never counted towards a rate |
+| the switchboard binary is missing | allow | allow | a spool line (below) |
+| config unreadable | allow, all repos as not opted in | allow | `gate.fail_open`, alarm at once |
+
+A **broken or deleted ledger must not disable the gates**: corrupting the file is the easiest way to switch enforcement off, so
+in `enforce` a broken ledger refuses what depends on it (and says why), and in every mode it alarms immediately. A missing
+ledger file when the head pointer exists is a broken ledger, not an empty one.
+
+**Alarms.** The **first fail-open of each kind, per repo, per day** alarms cos immediately; in addition more than 3 in an hour
+raises one alarm (cos only). `status` and `fleet-doctor` show, per repo, the counts of checks, refusals and fail-opens over the
+last day: a gate that has never refused and fails open often is dead, and the doctor says so.
+
+**Time budget.** A 3 s limit across the PR read, the plan fetch, the notice read and the ledger is not realistic on a loaded
+machine (a single `whoami` takes 0.3 to 0.8 s here, and the shim's own identity lookup can spend up to 3 s). The budget is a
+**per-repo setting**, `budget_ms`, default 6000, measured in shadow before any repo enforces. The plan and the PR's read are
+**cached** briefly (60 s, keyed by the head and the plan hash) and shared between the shim's call and `gates`, so a retry is
+cheap. A repo whose fail-open rate from timeouts exceeds 5% is not eligible to enforce.
+
+**The spool is untrusted.** The shim has no audit log, so it appends a line to `gate-failopen.jsonl` when it cannot reach the
+switchboard. Any local process can write that file; the daemon reads it as untrusted text: each line is clipped, treated as
+data (never markup, never a command), and only counted and shown.
+
+**No recursion.** The shim calls `gates-check`, which calls `gh`. That inner `gh` carries the own-call marker (#141) so the
+shim passes it through unchanged and never re-enters the gate. A test runs a check with the marker and proves the shim does not
+call `gates-check` again.
+
+## The way out: who can run which command
+
+`enforce` can stop the fleet if it is switched on carelessly or breaks. The design therefore defines, end to end, who can do
+what, and the commands cos needs. **Changes to the chief of staff's permissions are held for the owner**, so this section only
+describes them; the permission generator and the permission corpus are a follow-up in the same slice, held as such.
+
+| Action | Command | Who | How it is reachable |
+|---|---|---|---|
+| Switch a repo to shadow or off (the soft kill) | `fleet-switchboard gates mode <repo> shadow\|off` | chief of staff (and the owner at a shell) | a new subcommand that edits `plan_gates` through the switchboard's own config writer, audited (`gate.mode`); it needs `gates` in cos's allowed commands, **a follow-up permission change held for the owner** |
+| Switch every repo off (the global kill) | `fleet-switchboard gates off` / `gates on` | chief of staff, owner | creates or removes `plan-gates.off` in the state directory through the same subcommand (cos cannot write the state directory directly) |
+| Waive G0 to G5 for one PR | `fleet-switchboard waive <repo#N> ...` | chief of staff only | `waive` must be added to cos's allowed commands and to the permission corpus; **held for the owner** |
+| Register evaluators | edit `plan_evaluators` in the config | the owner (a shell) | a config edit; cos cannot do it, by design: who may judge is the owner's decision |
+
+`status` prints the kill file loudly while it exists, and each repo's mode.
+
+**Enforce cannot be switched on into a deadlock.** Setting a repo to `enforce` is **refused** (config validation, and
+`gates mode <repo> enforce`) unless every evaluator named by the plans of open PRs in that repo is registered in
+`plan_evaluators`, and a recorder is defined for `ci`: the `ci` evaluator's verdict is recorded by a registered agent that
+reads the PR's CI result at the head (a `ci` verdict is the one a machine can give, so a registered `ci` recorder is mandatory
+for `enforce`; until there is one, `ci` scenarios block enforcement of that repo). `gates-check --preflight <repo>` lists what
+is missing so the switch-on is a checklist, not a surprise.
+
+**The engine does not gate its own repair.** A fix to the gate engine is a PR in a repository that may be opted in. The
+rule: **this repository (fleet-kit) stays in `shadow`**, and the kill switch is the plan for any other repo that hits a
+bug in the engine; a hotfix to the engine proceeds under a cos waiver or with the repo switched to shadow first.
 
 ## The waiver
 
@@ -150,6 +228,10 @@ gated: only ready and merge are.
 | Area | Cases |
 |---|---|
 | mode and opt-in | a repo not listed: no output, no change; `shadow` never refuses and records would-refuse; `enforce` refuses; `enabled: false` and the `plan-gates.off` file each disable at the next command and are logged |
+| merge head | a push between check and merge makes the merge fail (`--match-head-commit`); `--auto` refused in enforce |
+| escape hatch | `gates mode <repo> shadow` and `gates off` work for cos and are audited; `enforce` is refused until every named evaluator and a `ci` recorder are registered; `--preflight` lists what is missing |
+| G1 | a plan with only epic-claimed scenarios does not pass G1; the explicit statement makes it n/a; moving a claim is shown |
+| shim recursion | the inner `gh` of a check is not gated again |
 | E1/E2 | `ready` refused with G1 missing; allowed with all proven; a draft `create` allowed; a non-draft `create` with no `PLAN:` refused only in enforce |
 | E3 | `merge` refused without G1 to G4, or with G6 open; allowed when satisfied; a draft refused; a push after ready voids the verdicts and the merge is refused again |
 | E4 | `launch` refused for a `PLAN:` with no consensus at its current hash; allowed with one; an edited plan voids it; no `PLAN:` allowed in shadow |
@@ -170,8 +252,10 @@ gated: only ready and merge are.
 ## Open questions
 
 1. The kill switch's polarity (above).
-2. Is a **global** `plan-gates.off` file wanted, or per-repo only? (A global file is quick to reach in an incident, but is one
-   more thing to forget.)
-3. The fail-open alarm threshold (N = 3 an hour) and who receives it (cos only, as proposed).
-4. Should `merge` also be gated for repos in `shadow` against `MERGE: captain` PRs (held for the owner), where the existing
-   hold already applies? As written, G6 only reports there.
+2. A **global** `plan-gates.off` file is kept, and `status` prints it loudly while it exists (reviewer's opinion, adopted).
+3. The fail-open alarm: the first of each kind per repo per day, plus more than 3 an hour, to cos only (adopted).
+4. In `shadow`, G6 reports against `MERGE: captain` PRs so the owner sees what enforcement would add; it refuses on it only after
+   the rest is proven (reviewer's opinion, adopted).
+5. The `PLAN:` line is in the PR body and its writer can edit it; #153 voids earlier entries on a change, but a writer could
+   point to a trivial plan of their own. With approval (G0c) untracked that is accepted for now, and is the reason G0c is the
+   next record to build.
