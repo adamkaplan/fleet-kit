@@ -1160,19 +1160,70 @@ def agent_session(entry):
     return value if isinstance(value, str) and value else None
 
 
+PROGRAM_VERSION_SECONDS = 3
+_VERSIONS = {}   # (realpath, mtime) -> the first line of `<program> --version`, or None; so a pass spawns nothing twice
+
+
+def program_version(path):
+    """The first line `<path> --version` prints, or None (it could not run, took over PROGRAM_VERSION_SECONDS, or said
+    nothing). Remembered per file and modification time: the daemon asks on every pass."""
+    try:
+        key = (path, os.stat(path).st_mtime)
+    except OSError:
+        return None
+    if key in _VERSIONS:
+        return _VERSIONS[key]
+    version = None
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=PROGRAM_VERSION_SECONDS)
+        lines = (done.stdout or "").strip().splitlines() if done.returncode == 0 else []
+        version = lines[0].strip() if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        version = None
+    if len(_VERSIONS) > 64:
+        _VERSIONS.clear()
+    _VERSIONS[key] = version
+    return version
+
+
+def resolve_program(name):
+    """The real path of a program the pane's command line names by a BARE name (`opencode`): the daemon's PATH lookup, then
+    realpath. None when it is not a bare name or is not found (a relative path means nothing without the pane's directory)."""
+    if not isinstance(name, str) or not name or "/" in name:
+        return None
+    found = shutil.which(name)
+    return os.path.realpath(found) if found else None
+
+
 def runs_program(cmdline, executable):
     """True when a process command line is `executable`, alone or with arguments.
 
     The program and the configured path are compared by realpath, both sides: a pane runs the resolved
     path of a binary the config names by its stable link (a package upgrade moves the target, not the link).
+    A pane started with the bare command (`opencode -s ses_...`, which the shell resolved on ITS path) is the same program when
+    the bare name resolves, on the daemon's PATH, to the same real file; when it resolves to a different file the two are still the
+    same program if both answer `--version` with the same line (a copy). Anything that cannot be decided is NOT the program: a
+    shell, an unknown name, a different binary or version is held.
     """
     if not isinstance(cmdline, str) or not executable:
         return False
     if cmdline == executable or cmdline.startswith(executable + " "):
         return True
+    first = cmdline.split(" ", 1)[0]
+    wanted = os.path.realpath(executable) if os.path.isabs(executable) else None
+    if wanted is not None and not os.path.isabs(first):
+        found = resolve_program(first)
+        if found is not None:
+            if found == wanted:
+                return True
+            if os.path.basename(found) not in (os.path.basename(executable), os.path.basename(wanted)):
+                return False   # a program of another name (a shell, node) is never asked for its version
+            seen, configured = program_version(found), program_version(wanted)
+            return bool(seen) and seen == configured
+        return False
     if not os.path.isabs(cmdline) or not os.path.isabs(executable):
         return False
-    wanted = os.path.realpath(executable)
     ends = [at for at, char in enumerate(cmdline) if char == " "] + [len(cmdline)]
     return any(os.path.realpath(cmdline[:end]) == wanted for end in ends[:16])
 

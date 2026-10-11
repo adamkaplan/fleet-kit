@@ -21424,6 +21424,73 @@ class TestPaneProgramBySymlink(Base):
             with self.subTest(cmdline=cmdline, exe=exe):
                 self.assertEqual(sb.runs_program(cmdline, exe), expected)
 
+    def program(self, name, version, directory):
+        path = Path(directory) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n[ \"$1\" = --version ] && echo %r\nexit 0\n" % version)
+        path.chmod(0o755)
+        return path
+
+    def test_a_pane_started_with_the_bare_command_is_the_configured_program_when_it_resolves_to_it(self):
+        configured = self.program("opencode", "opencode 2.0.22", self.home / "Cellar" / "bin")
+        link_dir = self.home / "brew" / "bin"
+        link_dir.mkdir(parents=True)
+        os.symlink(str(configured), str(link_dir / "opencode"))
+        other_dir = self.home / "other" / "bin"
+        self.program("opencode", "opencode 9.9.9", other_dir)
+        copy_dir = self.home / "copy" / "bin"
+        self.program("opencode", "opencode 2.0.22", copy_dir)
+        self.program("node", "opencode 2.0.22", self.home / "node" / "bin")                 # another name, same --version text
+        for label, path, exe, cmdline, expected in (
+                ("bare name through a symlink, configured by the link", str(link_dir), str(link_dir / "opencode"),
+                 "opencode -s ses_x", True),
+                ("bare name, configured by the real file", str(link_dir), str(configured), "opencode -s ses_x", True),
+                ("bare name alone", str(link_dir), str(configured), "opencode", True),
+                ("absolute and equal (unchanged)", "", str(configured), str(configured) + " -s ses_x", True),
+                ("a genuinely different opencode on the path", str(other_dir), str(configured), "opencode -s ses_x", False),
+                ("a copy with the same version", str(copy_dir), str(configured), "opencode -s ses_x", True),
+                ("a bare name that is not on the path", str(self.home / "empty"), str(configured), "opencode -s ses_x", False),
+                ("a shell", "/bin:/usr/bin", str(configured), "zsh", False),
+                ("a login shell", "/bin:/usr/bin", str(configured), "-zsh", False),
+                ("another program with the same version text", str(self.home / "node" / "bin"), str(configured),
+                 "node app.js", False),
+                ("a relative path", str(link_dir), str(configured), "./opencode -s x", False),
+                ("nothing", str(link_dir), str(configured), None, False)):
+            with self.subTest(label):
+                with mock.patch.dict(os.environ, {"PATH": path}):
+                    self.assertEqual(sb.runs_program(cmdline, exe), expected)
+
+    def test_the_version_is_asked_for_once_per_file_and_never_blocks(self):
+        one = self.program("opencode", "opencode 1", self.home / "v" / "bin")
+        sb._VERSIONS.clear()
+        calls = []
+        real = sb.subprocess.run
+
+        def counting(argv, **kwargs):
+            calls.append(list(argv))
+            return real(argv, **kwargs)
+        with mock.patch.object(sb.subprocess, "run", counting):
+            self.assertEqual((sb.program_version(str(one)), sb.program_version(str(one))), ("opencode 1", "opencode 1"))
+            self.assertEqual(len(calls), 1)
+            slow = self.program("slow", "x", self.home / "s" / "bin")
+            slow.write_text("#!/bin/sh\nsleep 30\n")
+            with mock.patch.object(sb, "PROGRAM_VERSION_SECONDS", 0.3):
+                self.assertIsNone(sb.program_version(str(slow)))                           # bounded, and undecided is held
+        self.assertIsNone(sb.program_version(str(self.home / "missing")))
+
+    def test_a_cos_pane_launched_with_the_bare_command_is_not_held_but_a_different_opencode_is(self):
+        world = World(self, agents=("platform",))
+        engine, pane, session = world.engine, world.panes["platform"], world.sessions["platform"]
+        world.herdr.panes[pane]["program"] = "opencode -s %s" % session
+        with mock.patch.object(sb.shutil, "which", return_value=FAKE_OPENCODE):
+            self.assertFalse(engine.discover(world.clock.now()).agents["platform"].wrong_program)
+            self.assertIsNone(sb.pane_problem(engine, pane, session))
+        with mock.patch.object(sb.shutil, "which", return_value="/elsewhere/bin/opencode"), \
+                mock.patch.object(sb, "program_version", lambda path: "opencode 9" if "elsewhere" in path else "opencode 2"):
+            seen = engine.discover(world.clock.now()).agents["platform"]
+            self.assertTrue(seen.wrong_program)
+            self.assertIn("runs a different opencode", seen.problem)
+
     def test_a_pane_on_the_resolved_path_is_not_wrong_for_discovery_or_for_launch_verification(self):
         world = World(self, agents=("platform",))
         engine, pane, session = world.engine, world.panes["platform"], world.sessions["platform"]
