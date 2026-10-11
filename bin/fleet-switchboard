@@ -11988,6 +11988,58 @@ def cmd_gates_check(args, runner, now):
     return exit_code
 
 
+ANCESTOR_DEPTH = 25
+AGENT_PROCESS_NAMES = ("opencode", "fleet-opencode", "copilot")
+
+
+def _ps_line(pid):
+    """(ppid, command) of `pid` from `ps`, or None when it cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=3,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = done.stdout.strip() if done.returncode == 0 else ""
+    found = re.match(r"^(\d+)\s+(.*)$", line)
+    return (int(found.group(1)), found.group(2)) if found else None
+
+
+def _is_agent_command(command):
+    for token in command.split()[:6]:
+        # an executable named for the agent, or a script under a directory named for it (`node /lib/opencode/cli.js`)
+        if any(part.lower() in AGENT_PROCESS_NAMES for part in token.split("/")):
+            return True
+    return False
+
+
+def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, depth=ANCESTOR_DEPTH):
+    """Why this process cannot be established as the owner's own terminal, or None when it can. Two things must hold: (a) standard
+    input AND output are a controlling terminal (an agent's tool shell runs on pipes), and (b) no ancestor in the caller's process
+    chain is an opencode or agent process (the chain is walked up to `depth` parents). If either cannot be established (no `ps`,
+    an unreadable parent, a chain that does not end) the answer is a reason, never "yes". A strong mistake guard, not a boundary:
+    see docs/switchboard.md."""
+    stdin, stdout, ps = stdin or sys.stdin, stdout or sys.stdout, ps or _ps_line
+    try:
+        if not (stdin.isatty() and stdout.isatty()):
+            return "standard input and output are not a terminal (an agent's tool shell runs on pipes)"
+    except (AttributeError, ValueError, OSError):
+        return "whether this is a terminal cannot be established"
+    pid = os.getppid() if start_pid is None else start_pid
+    for _ in range(depth):
+        if pid <= 1:
+            return None
+        got = ps(pid)
+        if got is None:
+            return "the process chain cannot be read (process %d): refused, not guessed" % pid
+        parent, command = got
+        if _is_agent_command(command):
+            return "an agent process is an ancestor of this command (%s)" % _one_line(command.split()[0] if command.split() else "?", 60)
+        if parent == pid:
+            return None
+        pid = parent
+    return "the process chain is deeper than %d: it cannot be established" % depth
+
+
 def gates_caller_kind(runner, now):
     """(kind, who): "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
@@ -11999,6 +12051,9 @@ def gates_caller_kind(runner, now):
     except IdentityUncertain:
         return "unknown", "unknown (an uncertain identity is refused, never read as a person: #138)"
     except CallerError:
+        problem = owner_terminal_problem()
+        if problem:
+            return "unknown", "not established as the owner's own terminal: %s" % problem
         return "person", "a person at a shell"
     except (V2Error, HerdrError):
         return "unknown", "unknown (the registry could not be read)"

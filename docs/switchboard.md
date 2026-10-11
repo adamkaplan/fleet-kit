@@ -4123,3 +4123,18 @@ agent registered under `plan_evaluators.ci`, but nobody can use the name `switch
 **refused** (by `gates mode ... enforce`, and a hand-edited `enforce` runs as `shadow`) when `ci` is empty, **or when it lists only `switchboard` and the audit
 holds no successful `gate.ci_record` in the last 7 days**: run `gates ci-record` on a PR whose CI is green to prove it, and run it again from time to
 time (a daemon pass that does so is a later step). A failed record, or one older than a week, proves nothing. `gates preflight` says which.
+
+**How "the owner's own terminal" is established (hardening of the owner verdict, #107).** No agent session is not enough: an agent that
+unsets `OPENCODE_SESSION_ID` and `HERDR_PANE_ID` has none either. So the check requires, besides no session, that (a) standard input and
+standard output are a **controlling terminal** (an agent's tool shell runs on pipes) **and** (b) **no ancestor** in the caller's process chain, walked up
+to 25 parents with `ps`, is an `opencode`, `fleet-opencode` or `copilot` process. If either cannot be established (no `ps`, an unreadable
+parent, a chain that does not end) the answer is a refusal with the reason, never a yes; the reason is printed and audited
+(`plan.verdict.refused`). The same check guards `gates mode` and `gates off|on` for a person; the chief of staff, an agent session, needs none.
+
+**What this is, plainly: a strong mistake guard, not a boundary against a determined agent that holds the owner's account.** All agents and
+the owner share one GitHub login and one user account on the machine. An agent that is determined to impersonate the owner could still
+allocate a pseudo-terminal (`script`, `expect`, a `pty` library) and detach itself from its agent ancestors (a double fork, `setsid`, a daemon
+that the init process adopts), after which both checks pass; or write the ledger, the config and the kill file directly. None of that is provable
+from inside the process. What the checks do stop is the honest mistakes and the cheap tricks: a tool shell on pipes, unsetting two variables, and a
+verdict recorded by the agent that ran into the gate. Real separation of the owner's verdicts needs something an agent cannot reach (a separate account, a hardware
+confirmation, or a required check on GitHub); this slice does not provide it.

@@ -16862,12 +16862,14 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
+    terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
+
     def run_as(self, who, *argv):
         if who is None:
             os.environ.pop("HERDR_PANE_ID", None)
         else:
             os.environ["HERDR_PANE_ID"] = self.world.panes[who]
-        with captured() as (out, err):
+        with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
             code = sb.main(list(argv), runner=self.route, now=self.world.clock.now,
                            wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
@@ -17902,6 +17904,76 @@ class TestCiRecorder(LedgerBase):
 
     def test_preflight_says_owner_verdicts_come_only_from_the_owners_terminal(self):
         self.assertIn("only from the owner's own terminal", self.run_as(None, "gates", "preflight", "acme/app")[1])
+
+
+class TestOwnerTerminal(LedgerBase):
+    """The owner's own terminal is established, not assumed: a controlling TTY and no agent process among the ancestors."""
+
+    class Tty:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    def chain(self, table):
+        """A fake `ps`: {pid: (ppid, command)}; None for a pid it does not know."""
+        return lambda pid: table.get(pid)
+
+    def problem(self, table, start=100, tty=True, **kw):
+        return sb.owner_terminal_problem(self.Tty(tty), self.Tty(tty), self.chain(table), start, **kw)
+
+    def test_a_terminal_with_no_agent_ancestor_is_the_owners(self):
+        table = {100: (90, "-zsh"), 90: (80, "/Applications/Term.app/Contents/MacOS/Term"), 80: (1, "/sbin/launchd")}
+        self.assertIsNone(self.problem(table))
+
+    def test_pipes_are_not_a_terminal(self):
+        table = {100: (1, "-zsh")}
+        for stdin, stdout in ((False, True), (True, False), (False, False)):
+            with self.subTest(stdin=stdin, stdout=stdout):
+                got = sb.owner_terminal_problem(self.Tty(stdin), self.Tty(stdout), self.chain(table), 100)
+                self.assertIn("not a terminal", got)
+
+    def test_an_agent_ancestor_anywhere_in_the_chain_refuses(self):
+        for command in ("/home/u/.local/bin/opencode --agent coder", "/opt/bin/fleet-opencode -s ses_1", "node /opt/lib/opencode/cli.js run",
+                        "/usr/local/bin/copilot --agent x"):
+            with self.subTest(command=command):
+                table = {100: (90, "-zsh"), 90: (80, "sh -c run"), 80: (70, command), 70: (1, "/sbin/launchd")}
+                self.assertIn("an agent process is an ancestor", self.problem(table))
+
+    def test_a_chain_that_cannot_be_read_or_does_not_end_refuses(self):
+        self.assertIn("cannot be read", self.problem({100: (90, "-zsh")}))          # 90 is unknown
+        loop = {n: (n + 1, "-zsh") for n in range(100, 140)}
+        self.assertIn("deeper than 5", self.problem(loop, depth=5))
+        self.assertIn("cannot be established", sb.owner_terminal_problem(object(), object(), self.chain({}), 100))
+
+    def test_a_real_ps_unreadable_pid_is_refused_not_guessed(self):
+        self.assertIsNone(sb._ps_line(2 ** 22 + 12345), "no such process: None, which the caller turns into a refusal")
+
+    def test_an_agent_without_its_session_variables_is_refused_for_the_owner_verdict_and_the_reason_is_logged(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: owner")
+        self.terminal_problem = "an agent process is an ancestor of this command (opencode)"
+        code, out, err = self.run_as(None, "verdict", "S3", "--pr", self.PR, "--as", "owner", "--result", "pass", "--evidence", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("not established as the owner's own terminal", err)
+        self.assertIn("an agent process is an ancestor", err)
+        (event,) = [e for e in self.world.audit() if e["event"] == "plan.verdict.refused"]
+        self.assertIn("an agent process is an ancestor", event["detail"]["why"])
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_same_check_guards_mode_changes_and_the_kill_file(self):
+        self.terminal_problem = "standard input and output are not a terminal (an agent's tool shell runs on pipes)"
+        before = self.config_file.read_text()
+        self.assertEqual(self.run_as(None, "gates", "off")[0], 2)
+        self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "off")[0], 2)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.terminal_problem = None
+        self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
+
+    def test_the_chief_of_staff_session_does_not_need_a_terminal(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.terminal_problem = "not a terminal"
+        self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
 
 
 class TestJudgeEval(Base):
