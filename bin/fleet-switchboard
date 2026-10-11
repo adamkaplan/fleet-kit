@@ -7158,7 +7158,8 @@ TRIAGE_FILE = "triage.json"
 TRIAGE_OWNER_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*|__)?(?:owner|owned by)(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*([A-Za-z0-9@_`\"'\[(][^\n]*)$", re.I | re.M)
 TRIAGE_OWNER_PLACEHOLDER_RE = re.compile(r"^[\W_]*(?:tbd|tbc|none|n/?a|na|nobody|no one|unknown|unassigned|unowned|todo|\?+)[\W_]*$", re.I)
 TRIAGE_NOT_APPROVING_RE = re.compile(r"\b(?:not\s+(?:yet\s+)?(?:approved|lgtm)|changes\s+requested|needs?\s+changes|request(?:s|ed)?\s+changes)\b", re.I)
-PARKED_UNTIL_RE = re.compile(r"^[ \t]*Parked until:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$", re.M)
+PARKED_UNTIL_RE = re.compile(r"^[ \t]*Parked until:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*\r?$", re.M)  # ASCII digits only; a CRLF body is read
+PARKED_MAX_DAYS = 366   # a park reaches at most this far ahead of the moment it is judged: `9999-12-31` does not park forever
 
 
 def parked_until(body, labels):
@@ -7374,7 +7375,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        parked = item.get("parked_until") is not None and now < item["parked_until"] and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
+        until = item.get("parked_until")   # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever
+        parked = until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0 and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
