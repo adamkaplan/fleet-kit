@@ -16620,6 +16620,414 @@ class TestCheckPublicNames(Base):
         self.assertEqual((BIN / "check-public-names").read_text().splitlines()[0], "#!/usr/bin/env python3")
 
 
+LEDGER_PLAN = """## Intent
+Commissioning works.
+Done when: (1) an owner can commission an agent; (2) it answers a chat message.
+
+```yaml
+scenarios:
+  - id: S1
+    covers: DW-1
+    text: Given a project with no agents, when an owner commissions one, then it is listed
+    proof: test
+    pass: the list call returns status 200 and exactly 1 agent named "alpha"
+    discriminates: a build that creates nothing returns an empty list and fails
+    evaluator: ci
+  - id: S2
+    covers: DW-2
+    text: Given a commissioned agent, when the owner sends a chat message, then it answers
+    proof: live
+    pass: the reply arrives within 5 s and is longer than 0 characters
+    discriminates: a stub that returns a canned empty reply fails
+    evaluator: tester
+  - id: S3
+    covers: DW-2
+    text: Given the chat window, when the reply arrives, then the header shows the agent state
+    proof: screenshot
+    pass: the header shows the word "Ready" after the reply
+    discriminates: a build that leaves the header blank shows an empty header in the screenshot
+    evaluator: reviewer
+  - id: S4
+    covers: PC-1
+    text: Given a plan section claimed at the epic, when the epic is integrated, then it holds
+    proof: live
+    pass: the integrated build returns status 200 for 3 of 3 sample projects
+    discriminates: a build that drops the third project returns 2 of 3 and fails
+    evaluator: owner
+    claim: epic
+  - id: U1
+    covers: PC-1
+    text: Existing projects with agents are listed exactly as before this change
+    proof: test
+    pass: the golden list output is byte-identical to the stored fixture
+    discriminates: a change in ordering or fields shows as a diff against the fixture
+    evaluator: ci
+```
+"""
+LEDGER_HEAD = "a" * 40
+LEDGER_NEW_HEAD = "b" * 40
+
+
+class TestPlanLedger(Base):
+    """#107: the evidence ledger (`prove`, `verdict`) and the read-only gates view. Synthetic names; nothing enforces."""
+
+    NAMES = ("coder", "rev", "tst", "own", "cibot", "other")
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=self.NAMES)
+        self.plan_issue = {"number": 7, "state": "open", "title": "plan", "body": LEDGER_PLAN, "updated_at": "2026-01-01T00:00:00Z"}
+        self.comments = []
+        self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": LEDGER_HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                   "body": "PLAN: acme/app#7\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.gh_down = False
+        self.configure()
+
+    def configure(self, evaluators=None):
+        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": "acme/app"}
+        raw["plan_evaluators"] = evaluators if evaluators is not None else {
+            "reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]}
+        self.write_config(raw)
+
+    def route(self, argv, **kwargs):
+        if argv[0] != FAKE_GH:
+            return self.world.route(argv, **kwargs)
+        if "--method" in argv or "-X" in argv:
+            raise AssertionError("the ledger commands must only read GitHub: %r" % (argv,))
+        if self.gh_down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable")
+        if argv[1] == "pr" and argv[2] == "view":
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr), "")
+        path = argv[2]
+        if "/comments" in path:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
+        if re.search(r"/issues/7$", path):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+
+    def run_as(self, who, *argv):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    PR = "acme/app#9"
+
+    def prove(self, who, sid, *more, result="pass"):
+        return self.run_as(who, "prove", sid, "--pr", self.PR, "--evidence", "ran the suite: 12 passed", "--result", result, *more)
+
+    def verdict(self, who, sid, evaluator, result="pass", *more):
+        return self.run_as(who, "verdict", sid, "--pr", self.PR, "--as", evaluator, "--result", result, *more)
+
+    def gates(self, *more):
+        code, out, err = self.run_as("coder", "gates", self.PR, "--json", *more)
+        return code, (json.loads(out) if out.strip().startswith("{") else None), err
+
+    def ledger(self):
+        path = self.world.state / "plan-ledger.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def row(self, report, gate):
+        return next(r for r in report["gates"] if r["gate"] == gate)
+
+    def all_proven(self):
+        for sid in ("S1", "S2", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0)
+        for who, sid, ev in (("cibot", "S1", "ci"), ("tst", "S2", "tester"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+
+    # -- prove
+
+    def test_prove_records_a_proof_bound_to_the_plan_hash_and_the_head(self):
+        code, out, err = self.prove("coder", "S1", "--command", "bin/test-x")
+        self.assertEqual(code, 0, err)
+        (entry,) = self.ledger()
+        self.assertEqual((entry["kind"], entry["scenario"], entry["by"], entry["head"], entry["result"]),
+                         ("proof", "S1", "coder", LEDGER_HEAD, "pass"))
+        self.assertRegex(entry["plan_hash"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual((entry["plan_ref"], entry["command"], entry["seq"]), ("acme/app#7", "bin/test-x", 1))
+        self.assertTrue(entry["env"])
+        self.assertIn("plan.proof", [e["event"] for e in self.world.audit()])
+
+    def test_prove_refuses_what_it_cannot_bind(self):
+        for who, sid, extra, fragment in (("coder", "S9", (), "no scenario S9"), ("coder", "S4", (), "claimed at the epic"),
+                                          (None, "S1", (), "HERDR_PANE_ID")):
+            with self.subTest(sid=sid, who=who):
+                code, out, err = self.prove(who, sid, *extra)
+                self.assertNotEqual(code, 0)
+                self.assertIn(fragment, err)
+        self.assertEqual(self.ledger(), [])
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        code, out, err = self.prove("coder", "S1")
+        self.assertEqual(code, 2)
+        self.assertIn("fails `plan check`", err)
+        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", " ")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.ledger(), [])
+
+    def test_prove_without_a_plan_says_where_to_put_one(self):
+        self.pr["body"] = "no plan line here"
+        code, out, err = self.prove("coder", "S1")
+        self.assertEqual(code, 2)
+        self.assertIn("PLAN:", err)
+        code, out, err = self.prove("coder", "S1", "--plan", "acme/app#7")
+        self.assertEqual(code, 0, err)
+
+    def test_the_head_is_read_from_the_pr_or_given_and_an_unreadable_pr_needs_it(self):
+        self.pr["headRefOid"] = None
+        code, out, err = self.prove("coder", "S1")
+        self.assertEqual(code, 2)
+        self.assertIn("--head", err)
+        code, out, err = self.prove("coder", "S1", "--head", "c" * 40)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ledger()[0]["head"], "c" * 40)
+
+    def test_evidence_is_redacted_and_clipped(self):
+        secret = "ghp_" + "0123456789abcdefABCDEF0123"
+        code, out, err = self.run_as("coder", "prove", "S1", "--pr", self.PR, "--evidence", "token %s and %s" % (secret, "x" * 900))
+        self.assertEqual(code, 0, err)
+        evidence = self.ledger()[0]["evidence"]
+        self.assertNotIn(secret, evidence)
+        self.assertLessEqual(len(evidence), sb.plan_ledger.EVIDENCE_LIMIT)
+
+    # -- verdict
+
+    def test_a_verdict_is_recorded_only_for_the_evaluator_the_scenario_names(self):
+        self.assertEqual(self.prove("coder", "S3")[0], 0)
+        code, out, err = self.verdict("rev", "S3", "reviewer")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ledger()[-1]["evaluator"], "reviewer")
+        code, out, err = self.verdict("tst", "S3", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("judged by reviewer, not tester", err)
+        self.assertEqual(len(self.ledger()), 2)
+
+    def test_only_a_registered_agent_may_record_and_by_default_nobody_may(self):
+        code, out, err = self.verdict("other", "S3", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered to record reviewer", err)
+        self.configure(evaluators={})
+        code, out, err = self.verdict("rev", "S3", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("no agent is registered to record reviewer", err)
+        self.assertIn("plan.verdict.refused", [e["event"] for e in self.world.audit()])
+        self.assertEqual(self.ledger(), [])
+
+    def test_the_author_of_the_pr_cannot_record_a_verdict_on_its_own_work(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.configure(evaluators={"reviewer": ["rev", "coder"], "tester": ["coder"], "owner": ["own"], "ci": ["coder"]})
+        for sid, ev in (("S3", "reviewer"), ("S1", "ci")):
+            code, out, err = self.verdict("coder", sid, ev)
+            self.assertEqual(code, 2)
+            self.assertIn("an author cannot record a verdict", err)
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof"])
+        self.assertEqual(self.verdict("rev", "S3", "reviewer")[0], 0)
+
+    def test_the_sender_of_the_prs_notice_counts_as_its_author(self):
+        self.assertEqual(self.run_as("other", "notice", "pr", self.PR, "ready")[0], 0)
+        self.configure(evaluators={"reviewer": ["other"]})
+        code, out, err = self.verdict("other", "S3", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("an author cannot record a verdict", err)
+
+    def test_a_scenario_that_names_the_old_personal_evaluator_is_judged_by_the_owner(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace("    evaluator: reviewer", "    evaluator: adam")
+        code, out, err = self.verdict("own", "S3", "owner")
+        self.assertEqual(code, 0, err)
+
+    # -- the chain
+
+    def test_each_entry_chains_to_the_one_before_and_an_edit_is_found(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        entries = self.ledger()
+        self.assertEqual(entries[1]["prev"], entries[0]["hash"])
+        self.assertEqual(entries[0]["prev"], "0" * 64)
+        path = self.world.state / "plan-ledger.jsonl"
+        original = path.read_text()
+        path.write_text(original.replace('"result": "pass"', '"result": "fail"', 1))
+        _, problem = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertIn("edited", problem)
+        code, out, err = self.prove("coder", "S3")
+        self.assertEqual(code, 2)
+        self.assertIn("not trustworthy", err)
+        lines = original.splitlines()
+        path.write_text("\n".join(reversed(lines)) + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.world.state)[1], "reordering is found")
+        path.write_text(lines[1] + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.world.state)[1], "deleting the first is found")
+        path.write_text(original)
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.world.state)[1])
+
+    def test_the_ledger_file_is_private_and_two_writers_do_not_lose_an_entry(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.world.state / "plan-ledger.jsonl")).st_mode), 0o600)
+        errors = []
+
+        def write(n):
+            try:
+                sb.plan_ledger.append_entry(self.world.state, {"kind": "proof", "result": "pass", "pr": "x#1", "scenario": "S%d" % n}, 5)
+            except Exception as err:  # pragma: no cover
+                errors.append(err)
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(errors, [])
+        entries, problem = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertEqual((len(entries), problem), (9, None))
+
+    # -- gates
+
+    def test_a_pr_with_everything_recorded_is_ready_and_the_untracked_gates_are_listed_not_counted(self):
+        self.all_proven()
+        code, report, err = self.gates()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(report["ready"])
+        self.assertEqual([r["status"] for r in report["gates"] if r["gate"] in ("G0a", "G1", "G4", "G5", "G6")], ["ok"] * 5)
+        self.assertEqual(report["untracked"], ["G0b", "G0c", "G2/G3"])
+        self.assertEqual({r["gate"] for r in report["gates"]},
+                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G7", "G8"})
+        self.assertEqual([self.row(report, g)["status"] for g in ("G7", "G8")], ["n/a", "n/a"])
+        self.assertIn("epic-claimed", self.row(report, "G1")["detail"])
+        self.assertTrue(all(r["decided_by"] for r in report["gates"]))
+
+    def test_gates_name_what_is_missing_and_exit_1(self):
+        code, report, err = self.gates()
+        self.assertEqual(code, 1)
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "missing")
+        self.assertTrue(any("S1: proof" in m and "ci verdict" in m for m in g1["missing"]), g1["missing"])
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        code, report, err = self.gates()
+        self.assertTrue(any(m.startswith("S1: ci verdict") for m in self.row(report, "G1")["missing"]))
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 1)
+        self.assertIn("NOT READY", out)
+        self.assertIn("missing:", out)
+        self.assertIn("not tracked yet", out)
+
+    def test_a_failing_proof_or_verdict_is_not_ready(self):
+        self.all_proven()
+        self.assertEqual(self.prove("coder", "S1", result="fail")[0], 0)
+        self.assertEqual(self.gates()[0], 1)
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.gates()[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci", "fail")[0], 0)
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertTrue(any("ci verdict says fail" in m for m in self.row(report, "G1")["missing"]))
+
+    def test_a_verdict_is_void_when_the_plan_changes(self):
+        self.all_proven()
+        self.assertEqual(self.gates()[0], 0)
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly 2 agents named")
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertTrue(any("plan changed" in note for s in report["scenarios"] for note in s["void"]))
+        self.assertEqual(report["scenarios"][0]["proof"], None)
+        text = self.run_as("coder", "gates", self.PR)[1]
+        self.assertIn("void: plan changed", text)
+
+    def test_a_whitespace_only_edit_does_not_void_but_a_constraint_edit_does(self):
+        self.all_proven()
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning   works.\n")
+        self.assertEqual(self.gates()[0], 0)
+        self.plan_issue["body"] = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a new constraint.")
+        self.assertEqual(self.gates()[0], 1)
+
+    def test_a_proof_is_void_when_the_head_moves(self):
+        self.all_proven()
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertTrue(any("head moved" in note for s in report["scenarios"] for note in s["void"]))
+        self.assertEqual(report["head"], LEDGER_NEW_HEAD)
+
+    def test_a_verdict_by_an_author_is_not_accepted_even_if_it_is_in_the_file(self):
+        self.all_proven()
+        good = next(e for e in self.ledger() if e["kind"] == "verdict" and e["scenario"] == "S3")
+        forged = {k: v for k, v in good.items() if k not in ("seq", "ts", "prev", "hash")}
+        sb.plan_ledger.append_entry(self.world.state, dict(forged, by="coder"), 9)   # written straight to the file
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertTrue(any("by an author" in m for m in self.row(report, "G1")["missing"]), self.row(report, "G1"))
+
+    def test_a_broken_ledger_makes_g1_untrustworthy(self):
+        self.all_proven()
+        path = self.world.state / "plan-ledger.jsonl"
+        path.write_text(path.read_text().replace('"result":"pass"', '"result":"fail"', 1).replace('"result": "pass"', '"result": "fail"', 1))
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER", self.run_as("coder", "gates", self.PR)[1])
+        self.assertTrue(report["ledger_problem"])
+
+    def test_g4_g5_and_g6_read_the_pr(self):
+        self.all_proven()
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.pr["body"] = "PLAN: acme/app#7\ncanon: n/a ok"
+        self.pr["labels"] = [{"name": "tester:merge-captain"}]
+        code, report, _ = self.gates()
+        self.assertEqual(code, 1)
+        self.assertEqual([self.row(report, g)["status"] for g in ("G4", "G5", "G6")], ["missing", "missing", "waiting"])
+        self.pr["body"] = "PLAN: acme/app#7\ncanon: n/a the change touches no documented behaviour"
+        self.assertEqual(self.row(self.gates()[1], "G5")["status"], "ok")
+        self.pr["body"] = "PLAN: acme/app#7"
+        self.assertEqual(self.row(self.gates()[1], "G5")["status"], "missing")
+
+    def test_g0a_needs_a_plan_that_passes(self):
+        self.pr["body"] = ""
+        code, report, _ = self.gates()
+        self.assertEqual(self.row(report, "G0a")["status"], "missing")
+        self.assertIn("PLAN:", " ".join(self.row(report, "G0a")["missing"]))
+        code, report, _ = self.gates("--plan", "acme/app#7")
+        self.assertEqual(self.row(report, "G0a")["status"], "ok")
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        code, report, _ = self.gates("--plan", "acme/app#7")
+        self.assertEqual(self.row(report, "G0a")["status"], "missing")
+        self.assertEqual(self.row(report, "G1")["status"], "missing")
+
+    def test_an_unreadable_pr_or_plan_is_said_not_hidden(self):
+        self.gh_down = True
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 1)
+        self.assertIn("PR not read", out)
+
+    def test_gates_only_read(self):
+        self.all_proven()
+        before = (self.world.state / "plan-ledger.jsonl").read_text()
+        self.gates()
+        self.assertEqual((self.world.state / "plan-ledger.jsonl").read_text(), before)
+        self.assertNotIn("gates", sb.ENSURE_ON_USE_COMMANDS)
+
+    # -- config and hygiene
+
+    def test_plan_evaluators_config_is_checked(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertNotIn("plan_evaluators", sb.validate_config(dict(base)))
+        self.assertEqual(sb.validate_config(dict(base, plan_evaluators={"reviewer": ["rev-1"]}))["plan_evaluators"], {"reviewer": ["rev-1"]})
+        for bad in ([], {"adam": ["x"]}, {"reviewer": "rev"}, {"reviewer": ["Bad Name"]}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict(base, plan_evaluators=bad))
+
+    def test_a_missing_ledger_module_stops_only_these_commands(self):
+        with mock.patch.object(sb, "load_plan_ledger", side_effect=FileNotFoundError("plan_ledger.py is gone")):
+            with self.assertRaises(FileNotFoundError):
+                sb.plan_ledger.LEDGER_FILE
+        text = SWITCHBOARD.read_text()
+        self.assertNotRegex(text, r"(?m)^plan_ledger = load_plan_ledger\(\)")
+
+    def test_the_new_files_carry_nothing_private(self):
+        for path in (BIN / "plan_ledger.py",):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
+
+
 class TestJudgeEval(Base):
     """#106: the evaluation harness, on SYNTHETIC rows only (the real labelled rows are private)."""
 

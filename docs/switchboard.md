@@ -3957,3 +3957,37 @@ and the text of `send`, `report`, `remind`, `notice` and `intent` messages is ne
 - **Still denied:** `az containerapp` entirely (`show` and `env show` print environment variable VALUES: the owner's call whether the Chief of Staff should have them), editing or writing files outside the opencode temp dir, builds and tests, `git push`/commit/checkout, deploys, secret VALUE reads, `az` writes, `gh` repo/secret/release/workflow-run/`--admin`/`--auto`/approve, `gh api` writes, `curl`, `herdr agent prompt`, `pane send`, send-keys, start, stop and close, and paths outside the fleet's repos, the temp dir and the switchboard config, state and opencode config dirs (those three: read only).
 - **Read vs write of the three config dirs:** reads are allowed (standing orders, audit, installed definitions); redirects and the edit tool are denied there. Limits: the file guards name the places they keep out (`.ssh`, `.aws`, `Documents`, ...) rather than allowing only the repos, because a deny cannot carve out an exception.
 - Proof: `python3 tools/cos-permissions-proof/run.py` (job shapes must run, the out-of-job corpus must be denied, nothing asks). Rollback: restore the previous definition files.
+
+## Plan evidence ledger and gates view (#107)
+
+Plan-driven development asks that a worker's proof of each plan scenario, and an evaluator's verdict on it, be held by the
+switchboard and not by the worker. This slice adds the record and a read-only view of the gates. **Nothing enforces
+anything yet**: no gate refuses a ready or a merge, and the `gh` shim is unchanged.
+
+**The ledger** is `plan-ledger.jsonl` in the state directory (mode 0600), append-only. Each entry carries the hash of the
+one before it, so an edit, a deletion or a reordering is found when the file is read, and a ledger whose chain is broken
+takes no new entry. It is tamper-**evident**, not tamper-proof: a process that can write the state directory can rewrite the
+whole chain. Entries are bound to the plan's **plan hash** (from `plan check`: editing the plan, even a constraint, voids
+them) and to the PR's **head** (a push voids them; the view shows them as void, with the reason, rather than hiding them).
+
+| Command | What it records |
+|---|---|
+| `fleet-switchboard prove <scenario> --pr <repo#N> --evidence <link or text> [--result pass\|fail] [--command ...] [--head <sha>] [--plan <source>]` | a PROOF by the calling agent (identified from its session, as for `send`): what it ran and saw, the head, the environment, the plan hash. Evidence is redacted and clipped. The plan must pass `plan check`; the scenario must exist and be claimed per PR (an epic-claimed scenario is proven at the epic head) |
+| `fleet-switchboard verdict <scenario> --pr <repo#N> --as ci\|tester\|reviewer\|owner --result pass\|fail` | a VERDICT, only as the evaluator the scenario names, only by an agent listed for it in the config key `plan_evaluators`, and never by a writer of the PR |
+| `fleet-switchboard gates <repo#N> [--json]` | nothing: it reads |
+
+The plan is `--plan`, else the one the PR's earlier ledger entries named, else the `PLAN: <link>` line of the PR body.
+
+**Who may be an evaluator is configuration, and the default is nobody.** `plan_evaluators` maps an evaluator to fleet agent
+names, for example `{"reviewer": ["reviewer-1"], "tester": ["tester-1"]}`. An evaluator with no names cannot be recorded
+for, which keeps a fresh install from accepting verdicts nobody was trusted to give. An **author** of a PR is anyone who
+recorded a proof for it or sent its `notice pr`; an author's verdict is refused when recorded, and ignored by `gates` if it is
+in the file anyway. A scenario that still names the old personal evaluator spelling is judged by `owner`.
+
+**`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
+it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is
+missing, 2 when it cannot run. Tracked now: **G0a** (the plan passes `plan check`), **G1** (every per-PR scenario has a passing
+proof and a passing verdict from its evaluator, at this plan hash and this head), **G4** (CI green at the head), **G5** (the PR
+body has a `canon:` line: what was updated, or `canon: n/a <reason>` with a reason), **G6** (waiting while the PR is held for the
+owner). Listed but **not tracked yet, and not counted**: G0b (consensus), G0c (approval) and G2/G3 (alignment and code review),
+whose records are later slices; G7 and G8 are epic and deploy gates and show `n/a` for one PR.
