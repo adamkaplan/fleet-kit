@@ -542,6 +542,32 @@ print(("WARN\t" if d.get("total") or late else "ok\t") + "sweep (%s): %d finding
   fi
 fi
 
+# =========================================================== 8f. the triage function (#130)
+# The daemon's last triage pass (counts by rule) from `fleet-switchboard status --json`. WARN on unreadable repos or units
+# that could not be checked; findings alone are information, not a doctor problem. It writes nothing to GitHub (the owner's hold).
+if [ -n "$sb_real" ] && [ -x "$sb_real" ]; then
+  run_to 40 "$sb_real" status --json
+  tr=$(printf '%s' "$LAST_OUT" | python3 -c '
+import json,sys
+try:
+    d=json.loads(sys.stdin.read()).get("triage")
+except Exception:
+    sys.exit(0)
+if not d:
+    print("ok\tno triage pass recorded yet"); sys.exit(0)
+parts=", ".join("%s %d" % kv for kv in sorted(d["counts"].items())) or "none"
+note=""
+if d.get("unreadable"):
+    note+="; unreadable: " + ", ".join(d["unreadable"])
+if d.get("unchecked_units"):
+    note+="; unchecked units in " + ", ".join(sorted(d["unchecked_units"]))
+mode="on" if d.get("enabled") else "shadow"
+print(("WARN\t" if d.get("unreadable") or d.get("unchecked_units") else "ok\t") + "triage (%s): %d finding(s): %s%s" % (mode, d.get("total", 0), parts, note))' 2>/dev/null)
+  if [ -n "$tr" ]; then
+    tr_tab=$(printf '\t'); LAST_OUT=""; emit "${tr%%"$tr_tab"*}" triage "${tr#*"$tr_tab"}"
+  fi
+fi
+
 # =========================================================== 9. charter drift
 # Best effort, WARN-only, never FAIL. Unparseable charters are skipped quietly.
 if [ ! -f "$TMPDIR_FD/panes.txt" ] && [ -n "$FLEET_REPO" ]; then

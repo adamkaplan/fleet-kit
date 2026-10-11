@@ -96,6 +96,34 @@ def load_decision_core():
 decision_core = load_decision_core()
 
 
+def load_plan_check():
+    """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
+    held = sys.modules.get("plan_check")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("plan_check", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["plan_check"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("plan_check", None)
+        raise
+    return module
+
+
+class _LazyPlanCheck:
+    """`plan_check`, loaded on first use: a missing or broken bin/plan_check.py must never stop the daemon or any other
+    command, only `plan check` itself, with a clear message."""
+
+    def __getattr__(self, name):
+        return getattr(load_plan_check(), name)
+
+
+plan_check = _LazyPlanCheck()
+
+
 def load_external_adapter():
     """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
     load_decision_core loads the core. Called only when an external decision system is switched on and names this
@@ -254,7 +282,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -304,6 +332,7 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_sweep_config(config, source)  # #117
+    validate_triage_config(config, source)  # #130
     return config
 
 
@@ -1104,7 +1133,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -1131,19 +1160,70 @@ def agent_session(entry):
     return value if isinstance(value, str) and value else None
 
 
+PROGRAM_VERSION_SECONDS = 3
+_VERSIONS = {}   # (realpath, mtime) -> the first line of `<program> --version`, or None; so a pass spawns nothing twice
+
+
+def program_version(path):
+    """The first line `<path> --version` prints, or None (it could not run, took over PROGRAM_VERSION_SECONDS, or said
+    nothing). Remembered per file and modification time: the daemon asks on every pass."""
+    try:
+        key = (path, os.stat(path).st_mtime)
+    except OSError:
+        return None
+    if key in _VERSIONS:
+        return _VERSIONS[key]
+    version = None
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=PROGRAM_VERSION_SECONDS)
+        lines = (done.stdout or "").strip().splitlines() if done.returncode == 0 else []
+        version = lines[0].strip() if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        version = None
+    if len(_VERSIONS) > 64:
+        _VERSIONS.clear()
+    _VERSIONS[key] = version
+    return version
+
+
+def resolve_program(name):
+    """The real path of a program the pane's command line names by a BARE name (`opencode`): the daemon's PATH lookup, then
+    realpath. None when it is not a bare name or is not found (a relative path means nothing without the pane's directory)."""
+    if not isinstance(name, str) or not name or "/" in name:
+        return None
+    found = shutil.which(name)
+    return os.path.realpath(found) if found else None
+
+
 def runs_program(cmdline, executable):
     """True when a process command line is `executable`, alone or with arguments.
 
     The program and the configured path are compared by realpath, both sides: a pane runs the resolved
     path of a binary the config names by its stable link (a package upgrade moves the target, not the link).
+    A pane started with the bare command (`opencode -s ses_...`, which the shell resolved on ITS path) is the same program when
+    the bare name resolves, on the daemon's PATH, to the same real file; when it resolves to a different file the two are still the
+    same program if both answer `--version` with the same line (a copy). Anything that cannot be decided is NOT the program: a
+    shell, an unknown name, a different binary or version is held.
     """
     if not isinstance(cmdline, str) or not executable:
         return False
     if cmdline == executable or cmdline.startswith(executable + " "):
         return True
+    first = cmdline.split(" ", 1)[0]
+    wanted = os.path.realpath(executable) if os.path.isabs(executable) else None
+    if wanted is not None and not os.path.isabs(first):
+        found = resolve_program(first)
+        if found is not None:
+            if found == wanted:
+                return True
+            if os.path.basename(found) not in (os.path.basename(executable), os.path.basename(wanted)):
+                return False   # a program of another name (a shell, node) is never asked for its version
+            seen, configured = program_version(found), program_version(wanted)
+            return bool(seen) and seen == configured
+        return False
     if not os.path.isabs(cmdline) or not os.path.isabs(executable):
         return False
-    wanted = os.path.realpath(executable)
     ends = [at for at, char in enumerate(cmdline) if char == " "] + [len(cmdline)]
     return any(os.path.realpath(cmdline[:end]) == wanted for end in ends[:16])
 
@@ -1414,7 +1494,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage"}
 
 
 def _line_of(text, limit):
@@ -2944,12 +3024,20 @@ def run_lock_held(state_dir):
         os.close(fd)
 
 
+# What names a CALLER (an agent's pane, its session, its role and repo): the daemon is nobody's agent, so it never carries them,
+# whichever shell started it, and neither do the processes it starts.
+CALLER_ENV_NAMES = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID",
+                    "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")
+OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # set in every switchboard process: its gh calls name their own account (GhAccounts);
+                                          # the gh shim leaves such a call's token alone and never re-identifies it
+
+
 def daemon_environment(environ):
-    """The environment for a daemon started from a hook: herdr's server env
-    minus the hook's own pane, which is whatever pane you had focused."""
+    """The environment for a daemon started from a hook: herdr's server env minus the hook's own pane (whatever pane you
+    had focused) and every other name of a caller (session, role, repo): started from an agent's shell, it would otherwise
+    BE that agent to the gh shim, which would swap the token of each of the daemon's own gh calls."""
     return {name: value for name, value in environ.items()
-            if not name.startswith("HERDR_PLUGIN_")
-            and name not in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID")}
+            if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES}
 
 
 def spawn_daemon(state_dir, spawn=subprocess.Popen):
@@ -3621,13 +3709,28 @@ def cmd_comment(args, runner, now):
 def cmd_whoami(args, runner, now):
     """The calling agent's fleet name: what the `gh` shim signs a comment with. Exit 1, silent on stdout,
     when the caller is not a fleet agent."""
-    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    engine, _, config = build_engine(runner, now, "cli", writable=False)
+    if getattr(args, "json", False):
+        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+        repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
+                         sort_keys=True))
+        return EXIT_OK
+    if getattr(args, "repo", False):
+        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+        repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        print(repo or _fleet_repo(fleet, config) or config.get("intent_repo") or "")
+        return EXIT_OK
     print(identify_caller(engine.herdr, engine.v2, os.environ))
     return EXIT_OK
 
 
 def add_foreground_parsers(sub):
-    sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
+    whoami = sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
+    whoami.add_argument("--json", action="store_true", help="Print {\"name\", \"repo\"} on one line: the gh shim's single "
+                        "lookup (name for the signature, repo for the account)")
+    whoami.add_argument("--repo", action="store_true", help="Print the repo of your resolved identity "
+                                       "(for the gh shim, which picks the account from it); empty when it has none")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
     comment.add_argument("--issue", type=issue_arg, required=True, help="The issue to comment on")
@@ -4513,6 +4616,20 @@ def mark_escalated(state_dir, key, when):
         write_escalated(state_dir, found)
 
 
+def captain_escalations_to_keep(engine):
+    """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
+    whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
+    no captain entry, so its key is not among the pending requests, and pruning on that would demote a decision the Chief of
+    Staff escalated. The key leaves when its notice does (the PR merged or closed), or by the head naming it never matching again.
+    None when the notices cannot be read: then nothing is pruned at all."""
+    try:
+        alive = {"%s#%d" % (n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+        escalated = read_escalated(engine.state_dir)
+    except (NoticeError, OSError, TypeError):
+        return None
+    return {k for k in escalated if k.startswith("captain:") and k[len("captain:"):].rpartition("@")[0] in alive}
+
+
 def prune_escalated(state_dir, pending):
     """Forget every escalation of a request that is no longer pending (the daemon's, once a pass)."""
     if pending is None or not (Path(state_dir) / ESCALATED_FILE).exists():
@@ -4767,7 +4884,7 @@ PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are 
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
 PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
 PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
 
@@ -4936,14 +5053,88 @@ def pr_ci_of(rollup):
 
 
 CAPTAIN_MARK = "MERGE: captain"
+CAPTAIN_MERGE_LABELS = ("merge-captain", "merge-automatic")
+CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hold-policy", "hold-prod-config",
+                       "hold-other-area")
+# TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, about 30
+# days after the labels landed) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
+# TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
+# to finish the relabelling before then.
+CAPTAIN_MARKER_UNTIL = "2026-12-01"
+
+
+def marker_window_open(now=None):
+    """True while the first-line marker is still read: CAPTAIN_MARKER_UNTIL is set and `now` (epoch seconds, default the clock) is
+    before the end of that day (UTC)."""
+    if not CAPTAIN_MARKER_UNTIL:
+        return False
+    try:
+        end = datetime.strptime(CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
+    except ValueError:
+        return False
+    return (time.time() if now is None else now) < end
+
+
+def pr_marker(body):
+    """`captain` or `automatic` when the body's FIRST non-empty line starts with `MERGE: captain` / `MERGE: automatic`, else None.
+    Nothing else of the body is read."""
+    if not isinstance(body, str):
+        return None
+    first = next((l.strip() for l in body.splitlines() if l.strip()), "")
+    for word in ("captain", "automatic"):
+        mark = "MERGE: " + word
+        if first.startswith(mark) and not re.match(r"\w", first[len(mark):len(mark) + 1]):
+            return word
+    return None
 
 
 def pr_is_captain(body):
     """True when the body's FIRST non-empty line starts with `MERGE: captain`. Nothing else of the body is read."""
-    if not isinstance(body, str):
-        return False
-    first = next((l.strip() for l in body.splitlines() if l.strip()), "")
-    return first.startswith(CAPTAIN_MARK) and not re.match(r"\w", first[len(CAPTAIN_MARK):len(CAPTAIN_MARK) + 1])
+    return pr_marker(body) == "captain"
+
+
+def _label_kind(names, kinds):
+    """The kinds of `kinds` (`merge-captain`, `hold-security`, ...) among label names written `<prefix>:<kind>`."""
+    found = []
+    for name in names or ():
+        text = name.get("name") if isinstance(name, dict) else name
+        if isinstance(text, str) and ":" in text and text.rsplit(":", 1)[1] in kinds and text.rsplit(":", 1)[1] not in found:
+            found.append(text.rsplit(":", 1)[1])
+    return found
+
+
+def pr_hold_reasons(labels):
+    """The reasons a PR is held, from its `hold-*` labels: ['security', 'contract'] (sorted)."""
+    return sorted(k[len("hold-"):] for k in _label_kind(labels, CAPTAIN_HOLD_LABELS))
+
+
+def pr_marker_state(labels, body, now=None):
+    """{"captain": bool, "label": 'captain'|'automatic'|None, "marker": 'captain'|'automatic'|None, "findings": [...]}: what holds
+    a PR for the person. THE LABEL IS THE SOURCE OF TRUTH: `merge-captain` makes it captain, `merge-automatic` makes it not,
+    whatever the body says; only with no merge label is the first-line marker read, and only inside the transition window.
+    `findings` are `marker-without-label` (the line says captain, no merge label: finish the relabelling) and `disagree` (the
+    label and the line say different things; the label won)."""
+    kinds = _label_kind(labels, CAPTAIN_MERGE_LABELS)
+    label = "captain" if "merge-captain" in kinds else "automatic" if "merge-automatic" in kinds else None
+    marker = pr_marker(body)
+    findings = []   # both merge labels at once: held (the cautious reading) and a disagreement, below
+    if label is None:
+        captain = marker == "captain" and marker_window_open(now)
+        if marker == "captain":
+            findings.append("marker-without-label")
+    else:
+        captain = label == "captain"
+        if marker is not None and marker != label:
+            findings.append("disagree")
+        if "merge-captain" in kinds and "merge-automatic" in kinds:
+            findings.append("disagree")
+    return {"captain": captain, "label": label, "marker": marker, "findings": findings}
+
+
+def is_captain(pr, now=None):
+    """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
+    see `pr_marker_state` for the rule (label first, the first-line marker only inside the transition window)."""
+    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
 
 
 def pr_login(user):
@@ -4968,6 +5159,29 @@ def pr_reviews_at(reviews, head, author):
         if oid == head and by != author and state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
             found[by] = state.lower().replace("_", " ")  # the latest review of each reviewer wins
     return [{"by": by, "state": state} for by, state in sorted(found.items())]
+
+
+def pr_review_older(reviews, head, author):
+    """True when someone other than the author reviewed this PR at a commit that is NOT its head (the review predates the
+    last push). Companion of `pr_reviews_at`; False when none or when the list cannot be read."""
+    if not isinstance(reviews, list) or not head or not author:
+        return False
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        commit = review.get("commit")
+        oid = commit.get("oid") if isinstance(commit, dict) else None
+        if (oid and oid != head and pr_login(review.get("author")) not in (None, author)
+                and str(review.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")):
+            return True
+    return False
+
+
+def pr_head_time(commits):
+    """When the PR's last commit was made (epoch seconds), from `gh pr view --json commits`, or None."""
+    if not isinstance(commits, list) or not commits or not isinstance(commits[-1], dict):
+        return None
+    return parse_iso(commits[-1].get("committedDate"))
 
 
 CAPTAIN_NO_REVIEW_SECONDS = 2 * 3600  # a captain PR with no review seen is a decision anyway this long after its notice
@@ -5022,9 +5236,13 @@ def pr_facts_from(data):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
     head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else None
     return {"title": " ".join(str(data.get("title") or "").split()), "state": data["state"].lower(),
-            "captain": pr_is_captain(data.get("body")), "author": pr_login(data.get("author")),
+            "captain": pr_marker_state(data.get("labels"), data.get("body"))["captain"],
+            "holds": pr_hold_reasons(data.get("labels")), "captain_findings": pr_marker_state(data.get("labels"), data.get("body"))["findings"],
+            "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
+            "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
+            "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
             "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
@@ -5033,7 +5251,7 @@ def pr_facts_from(data):
             "head": head}
 
 
-def read_pr_facts(engine, repo, number):
+def read_pr_facts(engine, repo, number, extra_fields=""):
     """ONE `gh pr view` of the PR, with the repo's configured account (gh_users). The hub's picture holds the PR's
     title, size and state only (not checks or review), so it cannot answer this on its own. Raises NoticeError."""
     config = engine.config
@@ -5043,7 +5261,8 @@ def read_pr_facts(engine, repo, number):
     except AccountError as err:
         raise NoticeError(str(err)) from None
     extra = {"env": env} if env is not None else {}
-    argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json", PR_VIEW_FIELDS]
+    argv = [config["gh"], "pr", "view", str(number), "--repo", repo, "--json",
+            PR_VIEW_FIELDS + ("," + extra_fields if extra_fields else "")]
     try:
         done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
                                                     timeout=min(config["call_timeout_seconds"],
@@ -5140,7 +5359,10 @@ def decisions_from_notices(engine, now):
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
-    names = [r.split("/")[-1] for r in decision_repos(engine)] + [i["repo"].split("/")[-1] for i in items]
+    # The id's repo form is decided by the repos IN PLAY (the watched ones and the notices' own), counted once each: with
+    # more than one, every notice id names its repo in full (`pr:owner/repo#N`); with one, the short name. It used to count a
+    # repo twice when it was both watched and noticed, so the form flipped whenever the watch set did (a restart).
+    in_play = set(decision_repos(engine)) | {i["repo"] for i in items}
     entries, bad, any_ok = [], {}, False
     budget = [PR_NOTICE_PASS_BUDGET]
     order = lambda i: (i["created"], i["repo"], i["number"])
@@ -5168,8 +5390,7 @@ def decisions_from_notices(engine, now):
             if since is not None:
                 engine.notice_effects["unreadable"][key] = None
                 engine.notice_effects["observed"][key] = None
-        name = repo.split("/")[-1]
-        tag = repo if names.count(name) > 1 else name
+        tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold)
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
@@ -5864,10 +6085,15 @@ def publish_decisions(engine):
         decisions = sweep_decisions(engine, decisions, now, errors)  # #117: withdraws the stale, finds the rest; never raises
     except Exception as err:
         engine._note("sweep.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
+    except Exception as err:
+        engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
-        store.prune_escalated(engine.request_keys)
+        keep = captain_escalations_to_keep(engine)
+        store.prune_escalated(None if keep is None or engine.request_keys is None else set(engine.request_keys) | keep)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
@@ -6017,11 +6243,13 @@ def decisions_caller(args, runner, now):
         if found is None:
             raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
         return found.fleet or {}
-    if not os.environ.get("HERDR_PANE_ID"):
+    if not os.environ.get("HERDR_PANE_ID") and not os.environ.get(SESSION_ENV):
         return {}
     try:
         engine, _, _ = build_engine(runner, now, "cli", writable=False)
         return caller_fleet(engine.herdr, engine.v2, os.environ)
+    except IdentityUncertain:
+        raise  # never the human's view: an uncertain identity is refused
     except (CallerError, ConfigError, V2Error, HerdrError):
         return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
 
@@ -6147,15 +6375,17 @@ def finish_pass(engine, discovery, report):
 # issue or PR is closed (withdrawn); S5 a cos-tier decision that has aged. It never edits GitHub and never changes a tier.
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
-                  "realarm_hours": 6, "person_names": ["Adam"]}
+                  "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
-SWEEP_CALLS_PER_PASS = 6      # the most `gh` calls the sweep makes in one pass (pages and single reads alike)
+SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.calls_per_pass`: the most `gh` calls one pass makes
+SWEEP_CALLS_CAP = 100
 SWEEP_CONFIRM_RESERVE = 2     # of them, kept for the single-issue reads (is this decision's issue closed?)
 SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent this long in a pass
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
-SWEEP_KINDS = {"S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
+SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
+               "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not MERGE: captain", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
@@ -6188,6 +6418,9 @@ def validate_sweep_config(config, source):
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
+    calls = section["calls_per_pass"]
+    if not isinstance(calls, int) or isinstance(calls, bool) or not 4 <= calls <= SWEEP_CALLS_CAP:
+        raise ConfigError("%s.calls_per_pass' must be a whole number from 4 to %d, got %r" % (where, SWEEP_CALLS_CAP, calls))
     names = section["person_names"]
     if not isinstance(names, list) or not names or not all(isinstance(n, str) and re.fullmatch(r"[\w@ .-]{1,40}", n)
                                                            for n in names):
@@ -6229,7 +6462,7 @@ def sweep_strong_statement(strong, text, default_repo, repos):
     """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
     person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
     `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
-    so `v3.3, #3055` stays one sentence. No refs means the statement names nothing by itself."""
+    so `v3.3, #9101` stays one sentence. No refs means the statement names nothing by itself."""
     if not isinstance(text, str):
         return False, []
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6258,7 +6491,7 @@ def sweep_says_waiting_strong(strong, text):
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
     for match in strong.finditer(text):
         start = max(text.rfind(c, 0, match.start()) for c in ".!?\n") + 1
-        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on Adam, if you agree" fires
+        clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on the owner, if you agree" fires
         if SWEEP_HEDGE_RE.search(clause) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
             continue
         return True
@@ -6272,7 +6505,7 @@ SWEEP_QUOTED_RE = re.compile(r"(?s:```.*?```)|`[^`\n]*`|^[ \t]*>.*$", re.M)
 
 def sweep_says_waiting(regex, text):
     """True when the text, outside code blocks, inline code and quoted lines, says an item waits on the person and does
-    not negate it ("not waiting on Adam", "no longer needs Adam"). Quoted text is somebody else's sentence."""
+    not negate it ("not waiting on the owner", "no longer needs the owner"). Quoted text is somebody else's sentence."""
     if not isinstance(text, str):
         return False
     text = SWEEP_QUOTED_RE.sub(" ", text.replace("\u2019", "'"))
@@ -6349,7 +6582,11 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         body = record.get("body")
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
-                         "captain": pr_is_captain(body), "body_waits": sweep_says_waiting(regex, body), "comments": [],
+                         "captain": is_captain({"labels": names, "body": body}),
+                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
+                         "author": (pr_login(record.get("user")) or "").lower(),
+                         "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
+                         "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False, "latest_refs": []}
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
@@ -6419,6 +6656,20 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     return [d for d in decisions if id(d) not in drop], stale
 
 
+def sweep_ours(engine, repo, number, author, assignees, notices=None):
+    """Whether a PR is OURS (a fleet agent's), by the rule the triage uses to tell ours from other-owner items: its author or an
+    assignee is one of `our_logins` (the triage's key, else the `gh_users` accounts and `owner_logins`), or an agent of ours recorded a
+    notice for it. Another team's PR is not ours: the sweep only flags what our own fleet should have labelled."""
+    tcfg = engine.config.get("triage")
+    mine = triage_our_logins(engine, tcfg if isinstance(tcfg, dict) else {})
+    if notices is None:
+        try:
+            notices = {(n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+        except (NoticeError, OSError, TypeError):
+            notices = set()
+    return (author in mine or any(a in mine for a in assignees or []) or (repo, number) in notices)
+
+
 def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
@@ -6431,6 +6682,10 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     def ref_text(repo, number):
         return "%s#%d" % (repo, number)
     s2, unattributed = set(), 0
+    try:
+        notices = {(n["repo"], n["number"]) for n in read_pr_notices(engine.state_dir)}
+    except (NoticeError, OSError, TypeError):
+        notices = set()
     for repo, picture in state.repos.items():
         for number, item in picture["items"].items():
             if not item["pr"]:
@@ -6442,6 +6697,12 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
+            if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
+                if "marker-without-label" in item["captain_findings"] and sweep_ours(
+                        engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
+                    found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
+                if "disagree" in item["captain_findings"]:
+                    found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
             continue
@@ -6503,6 +6764,12 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
     body, is_pr = data.get("body"), _is_pr(data)
     labelled = bool(names & {awaiting_label(engine.config), awaiting_cos_label(engine.config)})
+    if kind in ("S6a", "S6b"):
+        want = "marker-without-label" if kind == "S6a" else "disagree"
+        if kind == "S6a" and not sweep_ours(engine, repo, number, (pr_login(data.get("user")) or "").lower(),
+                                            [(pr_login(a) or "").lower() for a in data.get("assignees") or [] if isinstance(a, dict)]):
+            return False
+        return is_pr and want in pr_marker_state(names, body)["findings"]
     if kind in ("S1a", "S1b"):
         if is_pr:
             return False
@@ -6523,7 +6790,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         else:
             waits_in_comments = any(sweep_says_waiting(regex, c.get("body")) for c in recent[-SWEEP_PR_COMMENTS:])
     if kind == "S2":
-        return is_pr and not pr_is_captain(body) and (sweep_says_waiting(regex, body) or waits_in_comments)
+        return is_pr and not is_captain({"labels": names, "body": body}) and (sweep_says_waiting(regex, body) or waits_in_comments)
     if kind == "S3":
         if awaiting_label(engine.config) in names:
             return False  # it carries the person's label: a human-tier decision, whatever the list copy said
@@ -6572,7 +6839,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
     regex = sweep_phrase_re(cfg["person_names"])
     state.strong = sweep_strong_re(cfg["person_names"])
-    budget = [SWEEP_CALLS_PER_PASS]
+    budget = [cfg.get("calls_per_pass", SWEEP_CALLS_PER_PASS)]
     sweep_refresh(engine, state, repos, now, cfg, regex, budget)
     share = [(budget[0] + 1) // 2]  # the single reads are split: half for S4, the rest (and S4's unused) to verifying
     start = share[0]
@@ -6705,6 +6972,639 @@ class SweepFacts:
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
 
 
+
+# ---- #130: the triage function (rule family T), grown from the sweep: the same hub reads, call budget, fresh re-check
+# before a finding, shadow default and batched fact to the Chief of Staff. THE OWNER'S HOLD (binding): it WRITES NOTHING to
+# GitHub, ever: no label, assignment, comment, close or edit. Its only writes are audit lines, triage.json (a display
+# file) and the batched fact to the Chief of Staff. The fix rules of the plan stay unbuilt until he lifts the hold.
+
+TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
+                   "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
+                   "calls_per_pass": 30, "pass_seconds": 10}
+# Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
+TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
+              "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
+# (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
+TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
+                "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
+                "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
+                "T11": "orphan", "OO": "other-owner (flag only)"}
+TRIAGE_TTL = 900               # seconds a unit read is kept
+TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
+TRIAGE_CALLS_CAP = 100
+TRIAGE_PASS_SECONDS = TRIAGE_DEFAULTS["pass_seconds"]       # default of `triage.pass_seconds`; cap TRIAGE_SECONDS_CAP
+TRIAGE_SECONDS_CAP = 60
+TRIAGE_LIST_PAGES = 2
+TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
+TRIAGE_UNREADABLE_RETRY = 3600
+TRIAGE_FILE = "triage.json"
+TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
+TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
+
+
+def validate_triage_config(config, source):
+    """`triage`: absent, null or {} runs in shadow (findings audited, nobody woken); `enabled` true adds only the wake of
+    the Chief of Staff; `false` turns it fully off. Nothing here can make it write to GitHub: there is no such code."""
+    if "triage" not in config:
+        return
+    raw = config["triage"]
+    if raw is False:
+        return
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'triage' must be an object or false, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(TRIAGE_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'triage' has key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)))
+    section = dict(TRIAGE_DEFAULTS, **raw)
+    where = "%s: 'triage" % source
+    for key in ("enabled", "daily_summary"):
+        if not isinstance(section[key], bool):
+            raise ConfigError("%s.%s' must be true or false, got %r" % (where, key, section[key]))
+    for key in ("repos", "our_logins"):
+        value = section[key]
+        if value is not None and not (isinstance(value, list) and all(isinstance(r, str) and r for r in value)):
+            raise ConfigError("%s.%s' must be a list of strings or null, got %r" % (where, key, value))
+    if section["repos"] is not None and not all(REPO_RE.match(r) for r in section["repos"]):
+        raise ConfigError("%s.repos' must be OWNER/REPO names, got %r" % (where, section["repos"]))
+    if not _is_number(section["realarm_hours"]) or section["realarm_hours"] <= 0:
+        raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
+    cap = section["max_findings"]
+    if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
+        raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
+    calls = section["calls_per_pass"]
+    if not isinstance(calls, int) or isinstance(calls, bool) or not 4 <= calls <= TRIAGE_CALLS_CAP:
+        raise ConfigError("%s.calls_per_pass' must be a whole number from 4 to %d, got %r" % (where, TRIAGE_CALLS_CAP, calls))
+    seconds = section["pass_seconds"]
+    if not _is_number(seconds) or not 1 <= seconds <= TRIAGE_SECONDS_CAP:
+        raise ConfigError("%s.pass_seconds' must be a number from 1 to %d, got %r" % (where, TRIAGE_SECONDS_CAP, seconds))
+    for name in ("sla",):
+        _check_sla(section[name], where + "." + name)
+    overrides = section["sla_overrides"]
+    if not isinstance(overrides, dict):
+        raise ConfigError("%s.sla_overrides' must map OWNER/REPO to an sla object, got %r" % (where, overrides))
+    for repo, sla in overrides.items():
+        _check_sla(sla, "%s.sla_overrides.%s" % (where, repo))
+    labels = section["required_labels"]
+    if not isinstance(labels, dict) or not all(
+            isinstance(repo, str) and isinstance(group, list) and all(
+                isinstance(l, str) or (isinstance(l, list) and l and all(isinstance(x, str) for x in l)) for l in group)
+            for repo, group in labels.items()):
+        raise ConfigError("%s.required_labels' must map OWNER/REPO to a list of labels (or lists of alternatives), "
+                          "got %r" % (where, labels))
+    config["triage"] = section
+
+
+def _check_sla(sla, where):
+    if not isinstance(sla, dict) or any(k not in TRIAGE_SLA or not _is_number(v) or v <= 0 for k, v in sla.items()):
+        raise ConfigError("%s' must be an object of positive numbers named among %s, got %r"
+                          % (where, ", ".join(TRIAGE_SLA), sla))
+
+
+def triage_sla(cfg, repo):
+    merged = dict(TRIAGE_SLA)
+    merged.update(cfg.get("sla") or {})
+    merged.update((cfg.get("sla_overrides") or {}).get(repo) or {})
+    return merged
+
+
+def triage_repos(engine, cfg):
+    if cfg.get("repos") is not None:
+        return list(cfg["repos"])
+    return sorted(set(decision_repos(engine)))
+
+
+def triage_our_logins(engine, cfg):
+    if cfg.get("our_logins") is not None:
+        return {l.lower() for l in cfg["our_logins"]}
+    config = engine.config
+    return {str(v).lower() for v in (config.get("gh_users") or {}).values()} | {l.lower() for l in config.get("owner_logins") or []}
+
+
+class TriageState:
+    """Memory only: rebuilt from GitHub and the decision list."""
+
+    def __init__(self):
+        self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
+        self.unreadable = {}     # repo -> reason, audited once
+        self.confirmed, self.attempted, self.alarmed = {}, {}, {}
+        self.enriched = {}       # (rule, ref) -> evidence the fresh read added
+        self.logged, self.facts, self.current = set(), {}, {}
+        self.started, self.day, self.day_counts = 0, None, {}
+        self.summarised = None
+
+
+def triage_state(engine):
+    state = getattr(engine, "triage", None)
+    if state is None:
+        state = engine.triage = TriageState()
+    return state
+
+
+def _login_of(user):
+    return pr_login(user)
+
+
+def triage_norm(issue):
+    """One issue or PR record as the rules read it; None when it is not usable. Only reduced facts: no text is kept
+    except the booleans computed from the body."""
+    number = _number(issue)
+    created, updated = parse_iso(issue.get("created_at")), parse_iso(issue.get("updated_at"))
+    if number is None or created is None or updated is None:
+        return None
+    body = issue.get("body")
+    summary = issue.get("sub_issues_summary") if isinstance(issue.get("sub_issues_summary"), dict) else {}
+    total, done = summary.get("total"), summary.get("completed")
+    return {"number": number, "pr": _is_pr(issue), "draft": bool(issue.get("draft")), "state": issue.get("state", "open"),
+            "created": created, "updated": updated, "author": (_login_of(issue.get("user")) or "").lower(),
+            "assignees": [(_login_of(a) or "").lower() for a in issue.get("assignees") or [] if isinstance(a, dict)],
+            "labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
+            "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
+                SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
+            "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
+            "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
+                                   "body": body})}
+
+
+def triage_comment_facts(records):
+    """[{"at", "next", "review"}] oldest first from comment records; no text kept."""
+    found = []
+    for c in records:
+        at = parse_iso(c.get("created_at")) if isinstance(c, dict) else None
+        text = SWEEP_QUOTED_RE.sub(" ", c.get("body") or "") if at is not None and isinstance(c.get("body"), str) else ""
+        if at is not None:
+            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": bool(TRIAGE_REVIEW_RE.search(text))})
+    return sorted(found, key=lambda c: c["at"])
+
+
+def triage_context(engine, repo, items, discovery):
+    """The charters, asks, work items and agent-owned numbers of one repo, from the agents list and the parent links the
+    issue list carries (`parent_issue_url`): no read of their own."""
+    owned, charters = set(), set()
+    for agent in (discovery.agents.values() if discovery else []):
+        fleet = agent.fleet or {}
+        if _fleet_repo(fleet, engine.config) != repo and fleet.get("repo") != repo:
+            continue
+        for field in ("issue", "charter"):
+            value = fleet.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                owned.add(value)
+                if field == "charter":
+                    charters.add(value)
+    charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
+    asks = {n for n, i in items.items() if i["parent"] in charters}
+    work = {n for n, i in items.items() if i["parent"] in asks}
+    return {"charters": charters, "asks": asks, "chain": charters | asks | work, "owned": owned}
+
+
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False):
+    """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
+    whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
+    Evidence holds only labels' names, ages in days and owner logins."""
+    number, found = item["number"], {}
+    chain = number in ctx["chain"]
+    ours = (item["author"] in ours_logins or any(a in ours_logins for a in item["assignees"]) or chain
+            or number in ctx["owned"] or number in notice_prs)
+    day = 86400.0
+    age_created, age_updated = (now - item["created"]) / day, (now - item["updated"]) / day
+    ask = number in ctx["asks"]
+    if not item["pr"]:
+        if not item["assignees"] and not chain and number not in ctx["owned"] and age_created >= sla["t1_days"]:
+            found["T1"] = {"created_days": round(age_created, 2)}
+        group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
+        if group_missing and age_created >= sla["t2_days"]:
+            found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
+                           "labels": sorted(item["labels"])[:8]}
+        awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
+        if comments is not None and not item["section"] and not awaiting and not item["next_body"] \
+                and not item["open_sub"] and not any(c["next"] for c in comments) \
+                and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
+            found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
+        if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
+            found["T8"] = {"quiet_days": round(age_updated, 2)}
+        if ask and "T3" not in found and age_updated >= sla["t9_days"]:
+            found["T9"] = {"quiet_days": round(age_updated, 2)}
+        if not chain and not item["assignees"] and "T1" not in found and age_updated >= sla["t11_days"]:
+            found["T11"] = {"quiet_days": round(age_updated, 2)}
+    elif not item["draft"] and comments is not None and ours and not captain_skip:
+        # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
+        # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
+        limit = sla["t7_ours_hours"] * 3600
+        if now - item["created"] >= limit and not any(c["review"] for c in comments):
+            if now - item["created"] <= TRIAGE_COMMENT_DAYS * day:   # older: the review may be outside the window
+                found["T7"] = {"waiting_hours": round((now - item["created"]) / 3600, 1)}
+    return found, ours
+
+
+def triage_read_unit(hub, repo, unit, now, budget):
+    """One unit's list read, charged what it used. Units: issues (open issues and PRs), comments (the last
+    TRIAGE_COMMENT_DAYS), closed:<label> (closed issues that still carry a label)."""
+    if unit == "issues":
+        path = "repos/%s/issues?state=open&per_page=100" % repo
+        records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+    elif unit == "comments":
+        since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
+        records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
+                                      % (repo, since), older=("created_at", since), cap=TRIAGE_LIST_PAGES)
+    else:
+        label = unit.split(":", 1)[1]
+        records, cut = hub.read_pages("repos/%s/issues?state=closed&labels=%s&per_page=100" % (repo, quote(label, safe="")),
+                                      cap=1)
+    budget[0] -= sweep_pages_used(records, cut)
+    return records, cut
+
+
+def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=TRIAGE_PASS_SECONDS):
+    """Read the stalest units (round-robin across every repo and unit, the least recently read first) while the pass's
+    call budget (less the reserve for fresh checks) and time allow. A repo the account cannot read is `unreadable`, once."""
+    hub = getattr(engine, "hub", None)
+    if hub is None:
+        return
+    todo = []
+    for repo in repos:
+        if repo in state.unreadable and now - state.unreadable[repo][1] < TRIAGE_UNREADABLE_RETRY:
+            continue
+        for unit in units:
+            held = state.units.get((repo, unit))
+            if held is None or now - held["at"] >= TRIAGE_TTL:
+                todo.append(((held or {"at": 0})["at"], repo, unit))
+    for _, repo, unit in sorted(todo):
+        if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
+            break
+        try:
+            records, cut = triage_read_unit(hub, repo, unit, now, budget)
+            state.units[(repo, unit)] = {"at": now, "data": records, "truncated": cut, "error": None}
+            state.unreadable.pop(repo, None)
+        except GitHubUnavailable as err:
+            budget[0] -= 1
+            reason = _one_line(str(err), 160)
+            if (repo, unit) in state.units:   # it was read before: a failed refresh keeps the old copy and tries later
+                state.units[(repo, unit)].update(at=now, error=reason)
+            else:
+                if repo not in state.unreadable:
+                    engine._note("triage.unreadable", repo, {"repo": repo, "unit": unit, "reason": reason})
+                state.unreadable[repo] = (reason, now)
+
+
+def triage_findings(engine, state, repos, decisions, cfg, now, errors):
+    """(candidates [(rule, ref, evidence)], unchecked {repo: [units missing]}, truncated repos). Reads nothing."""
+    discovery = getattr(engine, "discovery", None)
+    ours_logins = triage_our_logins(engine, cfg)
+    notice_prs = {}
+    try:
+        for n in read_pr_notices(engine.state_dir):
+            notice_prs.setdefault(n["repo"], set()).add(n["number"])
+    except (NoticeError, OSError, TypeError):
+        pass
+    out, unchecked, truncated = [], {}, []
+    captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
+    for repo in repos:
+        issues_unit = state.units.get((repo, "issues"))
+        if issues_unit is None:
+            continue
+        if issues_unit["truncated"]:
+            truncated.append(repo)
+        items = {}
+        for record in issues_unit["data"]:
+            item = triage_norm(record)
+            if item is not None and item["state"] == "open":
+                items[item["number"]] = item
+        ctx = triage_context(engine, repo, items, discovery)
+        comments_unit = state.units.get((repo, "comments"))
+        by_number = {}
+        if comments_unit is not None:
+            for c in comments_unit["data"]:
+                n = _url_number(c.get("issue_url"))
+                if n is not None:
+                    by_number.setdefault(n, []).append(c)
+        sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
+        if comments_unit is None:
+            unchecked.setdefault(repo, []).append("comments")
+        for number, item in sorted(items.items()):
+            comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
+            # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
+            captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
+            found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
+                                       captain_skip=captain_skip)
+            if not found:
+                continue
+            ref = "%s#%d" % (repo, number)
+            if ours:
+                out.extend((rule, ref, evidence) for rule, evidence in sorted(found.items()))
+            else:   # another person's or team's: only ever a flag, never counted as our violation
+                out.append(("OO", ref, {"would_be": sorted(found)}))
+        for unit in ("closed:" + l for l in sorted(triage_awaiting_labels(engine))):
+            held = state.units.get((repo, unit))
+            if held is None:
+                unchecked.setdefault(repo, []).append(unit)
+                continue
+            for record in held["data"]:
+                number = _number(record)
+                names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
+                if number is not None and record.get("state") == "closed" and unit.split(":", 1)[1] in names:
+                    out.append(("T10", "%s#%d" % (repo, number), {"label": unit.split(":", 1)[1]}))
+    if not errors:   # T5, T6 read only the decision list: judged only when it is whole
+        for d in decisions:
+            since = parse_iso(d.get("since"))
+            if d.get("tier") != "human" or d.get("kind") not in ("issue", "report", "captain") or since is None:
+                continue
+            ref = sweep_ref_of(d, engine.config.get("intent_repo"))
+            ident = "%s#%d" % ref if ref and ref[0] else (d.get("id") or "?")
+            days = (now - since) / 86400
+            if d.get("kind") == "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t6_days"]:
+                evidence = {"waiting_days": round(days, 2), "waiting_hours": round(days * 24, 1)}
+                if d.get("holds"):
+                    evidence["holds"] = list(d["holds"])   # the hold-* labels: why it is held
+                out.append(("T6", ident, evidence))
+            elif d.get("kind") != "captain" and days >= triage_sla(cfg, ref[0] if ref else "")["t5_days"]:
+                out.append(("T5", ident, {"waiting_days": round(days, 2), "waiting_hours": round(days * 24, 1)}))
+    return out, unchecked, truncated
+
+
+def triage_awaiting_labels(engine):
+    return {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
+
+
+def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
+    """True when a FRESH read bears the finding out, False when it does not, None when it cannot be checked now. T5 and
+    T6 are about the decision list derived this very pass (no read)."""
+    if rule in ("T5", "T6"):
+        return True
+    hub = getattr(engine, "hub", None)
+    repo, _, number = ref.rpartition("#")
+    if hub is None or not number.isdigit():
+        return None
+    wants_comments = rule in ("T3", "T7") or (rule == "OO" and {"T3", "T7"} & set((evidence or {}).get("would_be", [])))
+    number, need = int(number), (2 if wants_comments else 1)
+    if rule == "T7":
+        return triage_verify_t7(engine, state, repo, number, cfg, now, budget)
+    if budget[0] < need:
+        return None
+    budget[0] -= 1
+    try:
+        data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+    except GitHubUnavailable:
+        return None
+    if not isinstance(data, dict) or "number" not in data and "state" not in data:
+        return None
+    if rule == "T10":
+        names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
+        return data.get("state") == "closed" and any(l in names for l in triage_awaiting_labels(engine))
+    if data.get("state") != "open":
+        return False
+    item = triage_norm(data)
+    if item is None:
+        return None
+    comments = None
+    if need == 2:
+        budget[0] -= 1
+        since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
+        try:
+            recent, cut = hub.read_pages("repos/%s/issues/%d/comments?since=%s&per_page=100" % (repo, number, since), cap=1)
+        except GitHubUnavailable:
+            return None
+        if cut:
+            return None
+        comments = triage_comment_facts(recent)
+    issues_unit = state.units.get((repo, "issues"))
+    items = {}
+    for record in (issues_unit["data"] if issues_unit else []):
+        other = triage_norm(record)
+        if other is not None and other["state"] == "open":
+            items[other["number"]] = other
+    items[number] = item
+    ctx = triage_context(engine, repo, items, getattr(engine, "discovery", None))
+    notice_prs = set()
+    try:
+        notice_prs = {n["number"] for n in read_pr_notices(engine.state_dir) if n["repo"] == repo}
+    except (NoticeError, OSError, TypeError):
+        pass
+    found, ours = triage_rules(item, comments, ctx, triage_sla(cfg, repo), now, triage_our_logins(engine, cfg),
+                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs)
+    return (rule in found) if (ours and rule != "OO") else (rule == "OO" and bool(found))
+
+
+def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
+    """T7 against the captain decision's own evidence (`captain_evidence`, built on `pr_reviews_at` and `pr_signed_at`): a
+    formal review by a non-author at the exact head, or a signed head-naming comment from a non-author agent that is not a
+    sender of the PR's notice, means REVIEWED: no finding. A review at an OLDER head only fires once the last push is older
+    than the T7 SLA, with the evidence 'review at an older head'. True/False/None as `triage_verify`."""
+    if budget[0] < 1:
+        return None
+    budget[0] -= 1
+    try:
+        facts = read_pr_facts(engine, repo, number, "commits")
+    except NoticeError:
+        return None
+    if facts["state"] != "open":
+        return False
+    senders, noticed = set(), False
+    try:
+        for item in read_pr_notices(engine.state_dir):
+            if item["repo"] == repo and item["number"] == number:
+                senders |= set(notice_senders(item))
+                noticed = True
+    except (NoticeError, OSError, TypeError):
+        noticed = False
+    # A signed comment is review evidence only when the PR's notice is on file (its sender is then known and excluded):
+    # with none, the author's own signed comment would pass for a review. Without a notice only a formal review counts.
+    if noticed:
+        evidence = captain_evidence(facts, senders)
+    else:
+        evidence = facts["reviews"] if facts.get("reviews") is None else [dict(r, kind="review") for r in facts["reviews"]]
+    if evidence is None:
+        return None          # reviews or comments could not be read: no finding either way
+    if evidence:
+        return False         # reviewed at the exact head, in the fleet's own flow
+    note = {} if noticed else {"notice": "no notice on file"}
+    if facts.get("reviews_older"):
+        pushed = facts.get("head_at")
+        hours = cfg and triage_sla(cfg, repo)["t7_ours_hours"]
+        if pushed is None or now - pushed < hours * 3600:
+            return False     # reviewed before the last push, and the push is not older than the SLA yet
+        note.update(review="review at an older head", since_push_hours=round((now - pushed) / 3600, 1))
+    if note:
+        state.enriched[("T7", "%s#%d" % (repo, number))] = note
+    return True
+
+
+def triage_pass(engine, decisions, now, errors=()):
+    """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
+    and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
+    cfg = engine.config.get("triage", TRIAGE_DEFAULTS)
+    if cfg is False or cfg is None:
+        return
+    repos = triage_repos(engine, cfg)
+    if not repos:
+        return  # nothing is tracked: nothing to read, nothing to say
+    state = triage_state(engine)
+    state.started = engine.now()
+    budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
+    seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
+    units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
+    candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
+    findings, unchecked = [], 0
+    for rule, ref, evidence in sorted(candidates, key=lambda c: (state.attempted.get((c[0], c[1]), 0), c[0], c[1])):
+        pair = (rule, ref)
+        if now - state.confirmed.get(pair, 0) < TRIAGE_TTL:
+            findings.append((rule, ref, evidence))
+            continue
+        if engine.now() - state.started >= seconds:
+            unchecked += 1
+            continue
+        state.attempted[pair] = now
+        verdict = triage_verify(engine, state, rule, ref, cfg, now, budget, evidence)
+        if verdict:
+            state.confirmed[pair] = now
+            findings.append((rule, ref, dict(evidence, **state.enriched.pop(pair, {}))))
+        elif verdict is None:
+            unchecked += 1
+        else:
+            state.confirmed.pop(pair, None)
+            if (pair, "d", int(now // 86400)) not in state.logged:
+                state.logged.add((pair, "d", int(now // 86400)))
+                engine._note("triage.dismissed", ref, {"rule": rule, "ref": ref, "why": "a fresh read does not bear it out"})
+    findings.sort()
+    day = int(now // 86400)
+    counts, other_owner = {}, 0
+    for rule, ref, evidence in findings:
+        if rule == "OO":
+            other_owner += 1   # a flag, never counted as one of our findings
+        else:
+            counts[rule] = counts.get(rule, 0) + 1
+        if (rule, ref, day) not in state.logged:
+            if len(state.logged) > 20000:
+                state.logged.clear()
+            state.logged.add((rule, ref, day))
+            engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
+                                                 "evidence": evidence, "woken": cfg["enabled"], "applied": False})
+    state.current = {"enabled": cfg["enabled"], "counts": counts, "total": sum(counts.values()),
+                     "other_owner": other_owner, "at": iso(now),
+                     "unchecked": unchecked, "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
+                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
+    triage_write(engine, state)
+    due_all = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    due = [pair for pair in due_all if pair[0] != "OO"]
+    flagged = [pair for pair in due_all if pair[0] == "OO"]
+    if cfg["enabled"] and due:   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
+        triage_queue_fact(state, due, now, cfg, len(flagged))
+        for pair in flagged:
+            state.alarmed[pair] = now
+        for rule, _ in due:
+            state.day_counts[rule] = state.day_counts.get(rule, 0) + 1
+    triage_daily_summary(engine, state, cfg, now, day, repos)
+
+
+def triage_queue_fact(state, due, now, cfg, other_owner=0):
+    shown = due[:cfg["max_findings"]]
+    digest = hashlib.sha256("|".join("%s:%s" % pair for pair in shown).encode()).hexdigest()[:10]
+    key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
+    kinds = sorted({r for r, _ in due})
+    summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
+        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
+        " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
+        "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
+    if other_owner:
+        summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
+    for pair in due:
+        state.alarmed[pair] = now
+    state.facts[key] = (summary, now)
+    for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
+        del state.facts[old]
+
+
+def triage_daily_summary(engine, state, cfg, now, day, repos):
+    """Once per 24 h SINCE THE LAST ONE (not per calendar day): found, other-owner, escalated, unchecked and unreadable counts.
+    Audited always; sent to the Chief of Staff only when enabled and `daily_summary`. Not before every repo was read once."""
+    if not state.current or (state.summarised is not None and now - state.summarised < 86400):
+        return
+    if not all((r, "issues") in state.units or r in state.unreadable for r in repos):
+        return   # not every repo has been read once yet (a restart's first passes): a summary of nothing says nothing
+    state.summarised = now
+    counts = state.current["counts"]
+    text = "triage summary: found %d (%s); other-owner flags %d; escalated since the last summary %d; unchecked %d; unreadable repos %d%s" % (
+        state.current["total"], ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none",
+        state.current.get("other_owner", 0), sum(state.day_counts.values()), state.current["unchecked"],
+        len(state.current["unreadable"]),
+        " (" + ", ".join(state.current["unreadable"][:5]) + ")" if state.current["unreadable"] else "")
+    state.day_counts = {}
+    engine._note("triage.summary", None, {"text": text, "counts": counts, "enabled": cfg["enabled"], "at": iso(now)})
+    if cfg["enabled"] and cfg["daily_summary"]:
+        state.facts["triage.summary:%d" % int(now)] = (text, now)
+
+
+def triage_write(engine, state):
+    path = Path(engine.state_dir) / TRIAGE_FILE
+    body = json.dumps(state.current, sort_keys=True)
+    if getattr(state, "written", None) == body:
+        return
+    try:
+        temp = path.with_name(TRIAGE_FILE + ".tmp")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body + "\n")
+        os.replace(str(temp), str(path))
+        state.written = body
+    except OSError:
+        pass
+
+
+def triage_summary(state_dir):
+    try:
+        raw = json.loads((Path(state_dir) / TRIAGE_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) and isinstance(raw.get("counts"), dict) else None
+
+
+def triage_status_lines(triage):
+    if not triage:
+        return []
+    parts = ", ".join("%s %d" % (k, n) for k, n in sorted(triage["counts"].items())) or "none"
+    lines = ["      triage     %s: %s finding(s) (%s) over %s repo(s) as of %s" % (
+        "on (wakes the Chief of Staff; writes nothing to GitHub)" if triage.get("enabled") else "shadow (audit only; writes nothing to GitHub)",
+        triage.get("total", 0), parts, triage.get("repos", "?"), triage.get("at", "?"))]
+    if triage.get("other_owner"):
+        lines.append("      triage     %d other-owner flag(s): not ours, not counted, never a wake on their own" % triage["other_owner"])
+    if triage.get("unreadable"):
+        lines.append("      triage     unreadable repo(s), no findings from them: " + ", ".join(triage["unreadable"]))
+    if triage.get("unchecked_units"):
+        lines.append("      triage     unchecked units: " + "; ".join(
+            "%s (%s)" % (r, ", ".join(u)) for r, u in sorted(triage["unchecked_units"].items())))
+    if triage.get("unchecked"):
+        lines.append("      triage     %d finding(s) not checked this pass (call budget or a failed read): neither "
+                     "raised nor audited" % triage["unchecked"])
+    if triage.get("truncated"):
+        lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    return lines
+
+
+class TriageFacts:
+    """The triage's pending facts for the Chief of Staff (the batched findings and the daily summary), one per Chief of
+    Staff that runs; kept until delivered, then they age out of the triage's memory."""
+
+    __name__ = "triage_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        state = getattr(engine, "triage", None) if engine else None
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if not state or not state.facts or discovery is None or discovery.problems:
+            return []
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        return [Fact(key, name, "triage", summary, created, sender="switchboard")
+                for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
+
+
 # ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`; like
 # `external_decisions` the key is absent from DEFAULTS, so a config that never names it is exactly what it was.
 
@@ -6712,7 +7612,7 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
                  "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
                  "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
                  "If nothing, do nothing and say nothing.")
-FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "fleetkit", "text": None}
+FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 
@@ -7297,7 +8197,7 @@ PLAIN_REF_RE = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
 
 def reference_numbers(pr, own):
     """PR 52: the issue numbers a PR that closes nothing points at, for the weak link: the plain `#N` in its title
-    and body, else the numbers in its head branch name (`drift2137`). Empty when the PR names a closing issue; the
+    and body, else the numbers in its head branch name (`drift4242`). Empty when the PR names a closing issue; the
     PR's own number is never a candidate. The caller accepts only exactly one."""
     if not isinstance(pr, dict) or closing_numbers(pr.get("body")) or pr.get("linked_issues"):
         return []
@@ -8928,6 +9828,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["sweep"] = sweep_summary(state)  # #117
+        report["triage"] = triage_summary(state)  # #130
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -8948,13 +9849,56 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     return report
 
 
+def identity_overview(discovery):
+    """{"sessions": [{"session", "name", "pane"}], "warnings": [...]}: the agent each live session resolves to, and
+    every place where the pane and the session disagree: one session shown in two panes, a name claimed by two sessions,
+    a pane whose herdr label is not the fleet name of its session. (The caller's own shell is `caller_identity`.)"""
+    sessions = [{"session": seen.session_id, "name": seen.name, "pane": seen.pane}
+                for seen in sorted(discovery.agents.values(), key=lambda o: o.name)]
+    warnings, panes, by_session = [], {}, {}
+    for seen in discovery.agents.values():
+        by_session[seen.session_id] = seen
+        if seen.conflict:
+            warnings.append("%s is claimed by more than one session (%s): an agent cannot be told from another"
+                            % (seen.name, ", ".join([seen.session_id] + seen.conflict)))
+    for entry in discovery.entries:
+        session, pane = agent_session(entry), entry.get("pane_id")
+        if session and isinstance(pane, str):
+            panes.setdefault(session, []).append(pane)
+            seen = by_session.get(session)
+            label = next((entry.get(k) for k in ("name", "agent_name", "label") if isinstance(entry.get(k), str)), None)
+            if seen is not None and label and label != seen.name:
+                warnings.append("pane %s is labelled %s in herdr but its session %s is the fleet agent %s"
+                                % (pane, label, session, seen.name))
+    for session, where in sorted(panes.items()):
+        if len(where) > 1 and session in by_session:
+            warnings.append("session %s (%s) is shown in %d panes (%s): the pane does not say who is calling"
+                            % (session, by_session[session].name, len(where), ", ".join(sorted(where))))
+    return {"sessions": sessions, "warnings": warnings}
+
+
+def caller_identity(herdr, v2, environ):
+    """What THIS shell resolves to, for `status`: the agent name, an `identity uncertain` refusal, or None for a shell
+    that names neither a pane nor a session (a person's)."""
+    if not environ.get("HERDR_PANE_ID") and not environ.get(SESSION_ENV):
+        return None
+    try:
+        return {"name": identify_caller(herdr, v2, environ)}
+    except CallerError as err:
+        return {"error": _one_line(str(err), 400)}
+    except (V2Error, HerdrError) as err:
+        return {"error": _one_line("cannot read: %s" % err, 200)}
+
+
 def fleet_overview(engine, entries):
     """Read-only: every fleet agent and every fact recipient, with the rule's answer for each."""
     discovery = engine.discover(engine.now(), entries)
     facts, problems = engine.collect_facts()
     names = sorted(set(discovery.agents) | {fact.recipient for fact in facts})
     overview = {"ok": True, "problems": discovery.problems + problems,
-                "list": [engine.pending(name, discovery, facts) for name in names]}
+                "list": [engine.pending(name, discovery, facts) for name in names],
+                "identity": identity_overview(discovery),
+                "caller": caller_identity(engine.herdr, engine.v2, os.environ)}
     overview.update(intent_gap_report(engine, discovery, facts))
     return overview
 
@@ -8967,6 +9911,21 @@ def _plan_line(entry):
     waiting = sum(1 for fact in plan["pending"] if fact.get("rider"))
     return "%d pending%s: %s (%s)" % (len(plan["pending"]), " (%d rider)" % waiting if waiting else "",
                                       plan["action"], plan["reason"])
+
+
+def identity_lines(agents):
+    """The `status` lines for identity: who each live session resolves to, a WARNING for every disagreement of pane and
+    session, and what this shell itself resolves to."""
+    identity = agents.get("identity") or {}
+    lines = []
+    if identity.get("sessions"):
+        lines.append("      identity   " + "; ".join("%s = %s (pane %s)" % (s["session"], s["name"], s["pane"] or "-")
+                                                      for s in identity["sessions"]))
+    lines.extend("      WARNING    identity: %s" % w for w in identity.get("warnings") or [])
+    caller = agents.get("caller")
+    if caller:
+        lines.append("      identity   this shell: %s" % (caller["name"] if "name" in caller else "WARNING " + caller["error"]))
+    return lines
 
 
 def _agent_line(entry):
@@ -9041,12 +10000,14 @@ def format_status(report):
         lines.append("      agents     %d fleet agent(s)" % len(listed))
         lines.extend("        " + _agent_line(entry) for entry in agents["list"])
         lines.extend("        problem: %s" % problem for problem in agents["problems"])
+        lines.extend(identity_lines(agents))
         lines.extend(intent_gap_lines(agents))
     else:
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
+    lines.extend(triage_status_lines(report.get("triage")))  # #130
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
@@ -9072,11 +10033,87 @@ class CallerError(Exception):
     """`send` cannot tell which fleet agent is calling."""
 
 
+class IdentityUncertain(CallerError):
+    """The caller's own session is not one the switchboard knows, so who is calling cannot be told. Refused, never
+    guessed, and NEVER read as "a person in a plain shell". (A session v2 knows that is not a fleet agent is a person's.)"""
+
+
+SESSION_ENV = "OPENCODE_SESSION_ID"   # the harness sets it per session, unique: the one thing the caller IS
+
+
+def _agent_label(v2, session_id):
+    try:
+        name = (_fleet_meta(v2.session_get(session_id)) or {}).get("name")
+    except (V2Error, HerdrError):
+        name = None
+    return name if isinstance(name, str) and name else "not a fleet agent"
+
+
+def session_identity(herdr, v2, environ):
+    """The caller's `metadata.fleet`, found from its OWN session (OPENCODE_SESSION_ID) in the switchboard's registry (v2's
+    session records and herdr's agent list), never from inherited environment variables (HERDR_PANE_ID, the role and
+    repo variables, the token), which a restart can leave belonging to another agent. None when no session is named.
+    Raises IdentityUncertain when v2 does not know the session, CallerError when it is known and not a fleet agent (a
+    person's). A HERDR_PANE_ID that names another agent's session is only a diagnostic, one warning line."""
+    own = environ.get(SESSION_ENV)
+    if not own:
+        return None
+    try:
+        info = v2.session_get(own)
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            raise IdentityUncertain("cannot tell who you are: session %s is not known to the switchboard's registry "
+                                    "(nothing was done)" % own) from None
+        raise
+    fleet = _fleet_meta(info)
+    if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
+        raise CallerError("session %s is not a fleet agent (no metadata.fleet.name)" % own)
+    warn_pane_disagrees(herdr, v2, environ, own, fleet["name"])
+    return fleet
+
+
+_WARNED_PANES = set()
+
+
+def warn_pane_disagrees(herdr, v2, environ, own, name):
+    """The diagnostic: HERDR_PANE_ID names a pane whose agent runs another session. The identity is taken from the
+    session; the warning says what is wrong with the environment, once per process."""
+    pane = environ.get("HERDR_PANE_ID")
+    if not pane or (pane, own) in _WARNED_PANES:
+        return
+    try:
+        theirs = agent_session(herdr.agent_get(pane))
+    except (HerdrError, V2Error):
+        return
+    if not theirs or theirs == own:
+        return
+    _WARNED_PANES.add((pane, own))
+    where = ""
+    try:
+        for entry in herdr.agent_list():
+            if agent_session(entry) == own and isinstance(entry.get("pane_id"), str):
+                where = "; this session runs in pane %s" % entry["pane_id"]
+                break
+    except (HerdrError, V2Error, AttributeError, TypeError):
+        pass
+    sys.stderr.write("%s: warning: HERDR_PANE_ID %s belongs to session %s (%s) but this session is %s (%s)%s: the "
+                     "identity is taken from the session, not from the pane; fix the environment (HERDR_PANE_ID, "
+                     "FLEET_SWITCHBOARD_ROLE, FLEET_SWITCHBOARD_REPO and the token travel together)\n"
+                     % (PROG, pane, theirs, _agent_label(v2, theirs), own, name, where))
+
+
+def no_pane_error(how):
+    return CallerError("cannot tell who you are: neither %s nor HERDR_PANE_ID is set: %s" % (SESSION_ENV, how))
+
+
 def identify_caller(herdr, v2, environ):
     """The caller's fleet name: HERDR_PANE_ID -> herdr agent -> v2 session -> metadata.fleet.name."""
+    fleet = session_identity(herdr, v2, environ)
+    if fleet is not None:
+        return fleet["name"]
     pane = environ.get("HERDR_PANE_ID")
     if not pane:
-        raise CallerError("HERDR_PANE_ID is not set: run send from a fleet agent's herdr pane")
+        raise no_pane_error("run send from a fleet agent's herdr pane")
     session_id = agent_session(herdr.agent_get(pane))
     if not session_id:
         raise CallerError("herdr pane %s shows no agent session" % pane)
@@ -9102,6 +10139,9 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
 
 
 def cmd_run(args, runner, now, wait):
+    if not args.once:   # the daemon: whoever started it, it is nobody's agent (see CALLER_ENV_NAMES)
+        for name in CALLER_ENV_NAMES:
+            os.environ.pop(name, None)
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
     if args.once:
@@ -9400,6 +10440,8 @@ def _notice_ack(args, engine, state):
         else:
             try:
                 caller = caller_fleet(engine.herdr, engine.v2, os.environ)["name"]
+            except IdentityUncertain:
+                raise
             except CallerError:
                 caller = None  # a plain shell: you
         if caller is not None:
@@ -9632,7 +10674,7 @@ class GhAccounts:
         account = self.account_for(repo) if repo else None
         if account is None:
             return None
-        return dict(self.environ, GH_TOKEN=self.token_for(account))
+        return dict(self.environ, GH_TOKEN=self.token_for(account), **{OWN_GH_ENV: "1"})
 
     def token_env(self, repo):
         """{"GH_TOKEN": token} for an agent working in `repo`, {} when the repo uses the default account."""
@@ -10197,6 +11239,8 @@ def soft_caller(runner, now):
         return {}, watched_repos(config, {})
     try:
         return caller_fleet(engine.herdr, engine.v2, os.environ), watched
+    except IdentityUncertain:
+        raise
     except (CallerError, V2Error, HerdrError):
         return {}, watched
 
@@ -10223,9 +11267,12 @@ def cmd_intent(args, runner, now):
 
 def caller_fleet(herdr, v2, environ):
     """The caller's `metadata.fleet`: HERDR_PANE_ID -> herdr agent -> v2 session."""
+    fleet = session_identity(herdr, v2, environ)
+    if fleet is not None:
+        return fleet
     pane = environ.get("HERDR_PANE_ID")
     if not pane:
-        raise CallerError("HERDR_PANE_ID is not set: run intents from a fleet agent's herdr pane")
+        raise no_pane_error("run intents from a fleet agent's herdr pane")
     session_id = agent_session(herdr.agent_get(pane))
     fleet = _fleet_meta(v2.session_get(session_id)) if session_id else None
     if not fleet or not isinstance(fleet.get("name"), str) or not fleet["name"]:
@@ -10295,6 +11342,129 @@ def add_intent_parsers(sub):
     intent = sub.add_parser("intent", help="Print an issue's ask: its Intent and Done-when, and the work item's Intent")
     intent.add_argument("issue", type=issue_arg, help="The issue number")
     sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
+
+
+# ---------------------------------------------------------------- `plan check` (#135, gate G0a)
+
+PLAN_URL_RE = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)(?:#issuecomment-([0-9]+))?/?$")
+PLAN_COMMENT_PAGES = 10
+
+
+class PlanInputError(Exception):
+    """The plan or the ask cannot be read: exit 2."""
+
+
+def parse_plan_source(text, default_repo=None):
+    """(repo, number, comment id or None) from `owner/repo#N`, an issue URL (a `#issuecomment-ID` picks that comment),
+    or a bare `N` / `#N` with `default_repo`. Raises PlanInputError."""
+    text = (text or "").strip()
+    found = PLAN_URL_RE.match(text)
+    if found:
+        return found.group(1), int(found.group(2)), int(found.group(3)) if found.group(3) else None
+    found = re.match(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$", text) or re.match(r"^()#?([0-9]+)$", text)
+    if not found or int(found.group(2)) < 1:
+        raise PlanInputError("%r is not a plan: write owner/repo#N, an issue URL, or --file PATH" % text)
+    repo = found.group(1) or default_repo
+    if not repo:
+        raise PlanInputError("%r names no repo and no intent_repo is configured: write owner/repo#N" % text)
+    return repo, int(found.group(2)), None
+
+
+def fetch_plan(reader, repo, number, comment_id=None):
+    """(text, source label, done_when of the issue) read from GitHub with GETs only. `reader` has `_api(path, repo)`."""
+    try:
+        issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
+        comments = []
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                raise PlanInputError("the comments of %s#%d did not come back as a list" % (repo, number))
+            comments.extend(got)
+            if len(got) < 100:
+                break
+    except IntentError as err:
+        raise PlanInputError("cannot read %s#%d: %s" % (repo, number, err)) from None
+    body = issue.get("body") if isinstance(issue, dict) and isinstance(issue.get("body"), str) else ""
+    if comment_id is not None:
+        picked = [c for c in comments if isinstance(c, dict) and c.get("id") == comment_id]
+        if not picked:
+            raise PlanInputError("%s#%d has no comment %d" % (repo, number, comment_id))
+        text, source = picked[0].get("body") or "", "comment %d%s" % (comment_id, plan_check.comment_author(picked[0]))
+    else:
+        text, source = plan_check.select_plan_text(body, comments)
+    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1]
+
+
+def cmd_plan_check(args, runner, now):
+    """`plan check`: read a plan, check it, print PASS or FAIL with one line per defect and the content hash. Exit 0
+    pass, 1 fail, 2 unreadable. Reads only; never writes GitHub."""
+    def finish(code, payload, lines, error=None):
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        elif error:
+            sys.stderr.write("%s: plan check: %s\n" % (PROG, error))
+        else:
+            print("\n".join(lines))
+        return code
+
+    try:
+        try:
+            plan_check.MAX_BYTES
+        except Exception as err:  # the module is missing or broken: say so, never a traceback
+            raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
+        done_when = args.done_when
+        plan_own = None
+        if args.file:
+            if args.source:
+                raise PlanInputError("give a plan source or --file, not both")
+            try:
+                with open(args.file, "r", encoding="utf-8") as handle:
+                    text = handle.read(plan_check.MAX_BYTES * 4 + 1)
+            except (OSError, UnicodeDecodeError) as err:
+                raise PlanInputError("cannot read %s: %s" % (args.file, getattr(err, "strerror", None) or err)) from None
+            if len(text) > plan_check.MAX_BYTES * 4:
+                raise PlanInputError("%s is larger than %d bytes" % (args.file, plan_check.MAX_BYTES * 4))
+            source = "file %s" % args.file
+            plan_own = parse_intent(text)[1]
+            done_when = done_when or plan_own
+            plan_own = plan_own if done_when != plan_own else None
+        else:
+            if not args.source:
+                raise PlanInputError("give a plan: owner/repo#N, an issue URL, or --file PATH")
+            config = load_config()
+            repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
+            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
+                                  accounts=GhAccounts(config, runner, now))
+            text, source, issue_done = fetch_plan(reader, repo, number, comment_id)
+            if args.ask and not done_when:
+                ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
+                done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
+                plan_own = issue_done
+            elif done_when:
+                plan_own = issue_done if issue_done and issue_done != done_when else None
+            else:
+                done_when = issue_done
+        if args.ask and args.file and not args.done_when:
+            raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
+        result = plan_check.check(text, done_when, plan_own)
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
+    result["source"] = source
+    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source))
+
+
+def add_plan_parsers(sub):
+    plan = sub.add_parser("plan", help="Plan-driven development: check a plan's scenarios (gate G0a)")
+    plan_sub = plan.add_subparsers(dest="plan_action", required=True)
+    check = plan_sub.add_parser("check", help="Check a plan: scenarios well-formed, every Done-when clause covered; "
+                                              "prints PASS or FAIL, one line per defect, and the plan's content hash")
+    check.add_argument("source", nargs="?", help="owner/repo#N, an issue URL (a #issuecomment-ID picks that comment), "
+                                                "or N with intent_repo set; the plan is the latest `Plan (scenarios)` "
+                                                "comment, else the issue body")
+    check.add_argument("--file", help="Read the plan from this file instead of GitHub")
+    check.add_argument("--ask", help="The ask whose Done-when to cover when the plan issue has none of its own")
+    check.add_argument("--done-when", dest="done_when", help="The Done-when line to cover (overrides the issue's)")
+    check.add_argument("--json", action="store_true", help="Machine-readable result")
 
 
 # ============================================================================
@@ -12832,6 +14002,7 @@ def build_parser():
     add_intent_parsers(sub)
     add_foreground_parsers(sub)  # PR 8
     add_policy_parsers(sub)  # PR 9
+    add_plan_parsers(sub)    # #135
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
     add_orders_parsers(sub)  # PR 17
@@ -12842,6 +14013,7 @@ def build_parser():
 
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
+    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exit_:
@@ -12855,6 +14027,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_poke(args)
     if args.action == "policy-report":
         return cmd_policy_report(args, runner, now)
+    if args.action == "plan":  # #135: reads only, never ensures the daemon
+        return cmd_plan_check(args, runner, now)
     if args.action in POLICY_COMMANDS:  # PR 9: prints one JSON line and exits 0 whatever happens
         return POLICY_COMMANDS[args.action](args, runner, now)
     try:
@@ -14671,27 +15845,73 @@ def _charter_body(reader, repo, charter):
     return body
 
 
-def edit_charter_orders(engine, repo, charter, event, detail, change):
-    """Edit the charter's orders: read the body, `change(body)` it, write it, read it back; once more
-    when the readback does not show the change (somebody edited in between); fail loudly when it still
-    does not. Audited before and after. Returns the orders after the change."""
+ORDERS_READBACK_WAITS = (0.0, 0.5, 1.5)  # seconds to wait before each look at the issue after a write (a read can lag the write it follows)
+
+
+def _sleep(seconds):
+    if seconds:
+        time.sleep(seconds)
+
+
+def edit_charter_orders(engine, repo, charter, event, detail, change, done):
+    """Edit the charter's orders safely. `change(body)` is the edit; `done(body)` says whether that edit is already in `body`
+    (an add: the exact bullet is there; a remove: that bullet's text has one occurrence fewer than before). Read the body; when
+    `done` already holds there is nothing to write. Otherwise read it AGAIN just before the write and refuse (nothing written)
+    if it moved since; write; then look at the issue (a few times: a read can lag a write). A write whose outcome is unknown is
+    never repeated blind: only after a fresh read still lacks the change is it made once more, from that fresh body.
+    Audited before and after. Returns the orders after the change."""
     reader = engine.intents
     body = _charter_body(reader, repo, charter)
+    if done(body):
+        reader.invalidate(charter, repo)
+        return parse_orders(body)  # already so (a retry, or the same order given twice): nothing to write
     new_body = change(body)  # an OrdersError here is a refusal: nothing is written, nothing audited as a write
     with engine._external(event, "charter:%s#%d" % (repo, charter), dict(detail, charter=charter, repo=repo)) as result:
         for attempt in (1, 2):
-            if attempt == 2:
+            if attempt == 1:
+                fresh = _charter_body(reader, repo, charter)
+                if fresh != body:
+                    raise OrdersError("#%d changed while this edit was being prepared; nothing was written. Run it again" % charter)
+            else:
                 body = _charter_body(reader, repo, charter)
+                if done(body):
+                    result["attempts"] = 1
+                    reader.invalidate(charter, repo)
+                    return parse_orders(body)  # the first write had landed after all: do not write again
                 new_body = change(body)
-            write_issue_body(reader, repo, charter, new_body)
-            back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
-            got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
-            if got == new_body or section_orders(got) == section_orders(new_body):
-                result["attempts"] = attempt
-                reader.invalidate(charter, repo)
-                return parse_orders(got)
-        raise OrdersError("wrote #%d twice and read back the issue without the change: the Standing orders "
-                          "section there is not what was written. Look at the issue; nothing was recorded" % charter)
+            try:
+                write_issue_body(reader, repo, charter, new_body)
+            except IntentError as err:
+                if err.reason != "unavailable":
+                    raise  # gh answered with a refusal: the write did not happen
+                raise OrdersError("the write to #%d ended without an answer (%s): it MAY HAVE LANDED. Run `%s orders list "
+                                  "--charter %d` first and only repeat the command if the change is not there" % (
+                                      charter, _one_line(str(err), 120), PROG, charter)) from None
+            for wait in ORDERS_READBACK_WAITS:
+                _sleep(wait)
+                back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+                got = back.get("body") if isinstance(back, dict) and isinstance(back.get("body"), str) else ""
+                if got == new_body or done(got):
+                    result["attempts"] = attempt
+                    reader.invalidate(charter, repo)
+                    return parse_orders(got)
+        raise OrdersError("wrote #%d and read the issue back without the change, twice: the Standing orders section there is "
+                          "not what was written, and whether a write landed is unknown. Run `%s orders list --charter %d` before "
+                          "running it again; nothing more was written" % (charter, PROG, charter))
+
+
+def order_bullet(text, by, date):
+    """The text of the bullet `add_order_to_body` writes (what `section_orders` returns for it)."""
+    return "%s (ordered by %s, %s)" % ((text or "").strip(), " ".join(str(by or "").split())[:60], date)
+
+
+def remove_order_text(body, text):
+    """`body` without the first order of the section whose text is `text` (the body unchanged when there is none)."""
+    found = _orders_section(body or "")
+    for number, (_, _, bullet) in enumerate(found["bullets"] if found else [], 1):
+        if bullet == text:
+            return remove_order_from_body(body, number)
+    return body
 
 
 def orders_caller(engine, args):
@@ -14771,15 +15991,22 @@ def orders_write(engine, args, caller, role, repo, charter):
             by = args.by or os_user()
             date = datetime.fromtimestamp(engine.now(), timezone.utc).strftime("%Y-%m-%d")
             detail = {"caller": caller, "by": by, "text": (args.text or "").strip()}
+            bullet = order_bullet(args.text, by, date)
             orders = edit_charter_orders(engine, repo, charter, "orders.add", detail,
-                                         lambda body: add_order_to_body(body, args.text, by, date))
+                                         lambda body: add_order_to_body(body, args.text, by, date),
+                                         lambda body: bullet in section_orders(body))  # the same order, by and day twice is one order
         else:
-            current = parse_orders(_charter_body(engine.intents, repo, charter))
+            now_body = _charter_body(engine.intents, repo, charter)
+            current = parse_orders(now_body)
             if not 1 <= args.number <= len(current):
                 raise OrdersError("no order %d: this charter has %d" % (args.number, len(current)))
-            detail = {"caller": caller, "number": args.number, "text": current[args.number - 1]}
+            remove_order_from_body(now_body, args.number)  # refuses the legacy `Standing authority:` line
+            target = current[args.number - 1]
+            detail = {"caller": caller, "number": args.number, "text": target}
+            before = section_orders(now_body).count(target)
             orders = edit_charter_orders(engine, repo, charter, "orders.remove", detail,
-                                         lambda body: remove_order_from_body(body, args.number))
+                                         lambda body: remove_order_text(body, target),  # by its text: a number can move under a retry
+                                         lambda body: section_orders(body).count(target) < before)
     except (OrdersError, IntentError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE if isinstance(err, OrdersError) else EXIT_ERROR
@@ -15139,6 +16366,8 @@ def decision_actor(engine, args):
         return name, role
     try:
         name, role, _ = orders_caller(engine, args)
+    except IdentityUncertain:
+        raise  # an agent whose identity is uncertain is not "you, in a plain shell"
     except CallerError:
         return None, None
     return name, role
@@ -15543,16 +16772,29 @@ def cmd_decision_write(args, action, runner, now):
 
 LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing job"),
                ("awaiting-cos", "fbca04", "Waiting on the Chief of Staff: it resolves or escalates"),
-               ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"))
+               ("awaiting-user", "d93f0b", "Waiting on the owner: the fleet's only blocking channel"),
+               # #133: held-for-the-owner state as labels (read by the switchboard, the sweep and the triage)
+               ("merge-captain", "b60205", "A PR held for the owner: it is not merged until the owner says so"),
+               ("merge-automatic", "0e8a16", "A PR that merges on green CI and independent review"),
+               ("hold-security", "d93f0b", "Held: a security boundary"),
+               ("hold-credential", "d93f0b", "Held: a credential or secret"),
+               ("hold-contract", "d93f0b", "Held: a shared contract or interface"),
+               ("hold-policy", "d93f0b", "Held: a policy or permission rule"),
+               ("hold-prod-config", "d93f0b", "Held: production configuration"),
+               ("hold-other-area", "d93f0b", "Held: an area owned by another team"))
 
 
 def label_names(config):
-    return {"orchestrator": orchestrator_label(config), "awaiting-cos": awaiting_cos_label(config),
-            "awaiting-user": awaiting_label(config)}
+    names = {"orchestrator": orchestrator_label(config), "awaiting-cos": awaiting_cos_label(config),
+             "awaiting-user": awaiting_label(config)}
+    for key, _, _ in LABEL_SPECS:
+        names.setdefault(key, "%s:%s" % (getpass.getuser(), key))   # the same `<user>:` namespace as the awaiting labels
+    return names
 
 
 def ensure_labels(engine, runner, repo):
-    """Create the three labels the fleet uses in `repo`, each with the repo's own gh account, unless they exist.
+    """Create the labels the fleet uses in `repo` (the three awaiting/orchestrator labels and the merge-class and hold labels),
+    each with the repo's own gh account, unless they exist.
     Returns {label: "created" | "already there"}. Idempotent."""
     names = label_names(engine.config)
     made = {}

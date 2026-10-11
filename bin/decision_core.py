@@ -509,8 +509,11 @@ def captain_entry(notice, facts, escalated, evidence):
         text = "reviewed at %s by %s" % (head[:8], ", ".join(
             "%s (%s)" % (e["by"], e["state"] if e["kind"] == "review" else "comment") for e in evidence))
         review = "; ".join(e["state"] for e in evidence)
-    return dict(notice, kind="captain", tier="human" if escalated else "cos", head=head, review=review,
-                reviews=evidence, review_evidence=line_of(text, 200))
+    entry = dict(notice, kind="captain", tier="human" if escalated else "cos", head=head, review=review,
+                 reviews=evidence, review_evidence=line_of(text, 200))
+    if facts.get("holds"):   # why it is held, from its `hold-*` labels (#133): shown, never read from prose
+        entry["holds"] = list(facts["holds"])
+    return entry
 
 
 def order_decisions(decisions):

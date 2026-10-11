@@ -13,17 +13,21 @@ It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 --body-file/-F (a file, or - for stdin). Everything else, and anything it does
 not understand, runs the real gh unchanged: this must never block a command.
 """
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 
 MARK = "<!-- fleet-switchboard:from=%s -->"
 SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
-WHOAMI_SECONDS = 10
+LOOKUP_SECONDS = 3.0
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
 def real_gh():
@@ -41,26 +45,117 @@ def real_gh():
     return None
 
 
-def my_name():
-    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+def switchboard_binary():
+    """The switchboard executable, or None. FLEET_SWITCHBOARD_BIN when set (a value that is SET wins, even a bad one), else
+    the one `install` linked, as the fleet-hooks plugin does: resolved, an executable file, nothing looked up on PATH."""
     binary = os.environ.get("FLEET_SWITCHBOARD_BIN")
     if not binary:
-        # Unset (an agent's shell rarely has it): the switchboard `install` linked, as the fleet-hooks plugin does.
-        # Resolved, and it must be an executable file; nothing is looked up on PATH. A value that is SET wins, even a bad one.
         try:
             binary = os.path.realpath(os.path.join(os.path.expanduser("~"), ".local", "bin", "fleet-switchboard"))
         except (OSError, ValueError):
-            return "agent"
+            return None
         if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-            return "agent"
-    if not os.path.isabs(binary):
-        return "agent"
+            return None
+    return binary if os.path.isabs(binary) else None
+
+
+def config_users():
+    """`gh_users` of the switchboard's config (repo or `owner/*` -> gh account), {} when there is none or it cannot be read."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     try:
-        done = subprocess.run([binary, "whoami"], capture_output=True, text=True, timeout=WHOAMI_SECONDS)
-    except (OSError, subprocess.SubprocessError):
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            users = json.load(handle).get("gh_users")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return users if isinstance(users, dict) else {}
+
+
+def lookup_seconds():
+    """The whole identity lookup of one gh call (who am I, which account, its token) shares ONE deadline of this many seconds
+    (default 3, FLEET_SHIM_LOOKUP_SECONDS, kept between 0.2 and 10): a wedged daemon or v2 adds at most that, then gh runs."""
+    try:
+        return min(10.0, max(0.2, float(os.environ.get("FLEET_SHIM_LOOKUP_SECONDS", LOOKUP_SECONDS))))
+    except ValueError:
+        return LOOKUP_SECONDS
+
+
+class Lookup:
+    """One identity lookup per gh call: a single `whoami --json` (name and repo together; an older switchboard that does not
+    know the flag is asked for the plain name, within the same deadline), under a shared deadline."""
+
+    def __init__(self):
+        self.deadline = time.monotonic() + lookup_seconds()
+        self._ident = None
+
+    def left(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def run(self, argv, **kwargs):
+        """The command's result, or None when the deadline is spent, it timed out or could not run."""
+        if self.left() <= 0:
+            return None
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=self.left(), **kwargs)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def identity(self):
+        """{"name", "repo"}: either may be missing. {} with no switchboard."""
+        if self._ident is not None:
+            return self._ident
+        self._ident = {}
+        binary = switchboard_binary()
+        if not binary:
+            return self._ident
+        done = self.run([binary, "whoami", "--json"])
+        try:
+            data = json.loads(done.stdout) if done is not None and done.returncode == 0 else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            name, repo = data.get("name"), data.get("repo")
+            self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
+                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None}
+            return self._ident
+        plain = self.run([binary, "whoami"])   # an older switchboard: the name only
+        name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
+        self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
+        return self._ident
+
+
+def account_env(gh, lookup=None):
+    """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
+    identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
+    `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
+    environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, the lookup deadline
+    spent, any trouble. The token is only put in the child's environment: never printed, logged or put in argv."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
+        users = config_users()
+        if not users or not switchboard_binary():
+            return None
+        lookup = lookup or Lookup()
+        repo = lookup.identity().get("repo")
+        if not repo:
+            return None
+        account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
+        if not isinstance(account, str) or not account:
+            return None
+        clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
+        got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
+        token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
+        return dict(os.environ, GH_TOKEN=token) if token else None
+    except Exception:
+        return None
+
+
+def my_name(lookup=None):
+    """The calling agent's fleet name, or "agent": the name only says who, the signature is what matters."""
+    try:
+        return (lookup or Lookup()).identity().get("name") or "agent"
+    except Exception:
         return "agent"
-    name = done.stdout.strip()
-    return name if done.returncode == 0 and NAME_RE.match(name) else "agent"
 
 
 def sign(body, name):
@@ -130,15 +225,19 @@ def main(args):
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
         return 127
     plan = None
+    lookup = Lookup()   # one identity lookup, one deadline, for the name and the account together
     try:
-        plan = signed_call(args, my_name()) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
+        plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
+    env = account_env(gh, lookup)
     if plan is None:
+        if env is not None:
+            os.execve(gh, [gh] + args, env)
         os.execv(gh, [gh] + args)
     argv, stdin_text, temp = plan
     try:
-        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None)
+        done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None, env=env)
         return done.returncode
     finally:
         if temp:
