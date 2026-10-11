@@ -17281,6 +17281,151 @@ class TestPlanLedger(LedgerBase):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
+class TestWaive(LedgerBase):
+    """`waive`: the chief of staff's logged override of G0 to G5 for one PR at its head. Never G6, G7, G8, never a writer, never
+    an unknown session; it expires; a waived gate reads `waived`, not passed. Neutral names."""
+
+    REASON = "hotfix for a broken release: the plan follows within a day"
+
+    def setUp(self):
+        super().setUp()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure()
+
+    def waive(self, who="cos", gates="G1", reason=None, *more):
+        return self.run_as(who, "waive", self.PR, "--gates", gates, "--reason", self.REASON if reason is None else reason, *more)
+
+    def check(self, kind="merge"):
+        code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", kind, "--json")
+        return code, json.loads(out), err
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_without_a_waiver_the_missing_proof_refuses_and_the_chief_of_staffs_waiver_lets_it_through_for_that_head(self):
+        code, payload, _ = self.check()
+        self.assertEqual((code, payload["verdict"], [f["gate"] for f in payload["failed"]]), (10, "refuse", ["G1"]))
+        code, out, err = self.waive()
+        self.assertEqual(code, 0, err)
+        self.assertIn("waived, not passed", out)
+        code, payload, _ = self.check()
+        self.assertEqual((code, payload["verdict"]), (0, "allow"))
+        report = self.gates()[1]
+        row = self.row(report, "G1")
+        self.assertEqual(row["status"], "waived")                                  # not "ok": it did not pass
+        self.assertIn("waived (by cos, %s, due " % self.REASON, row["detail"])
+        self.assertEqual(report["waived"], ["G1"])
+        self.assertTrue(report["ready"])
+        text = "\n".join(sb.plan_ledger.render_gates(report, self.PR))
+        self.assertIn("WAIVED (not passed): G1", text)
+
+    def test_the_entry_is_hash_chained_with_who_why_pr_head_and_expiry_and_audited(self):
+        self.waive(gates="G1,G4")
+        (entry,) = self.ledger()
+        self.assertEqual((entry["kind"], entry["pr"], entry["head"], entry["gates"], entry["by"], entry["reason"]),
+                         ("waiver", self.PR, LEDGER_HEAD, ["G1", "G4"], "cos", self.REASON))
+        self.assertEqual(entry["expires"] - entry["ts"], sb.plan_ledger.WAIVER_SECONDS)
+        entries, problem = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertIsNone(problem)                                                  # the chain verifies with the waiver in it
+        (event,) = self.events("plan.waiver")
+        self.assertEqual((event["detail"]["by"], event["detail"]["head"], event["detail"]["gates"]), ("cos", LEDGER_HEAD, ["G1", "G4"]))
+        self.assertEqual(event["detail"]["chain"], entry["hash"])
+
+    def test_a_push_after_the_waiver_or_its_expiry_or_another_pr_does_nothing(self):
+        self.waive()
+        self.assertEqual(self.check()[0], 0)
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD                                     # a push: the waiver covered the old head only
+        self.assertEqual(self.check()[0], 10)
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "missing")
+        self.pr["headRefOid"] = LEDGER_HEAD
+        self.assertEqual(self.check()[0], 0)
+        self.world.clock.t += sb.plan_ledger.WAIVER_SECONDS + 1                     # past the due date
+        self.assertEqual(self.check()[0], 10)
+        self.world.clock.t -= sb.plan_ledger.WAIVER_SECONDS + 1
+        entries, _ = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertEqual(sb.plan_ledger.valid_waivers(entries, "acme/app#10", LEDGER_HEAD, self.world.clock.now()), {})   # another PR
+
+    def test_g6_g7_g8_and_unknown_gates_are_never_waived_and_nothing_is_recorded(self):
+        for gates, fragment in (("G6", "never waived"), ("G8", "never waived"), ("G7", "never waived"), ("G1,G6", "never waived"),
+                                ("G9", "not a gate that can be waived"), ("", "name the gates"), ("nonsense", "not a gate")):
+            with self.subTest(gates=gates):
+                code, out, err = self.waive(gates=gates)
+                self.assertEqual(code, 2)
+                self.assertIn(fragment, err)
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual(len(self.events("gate.waiver.refused")), 7)
+
+    def test_a_forged_ledger_entry_cannot_waive_g6_either(self):
+        self.pr["body"] = "MERGE: captain\nPLAN: acme/app#7\ncanon: updated the docs"
+        forged = {"kind": "waiver", "pr": self.PR, "head": LEDGER_HEAD, "gates": ["G6", "G1"], "reason": "x" * 30, "by": "cos",
+                  "result": "pass", "expires": self.world.clock.now() + 3600}
+        sb.plan_ledger.append_entry(self.world.state, forged, self.world.clock.now())
+        report = self.gates()[1]
+        self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
+        self.assertEqual(self.row(report, "G1")["status"], "waived")
+        code, payload, _ = self.check()
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6"])             # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
+
+    def test_a_short_reason_is_refused(self):
+        code, out, err = self.waive(reason="too short")
+        self.assertEqual(code, 2)
+        self.assertIn("at least %d characters" % sb.plan_ledger.WAIVER_REASON_MIN, err)
+        self.assertEqual(self.ledger(), [])
+
+    def test_only_the_chief_of_staff_or_a_person_and_an_unknown_session_is_refused(self):
+        for who in ("coder", "rev", "own"):
+            code, out, err = self.waive(who=who)
+            self.assertEqual(code, 2)
+            self.assertIn("may not waive gates", err)
+        self.assertEqual(self.ledger(), [])
+        os.environ["OPENCODE_SESSION_ID"] = "ses_nosuchsession"
+        try:
+            code, out, err = self.run_as(None, "waive", self.PR, "--gates", "G1", "--reason", self.REASON)
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+        self.assertEqual(code, 2)
+        self.assertIn("uncertain identity is refused", err)
+        self.assertEqual(self.ledger(), [])
+        code, out, err = self.waive(who=None)                                       # a person at a shell
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ledger()[0]["by"], "a person at a shell")
+
+    def test_a_writer_of_the_pr_cannot_waive_its_own_gates(self):
+        sb.record_pr_notice(self.world.state, "acme/app", 9, "cos", "", self.world.clock.now())
+        code, out, err = self.waive()
+        self.assertEqual(code, 2)
+        self.assertIn("a writer cannot waive its own gates", err)
+        self.assertEqual(self.ledger(), [])
+
+    def test_a_broken_ledger_takes_no_waiver_and_honours_none(self):
+        self.waive()
+        path = self.world.state / "plan-ledger.jsonl"
+        path.write_text(path.read_text().replace('"G1"', '"G4"'))                    # edited by hand
+        code, out, err = self.waive(gates="G4")
+        self.assertEqual(code, 2)
+        self.assertIn("not trustworthy", err)
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "missing")      # no waiver is honoured from a broken ledger
+
+    def test_the_head_must_be_the_prs_and_the_gate_g1_missing_only_becomes_waived(self):
+        code, out, err = self.waive("cos", "G1", self.REASON, "--head", "c" * 40)
+        self.assertEqual(code, 2)
+        self.assertIn("is not the PR's head", err)
+        self.waive(gates="G1,G5")
+        report = self.gates()[1]
+        self.assertEqual(self.row(report, "G5")["status"], "ok")                    # a gate that passes stays ok, not waived
+        self.assertEqual(report["waived"], ["G1"])
+
+    def test_help_and_docs_name_the_command(self):
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["waive", "--help"])
+        flat = " ".join(out.getvalue().split())
+        for word in ("--gates", "--reason", "never G6, G7 or G8"):
+            self.assertIn(word, flat)
+
+
 class TestPlanGatesCheck(LedgerBase):
     """#107 slice 3a: `gates-check`, the per-repo mode, the kill switches and the role guard. Nothing enforces: no shim calls it."""
 

@@ -4007,6 +4007,19 @@ body has a `canon:` line: what was updated, or `canon: n/a <reason>` with a reas
 owner). Listed but **not tracked yet, and not counted**: G0b (consensus), G0c (approval) and G2/G3 (alignment and code review),
 whose records are later slices; G7 and G8 are epic and deploy gates and show `n/a` for one PR.
 
+## `waive`: the logged override of G0 to G5 (#107)
+
+`fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
+for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or a person at a shell (the identity rule of `gates mode`:
+an unknown session is refused, never read as a person; a mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
+**G6 (a held PR: the owner's hold), G7 and G8 are refused**, and a hand-written ledger entry naming them is ignored. A **writer of the PR**
+(one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
+waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`
+audit line. It is bound to **the head it was recorded at** (a push needs a new one) and **expires after 24 hours**, the due date of the
+retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
+the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
+and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
