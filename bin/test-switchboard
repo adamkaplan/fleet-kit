@@ -14183,8 +14183,10 @@ class FakeSweepHub:
         return data
 
 
-def sweep_issue(number, body="", labels=(), pr=False):
+def sweep_issue(number, body="", labels=(), pr=False, author=None):
     record = {"number": number, "body": body, "labels": [{"name": n} for n in labels]}
+    if author:
+        record["user"] = {"login": author}
     if pr:
         record["pull_request"] = {"url": "x"}
     return record
@@ -14232,8 +14234,9 @@ class TestSweep(Base):
         self.assertEqual(self.found(), [("S1a", "acme/api#1"), ("S1b", "acme/api#2")])
 
     def test_s2_a_pr_held_for_the_person_without_the_captain_mark(self):
+        self.engine.config["triage"] = {"our_logins": ["bot"]}
         self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True),
-                         11: sweep_issue(11, "MERGE: captain\nheld for Alex", pr=True),
+                         11: sweep_issue(11, "MERGE: captain\nheld for Alex", pr=True, author="bot"),
                          12: sweep_issue(12, "fine", pr=True), 13: sweep_issue(13, "x", pr=True)}
         self.hub.comments = [sweep_comment(12, "waiting on alex", self.at(1)), sweep_comment(13, "chat", self.at(1))]
         self.sweep()
@@ -15607,6 +15610,10 @@ class TestCaptainLabels(Base):
 class TestCaptainSweepFindings(TestSweep):
     """The sweep's captain handling: S2 reads the helper; S6a and S6b finish the relabelling; nothing is written."""
 
+    def setUp(self):
+        super().setUp()
+        self.engine.config["triage"] = {"our_logins": ["bot"]}   # who is ours: the rule the triage uses
+
     def test_s2_does_not_fire_for_a_pr_held_by_its_label_and_s6_says_nothing_when_they_agree(self):
         self.hub.open = {30: sweep_issue(30, "Held for the owner", [self.USER.replace("awaiting-user", "merge-captain")], pr=True),
                          31: sweep_issue(31, "MERGE: captain\nHeld for the owner",
@@ -15617,7 +15624,7 @@ class TestCaptainSweepFindings(TestSweep):
     def test_s6a_a_marker_without_the_label_and_s6b_a_disagreement(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         automatic = self.USER.replace("awaiting-user", "merge-automatic")
-        self.hub.open = {40: sweep_issue(40, "MERGE: captain\nx", pr=True),                       # line, no label
+        self.hub.open = {40: sweep_issue(40, "MERGE: captain\nx", pr=True, author="bot"),         # line, no label
                          41: sweep_issue(41, "MERGE: captain\nx", [automatic], pr=True),           # the label disagrees
                          42: sweep_issue(42, "MERGE: automatic\nx", [captain], pr=True),           # and the other way
                          43: sweep_issue(43, "MERGE: captain\nx", [captain], pr=True),             # they agree
@@ -15628,10 +15635,39 @@ class TestCaptainSweepFindings(TestSweep):
 
     def test_a_finding_is_dropped_when_a_fresh_read_shows_the_label_was_added(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
-        self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True)}
-        self.hub.live = {50: sweep_issue(50, "MERGE: captain\nx", [captain], pr=True)}
+        self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True, author="bot")}
+        self.hub.live = {50: sweep_issue(50, "MERGE: captain\nx", [captain], pr=True, author="bot")}
         self.sweep()
         self.assertEqual(self.found(), [])
+
+    def test_s6a_flags_only_a_pr_of_ours_and_another_teams_line_is_fine(self):
+        self.hub.open = {
+            60: sweep_issue(60, "MERGE: captain\nx", pr=True, author="bot"),             # authored by one of ours: a finding
+            61: sweep_issue(61, "MERGE: captain\nx", pr=True, author="someone-else"),    # another team's author: fine
+            62: sweep_issue(62, "MERGE: captain\nx", pr=True),                           # no author known: not ours either
+            63: sweep_issue(63, "MERGE: captain\nx", pr=True, author="someone-else"),    # theirs, but one of our agents noticed it
+        }
+        self.hub.open[64] = dict(sweep_issue(64, "MERGE: captain\nx", pr=True, author="someone-else"),
+                                 assignees=[{"login": "bot"}])                           # assigned to one of ours
+        sb.record_pr_notice(self.world.state, "acme/api", 63, "agent-one", "", self.world.clock.now())
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S6a"],
+                         [("S6a", "acme/api#60"), ("S6a", "acme/api#63"), ("S6a", "acme/api#64")])
+        # the same rule with a different key: with no our_logins configured nothing is ours but the noticed PR
+        self.engine.config["triage"] = {}
+        self.engine.sweep.confirmed.clear()
+        self.engine.sweep.logged.clear()
+        self.world.tick(sb.SWEEP_TTL + 1)
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.engine.sweep.current["counts"].get("S6a"), 1)             # only #63, by its notice
+
+    def test_a_fresh_read_that_shows_another_teams_author_drops_the_finding(self):
+        self.hub.open = {70: sweep_issue(70, "MERGE: captain\nx", pr=True, author="bot")}
+        self.hub.live = {70: sweep_issue(70, "MERGE: captain\nx", pr=True, author="someone-else")}
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S6a"], [])
 
     def test_the_sweep_writes_nothing_to_github(self):
         text = (REPO / "bin" / "fleet-switchboard").read_text()

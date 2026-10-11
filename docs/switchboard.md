@@ -2353,8 +2353,9 @@ there is no merge label. The window is a dated constant, `CAPTAIN_MARKER_UNTIL` 
 one-line way to drop the marker is to set it to `None`, after telling the Chief of Staff. A captain decision lists its hold reasons
 (`holds`, from the `hold-*` labels, nothing from prose), and a T6 finding carries them too.
 
-**The sweep finishes the relabelling.** Two findings, both read-only: S6a, a PR whose first line says `MERGE: captain` but which has no
-merge label; S6b, a PR whose merge label and first line disagree (or which carries both merge labels: held, and said so). Like every
+**The sweep finishes the relabelling.** Two findings, both read-only: S6a, a PR of OURS (judged by the rule the triage uses to tell ours from
+other-owner items: its author or an assignee is one of `our_logins`, or an agent of ours recorded a notice for it) whose first line says
+`MERGE: captain` but which has no merge label (another team's author carrying the line is fine, not a finding); S6b, a PR whose merge label and first line disagree (or which carries both merge labels: held, and said so). Like every
 sweep finding each is re-checked against a fresh read before it is raised. The sweep and the triage write nothing to GitHub: a person
 (or the owning orchestrator) adds the labels.
 
