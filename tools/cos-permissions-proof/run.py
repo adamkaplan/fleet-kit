@@ -147,6 +147,9 @@ def main():
     if not shutil.which("opencode"):
         sys.exit("run.py: opencode is not on PATH")
     corpus = json.load(open(a.corpus))
+    temp = os.path.join(os.path.realpath(tempfile.gettempdir()), "opencode")  # the opencode temp dir (macOS: /private/var/folders/.../T/opencode)
+    os.makedirs(temp, exist_ok=True)
+    corpus = json.loads(json.dumps(corpus).replace("@TEMP@", temp))
     text = open(a.definition).read().replace("__PROVIDER__/__MODEL_ID__", "mock/mock")
     work = a.work or tempfile.mkdtemp(prefix="cos-permissions-proof-")
     jobs = []

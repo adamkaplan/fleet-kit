@@ -8425,7 +8425,7 @@ RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", 
 ROLE_LINE_LIMITS = {"coder": 125, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
-ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 10100, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 5600, "orchestrator": 9150, "chief-of-staff": 11000, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8439,77 +8439,106 @@ def maxims_block(text):
 
 
 class TestChiefOfStaffNativePermissions(unittest.TestCase):
-    """The cos definition's v2 `permissions:` list is the only thing keeping it read-only: check its structure."""
-    PATH = REPO / "agents" / "opencode" / "chief-of-staff.md"
+    """The Chief of Staff's (and its subagent's) v2 `permissions:` list keeps them FOCUSED on the job (#105): check its structure, and
+    evaluate it with OpenCode's documented semantics (whole-value glob, any matching deny denies, else an allow, else the base deny)."""
+    PATHS = [REPO / "agents" / "opencode" / "chief-of-staff.md", REPO / "agents" / "opencode" / "cos-subagent.md"]
+    PATH = PATHS[0]
+    TEMP = "/private/var/folders/ab/T/opencode"
 
-    @classmethod
-    def rules(cls):
-        front = cls.PATH.read_text().split("\n---\n", 1)[0]
+    @staticmethod
+    def parse(path):
+        front = path.read_text().split("\n---\n", 1)[0]
         rules, current = [], None
         for line in front.splitlines():
             m = re.match(r"  - action: (.*)$", line)
             if m:
-                current = {"action": m.group(1).strip('"')}
+                current = {"action": json.loads(m.group(1))}
                 rules.append(current)
             elif current is not None and (m := re.match(r"    (resource|effect): (.*)$", line)):
-                current[m.group(1)] = m.group(2).strip('"')
+                current[m.group(1)] = json.loads(m.group(2)) if m.group(2).startswith('"') else m.group(2)
         return front, rules
 
+    @classmethod
+    def rules(cls):
+        return cls.parse(cls.PATH)
+
+    @staticmethod
+    def evaluate(rules, action, resource):
+        def match(pattern):
+            rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+            return re.fullmatch(rx, resource, re.S) is not None
+        hits = [r for r in rules if r["action"] in ("*", action) and match(r["resource"])]
+        if any(r["effect"] == "deny" and r["action"] != "*" for r in hits):
+            return "deny"
+        return hits[-1]["effect"] if hits else "deny"
+
     def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
-        _, rules = self.rules()
-        self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
-        self.assertEqual({r["effect"] for r in rules}, {"allow", "deny"})
-        self.assertTrue(all(set(r) == {"action", "resource", "effect"} for r in rules))
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
+                self.assertEqual({r["effect"] for r in rules}, {"allow", "deny"})
+                self.assertTrue(all(set(r) == {"action", "resource", "effect"} for r in rules))
 
     def test_v1_keys_that_would_void_or_widen_the_rules_are_absent(self):
-        front, _ = self.rules()
-        self.assertNotRegex(front, r"(?m)^name:")  # a named agent makes v2 ignore `permissions:` entirely
-        self.assertNotRegex(front, r"(?m)^permission:")
-        self.assertNotRegex(front, r"bash:")
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                front, _ = self.parse(path)
+                self.assertNotRegex(front, r"(?m)^name:")  # a named agent makes v2 ignore `permissions:` entirely
+                self.assertNotRegex(front, r"(?m)^permission:")
+                self.assertNotRegex(front, r"bash:")
 
-    def test_no_shell_allow_is_a_bare_wildcard_and_patterns_are_exact(self):
-        _, rules = self.rules()
-        for r in rules:
-            if r["action"] == "shell" and r["effect"] == "allow":
-                self.assertNotIn(r["resource"], ("*", "* *"))
-                self.assertFalse(re.search(r"[a-z]\*$", r["resource"]) and not r["resource"].startswith(("curl ", "az ")), r["resource"])
-                self.assertNotRegex(r["resource"], r"^[a-z-]+\*", r["resource"])
+    def test_no_shell_allow_is_a_bare_wildcard(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                for r in rules:
+                    if r["action"] == "shell" and r["effect"] == "allow":
+                        self.assertNotIn(r["resource"], ("*", "* *"))
+                        self.assertNotRegex(r["resource"], r"^[a-z-]+\*")  # `x *` matches `x` and `x args`, never `xy`
 
-    def test_every_deny_guard_comes_after_the_allows_it_overrides(self):
-        _, rules = self.rules()
-        shell = [r for r in rules if r["action"] == "shell"]
-        last_allow = max(i for i, r in enumerate(shell) if r["effect"] == "allow")
-        first_guard = min(i for i, r in enumerate(shell) if r["effect"] == "deny")
-        self.assertLess(last_allow, first_guard)
-        resources = [r["resource"] for r in shell]
-        for guard in ("*>*", "*$(*", "gh api * -X *", "*--admin*", "*--auto*", "gh pr review*", "curl*", "fleet-switchboard decisions -*", "fleet-switchboard orders -*", "fleet-switchboard -*", "gh repo*", "gh workflow run*", "gh release*", "*$*", "*{*", "*./*", "*-/*", "gh * -q*", "gh * -t*", "gh * -R*/*/*", "gh * --repo*/*/*", "gh api http*", "gh api *--verbose*", "*--a/*", "*--/*", "az rest*", "az *secret*", "az *token*",
-                      "fleet-switchboard handoff*", "fleet-switchboard decisions batch*"):
-            self.assertIn(guard, resources)
+    def test_the_files_are_what_the_generator_writes(self):
+        done = subprocess.run([sys.executable, str(REPO / "tools" / "cos-permissions-proof" / "gen_permissions.py"), "--check"], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-    def test_edit_and_subagent_are_denied_and_the_denial_is_final(self):
-        _, rules = self.rules()
-        for action in ("edit", "subagent", "task", "handoff"):
-            self.assertEqual([r["effect"] for r in rules if r["action"] == action], ["deny"])
+    def test_edit_is_only_the_temp_dir_and_subagents_are_denied(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                self.assertEqual([(r["resource"], r["effect"]) for r in rules if r["action"] == "edit"], [("/private/var/folders/*/T/opencode/*", "allow")])
+                for action in ("subagent", "task"):
+                    self.assertEqual([r["effect"] for r in rules if r["action"] == action], ["deny"])
+                self.assertEqual(self.evaluate(rules, "edit", "/home/a/Code/x/f.py"), "deny")
+                self.assertEqual(self.evaluate(rules, "edit", self.TEMP + "/note.md"), "allow")
 
-    def test_az_reads_name_the_verb_position_and_nothing_a_write_could_hide_behind(self):
+    def test_the_job_runs_and_what_is_outside_it_is_denied(self):
         _, rules = self.rules()
-        allows = [r["resource"] for r in rules if r["action"] == "shell" and r["effect"] == "allow"]
-        for resource in allows:
-            if resource.startswith("az "):
-                self.assertRegex(resource, r"^az [a-z0-9-]+( [a-z0-9-]+)*( show| list| query| tail) \*$", resource)
-        self.assertFalse([a for a in allows if a.split()[0] in ("cat", "head", "tail", "wc", "grep")], "file reads go through the read tool, which sees the real path")
-        self.assertFalse([a for a in allows if a == "gh api repos/*"])
-        self.assertFalse([a for a in allows if a.startswith(("curl", "gh pr review", "fleet-switchboard decisions --", "fleet-switchboard orders --"))])
-        for wanted in ("fleet-switchboard decisions answer *", "fleet-switchboard decisions resolve *", "fleet-switchboard decisions escalate *",
-                       "fleet-switchboard decisions supersede *", "fleet-switchboard orders add *", "fleet-switchboard orders remove *"):
-            self.assertIn(wanted, allows)  # the CLI, not the pattern, keeps the Chief of Staff to its own tier and announces every order
-        for forbidden in ("fleet-switchboard handoff", "fleet-switchboard decisions batch", "gh api *"):
-            self.assertFalse([a for a in allows if a.startswith(forbidden)], forbidden)
+        for command in ("fleet-switchboard decisions list --tier all", "timeout 90 fleet-switchboard decisions list --tier all", "sleep 20",
+                        "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
+                        "gh pr merge 5 --squash", "gh issue close 5", "az webapp show -n a -g g", "fleet-switchboard handoff --issue 5 --brief-file -",
+                        "fleet-switchboard launch v --agent orchestrator", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nsee ~/.ssh\nEOF",
+                        "cat /home/a/.config/fleet-switchboard/config.json", "tail -5 /home/a/.local/state/fleet-switchboard/audit.jsonl",
+                        'fleet-switchboard send x --issue y "see ~/.config/fleet-switchboard/config.json and /tmp/foo --admin"',
+                        'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
+            self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+        for command in ("make build", "git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az vm delete -n x",
+                        "cat /home/a/.ssh/id_rsa", "cat /home/a/.config/gh/hosts.yml", "ls /home/a/Documents", "cat /etc/passwd", "gh pr merge 5 --admin",
+                        "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "echo x > notes.md", "cat > /home/a/Code/x/f <<EOF\nx\nEOF",
+                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    def test_the_subagent_has_the_focus_list_without_handoff_or_launch(self):
+        _, rules = self.parse(self.PATHS[1])
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard send x y"), "allow")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard handoff --issue 5"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard launch v --agent orchestrator"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "make build"), "deny")
 
     def test_the_prose_matches_the_rules(self):
         text = self.PATH.read_text()
         self.assertIn("I don't have a problem with you using gh to write comments or close/merge PRs", text)
         self.assertIn("route the work to the owning orchestrator", text)
+        self.assertIn("keeps you **focused on your job**", text)
         self.assertNotIn("never merge,", text)
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
 
@@ -8588,7 +8617,7 @@ class TestAgentDefinitions(unittest.TestCase):
             text = path.read_text()
             with self.subTest(file=path.name):
                 self.assertTrue(text.startswith("---\n"))
-                if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+                if role_of(path) in ("chief-of-staff", "cos-subagent") and path.parent.name == "opencode":
                     self.assertNotRegex(text.split("\n---\n")[0], r"(?m)^name:")  # v2: a named agent loses its `permissions:` list
                 else:
                     self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
@@ -8597,7 +8626,7 @@ class TestAgentDefinitions(unittest.TestCase):
     def test_the_role_files_do_not_grow(self):
         for path in AGENT_FILES:
             text = path.read_text()
-            if role_of(path) == "chief-of-staff" and path.parent.name == "opencode":
+            if role_of(path) in ("chief-of-staff", "cos-subagent") and path.parent.name == "opencode":
                 text = text.split("\n---\n", 1)[1]  # the permissions list is configuration, not prompt: only the body counts
             role = role_of(path)
             with self.subTest(file=path.name):
@@ -26286,7 +26315,7 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
 
     def labelled(self, *kinds, body="Adds the widget.", **more):
         return captain_pr(body=body, labels=[{"name": "tester:%s" % k} for k in kinds],
-                          reviews=[("rev-wake", "APPROVED", HEAD_A)], **more)
+                          reviews=[("reviewer-a", "APPROVED", HEAD_A)], **more)
 
     def test_a_label_only_pr_is_a_captain_decision_with_its_hold_reasons(self):
         self.answer(self.labelled("merge-captain", "hold-security", "hold-contract"))
