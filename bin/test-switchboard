@@ -14684,6 +14684,36 @@ class TestSweep(Base):
         self.sweep([old, fresh], aged_cos_hours=0.1)
         self.assertIn(("S5", "d41"), self.found())
 
+    def test_s5_skips_a_cos_entry_whose_ref_is_already_in_the_owners_tier(self):
+        old = sb.iso(self.world.clock.now() - 3 * 3600)
+        cos = lambda ident, ask=None, repo="acme/api", **more: dict({"id": ident, "kind": "report", "tier": "cos", "repo": repo,
+                                                                    "ask": ask, "since": old, "title": "t"}, **more)
+        human = lambda ident, ask=None, repo="acme/api", **more: dict({"id": ident, "kind": "issue", "tier": "human", "repo": repo,
+                                                                      "ask": ask, "since": old, "title": "t"}, **more)
+        decisions = [
+            cos("d-a", ask=500), human("api#500", ask=500),                                           # the same issue, folded or escalated
+            cos("d-b", ask=501, repo="ACME/API"), human("api#501", ask=501),                         # another repo spelling (case)
+            cos("pr:acme/api#502", ask=None, kind="captain", number=502), human("pr:acme/api#502", kind="captain", number=502),
+            cos("pr:api#503", kind="captain", repo=None), human("pr:acme/api#503", kind="captain", number=503),   # short vs full pr: ref
+            cos("pr:acme/api#504", kind="captain", number=504), human("pr:api#504", kind="captain", repo=None),   # and the other way
+            cos("d-alone", ask=510),                                                                  # a cos-tier item alone still raises
+            cos("pr:acme/api#511", kind="captain", number=511),                                       # so does a captain PR alone
+            cos("d-other-repo", ask=500, repo="acme/web"),                                            # another repo's #500 is not ours
+        ]
+        self.engine.config["github_repos"] = ["acme/api", "acme/web"]
+        self.engine.discover(self.world.clock.now())
+        self.sweep(decisions)
+        self.assertEqual([f for f in self.found() if f[0] == "S5"],
+                         [("S5", "d-alone"), ("S5", "d-other-repo"), ("S5", "pr:acme/api#511")])
+
+    def test_s5_ref_keys_read_both_spellings_and_an_ambiguous_short_name_resolves_nowhere(self):
+        keys = lambda d, repos=("acme/api",): sb.sweep_ref_keys(d, "acme/api", list(repos))
+        self.assertEqual(keys({"id": "pr:acme/api#7"}), {("acme/api", 7)})
+        self.assertEqual(keys({"id": "pr:api#7"}), {("acme/api", 7)})
+        self.assertEqual(keys({"id": "pr:API#7", "repo": "Acme/Api", "number": 7}), {("acme/api", 7)})
+        self.assertEqual(keys({"id": "pr:api#7"}, ("acme/api", "other/api")), set())                 # two repos named api: not guessed
+        self.assertEqual(keys({"id": "x", "repo": None, "ask": None}), set())
+
     def test_one_batched_capped_fact_for_the_chief_of_staff_and_a_debounce(self):
         self.hub.open = {n: sweep_issue(n, "## Decision required\nx") for n in range(100, 108)}
         state = sb.sweep_state(self.engine)   # bear them all out first, as earlier passes would have

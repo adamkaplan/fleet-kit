@@ -6490,7 +6490,7 @@ SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
-               "S5": "cos-tier decision aged"}
+               "S5": "cos-tier decision aged (and not already in the owner's tier)"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -6732,6 +6732,28 @@ def sweep_ref_of(decision, home):
     return (decision.get("repo") or home, number)
 
 
+_DECISION_ID_REF = re.compile(r"^pr:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)#(\d+)$")
+
+
+def sweep_ref_keys(decision, home, repos):
+    """The set of (repo lower-case, number) a decision is about: its repo and ask or number, and the ref its id spells (`pr:owner/repo#N`
+    or `pr:repo#N`, the short name resolved among `repos` when exactly one matches). Repos are compared without case."""
+    keys = set()
+    ref = sweep_ref_of(decision, home)
+    if ref and ref[0]:
+        keys.add((ref[0].lower(), ref[1]))
+    found = _DECISION_ID_REF.match(str(decision.get("id") or ""))
+    if found:
+        tag, number = found.group(1).lower(), int(found.group(2))
+        if "/" in tag:
+            keys.add((tag, number))
+        else:
+            named = [r.lower() for r in repos if r.lower().split("/")[-1] == tag]
+            if len(named) == 1:
+                keys.add((named[0], number))
+    return keys
+
+
 def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     """(kept decisions, refs found stale): a decision whose issue or PR is closed or merged is stale. Closed state is read
     one issue at a time, cached SWEEP_TTL, within the pass's call budget (the least recently read first)."""
@@ -6821,6 +6843,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             for target in targets:
                 if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
                     found.add(("S3", ref_text(*target)))
+    repos_known = list(state.repos) + ([home] if home else [])
+    human_keys = set()
+    for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
+        if d.get("tier", "human") == "human" and d.get("kind") != "notice":
+            human_keys |= sweep_ref_keys(d, home, repos_known)
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -6833,7 +6860,8 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             found.add(("S3", ref_text(*target)))
         since = parse_iso(d.get("since"))
         if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
-                and now - since >= cfg["aged_cos_hours"] * 3600):
+                and now - since >= cfg["aged_cos_hours"] * 3600
+                and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
     state.unattributed = unattributed
     return sorted(found)
