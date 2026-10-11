@@ -16679,7 +16679,7 @@ LEDGER_HEAD = "a" * 40
 LEDGER_NEW_HEAD = "b" * 40
 
 
-class TestPlanLedger(Base):
+class LedgerBase(Base):
     """#107: the evidence ledger (`prove`, `verdict`) and the read-only gates view. Synthetic names; nothing enforces."""
 
     NAMES = ("coder", "rev", "tst", "own", "cibot", "other")
@@ -16695,8 +16695,11 @@ class TestPlanLedger(Base):
         self.gh_down = False
         self.configure()
 
+    extra_config = None
+
     def configure(self, evaluators=None):
         raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": "acme/app"}
+        raw.update(self.extra_config or {})
         raw["plan_evaluators"] = evaluators if evaluators is not None else {
             "reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]}
         self.write_config(raw)
@@ -16753,6 +16756,8 @@ class TestPlanLedger(Base):
         for who, sid, ev in (("cibot", "S1", "ci"), ("tst", "S2", "tester"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
+
+class TestPlanLedger(LedgerBase):
     # -- prove
 
     def test_prove_records_a_proof_bound_to_the_plan_hash_and_the_head(self):
@@ -17132,6 +17137,292 @@ class TestPlanLedger(Base):
         for path in (BIN / "plan_ledger.py",):
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
+
+
+class TestPlanGatesCheck(LedgerBase):
+    """#107 slice 3a: `gates-check`, the per-repo mode, the kill switches and the role guard. Nothing enforces: no shim calls it."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_gates({"acme/app": {"mode": "shadow"}})
+
+    def set_gates(self, repos):
+        self.extra_config = {"plan_gates": {"repos": repos}}
+        self.configure()
+
+    def check(self, kind="merge", *more, who="coder", pr=None):
+        code, out, err = self.run_as(who, "gates-check", pr or self.PR, "--for", kind, "--json", *more)
+        return code, (json.loads(out) if out.strip().startswith("{") else None), err
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    # -- the decision
+
+    def test_a_repo_not_listed_is_not_checked_and_says_nothing(self):
+        self.set_gates({"acme/other": {"mode": "enforce"}})
+        code, out, err = self.check()
+        self.assertEqual((code, out["verdict"], out["reason"]), (0, "allow", "not opted in"))
+        self.assertEqual(self.events("gate.would_refuse") + self.events("gate.refused"), [])
+
+    def test_shadow_allows_and_records_what_enforcement_would_refuse(self):
+        code, out, err = self.check("merge")
+        self.assertEqual((code, out["verdict"], out["mode"]), (0, "allow", "shadow"))
+        self.assertTrue(out["failed"])
+        (event,) = self.events("gate.would_refuse")
+        self.assertIn("G1", event["detail"]["failed"])
+        self.assertEqual(self.events("gate.refused"), [])
+
+    def test_enforce_refuses_with_exit_10_and_names_the_gates(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, err = self.check("ready")
+        self.assertEqual((code, out["verdict"]), (10, "refuse"))
+        self.assertEqual([f["gate"] for f in out["failed"]], ["G1"])
+        self.assertIn("gate.refused", [e["event"] for e in self.world.audit()])
+        code, text, err = self.run_as("coder", "gates-check", self.PR, "--for", "ready")
+        self.assertEqual(code, 10)
+        self.assertIn("refused for ready", err)
+
+    def test_enforce_allows_when_the_gates_it_needs_are_satisfied(self):
+        self.all_proven()
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        for kind in ("ready", "merge"):
+            code, out, err = self.check(kind)
+            self.assertEqual((code, out["verdict"], out["failed"]), (0, "allow", []), kind)
+
+    def test_each_check_requires_its_own_gates(self):
+        self.all_proven()
+        self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        self.assertEqual(self.check("ready")[0], 0, "CI is not a ready gate")
+        code, out, _ = self.check("merge")
+        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G4"]))
+        self.pr["labels"] = [{"name": "tester:merge-captain"}]
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        code, out, _ = self.check("merge")
+        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6"]))
+
+    def test_untracked_gates_never_refuse(self):
+        self.all_proven()
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 0)   # G0b, G0c and G2/G3 are untracked: they cannot block
+
+    def test_the_repo_matches_without_regard_to_case(self):
+        self.set_gates({"Acme/App": {"mode": "enforce"}})
+        self.assertEqual(self.check("ready")[0], 10)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "plan_gates": {"repos": {"a/b": {}, "A/B": {}}}})
+
+    def test_a_plan_with_nothing_claimed_per_pr_does_not_pass_g1_without_a_reasoned_statement(self):
+        scenario_block = LEDGER_PLAN[LEDGER_PLAN.index("```yaml"):].replace("    claim: epic\n", "")
+        epic_plan = re.sub(r"(    evaluator: \w+)\n", r"\1\n    claim: epic\n", scenario_block)
+        head = LEDGER_PLAN[:LEDGER_PLAN.index("```yaml")]
+        self.plan_issue["body"] = head + epic_plan
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        code, out, _ = self.check("ready")
+        self.assertEqual(code, 10)
+        self.assertIn("claimed per PR", out["reason"])
+        self.plan_issue["body"] = head + epic_plan + "\nper-pr scenarios: none because the whole change is proven at the epic head\n"
+        code, out, _ = self.check("ready")
+        self.assertEqual(code, 0, out)
+        self.plan_issue["body"] = head + epic_plan + "\nper-pr scenarios: none because short\n"
+        self.assertEqual(self.check("ready")[0], 10, "the reason is at least 20 characters")
+
+    # -- fail-open
+
+    def test_only_exit_10_refuses_and_every_failure_is_a_fail_open_with_a_record(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        self.gh_down = True
+        code, out, err = self.check("merge")
+        self.assertEqual((code, out["verdict"]), (3, "fail-open"))
+        self.assertNotEqual(code, 10)
+        self.assertEqual(len(self.events("gate.fail_open")), 1)
+        self.assertEqual(self.events("gate.refused"), [], "a fail-open is not recorded as a refusal")
+
+    def test_a_crash_inside_the_check_is_a_fail_open_not_a_refusal(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        with mock.patch.object(sb.plan_ledger, "evaluate_gates", side_effect=ValueError("boom")):
+            code, out, err = self.check("merge")
+        self.assertEqual((code, out["verdict"]), (3, "fail-open"))
+        self.assertIn("boom", out["reason"])
+
+    def test_a_check_that_outruns_its_budget_fails_open(self):
+        self.set_gates({"acme/app": {"mode": "enforce", "budget_ms": 500}})
+        base = self.route
+
+        def slow(argv, **kw):
+            time.sleep(1.5)
+            return base(argv, **kw)
+        self.route = slow
+        started = time.time()
+        code, out, _ = self.check("merge")
+        self.assertEqual((code, out["verdict"]), (3, "fail-open"))
+        self.assertIn("no answer within 500 ms", out["reason"])
+        self.assertLess(time.time() - started, 1.4, "the caller is not held past the budget")
+
+    def test_a_broken_ledger_refuses_g1_in_enforce_and_alarms_once_a_day(self):
+        self.all_proven()
+        path = self.world.state / "plan-ledger.jsonl"
+        path.write_text(path.read_text().replace('"result": "pass"', '"result": "fail"', 1))
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        for _ in range(3):
+            code, out, _ = self.check("ready")
+            self.assertEqual(code, 10)
+        self.assertEqual(len(self.events("gate.ledger_broken")), 1, "one alarm a day per repo, not one per command")
+        self.set_gates({"acme/app": {"mode": "shadow"}})
+        self.assertEqual(self.check("ready")[0], 0)
+
+    def test_the_first_fail_open_of_a_kind_per_repo_per_day_is_marked(self):
+        self.gh_down = True
+        self.check("merge")
+        self.check("merge")
+        firsts = [e["detail"]["first_today"] for e in self.events("gate.fail_open")]
+        self.assertEqual(firsts, [True, False])
+
+    def test_a_fail_open_and_a_refusal_are_distinguishable_in_the_log(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        self.check("ready")
+        self.gh_down = True
+        self.check("ready")
+        names = [e["event"] for e in self.world.audit() if e["event"].startswith("gate.")]
+        self.assertEqual(names, ["gate.refused", "gate.fail_open"])
+
+    # -- kill switches and the role guard
+
+    def test_enabled_false_disables_a_repo_at_the_next_command(self):
+        self.set_gates({"acme/app": {"mode": "enforce", "enabled": False}})
+        code, out, _ = self.check("merge")
+        self.assertEqual((code, out["reason"]), (0, "disabled (kill switch)"))
+
+    def test_the_global_kill_file_disables_every_repo_and_is_logged(self):
+        self.set_gates({"acme/app": {"mode": "enforce"}})
+        (self.world.state / "plan-gates.off").write_text("")
+        code, out, _ = self.check("merge")
+        self.assertEqual(code, 0)
+        self.assertIn("kill file", out["reason"])
+        self.assertEqual(len(self.events("gate.killed")), 1)
+        status = self.run_as(None, "status")[1]
+        self.assertIn("PLAN GATES: the global kill file exists", status)
+
+    def test_cos_and_a_person_may_change_a_mode_and_it_is_audited(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure_ci_recorder()
+        code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 0, err)
+        raw = json.loads(self.config_file.read_text())
+        self.assertEqual(raw["plan_gates"]["repos"]["acme/app"], {"mode": "enforce", "enabled": True})
+        self.assertEqual(raw["intent_repo"], "acme/app", "every other key is kept")
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "off")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(json.loads(self.config_file.read_text())["plan_gates"]["repos"]["acme/app"]["enabled"])
+        self.assertEqual([(e["detail"]["by"], e["detail"]["mode"]) for e in self.events("gate.mode")],
+                         [("cos", "enforce"), ("a person at a shell", "off")])
+
+    def configure_ci_recorder(self):
+        self.configure()   # the default evaluators include a `ci` recorder
+
+    def test_any_other_agent_is_refused_and_nothing_changes(self):
+        before = self.config_file.read_text()
+        for word in (("mode", "acme/app", "off"), ("off",)):
+            code, out, err = self.run_as("coder", "gates", *word)
+            self.assertEqual(code, 2)
+            self.assertIn("may not change gate modes", err)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.assertFalse((self.world.state / "plan-gates.off").exists())
+        self.assertEqual(len(self.events("gate.mode.refused")), 2)
+
+    def test_an_unknown_session_is_refused_not_read_as_a_person(self):
+        before = self.config_file.read_text()
+        os.environ["OPENCODE_SESSION_ID"] = "ses_nosuchsession"
+        try:
+            code, out, err = self.run_as(None, "gates", "mode", "acme/app", "off")
+            code2, _, err2 = self.run_as(None, "gates", "off")
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+        self.assertEqual((code, code2), (2, 2))
+        self.assertIn("uncertain identity is refused", err)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.assertFalse((self.world.state / "plan-gates.off").exists())
+
+    def test_a_known_session_that_is_not_a_fleet_agent_is_a_person(self):
+        os.environ["OPENCODE_SESSION_ID"] = self.world.v2.create_session({})   # no metadata.fleet: a person's session
+        try:
+            self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+
+    def test_enforce_set_by_hand_in_the_config_runs_as_shadow_until_the_preflight_passes(self):
+        self.configure(evaluators={})   # no ci recorder
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure(evaluators={})
+        for _ in range(2):
+            code, out, err = self.check("ready")
+            self.assertEqual((code, out["mode"]), (0, "shadow"), "a hand-edited enforce does not refuse")
+            self.assertIn("enforce is not active", out["downgraded"])
+        self.assertEqual(len(self.events("gate.enforce_downgraded")), 1, "logged once a day per repo")
+        self.assertIn("gate.would_refuse", [e["event"] for e in self.world.audit()])
+        text = self.run_as(None, "status")[1]
+        self.assertIn("enforce REQUESTED but running as shadow", text)
+        self.configure()   # the default evaluators include a ci recorder
+        code, out, _ = self.check("ready")
+        self.assertEqual((code, out["mode"], out.get("downgraded")), (10, "enforce", None))
+
+    def test_gates_off_and_on_make_and_remove_the_kill_file(self):
+        self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
+        self.assertTrue((self.world.state / "plan-gates.off").exists())
+        self.assertEqual(self.run_as(None, "gates", "on")[0], 0)
+        self.assertFalse((self.world.state / "plan-gates.off").exists())
+        self.assertEqual(self.run_as(None, "gates", "on")[0], 0, "removing it twice is fine")
+
+    def test_enforce_is_refused_until_a_ci_recorder_is_registered(self):
+        self.configure(evaluators={"reviewer": ["rev"]})
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure(evaluators={"reviewer": ["rev"]})
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertIn("plan_evaluators.ci", err)
+        self.assertEqual(json.loads(self.config_file.read_text())["plan_gates"]["repos"]["acme/app"]["mode"], "shadow")
+        code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
+        self.assertEqual(code, 1)
+        self.assertIn("blocking:", out)
+        self.assertIn("`tester`", out)
+
+    def test_preflight_notes_the_manual_permission_precondition(self):
+        code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
+        self.assertEqual(code, 0)
+        self.assertIn("must be allowed `gates mode`", out)
+
+    def test_a_bad_mode_or_usage_is_refused(self):
+        for argv in (("mode", "acme/app", "loud"), ("mode", "acme/app"), ("mode",)):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.run_as(None, "gates", *argv)[0], 2)
+
+    # -- config and status
+
+    def test_the_plan_gates_config_is_checked(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertNotIn("plan_gates", sb.validate_config(dict(base)))
+        good = sb.validate_config(dict(base, plan_gates={"repos": {"a/b": {}}}))["plan_gates"]
+        self.assertEqual(good["repos"]["a/b"], {"mode": "shadow", "enabled": True, "budget_ms": 3000})
+        for bad in ([], {"repo": {}}, {"repos": {"nope": {}}}, {"repos": {"a/b": {"mode": "off"}}}, {"repos": {"a/b": {"enabled": "yes"}}},
+                    {"repos": {"a/b": {"budget_ms": 5}}}, {"repos": {"a/b": {"budget_ms": True}}}, {"repos": {"a/b": {"x": 1}}},
+                    {"repos": {"a/b": "shadow"}}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict(base, plan_gates=bad))
+
+    def test_status_shows_each_repos_mode_and_todays_counts(self):
+        self.check("merge")
+        self.gh_down = True
+        self.check("merge")
+        text = self.run_as(None, "status")[1]
+        self.assertIn("plan gates acme/app: shadow; today 1 check(s), 0 refusal(s), 1 would-refuse, 1 fail-open(s)", text)
+
+    def test_nothing_is_wired_to_a_shim_and_the_command_only_reads_github(self):
+        self.assertNotIn("gates-check", (REPO / "shims" / "gh").read_text())
+        self.check("merge")   # the route refuses any write: the test passing is the proof
+        self.assertNotIn("gates-check", sb.ENSURE_ON_USE_COMMANDS)
 
 
 class TestJudgeEval(Base):

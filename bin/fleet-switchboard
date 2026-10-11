@@ -309,7 +309,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -361,7 +361,19 @@ def validate_config(raw, source="config"):
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
+    validate_plan_gates_config(config, source)  # #107 slice 3a
     return config
+
+
+def validate_plan_gates_config(config, source):
+    """`plan_gates`: absent means no repo is opted in. See plan_ledger.validate_plan_gates."""
+    if config.get("plan_gates") is None:
+        config.pop("plan_gates", None)
+        return
+    try:
+        config["plan_gates"] = plan_ledger.validate_plan_gates(config["plan_gates"], source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
 
 
 PLAN_EVALUATOR_KINDS = ("ci", "tester", "reviewer", "owner")
@@ -9891,6 +9903,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             if work_line is not None:
                 report["external"]["work_line"] = work_line
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
+    report["plan_gates"] = plan_gates_status(config if config_ok else None, state if state_ok else None, now()) if state_ok else None
     if config_ok and state_ok:
         working = sum(1 for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")
                       and entry["observation"]["status"] == "working")
@@ -10069,6 +10082,7 @@ def format_status(report):
     lines.extend("      " + report["external"]["line"] for _ in [0] if "external" in report)
     lines.extend("      " + report["external"]["work_line"] for _ in [0] if "external" in report and "work_line" in report["external"])
     lines.extend(format_cos_orders_status(report["cos_orders"]) if "cos_orders" in report else [])  # PR 18
+    lines.extend("      " + line for line in ((report.get("plan_gates") or {}).get("lines") or []))  # #107
     lines.extend("      " + report["policy"]["line"] for _ in [0] if "policy" in report)
     lines.extend(format_install_lines(report))  # PR 16
     return "\n".join(lines)
@@ -11569,7 +11583,7 @@ def checked_plan(engine_config, source, ask, runner, now):
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
-    return dict(result, scenarios_parsed=parsed, source=label)
+    return dict(result, scenarios_parsed=parsed, source=label, text=text)
 
 
 def _ledger_pr(args):
@@ -11687,6 +11701,11 @@ def cmd_verdict(args, runner, now):
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
+    if args.pr in ("mode", "off", "on"):
+        return cmd_gates_switch(args, runner, now)
+    if args.pr == "preflight":
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_preflight(args, runner, now)
     ctx = _ledger_context(args, runner, now, False)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
@@ -11708,6 +11727,271 @@ def cmd_gates(args, runner, now):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
     return EXIT_OK if report["ready"] else EXIT_ERROR
+
+
+
+# ---------------------------------------------------------------- `gates-check` and the mode switches (#107 slice 3a)
+#
+# docs/plan-gate-engine-design.md. `gates-check` answers one question for a future shim: allow or refuse? It is read-only.
+# Exit 0 allow, 10 refuse, anything else a fail-open (the caller allows). Nothing calls it yet and, with every repo in `shadow`
+# or unlisted, it never refuses. Only exit 10 refuses; a Python exception exits 3 (fail-open), never 10.
+
+GATES_OFF_FILE = "plan-gates.off"
+GATES_STATE_FILE = "plan-gates-state.json"
+
+
+def gates_off_path(state):
+    return Path(state) / GATES_OFF_FILE
+
+
+def _day(now):
+    return time.strftime("%Y-%m-%d", time.gmtime(now))
+
+
+def gates_state(state, now):
+    """The per-day counters and alarm marks, {"day", "repos": {repo: {checks, refusals, would_refuse, fail_opens}}, "alarmed": [..]}.
+    A new UTC day starts empty."""
+    try:
+        data = json.loads((Path(state) / GATES_STATE_FILE).read_text())
+        if isinstance(data, dict) and data.get("day") == _day(now) and isinstance(data.get("repos"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"day": _day(now), "repos": {}, "alarmed": []}
+
+
+def gates_note(state, now, repo, counter, alarm=None):
+    """Count `counter` for `repo` today; True when `alarm` (a kind) is new today for this repo (so it should be raised)."""
+    data = gates_state(state, now)
+    entry = data["repos"].setdefault(normal_repo_name(repo), {"checks": 0, "refusals": 0, "would_refuse": 0, "fail_opens": 0})
+    entry[counter] = entry.get(counter, 0) + 1
+    fresh = False
+    if alarm:
+        mark = "%s:%s" % (normal_repo_name(repo), alarm)
+        if mark not in data["alarmed"]:
+            data["alarmed"].append(mark)
+            fresh = True
+    try:
+        temp = Path(state) / ("%s.%d.tmp" % (GATES_STATE_FILE, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(data, sort_keys=True))
+        os.replace(str(temp), str(Path(state) / GATES_STATE_FILE))
+    except OSError:
+        pass   # a counter is best effort
+    return fresh
+
+
+def normal_repo_name(repo):
+    return plan_ledger.normal_repo(repo)
+
+
+def _gates_audit(engine, event, subject, detail):
+    if engine.audit is not None:
+        try:
+            engine.audit.append(engine.actor, event, subject, detail)
+        except OSError:
+            pass
+
+
+def cmd_gates_check(args, runner, now):
+    """`gates-check <pr> --for ready|merge`. Read-only (state counters aside). 0 allow, 10 refuse, 3 fail-open."""
+    exit_code, payload = plan_ledger.EXIT_FAIL_OPEN, {"verdict": "fail-open"}
+    engine = state = None
+    repo = None
+    try:
+        repo, number, pr = _ledger_pr(args)
+        config = load_config()
+        setting = plan_ledger.repo_setting(config, repo)
+        state = ensure_state_dir()
+        engine, _, _ = build_engine(runner, now, "cli", writable=True)
+        if setting is None or not setting["enabled"]:
+            payload = {"verdict": "allow", "reason": "not opted in" if setting is None else "disabled (kill switch)"}
+            exit_code = plan_ledger.EXIT_ALLOW
+        elif gates_off_path(state).exists():
+            _gates_audit(engine, "gate.killed", pr, {"for": args.check_for, "by": "plan-gates.off"})
+            payload = {"verdict": "allow", "reason": "the global kill file %s exists" % GATES_OFF_FILE}
+            exit_code = plan_ledger.EXIT_ALLOW
+        else:
+            box = {}
+
+            def work():
+                try:
+                    ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
+                    ctx = _ledger_context(ns, runner, now, False)
+                    box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
+                                                                ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr)
+                    box["unreadable"] = ctx.unreadable
+                except BaseException as err:  # the answer must reach the caller as a fail-open, not a traceback
+                    box["error"] = "%s: %s" % (type(err).__name__, _one_line(str(err), 150))
+            thread = threading.Thread(target=work, daemon=True)
+            thread.start()
+            thread.join(setting["budget_ms"] / 1000.0)
+            if thread.is_alive():
+                raise TimeoutError("no answer within %d ms" % setting["budget_ms"])
+            if "error" in box:
+                raise RuntimeError(box["error"])
+            report = box["report"]
+            if box.get("unreadable"):
+                raise RuntimeError("GitHub unreadable: %s" % box["unreadable"])   # an unknown is not a refusal
+            mode, downgraded = plan_ledger.effective_mode(config, setting)
+            if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
+                _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
+            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode)
+            gates_note(state, now(), repo, "checks")
+            payload = {"verdict": verdict, "mode": mode, "for": args.check_for, "failed": failed, "reason": why}
+            if downgraded:
+                payload["downgraded"] = downgraded
+            if report.get("ledger_problem") and gates_note(state, now(), repo, "ledger_broken", alarm="ledger.broken"):
+                _gates_audit(engine, "gate.ledger_broken", pr, {"problem": report["ledger_problem"]})   # once a day per repo
+            if verdict == "refuse":
+                gates_note(state, now(), repo, "refusals")
+                _gates_audit(engine, "gate.refused", pr, {"for": args.check_for, "failed": [f["gate"] for f in failed]})
+                exit_code = plan_ledger.EXIT_REFUSE
+            else:
+                exit_code = plan_ledger.EXIT_ALLOW
+                if failed:   # shadow: what enforcement would have refused
+                    gates_note(state, now(), repo, "would_refuse")
+                    _gates_audit(engine, "gate.would_refuse", pr, {"for": args.check_for, "failed": [f["gate"] for f in failed],
+                                                                    "reason": _one_line(why, 300)})
+    except BaseException as err:
+        if isinstance(err, (KeyboardInterrupt, SystemExit)):
+            raise
+        reason = "%s: %s" % (type(err).__name__, _one_line(str(err), 200))
+        payload = {"verdict": "fail-open", "reason": reason}
+        exit_code = plan_ledger.EXIT_FAIL_OPEN
+        if state is not None and repo:
+            first = gates_note(state, now(), repo, "fail_opens", alarm="fail-open:%s" % type(err).__name__)
+            if engine is not None:
+                _gates_audit(engine, "gate.fail_open", "%s" % args.pr, {"for": args.check_for, "reason": reason, "first_today": first})
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    elif payload["verdict"] == "refuse":
+        sys.stderr.write("%s: gates-check: refused for %s: %s\n" % (PROG, args.check_for, payload["reason"]))
+    elif payload["verdict"] == "fail-open":
+        sys.stderr.write("%s: gates-check: could not check (%s): allowed\n" % (PROG, payload["reason"]))
+    return exit_code
+
+
+def gates_caller_may_switch(runner, now):
+    """(ok, who): the chief of staff, or a person at a shell with no fleet identity, may change a gate mode. Any other fleet
+    agent is refused. A mistake-guard on the session identity (#138), not a boundary."""
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+    except IdentityUncertain:
+        return False, "unknown (an uncertain identity is refused, never read as a person: #138)"
+    except CallerError:
+        return True, "a person at a shell"
+    except (V2Error, HerdrError):
+        return False, "unknown (the registry could not be read)"
+    if fleet.get("role") == "chief-of-staff":
+        return True, fleet["name"]
+    return False, fleet.get("name") or "an agent"
+
+
+def _write_gates_config(raw_edit):
+    """Edit the config file's `plan_gates` through `raw_edit(section) -> section`, atomically, keeping every other key, and
+    check the result with validate_config before it is written."""
+    path = config_path()
+    try:
+        raw = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError) as err:
+        raise ConfigError("cannot read %s to edit it: %s" % (path, _one_line(str(err), 100))) from None
+    section = raw.get("plan_gates") if isinstance(raw.get("plan_gates"), dict) else {}
+    section = {"repos": dict(section.get("repos") or {})}
+    raw["plan_gates"] = raw_edit(section)
+    validate_config(raw, str(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(raw, indent=2) + "\n")
+    os.replace(str(temp), str(path))
+
+
+def cmd_gates_switch(args, runner, now):
+    """`gates mode <repo> shadow|enforce|off` and `gates off|on`: change enforcement. chief of staff or a person only; audited."""
+    ok, who = gates_caller_may_switch(runner, now)
+    engine, state, config = build_engine(runner, now, "cli")
+    word = args.pr
+    if not ok:
+        _gates_audit(engine, "gate.mode.refused", word, {"by": who, "args": args.rest[:3]})
+        raise LedgerCommandError("refused: %s may not change gate modes (the chief of staff, or a person at a shell, may)" % who)
+    if word in ("off", "on"):
+        path = gates_off_path(state)
+        if word == "off":
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(fd)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        _gates_audit(engine, "gate.mode", "all", {"by": who, "global": word})
+        print("plan gates: global kill file %s (%s)" % ("created: every repo is off" if word == "off" else "removed", GATES_OFF_FILE))
+        return EXIT_OK
+    if len(args.rest) != 2 or args.rest[1] not in ("shadow", "enforce", "off"):
+        raise LedgerCommandError("usage: gates mode <owner/repo> shadow|enforce|off")
+    repo, target = args.rest
+    if target == "enforce":
+        blocking, notes = plan_ledger.preflight(config, repo)
+        if blocking:
+            raise LedgerCommandError("refused: %s not switched to enforce: %s" % (repo, "; ".join(blocking)))
+        for note in notes:
+            sys.stderr.write("%s: gates mode: note: %s\n" % (PROG, note))
+
+    def edit(section):
+        repos = section["repos"]
+        current = next((n for n in repos if plan_ledger.normal_repo(n) == plan_ledger.normal_repo(repo)), repo)
+        entry = dict(repos.get(current) or {})
+        if target == "off":
+            entry["enabled"] = False
+        else:
+            entry["mode"], entry["enabled"] = target, True
+        repos[current] = entry
+        return section
+    _write_gates_config(edit)
+    _gates_audit(engine, "gate.mode", repo, {"by": who, "mode": target})
+    print("plan gates: %s is now %s" % (repo, "off (kill switch)" if target == "off" else target))
+    return EXIT_OK
+
+
+def cmd_gates_preflight(args, runner, now):
+    config = load_config()
+    blocking, notes = plan_ledger.preflight(config, args.pr)
+    print("preflight for enforcing %s: %s" % (args.pr, "BLOCKED" if blocking else "nothing blocks it"))
+    for line in blocking:
+        print("  blocking: %s" % line)
+    for line in notes:
+        print("  note: %s" % line)
+    return EXIT_ERROR if blocking else EXIT_OK
+
+
+def plan_gates_status(config, state, now):
+    """{"line": ..., "repos": {...}, "killed": bool} for `status`."""
+    section = (config or {}).get("plan_gates") if isinstance(config, dict) else None
+    killed = bool(state) and gates_off_path(state).exists()
+    out = {"killed": killed, "repos": {}, "lines": []}
+    if killed:
+        out["lines"].append("PLAN GATES: the global kill file exists (%s): every repo is OFF. `%s gates on` removes it" % (GATES_OFF_FILE, PROG))
+    if not section or not section.get("repos"):
+        if killed:
+            return out
+        return None
+    counts = gates_state(state, now)["repos"] if state else {}
+    for name, entry in sorted(section["repos"].items()):
+        c = counts.get(plan_ledger.normal_repo(name), {})
+        label = "off (kill switch)" if not entry["enabled"] else entry["mode"]
+        if entry["enabled"] and entry["mode"] == "enforce":
+            actual, why = plan_ledger.effective_mode(config, dict(entry, name=name))
+            if why:
+                label = "enforce REQUESTED but running as shadow (%s)" % why
+        out["repos"][name] = dict(entry, counts=c)
+        out["lines"].append("plan gates %s: %s; today %d check(s), %d refusal(s), %d would-refuse, %d fail-open(s)" % (
+            name, label, c.get("checks", 0), c.get("refusals", 0), c.get("would_refuse", 0), c.get("fail_opens", 0)))
+    return out
 
 
 def add_ledger_parsers(sub):
@@ -11732,9 +12016,19 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
-    gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it")
+    gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
+                                         "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
+                                         "`gates preflight <repo>`")
     common(gates, scenario=False)
+    gates.add_argument("rest", nargs="*", help="With `mode`: <owner/repo> <shadow|enforce|off>")
     gates.add_argument("--json", action="store_true")
+    check = sub.add_parser("gates-check", help="Is a ready or a merge allowed? Read-only: exit 0 allow, 10 refuse, anything else "
+                                               "a fail-open. Only exit 10 refuses. Nothing calls it yet")
+    check.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    check.add_argument("--for", dest="check_for", required=True, choices=plan_ledger.CHECK_FOR)
+    check.add_argument("--plan")
+    check.add_argument("--ask")
+    check.add_argument("--json", action="store_true")
 
 
 def add_plan_parsers(sub):
@@ -14341,9 +14635,9 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return cmd_report(args, runner, now)
         if args.action == "notice":
             return cmd_notice(args, runner, now)
-        if args.action in ("prove", "verdict", "gates"):  # #107: state and GETs only; never ensures the daemon
+        if args.action in ("prove", "verdict", "gates", "gates-check"):  # #107: state and GETs only; never ensures the daemon
             try:
-                return {"prove": cmd_prove, "verdict": cmd_verdict, "gates": cmd_gates}[args.action](args, runner, now)
+                return {"prove": cmd_prove, "verdict": cmd_verdict, "gates": cmd_gates, "gates-check": cmd_gates_check}[args.action](args, runner, now)
             except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
                 sys.stderr.write("%s: %s: %s\n" % (PROG, args.action, _one_line(str(err), 400)))
                 return EXIT_USAGE
