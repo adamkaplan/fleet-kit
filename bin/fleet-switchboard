@@ -5285,10 +5285,12 @@ CAPTAIN_EVIDENCE_MAX = 5    # signed reviewers listed in a decision
 PLACEHOLDER_SIGNERS = {"agent", "name", "none", "null", "unknown", "nobody", "anonymous", "you", "me", "x", "todo"}
 
 
-def pr_signed_at(comments, head):
+def pr_signed_at(comments, head, review_only=False):
     """The agent names that signed (`<!-- fleet-switchboard:from=NAME -->`) one of the last PR_COMMENTS_READ comments
     naming `head` as a whole token (all 40 characters, or a prefix of at least 7). Only the signature and the token
-    are read, never shown. None when the comments cannot be read (no list, no head)."""
+    are read, never shown. `review_only` keeps only the comments that also read as a review (`review of <sha>`, approved, changes
+    requested, lgtm): the fleet's agents share one GitHub account that cannot approve its own PR, so a review lives in a signed
+    comment. None when the comments cannot be read (no list, no head)."""
     if not isinstance(comments, list) or not head:
         return None
     found = set()
@@ -5299,6 +5301,8 @@ def pr_signed_at(comments, head):
         body = body[:PR_COMMENT_CLIP]
         mark = FLEET_MARK.search(body)
         if mark is None or mark.group(1).lower() in PLACEHOLDER_SIGNERS:
+            continue
+        if review_only and not TRIAGE_REVIEW_RE.search(body):
             continue
         if any(head.lower().startswith(t) for t in re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])", body.lower())):
             found.add(mark.group(1))
@@ -5335,6 +5339,7 @@ def pr_facts_from(data):
             "author": pr_login(data.get("author")),
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
+            "signed_review": pr_signed_at(data.get("comments"), head, True),
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
@@ -6479,6 +6484,8 @@ def finish_pass(engine, discovery, report):
 
 SWEEP_DEFAULTS = {"enabled": False, "aged_cos_hours": 2, "comment_window_days": 7, "max_findings": 20,
                   "realarm_hours": 6, "person_names": ["the owner"], "calls_per_pass": 12}
+SWEEP_S6A_GRACE = 900         # a PR younger than this is not yet "marker without label": the label is applied after it opens
+SWEEP_S1A_GRACE = 600         # a decision section whose issue changed this recently may be mid-escalation (one label off, the next not yet on)
 SWEEP_TTL = 900               # seconds a repo's lists are kept before they are read again
 SWEEP_CALLS_PER_PASS = SWEEP_DEFAULTS["calls_per_pass"]   # default of `sweep.calls_per_pass`: the most `gh` calls one pass makes
 SWEEP_CALLS_CAP = 100
@@ -6490,7 +6497,7 @@ SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
-               "S5": "cos-tier decision aged"}
+               "S5": "cos-tier decision aged (and not already in the owner's tier)"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -6544,7 +6551,9 @@ def sweep_phrase_re(names):
 
 SWEEP_STRONG_VERBS = ("waiting on", "waits on", "held for")
 SWEEP_STRONG_NEEDS = ("decision", "yes", "answer", "approval", "review", "ok")
-SWEEP_HEDGE_RE = re.compile(r"\b(?:if|would|may|proposal|proposals|option|options|could|says|saying|said)\b", re.I)
+SWEEP_HEDGE_RE = re.compile(r"\b(?:if|would|may|proposal|proposals|option|options|could|says|saying|said"
+                            r"|when|once|before|after|later|deferred|parked|not started)\b", re.I)   # the later words name a FUTURE gate
+SWEEP_FUTURE_AFTER_RE = re.compile(r"\b(?:deferred|parked|not started|when (?:picked up|a quiet window))\b", re.I)
 
 
 def sweep_strong_re(names):
@@ -6576,7 +6585,7 @@ def sweep_strong_statement(strong, text, default_repo, repos):
         after = SWEEP_BOUNDARY_RE.search(text, match.end())
         sentence_end = after.start() if after else len(text)
         if SWEEP_HEDGE_RE.search(text[start:match.start()]) or SWEEP_NEGATION_RE.search(
-                text[max(0, match.start() - 30):match.start()]):
+                text[max(0, match.start() - 30):match.start()]) or SWEEP_FUTURE_AFTER_RE.search(text[match.end():sentence_end]):
             continue
         fires = True
         for full, short, number in SWEEP_REF_RE.findall(text[start:sentence_end]):
@@ -6595,7 +6604,10 @@ def sweep_says_waiting_strong(strong, text):
     for match in strong.finditer(text):
         start = max(text.rfind(c, 0, match.start()) for c in ".!?\n") + 1
         clause = text[start:match.start()]  # only what comes BEFORE the phrase hedges it: "waiting on the owner, if you agree" fires
-        if SWEEP_HEDGE_RE.search(clause) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()]):
+        end = [i for i in (text.find(c, match.end()) for c in ".!?\n") if i >= 0]
+        rest = text[match.end():min(end) if end else len(text)]   # a plain "deferred" / "parked" after it also makes it not-now
+        if (SWEEP_HEDGE_RE.search(clause) or SWEEP_NEGATION_RE.search(text[max(0, match.start() - 30):match.start()])
+                or SWEEP_FUTURE_AFTER_RE.search(rest)):
             continue
         return True
     return False
@@ -6688,6 +6700,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "captain": is_captain({"labels": names, "body": body}),
                          "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
                          "author": (pr_login(record.get("user")) or "").lower(),
+                         "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False, "latest_refs": []}
@@ -6732,6 +6745,28 @@ def sweep_ref_of(decision, home):
     return (decision.get("repo") or home, number)
 
 
+_DECISION_ID_REF = re.compile(r"^pr:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)#(\d+)$")
+
+
+def sweep_ref_keys(decision, home, repos):
+    """The set of (repo lower-case, number) a decision is about: its repo and ask or number, and the ref its id spells (`pr:owner/repo#N`
+    or `pr:repo#N`, the short name resolved among `repos` when exactly one matches). Repos are compared without case."""
+    keys = set()
+    ref = sweep_ref_of(decision, home)
+    if ref and ref[0]:
+        keys.add((ref[0].lower(), ref[1]))
+    found = _DECISION_ID_REF.match(str(decision.get("id") or ""))
+    if found:
+        tag, number = found.group(1).lower(), int(found.group(2))
+        if "/" in tag:
+            keys.add((tag, number))
+        else:
+            named = [r.lower() for r in repos if r.lower().split("/")[-1] == tag]
+            if len(named) == 1:
+                keys.add((named[0], number))
+    return keys
+
+
 def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     """(kept decisions, refs found stale): a decision whose issue or PR is closed or merged is stale. Closed state is read
     one issue at a time, cached SWEEP_TTL, within the pass's call budget (the least recently read first)."""
@@ -6773,6 +6808,12 @@ def sweep_ours(engine, repo, number, author, assignees, notices=None):
     return (author in mine or any(a in mine for a in assignees or []) or (repo, number) in notices)
 
 
+def sweep_within(when, now, seconds):
+    """True when `when` (epoch seconds, or None when unknown) is less than `seconds` before `now`: the grace is only ever given on
+    a time that is known."""
+    return isinstance(when, (int, float)) and 0 <= now - when < seconds
+
+
 def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
@@ -6794,14 +6835,16 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             if not item["pr"]:
                 labelled = bool(item["labels"] & awaiting)
                 if item["heading"] and not labelled:
-                    found.add(("S1a", ref_text(repo, number)))
+                    if not sweep_within(item.get("updated"), now, SWEEP_S1A_GRACE):
+                        found.add(("S1a", ref_text(repo, number)))
                 elif labelled and not item["section"]:
                     found.add(("S1b", ref_text(repo, number)))
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
             if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
-                if "marker-without-label" in item["captain_findings"] and sweep_ours(
+                if "marker-without-label" in item["captain_findings"] and not sweep_within(
+                        item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
                     found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
                 if "disagree" in item["captain_findings"]:
@@ -6821,6 +6864,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             for target in targets:
                 if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
                     found.add(("S3", ref_text(*target)))
+    repos_known = list(state.repos) + ([home] if home else [])
+    human_keys = set()
+    for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
+        if d.get("tier", "human") == "human" and d.get("kind") != "notice":
+            human_keys |= sweep_ref_keys(d, home, repos_known)
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -6833,7 +6881,8 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             found.add(("S3", ref_text(*target)))
         since = parse_iso(d.get("since"))
         if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
-                and now - since >= cfg["aged_cos_hours"] * 3600):
+                and now - since >= cfg["aged_cos_hours"] * 3600
+                and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
     state.unattributed = unattributed
     return sorted(found)
@@ -6872,10 +6921,14 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         if kind == "S6a" and not sweep_ours(engine, repo, number, (pr_login(data.get("user")) or "").lower(),
                                             [(pr_login(a) or "").lower() for a in data.get("assignees") or [] if isinstance(a, dict)]):
             return False
+        if kind == "S6a" and sweep_within(parse_iso(data.get("created_at")), now, SWEEP_S6A_GRACE):
+            return False   # opened a moment ago: the label is applied after it opens
         return is_pr and want in pr_marker_state(names, body)["findings"]
     if kind in ("S1a", "S1b"):
         if is_pr:
             return False
+        if kind == "S1a" and sweep_within(parse_iso(data.get("updated_at")), now, SWEEP_S1A_GRACE):
+            return False   # changed a moment ago: an escalation may be half done (one label off, the next not yet on)
         return (sweep_has_heading(body) and not labelled) if kind == "S1a" else (labelled and not sweep_has_section(body))
     waits_in_comments = False
     if comments_raised:
@@ -7092,6 +7145,7 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "OO": "other-owner (flag only)"}
+TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
 TRIAGE_CALLS_CAP = 100
@@ -7120,6 +7174,7 @@ def parked_until(body, labels):
     return day.timestamp() + 86400.0
 
 
+TRIAGE_OWNER_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*|__)?(?:owner|owned by)(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*[A-Za-z0-9@_`\"'\[(][^\n]*$", re.I | re.M)
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
 
@@ -7248,6 +7303,7 @@ def triage_norm(issue):
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
+            "owner_body": bool(isinstance(body, str) and TRIAGE_OWNER_RE.search(SWEEP_QUOTED_RE.sub(" ", body))),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
                                    "body": body})}
@@ -7296,7 +7352,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
     age_created, age_updated = (now - item["created"]) / day, (now - item["updated"]) / day
     ask = number in ctx["asks"]
     if not item["pr"]:
-        if not item["assignees"] and not chain and number not in ctx["owned"] and age_created >= sla["t1_days"]:
+        named = item.get("owner_body", False)   # an explicit `Owner: <name>` or `owned by <name>` line names the owner
+        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and age_created >= sla["t1_days"]:
             found["T1"] = {"created_days": round(age_created, 2)}
         group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
         if group_missing and age_created >= sla["t2_days"]:
@@ -7312,7 +7369,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
-        if not chain and not item["assignees"] and "T1" not in found and age_updated >= sla["t11_days"]:
+        if not chain and not item["assignees"] and not named and "T1" not in found and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
     elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
@@ -7429,7 +7486,9 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             for record in held["data"]:
                 number = _number(record)
                 names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
-                if number is not None and record.get("state") == "closed" and unit.split(":", 1)[1] in names:
+                closed_at = parse_iso(record.get("closed_at"))
+                if (number is not None and record.get("state") == "closed" and unit.split(":", 1)[1] in names
+                        and not sweep_within(closed_at, now, TRIAGE_T10_GRACE)):   # the label usually comes off minutes after the close
                     out.append(("T10", "%s#%d" % (repo, number), {"label": unit.split(":", 1)[1]}))
     if not errors:   # T5, T6 read only the decision list: judged only when it is whole
         for d in decisions:
@@ -7477,7 +7536,8 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
         return None
     if rule == "T10":
         names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
-        return data.get("state") == "closed" and any(l in names for l in triage_awaiting_labels(engine))
+        return (data.get("state") == "closed" and any(l in names for l in triage_awaiting_labels(engine))
+                and not sweep_within(parse_iso(data.get("closed_at")), now, TRIAGE_T10_GRACE))
     if data.get("state") != "open":
         return False
     item = triage_norm(data)
@@ -7540,6 +7600,12 @@ def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
         evidence = captain_evidence(facts, senders)
     else:
         evidence = facts["reviews"] if facts.get("reviews") is None else [dict(r, kind="review") for r in facts["reviews"]]
+        if evidence is not None and not evidence:
+            # No notice to name the author's agent: only a comment that SAYS it is a review (not merely names the head) counts, and
+            # the PR's own author login never does.
+            reviewers = [who for who in (facts.get("signed_review") or []) if who != facts.get("author")]
+            if reviewers:
+                evidence = [{"by": who, "kind": "comment", "state": "signed review comment"} for who in reviewers[:CAPTAIN_EVIDENCE_MAX]]
     if evidence is None:
         return None          # reviews or comments could not be read: no finding either way
     if evidence:
