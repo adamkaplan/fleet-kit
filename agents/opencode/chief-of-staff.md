@@ -688,24 +688,6 @@ permissions:
     resource: "az apim list *"
     effect: allow
   - action: "shell"
-    resource: "az containerapp show *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp list *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp revision show *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp revision list *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp env show *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp env list *"
-    effect: allow
-  - action: "shell"
     resource: "az staticwebapp show *"
     effect: allow
   - action: "shell"
@@ -767,9 +749,6 @@ permissions:
     effect: allow
   - action: "shell"
     resource: "az webapp log tail *"
-    effect: allow
-  - action: "shell"
-    resource: "az containerapp logs show *"
     effect: allow
   - action: "shell"
     resource: "az account show"
@@ -1846,22 +1825,10 @@ permissions:
     resource: "timeout * az * --debug*"
     effect: deny
   - action: "shell"
-    resource: "az containerapp exec*"
+    resource: "az containerapp*"
     effect: deny
   - action: "shell"
-    resource: "timeout * az containerapp exec*"
-    effect: deny
-  - action: "shell"
-    resource: "az containerapp up*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * az containerapp up*"
-    effect: deny
-  - action: "shell"
-    resource: "az containerapp registry*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * az containerapp registry*"
+    resource: "timeout * az containerapp*"
     effect: deny
   - action: "shell"
     resource: "fleet-switchboard decisions batch*"

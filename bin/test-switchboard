@@ -8514,7 +8514,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         _, rules = self.rules()
         for command in ("fleet-switchboard decisions list --tier all", "timeout 90 fleet-switchboard decisions list --tier all", "sleep 20",
                         "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
-                        "gh pr merge 5 --squash", "gh issue close 5", "az containerapp show -n a -g g", "fleet-switchboard handoff --issue 5 --brief-file -",
+                        "gh pr merge 5 --squash", "gh issue close 5", "az webapp show -n a -g g", "fleet-switchboard handoff --issue 5 --brief-file -",
                         "fleet-switchboard launch v --agent orchestrator", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nsee ~/.ssh\nEOF",
                         "cat /home/a/.config/fleet-switchboard/config.json", "tail -5 /home/a/.local/state/fleet-switchboard/audit.jsonl",
                         'fleet-switchboard send x --issue y "see ~/.config/fleet-switchboard/config.json and /tmp/foo --admin"',
@@ -8523,7 +8523,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         for command in ("make build", "git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az vm delete -n x",
                         "cat /home/a/.ssh/id_rsa", "cat /home/a/.config/gh/hosts.yml", "ls /home/a/Documents", "cat /etc/passwd", "gh pr merge 5 --admin",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "echo x > notes.md", "cat > /home/a/Code/x/f <<EOF\nx\nEOF",
-                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
+                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
     def test_the_subagent_has_the_focus_list_without_handoff_or_launch(self):

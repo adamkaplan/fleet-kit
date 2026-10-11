@@ -63,12 +63,12 @@ def build(subagent=False):
               "storage account", "storage container", "monitor metrics", "monitor activity-log", "monitor log-analytics workspace", "role assignment",
               "role definition", "identity", "cognitiveservices account", "postgres flexible-server", "mysql flexible-server", "cosmosdb", "redis",
               "servicebus namespace", "eventhub namespace", "provider", "policy assignment", "tag", "lock", "deployment group", "deployment sub",
-              "cdn profile", "apim", "containerapp", "containerapp revision", "containerapp env", "staticwebapp", "appservice plan", "batch account",
+              "cdn profile", "apim", "staticwebapp", "appservice plan", "batch account",
               "k8s-extension", "ad signed-in-user", "ad sp", "ad app", "ad user", "ad group"]
     for group in groups:
         for verb in ("show", "list"):
             allow("shell", "az %s %s *" % (group, verb))
-    for shape in ("graph query *", "monitor log-analytics query *", "webapp log tail *", "containerapp logs show *", "account show", "account list"):
+    for shape in ("graph query *", "monitor log-analytics query *", "webapp log tail *", "account show", "account list"):
         allow("shell", "az " + shape)
 
     # ---- guards: nothing in the job justifies these. Each is a deny; an anchored copy covers the `timeout N` wrapper.
@@ -100,7 +100,7 @@ def build(subagent=False):
     for word in ("secret", "key", "token", "password", "credential", "connection-string", "connectionstring", "appsettings", "extension", "sas", "ssh",
                  "identity-token", "access-token", "Secret", "Key", "Token", "Password", "Credential", "ConnectionString", "AdminPassword"):
         guard("az *%s*" % word)
-    for pattern in ("az rest*", "az login*", "az account get-access-token*", "az * --debug*", "az containerapp exec*", "az containerapp up*", "az containerapp registry*"):
+    for pattern in ("az rest*", "az login*", "az account get-access-token*", "az * --debug*", "az containerapp*"):
         guard(pattern)
     # the switchboard: the Chief of Staff does not raise orchestrators' batches, nor launches itself or its delegate
     for pattern in ("fleet-switchboard decisions batch*", "fleet-switchboard launch *--agent chief-of-staff*", "fleet-switchboard launch *--agent cos-subagent*"):
