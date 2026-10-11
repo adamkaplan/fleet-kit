@@ -23070,6 +23070,21 @@ class TestOrdersCLI(OrdersCase):
         self.assertEqual(len(self.gh.patches), 2)
         self.assertEqual(len([o for o in self.orders_in_github() if o.startswith("x ")]), 1)
 
+    def test_a_write_that_ends_without_an_answer_says_it_may_have_landed_and_to_list_first(self):
+        self.as_agent("chief-of-staff")
+        with mock.patch.object(sb, "write_issue_body", side_effect=sb.IntentError("unavailable", "gh did not answer within 5s")):
+            code, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertEqual(code, 2)
+        self.assertIn("MAY HAVE LANDED", err)
+        self.assertIn("orders list --charter 1", err)
+        self.assertNotIn("again", err.replace("only repeat", ""))
+
+    def test_the_unknown_readback_error_also_says_to_list_first(self):
+        self.as_agent("chief-of-staff")
+        self.gh.drop_patches = 5
+        _, _, err = self.main("orders", "add", "--charter", "1", "x", "--by", "alice")
+        self.assertIn("orders list --charter 1", err)
+
     def test_an_unreachable_github_is_an_error_not_a_silent_success(self):
         self.as_agent("chief-of-staff")
         self.gh.down = True

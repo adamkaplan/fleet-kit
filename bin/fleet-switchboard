@@ -15763,7 +15763,14 @@ def edit_charter_orders(engine, repo, charter, event, detail, change, done):
                     reader.invalidate(charter, repo)
                     return parse_orders(body)  # the first write had landed after all: do not write again
                 new_body = change(body)
-            write_issue_body(reader, repo, charter, new_body)
+            try:
+                write_issue_body(reader, repo, charter, new_body)
+            except IntentError as err:
+                if err.reason != "unavailable":
+                    raise  # gh answered with a refusal: the write did not happen
+                raise OrdersError("the write to #%d ended without an answer (%s): it MAY HAVE LANDED. Run `%s orders list "
+                                  "--charter %d` first and only repeat the command if the change is not there" % (
+                                      charter, _one_line(str(err), 120), PROG, charter)) from None
             for wait in ORDERS_READBACK_WAITS:
                 _sleep(wait)
                 back = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
@@ -15773,8 +15780,8 @@ def edit_charter_orders(engine, repo, charter, event, detail, change, done):
                     reader.invalidate(charter, repo)
                     return parse_orders(got)
         raise OrdersError("wrote #%d and read the issue back without the change, twice: the Standing orders section there is "
-                          "not what was written, and whether a write landed is unknown. Look at the issue before running it "
-                          "again; nothing more was written" % charter)
+                          "not what was written, and whether a write landed is unknown. Run `%s orders list --charter %d` before "
+                          "running it again; nothing more was written" % (charter, PROG, charter))
 
 
 def order_bullet(text, by, date):
