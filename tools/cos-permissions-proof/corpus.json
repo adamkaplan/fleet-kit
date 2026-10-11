@@ -110,7 +110,19 @@
   "git log --oneline | head -5",
   "git -C /home/a/Code/widget status; git -C /home/a/Code/other status",
   "timeout 30 git ls-remote origin",
-  "git log --graph --oneline --all | grep fix | cut -c1-80"
+  "git log --graph --oneline --all | grep fix | cut -c1-80",
+  "fleet-switchboard decisions escalate x#1 --reason \"saw 2>&1 here\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"a > b\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"a; b\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"ran `ls` first\"",
+  "fleet-switchboard orders add --charter o/r#1 \"keep out of ~/.ssh > never\"",
+  "fleet-switchboard orders add --charter o/r#1 \"x 2>&1 y; z\"",
+  "fleet-switchboard decisions answer x#1 allow --note \"log > a; b 2>&1\"",
+  "fleet-switchboard decisions resolve x#1 --note \"see 2>&1 and > f\"",
+  "fleet-switchboard decisions supersede x#1 y#2 --by o/r#3 --note \"a > b 2>&1\"",
+  "fleet-switchboard send x --issue 1 \"a 2>&1 > f; z\"",
+  "fleet-switchboard report done --issue 1 \"wrote > out; ok 2>&1\"",
+  "fleet-switchboard remind cos 5m \"check a > b\""
  ],
  "hostile": [
   "cat /Users/a/Code/x/src/a.py > /Users/a/Code/x/src/b.py",
@@ -298,7 +310,19 @@
   "git push --force",
   "git config core.pager sh",
   "git branch x && git branch -D x",
-  "git checkout . "
+  "git checkout . ",
+  "fleet-switchboard decisions escalate x#1 --reason \"text\" > out.txt",
+  "fleet-switchboard decisions escalate x#1 --reason \"text\" >> out.txt",
+  "fleet-switchboard decisions escalate x#1 --reason \"text\" 2> err.txt",
+  "fleet-switchboard decisions escalate x#1 --reason \"text\" &> out",
+  "fleet-switchboard decisions answer x#1 allow --note \"t\" > f",
+  "fleet-switchboard decisions resolve x#1 --note 't' > f",
+  "fleet-switchboard orders add --charter o/r#1 \"text\" > out",
+  "fleet-switchboard send x --issue 1 \"hi\" > out",
+  "fleet-switchboard report done --issue 1 \"hi\" >> out",
+  "fleet-switchboard decisions > out",
+  "fleet-switchboard decisions list > out",
+  "fleet-switchboard decisions --tier cos > out"
  ],
  "harmless": [],
  "_doc": "allowed: must RAN. hostile: must NOT run, except `harmless`: hand-triaged shapes that are read-only or legitimate coordination (reads, gh comment/close/merge without --admin/--auto, fleet-switchboard) which an older stricter corpus listed as hostile.",
@@ -413,6 +437,18 @@
   "git log --oneline | head -5",
   "git -C /home/a/Code/widget status; git -C /home/a/Code/other status",
   "timeout 30 git ls-remote origin",
-  "git log --graph --oneline --all | grep fix | cut -c1-80"
+  "git log --graph --oneline --all | grep fix | cut -c1-80",
+  "fleet-switchboard decisions escalate x#1 --reason \"saw 2>&1 here\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"a > b\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"a; b\"",
+  "fleet-switchboard decisions escalate x#1 --reason \"ran `ls` first\"",
+  "fleet-switchboard orders add --charter o/r#1 \"keep out of ~/.ssh > never\"",
+  "fleet-switchboard orders add --charter o/r#1 \"x 2>&1 y; z\"",
+  "fleet-switchboard decisions answer x#1 allow --note \"log > a; b 2>&1\"",
+  "fleet-switchboard decisions resolve x#1 --note \"see 2>&1 and > f\"",
+  "fleet-switchboard decisions supersede x#1 y#2 --by o/r#3 --note \"a > b 2>&1\"",
+  "fleet-switchboard send x --issue 1 \"a 2>&1 > f; z\"",
+  "fleet-switchboard report done --issue 1 \"wrote > out; ok 2>&1\"",
+  "fleet-switchboard remind cos 5m \"check a > b\""
  ]
 }

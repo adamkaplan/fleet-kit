@@ -8683,13 +8683,9397 @@ permissions:
     resource: "timeout * fleet-switchboard pending *>*"
     effect: deny
   - action: "shell"
-    resource: "fleet-switchboard decisions *>*"
-    effect: deny
-  - action: "shell"
-    resource: "timeout * fleet-switchboard decisions *>*"
-    effect: deny
-  - action: "shell"
     resource: "timeout *>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard send *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard send *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard report *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard report *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard remind *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard remind *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard notice *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard notice *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard intent *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard intent *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions escalate *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions escalate *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions answer *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions answer *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions resolve *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions resolve *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions supersede *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions supersede *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders add *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders add *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *\" 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' &>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 1>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2> *"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>a*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>b*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>c*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>d*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>e*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>f*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>g*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>h*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>i*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>j*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>k*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>l*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>m*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>n*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>o*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>p*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>r*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>s*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>t*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>u*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>v*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>w*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>x*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>A*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>B*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>C*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>D*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>E*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>F*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>G*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>H*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>I*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>J*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>K*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>L*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>M*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>N*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>O*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>P*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>Q*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>R*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>S*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>T*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>U*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>V*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>W*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>X*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>Y*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>Z*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>0*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>1*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>2*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>3*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>4*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>5*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>6*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>7*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>8*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>9*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>.*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>_*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>/*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>~*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard orders remove *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard orders remove *' 2>-*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions >*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions >*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions list *>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions list *>*"
+    effect: deny
+  - action: "shell"
+    resource: "fleet-switchboard decisions -*>*"
+    effect: deny
+  - action: "shell"
+    resource: "timeout * fleet-switchboard decisions -*>*"
     effect: deny
   - action: "shell"
     resource: "cat <*"

@@ -165,8 +165,23 @@ def build(subagent=False):
     guard("jq *env*")
     # writes: a redirect to anywhere but the message temp dir (the cat > temp form above is the one allowed redirect)
     for command in ("ls", "grep", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "jq", "echo", "printf", "date", "git", "gh pr view", "gh pr list",
-                    "gh issue view", "gh issue list", "gh api", "az", "fleet-switchboard status", "fleet-switchboard pending", "fleet-switchboard decisions", "timeout"):
+                    "gh issue view", "gh issue list", "gh api", "az", "fleet-switchboard status", "fleet-switchboard pending", "timeout"):
         guard("%s *>*" % command)
+    # Message commands carry free text (a --reason, a --note, an order, a send body): characters like `2>&1`, `>`, `;` INSIDE the quotes are never matched
+    # against a redirect, flag or path rule (they are not guarded at all above). A glob cannot see quotes, so a REAL redirect is caught only where it
+    # can be told from text: right after a closing quote (`... "text" > file`, `>>`, `&>`, `1>`, `2> file`; a stream merge `2>&1` stays allowed), and
+    # on the forms that take no text (`decisions`, `decisions list`, `decisions --tier ...`). Not caught: a redirect before the quote, or one glued to it.
+    for command in ("fleet-switchboard send", "fleet-switchboard report", "fleet-switchboard remind", "fleet-switchboard notice", "fleet-switchboard intent",
+                    "fleet-switchboard decisions escalate", "fleet-switchboard decisions answer", "fleet-switchboard decisions resolve",
+                    "fleet-switchboard decisions supersede", "fleet-switchboard orders add", "fleet-switchboard orders remove"):
+        for quote in ('"', "'"):
+            for redirect in (" >", " &>", " 1>", " 2> "):
+                guard("%s *%s%s*" % (command, quote, redirect))
+            for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/~-":
+                guard("%s *%s 2>%s*" % (command, quote, ch))
+    guard("fleet-switchboard decisions >*")
+    guard("fleet-switchboard decisions list *>*")
+    guard("fleet-switchboard decisions -*>*")
     guard("cat <*")
     for target in ("~", "$", ".", "/Users", "/home", "/etc", "/usr", "/bin", "/opt", "/Library", "/System", "/tmp", "/root", "/var/folders", "/private/etc", '"', "'") + tuple("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"):
         guard("cat >%s*" % target if False else "cat > %s*" % target)
