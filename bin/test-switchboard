@@ -9851,6 +9851,148 @@ class TestShimHygiene(unittest.TestCase):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
 
 
+class TestGhShimGateProbe(Base):
+    """Slice 3b: the shim asks `gates-check` before `pr ready` and `pr merge`, SHADOW ONLY: it records and never blocks."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        self.log = self.home / "gh-log.json"
+        fake = self.bin / "gh"
+        fake.write_text("#!/usr/bin/env python3\nimport json,sys\njson.dump({'argv': sys.argv[1:]}, open(%r,'w'))\n"
+                        "print('real gh out'); sys.exit(7)\n" % str(self.log))
+        fake.chmod(0o755)
+        self.calls_log = self.home / "gates-calls.log"
+        self.sb = self.home / "fakesb"
+        self.sb.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; else echo worker; fi; exit 0; fi\n"
+                           "if [ \"$1\" = gates-check ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
+                           "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  echo '{\"verdict\": \"x\"}'; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % str(self.calls_log))
+        self.sb.chmod(0o755)
+        self.state = self.home / "state"
+        self.state.mkdir()
+        self.write_gates({"acme/app": {"mode": "shadow"}})
+
+    def write_gates(self, repos):
+        config = self.home / ".config" / "fleet-switchboard" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"plan_gates": {"repos": repos}} if repos is not None else {}))
+
+    def run_shim(self, *args, env=None, binary=True):
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home),
+                   "FLEET_SWITCHBOARD_STATE": str(self.state)}
+        if binary:
+            environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
+        environ.update(env or {})
+        if self.log.exists():
+            self.log.unlink()
+        started = time.time()
+        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        self.elapsed = time.time() - started
+        seen = json.loads(self.log.read_text()) if self.log.exists() else None
+        return done, seen
+
+    def gate_calls(self):
+        return self.calls_log.read_text().splitlines() if self.calls_log.exists() else []
+
+    def spool(self):
+        path = self.state / "gate-failopen.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_ready_and_merge_ask_gates_check_for_the_right_pr_and_the_real_gh_runs_unchanged(self):
+        for args, kind in ((("pr", "ready", "12", "-R", "acme/app"), "ready"), (("pr", "merge", "12", "--repo", "acme/app", "--squash"), "merge"),
+                           (("pr", "merge", "https://github.com/acme/app/pull/12", "--delete-branch"), "merge"),
+                           (("pr", "ready", "12"), "ready")):   # a bare number: the repo is the caller's own (whoami)
+            with self.subTest(args=args):
+                if self.calls_log.exists():
+                    self.calls_log.unlink()
+                done, seen = self.run_shim(*args)
+                self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), "the real gh's exit code and output pass through")
+                self.assertEqual(seen["argv"], list(args))
+                (call,) = self.gate_calls()
+                self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=1" % kind)
+
+    def test_it_never_blocks_whatever_the_answer(self):
+        for code, event in (("10", "would_refuse"), ("3", "fail_open"), ("1", "fail_open"), ("127", "fail_open"), ("0", None)):
+            with self.subTest(code=code):
+                spool = self.state / "gate-failopen.jsonl"
+                if spool.exists():
+                    spool.unlink()
+                done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": code})
+                self.assertEqual((done.returncode, seen["argv"]), (7, ["pr", "merge", "12", "-R", "acme/app"]))
+                self.assertEqual([e["event"] for e in self.spool()], [event] if event else [])
+
+    def test_a_check_that_hangs_costs_at_most_the_bound_and_the_command_still_runs(self):
+        done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "1"})
+        self.assertEqual(seen["argv"], ["pr", "ready", "12", "-R", "acme/app"])
+        self.assertLess(self.elapsed, 6)
+        (entry,) = self.spool()
+        self.assertEqual(entry["event"], "fail_open")
+        self.assertIn("no answer within 1s", entry["detail"])
+
+    def test_the_bound_is_clamped_and_defaults_to_three_seconds(self):
+        source = SHIM.read_text()
+        self.assertIn("GATE_SECONDS = 3.0", source)
+        done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "0.01"})
+        self.assertLess(self.elapsed, 6, "a bound below 0.2 s is raised to 0.2 s, not 0")
+
+    def test_with_no_switchboard_the_command_runs_and_the_gap_is_recorded(self):
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", binary=False, env={"HOME": str(self.home / "nohome")})
+        self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app"])
+
+    def test_shapes_it_does_not_understand_pass_through_and_are_not_probed(self):
+        for args in (("pr", "merge"), ("pr", "merge", "my-branch", "-R", "acme/app"), ("pr", "ready", "12", "--undo", "-R", "acme/app"),
+                     ("pr", "merge", "12", "13", "-R", "acme/app"), ("pr", "merge", "12", "--mystery", "-R", "acme/app"),
+                     ("pr", "merge", "12", "-R", "not a repo"), ("pr", "merge", "--", "12"), ("pr", "ready", "0", "-R", "acme/app"),
+                     ("pr", "create", "--title", "t", "--body", "b"), ("pr", "view", "12", "-R", "acme/app"),
+                     ("pr", "merge", "https://example.com/acme/app/pull/12")):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args)
+                self.assertEqual(seen["argv"][:2], list(args)[:2])
+                self.assertEqual(self.gate_calls(), [])
+
+    def test_a_repo_not_listed_is_not_probed_and_the_match_ignores_case(self):
+        self.run_shim("pr", "merge", "12", "-R", "acme/other")
+        self.assertEqual(self.gate_calls(), [])
+        self.write_gates({"Acme/App": {"mode": "shadow"}})
+        self.run_shim("pr", "merge", "12", "-R", "ACME/app")
+        self.assertEqual(len(self.gate_calls()), 1)
+        self.write_gates({})
+        self.calls_log.unlink()
+        self.run_shim("pr", "merge", "12", "-R", "acme/app")
+        self.assertEqual(self.gate_calls(), [], "no plan_gates in the config: nothing is probed")
+        self.write_gates(None)
+        self.run_shim("pr", "merge", "12", "-R", "acme/app")
+        self.assertEqual(self.gate_calls(), [])
+
+    def test_a_fork_pr_url_is_asked_about_under_its_own_repo(self):
+        self.write_gates({"acme/app": {"mode": "shadow"}})
+        self.run_shim("pr", "merge", "https://github.com/someone/app/pull/9")
+        self.assertEqual(self.gate_calls(), [], "a fork's PR is another repo: not listed, not probed")
+
+    def test_the_switchboards_own_gh_calls_are_not_probed(self):
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
+        self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app"])
+        self.assertEqual(self.gate_calls(), [])
+
+    def test_the_spool_is_private_clipped_and_bounded(self):
+        self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10"})
+        path = self.state / "gate-failopen.jsonl"
+        self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
+        path.write_text("x" * 300000)
+        self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10"})
+        self.assertEqual(len(path.read_text()), 300000, "a full spool takes no more lines")
+        path.unlink()
+        self.state.rmdir()
+        self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "10"})   # no state dir: nothing written, nothing fails
+
+    def test_signing_and_the_account_environment_are_untouched(self):
+        done, seen = self.run_shim("pr", "comment", "3", "--body", "hello")
+        self.assertIn("fleet-switchboard:from=worker", seen["argv"][-1])
+        self.assertEqual(self.gate_calls(), [])
+
+
 class TestGhShim(Base):
     """The agent types plain `gh issue comment ...`; the shim signs it. A fake gh records what it was given."""
 
@@ -17419,8 +17561,8 @@ class TestPlanGatesCheck(LedgerBase):
         text = self.run_as(None, "status")[1]
         self.assertIn("plan gates acme/app: shadow; today 1 check(s), 0 refusal(s), 1 would-refuse, 1 fail-open(s)", text)
 
-    def test_nothing_is_wired_to_a_shim_and_the_command_only_reads_github(self):
-        self.assertNotIn("gates-check", (REPO / "shims" / "gh").read_text())
+    def test_the_shim_only_probes_in_shadow_and_the_command_only_reads_github(self):
+        self.assertNotIn("sys.exit(10)", (REPO / "shims" / "gh").read_text())   # the shim never refuses (slice 3b is shadow only)
         self.check("merge")   # the route refuses any write: the test passing is the proof
         self.assertNotIn("gates-check", sb.ENSURE_ON_USE_COMMANDS)
 
