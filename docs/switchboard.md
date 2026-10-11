@@ -2291,6 +2291,14 @@ of a hundred drains over ten or more passes, then stays drained until a confirma
 other-owner flags (not ours, never acted on). They are checked **after** our own findings, which are never kept waiting behind them, and
 within each group the least recently attempted comes first, so none starves. `status` names how many unchecked are other-owner flags and the
 age of the oldest unchecked finding (since its last answer, or since it was first seen).
+
+Precision rules (from the owners' hand-checks; the sweep and the triage still only report, in shadow, and write nothing to GitHub):
+- **T1 and T11** count an explicit `Owner: <name>` or `owned by <name>` line in the body as an owner, besides an assignee or a parent (a quoted or code line does not count, nor an empty `Owner:`).
+- **T7** (no review): our agents share one GitHub account that cannot approve its own PR, so a review lives in a signed comment. With the PR's notice on file a head-naming signed comment of another agent counts (as before); with none, a signed comment by another signer that names the exact head AND says it is a review (`review of <sha>`, approved, changes requested, lgtm) counts too. The PR author's own login never counts.
+- **S6a** (marker without label) is not raised for a PR opened less than 15 minutes ago (`SWEEP_S6A_GRACE`): the label is applied after it opens.
+- **S1a** (decision section without an awaiting label) is not raised while the issue changed less than 10 minutes ago (`SWEEP_S1A_GRACE`): cos removes one label and the person's label follows.
+- **T10** (closed but still labelled awaiting) waits 10 minutes after the close (`TRIAGE_T10_GRACE`): the label comes off minutes later.
+- **S3** (said to wait on the person) ignores a sentence that names a future gate before the phrase (`when`, `once`, `before`, `after`, `later`, `deferred`, `parked`, `not started`) or `deferred`, `parked`, `not started`, `when picked up` after it.
 112 calls an hour (at most 168), plus one or two fresh calls per live finding per 15 minutes (a few dozen an hour at typical
 counts), far under the hourly API limit. The sweep has its own budget, `sweep.calls_per_pass` (default 12, 4 to 100); the two
 count separately and share the hub's cache but not each other's calls, so neither starves the other, and together on a cold cache

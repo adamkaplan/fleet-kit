@@ -14358,8 +14358,12 @@ class FakeSweepHub:
         return data
 
 
-def sweep_issue(number, body="", labels=(), pr=False, author=None):
+def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None):
     record = {"number": number, "body": body, "labels": [{"name": n} for n in labels]}
+    if created:
+        record["created_at"] = created
+    if updated:
+        record["updated_at"] = updated
     if author:
         record["user"] = {"login": author}
     if pr:
@@ -14661,6 +14665,37 @@ class TestSweep(Base):
         self.world.tick(sb.SWEEP_TTL + 1)
         self.sweep([report])
         self.assertIn(("S3", "acme/api#23"), self.found())
+
+    def test_s3_a_future_gate_or_a_deferral_is_not_waiting_now(self):
+        now_waiting = ("waiting on Alex", "needs Alex's decision.", "blocked, waiting on Alex, if you agree")
+        not_now = ("when a quiet window opens, waiting on Alex", "before the rehearsal, needs Alex's decision",
+                   "once picked up it is waiting on Alex", "later this is waiting on Alex", "Parked: waiting on Alex",
+                   "waiting on Alex, deferred", "waiting on Alex; not started", "after the migration, waiting on Alex",
+                   "waiting on Alex when picked up")
+        regex = sb.sweep_strong_re(["Alex"])
+        for text in now_waiting:
+            with self.subTest(text=text):
+                self.assertTrue(sb.sweep_says_waiting_strong(regex, text))
+                self.assertTrue(sb.sweep_strong_statement(regex, text, "acme/api", ["acme/api"])[0])
+        for text in not_now:
+            with self.subTest(text=text):
+                self.assertFalse(sb.sweep_says_waiting_strong(regex, text))
+                self.assertFalse(sb.sweep_strong_statement(regex, text, "acme/api", ["acme/api"])[0])
+
+    def test_s1a_a_decision_section_changed_ten_minutes_ago_may_be_mid_escalation(self):
+        recent, old = self.at(5 / 1440), self.at(11 / 1440)
+        self.hub.open = {60: sweep_issue(60, "## Decision required\nx", updated=recent),
+                         61: sweep_issue(61, "## Decision required\nx", updated=old),
+                         62: sweep_issue(62, "## Decision required\nx")}   # no time known: no grace
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S1a", "acme/api#61"), ("S1a", "acme/api#62")])
+        self.world.tick(6 * 60)   # #60 is now 11 minutes since its change: raised
+        self.engine.sweep.confirmed.clear()
+        self.world.tick(sb.SWEEP_TTL)
+        self.sweep()
+        self.sweep()
+        self.assertIn(("S1a", "acme/api#60"), self.found())
 
     def test_s4_leaves_a_report_decision_whose_ask_is_closed(self):
         self.hub.closed = {32}
@@ -15101,6 +15136,34 @@ class TestTriage(Base):
         self.add(82, created=9, updated=0.5, parent=1, labels=["kind", "blocked"], body="Next: x")
         self.go()
         self.assertEqual((self.only("T8"), self.only("T9")), (["acme/api#80"], ["acme/api#81"]))
+
+    def test_t1_an_explicit_owner_line_in_the_body_is_an_owner(self):
+        self.charter()
+        for n, body in ((300, "Owner: the platform orchestrator"), (301, "- **Owner:** ops\nmore"), (302, "owned by ops-lead"),
+                        (303, "Owner:"), (304, "the owner is unknown"), (305, "> Owner: someone"), (306, "no owner here"),
+                        (307, "`Owner: x`")):
+            self.add(n, created=2, labels=["kind"], body=body)
+        self.go()
+        self.assertEqual(self.only("T1"), ["acme/api#303", "acme/api#304", "acme/api#305", "acme/api#306", "acme/api#307"])
+
+    def test_t7_with_no_notice_a_signed_comment_that_says_review_at_the_head_counts_and_the_authors_own_does_not(self):
+        self.charter()
+        for n in (310, 311, 312, 313):
+            self.add(n, created=0.4, pr=True)
+        self.describe_pr(310, comments=[("reviewer", "review of %s: clean" % TRI_HEAD_A[:7] + " " + TRI_HEAD_A)])   # an agent's review comment
+        self.describe_pr(311, comments=[("bot", "review of %s: clean %s" % (TRI_HEAD_A[:7], TRI_HEAD_A))])           # the author's own
+        self.describe_pr(312, comments=[("reviewer", "review of %s: clean" % TRI_HEAD_B[:7] + " " + TRI_HEAD_B)])   # an older head
+        self.describe_pr(313, comments=[("reviewer", "pushed " + TRI_HEAD_A)])                                      # names the head, not a review
+        self.go()
+        self.assertEqual(self.only("T7"), ["acme/api#311", "acme/api#312", "acme/api#313"])
+
+    def test_t10_waits_ten_minutes_after_the_close(self):
+        self.charter()
+        fresh = dict(tri_issue(self.now, 101, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 240))
+        stale = dict(tri_issue(self.now, 102, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 1200))
+        self.hub.closed["acme/api"] = {self.USER: [fresh, stale]}
+        self.go(passes=2)
+        self.assertEqual(self.only("T10"), ["acme/api#102"])
 
     def test_t10_a_closed_issue_still_labelled_awaiting_is_immediate(self):
         self.charter()
@@ -15876,6 +15939,15 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_s6a_a_pr_opened_within_15_minutes_gets_the_label_first(self):
+        fresh, early, later = (sb.iso(self.world.clock.now() - m * 60) for m in (4, 20, 120))
+        self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True, author="bot", created=fresh),    # the 02:03-vs-02:07 shape
+                         51: sweep_issue(51, "MERGE: captain\nx", pr=True, author="bot", created=early),
+                         52: sweep_issue(52, "MERGE: captain\nx", pr=True, author="bot", created=later)}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S6a"], [("S6a", "acme/api#51"), ("S6a", "acme/api#52")])
 
     def test_a_finding_is_dropped_when_a_fresh_read_shows_the_label_was_added(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
