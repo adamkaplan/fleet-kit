@@ -8601,6 +8601,9 @@ class TestPlanningSkill(unittest.TestCase):
         for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
             self.assertIn(phrase, text)
         self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
+        self.assertNotIn("--tier", text)  # no command signature for a command that does not exist yet
+        self.assertIn("computed from the ask or epic", text)
+        self.assertIn("name the integration branch in the plan", text)
 
     def test_it_is_installed_with_the_kits_other_skills_and_named_in_the_install_guide(self):
         self.assertIn("fleet-planning", sb.kit_skill_names(REPO))

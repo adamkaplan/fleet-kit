@@ -23,7 +23,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
-   `claim: epic` for what only an integrated head can prove.
+   `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
@@ -44,10 +44,10 @@ work items.
 
 ## Challenge it
 
-When available: `fleet-switchboard plan review <issue> --tier <light|normal|full>` launches independent read-only reviewers
-and records their verdicts (not built yet: until then ask the Chief of Staff for a hand-run review). Expect up to three
-rounds; an objection still standing after round three goes up to the Chief of Staff and then the owner, never dropped.
-Tiers: light (a small item under a reviewed plan), normal (an item with its own plan), full (an ask, an epic, a held-PR area).
+When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet:
+until then ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+chosen per item. Expect up to three rounds; an objection still standing after round three goes up to the Chief of Staff and
+then the owner, never dropped.
 
 ## What the reviewers attack
 
