@@ -398,6 +398,18 @@ def preflight(config, repo):
     return blocking, notes
 
 
+def effective_mode(config, setting):
+    """(mode, why): the mode a check really runs in. `enforce` runs only when its preflight passes, wherever the mode is
+    read (the config file can be edited by hand, so the switch command is not the only way in); otherwise it runs as
+    `shadow` and `why` says what blocks it. A repo that is not enforcing has no `why`."""
+    if setting["mode"] != "enforce":
+        return setting["mode"], None
+    blocking, _ = preflight(config, setting.get("name") or "")
+    if blocking:
+        return "shadow", "enforce is not active: " + "; ".join(blocking)
+    return "enforce", None
+
+
 def decide(report, check_for, mode):
     """(verdict, failed, why): verdict is "allow" or "refuse". `report` is evaluate_gates' output. In `shadow` a failing check
     is still reported (failed is not empty) but the verdict is always "allow". A gate that is not tracked or does not apply

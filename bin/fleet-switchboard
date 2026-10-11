@@ -11834,9 +11834,14 @@ def cmd_gates_check(args, runner, now):
             report = box["report"]
             if box.get("unreadable"):
                 raise RuntimeError("GitHub unreadable: %s" % box["unreadable"])   # an unknown is not a refusal
-            verdict, failed, why = plan_ledger.decide(report, args.check_for, setting["mode"])
+            mode, downgraded = plan_ledger.effective_mode(config, setting)
+            if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
+                _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
+            verdict, failed, why = plan_ledger.decide(report, args.check_for, mode)
             gates_note(state, now(), repo, "checks")
-            payload = {"verdict": verdict, "mode": setting["mode"], "for": args.check_for, "failed": failed, "reason": why}
+            payload = {"verdict": verdict, "mode": mode, "for": args.check_for, "failed": failed, "reason": why}
+            if downgraded:
+                payload["downgraded"] = downgraded
             if report.get("ledger_problem") and gates_note(state, now(), repo, "ledger_broken", alarm="ledger.broken"):
                 _gates_audit(engine, "gate.ledger_broken", pr, {"problem": report["ledger_problem"]})   # once a day per repo
             if verdict == "refuse":
@@ -11874,7 +11879,9 @@ def gates_caller_may_switch(runner, now):
     try:
         engine, _, _ = build_engine(runner, now, "cli", writable=False)
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
-    except (CallerError, IdentityUncertain):
+    except IdentityUncertain:
+        return False, "unknown (an uncertain identity is refused, never read as a person: #138)"
+    except CallerError:
         return True, "a person at a shell"
     except (V2Error, HerdrError):
         return False, "unknown (the registry could not be read)"
@@ -11977,6 +11984,10 @@ def plan_gates_status(config, state, now):
     for name, entry in sorted(section["repos"].items()):
         c = counts.get(plan_ledger.normal_repo(name), {})
         label = "off (kill switch)" if not entry["enabled"] else entry["mode"]
+        if entry["enabled"] and entry["mode"] == "enforce":
+            actual, why = plan_ledger.effective_mode(config, dict(entry, name=name))
+            if why:
+                label = "enforce REQUESTED but running as shadow (%s)" % why
         out["repos"][name] = dict(entry, counts=c)
         out["lines"].append("plan gates %s: %s; today %d check(s), %d refusal(s), %d would-refuse, %d fail-open(s)" % (
             name, label, c.get("checks", 0), c.get("refusals", 0), c.get("would_refuse", 0), c.get("fail_opens", 0)))

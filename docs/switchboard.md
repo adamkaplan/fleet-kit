@@ -4004,8 +4004,7 @@ whose records are later slices; G7 and G8 are epic and deploy gates and show `n/
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
 nothing is enforced**: it is the decision, the configuration and the switches, so they can be tried and measured first.
 
-`fleet-switchboard gates-check <repo#N> --for ready|merge [--json]` answers "is this allowed?" and only reads (plus counters
-in the state directory). **Exit 0 allow, 10 refuse, 3 fail-open; only 10 refuses**, and a Python exception exits 3, never 10.
+`fleet-switchboard gates-check <repo#N> --for ready|merge [--json]` answers "is this allowed?" and writes nothing to GitHub (it appends audit lines and updates the per-day counters in the state directory; the counters are best effort and unlocked, so concurrent checks can lose a count). **Exit 0 allow, 10 refuse, 3 fail-open; only 10 refuses**, and a Python exception exits 3, never 10.
 `ready` requires G0a and G1; `merge` requires G0a, G1, G4 and G6. G0b, G0c and G2/G3 are untracked and cannot refuse.
 
 **Config `plan_gates`:** `{"repos": {"acme/app": {"mode": "shadow", "enabled": true, "budget_ms": 3000}}}`. A repo not listed is
@@ -4022,8 +4021,7 @@ refuses G1 in `enforce` (and says why) and alarms once a day per repo (`gate.led
 
 **Changing a mode** (`gates mode <owner/repo> shadow|enforce|off`, `gates off`, `gates on`, `gates preflight <repo>`) is allowed
 for the chief of staff and for a person at a shell with no fleet identity; any other agent is refused and the refusal is audited
-(`gate.mode.refused`). It is the session-identity guard of #138, a guard against mistakes, and any local process can still create
-the kill file. Switching a repo to `enforce` is **refused until a recorder is registered for `ci`** (`plan_evaluators.ci`);
+(`gate.mode.refused`). It is the session-identity guard of #138: **an uncertain identity (a session id the switchboard does not know) is refused, never read as a person**; a known session that is not a fleet agent, or no session and no pane, is a person. It is a guard against mistakes, not a boundary: an agent that unsets its own session and pane variables looks like a person, and any local process can create the kill file. Switching a repo to `enforce` is **refused until a recorder is registered for `ci`** (`plan_evaluators.ci`), and the same preflight is applied **wherever the mode is read**: a config edited by hand to `enforce` runs as `shadow` while the preflight blocks (logged as `gate.enforce_downgraded`, once a day per repo, and shown in `status` as "enforce REQUESTED but running as shadow"); the config is not rejected, so a bad edit cannot stop the daemon;
 `preflight` also lists the evaluators nobody is registered for (a plan that names one cannot get its verdict) and the manual
 precondition that the chief of staff be allowed `gates mode` and `waive` before enforcement is switched on, a permission change
 held for the owner. The check looks at registered evaluators, not at open PRs' plans, so a later plan naming a newly used

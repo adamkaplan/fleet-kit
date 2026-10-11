@@ -17332,6 +17332,42 @@ class TestPlanGatesCheck(LedgerBase):
         self.assertFalse((self.world.state / "plan-gates.off").exists())
         self.assertEqual(len(self.events("gate.mode.refused")), 2)
 
+    def test_an_unknown_session_is_refused_not_read_as_a_person(self):
+        before = self.config_file.read_text()
+        os.environ["OPENCODE_SESSION_ID"] = "ses_nosuchsession"
+        try:
+            code, out, err = self.run_as(None, "gates", "mode", "acme/app", "off")
+            code2, _, err2 = self.run_as(None, "gates", "off")
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+        self.assertEqual((code, code2), (2, 2))
+        self.assertIn("uncertain identity is refused", err)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.assertFalse((self.world.state / "plan-gates.off").exists())
+
+    def test_a_known_session_that_is_not_a_fleet_agent_is_a_person(self):
+        os.environ["OPENCODE_SESSION_ID"] = self.world.v2.create_session({})   # no metadata.fleet: a person's session
+        try:
+            self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
+        finally:
+            os.environ.pop("OPENCODE_SESSION_ID", None)
+
+    def test_enforce_set_by_hand_in_the_config_runs_as_shadow_until_the_preflight_passes(self):
+        self.configure(evaluators={})   # no ci recorder
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure(evaluators={})
+        for _ in range(2):
+            code, out, err = self.check("ready")
+            self.assertEqual((code, out["mode"]), (0, "shadow"), "a hand-edited enforce does not refuse")
+            self.assertIn("enforce is not active", out["downgraded"])
+        self.assertEqual(len(self.events("gate.enforce_downgraded")), 1, "logged once a day per repo")
+        self.assertIn("gate.would_refuse", [e["event"] for e in self.world.audit()])
+        text = self.run_as(None, "status")[1]
+        self.assertIn("enforce REQUESTED but running as shadow", text)
+        self.configure()   # the default evaluators include a ci recorder
+        code, out, _ = self.check("ready")
+        self.assertEqual((code, out["mode"], out.get("downgraded")), (10, "enforce", None))
+
     def test_gates_off_and_on_make_and_remove_the_kill_file(self):
         self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
         self.assertTrue((self.world.state / "plan-gates.off").exists())
