@@ -11774,21 +11774,30 @@ def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
     ctx = _ledger_context(args, runner, now, True)
-    caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     scenario = _scenario_of(ctx, args.scenario)
     named = plan_ledger.evaluator_of(scenario)
     if args.evaluator != named:
         raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (args.scenario, named, args.evaluator))
     senders = ctx.facts.get("notice_senders") or ()
-    if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
-        raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
-                                 "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
-    ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
-                                             plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
+    if named == "owner":
+        # The owner's verdict comes only from the owner's own terminal: a caller with NO agent session. An agent (even an
+        # unregistered one, even the chief of staff) is refused; so is an uncertain identity.
+        got = gates_caller_kind(runner, now)
+        caller, ok = "owner", got[0] == "person"
+        why = None if ok else "only the owner, from the owner's own terminal (no agent session), may record `owner` verdicts; %s is %s" % (
+            got[1], "an agent" if got[0] == "agent" else "not known")
+    else:
+        caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+        if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+            raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
+                                     "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
+        ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
+                                                 plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
-                                    {"scenario": args.scenario, "by": caller, "evaluator": named, "why": why})
+                                    {"scenario": args.scenario, "by": caller if named != "owner" else "(not the owner's terminal)",
+                                     "evaluator": named, "why": why})
         raise LedgerCommandError("refused: %s" % why)
     entry = {"kind": "verdict", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
              "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
@@ -11842,6 +11851,9 @@ def cmd_gates(args, runner, now):
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
     if args.pr in ("mode", "off", "on"):
         return cmd_gates_switch(args, runner, now)
+    if args.pr == "ci-record":
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_ci_record(args, runner, now)
     if args.pr == "preflight":
         args.pr = args.rest[0] if args.rest else ""
         return cmd_gates_preflight(args, runner, now)
@@ -11975,7 +11987,7 @@ def cmd_gates_check(args, runner, now):
             report = box["report"]
             if box.get("unreadable"):
                 raise RuntimeError("GitHub unreadable: %s" % box["unreadable"])   # an unknown is not a refusal
-            mode, downgraded = plan_ledger.effective_mode(config, setting)
+            mode, downgraded = plan_ledger.effective_mode(config, setting, lambda: ci_recorder_proven(state, now()))
             if downgraded and gates_note(state, now(), repo, "downgraded", alarm="enforce-downgraded"):
                 _gates_audit(engine, "gate.enforce_downgraded", pr, {"reason": _one_line(downgraded, 300)})   # once a day per repo
             verdict, failed, why = plan_ledger.decide(report, args.check_for, mode, setting.get("enforce_gates"))
@@ -12016,21 +12028,90 @@ def cmd_gates_check(args, runner, now):
     return exit_code
 
 
-def gates_caller_may_switch(runner, now):
-    """(ok, who): the chief of staff, or a person at a shell with no fleet identity, may change a gate mode. Any other fleet
-    agent is refused. A mistake-guard on the session identity (#138), not a boundary."""
+ANCESTOR_DEPTH = 25
+AGENT_PROCESS_NAMES = ("opencode", "fleet-opencode", "copilot")
+
+
+def _ps_line(pid):
+    """(ppid, command) of `pid` from `ps`, or None when it cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=3,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = done.stdout.strip() if done.returncode == 0 else ""
+    found = re.match(r"^(\d+)\s+(.*)$", line)
+    return (int(found.group(1)), found.group(2)) if found else None
+
+
+def _is_agent_command(command):
+    for token in command.split()[:6]:
+        # an executable named for the agent, or a script under a directory named for it (`node /lib/opencode/cli.js`)
+        if any(part.lower() in AGENT_PROCESS_NAMES for part in token.split("/")):
+            return True
+    return False
+
+
+def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, depth=ANCESTOR_DEPTH):
+    """Why this process cannot be established as the owner's own terminal, or None when it can. Two things must hold: (a) standard
+    input AND output are a controlling terminal (an agent's tool shell runs on pipes), and (b) no ancestor in the caller's process
+    chain is an opencode or agent process (the chain is walked up to `depth` parents). If either cannot be established (no `ps`,
+    an unreadable parent, a chain that does not end) the answer is a reason, never "yes". A strong mistake guard, not a boundary:
+    see docs/switchboard.md."""
+    stdin, stdout, ps = stdin or sys.stdin, stdout or sys.stdout, ps or _ps_line
+    try:
+        if not (stdin.isatty() and stdout.isatty()):
+            return "standard input and output are not a terminal (an agent's tool shell runs on pipes)"
+    except (AttributeError, ValueError, OSError):
+        return "whether this is a terminal cannot be established"
+    pid = os.getppid() if start_pid is None else start_pid
+    for _ in range(depth):
+        if pid <= 1:
+            return None
+        got = ps(pid)
+        if got is None:
+            return "the process chain cannot be read (process %d): refused, not guessed" % pid
+        parent, command = got
+        if _is_agent_command(command):
+            return "an agent process is an ancestor of this command (%s)" % _one_line(command.split()[0] if command.split() else "?", 60)
+        if parent == pid:
+            return None
+        pid = parent
+    return "the process chain is deeper than %d: it cannot be established" % depth
+
+
+def gates_caller_kind(runner, now):
+    """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` (a later `waive` is the chief of staff's, an
+    agent session, and does not use it; anything that is "only the owner" must). Returns (kind, who[, role]).
+    "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
+    agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
+    it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
+    session identity. A mistake-guard, not a boundary: an agent that unsets its own session and pane variables looks like a person."""
     try:
         engine, _, _ = build_engine(runner, now, "cli", writable=False)
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
     except IdentityUncertain:
-        return False, "unknown (an uncertain identity is refused, never read as a person: #138)"
+        return "unknown", "unknown (an uncertain identity is refused, never read as a person: #138)"
     except CallerError:
-        return True, "a person at a shell"
+        problem = owner_terminal_problem()
+        if problem:
+            return "unknown", "not established as the owner's own terminal: %s" % problem
+        return "person", "a person at a shell"
     except (V2Error, HerdrError):
-        return False, "unknown (the registry could not be read)"
-    if fleet.get("role") == "chief-of-staff":
-        return True, fleet["name"]
-    return False, fleet.get("name") or "an agent"
+        return "unknown", "unknown (the registry could not be read)"
+    return "agent", fleet.get("name") or "an agent", fleet.get("role")
+
+
+def gates_caller_may_switch(runner, now):
+    """(ok, who): the chief of staff, or a person at a shell with no fleet identity, may change a gate mode. Any other fleet
+    agent is refused."""
+    got = gates_caller_kind(runner, now)
+    if got[0] == "person":
+        return True, got[1]
+    if got[0] == "agent" and got[2] == "chief-of-staff":
+        return True, got[1]
+    return False, got[1]
 
 
 def _write_gates_config(raw_edit):
@@ -12079,7 +12160,7 @@ def cmd_gates_switch(args, runner, now):
         raise LedgerCommandError("usage: gates mode <owner/repo> shadow|enforce|off")
     repo, target = args.rest
     if target == "enforce":
-        blocking, notes = plan_ledger.preflight(config, repo)
+        blocking, notes = plan_ledger.preflight(config, repo, lambda: ci_recorder_proven(state, now()))
         if blocking:
             raise LedgerCommandError("refused: %s not switched to enforce: %s" % (repo, "; ".join(blocking)))
         for note in notes:
@@ -12103,6 +12184,61 @@ def cmd_gates_switch(args, runner, now):
     return EXIT_OK
 
 
+def ci_recorder_proven(state, now_ts):
+    """True when the audit holds a successful `gate.ci_record` within the last week: the built-in `ci` recorder has really run."""
+    for entry in reversed(_audit_tail(state)):
+        detail = entry.get("detail") or {}
+        if entry.get("event") == "gate.ci_record" and detail.get("ok") is True:
+            at = detail.get("at")   # the switchboard's own clock when it recorded (the audit line's ts is the wall clock)
+            if isinstance(at, (int, float)) and now_ts - at <= plan_ledger.CI_RECORD_FRESH_SECONDS:
+                return True
+    return False
+
+
+def cmd_gates_ci_record(args, runner, now):
+    """`gates ci-record <repo#N>`: the switchboard itself records the `ci` verdict. It reads the PR's check runs at its CURRENT head
+    through `gh` (the repo's account) and, only when they are all complete and green, records a passing `ci` verdict, by
+    `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. It records
+    nothing for a failing, pending or missing run, and never for a head other than the PR's. Any caller may run it: the
+    verdict says only what GitHub's checks say, whoever asked."""
+    ns = types.SimpleNamespace(pr=args.pr, plan=getattr(args, "plan", None), ask=getattr(args, "ask", None), head=None)
+    ctx = _ledger_context(ns, runner, now, True)
+    if ctx.unreadable:
+        raise LedgerCommandError("the PR could not be read, so nothing was recorded: %s" % ctx.unreadable)
+    head = (ctx.facts or {}).get("head")
+    ci = (ctx.facts or {}).get("ci")
+    if ctx.plan is None or ctx.plan["result"] != "pass":
+        raise LedgerCommandError("no passing plan for the PR (%s): nothing was recorded" % (ctx.plan_problem or "run `plan check`"))
+    wanted = [x for x in ctx.plan["scenarios_parsed"] if (x.get("claim") or "pr") == "pr" and plan_ledger.evaluator_of(x) == "ci"]
+    detail = {"head": head, "ci": ci, "scenarios": [x["id"] for x in wanted], "at": int(now())}
+    if not head:
+        raise LedgerCommandError("the PR's head is unknown: nothing was recorded")
+    if ci != "green":
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
+        raise LedgerCommandError("CI is %s at %s (only a complete, green run is recorded): nothing was recorded" % (ci, head[:8]))
+    if not wanted:
+        _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, why="no scenario names ci"))
+        print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % head[:8])
+        return EXIT_OK
+    done, skipped = [], []
+    for scenario in wanted:
+        fresh = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict"
+                 and e.get("evaluator") == "ci" and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == head
+                 and e.get("result") == "pass" and e.get("by") == plan_ledger.CI_RECORDER]
+        if fresh:
+            skipped.append(scenario["id"])
+            continue
+        plan_ledger.append_entry(ctx.state, {"kind": "verdict", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source,
+                                             "plan_hash": ctx.plan["plan_hash"], "head": head, "result": "pass",
+                                             "by": plan_ledger.CI_RECORDER, "evaluator": "ci",
+                                             "evidence": "CI green at %s: every check run complete and passing" % head[:12]}, now())
+        done.append(scenario["id"])
+    _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=done, already=skipped))
+    print("CI is green at %s: recorded %s%s" % (head[:8], ", ".join(done) or "nothing new",
+                                               " (already recorded: %s)" % ", ".join(skipped) if skipped else ""))
+    return EXIT_OK
+
+
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
     blocking, notes = plan_ledger.preflight(config, args.pr)
@@ -12117,7 +12253,7 @@ def cmd_gates_preflight(args, runner, now):
     return EXIT_ERROR if blocking else EXIT_OK
 
 
-def plan_gates_status(config, state, now):
+def plan_gates_status(config, state, now_ts):
     """{"line": ..., "repos": {...}, "killed": bool} for `status`."""
     section = (config or {}).get("plan_gates") if isinstance(config, dict) else None
     killed = bool(state) and gates_off_path(state).exists()
@@ -12128,12 +12264,12 @@ def plan_gates_status(config, state, now):
         if killed:
             return out
         return None
-    counts = gates_state(state, now)["repos"] if state else {}
+    counts = gates_state(state, now_ts)["repos"] if state else {}
     for name, entry in sorted(section["repos"].items()):
         c = counts.get(plan_ledger.normal_repo(name), {})
         label = "off (kill switch)" if not entry["enabled"] else entry["mode"]
         if entry["enabled"] and entry["mode"] == "enforce":
-            actual, why = plan_ledger.effective_mode(config, dict(entry, name=name))
+            actual, why = plan_ledger.effective_mode(config, dict(entry, name=name), lambda: ci_recorder_proven(state, now_ts))
             if why:
                 label = "enforce REQUESTED but running as shadow (%s)" % why
         out["repos"][name] = dict(entry, counts=c)
