@@ -26279,7 +26279,7 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
 
     def labelled(self, *kinds, body="Adds the widget.", **more):
         return captain_pr(body=body, labels=[{"name": "tester:%s" % k} for k in kinds],
-                          reviews=[("rev-wake", "APPROVED", HEAD_A)], **more)
+                          reviews=[("reviewer-a", "APPROVED", HEAD_A)], **more)
 
     def test_a_label_only_pr_is_a_captain_decision_with_its_hold_reasons(self):
         self.answer(self.labelled("merge-captain", "hold-security", "hold-contract"))

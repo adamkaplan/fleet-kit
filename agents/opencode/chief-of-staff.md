@@ -5271,7 +5271,7 @@ Allowed: `fleet-switchboard` (send, report, remind, intent, status, pending, dec
 and the `gh` comment, close, edit and merge of PRs and issues, `az` status, list, show and log reads, `git` reads, pipes over read output
 (`grep cut head tail sort uniq wc jq tr`), `timeout N` and `sleep`, `$(cat <temp dir>/msg.txt)` to compose a message from a file, and a
 heredoc `cat > <temp dir>/file` to write that file. The opencode temp dir is yours to read and write (other agents' renders, audits and
-briefs are there). The switchboard config and state dirs and the opencode config dir you may READ, never write (a config change is Adam's yes).
+briefs are there). The switchboard config and state dirs and the opencode config dir you may READ, never write (a config change is the owner's yes).
 The text of a `send`, `report`, `remind`, `notice` or `intent` message is never checked against a path or flag rule.
 
 Denied: editing files in repos, building, testing, deploying, `git push`, secret VALUE reads (`az keyvault secret show`, tokens, storage keys),
