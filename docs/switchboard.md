@@ -4058,3 +4058,10 @@ unknown flag, `ready --undo`, `--`, and `pr create` (a new PR has no number befo
 creation in a later slice). A PR URL of a fork is another repo: not listed, not probed. The switchboard's own `gh` calls
 (`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
 unchanged.
+
+### `2>&1` and jq interpolation for the Chief of Staff
+
+`gh ... --jq '<filter with string interpolation>'` already runs (checked on the real v2 harness); a filter is not a command. The denial seen in practice was
+`fleet-switchboard decisions 2>&1; fleet-switchboard decisions --all 2>&1`: the blanket redirect guard (`*>*`) matched `2>&1`. The redirect guards now deny every redirect
+except the stream merge `2>&1` (the character after `>` is enumerated, `>&` only followed by `1`, `&>`, `>>`, `>file`, `2>file` still denied). `;` between two commands is fine
+when each part is allowed on its own, because each part is evaluated separately (`...; rm x` and `...; make build` stay denied). Limit: `*` and `?` are the glob characters, so `>*` and `>?` cannot be named and are not denied.

@@ -122,10 +122,27 @@ def build(subagent=False):
             guard("cat %s%s*" % (first, place))
         guard("cat %s*" % place.lstrip("/"))
     guard("jq *env*")
+    printable = "".join(chr(i) for i in range(33, 127) if chr(i) not in "*?")  # `*` and `?` are the glob characters themselves: they cannot be named
+
+    def redirects(command):
+        """Deny every redirect except the stream merge `2>&1` (`>&1` and nothing after it): `>file`, `>>file`, `&>file`, `>&file`.
+        A glob cannot say "anything but", so the character after `>` (and after `>&1`) is enumerated."""
+        guard("%s *&>*" % command)
+        guard("%s *>" % command)
+        for ch in printable:
+            if ch != "&":
+                guard("%s *>%s*" % (command, ch))
+            elif True:
+                for after in printable.replace("1", ""):
+                    guard("%s *>&%s*" % (command, after))
+        guard("%s *> *" % command)
+        for after in printable:
+            guard("%s *>&1%s*" % (command, after))
+
     # writes: a redirect to anywhere but the message temp dir (the cat > temp form above is the one allowed redirect)
     for command in ("ls", "grep", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "jq", "echo", "printf", "date", "git", "gh pr view", "gh pr list",
                     "gh issue view", "gh issue list", "gh api", "az", "fleet-switchboard status", "fleet-switchboard pending", "fleet-switchboard decisions", "timeout"):
-        guard("%s *>*" % command)
+        redirects(command)
     guard("cat <*")
     for target in ("~", "$", ".", "/Users", "/home", "/etc", "/usr", "/bin", "/opt", "/Library", "/System", "/tmp", "/root", "/var/folders", "/private/etc", '"', "'") + tuple("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"):
         guard("cat >%s*" % target if False else "cat > %s*" % target)
