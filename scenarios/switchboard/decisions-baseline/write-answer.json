@@ -3,7 +3,7 @@
   "argv": "decisions answer api#2df allow --note per the standing order",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "out": "answered api#2df: allow\n",
   "permission_replies": [
    {
@@ -18,7 +18,7 @@
   "argv": "decisions answer api#2op deny",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "out": "answered api#2op: deny\n",
   "permission_replies": [
    {
@@ -40,7 +40,7 @@
   "argv": "decisions answer api#2wb use postgres",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "form_replies": [
    {
     "answer": {
@@ -56,7 +56,7 @@
   "argv": "decisions answer api#2wc yes",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "form_replies": [
    {
     "answer": {
@@ -72,7 +72,7 @@
   "argv": "decisions answer api#2wk 7",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "form_replies": [
    {
     "answer": {
@@ -88,7 +88,7 @@
   "argv": "decisions answer api#2ez 2.5",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "form_replies": [
    {
     "answer": {

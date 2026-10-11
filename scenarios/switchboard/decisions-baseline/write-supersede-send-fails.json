@@ -3,7 +3,7 @@
   "argv": "decisions supersede api#5kj --by api#50",
   "as": "cos",
   "code": 1,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "out": "api#5kj: refused: the note was not sent to api-orch (held): the report stays open\n"
  },
  {

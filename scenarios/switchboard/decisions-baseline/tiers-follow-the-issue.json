@@ -41,7 +41,7 @@
   "argv": "decisions escalate api#12",
   "as": "cos",
   "code": 0,
-  "err": "",
+  "err": "fleet-switchboard: the change is written; the daemon is not running, so the decision list shows it after the next pass (start it with `fleet-switchboard ensure`)\n",
   "gh_writes": [
    "POST repos/acme/api/issues/12/labels",
    "DELETE repos/acme/api/issues/12/labels/me%3Aawaiting-cos"

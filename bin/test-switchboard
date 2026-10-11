@@ -20234,6 +20234,104 @@ class TestReportFoldVariants(unittest.TestCase):
 
 
 
+
+class TestDecisionWriteWaitsForTheList(Base):
+    """`decisions escalate|resolve|answer|supersede` leave the list showing the new state when they return, or say honestly that it is
+    applied at the next pass. The daemon is the one writer of decisions.json: the command only pokes it and reads. Synthetic names."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = sb.ensure_state_dir(None)
+        self.now = [0.0]
+        self.slept = []
+        patch = mock.patch.dict(sb._refresh_clock, {"sleep": self.sleep, "monotonic": lambda: self.now[0]})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.on_sleep = None
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now[0] += seconds
+        if self.on_sleep:
+            self.on_sleep(len(self.slept))
+
+    def daemon_writes(self, decisions):
+        body = {"decisions": decisions, "errors": [], "written_at": sb.iso(time.time()), "generation": 1, "daemon_pid": 1}
+        (self.state / sb.DECISIONS_FILE).write_text(json.dumps(body))
+
+    def entry(self, ident, tier="cos"):
+        return {"id": ident, "kind": "issue", "tier": tier, "title": "t", "repo": "acme/api", "ask": 7}
+
+    def finish(self, action, idents, poked=True):
+        return sb.refreshed_or_honest_line(action, idents, poked, state_dir=str(self.state))
+
+    def test_an_escalation_waits_until_the_file_shows_the_owners_tier_and_then_says_nothing(self):
+        self.daemon_writes([self.entry("api#7")])                       # the old state: still the Chief of Staff's
+        self.on_sleep = lambda n: self.daemon_writes([self.entry("api#7", "human")]) if n == 2 else None   # the daemon's pass lands
+        self.assertIsNone(self.finish("escalate", ["api#7"]))
+        self.assertEqual(len(self.slept), 2)                            # it waited for the pass, not the whole bound
+
+    def test_resolve_answer_and_supersede_wait_until_every_decision_is_gone(self):
+        for action in ("resolve", "answer", "supersede"):
+            with self.subTest(action=action):
+                self.slept.clear()
+                self.now[0] = 0.0
+                self.daemon_writes([self.entry("api#7"), self.entry("api#8"), self.entry("api#9")])
+                self.on_sleep = lambda n: self.daemon_writes([self.entry("api#9")]) if n == 1 else None
+                self.assertIsNone(self.finish(action, ["api#7", "api#8"]))   # both are gone; another decision may stay
+
+    def test_a_file_that_never_changes_gives_one_honest_line_after_the_bound(self):
+        self.daemon_writes([self.entry("api#7")])
+        line = self.finish("escalate", ["api#7"])
+        self.assertIn("applied at the next pass", line)
+        self.assertIn("may still show the old state", line)
+        self.assertGreaterEqual(self.now[0], sb.DECISION_REFRESH_SECONDS)   # it waited the bound, no more
+        self.assertLess(self.now[0], sb.DECISION_REFRESH_SECONDS + 1)
+
+    def test_a_stale_or_missing_file_is_not_a_current_list(self):
+        self.assertIn("applied at the next pass", self.finish("resolve", ["api#7"]))          # no file at all
+        self.daemon_writes([])
+        old = time.time() - sb.DECISIONS_STALE_SECONDS - 60
+        os.utime(str(self.state / sb.DECISIONS_FILE), (old, old))
+        self.now[0] = 0.0
+        self.assertIn("applied at the next pass", self.finish("resolve", ["api#7"]))          # an old file shows nothing as current
+
+    def test_with_no_daemon_it_says_so_and_does_not_wait(self):
+        self.daemon_writes([self.entry("api#7")])
+        line = self.finish("escalate", ["api#7"], poked=False)
+        self.assertIn("the daemon is not running", line)
+        self.assertIn("ensure", line)
+        self.assertEqual(self.slept, [])
+
+    def test_the_command_only_reads_the_file_the_daemon_owns(self):
+        self.daemon_writes([self.entry("api#7")])
+        path = self.state / sb.DECISIONS_FILE
+        before = (path.read_text(), path.stat().st_mtime_ns)
+        self.finish("escalate", ["api#7"])
+        self.assertEqual((path.read_text(), path.stat().st_mtime_ns), before)
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        body = text[text.index("def refreshed_or_honest_line"):text.index("def finish_decision_write")]
+        for forbidden in ("write_text", "os.replace", "open(", "publish", "write_decisions"):
+            self.assertNotIn(forbidden, body, forbidden)
+
+    def test_the_write_commands_poke_then_wait_and_say_the_line_on_stderr_not_stdout(self):
+        calls = []
+        with mock.patch.object(sb, "send_poke", lambda d: calls.append("poke") or True), \
+                mock.patch.object(sb, "refreshed_or_honest_line", lambda a, i, p, state_dir=None: calls.append((a, i, p)) or "later"):
+            with captured() as (out, err):
+                sb.finish_decision_write("escalate", ["api#7"])
+                sb.finish_decision_write("supersede", ["api#7", "api#8", None])
+        self.assertEqual(calls, ["poke", ("escalate", ["api#7"], True), "poke", ("supersede", ["api#7", "api#8"], True)])
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue().count("later"), 2)
+
+    def test_nothing_in_it_can_raise_into_the_command(self):
+        with mock.patch.object(sb, "send_poke", side_effect=RuntimeError("boom")):
+            with captured() as (out, err):
+                sb.finish_decision_write("escalate", ["api#7"])                    # a failure here never fails the write
+        self.assertEqual(out.getvalue(), "")
+
+
 class TestDecisionsFromGitHub(Base):
     def setUp(self):
         super().setUp()
