@@ -3806,3 +3806,15 @@ secrets, the `read`/`grep`/`glob` tools' resource (the shell replay cannot exerc
 `gh -R evil.example/o/r ...` or a foreign-host URL would send gh's request (and token) to that host. Denied for every `gh` shape: `-R`/`--repo` in any host form (`HOST/OWNER/REPO`, a dot before the first slash, `@`),
 and, for the read and merge shapes, any `://` or `@` argument and `gh api http*`; for the comment/close/edit shapes a URL in first (selector) position. `-R OWNER/REPO` stays allowed. A URL
 inside free text, or a selector URL placed after flags in a comment/close/edit command, is not caught (documented residual; the message commands must keep their text).
+
+### The Chief of Staff's permissions are a focus, not a fence (#105 premise correction)
+
+The rules keep the Chief of Staff (and its subagent, which has the same list minus `handoff` and `launch`) on its job; they do not defend against it. The list is generated
+by `tools/cos-permissions-proof/gen_permissions.py` (a test checks the agent files equal its output; run it to regenerate). Base `* * deny`, last match wins, any deny denies, so no deny can have an exception: guards are anchored to the command they guard,
+and the text of `send`, `report`, `remind`, `notice` and `intent` messages is never matched by a path or flag guard.
+- **Loosened (PR #108 had denied these):** pipes over read output (`grep cut head tail sort uniq wc jq tr`), `gh --jq/-q/--template`, `timeout N` and `sleep`, `$(...)` (the inner command is evaluated on its own, so it
+  must itself be allowed: `$(cat <temp dir>/msg.txt)`), a heredoc `cat > <temp dir>/file`, `fleet-switchboard handoff` and `launch` (any `--agent` except chief-of-staff and cos-subagent), `herdr` list/get/read of workspaces, tabs, panes and agents, `api snapshot`, rename and focus of a workspace or tab,
+  `az containerapp show|list|revision list|env show|list` and `logs show` (**these read environment variable VALUES: for Adam to decide**), `az --query`, quotes, backslashes, braces.
+- **Still denied:** editing or writing files outside the opencode temp dir, builds and tests, `git push`/commit/checkout, deploys, secret VALUE reads, `az` writes, `gh` repo/secret/release/workflow-run/`--admin`/`--auto`/approve, `gh api` writes, `curl`, `herdr agent prompt`, `pane send`, send-keys, start, stop and close, and paths outside the fleet's repos, the temp dir and the switchboard config, state and opencode config dirs (those three: read only).
+- **Read vs write of the three config dirs:** reads are allowed (standing orders, audit, installed definitions); redirects and the edit tool are denied there. Limits: the file guards name the places they keep out (`.ssh`, `.aws`, `Documents`, ...) rather than allowing only the repos, because a deny cannot carve out an exception.
+- Proof: `python3 tools/cos-permissions-proof/run.py` (job shapes must run, the out-of-job corpus must be denied, nothing asks). Rollback: restore the previous definition files.
