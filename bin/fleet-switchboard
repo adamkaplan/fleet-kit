@@ -13241,12 +13241,22 @@ def _write_gates_config(raw_edit):
 
 def cmd_gates_switch(args, runner, now):
     """`gates mode <repo> shadow|enforce|off` and `gates off|on`: change enforcement. chief of staff or a person only; audited."""
-    ok, who = gates_caller_may_switch(runner, now)
+    kind = gates_caller_kind(runner, now)
+    ok, who = kind[0] == "person" or (kind[0] == "agent" and kind[2] == "chief-of-staff"), kind[1]
     engine, state, config = build_engine(runner, now, "cli")
     word = args.pr
     if not ok:
         _gates_audit(engine, "gate.mode.refused", word, {"by": who, "args": args.rest[:3]})
         raise LedgerCommandError("refused: %s may not change gate modes (the chief of staff, or a person at a shell, may)" % who)
+    # Turning enforcement ON is the owner's, in person: the COMMAND refuses any other caller (the chief of staff, any agent session, an
+    # unknown session, a caller that is not the owner's own terminal), whatever wraps it (`timeout`, `env`, a pipe): the command sees
+    # the caller, not the wrapper. Turning gates off, to shadow, and waiving stay the chief of staff's.
+    enables = word == "on" or (word == "mode" and len(args.rest) == 2 and args.rest[1] == "enforce")
+    if enables and kind[0] != "person":
+        _gates_audit(engine, "gate.mode.refused", word, {"by": who, "args": args.rest[:3], "why": "enabling enforcement is the owner's, at their own terminal"})
+        raise LedgerCommandError("refused: only the owner, at their own terminal, turns enforcement on (%s is %s). You may turn gates off, "
+                                 "set a repo to shadow, or waive; ask the owner for the rest" % (who, "the chief of staff" if kind[0] == "agent" and kind[2] == "chief-of-staff"
+                                                                                         else "an agent" if kind[0] == "agent" else "not established as the owner"))
     if word in ("off", "on"):
         path = gates_off_path(state)
         if word == "off":
