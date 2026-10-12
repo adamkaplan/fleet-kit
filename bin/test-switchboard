@@ -36322,6 +36322,34 @@ class TestReviewerSubagents(LedgerBase):
         for rel in ("skills/fleet-review/SKILL.md", "docs/switchboard.md"):
             self.assertIn("opencode api GET /api/agent", (REPO / rel).read_text(), rel)
 
+    @staticmethod
+    def verdict(perms, action, command):
+        """The effect of the LAST rule that matches (deny by default first, the denies last), as the permission list reads."""
+        import fnmatch
+        effect = None
+        for a, r, e in perms:
+            if a in ("*", action) and fnmatch.fnmatchcase(command, r):
+                effect = e
+        return effect
+
+    BARE = ("fleet-switchboard review laws acme/app#9", "gh pr diff 9", "gh pr diff 9 --repo acme/app", "gh pr view 9 --json files", "git diff abc..def", "git log -5", "git show abc")
+    REFUSED = ("fleet-switchboard review laws 230 2>&1", "gh pr diff 230 2>&1", "git diff abc > out.txt", "gh pr view 9 >> out", "git diff abc..def --output=out", "gh pr view 9 --web")
+
+    def test_the_documented_bare_commands_are_allowed_and_the_redirect_forms_refused_for_every_reviewer(self):
+        for role in self.ROLES:
+            with self.subTest(role=role):
+                text, head, perms = self.front(role)
+                for command in self.BARE:
+                    self.assertEqual(self.verdict(perms, "shell", command), "allow", command)
+                for command in self.REFUSED:
+                    self.assertEqual(self.verdict(perms, "shell", command), "deny", command)
+                self.assertIn("**bare**", text)
+                self.assertIn("no pipe", text)
+                self.assertIn("2>&1", text)
+        skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
+        self.assertIn("**bare**", skill)
+        self.assertIn("2>&1", skill)
+
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:
             with self.subTest(role=role):

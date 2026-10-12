@@ -9,6 +9,8 @@ Make the change work first. Then, in a repository that has review laws (`REVIEW_
 reviewer subagents on your pull request **before you offer it**: `reviewer-code`, `reviewer-architecture`, `reviewer-security`, `reviewer-impact` and `reviewer-test`. Invoke each with the Task
 tool and the pull request reference (`owner/repo#N`); they can run side by side.
 
+Each reviewer runs its shell commands **bare**: one command per call, no pipe (`| head`), no redirect (`2>&1`, `>`), no `cd X &&` chain; the permissions refuse anything compound or with a `>` in it, and the commands it needs (`fleet-switchboard review laws <pr>`, `gh pr diff <pr>`, `gh pr view <pr>`, `git diff|log|show ...`) print what it needs without them. Tell it so when you invoke it.
+
 Each reviewer:
 - loads the repository's laws and overlay **from the pull request's base commit** with `fleet-switchboard review laws <pr>`, never from your branch (a pull request cannot rewrite the law it is judged by);
 - reads the change and judges it; it **never builds, runs or tests** anything, writes nothing and holds no write command; it has at most 50 turns and answers `verdict: incomplete` rather than ending in silence;
