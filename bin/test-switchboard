@@ -656,11 +656,13 @@ class TestHerdrClient(Base):
         self.assertEqual((path, method), ("/s/herdr.sock", "layout.apply"))
         self.assertEqual(params, {"workspace_id": "w1", "tab_label": "coder", "root": {
             "type": "pane", "label": "coder", "cwd": "/work", "command": ["/bin/oc", "-s", "ses_1"],
-            "env": {"A": "b"}}})
+            "env": {"A": "b", "FLEET_SWITCHBOARD_OWN_GH": ""}}})   # the marker for the switchboard's own gh calls never reaches an agent's pane
         self.assertNotIn("focus", json.dumps(params).lower())
+        client.open_tab_running("w1", "coder", "/work", ["/bin/oc"], {"FLEET_SWITCHBOARD_OWN_GH": "1", "A": "b"})
+        self.assertEqual(sent[1][2]["root"]["env"], {"A": "b", "FLEET_SWITCHBOARD_OWN_GH": ""}, "an inherited marker is overridden, not passed on")
         with self.assertRaises(ValueError):
             client._socket("pane.send_text", {})
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 2)   # the two layout.apply calls above; the refused method sent nothing
 
     def test_a_socket_error_or_odd_reply_is_a_herdr_error(self):
         for reply in ({"error": {"code": "workspace_not_found"}}, {"result": {}}, {"result": {"layout": {}}}):
@@ -1559,6 +1561,8 @@ class FakeV2:
             return subprocess.CompletedProcess(argv, 1, "", "error: cannot reach the OpenCode service\n")
         if argv[1:2] != ["api"] or len(argv) < 3:
             return subprocess.CompletedProcess(argv, 2, "", "fake opencode: only `api` is modelled\n")
+        if argv[2] == "GET":   # `opencode api GET /api/agent` (the registered agents): not modelled here, so the service reads as unreachable
+            return subprocess.CompletedProcess(argv, 1, "", "fake opencode: GET is not modelled\n")
         op, params, body, rest = argv[2], {}, None, argv[3:]
         while rest:
             flag, value, rest = rest[0], rest[1], rest[2:]
@@ -2915,6 +2919,29 @@ class TestSteerToWorking(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
 
+    def test_send_to_the_role_name_reaches_the_one_agent_with_that_role(self):
+        self.world = World(self, agents=())
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("platform", fleet={"role": "orchestrator", "reports_to": "chief-of-staff"})
+        outcome = self.world.engine.send("platform", "chief-of-staff", "a question")
+        self.assertTrue(outcome["sent"], outcome)
+        self.assertEqual(len(self.world.admissions("cos")), 1)
+        again = self.world.engine.send("platform", "cos", "by name still works")        # the registered name is unchanged
+        self.assertIn("sent", again)
+        self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})                    # two chiefs: the alias is ambiguous, taken literally
+        held = self.world.engine.send("platform", "chief-of-staff", "which one?")
+        self.assertFalse(held["sent"])
+        self.assertIn("no herdr pane shows a v2 session named chief-of-staff", held["reason"])
+
+    def test_the_alias_with_no_chief_of_staff_is_taken_literally_and_an_interrupt_through_it_is_still_refused_to_a_non_boss(self):
+        held = self.send(sender="coder", to="chief-of-staff")
+        self.assertEqual(held["sent"], False)
+        self.assertIn("named chief-of-staff", held["reason"])
+        self.world.add_agent("chief", fleet={"role": "chief-of-staff"})
+        with self.assertRaises(sb.InterruptRefused):
+            self.world.engine.send("coder", "chief-of-staff", "stop", interrupt=True)
+        self.assertEqual(self.world.v2.interrupts, [])
+
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
 
@@ -3806,7 +3833,7 @@ class TestLaunch(Base):
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                     "FLEET_SWITCHBOARD_ROLE": "coder"})  # PR 18: who this pane is
+                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
@@ -3963,7 +3990,7 @@ class TestLaunch(Base):
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                 "FLEET_SWITCHBOARD_ROLE": "coder"})
+                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -4006,6 +4033,41 @@ class TestLaunch(Base):
                            socket_call=self.world.herdr.socket)
         self.assertNotEqual(code, 0)
         self.assertIn("--agent and --dir", err.getvalue())
+
+    def listing_runner(self, agents):
+        """The world's runner, with `opencode api GET /api/agent` answering `agents` ({name: mode}); None: the service is not reachable."""
+        def route(argv, **kwargs):
+            if argv[1:4] == ["api", "GET", "/api/agent"]:
+                if agents is None:
+                    raise FileNotFoundError(2, "No such file")
+                rows = [{"id": n, "mode": m, "permissions": []} for n, m in agents.items()]
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"data": rows}), "")
+            return self.world.route(argv, **kwargs)
+        return route
+
+    def cli_launch(self, runner, agent, name="coder9"):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err):
+            code = sb.main(["launch", name, "--agent", agent, "--dir", str(self.work)], runner=runner,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_launch_of_an_agent_the_service_does_not_know_is_refused_before_anything_is_created(self):
+        sessions = len(self.world.v2.sessions)
+        code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "orchestrator": "primary", "reviewer-code": "subagent"}), "tester")
+        self.assertEqual(code, 1)
+        self.assertIn("--agent 'tester' is not registered with the OpenCode service", err)
+        self.assertIn("primary agents registered: coder, orchestrator", err)
+        self.assertNotIn("reviewer-code", err.split("registered:")[1], "only primary agents are offered")
+        self.assertIn("agents verify", err)
+        self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
+
+    def test_a_registered_agent_launches_and_an_unreachable_service_does_not_block_it(self):
+        for n, agents in enumerate(({"coder": "primary"}, None)):
+            with self.subTest(agents=agents):
+                code, out, err = self.cli_launch(self.listing_runner(agents), "coder", name="coder%d" % (10 + n))
+                self.assertEqual(code, 0, err)
 
     def test_the_cli_takes_the_workspace_from_the_pane_it_runs_in(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -8584,6 +8646,7 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
                  "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
                  "Permission doesn't travel", "An empty queue is not a mandate")
+HYGIENE_MAXIMS = ("Say it failed",)   # the one maxim the coder holds as a rule (R-CODE-1); the owner's two principles for how a coder works stay in the definition
 COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
@@ -8599,8 +8662,10 @@ ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "c
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
 # one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+# two maxims restored in the coder: +2 lines, +200 B
+# hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
-ROLE_BYTE_LIMITS = {"coder": 7550, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7650, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -9021,7 +9086,12 @@ class TestAgentDefinitions(unittest.TestCase):
                 self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
-                    self.assertIn(phrase, block)
+                    # `Say it failed` lives in CODING_STANDARDS.md (R-CODE-1); the coder keeps a pointer, not the text. Chesterton's fence and cut the root stay in EVERY definition: Copilot coders and other installs load no global AGENTS.md
+                    if role == "coder" and phrase in HYGIENE_MAXIMS:
+                        self.assertNotIn(phrase, block)
+                    else:
+                        self.assertIn(phrase, block)
+                self.assertEqual("CODING_STANDARDS.md" in block, role == "coder")
                 self.assertEqual("Trust, but verify" in block, role not in WORKER_ROLES)
                 for phrase in COS_ONLY_MAXIMS:
                     self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
@@ -36918,6 +36988,8 @@ class TestReviewerSubagents(LedgerBase):
         super().setUp()
         self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main")
         self.contents_calls = []
+        self.list_calls = []
+        self.merged_prs = []
         self.contents = {(name, self.BASE): "base text of %s: rule R-CODE-3\n" % name for name in self.LAW_FILES[:4]}
         self.contents[("REVIEW_LAWS.md", LEDGER_HEAD)] = "EDITED BY THE PR HEAD\n"
 
@@ -36930,6 +37002,9 @@ class TestReviewerSubagents(LedgerBase):
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             body = {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "list"]:
+            self.list_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.merged_prs), "")
         return super().route(argv, **kwargs)
 
     def review(self, who, *argv):
@@ -36980,6 +37055,113 @@ class TestReviewerSubagents(LedgerBase):
         shells = [r for a, r, e in perms if a == "shell" and e == "allow"]
         self.assertFalse([r for r in shells if r.split()[0] not in ("fleet-switchboard", "git", "gh")], shells)
         self.assertFalse([r for r in shells if "record" in r or "test" in r.split()[1:2] or "pytest" in r])
+
+    @staticmethod
+    def merged(number, merged, title="a change", body="", commits=("2026-01-01T10:00:00Z",), green="2026-01-01T10:30:00Z", lines=(10, 5)):
+        return {"number": number, "title": title, "body": body, "createdAt": commits[0], "mergedAt": merged, "additions": lines[0], "deletions": lines[1],
+                "commits": [{"committedDate": c} for c in commits],
+                "statusCheckRollup": [{"conclusion": "SUCCESS", "completedAt": green}, {"conclusion": "FAILURE", "completedAt": "2026-01-02T00:00:00Z"}]}
+
+    def test_review_measure_computes_each_column_and_the_two_groups_without_writing_anything(self):
+        self.merged_prs = [self.merged(1, "2026-01-01T12:00:00Z"), self.merged(2, "2026-01-02T12:00:00Z", lines=(100, 100)),
+                           self.merged(3, "2026-01-03T12:00:00Z", green="2026-01-03T10:10:00Z", commits=("2026-01-03T10:00:00Z",)),
+                           self.merged(4, "2026-01-04T12:00:00Z", title="Fix the thing from #2", body="")]
+        self.merged_prs[2]["commits"] = [{"committedDate": "2026-01-03T10:00:00Z"}]
+        self.merged_prs[2]["createdAt"] = "2026-01-03T10:00:00Z"
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2", "--split", "3", "--json")
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual([r["pr"] for r in data["baseline"]], [1, 2])
+        self.assertEqual([r["pr"] for r in data["after"]], [3, 4])
+        by = {r["pr"]: r for r in data["baseline"] + data["after"]}
+        self.assertEqual(by[1]["to_green_min"], 30.0)
+        self.assertEqual(by[3]["to_green_min"], 10.0)
+        self.assertEqual((by[2]["lines"], by[2]["escaped"], by[1]["escaped"]), (200, 1, 0), "the fix naming #2 within 14 days marks #2 only")
+        self.assertEqual(by[1]["rounds"], None, "no recorded review: blank, not zero")
+        self.assertEqual(self.list_calls[0][self.list_calls[0].index("--state") + 1], "merged")
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2", "--split", "3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("BASELINE (2 PRs", out)
+        self.assertIn("AFTER (2 PRs", out)
+        self.assertIn("median", out)
+
+    def test_review_measure_counts_recorded_review_heads_and_findings_and_refuses_bad_bounds_and_unknown_split(self):
+        self.merged_prs = [self.merged(7, "2026-01-01T12:00:00Z")]
+        entries = [{"kind": "review_record", "pr": "acme/app#7", "head": "a" * 40, "reviewer": "code", "blocks": 1, "notes": 2},
+                   {"kind": "review_record", "pr": "acme/app#7", "head": "b" * 40, "reviewer": "code", "blocks": 0, "notes": 1},
+                   {"kind": "review_record", "pr": "other/app#7", "head": "c" * 40, "reviewer": "code", "blocks": 9, "notes": 9}]
+        row = sb.measure_row(self.merged_prs[0], entries, self.merged_prs, "acme/app")
+        self.assertEqual((row["rounds"], row["blocks"], row["notes"]), (2, 1, 3))
+        for bad in (("--count", "0"), ("--count", "51"), ("--scan", "41"), ("--count", "10", "--scan", "5")):
+            with self.subTest(bad=bad):
+                code, out, err = self.review("coder", "measure", "acme/app", *bad)
+                self.assertEqual(code, sb.EXIT_USAGE)
+                self.assertIn("review measure", err)
+        code, out, err = self.review("coder", "measure", "acme/app", "--split", "999")
+        self.assertEqual(code, sb.EXIT_USAGE)
+        self.assertIn("#999", err)
+
+    def test_review_measure_strips_terminal_escapes_from_titles_and_reports_every_way_gh_can_fail(self):
+        self.merged_prs = [self.merged(1, "2026-01-01T12:00:00Z", title="evil \x1b[31mred\x07 title")]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertNotRegex(out, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("evil", out)
+        real = self.route
+        for answer, why in ((subprocess.CompletedProcess([], 1, "", "gh: boom"), "failed"), (subprocess.CompletedProcess([], 0, "not json", ""), "JSON"),
+                            (subprocess.CompletedProcess([], 0, "{}", ""), "not a list")):
+            with self.subTest(why=why):
+                self.route = lambda argv, answer=answer, **kw: answer if argv[1:3] == ["pr", "list"] else real(argv, **kw)
+                code, out, err = self.review("coder", "measure", "acme/app")
+                self.assertEqual(code, sb.EXIT_USAGE)
+                self.assertIn(why, err)
+
+    def test_review_measure_edges_the_escape_window_the_number_match_missing_checks_and_no_split(self):
+        base = self.merged(2, "2026-01-01T12:00:00Z")
+        for title, merged, body, expect in (("Fix it", "2026-01-16T12:00:01Z", "for #2", 0), ("Fix it", "2025-12-31T12:00:00Z", "for #2", 0),
+                                            ("Update things", "2026-01-02T12:00:00Z", "for #2", 0), ("Fix it", "2026-01-02T12:00:00Z", "for #20", 0),
+                                            ("Revert it", "2026-01-15T12:00:00Z", "reverts #2", 1)):
+            with self.subTest(title=title, merged=merged, body=body):
+                other = self.merged(9, merged, title=title, body=body)
+                self.assertEqual(sb.measure_row(base, [], [base, other], "acme/app")["escaped"], expect)
+        none_green = dict(base, statusCheckRollup=[{"conclusion": "FAILURE", "completedAt": "2026-01-01T11:00:00Z"}])
+        self.assertIsNone(sb.measure_row(none_green, [], [none_green], "acme/app")["to_green_min"])
+        early = dict(base, statusCheckRollup=[{"conclusion": "SUCCESS", "completedAt": "2025-01-01T00:00:00Z"}])
+        self.assertIsNone(sb.measure_row(early, [], [early], "acme/app")["to_green_min"])
+        self.assertEqual(sb._median([1, 2, 3, 10]), 2.5)
+        self.merged_prs = [self.merged(n, "2026-01-0%dT12:00:00Z" % n) for n in (1, 2, 3)]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("BASELINE (2 PRs", out)
+        self.assertNotIn("AFTER", out)
+        row = out.split("\n")[2].split()
+        self.assertEqual(row[-4:-1], ["-", "-", "-"], "no recorded review: rounds, blocks and notes print as dashes")
+
+    def test_review_measure_warns_loudly_and_carries_on_when_the_ledger_chain_is_damaged(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], "line 3: the chain breaks")):
+            code, out, err = self.review("coder", "measure", "acme/app", "--count", "1", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("review ledger is damaged (line 3: the chain breaks)", err)
+        self.assertIsNone(json.loads(out)["baseline"][0]["rounds"])
+
+    def test_review_measure_reads_the_ledger_for_this_repository_only(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        code, out, err = self.record("coder", "code", "approve", "--blocks", "0", "--notes", "2")
+        self.assertEqual(code, 0, err)
+        for repo, expect in (("acme/app", (1, 2)), ("other/app", (None, None))):
+            with self.subTest(repo=repo):
+                code, out, err = self.review("coder", "measure", repo, "--count", "1", "--json")
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)["baseline"][0]
+                self.assertEqual((row["rounds"], row["notes"]), expect)
+
+    def test_the_coder_pointer_names_only_rules_that_exist_in_the_standards(self):
+        standards = (REPO / "CODING_STANDARDS.md").read_text()
+        for path in (REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            line = [l for l in path.read_text().splitlines() if "CODING_STANDARDS.md" in l][0]
+            for number in re.findall(r"\d+", line.split("(cite", 1)[1].split(":", 1)[0]):
+                self.assertIn("**R-CODE-%s " % number, standards, path.name)
 
     def test_the_skill_and_the_docs_name_the_test_reviewer_and_say_five(self):
         skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
@@ -37056,6 +37238,13 @@ class TestReviewerSubagents(LedgerBase):
         skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
         self.assertIn("**bare**", skill)
         self.assertIn("2>&1", skill)
+
+    def test_the_skill_says_to_run_the_panel_at_the_head_and_to_give_the_full_command_forms(self):
+        skill = " ".join((REPO / "skills" / "fleet-review" / "SKILL.md").read_text().split())
+        self.assertIn("Run it from a checkout at the pull request's head", skill)
+        self.assertIn("fleet-switchboard review laws owner/repo#N", skill)
+        self.assertIn("gh pr diff N --repo owner/repo", skill)
+        self.assertIn("a bare number is refused", skill)
 
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:

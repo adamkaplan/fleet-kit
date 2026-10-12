@@ -1194,9 +1194,12 @@ class HerdrClient:
     def open_tab_running(self, workspace, label, cwd, argv, env):
         """A new tab in `workspace` whose one pane execs `argv` directly. Never
         types, never takes focus. Returns {"tab_id", "pane_id"}."""
+        # A pane is an AGENT's: the marker a switchboard process carries for its own gh calls must not reach it (the gh shim would then skip
+        # the per-repo account), so it is named here with an empty value, which the shim does not read as set; an inherited one is overridden.
+        pane_env = dict(env, **{OWN_GH_ENV: ""})
         reply = self._socket("layout.apply", {
             "workspace_id": workspace, "tab_label": label,
-            "root": {"type": "pane", "label": label, "cwd": cwd, "command": list(argv), "env": dict(env)}})
+            "root": {"type": "pane", "label": label, "cwd": cwd, "command": list(argv), "env": pane_env}})
         layout = (reply or {}).get("result", {}).get("layout") if isinstance(reply, dict) else None
         root = layout.get("root") if isinstance(layout, dict) else None
         pane, tab = (root or {}).get("pane_id"), layout.get("tab_id") if isinstance(layout, dict) else None
@@ -2338,6 +2341,7 @@ class Switchboard:
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
+        recipient = resolve_boss(discovery, recipient)   # `chief-of-staff` is the role: it reaches the one agent with that role (#80), as a report does
         if interrupt:
             target = discovery.agents.get(recipient)
             if target is None or boss_name(discovery, target) != sender:
@@ -3305,6 +3309,17 @@ class LaunchError(Exception):
 
 RESERVED_AGENT_NAMES = ("fleet-switchboard", "switchboard", "plan-review", "owner")   # names the switchboard itself acts under: no agent may take one
 LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lanes: only it launches them
+
+
+def launch_agent_problem(config, runner, agent):
+    """Why `agent` cannot be launched: the OpenCode service does not know it (an agent with no installed definition starts as the default Build
+    agent with the brief unsent). None when it is registered, or when the service cannot be asked (v2 then refuses it itself)."""
+    state, found = agents_found(runner, config.get("opencode") or "opencode", AGENTS_VERIFY_TIMEOUT)
+    if state != "up" or agent in found:
+        return None
+    known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
+    return ("--agent %r is not registered with the OpenCode service, so it would start as the default agent and the brief would not be sent "
+            "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
 def launch_problems(name, agent, directory, workspace, issue, charter=None):
@@ -10660,6 +10675,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
+    problem = launch_agent_problem(engine.config, runner, args.agent)
+    if problem:
+        raise LaunchError(problem)
     brief = read_brief(args.brief_file, sys.stdin)
     launch_gate_probe(engine, state, engine.config, args, brief, runner, now)   # #107 slice 3c: shadow only, never refuses
     launched = now()
@@ -14363,6 +14381,8 @@ def parse_review_block(text):
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    if args.review_cmd == "measure":
+        return cmd_review_measure(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
@@ -14429,6 +14449,143 @@ def cmd_review(args, runner, now):
         return EXIT_USAGE
 
 
+# ---------------------------------------------------------------- `review measure` (#179, slice L7)
+#
+# Read-only. Did moving coding-hygiene text out of the agent definitions into the reviewers' standards make changes land faster and cleaner? It
+# prints, for the merged PRs a repository has, per PR: minutes from the first commit to green CI, review rounds, findings and escaped defects,
+# and the medians of a BASELINE group (the N merged before a split PR) and an AFTER group (the N merged from it on). HEURISTICS, stated:
+#   to green    first commit date -> the latest completion time among the PR's successful checks at its merged head (a rerun can inflate it)
+#   rounds      distinct heads with a recorded review in the local ledger (blank when none was recorded: only recorded reviews are counted)
+#   findings    blocking and note counts of the latest recorded review per head and reviewer
+#   escaped     another PR merged within 14 days after this one whose title starts with Revert or Fix and names this PR as #N in its title or body
+# The running agents load their definitions at start: the AFTER group only measures the new text once agents have restarted after the split.
+
+MEASURE_ESCAPE_DAYS = 14
+MEASURE_SCAN_MAX = 40   # GitHub refuses a bigger read of the commits' authors (a node limit)
+MEASURE_GROUP_MAX = 50
+_MEASURE_FIX_RE = re.compile(r"^\s*(revert|fix)\b", re.I)
+
+
+def _measure_time(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def measure_row(pr, entries, all_prs, repo):
+    """One table row for the merged PR `pr` (the object of `gh pr list --json`); `entries` is the review ledger."""
+    number = pr.get("number")
+    merged = _measure_time(pr.get("mergedAt"))
+    starts = [t for t in (_measure_time(c.get("committedDate")) for c in pr.get("commits") or []) if t is not None] or \
+        [t for t in (_measure_time(pr.get("createdAt")),) if t is not None]
+    greens = [t for t in (_measure_time(c.get("completedAt")) for c in pr.get("statusCheckRollup") or []
+                          if isinstance(c, dict) and c.get("conclusion") == "SUCCESS") if t is not None]
+    to_green = round((max(greens) - min(starts)) / 60.0, 1) if greens and starts and max(greens) >= min(starts) else None
+    latest = {}
+    for entry in entries or []:
+        if entry.get("kind") == "review_record" and entry.get("pr") == "%s#%s" % (repo, number):
+            latest[(entry.get("head"), entry.get("reviewer"))] = entry
+    heads = {head for head, _ in latest}
+    escaped = 0
+    for other in all_prs:
+        later = _measure_time(other.get("mergedAt"))
+        if other.get("number") == number or later is None or merged is None or not 0 < later - merged <= MEASURE_ESCAPE_DAYS * 86400:
+            continue
+        if _MEASURE_FIX_RE.match(other.get("title") or "") and re.search(r"#%s\b" % number, (other.get("title") or "") + " " + (other.get("body") or "")):
+            escaped += 1
+    # a title is the author's text: no terminal escapes reach the screen
+    lines = (pr.get("additions") or 0) + (pr.get("deletions") or 0)
+    return {"pr": number, "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(pr.get("title") or "")), 50), "merged": pr.get("mergedAt"), "lines": lines, "to_green_min": to_green,
+            "rounds": len(heads) if heads else None, "blocks": sum(e.get("blocks") or 0 for e in latest.values()) if heads else None,
+            "notes": sum(e.get("notes") or 0 for e in latest.values()) if heads else None, "escaped": escaped}
+
+
+def _median(values):
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else round((values[mid - 1] + values[mid]) / 2.0, 1)
+
+
+def measure_summary(rows):
+    """The medians of a group, and minutes to green per 100 changed lines (so a group of larger changes is not read as slower)."""
+    per_100 = [round(r["to_green_min"] * 100.0 / max(r["lines"], 1), 1) for r in rows if r["to_green_min"] is not None]
+    return {"prs": len(rows), "median_to_green_min": _median(r["to_green_min"] for r in rows), "median_green_min_per_100_lines": _median(per_100),
+            "median_rounds": _median(r["rounds"] for r in rows), "median_blocks": _median(r["blocks"] for r in rows),
+            "median_notes": _median(r["notes"] for r in rows), "median_lines": _median(r["lines"] for r in rows),
+            "escaped_prs": sum(1 for r in rows if r["escaped"])}
+
+
+def measure_groups(prs, count, split=None):
+    """(baseline, after) lists of merged PRs, oldest first. With `split` (a PR number in the list): the `count` merged before it and the `count`
+    from it on. Without: the newest `count` as the baseline and an empty after."""
+    ordered = sorted((p for p in prs if _measure_time(p.get("mergedAt")) is not None), key=lambda p: _measure_time(p["mergedAt"]))
+    if split is None:
+        return ordered[-count:], []
+    where = [i for i, p in enumerate(ordered) if p.get("number") == split]
+    if not where:
+        raise ReviewError("PR #%s is not among the %d merged PRs read: raise --scan or name a recent merged PR" % (split, len(ordered)))
+    return ordered[max(0, where[0] - count):where[0]], ordered[where[0]:where[0] + count]
+
+
+def format_measure(base_rows, after_rows):
+    head = "%-6s %-50s %6s %9s %6s %6s %6s %7s" % ("PR", "title", "lines", "to-green", "rounds", "blocks", "notes", "escaped")
+
+    def line(r):
+        cells = [("-" if r[k] is None else str(r[k])) for k in ("lines", "to_green_min", "rounds", "blocks", "notes", "escaped")]
+        return "%-6s %-50s %6s %9s %6s %6s %6s %7s" % tuple(["#%s" % r["pr"], r["title"]] + cells)
+    out = []
+    for name, rows in (("BASELINE", base_rows), ("AFTER", after_rows)):
+        if not rows and name == "AFTER":
+            continue
+        out += ["%s (%d PRs; to-green in minutes)" % (name, len(rows)), head] + [line(r) for r in rows]
+        out.append("  median: " + json.dumps(measure_summary(rows), sort_keys=True))
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def cmd_review_measure(args, runner, now):
+    try:
+        if not 1 <= args.count <= MEASURE_GROUP_MAX or not args.count <= args.scan <= MEASURE_SCAN_MAX:
+            raise ReviewError("--count must be 1 to %d and --scan from --count to %d" % (MEASURE_GROUP_MAX, MEASURE_SCAN_MAX))
+        engine, state, config = build_engine(runner, now, "cli", writable=False)
+        accounts = getattr(engine, "accounts", None) or GhAccounts(config, runner, now)
+        try:
+            env = accounts.env_for(args.repo)
+        except AccountError as err:
+            raise ReviewError(str(err)) from None
+        argv = [config["gh"], "pr", "list", "--repo", args.repo, "--state", "merged", "--limit", str(args.scan), "--json",
+                "number,title,body,createdAt,mergedAt,additions,deletions,commits,statusCheckRollup"]
+        try:
+            done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"],
+                                                stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        except (OSError, subprocess.SubprocessError) as err:
+            raise ReviewError("gh pr list %s: %s" % (args.repo, accounts.scrub(_one_line(str(err), 120)))) from None
+        if done.returncode != 0:
+            raise ReviewError("gh pr list %s failed: %s" % (args.repo, accounts.scrub(_one_line(done.stderr or "", 160)) or "exit %d" % done.returncode))
+        try:
+            prs = json.loads(done.stdout or "[]")
+        except ValueError:
+            raise ReviewError("gh pr list answered something that is not JSON") from None
+        if not isinstance(prs, list):
+            raise ReviewError("gh pr list answered something that is not a list")
+        entries, problem = plan_ledger.read_ledger(state)
+        if problem:   # fail open on purpose (R-CODE-2): the figures are a read-only report, so say it loudly and carry on with the intact entries
+            sys.stderr.write("%s: review measure: the review ledger is damaged (%s): blank review columns may be missing records\n" % (PROG, _one_line(problem, 200)))
+        base, after = measure_groups(prs, args.count, args.split)
+        rows = lambda group: [measure_row(p, entries, prs, args.repo) for p in group]
+        if args.json:
+            print(json.dumps({"baseline": rows(base), "after": rows(after)}, indent=2, sort_keys=True))
+        else:
+            print(format_measure(rows(base), rows(after)))
+        return EXIT_OK
+    except (ReviewError, plan_ledger.LedgerError, ConfigError) as err:
+        sys.stderr.write("%s: review measure: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+
+
 def add_review_parsers(sub):
     review = sub.add_parser("review", help="Reviewer subagents (#179): print the laws from the PR's base commit, record a reviewer's result")
     rsub = review.add_subparsers(dest="review_cmd", required=True)
@@ -14445,6 +14602,12 @@ def add_review_parsers(sub):
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
+    measure.add_argument("repo", help="owner/repo")
+    measure.add_argument("--count", type=int, default=10, help="PRs per group (default 10)")
+    measure.add_argument("--scan", type=int, default=MEASURE_SCAN_MAX, help="Merged PRs read (default %d; the escape check looks among them)" % MEASURE_SCAN_MAX)
+    measure.add_argument("--split", type=int, help="A merged PR number: the baseline is the --count merged before it, the after is --count from it on")
+    measure.add_argument("--json", action="store_true", help="Machine-readable rows")
 
 
 # ---------------------------------------------------------------- `pr-explain` (#179, slice L6)
