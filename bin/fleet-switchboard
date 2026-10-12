@@ -14563,13 +14563,13 @@ def add_impact_parsers(sub):
 #
 # OpenCode v2 silently registers an agent whose front matter does not parse as a default PRIMARY agent with a handful of rules. The service is
 # asked (`opencode api GET /api/agent`, read-only) and each of our agents is compared with this table: its mode and a MINIMUM rule count. The
-# minimum sits well above what a default agent gets (10 to 14) and below what the file defines, so a failed parse fails it and a normal
+# minimum sits above what a default agent gets (10 to 14) and at or below what the file defines, so a failed parse fails it and a normal
 # edit does not. A service that is not running is said, not failed: nothing was installed wrongly.
 EXPECTED_AGENTS = {
     "chief-of-staff": ("primary", 150),
     "cos-subagent": ("primary", 150),
-    "orchestrator": ("primary", 14),
-    "coder": ("primary", 14),
+    "orchestrator": ("primary", 16),
+    "coder": ("primary", 16),
     "reviewer-code": ("subagent", 35),
     "reviewer-architecture": ("subagent", 35),
     "reviewer-security": ("subagent", 35),
@@ -14616,7 +14616,7 @@ def cmd_agents(args, runner, now):
     state, payload = agents_found(runner, args.opencode, args.timeout)
     if state == "down":
         print("agents: the OpenCode service is not running or not reachable, so nothing was checked (%s). Start it, then run this again." % payload)
-        return EXIT_OK
+        return EXIT_ERROR if args.strict else EXIT_OK
     if state == "bad":
         sys.stderr.write("%s: agents verify: %s\n" % (PROG, payload))
         return EXIT_ERROR
@@ -14637,6 +14637,7 @@ def add_agents_parsers(sub):
                                    description="Reads `opencode api GET /api/agent` and fails (exit 1) when an agent of the kit is missing, has the wrong mode or "
                                                "too few rules. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
+    verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 

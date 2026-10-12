@@ -36248,7 +36248,7 @@ class TestAgentsVerify(unittest.TestCase):
     def test_too_few_rules_and_a_missing_agent_fail(self):
         code, out, err = self.run_verify(self.listing(**{"coder": ("primary", 11), "reviewer-test": ("subagent", 5)}).replace('"id": "reviewer-impact"', '"id": "someone-else"'))
         self.assertEqual(code, 1)
-        self.assertIn("coder: 11 rules, expected at least 14", out)
+        self.assertIn("coder: 11 rules, expected at least 16", out)
         self.assertIn("reviewer-test: 5 rules, expected at least 35", out)
         self.assertIn("reviewer-impact: not registered", out)
 
@@ -36258,6 +36258,19 @@ class TestAgentsVerify(unittest.TestCase):
                 code, out, err = self.run_verify(**kwargs)
                 self.assertEqual(code, 0)
                 self.assertIn("not running or not reachable, so nothing was checked", out)
+
+    def test_strict_makes_a_service_that_is_not_running_a_failure(self):
+        out, err = io.StringIO(), io.StringIO()
+        def down(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ):
+            self.assertEqual(sb.main(["agents", "verify", "--strict"], runner=down), 1)
+            self.assertEqual(sb.main(["agents", "verify"], runner=down), 0)
+        self.assertEqual(out.getvalue().count("nothing was checked"), 2)
+
+    def test_the_coder_and_orchestrator_floor_is_above_what_a_default_agent_gets(self):
+        self.assertGreater(sb.EXPECTED_AGENTS["coder"][1], 14)   # the default plan agent has 14 rules
+        self.assertGreater(sb.EXPECTED_AGENTS["orchestrator"][1], 14)
 
     def test_an_answer_that_is_not_the_agent_list_fails(self):
         code, out, err = self.run_verify("<html>not json</html>")
@@ -36276,6 +36289,7 @@ class TestAgentsVerify(unittest.TestCase):
                 self.assertLess(floor, defined + 12, name)
         self.assertIn("agents verify", (REPO / "INSTALL.md").read_text())
         self.assertIn("agents verify", (REPO / "docs" / "switchboard.md").read_text())
+        self.assertIn("--strict", (REPO / "INSTALL.md").read_text())
 
 
 class TestOwnReviewLaws(unittest.TestCase):
