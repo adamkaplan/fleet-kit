@@ -8521,7 +8521,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -8531,7 +8531,8 @@ ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "c
 # #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
-ROLE_BYTE_LIMITS = {"coder": 6800, "orchestrator": 10650, "chief-of-staff": 11650, "cos-subagent": 3500}
+# one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+ROLE_BYTE_LIMITS = {"coder": 7250, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8681,6 +8682,27 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         self.assertIn("keeps you **focused on your job**", text)
         self.assertNotIn("never merge,", text)
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
+
+
+class TestVerdictRecordingText(unittest.TestCase):
+    """The reviewer and tester roles record their verdict in ONE command as the last step of the review they already do (text only)."""
+    ONE = 'fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --evidence'
+
+    def test_the_skill_and_the_coder_definitions_say_the_one_command_and_the_per_scenario_fallback(self):
+        for rel in ("skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/copilot/coder.agent.md"):
+            with self.subTest(file=rel):
+                text = " ".join((REPO / rel).read_text().split())
+                self.assertIn(self.ONE, text)
+                self.assertIn("per-scenario form" if "SKILL" in rel else "until then record each scenario", text)
+                self.assertIn("A push voids it", text)
+
+    def test_the_orchestrator_definitions_point_at_it_and_the_planning_skill_says_owner_evaluators_are_rare(self):
+        for rel in ("agents/opencode/orchestrator.md", "agents/copilot/orchestrator.agent.md"):
+            with self.subTest(file=rel):
+                self.assertIn("Reviewers and testers record their verdicts when they finish", (REPO / rel).read_text())
+        planning = " ".join((REPO / "skills" / "fleet-planning" / "SKILL.md").read_text().split())
+        self.assertIn("Owner evaluators are rare", planning)
+        self.assertIn("a coder's only extra step is `prove`", planning)
 
 
 class TestPlanningSkill(unittest.TestCase):
