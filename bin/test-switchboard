@@ -1347,6 +1347,22 @@ class TestStatus(Base):
                           ["/opt/herdr", "plugin", "list"]])  # PR 16: whether herdr lists the plugin; read-only
         self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
 
+    def test_an_unknown_config_key_is_shown_with_the_nearest_known_key(self):
+        self.write_config({"opencode": "/opt/lab/bin/opencode", "herdr": "/opt/herdr", "batch_secs": 5, "policy": {"budgetms": 5}, "zzz_unrelated": 1})
+        code, out, err = self.status(routed())
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"(?m)^WARN  config +batch_secs is not read by this tool \(did you mean batch_seconds\?\)$")
+        self.assertRegex(out, r"(?m)^WARN  config +policy\.budgetms is not read by this tool \(did you mean budget_ms\?\)$")
+        self.assertRegex(out, r"(?m)^WARN  config +zzz_unrelated is not read by this tool$")   # nothing close: no guess
+        self.assertEqual(out.count("WARN  config"), 3)
+        self.assertIn("batch_secs", err)   # and still on stderr
+
+    def test_a_clean_config_shows_no_warning_even_after_an_earlier_load_saw_one(self):
+        sb.warn_unknown_config("x", "", ["leftover"], ["opencode"])
+        self.write_config({"opencode": "/opt/lab/bin/opencode", "herdr": "/opt/herdr"})
+        code, out, err = self.status(routed())
+        self.assertNotIn("WARN  config", out)
+
     def test_unconfigured_v2_is_reported_and_never_run(self):
         # A bare name would be resolved through PATH, which can find OpenCode v1.
         runner = routed()

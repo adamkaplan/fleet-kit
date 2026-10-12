@@ -49,6 +49,7 @@ import hashlib
 import hmac
 import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import difflib
 import json
 import math
 import os
@@ -359,24 +360,43 @@ def _is_number(value):
 
 
 _WARNED_CONFIG = set()
+UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
+TOP_LEVEL_EXTRA_KEYS = {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold"}
 
 
-def warn_unknown_config(message):
+def config_known_keys():
+    return sorted(set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS)
+
+
+def warn_unknown_config(message, section="", names=(), known=()):
     """A key this tool does not read is WARNED about (once per message per process), never refused: a newer config must not break an older
-    CLI (a worktree branched before a key existed). A wrong TYPE or value on a key it does read still refuses."""
+    CLI (a worktree branched before a key existed). A wrong TYPE or value on a key it does read still refuses. The key is also remembered with
+    the nearest known key (a likely typo), so `status` can show it: a warning on stderr alone is easy to miss in a daemon."""
+    for name in names:
+        close = difflib.get_close_matches(str(name), [str(k) for k in known], n=1, cutoff=0.6)
+        UNKNOWN_CONFIG[(section, str(name))] = close[0] if close else None
     if message not in _WARNED_CONFIG:
         _WARNED_CONFIG.add(message)
         sys.stderr.write("%s: warning: %s (ignored)\n" % (PROG, message))
+
+
+def unknown_config_lines():
+    """One line per unknown key seen while loading the config: `<section.>key (did you mean <nearest>?)`."""
+    lines = []
+    for (section, name), close in sorted(UNKNOWN_CONFIG.items()):
+        where = "%s.%s" % (section, name) if section else name
+        lines.append("%s is not read by this tool%s" % (where, " (did you mean %s?)" % close if close else ""))
+    return lines
 
 
 def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - TOP_LEVEL_EXTRA_KEYS)
     if unknown:
         warn_unknown_config(
-            "%s contains key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+            "%s contains key(s) this tool does not read: %s" % (source, ", ".join(unknown)), '', unknown, config_known_keys())
     config = dict(DEFAULTS)
     config["opencode_env"], config["launch_env"] = {}, {}
     config.update(raw)
@@ -512,7 +532,7 @@ def validate_external_config(config, source):
         raise ConfigError("%s: 'external_decisions' must be an object, got %r" % (source, type(raw).__name__))
     unknown = sorted(set(raw) - set(EXTERNAL_DEFAULTS))
     if unknown:
-        warn_unknown_config("%s: 'external_decisions' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+        warn_unknown_config("%s: 'external_decisions' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)), 'external_decisions', unknown, list(EXTERNAL_DEFAULTS))
     section = dict(EXTERNAL_DEFAULTS, **raw)
     where = "%s: 'external_decisions" % source
     if not isinstance(section["enabled"], bool):
@@ -2489,7 +2509,7 @@ def _checked_jev_settings(jev, source):
     unknown = sorted(set(jev) - set(JEV_DEFAULTS))
     if unknown:
         warn_unknown_config("%s: 'jev' contains key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(JEV_DEFAULTS)))
+                          % (source, ", ".join(unknown), ", ".join(JEV_DEFAULTS)), 'jev', unknown, list(JEV_DEFAULTS))
     settings = dict(JEV_DEFAULTS, **jev)
     for name in ("model", "url", "key_env"):
         if not isinstance(settings[name], str) or not settings[name].strip():
@@ -4178,7 +4198,7 @@ def validate_report_triage_config(config, source):
     unknown = sorted(set(raw) - set(REPORT_TRIAGE_DEFAULTS))
     if unknown:
         warn_unknown_config("%s: 'report_triage' contains key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(REPORT_TRIAGE_DEFAULTS)))
+                          % (source, ", ".join(unknown), ", ".join(REPORT_TRIAGE_DEFAULTS)), 'report_triage', unknown, list(REPORT_TRIAGE_DEFAULTS))
     settings = dict(REPORT_TRIAGE_DEFAULTS, **raw)
     if not _is_number(settings["owed_threshold"]) or not 0 < settings["owed_threshold"] <= 1:
         raise ConfigError("%s: 'report_triage.owed_threshold' must be a number above 0 and at most 1, got %r"
@@ -6644,7 +6664,7 @@ def validate_sweep_config(config, source):
     unknown = sorted(set(raw) - set(SWEEP_DEFAULTS))
     if unknown:
         warn_unknown_config("%s: 'sweep' has key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(SWEEP_DEFAULTS)))
+                          % (source, ", ".join(unknown), ", ".join(SWEEP_DEFAULTS)), 'sweep', unknown, list(SWEEP_DEFAULTS))
     section = dict(SWEEP_DEFAULTS, **raw)
     where = "%s: 'sweep" % source
     if not isinstance(section["enabled"], bool):
@@ -7338,7 +7358,7 @@ def validate_triage_config(config, source):
     unknown = sorted(set(raw) - set(TRIAGE_DEFAULTS))
     if unknown:
         warn_unknown_config("%s: 'triage' has key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)))
+                          % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)), 'triage', unknown, list(TRIAGE_DEFAULTS))
     section = dict(TRIAGE_DEFAULTS, **raw)
     where = "%s: 'triage" % source
     for key in ("enabled", "daily_summary"):
@@ -7999,7 +8019,7 @@ def validate_friction_config(config, source):
         raise ConfigError("%s: 'friction_wake' must be an object, got %r" % (source, type(raw).__name__))
     unknown = sorted(set(raw) - set(FRICTION_DEFAULTS))
     if unknown:
-        warn_unknown_config("%s: 'friction_wake' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)))
+        warn_unknown_config("%s: 'friction_wake' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)), 'friction_wake', unknown, list(FRICTION_DEFAULTS))
     section = dict(FRICTION_DEFAULTS, **raw)
     where = "%s: 'friction_wake" % source
     if not isinstance(section["enabled"], bool):
@@ -10167,6 +10187,7 @@ def _v2_summary(info):
 def collect_status(runner=subprocess.run, now=time.time, platform=None):
     report = {"version": VERSION}
     path = config_path()
+    UNKNOWN_CONFIG.clear()   # what this status finds in this file, not what an earlier load in the process found
     config_ok, config = _check(lambda: load_config(path))
     report["config"] = {"path": str(path), "exists": path.exists(), "ok": config_ok}
     if config_ok:
@@ -10183,6 +10204,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         })
     else:
         report["config"]["error"] = config
+    report["config"]["unknown_keys"] = unknown_config_lines()   # found by the load above (warned, ignored)
 
     state_ok, state = _check(lambda: str(ensure_state_dir()))
     report["state_dir"] = {"path": str(state_dir_path()), "ok": state_ok}
@@ -10382,6 +10404,8 @@ def format_status(report):
                         config["poll_seconds"]))
     else:
         lines.append("%s config     %s" % (mark(config), config["error"]))
+    for note in config.get("unknown_keys", ()):
+        lines.append("WARN  config     %s" % note)
     lines.extend(format_config_lines(report.get("daemon")))  # PR 16: the daemon's own account of its config
     state = report["state_dir"]
     lines.append("%s state      %s" % (mark(state), state["path"] if state["ok"] else state["error"]))
@@ -14775,7 +14799,7 @@ def validate_policy_config(config, source):
     unknown = sorted(set(raw) - set(POLICY_DEFAULTS))
     if unknown:
         warn_unknown_config("%s: 'policy' contains key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(POLICY_DEFAULTS)))
+                          % (source, ", ".join(unknown), ", ".join(POLICY_DEFAULTS)), 'policy', unknown, list(POLICY_DEFAULTS))
     settings = dict(POLICY_DEFAULTS, **raw)
     if not isinstance(settings["enabled"], bool):
         raise ConfigError("%s: 'policy.enabled' must be true or false, got %r" % (source, settings["enabled"]))
