@@ -2365,7 +2365,7 @@ Whether a PR is held for the owner, and why, is state in **labels** the switchbo
 (`<user>:...`, the OS user). `fleet-switchboard labels ensure` creates them in every watched repo (or `--repo`), idempotently and with
 each repo's own gh account: `<user>:merge-captain` (held for the owner), `<user>:merge-automatic` (merges on green CI and independent
 review), and the reasons a PR is held, one or more of `<user>:hold-security`, `hold-credential`, `hold-contract`, `hold-policy`,
-`hold-prod-config`, `hold-other-area` (an area owned by another team).
+`hold-prod-config`, `hold-other-area` (an area owned by another team), `hold-impact` (the impact floor or an independent rating, #179: written by the switchboard).
 
 **One rule, one helper.** `is_captain(pr)` (a dict with `labels` and `body`) is the only place that decides it, used by the PR facts
 (and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the
@@ -4172,6 +4172,18 @@ and **size is never a hold by itself**. The independent rating (`--rating Critic
 (the single source; `Eliminated` is not rated) and **can only add a hold, never lower the floor**: `hold` when the floor holds or any rated cell is `H`, `second-review` for a `2` cell, else `none`.
 The daemon's pass (`impact_would_hold_pass`, after the ci recorder, off with `impact_floor.enabled: false` or the global `plan-gates.off` file) judges each open PR of the repos under `plan_gates` once per head,
 at most 6 `gh pr view` reads per pass, and records `gate.would_hold` in the audit. **It writes no label, comment or ledger entry**: applying `hold-impact` is slice L4. **An unreadable diff fails towards hold:** when GitHub lists fewer files than the PR changed (its list is capped), or a renamed or copied file has no known source path, the floor decides `hold` with the reason `floor unknown` and the daemon records it (`unknown` in `gate.would_hold`); a rename whose old path is known counts through the old path like a deletion.
+
+**The impact hold writes the labels (#179, slice L4).** A NEW write authority, **off unless the config says `"impact_hold": {"enabled": true}`** (the one line a person flips; `dry_run: true` audits
+`gate.would_hold` and writes nothing; `repos.<owner/repo>.enabled: false` stops one repo; the global `plan-gates.off` file stops everything). When on, the daemon's pass (after the ci recorder, for the open
+non-draft PRs of the repos under `plan_gates` that name floor globs, at most 6 `gh pr view` reads per pass plus a one-time label ensure per repo) adds **`<user>:merge-captain`** and **`<user>:hold-impact`**
+to a PR whose deterministic floor says hold, **or unknown** (an unreadable diff), or whose recorded independent impact review for that exact head says `hold` (`review record --reviewer impact --impact-action hold`;
+it can only ADD a hold, never lower the floor). It writes **labels only, no comment**, with the repo's own account (`gh_users`), within about five minutes of a PR opening or its head moving (the list cache is 3 minutes);
+the audit carries `gate.would_hold` (the matched paths, globs and reasons) and `gate.hold_applied` (the labels added). It adds only the labels that are missing and **never removes one**, judges each head once, and retries a
+failed write after 5 minutes. The PR then behaves as any held PR: the captain decision shows it and G6 is waiting; **to make the shim refuse the merge, list G6 in the repo's `enforce_gates`** (a person's config edit).
+`fleet-switchboard impact hold --dry-run [--repo R]` shows, read-only, what the daemon would label now. **Only the owner clears a false hold**, from the owner's own terminal:
+`fleet-switchboard impact clear <repo#N> --reason TEXT` (at least 10 characters) records the clear for **that head** in `impact-hold.json` (so the daemon does not re-add it; a new head is judged again), removes `hold-impact`
+and the `merge-captain` the switchboard itself added, and audits `gate.hold_cleared`; the Chief of Staff and every agent are refused (`gate.hold_clear_refused`): G6 is never waivable by the Chief of Staff. Like every label while agents share one
+GitHub account, the hold is a **guardrail, not a boundary**: whoever can edit labels can remove it, and a removal with no `impact clear` is re-added the next time the daemon restarts and judges that head again.
 
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
 verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:

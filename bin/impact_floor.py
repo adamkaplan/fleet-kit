@@ -154,3 +154,39 @@ def decide(floor_hit, rated, unknown=None):
     if any(action == ACTION_SECOND for _, _, _, action in rated):
         return "second-review", ["rating: a medium-band impact asks for a second independent review"]
     return "none", []
+
+
+def validate_hold_config(raw):
+    """Raise ValueError naming the key when `impact_hold` is not {enabled?, dry_run?, calls_per_pass?, repos: {owner/repo: {enabled}}}.
+    The hold is OFF unless `enabled` is true (the one line a person flips)."""
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ValueError("'impact_hold' must be an object")
+    unknown = sorted(set(raw) - {"enabled", "dry_run", "calls_per_pass", "repos"})
+    if unknown:
+        raise ValueError("'impact_hold' has key(s) this tool does not read: %s" % ", ".join(unknown))
+    for key in ("enabled", "dry_run"):
+        if key in raw and not isinstance(raw[key], bool):
+            raise ValueError("'impact_hold.%s' must be true or false" % key)
+    calls = raw.get("calls_per_pass", 1)
+    if not isinstance(calls, int) or isinstance(calls, bool) or calls < 0:
+        raise ValueError("'impact_hold.calls_per_pass' must be a whole number, 0 or more")
+    repos = raw.get("repos", {})
+    if not isinstance(repos, dict):
+        raise ValueError("'impact_hold.repos' must be an object keyed by owner/repo")
+    for name, entry in repos.items():
+        if not isinstance(entry, dict) or set(entry) - {"enabled"} or not isinstance(entry.get("enabled", True), bool):
+            raise ValueError("'impact_hold.repos.%s' must be {\"enabled\": true|false}" % name)
+
+
+def hold_mode(config, repo):
+    """"off" (the default: nothing is written), "dry-run" (decisions are audited, nothing is written) or "enforce", for `repo`.
+    A per-repo `enabled: false` stops the writes for that repo."""
+    section = (config or {}).get("impact_hold") or {}
+    if section.get("enabled") is not True:
+        return "off"
+    for name, entry in (section.get("repos") or {}).items():
+        if name.lower() == (repo or "").lower() and entry.get("enabled") is False:
+            return "off"
+    return "dry-run" if section.get("dry_run") else "enforce"

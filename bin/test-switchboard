@@ -16552,6 +16552,8 @@ class TestCaptainLabels(Base):
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-security", "merge-captain", "hold-contract", "hold-other-area")),
                          ["contract", "other-area", "security"])
         self.assertEqual(sb.pr_hold_reasons(["bug", None, 5]), [])
+        self.assertEqual(sb.pr_hold_reasons(self.labels("hold-impact", "merge-captain")), ["impact"])   # #179 L4: the same held-PR label set
+        self.assertTrue(sb.pr_marker_state(self.labels("merge-captain", "hold-impact"), "")["captain"])
 
     def test_the_pr_facts_use_the_labels_and_carry_the_holds(self):
         data = dict(json.loads(pr_view_json()), body="plain", headRefOid="a" * 40, author={"login": "coder-bot"},
@@ -19377,6 +19379,231 @@ class TestImpactFloorCommandAndPass(LedgerBase):
                 sb.impact_would_hold_pass(engine, 100000.0)
                 self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [])
         (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+
+
+class TestImpactHold(LedgerBase):
+    """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
+    owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
+
+    def setUp(self):
+        super().setUp()
+        self.writes = []
+        self.hold_config = {"enabled": True}
+        self.floor_pr()
+        self.t = 100000.0
+        self.reconfigure()
+        self.names = sb.label_names(sb.load_config())
+
+    def reconfigure(self):
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}, impact_hold=self.hold_config)
+        self.configure()
+        if hasattr(self, "engine_cached"):
+            del self.engine_cached
+
+    def floor_pr(self, path="migrations/0002.sql", head=LEDGER_HEAD):
+        self.pr.update({"headRefOid": head, "changedFiles": 1, "files": [{"path": path}]})
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "GET" and "/issues?state=open" in argv[2]:                 # the open list, for the dry run
+                items = [{"number": 9, "pull_request": {"url": "x"}, "body": "PLAN: acme/app#7", "labels": [], "user": {"login": "shared"}}]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(items if "page=1" in argv[2] else []), "")
+            if method == "GET":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")            # a label that already exists
+            self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return super().route(argv, **kwargs)
+
+    def listed(self, head=LEDGER_HEAD, labels=(), number=9, draft=False):
+        return {"number": number, "head": {"sha": head}, "body": "PLAN: acme/app#7", "draft": draft, "labels": [{"name": l} for l in labels]}
+
+    def passes(self, records=None, advance=0, hub=None):
+        self.t += advance
+        if not hasattr(self, "engine_cached"):
+            self.hub = hub or FakeHub({"acme/app": records or [self.listed()]})
+            engine = self.world.new_engine("daemon")
+            engine.hub, engine.gh_runner = self.hub, self.route
+            engine.config, engine.state_dir = sb.load_config(), self.world.state
+            self.engine_cached = engine
+        elif records is not None:
+            self.hub.prs["acme/app"] = records
+        sb.ci_record_pass(self.engine_cached, self.t)
+        sb.impact_would_hold_pass(self.engine_cached, self.t)
+
+    def label_writes(self):
+        return [w for w in self.writes if w[1].endswith("/labels") and w[0] == "POST"]
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_a_floor_path_is_labelled_within_one_pass_with_both_labels_and_the_reason_is_audited(self):
+        self.passes()
+        (write,) = self.label_writes()
+        self.assertEqual(write[1], "repos/acme/app/issues/9/labels")
+        self.assertEqual(write[2], {"labels": [self.names["merge-captain"], self.names["hold-impact"]]})
+        (applied,) = self.events("gate.hold_applied")
+        self.assertEqual((applied["detail"]["floor_paths"], applied["detail"]["labels"]), (["migrations/0002.sql"], write[2]["labels"]))
+        self.assertTrue(applied["detail"]["globs"])
+        self.assertEqual([w for w in self.writes if w[1].endswith("/comments")], [], "labels only: no comment")
+        labelled = {"labels": [{"name": n} for n in write[2]["labels"]], "body": ""}
+        self.assertTrue(sb.is_captain(labelled))                                          # the PR now behaves as a held PR
+
+    def test_a_harmless_change_is_not_held_and_a_doc_path_never_is(self):
+        self.floor_pr(path="src/app.py")
+        self.passes()
+        self.floor_pr(path="docs/migrations/x.md")
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=400)
+        self.assertEqual(self.writes, [])
+
+    def test_it_is_off_by_default_and_a_per_repo_flag_and_the_global_off_file_stop_the_writes(self):
+        for name, edit in (("default", None), ("repo", {"enabled": True, "repos": {"acme/app": {"enabled": False}}}), ("off", "file")):
+            with self.subTest(name=name):
+                self.writes.clear()
+                (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+                self.hold_config = edit if isinstance(edit, dict) else {"enabled": True}
+                if edit is None:
+                    self.hold_config = {}
+                if edit == "file":
+                    (self.world.state / "plan-gates.off").write_text("")
+                self.reconfigure()
+                self.passes()
+                self.assertEqual(self.writes, [])
+        (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+        self.assertEqual(sb.impact_floor.hold_mode({}, "acme/app"), "off")
+
+    def test_dry_run_mode_audits_what_it_would_do_and_writes_nothing(self):
+        self.hold_config = {"enabled": True, "dry_run": True}
+        self.reconfigure()
+        self.passes()
+        self.assertEqual(self.writes, [])
+        (event,) = self.events("gate.would_hold")
+        self.assertTrue(event["detail"]["advisory"])
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would add", out)
+        self.assertIn("1 PR(s) would be held (a dry run: nothing was written", out)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.run_as("coder", "impact", "hold")[0], 2, "by hand only --dry-run exists: the daemon writes")
+
+    def test_it_never_flaps_labels_once_a_moved_head_is_judged_again_and_a_labelled_pr_is_not_written_twice(self):
+        for n in range(5):
+            self.passes(advance=n * 400)
+        self.assertEqual(len(self.label_writes()), 1)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "the daemon never removes a label")
+        self.floor_pr(head=LEDGER_NEW_HEAD)
+        both = [self.names["merge-captain"], self.names["hold-impact"]]
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=both)], advance=2000)
+        self.assertEqual(len(self.label_writes()), 1, "already labelled: nothing to add")
+        self.floor_pr(head="c" * 40)
+        self.passes(records=[self.listed(head="c" * 40)], advance=4000)           # labels gone from the fresh PR picture: added again
+        self.assertEqual(len(self.label_writes()), 2)
+
+    def test_only_the_missing_label_is_added(self):
+        self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
+        (write,) = self.label_writes()
+        self.assertEqual(write[2], {"labels": [self.names["hold-impact"]]})
+        (applied,) = self.events("gate.hold_applied")
+        self.assertEqual(applied["detail"]["labels"], [self.names["hold-impact"]])
+
+    def test_the_owner_clear_is_honoured_for_that_head_only_and_removes_what_the_switchboard_added(self):
+        self.passes()
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")
+        self.assertEqual(code, 0, err)
+        deletes = sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE")
+        self.assertEqual(deletes, sorted(n.replace(":", "%3A") for n in (self.names["merge-captain"], self.names["hold-impact"])))
+        self.assertEqual(len(self.events("gate.hold_cleared")), 1)
+        before = len(self.label_writes())
+        self.passes(advance=1000)
+        self.passes(records=[self.listed()], advance=4000)
+        self.assertEqual(len(self.label_writes()), before, "the same head: not re-added")
+        self.floor_pr(head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=8000)
+        self.assertEqual(len(self.label_writes()), before + 1, "a new head is held again")
+
+    def test_a_clear_keeps_a_merge_captain_label_the_switchboard_did_not_add(self):
+        self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        deletes = [w[1] for w in self.writes if w[0] == "DELETE"]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("hold-impact", deletes[0])
+
+    def test_cos_and_every_agent_are_refused_the_clear_and_nothing_is_written_or_recorded(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.passes()
+        before = list(self.writes)
+        for who in ("cos", "coder", "other"):
+            code, out, err = self.run_as(who, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")
+            self.assertEqual(code, 2, who)
+            self.assertIn("only the owner", err)
+        self.assertEqual(self.writes, before)
+        self.assertEqual(len(self.events("gate.hold_clear_refused")), 3)
+        self.assertFalse((self.world.state / sb.IMPACT_STATE_FILE).exists() and sb.read_impact_state(self.world.state)["clears"])
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "short")
+        self.assertEqual(code, 2)
+        self.assertIn("at least 10 characters", err)
+
+    def test_an_unreadable_diff_holds_as_unknown_and_is_labelled(self):
+        self.pr.update({"changedFiles": 3000, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})
+        self.passes()
+        (write,) = self.label_writes()
+        self.assertEqual(len(write[2]["labels"]), 2)
+        self.assertIn("floor unknown", " ".join(self.events("gate.hold_applied")[0]["detail"]["reasons"]))
+
+    def test_the_independent_impact_reviewer_can_add_a_hold_but_a_clean_floor_is_otherwise_untouched(self):
+        self.floor_pr(path="src/app.py")
+        self.passes()
+        self.assertEqual(self.writes, [])
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact",
+                                                       "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold",
+                                                       "summary": "x"}, 1)
+        self.passes(advance=10)
+        (write,) = self.label_writes()
+        self.assertEqual(len(write[2]["labels"]), 2)
+        self.assertIn("independent impact reviewer", " ".join(self.events("gate.hold_applied")[0]["detail"]["reasons"]))
+        self.passes(advance=500)
+        self.assertEqual(len(self.label_writes()), 1)
+
+    def test_a_review_record_at_another_head_or_a_non_hold_action_adds_nothing(self):
+        self.floor_pr(path="src/app.py")
+        for head, action in (("d" * 40, "hold"), (LEDGER_HEAD, "none")):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact",
+                                                           "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "impact_action": action,
+                                                           "summary": "x"}, 1)
+        self.passes()
+        self.assertEqual(self.writes, [])
+
+    def test_only_repos_under_plan_gates_are_written_and_the_call_budget_bounds_a_pass(self):
+        self.hub = FakeHub({"acme/app": [self.listed(number=n) for n in range(20, 30)], "acme/other": [self.listed(number=3)]})
+        self.passes(hub=self.hub)
+        self.assertTrue(all("acme/other" not in w[1] for w in self.writes))
+        self.assertLessEqual(len(self.label_writes()), 1, "13 label-ensure reads are charged once, then at most one PR fits the 6-call pass")
+        self.assertLessEqual(len(self.writes), 3)
+
+    def test_a_failed_write_is_retried_later_not_marked_done(self):
+        base = self.route
+        fail = {"on": True}
+
+        def flaky(argv, **kw):
+            if fail["on"] and argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST":
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            return base(argv, **kw)
+        self.route = flaky
+        self.passes()
+        self.assertEqual(self.label_writes(), [])
+        self.assertTrue(self.events("impact.error"))
+        fail["on"] = False
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(len(self.label_writes()), 1)
+
+    def test_the_hold_config_is_validated_and_the_label_is_in_the_held_set(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in ({"enabled": "yes"}, {"dry_run": 1}, {"when": 1}, {"repos": {"acme/app": {"enabled": "no"}}}, {"calls_per_pass": -1}, []):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, impact_hold=bad))
+        sb.validate_config(dict(base, impact_hold={"enabled": True, "dry_run": False, "repos": {"acme/app": {"enabled": False}}}))
+        self.assertIn("hold-impact", sb.CAPTAIN_HOLD_LABELS)
+        self.assertIn("hold-impact", [k for k, _, _ in sb.LABEL_SPECS])
 
 
 class TestCiRecordPass(LedgerBase):
@@ -28595,7 +28822,7 @@ class TestSupersede(WriteWorld):
 
 class TestLabelsEnsure(WriteWorld):
     NEW = ("parked", "merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
-           "hold-prod-config", "hold-other-area")
+           "hold-prod-config", "hold-other-area", "hold-impact")
     WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()]
                   + ["%s:%s" % (sb.orchestrator_label().split(":")[0], k) for k in NEW])
 
