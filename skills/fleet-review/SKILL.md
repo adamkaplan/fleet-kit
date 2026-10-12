@@ -22,4 +22,6 @@ Then fix the blocking findings (each cites a rule; a finding that cites none is 
 a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (shadow, not counted)` line with how many of the five recorded at the current head; it does not block you yet.
 
 Their result is feedback for you. It never replaces the independent review agent's verdict, and a hold is never decided by you or by a reviewer: the switchboard's matrix and path floor decide it.
+After an install, check that OpenCode registered each reviewer as written: `opencode api GET /api/agent` lists every agent with its `mode` and rule count (a reviewer must show mode `subagent` and about 40 rules). An agent whose front matter does not parse is silently registered as a default primary agent with a handful of rules and cannot be invoked as a subagent; quote any `description:` that contains a colon.
+
 If you were asked to review a pull request rather than to author one, you are the independent reviewer, not one of these five: follow your own brief.
