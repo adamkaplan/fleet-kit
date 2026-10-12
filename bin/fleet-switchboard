@@ -14551,7 +14551,7 @@ def cmd_review_measure(args, runner, now):
         if not isinstance(prs, list):
             raise ReviewError("gh pr list answered something that is not a list")
         entries, problem = plan_ledger.read_ledger(state)
-        if problem:
+        if problem:   # fail open on purpose (R-CODE-2): the figures are a read-only report, so say it loudly and carry on with the intact entries
             sys.stderr.write("%s: review measure: the review ledger is damaged (%s): blank review columns may be missing records\n" % (PROG, _one_line(problem, 200)))
         base, after = measure_groups(prs, args.count, args.split)
         rows = lambda group: [measure_row(p, entries, prs, args.repo) for p in group]

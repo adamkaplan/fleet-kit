@@ -36845,7 +36845,16 @@ class TestReviewerSubagents(LedgerBase):
         self.assertEqual(code, 0, err)
         self.assertIn("BASELINE (2 PRs", out)
         self.assertNotIn("AFTER", out)
-        self.assertIn(" -  ", out.split("\n")[2] + "  ", "a missing figure prints as a dash")
+        row = out.split("\n")[2].split()
+        self.assertEqual(row[-4:-1], ["-", "-", "-"], "no recorded review: rounds, blocks and notes print as dashes")
+
+    def test_review_measure_warns_loudly_and_carries_on_when_the_ledger_chain_is_damaged(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], "line 3: the chain breaks")):
+            code, out, err = self.review("coder", "measure", "acme/app", "--count", "1", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("review ledger is damaged (line 3: the chain breaks)", err)
+        self.assertIsNone(json.loads(out)["baseline"][0]["rounds"])
 
     def test_review_measure_reads_the_ledger_for_this_repository_only(self):
         self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
