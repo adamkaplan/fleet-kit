@@ -8645,12 +8645,12 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
                  "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
                  "Permission doesn't travel", "An empty queue is not a mandate")
-HYGIENE_MAXIMS = ("Chesterton's fence", "Cut the root, not the branch", "Say it failed")
+HYGIENE_MAXIMS = ("Say it failed",)   # the one maxim the coder holds as a rule (R-CODE-1); the owner's two principles for how a coder works stay in the definition
 COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -8661,9 +8661,10 @@ ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "c
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
 # one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+# two maxims restored in the coder: +2 lines, +200 B
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
-ROLE_BYTE_LIMITS = {"coder": 7450, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7650, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -9084,7 +9085,7 @@ class TestAgentDefinitions(unittest.TestCase):
                 self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
-                    # the coding-hygiene maxims live in CODING_STANDARDS.md (R-CODE-1, 15, 16); the coder keeps a pointer, not the text
+                    # `Say it failed` lives in CODING_STANDARDS.md (R-CODE-1); the coder keeps a pointer, not the text. Chesterton's fence and cut the root stay in EVERY definition: Copilot coders and other installs load no global AGENTS.md
                     if role == "coder" and phrase in HYGIENE_MAXIMS:
                         self.assertNotIn(phrase, block)
                     else:

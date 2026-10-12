@@ -645,7 +645,7 @@ Behaviour is set by a few short maxims, not by long rules. A reasoning agent
 gets more from one well-chosen phrase than from a paragraph of conditions, and
 a short list stays read.
 
-**Shared by every role** (the coder holds Chesterton's fence, cut the root and say it failed as R-CODE-15, 16 and 1 of `CODING_STANDARDS.md`, where the reviewers enforce them, and keeps a pointer instead of the text: see `review measure`).
+**Shared by every role** (the coder keeps `Say it failed` as R-CODE-1 of `CODING_STANDARDS.md` and a pointer instead of the text: see `review measure`).
 
 - **Festina lente.** Make haste slowly: the careful step is the fast one.
 - **Chesterton's fence.** Know why something is there before removing it.
@@ -4346,7 +4346,7 @@ Check an installed reviewer with `opencode api GET /api/agent` (mode `subagent`,
 
 ### Measuring the hygiene cut, `review measure` (#179, slice L7)
 
-The coder definitions no longer carry the three coding-hygiene maxims (Chesterton's fence, cut the root, say it failed): they are rules R-CODE-15, R-CODE-16 and R-CODE-1 of `CODING_STANDARDS.md`, which the reviewers hold the change to, and the coder keeps one line saying so ("get it working first"). The orchestrator and the Chief of Staff keep the maxims: they do not write the code. Safety text (public names, never force-push, credentials) stays where it is.
+The coder definitions no longer carry `Say it failed`: it is rule R-CODE-1 of `CODING_STANDARDS.md`, which the reviewers hold the change to, and the coder keeps one line saying so ("get it working first"). Chesterton's fence and cut the root stay in every definition, the coder's too: they are standing principles for how a coder works, and Copilot coders and other installs load no global instructions file. Safety text (public names, never force-push, credentials) stays where it is.
 
 `fleet-switchboard review measure <owner/repo> [--count 10] [--scan 40] [--split <merged PR>] [--json]` is read-only (one `gh pr list` read, the local review ledger). Per merged PR it prints: lines changed; minutes from the first commit to green CI (to the latest completion among the PR's successful checks at its merged head, so a rerun inflates it); review rounds (distinct heads with a recorded review; blank when none was recorded); blocking findings and notes of the latest record per head and reviewer; and escaped defects (another PR merged within 14 days after it, titled Revert or Fix, naming it as `#N`). It then prints the medians of the BASELINE group (the `--count` PRs merged before the `--split` PR) and the AFTER group (the `--count` from it on), with minutes to green per 100 changed lines so larger changes are not read as slower. GitHub limits one read to 40 PRs. **Running agents load their definitions at start**: the AFTER group measures the new text only for PRs by agents restarted after the split, so choose the split PR accordingly. Small samples are anecdotes, not proof.
 

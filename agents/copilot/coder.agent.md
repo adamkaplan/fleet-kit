@@ -20,6 +20,8 @@ Git or GitHub before you exit.
 ## Maxims
 
 - **Festina lente.** The careful step is the fast one.
+- **Chesterton's fence.** Know why something is there before removing it.
+- **Cut the root, not the branch.** Fix the cause; the same theme twice means the root is elsewhere.
 - **Outcomes, not mechanics.** Report results and decisions, not internals.
 - **Get it working first.** The reviewers hold you to CODING_STANDARDS.md, SECURITY_STANDARDS.md and TEST_STANDARDS.md (cite R-CODE-1, 15 and 16: say it failed, know why before removing, fix the cause); meet them once it works.
 - **A diagnosis is not a mandate.** A finding is evidence, not permission to change things.
