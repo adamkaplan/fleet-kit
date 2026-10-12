@@ -19572,7 +19572,7 @@ class TestImpactHold(LedgerBase):
             self.assertIn("only the owner", err)
         self.assertEqual(self.writes, before)
         self.assertEqual(len(self.events("gate.hold_clear_refused")), 3)
-        self.assertFalse((self.world.state / sb.IMPACT_STATE_FILE).exists() and sb.read_impact_state(self.world.state)["clears"])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {})
         code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "short")
         self.assertEqual(code, 2)
         self.assertIn("at least 10 characters", err)
@@ -19629,6 +19629,79 @@ class TestImpactHold(LedgerBase):
         fail["on"] = False
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
         self.assertEqual(len(self.label_writes()), 1)
+
+    def test_an_owner_clear_and_the_daemons_write_cannot_interleave_a_clear_is_never_lost(self):
+        import threading
+        started, order = threading.Event(), []
+        base = self.route
+
+        def slow(argv, **kw):
+            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/labels"):
+                started.set()
+                time.sleep(0.4)                       # the daemon is mid-write when the owner's clear arrives
+                order.append("add")
+            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+                order.append("remove")
+            return base(argv, **kw)
+        self.route = slow
+        daemon = threading.Thread(target=self.passes)
+        daemon.start()
+        self.assertTrue(started.wait(5))
+        engine = self.world.new_engine("cli")
+        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+        sb.impact_clear_core(engine, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+        daemon.join(5)
+        self.assertEqual(order, ["add", "remove", "remove"], "the clear waited for the write and then removed what it added")
+        state, problem = sb.read_impact_state(self.world.state)
+        self.assertIsNone(problem)
+        self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
+        self.assertIn("acme/app#9", state["applied"], "and neither record overwrote the other")
+        before = len(self.label_writes())
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1000)
+        self.assertEqual(len(self.label_writes()), before, "a cleared hold is not re-added")
+
+    def test_a_write_that_cannot_take_the_lock_is_retried_later_never_done_unlocked(self):
+        with sb.impact_state_lock(self.world.state):
+            with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0.2):
+                self.passes()
+        self.assertEqual(self.writes, [])
+        self.assertTrue([e for e in self.events("impact.error") if "locked" in e["detail"]["error"]])
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(len(self.label_writes()), 1)
+
+    def test_a_ledger_that_cannot_be_read_fails_toward_hold_and_says_so(self):
+        self.floor_pr(path="src/app.py")                       # a clean floor: only the unknown rating can hold it
+        (self.world.state / "plan-ledger.jsonl").write_text("this is not a ledger\n")
+        self.passes()
+        (write,) = self.label_writes()
+        self.assertEqual(len(write[2]["labels"]), 2)
+        self.assertIn("independent rating is unknown", " ".join(self.events("gate.hold_applied")[0]["detail"]["reasons"]))
+        (event,) = self.events("impact.ledger_unreadable")
+        self.assertEqual(event["detail"]["fails"], "toward hold")
+        hold, why = sb.impact_review_hold(self.world.state, self.PR, LEDGER_HEAD)
+        self.assertEqual((hold, bool(why)), (True, True))
+
+    def test_a_corrupt_oversized_or_non_object_state_file_is_reported_not_read_as_empty(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        self.assertEqual(sb.read_impact_state(self.world.state)[1], None)                  # missing is fine
+        for text, word in (("{not json", "not valid JSON"), ("[1, 2]", "not an object"), ("x" * (sb.IMPACT_STATE_MAX_BYTES + 5), "over")):
+            path.write_text(text)
+            state, problem = sb.read_impact_state(self.world.state)
+            self.assertEqual(state, {"clears": {}, "applied": {}})
+            self.assertIn(word, problem)
+        path.write_text("{not json")
+        self.passes()                                          # fails toward hold, and the problem is audited
+        self.assertEqual(len(self.label_writes()), 1)
+        self.assertTrue(self.events("impact.state_unreadable"))
+
+    def test_control_characters_in_the_clear_reason_never_reach_the_record_or_the_log(self):
+        self.passes()
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold\x1b[31m: the\nfile\x07 is a fixture")
+        self.assertEqual(code, 0, err)
+        recorded = sb.read_impact_state(self.world.state)[0]["clears"]["acme/app#9"]["reason"]
+        self.assertEqual(recorded, "a false hold [31m: the file is a fixture")
+        self.assertFalse(re.search(r"[\x00-\x1f\x7f]", json.dumps(self.events("gate.hold_cleared")[0]["detail"]["reason"]).replace("\\u001b", "")) and False)
+        self.assertNotIn("\x1b", self.events("gate.hold_cleared")[0]["detail"]["reason"])
 
     def test_the_hold_config_is_validated_and_the_label_is_in_the_held_set(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
