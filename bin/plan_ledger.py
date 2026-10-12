@@ -497,25 +497,97 @@ def preflight(config, repo, ci_proven=None, cos_ready=None):
     return blocking, notes
 
 
-COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")
+COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")   # kept for callers that name them
+# What the Chief of Staff MUST be able to run (the way out of a refusal), and what it must NOT be able to run (turning enforcement ON is the
+# owner's). Judged by evaluating each probe against the installed definition's shell rules, not by looking for exact resource strings.
+COS_MUST_ALLOW = ("fleet-switchboard waive acme/app#1 --gates G1 --reason hotfix", "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off")
+COS_MUST_DENY = ("fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                 "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 30 fleet-switchboard gates mode acme/app ENFORCE", "timeout 5 fleet-switchboard gates on",
+                 "timeout 5 fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix",
+                 "fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix", "fleet-switchboard waive acme/app#1 --gates G8 --reason hotfix")
+
+
+def _frontmatter(text):
+    """The front matter of a definition (between the first two `---` lines), or None when the text has none."""
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        return None
+    return text[4:].split("\n---\n", 1)[0]
+
+
+def _permission_lines(text):
+    """The lines of the `permissions:` block of a definition's FRONT MATTER only (body prose is never read). A text with no front matter is
+    taken as a bare rule list (a test's or a tool's input)."""
+    front = _frontmatter(text)
+    if front is None:
+        return text.splitlines()
+    lines = front.splitlines()
+    return lines[lines.index("permissions:") + 1:] if "permissions:" in lines else []
+
+
+def cos_rules(text):
+    """The (action, resource, effect) rules of a definition's `permissions:` list, in order. Two shapes are read: the one-line flow
+    form `- {action: shell, resource: "x", effect: allow}` (the installed short list) and the older block form with `action:`,
+    `resource:` and `effect:` on separate lines."""
+    import json as _json
+    import re as _re
+    rules, action, resource = [], None, None
+    for raw in _permission_lines(text):
+        line = raw.strip()
+        flow = _re.fullmatch(r"-\s*\{action:\s*(.+?),\s*resource:\s*(\".*\"),\s*effect:\s*(allow|deny|ask)\s*\}", line)
+        if flow:
+            try:
+                rules.append((flow.group(1).strip().strip('"'), _json.loads(flow.group(2)), flow.group(3)))
+            except ValueError:
+                pass
+            continue
+        line = line[2:].strip() if line.startswith("- ") else line
+        if line.startswith("action:"):
+            action = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("resource:"):
+            resource = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("effect:") and resource is not None:
+            rules.append((action or "shell", resource, line.split(":", 1)[1].strip().strip('"')))
+            resource = None
+    return rules
+
+
+def _glob_match(pattern, command):
+    """OpenCode's whole-value glob: `*` any run, `?` one character; a trailing ` *` also matches the bare command."""
+    import re as _re
+    rx = "".join(".*" if c == "*" else "." if c == "?" else _re.escape(c) for c in pattern)
+    if pattern.endswith(" *"):
+        rx = rx[:-len(_re.escape(" ") + ".*")] + "(?: .*)?"
+    return _re.fullmatch(rx, command, _re.S) is not None
+
+
+def cos_allows(rules, command):
+    """True when the shell `rules` let `command` run, as v2 decides it: the LAST rule of the shell action (or the base `*`) that matches
+    wins, and a command no rule matches is denied. (So a deny only holds when it comes after the allow that would admit the command.)"""
+    verdict = "deny"
+    for action, resource, effect in rules:
+        if action in ("shell", "bash", "*") and _glob_match(resource, command):
+            verdict = effect
+    return verdict == "allow"
 
 
 def cos_lacking(text):
-    """What the installed chief-of-staff definition (its text, or None when unreadable) does not yet allow of COS_NEEDS: the
-    way out of a refusal. "" when both are allowed. A later `deny` of the same resource does not count as allowed."""
+    """What the installed chief-of-staff definition (its text, or None when unreadable) gets wrong about the way out of a refusal:
+    "" when it can run `waive` (G0 to G5), `gates mode <repo> shadow` and `gates off`, and CANNOT turn enforcement on (`gates mode ...
+    enforce`, `gates on`) or waive G6 or G8. A cos that could turn it on is as blocking as one that cannot turn it off."""
     if text is None:
         return "the installed chief-of-staff definition could not be read"
-    state = {}
-    resource = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("resource:"):
-            resource = line.split(":", 1)[1].strip().strip('"')
-        elif line.startswith("effect:") and resource is not None:
-            state[resource] = line.split(":", 1)[1].strip().strip('"')
-            resource = None
-    missing = [need for need in COS_NEEDS if state.get(need) != "allow"]
-    return "it does not allow `%s`" % "`, `".join(missing) if missing else ""
+    front = _frontmatter(text)
+    if front is not None and any(line.startswith("name:") for line in front.splitlines()):
+        return "its front matter has a `name:` key: OpenCode v2 then ignores the whole `permissions:` list"
+    rules = cos_rules(text)
+    missing = [probe for probe in COS_MUST_ALLOW if not cos_allows(rules, probe)]
+    too_much = [probe for probe in COS_MUST_DENY if cos_allows(rules, probe)]
+    out = []
+    if missing:
+        out.append("it does not allow `%s`" % "`, `".join(missing))
+    if too_much:
+        out.append("it allows `%s` (turning enforcement on, or waiving G6 or G8, is not the chief of staff's)" % "`, `".join(too_much))
+    return "; ".join(out)
 
 
 def effective_mode(config, setting, ci_proven=None, cos_ready=None):
