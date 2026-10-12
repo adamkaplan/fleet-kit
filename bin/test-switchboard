@@ -10026,6 +10026,9 @@ class HandoffCase(IntentCase):
 
 
 SHIM = REPO / "shims" / "gh"
+# The shim looks its identity up with a short deadline (3 s by default, two process starts for an older switchboard). A test that expects a NAME must not
+# depend on how busy the machine is, so its shim runs get the longest deadline the shim allows (10 s). The tests of the deadline itself set their own.
+SHIM_LOOKUP_SECONDS = "10"
 
 
 class TestShimHygiene(unittest.TestCase):
@@ -10080,7 +10083,7 @@ class TestGhShimGateProbe(Base):
 
     def run_shim(self, *args, env=None, binary=True):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home),
-                   "FLEET_SWITCHBOARD_STATE": str(self.state)}
+                   "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
         if binary:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
         environ.update(env or {})
@@ -10322,11 +10325,11 @@ class TestGhShim(Base):
                         % str(self.log))
         fake.chmod(0o755)
         self.who = self.home / "whoami"
-        self.who.write_text("#!/bin/sh\n[ \"$1\" = whoami ] && echo \"${FAKE_WHO:-platform}\" && exit ${FAKE_WHO_EXIT:-0}\nexit 2\n")
+        self.who.write_text("#!/bin/sh\n[ -n \"$FAKE_WHO_SLEEP\" ] && sleep \"$FAKE_WHO_SLEEP\"\n[ \"$1\" = whoami ] && echo \"${FAKE_WHO:-platform}\" && exit ${FAKE_WHO_EXIT:-0}\nexit 2\n")
         self.who.chmod(0o755)
 
     def run_shim(self, *args, stdin="", env=None, who=True):
-        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home)}
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
         if who:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.who)
         environ.update(env or {})
@@ -10380,6 +10383,16 @@ class TestGhShim(Base):
             self.assertIn("from=agent", seen["argv"][-1])
 
     MARK = "<!-- fleet-switchboard:from=platform -->"
+
+    def test_a_slow_identity_lookup_is_the_whole_of_the_old_flakiness(self):
+        """The signing tests failed on a busy machine ('from=agent' for 'from=platform'): the shim's 3 s lookup deadline ran out because the lookup (two process
+        starts) was slow, not because the real switchboard was reached (the run's environment is scrubbed and its binary is the fake). Shown on purpose: with a
+        deadline shorter than the lookup the name is `agent`; with the deadline the tests now use it is the name."""
+        slow = {"FAKE_WHO_SLEEP": "1.1"}
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env=dict(slow, FLEET_SHIM_LOOKUP_SECONDS="2"))
+        self.assertIn("from=agent", seen["argv"][-1], "a lookup slower than its deadline falls back to agent")
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env=slow)
+        self.assertIn("from=platform", seen["argv"][-1], "the same slow lookup within the tests' deadline is the name")
 
     def test_each_way_of_giving_a_body_is_signed(self):
         signed = "hello\n\n" + self.MARK + "\n"
