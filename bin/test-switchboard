@@ -2918,6 +2918,29 @@ class TestSteerToWorking(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
 
+    def test_send_to_the_role_name_reaches_the_one_agent_with_that_role(self):
+        self.world = World(self, agents=())
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("platform", fleet={"role": "orchestrator", "reports_to": "chief-of-staff"})
+        outcome = self.world.engine.send("platform", "chief-of-staff", "a question")
+        self.assertTrue(outcome["sent"], outcome)
+        self.assertEqual(len(self.world.admissions("cos")), 1)
+        again = self.world.engine.send("platform", "cos", "by name still works")        # the registered name is unchanged
+        self.assertIn("sent", again)
+        self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})                    # two chiefs: the alias is ambiguous, taken literally
+        held = self.world.engine.send("platform", "chief-of-staff", "which one?")
+        self.assertFalse(held["sent"])
+        self.assertIn("no herdr pane shows a v2 session named chief-of-staff", held["reason"])
+
+    def test_the_alias_with_no_chief_of_staff_is_taken_literally_and_an_interrupt_through_it_is_still_refused_to_a_non_boss(self):
+        held = self.send(sender="coder", to="chief-of-staff")
+        self.assertEqual(held["sent"], False)
+        self.assertIn("named chief-of-staff", held["reason"])
+        self.world.add_agent("chief", fleet={"role": "chief-of-staff"})
+        with self.assertRaises(sb.InterruptRefused):
+            self.world.engine.send("coder", "chief-of-staff", "stop", interrupt=True)
+        self.assertEqual(self.world.v2.interrupts, [])
+
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
 

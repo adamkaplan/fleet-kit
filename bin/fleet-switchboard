@@ -2340,6 +2340,7 @@ class Switchboard:
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
+        recipient = resolve_boss(discovery, recipient)   # `chief-of-staff` is the role: it reaches the one agent with that role (#80), as a report does
         if interrupt:
             target = discovery.agents.get(recipient)
             if target is None or boss_name(discovery, target) != sender:
