@@ -211,3 +211,24 @@ R2 review fixes: `start` and `respond` verify the ask from the plan issue itself
 on a changed scenario hash, and a round with no lane is refused; the check, the review id (from the appended sequence number) and the append are one
 critical section under the ledger lock (`append_checked`), so two concurrent starts cannot open two reviews; `respond` checks the budget before it
 records anything, requires one `<lane>/<id>: accept|reject` line per open objection, and `verdict` and the table are size-capped (64 KB; 20 objections).
+
+R4 (escalation) is built, without the closing round and the normal consensus write (R5): when `respond` finds the rounds spent, the objections still open
+are recorded as `escalation` entries (the planner's response beside each, the boss and a `held_area` flag) and the boss is told through the outbox; the
+switchboard's own message is the only message a lane of an open review may receive (`send` refuses an agent's). `plan review decide <review> --objection
+<lane/id> --accept|--override --reason ...`: the boss named in the escalation or the owner at a terminal; the risk and security lane and held-PR areas can
+only be overridden by the owner; an `accept` lets the planner revise within the 2 rounds after an escalation; when those are spent the next `respond`
+escalates again, to the owner alone (`owner_only`). An override of the last open objection writes the `consensus` entry marked `overridden_by` with the
+reason, and an overridden consensus shows in `status` and in the launch check (`gate.consensus_overridden`). `plan review tick` is the housekeeping a timer or a
+person runs: a lane with no verdict after `lane_timeout_seconds` is relaunched once, then escalated as `<lane>/unavailable` (a stalled lane never counts as an
+approval), and an undecided escalation is reminded every `escalation_hours` (default 24). `abandon` also closes the review's escalations. Not built: the triage
+finding for an old escalation (the reminder is the first step), the closing round, the normal consensus write and `report` (R5), the lane agent definitions and
+their permissions (R3, held for the owner).
+
+R4 review fixes: a planner that is its own boss (the chief of staff's own plan) escalates to the owner directly (`owner_only`), and no agent that is the
+planner of a plan may decide an objection to it; the names the switchboard acts under (`fleet-switchboard`, `switchboard`, `plan-review`, `owner`) are
+reserved and cannot be launched, and so is the `planrev-` prefix (only the engine launches its lanes), so the lane send guard's exemption cannot be
+spoofed; `tick` claims a relaunch, an unavailable escalation and a reminder under the ledger lock (two ticks cannot double them) and so does the
+escalation in `respond`; the escalation message presents the lane's objection and the planner's response as quoted data, not instructions. `abandon` is
+for the same callers as `start` (a person, a registered orchestrator or the chief of staff) and records its closing of escalations as decisions with the
+action `abandoned`. Nothing runs `tick` on a schedule yet: a person, an orchestrator or the chief of staff runs it (wiring it into the daemon pass is a
+later step), so the 24-hour reminder and the stuck-lane handling happen only when someone does.

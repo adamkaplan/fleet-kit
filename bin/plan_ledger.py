@@ -23,7 +23,7 @@ LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
-REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned")   # the plan review engine's records (#109)
+REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder")   # the plan review engine's records (#109)
 KINDS = EVIDENCE_KINDS + REVIEW_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
@@ -529,6 +529,13 @@ def consensus_at(entries, plan_hash):
         if entry.get("kind") == "consensus" and entry.get("plan_hash") == plan_hash and entry.get("result") == "pass":
             return entry
     return None
+
+
+def consensus_overridden(entries, plan_hash):
+    """Who overrode the consensus at exactly `plan_hash` (a person or a boss decided past an open objection), or None: an overridden
+    consensus is visible wherever consensus is read."""
+    found = consensus_at(entries, plan_hash)
+    return found.get("overridden_by") if found else None
 
 
 def launch_findings(brief, plan, entries):
