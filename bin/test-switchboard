@@ -35145,6 +35145,35 @@ class TestReviewLawsStarterSet(Base):
                        "must not contradict the repository's `AGENTS.md`", "untrusted text"):
             self.assertIn(needle, text)
 
+    def test_the_scope_of_the_read_only_rule_and_the_floor_as_the_matrixs_companion_are_stated(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule2 = next(l for l in text.splitlines() if l.startswith("- **R-LAW-2 "))
+        self.assertIn("reviewer agent bound by these laws", rule2)
+        self.assertIn("independent verification agent", rule2)
+        self.assertIn("may run the repository's named checks", rule2)
+        self.assertIn("says so in its own copy", rule2)
+        rules = {l.split(" ", 2)[1].strip("*"): l for l in text.splitlines() if l.startswith("- **R-LAW-")}
+        self.assertIn("The floor is the matrix's companion", rules["R-LAW-13"])
+        self.assertIn("its authority is the matrix (R-LAW-11)", rules["R-LAW-13"])
+        self.assertIn("the impact matrix below", rules["R-LAW-11"])
+        self.assertNotIn("also holds changes", text, "the floor is a numbered rule, not an uncited aside")
+
+    def test_every_rule_says_how_it_is_checked_and_a_note_only_rule_never_blocks_alone(self):
+        kinds = set()
+        for name in self.FILES:
+            for line in self.rules(name):
+                match = re.search(r"_check: (diff|test|search|note only): [^_]+_$", line)
+                self.assertIsNotNone(match, "no check hint: %r" % line[:90])
+                kinds.add(match.group(1))
+        self.assertEqual(kinds, {"diff", "test", "search", "note only"})
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule14 = next(l for l in text.splitlines() if l.startswith("- **R-LAW-14 "))
+        self.assertIn("note only", rule14)
+        self.assertIn("never blocks by itself", rule14)
+        for rule in ("R-CODE-9", "R-CODE-10", "R-TEST-8"):
+            line = next(l for name in self.FILES for l in self.rules(name) if l.startswith("- **%s " % rule))
+            self.assertIn("check: note only", line, rule)
+
     def test_the_standards_carry_the_review_findings_that_recur(self):
         coding = "\n".join(self.rules("CODING_STANDARDS.md")).lower()
         security = "\n".join(self.rules("SECURITY_STANDARDS.md")).lower()
@@ -35189,6 +35218,26 @@ class TestReviewLawsStarterSet(Base):
         self.assertEqual((target / "CODING_STANDARDS.md").read_text(), (self.DIR / "CODING_STANDARDS.md").read_text())
         self.assertEqual((target / "AGENTS.md").read_text(), "build with make\n")
         self.assertIn("AGENTS.md: it was not touched", out)
+
+    def test_install_never_follows_a_symlink_even_a_dangling_one_and_not_with_force(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        elsewhere = self.home / "elsewhere.md"
+        (target / "REVIEW_LAWS.md").symlink_to(elsewhere)   # dangling: the file it points at does not exist
+        for argv in ((str(target),), (str(target), "--force")):
+            code, out, err = self.install(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn("symbolic link", err)
+            self.assertFalse(elsewhere.exists(), "nothing was written through the link")
+            self.assertTrue((target / "REVIEW_LAWS.md").is_symlink())
+            self.assertFalse((target / "CODING_STANDARDS.md").exists())
+
+    def test_install_says_the_version_once(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        code, out, err = self.install(str(target))
+        self.assertNotIn("vreview-laws", out)
+        self.assertIn("(review-laws-1)", out)
 
     def test_install_refuses_a_path_that_is_not_a_directory(self):
         code, out, err = self.install(str(self.home / "nowhere"))
