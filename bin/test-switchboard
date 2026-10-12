@@ -661,7 +661,7 @@ class TestHerdrClient(Base):
         self.assertEqual(sent[1][2]["root"]["env"], {"A": "b", "FLEET_SWITCHBOARD_OWN_GH": ""}, "an inherited marker is overridden, not passed on")
         with self.assertRaises(ValueError):
             client._socket("pane.send_text", {})
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 2)   # the two layout.apply calls above; the refused method sent nothing
 
     def test_a_socket_error_or_odd_reply_is_a_herdr_error(self):
         for reply in ({"error": {"code": "workspace_not_found"}}, {"result": {}}, {"result": {"layout": {}}}):
