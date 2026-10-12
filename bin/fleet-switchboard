@@ -291,6 +291,7 @@ DEFAULTS = {
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
+    "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
@@ -425,7 +426,7 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
-    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "poll_seconds",
+    for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
@@ -2340,6 +2341,7 @@ class Switchboard:
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
+        asked = recipient
         recipient = resolve_boss(discovery, recipient)   # `chief-of-staff` is the role: it reaches the one agent with that role (#80), as a report does
         if interrupt:
             target = discovery.agents.get(recipient)
@@ -2352,7 +2354,10 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        return self.send_fact(fact, discovery, now, interrupt=interrupt)
+        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
+        if recipient != asked:
+            outcome = dict(outcome, resolved_to=recipient)   # the sender is told which agent the role name reached
+        return outcome
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -10827,7 +10832,44 @@ def resolve_for_sender(engine, config, issue, sender):
     return resolve_issue(config, issue, fleets.get(sender, {}), watched_repos(config, fleets))
 
 
+def run_bounded(work, seconds):
+    """(finished, result): `work()` on a worker thread, waited for at most `seconds`. When it is not done by then the thread is left to finish
+    or die with the process (it is a daemon thread) and the caller says so: a slow dependency is a clear failure line, never a silent wait."""
+    box = {}
+
+    def target():
+        try:
+            box["result"] = work()
+        except BaseException as err:   # re-raised in the caller, with the original type
+            box["error"] = err
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        return False, None
+    if "error" in box:
+        raise box["error"]
+    return True, box.get("result")
+
+
 def cmd_send(args, runner, now):
+    """`send`, bounded as a whole by `send_timeout_seconds` (default 60 s): past it the command exits 1 saying the delivery did not finish, may
+    still complete or have been cut off part way (the state is unknown), never a silent multi-minute wait."""
+    try:
+        seconds = load_config()["send_timeout_seconds"]
+    except ConfigError as err:   # the command itself reports the config error below; the bound falls back to the default, and says so
+        seconds = DEFAULTS["send_timeout_seconds"]
+        sys.stderr.write("%s: the config could not be read (%s): the default send bound of %s s applies\n" % (PROG, _one_line(str(err), 160), seconds))
+    done, code = run_bounded(lambda: _cmd_send(args, runner, now), seconds)
+    if not done:
+        sys.stderr.write("%s: send to %s did not finish within %s s (a slow v2 or herdr): it may still be delivered, or have been cut off "
+                         "part way: the state is unknown, so check `%s pending %s` and the recipient before sending again\n" % (
+                             PROG, args.name, seconds, PROG, args.name))
+        return EXIT_ERROR
+    return code
+
+
+def _cmd_send(args, runner, now):
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
     if refusal:
@@ -10866,7 +10908,9 @@ def cmd_send(args, runner, now):
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
     print(outcome["message_id"])
-    sys.stderr.write("%s: %s delivered to %s\n" % (PROG, outcome["action"], args.name))
+    target = outcome.get("resolved_to")
+    sys.stderr.write("%s: %s delivered to %s%s\n" % (PROG, outcome["action"], target or args.name,
+                                                   " (the role name %s resolved to it)" % args.name if target else ""))
     return EXIT_OK
 
 
