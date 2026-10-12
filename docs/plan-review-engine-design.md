@@ -205,3 +205,9 @@ lane reported: the table must name every open blocking objection (`<lane>/<id>`)
 round runs only the lanes that still object (plus L1 when the scenarios changed). A plan source belongs to one ask: naming another ask for it is refused.
 Limits of this slice: the ask is named with `--ask` (deriving it from the `PLAN:` target's parent chain is later), no closing round, no consensus write, no
 escalation or `decide`, no daemon read of the lane's final message, no `report`.
+
+R2 review fixes: `start` and `respond` verify the ask from the plan issue itself (the plan issue is the ask or its parent chain reaches it; a mismatching
+`--ask` is refused, so naming another ask cannot reset the count); the next round's lanes come from the lineage's open objections (their lanes) plus L1
+on a changed scenario hash, and a round with no lane is refused; the check, the review id (from the appended sequence number) and the append are one
+critical section under the ledger lock (`append_checked`), so two concurrent starts cannot open two reviews; `respond` checks the budget before it
+records anything, requires one `<lane>/<id>: accept|reject` line per open objection, and `verdict` and the table are size-capped (64 KB; 20 objections).

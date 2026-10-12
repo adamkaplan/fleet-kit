@@ -102,8 +102,13 @@ def _write_head(state_dir, entry):
 def append_entry(state_dir, entry, now):
     """Add `entry` to the ledger under an exclusive lock: seq, time, prev and hash are set here. Refuses when the
     existing chain is broken (a tampered ledger takes no new entry). Returns the stored entry."""
-    if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
-        raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    return append_checked(state_dir, now, lambda entries, seq: entry)
+
+
+def append_checked(state_dir, now, build):
+    """The same append, with the DECISION inside the critical section: `build(entries, seq)` is called under the exclusive lock with the
+    chain as it stands and the sequence number the entry will get, and returns the entry to write (or raises to refuse). A caller that must
+    check the ledger and then add to it (one open review per lineage, a review id) does both here, so two writers cannot both pass the check."""
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -111,6 +116,9 @@ def append_entry(state_dir, entry, now):
         entries, problem = read_ledger(state_dir)
         if problem:
             raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        entry = build(entries, len(entries) + 1)
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
         stored = dict(entry, seq=len(entries) + 1, ts=int(now), prev=entries[-1]["hash"] if entries else GENESIS)
         stored["hash"] = entry_hash(stored)
         os.write(fd, (json.dumps(stored, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
