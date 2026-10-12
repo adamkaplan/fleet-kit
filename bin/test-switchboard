@@ -19681,6 +19681,22 @@ class TestImpactHold(LedgerBase):
         hold, why = sb.impact_review_hold(self.world.state, self.PR, LEDGER_HEAD)
         self.assertEqual((hold, bool(why)), (True, True))
 
+    def test_the_owner_clear_still_works_while_the_ledger_is_down_and_the_cleared_head_stays_cleared(self):
+        self.floor_pr(path="src/app.py")
+        (self.world.state / "plan-ledger.jsonl").write_text("this is not a ledger\n")
+        self.passes()                                                      # held only because the rating is unknown
+        self.assertEqual(len(self.label_writes()), 1)
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the ledger is down, the change is a fixture")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len([w for w in self.writes if w[0] == "DELETE"]), 2)
+        self.assertEqual(len(self.events("gate.hold_cleared")), 1)
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1000)
+        self.passes(records=[self.listed()], advance=4000)
+        self.assertEqual(len(self.label_writes()), 1, "still down, same head: not re-added")
+        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=9000)
+        self.assertEqual(len(self.label_writes()), 2, "a new head is judged again, and the unknown rating holds it")
+
     def test_a_corrupt_oversized_or_non_object_state_file_is_reported_not_read_as_empty(self):
         path = self.world.state / sb.IMPACT_STATE_FILE
         self.assertEqual(sb.read_impact_state(self.world.state)[1], None)                  # missing is fine
