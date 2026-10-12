@@ -498,7 +498,7 @@ After the agents are copied and the service has restarted, check that OpenCode r
 
 ```
 VERIFY:  ./bin/fleet-switchboard agents verify
-PROVES:  "agents: PASS (9 of 9 ...)". An agent whose front matter does not parse is
+PROVES:  "agents: PASS (9 of 9 ...)" (add --strict to make an unreachable service a failure). An agent whose front matter does not parse is
          silently registered as a default primary agent with a handful of rules, and a
          reviewer then cannot be run as a subagent. A FAIL line names the agent and
          why. "not running" means nothing was checked (the service is down): start it
