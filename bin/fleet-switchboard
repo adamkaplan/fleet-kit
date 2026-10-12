@@ -13852,10 +13852,17 @@ def explainer_risk_cell(severity=None, probability=None, eliminated=False, matri
     return "%s x %s: %s (%s)" % (severity, probability, cell["level"], matrix["action_meaning"][cell["action"]])
 
 
-def explainer_mermaid(title, paths, irreversible, risk):
+def explainer_count(listed, total):
+    """`4 files`, or `100 of 140 files listed` when `gh` returned fewer files than the PR changes (its list is capped): a cut list is said, not hidden."""
+    if isinstance(total, int) and not isinstance(total, bool) and total > listed:
+        return "%d of %d files listed" % (listed, total)
+    return "%d file%s" % (listed, "" if listed == 1 else "s")
+
+
+def explainer_mermaid(title, paths, irreversible, risk, total=None):
     """The infographic of a captain PR, as a Mermaid flowchart of four labelled boxes: what changes, what it touches, what is irreversible, the risk cell."""
     return "\n".join(["flowchart LR",
-                      '  A["Changes: %s"] --> B["Touches: %s (%d files)"]' % (explainer_label(title, 50), explainer_label(explainer_areas(paths), 50), len(paths)),
+                      '  A["Changes: %s"] --> B["Touches: %s (%s)"]' % (explainer_label(title, 50), explainer_label(explainer_areas(paths), 50), explainer_count(len(paths), total)),
                       '  B --> C["Irreversible: %s"]' % explainer_label(irreversible, 60),
                       '  C --> D["Risk: %s"]' % explainer_label(risk, 70)])
 
@@ -13885,12 +13892,22 @@ def mermaid_defects(text):
     return sorted(set(problems))
 
 
+def explainer_text(text):
+    """A before or after line made safe for the block: one line, and never a marker comment, a comment close or a code fence (any of them would
+    end the block early, add a second marker or break the fenced why part)."""
+    plain = " ".join(str(text or "").split())
+    for bad in (EXPLAINER_BEGIN, EXPLAINER_END, "<!--", "-->", "```"):
+        plain = plain.replace(bad, " ")
+    return " ".join(plain.split())
+
+
 def explainer_block(why_before, why_after, mermaid=None):
     """The ONE block of a PR description: the why part (every PR) and the infographic (a captain PR), between two marker comments."""
+    why_before, why_after = explainer_text(why_before), explainer_text(why_after)
     parts = [EXPLAINER_BEGIN, ""]
     if mermaid:
         parts += ["```mermaid", mermaid, "```", ""]
-    parts += ["**Why (before and after)**", "", "```text", "before: %s" % " ".join(str(why_before).split()), "after:  %s" % " ".join(str(why_after).split()), "```", "", EXPLAINER_END]
+    parts += ["**Why (before and after)**", "", "```text", "before: %s" % why_before, "after:  %s" % why_after, "```", "", EXPLAINER_END]
     return "\n".join(parts)
 
 
@@ -13963,7 +13980,8 @@ def cmd_pr_explain(args, runner, now):
     except (ValueError, OSError, KeyError) as err:
         sys.stderr.write("%s: pr-explain: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_USAGE
-    diagram = explainer_mermaid(pr.get("title") or "this change", paths, args.irreversible or "nothing found by path: check by hand", risk) if captain else None
+    diagram = explainer_mermaid(pr.get("title") or "this change", paths, args.irreversible or "nothing found by path: check by hand", risk,
+                                total=pr.get("changedFiles")) if captain else None
     block = explainer_block(args.before or "<what happened before, one or two lines>", args.after or "<what happens after, one or two lines>", diagram)
     if args.body_file:
         try:

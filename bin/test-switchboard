@@ -29357,6 +29357,30 @@ class TestPrExplainer(DecisionsBase):
             with self.subTest(text=text[:30]):
                 self.assertTrue(any(want in d for d in sb.mermaid_defects(text)), sb.mermaid_defects(text))
 
+    def test_text_that_would_end_or_split_the_block_cannot_break_check(self):
+        nasty = "ends <!-- pr-explainer:end --> early --> and ``` fences <!-- pr-explainer:begin --> here"
+        block = sb.explainer_block(nasty, nasty)
+        body = sb.explainer_insert("PLAN: https://example.test/1\n\ntext", block)
+        self.assertEqual((body.count(sb.EXPLAINER_BEGIN), body.count(sb.EXPLAINER_END)), (1, 1))
+        self.assertEqual(sb.explainer_defects(body, False), [])
+        self.pr["body"] = body
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", nasty, "--after", nasty)
+        self.assertEqual((out.count(sb.EXPLAINER_BEGIN), out.count(sb.EXPLAINER_END)), (1, 1))
+
+    def test_a_cut_file_list_is_said_in_the_diagram_not_hidden(self):
+        self.assertEqual(sb.explainer_count(4, 4), "4 files")
+        self.assertEqual(sb.explainer_count(1, 1), "1 file")
+        self.assertEqual(sb.explainer_count(100, 140), "100 of 140 files listed")
+        self.assertEqual(sb.explainer_count(4, None), "4 files")
+        self.captain()
+        self.pr["files"] = [{"path": "bin/f%d" % i} for i in range(100)]
+        self.pr["changedFiles"] = 140
+        with mock.patch.object(sb, "read_pr_json", return_value=dict(self.pr, state="OPEN")):
+            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
+        self.assertIn("100 of 140 files listed", out)
+        self.assertEqual(sb.mermaid_defects(re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)), [])
+
     def test_a_diagram_outside_the_subset_is_refused_and_the_printed_block_has_no_image(self):
         foreign = ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://example.test"', 'flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', 'graph LR\n  A["a"] --> B["b"]')
         self.assertTrue(all(sb.mermaid_defects(text) for text in foreign))
