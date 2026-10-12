@@ -4164,6 +4164,16 @@ not enforced: G5 missing` (or `NOT READY for the enforced gates (...): open G1`)
 keeps the old line and the old exit (the whole board). `--all` exits by the whole board in every mode; `--json` adds `enforced`, `ready_enforced`
 and `open_enforced` next to the unchanged `ready`.
 
+**The impact floor (#179, slice L3: advisory, writes nothing).** `fleet-switchboard impact floor <repo#N> [--rating SEVERITY/PROBABILITY ...] [--json]` reads one
+PR's files and says what the deterministic hold floor would decide. The floor is **paths only**: a PR holds when it adds, changes or **deletes** a file inside its repo's floor
+globs (`bin/impact_floor.py` carries the proposal for this repo: `shims/**`, `plugins/fleet-hooks/**`, `templates/**`, `tools/cos-permissions-proof/**`, `bin/plan_ledger.py`;
+excluded: `agents/**`, `skills/**`, `docs/**`, `AGENTS.md`; override per repo under `impact_floor.repos.<owner/repo>` with `globs` and `exclude`). A deletion outside the globs never holds,
+and **size is never a hold by itself**. The independent rating (`--rating Critical/Remote`, repeatable) uses the standard's categories on the matrix in `docs/review-laws/impact-matrix.json`
+(the single source; `Eliminated` is not rated) and **can only add a hold, never lower the floor**: `hold` when the floor holds or any rated cell is `H`, `second-review` for a `2` cell, else `none`.
+The daemon's pass (`impact_would_hold_pass`, after the ci recorder, off with `impact_floor.enabled: false` or the global `plan-gates.off` file) judges each open PR of the repos under `plan_gates` once per head,
+at most 6 `gh pr view` reads per pass, and records `gate.would_hold` in the audit. **It writes no label, comment or ledger entry**: applying `hold-impact` is slice L4. GitHub lists a PR's files up to a cap,
+so a longer change is reported as possibly incomplete.
+
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
 verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
 the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and

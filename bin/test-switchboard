@@ -18966,6 +18966,131 @@ class FakeHub:
         return list(self.prs.get(repo, [])), False
 
 
+IMPACT_TABLE = {   # the plan's table (S10): severity -> probability -> action; H hold, 2 second review, . none
+    "Catastrophic": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "HHHHH")),
+    "Critical": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "2HHHH")),
+    "Marginal": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), ".22HH")),
+    "Negligible": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "...22")),
+}
+FLOOR_CONFIG = {"impact_floor": {"repos": {"acme/app": {"globs": ["migrations/**", "api/routes/**", "config/secrets*"],
+                                                         "exclude": ["docs/**"]}}}}
+
+
+class TestImpactFloorPure(unittest.TestCase):
+    """#179 slice L3: the hold table, the rating's categories and the path-glob floor. Pure; synthetic paths."""
+
+    def setUp(self):
+        self.f = sb.load_impact_floor()
+        self.matrix = self.f.load_matrix()
+
+    def test_the_twenty_cells_return_the_stored_actions_and_the_review_laws_table_equals_the_matrix(self):
+        got = {sev: {pr: self.f.cell_action(self.matrix, sev, pr)[1] for pr in IMPACT_TABLE[sev]} for sev in IMPACT_TABLE}
+        self.assertEqual(got, IMPACT_TABLE)                      # byte-identical to the fixture: 20 of 20
+        text = (REPO / "docs" / "review-laws" / "REVIEW_LAWS.md").read_text()
+        for sev, row in IMPACT_TABLE.items():
+            line = [l for l in text.splitlines() if l.startswith("| %s |" % sev)][-1]   # the action table is the last one
+            cells = [c.strip() for c in line.strip("|").split("|")][1:]
+            self.assertEqual([c[-2] for c in cells], list(row.values()), sev)
+
+    def test_the_rating_uses_the_standards_categories_and_an_eliminated_impact_is_not_rated(self):
+        pairs = [(s, p) for s in IMPACT_TABLE for p in IMPACT_TABLE[s]]
+        self.assertEqual(len(self.f.rate(self.matrix, pairs)), 20)                 # 4 of 4 severities x 5 of 5 probabilities
+        self.assertEqual(self.f.rate(self.matrix, [("Catastrophic", "Eliminated")]), [])
+        self.assertEqual(len(self.f.rate(self.matrix, [("Catastrophic", "Eliminated"), ("Marginal", "Remote")])), 1)
+
+    def test_the_rating_can_add_a_hold_but_never_lower_the_floor(self):
+        negligible = self.f.rate(self.matrix, [("Negligible", "Improbable")])
+        self.assertEqual(self.f.decide(["migrations/1.sql"], negligible)[0], "hold")        # floor holds, rating negligible
+        self.assertEqual(self.f.decide(["migrations/1.sql"], [])[0], "hold")                # floor holds, no rating at all
+        self.assertEqual(self.f.decide([], self.f.rate(self.matrix, [("Critical", "Remote")]))[0], "hold")   # only the rating is serious
+        self.assertEqual(self.f.decide([], self.f.rate(self.matrix, [("Marginal", "Remote")]))[0], "second-review")
+        self.assertEqual(self.f.decide([], negligible)[0], "none")
+
+    def test_the_floor_is_paths_only_a_deletion_inside_holds_outside_never_and_excluded_paths_never(self):
+        globs, exclude = ["migrations/**", "api/routes/**", "config/secrets*"], ["docs/**"]
+        hit = self.f.floor_paths(["migrations/0001.sql", "api/routes/a/b.py", "config/secrets.env", "tests/t.py", "docs/migrations/x.md",
+                                  "src/app.py", "generated/api.json"], globs, exclude)
+        self.assertEqual(hit, ["api/routes/a/b.py", "config/secrets.env", "migrations/0001.sql"])
+        self.assertEqual(self.f.floor_paths(["tests/old_test.py", "docs/old.md"], globs, exclude), [])   # a deletion outside: no hold
+        self.assertEqual(self.f.decide([], [])[0], "none")                                               # size is not an input at all
+
+    def test_the_built_in_floor_for_this_repo_names_the_proposed_globs_and_excludes_definitions_and_docs(self):
+        globs, exclude = self.f.floor_for("adamkaplan/fleet-kit")
+        hit = self.f.floor_paths(["shims/gh", "plugins/fleet-hooks/a.js", "templates/u.service", "tools/cos-permissions-proof/x.py",
+                                  "bin/plan_ledger.py", "agents/opencode/coder.md", "skills/x/SKILL.md", "docs/a.md", "AGENTS.md",
+                                  "bin/fleet-switchboard"], globs, exclude)
+        self.assertEqual(hit, ["bin/plan_ledger.py", "plugins/fleet-hooks/a.js", "shims/gh", "templates/u.service",
+                               "tools/cos-permissions-proof/x.py"])
+        self.assertEqual(self.f.floor_for("someone/else"), ([], []))
+
+
+class TestImpactFloorCommandAndPass(LedgerBase):
+    """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr.update({"changedFiles": 2, "files": [{"path": "migrations/0002.sql", "additions": 1, "deletions": 0},
+                                                       {"path": "tests/test_a.py", "additions": 50000, "deletions": 90000}]})
+
+    def test_a_pr_that_touches_a_floor_path_would_hold_and_the_command_writes_nothing(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertEqual((report["decision"], report["floor_paths"], report["complete"]), ("hold", ["migrations/0002.sql"], True))
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan."))], [])
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertIn("HOLD (advisory: nothing is written)", out)
+
+    def test_a_huge_change_outside_the_floor_does_not_hold_and_a_rating_can_add_one(self):
+        self.pr.update({"changedFiles": 1, "files": [{"path": "src/app.py", "additions": 100000, "deletions": 100000}]})
+        self.assertEqual(json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])["decision"], "none")
+        got = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--rating", "critical/remote", "--rating", "negligible/eliminated", "--json")[1])
+        self.assertEqual((got["decision"], len(got["rated"])), ("hold", 1))
+
+    def test_a_partial_file_list_is_said_to_be_possibly_incomplete(self):
+        self.pr["changedFiles"] = 400
+        out = self.run_as("coder", "impact", "floor", self.PR)[1]
+        self.assertIn("the floor may be incomplete", out)
+
+    def test_the_daemon_pass_audits_would_hold_once_per_head_and_writes_no_label(self):
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route          # route raises on any write
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        t = 100000.0
+        sb.ci_record_pass(engine, t)
+        sb.impact_would_hold_pass(engine, t)
+        sb.impact_would_hold_pass(engine, t + 10)
+        events = [e for e in self.world.audit() if e["event"] == "gate.would_hold"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]["subject"], events[0]["detail"]["floor_paths"], events[0]["detail"]["advisory"]),
+                         ("acme/app#9", ["migrations/0002.sql"], True))
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        hub.prs["acme/app"] = [{"number": 9, "head": {"sha": LEDGER_NEW_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]
+        sb.ci_record_pass(engine, t + 400)
+        sb.impact_would_hold_pass(engine, t + 400)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.would_hold"]), 2, "a new head is judged again")
+
+    def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
+        for edit in ("disabled", "killed"):
+            with self.subTest(edit=edit):
+                hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+                engine = self.world.new_engine("daemon")
+                engine.hub, engine.gh_runner = hub, self.route
+                engine.config, engine.state_dir = sb.load_config(), self.world.state
+                if edit == "disabled":
+                    engine.config = dict(engine.config, impact_floor=dict(engine.config["impact_floor"], enabled=False))
+                else:
+                    (self.world.state / "plan-gates.off").write_text("")
+                sb.ci_record_pass(engine, 100000.0)
+                sb.impact_would_hold_pass(engine, 100000.0)
+                self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [])
+        (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+
+
 class TestCiRecordPass(LedgerBase):
     """The daemon pass of the ci recorder: open PRs under a plan, in repos listed in `plan_gates`, get their `ci` verdict when the
     checks at the CURRENT head are green. Records only; never refuses; GETs only."""
