@@ -241,6 +241,33 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config()["opencode_env"], {})
         self.assertEqual(sb.DEFAULTS["opencode_env"], {})
 
+    def test_an_unknown_top_level_or_nested_key_is_a_warning_not_a_refusal_and_a_bad_type_still_refuses(self):
+        for raw in ({"surprise": 1}, {"policy": {"surprise": 1}}, {"jev": {"surprise": 1}}, {"sweep": {"surprise": 1}}):
+            with self.subTest(raw=raw):
+                sb._WARNED_CONFIG.clear()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    config = sb.validate_config(raw)
+                self.assertIn("warning:", err.getvalue())
+                self.assertIn("surprise", err.getvalue())
+                self.assertIn("this tool does not read", err.getvalue())
+                self.assertIsInstance(config, dict)
+        sb._WARNED_CONFIG.clear()
+        with self.assertRaises(sb.ConfigError):
+            with contextlib.redirect_stderr(io.StringIO()):
+                sb.validate_config({"surprise": 1, "batch_seconds": "90"})   # a warning never hides a real error
+        with self.assertRaises(sb.ConfigError):
+            with contextlib.redirect_stderr(io.StringIO()):
+                sb.validate_config({"policy": {"surprise": 1}, "opencode": 7})
+
+    def test_the_same_unknown_key_is_warned_once_per_process(self):
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.validate_config({"surprise": 1})
+            sb.validate_config({"surprise": 1})
+        self.assertEqual(err.getvalue().count("surprise"), 1)
+
     def test_bad_values_are_refused_with_the_key_named(self):
         cases = [
             ({"opencode": 7}, "'opencode'"),
@@ -259,7 +286,6 @@ class TestConfig(Base):
             ({"engaged_minutes": None}, "'engaged_minutes'"),
             ({"call_timeout_seconds": "20"}, "'call_timeout_seconds'"),
             ({"poll_seconds": 0}, "'poll_seconds'"),
-            ({"surprise": 1}, "surprise"),
         ]
         for raw, needle in cases:
             with self.subTest(raw=raw):
