@@ -53,6 +53,7 @@ import json
 import math
 import os
 from pathlib import Path
+import inspect
 import re
 import secrets
 import select
@@ -14330,7 +14331,7 @@ def cmd_pr_explain(args, runner, now):
     return EXIT_OK
 
 
-def add_pr_explain_parser(sub):
+def add_pr_explain_parsers(sub):
     explain = sub.add_parser("pr-explain", help="Print the PR explainer block: a before/after why part and, for a captain PR, the infographic (read-only)",
                              description="Reads the PR once and PRINTS the block for its description; it writes nothing. Paste it, or use --body-file to get the whole "
                                          "new body with the block in once, then `gh pr edit --body-file`. --check judges the description the PR has.")
@@ -14357,7 +14358,6 @@ def add_impact_parsers(sub):
 
 
 def add_review_laws_parsers(sub):
-    add_review_parsers(sub)
     laws = sub.add_parser("review-laws", help="The review laws starter set (#179)")
     laws_sub = laws.add_subparsers(dest="laws_action", required=True)
     install = laws_sub.add_parser("install", help="Copy the generic review laws and standards into a repository and say what to edit")
@@ -16952,104 +16952,82 @@ def build_parser():
                         "(or pull request) is closed or merged")
     remind.add_argument("--until-merged", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this pull "
                         "request is merged")
-    add_intent_parsers(sub)
-    add_foreground_parsers(sub)  # PR 8
-    add_policy_parsers(sub)  # PR 9
-    add_plan_parsers(sub)    # #135
-    add_review_laws_parsers(sub)    # #179 slice L1
-    add_pr_explain_parser(sub)      # #179 slice L6
-    add_impact_parsers(sub)         # #179 slice L3
-    add_ledger_parsers(sub)  # #107
-    add_v1_move_parsers(sub)  # PR 10
-    add_install_parsers(sub)  # PR 16
-    add_orders_parsers(sub)  # PR 17
-    add_decision_parsers(sub)  # PR 18
+    # Every `add_<name>_parsers(sub)` function of this module registers its commands: nothing is listed here, so a new command adds no shared line
+    # (the registrations used to be a list that every slice appended to, and any two in-flight slices conflicted on it). Alphabetical by function name.
+    for registrar in command_registrars():
+        registrar(sub)
     sub.add_parser("version", help="Print the version")
+    parser.commands = frozenset(sub.choices)   # the registered subcommands: what `dispatch` may run
     return parser
 
 
-def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
-         socket_call=None):
-    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
-    try:
-        args = build_parser().parse_args(argv)
-    except SystemExit as exit_:
-        return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+# ---------------------------------------------------------------- the front door: self-registering commands
+#
+# A command is two functions named for it and nothing else: `add_<name>_parsers(sub)` (registers its argparse parsers; found by name) and
+# `cmd_<action with - as _>(args, ...)` (runs it; found by name). `main` lists neither. The few special cases are explicit, here, and are the only
+# things a new command could ever need to edit: DIRECT_ACTIONS (run outside the error mapping and without ensuring the daemon),
+# LEDGER_ACTIONS (their own errors are usage errors) and ENSURE_ON_USE_COMMANDS (the daemon is started first).
+
+COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
+REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
+DIRECT_ACTIONS = frozenset({"status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool"})   # no error mapping, no daemon start
+# A new command may instead say it is direct next to its own definition (`cmd_x.direct = True`), so it edits no shared line either.
+LEDGER_ACTIONS = frozenset({"prove", "verdict", "waive", "gates", "gates-check"})   # #107: state and GETs only; their own errors are usage errors
+COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
+
+
+def command_registrars():
+    """The `add_*_parsers` functions of this module, by name (sorted): the one place commands are collected."""
+    return [globals()[name] for name in sorted(n for n in globals() if REGISTRAR_NAME_RE.fullmatch(n)) if callable(globals()[name])]
+
+
+def resolve_command(action, known):
+    """The function that runs `action`, or None. ONLY a `cmd_<action>` function of this module, ONLY for an action that is a registered
+    subcommand (`known`) and whose name is plain lower case: a hostile or unknown name never reaches `getattr` of anything else, so it can
+    never run an arbitrary function."""
+    if not isinstance(action, str) or not COMMAND_NAME_RE.fullmatch(action) or action not in known:
+        return None
+    handler = globals().get("cmd_" + action.replace("-", "_"))
+    return handler if callable(handler) else None
+
+
+def call_command(handler, **available):
+    """`handler(...)` with the arguments it names, taken from `available` (args, runner, now, spawn, socket_call, wait): `cmd_poke(args)` gets one,
+    `cmd_run(args, runner, now, wait)` four. A required parameter outside COMMAND_ARGUMENTS is a programming error, said plainly."""
+    params = inspect.signature(handler).parameters
+    missing = [n for n, p in params.items() if p.default is p.empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and n not in available]
+    if missing:
+        raise TypeError("%s asks for %s, which a command is never given (it may ask for: %s)" % (handler.__name__, ", ".join(missing), ", ".join(COMMAND_ARGUMENTS)))
+    return handler(**{n: available[n] for n in params if n in available})
+
+
+def cmd_plan(args, runner, now, socket_call=None):
+    """`plan check` (the default) or `plan review` (#109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled)."""
+    if args.plan_action == "review":
+        return cmd_plan_review(args, runner, now, socket_call)
+    return cmd_plan_check(args, runner, now)
+
+
+def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
+    """Run the parsed command: the exit code. `known` is the set of registered subcommands (parser.commands)."""
+    available = {"args": args, "runner": runner, "now": now, "spawn": spawn, "socket_call": socket_call, "wait": wait}
     if args.action == "version":
         print("%s %s" % (PROG, VERSION))
         return EXIT_OK
-    if args.action == "status":
-        return cmd_status(args, runner, now)
-    if args.action == "poke":
-        return cmd_poke(args)
-    if args.action == "policy-report":
-        return cmd_policy_report(args, runner, now)
-    if args.action == "review-laws":  # #179: copies files, never ensures the daemon
-        return cmd_review_laws(args, runner, now)
-    if args.action == "review":  # #179 L2: reads GitHub, `record` writes the ledger; never ensures the daemon
-        return cmd_review(args, runner, now)
-
-
-    if args.action == "pr-explain":  # #179 slice L6: one GET, prints; never ensures the daemon, never writes
-        return cmd_pr_explain(args, runner, now)
-    if args.action == "impact":  # #179 L3: reads one PR, writes nothing, never ensures the daemon
-        return cmd_impact(args, runner, now)
-    if args.action == "plan":  # #135: reads only, never ensures the daemon
-        if args.plan_action == "review":  # #109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled
-            return cmd_plan_review(args, runner, now, socket_call)
-        return cmd_plan_check(args, runner, now)
-    if args.action in POLICY_COMMANDS:  # PR 9: prints one JSON line and exits 0 whatever happens
-        return POLICY_COMMANDS[args.action](args, runner, now)
+    handler = resolve_command(args.action, known)
+    if handler is not None and (args.action in DIRECT_ACTIONS or getattr(handler, "direct", False) is True):   # reads or answers on its own terms: no daemon start, no error mapping
+        return call_command(handler, **available)
     try:
-        if args.action in ENSURE_ON_USE_COMMANDS:  # PR 16: the daemon is alive when a command needs it
-            ensure_on_use(spawn)
-        if args.action == "ensure":
-            return cmd_ensure(args, spawn)
-        if args.action == "install":  # PR 16
-            return cmd_install(args, runner, now, spawn)
-        if args.action == "key":
-            return cmd_key(args)
-        if args.action == "restart":
-            return cmd_restart(args, runner, spawn)
-        if args.action == "bootstrap":
-            return cmd_bootstrap(args, runner, now, socket_call)
-        if args.action == "launch":
-            return cmd_launch(args, runner, now, socket_call)
-        if args.action == "handoff":  # PR 8
-            return cmd_handoff(args, runner, now, socket_call)
-        if args.action == "run":
-            return cmd_run(args, runner, now, wait)
-        if args.action == "send":
-            return cmd_send(args, runner, now)
-        if args.action == "report":
-            return cmd_report(args, runner, now)
-        if args.action == "notice":
-            return cmd_notice(args, runner, now)
-        if args.action in ("prove", "verdict", "waive", "gates", "gates-check"):  # #107: state and GETs only; never ensures the daemon
-            try:
-                return {"prove": cmd_prove, "verdict": cmd_verdict, "waive": cmd_waive, "gates": cmd_gates,
-                        "gates-check": cmd_gates_check}[args.action](args, runner, now)
-            except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
-                sys.stderr.write("%s: %s: %s\n" % (PROG, args.action, _one_line(str(err), 400)))
-                return EXIT_USAGE
-        if args.action == "decisions":
-            return cmd_decisions(args, runner, now)
-        if args.action == "comment":
-            return cmd_comment(args, runner, now)
-        if args.action == "whoami":
-            return cmd_whoami(args, runner, now)
-        if args.action == "pending":
-            return cmd_pending(args, runner, now)
-        if args.action == "remind":
-            return cmd_remind(args, runner, now)
-        if args.action in INTENT_COMMANDS:
-            return INTENT_COMMANDS[args.action](args, runner, now)
-        if args.action in V1_MOVE_COMMANDS:  # PR 10
-            return V1_MOVE_COMMANDS[args.action](args, runner, now)
-        if args.action == "orders":  # PR 17
-            return cmd_orders(args, runner, now)
-        if args.action == "labels":  # PR 18
-            return cmd_labels(args, runner, now)
+        if handler is not None:
+            if args.action in ENSURE_ON_USE_COMMANDS:  # PR 16: the daemon is alive when a command needs it
+                ensure_on_use(spawn)
+            if args.action in LEDGER_ACTIONS:
+                try:
+                    return call_command(handler, **available)
+                except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
+                    sys.stderr.write("%s: %s: %s\n" % (PROG, args.action, _one_line(str(err), 400)))
+                    return EXIT_USAGE
+            return call_command(handler, **available)
     except SimulatedCrash as crash:
         sys.stderr.write("%s: crashed: %s\n" % (PROG, crash))
         return EXIT_CRASH
@@ -17059,6 +17037,17 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return EXIT_ERROR
     sys.stderr.write("%s: unknown command %r\n" % (PROG, args.action))
     return EXIT_USAGE
+
+
+def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
+         socket_call=None):
+    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exit_:
+        return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+    return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
 # ============================================================================
