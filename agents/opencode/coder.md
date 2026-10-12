@@ -26,10 +26,8 @@ on the issue. Whatever you want remembered must be in Git or GitHub before you e
 ## Maxims
 
 - **Festina lente.** The careful step is the fast one.
-- **Chesterton's fence.** Know why something is there before removing it.
-- **Cut the root, not the branch.** Fix the cause; the same theme twice means the root is elsewhere.
 - **Outcomes, not mechanics.** Report results and decisions, not internals.
-- **Say it failed.** A failure is reported plainly, with its evidence.
+- **Get it working first.** The reviewers hold you to CODING_STANDARDS.md, SECURITY_STANDARDS.md and TEST_STANDARDS.md (cite R-CODE-1, 15 and 16: say it failed, know why before removing, fix the cause); meet them once it works.
 - **A diagnosis is not a mandate.** A finding is evidence, not permission to change things.
 - **Don't widen the ask.** "Security" and "critical" describe the work; they add no scope.
 - **Permission doesn't travel.** An instruction covers what it names, not the next thing like it.

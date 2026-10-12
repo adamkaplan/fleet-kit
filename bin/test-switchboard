@@ -8645,11 +8645,12 @@ AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
 SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
                  "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
                  "Permission doesn't travel", "An empty queue is not a mandate")
+HYGIENE_MAXIMS = ("Chesterton's fence", "Cut the root, not the branch", "Say it failed")
 COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -8660,8 +8661,9 @@ ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "c
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
 # one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+# hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
-ROLE_BYTE_LIMITS = {"coder": 7550, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7450, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -9082,7 +9084,12 @@ class TestAgentDefinitions(unittest.TestCase):
                 self.assertLessEqual(len([line for line in block.splitlines() if line.strip()]), 12)
                 role = role_of(path)
                 for phrase in SHARED_MAXIMS:
-                    self.assertIn(phrase, block)
+                    # the coding-hygiene maxims live in CODING_STANDARDS.md (R-CODE-1, 15, 16); the coder keeps a pointer, not the text
+                    if role == "coder" and phrase in HYGIENE_MAXIMS:
+                        self.assertNotIn(phrase, block)
+                    else:
+                        self.assertIn(phrase, block)
+                self.assertEqual("CODING_STANDARDS.md" in block, role == "coder")
                 self.assertEqual("Trust, but verify" in block, role not in WORKER_ROLES)
                 for phrase in COS_ONLY_MAXIMS:
                     self.assertEqual(phrase in block, role == "chief-of-staff", phrase)
@@ -36754,6 +36761,8 @@ class TestReviewerSubagents(LedgerBase):
         super().setUp()
         self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main")
         self.contents_calls = []
+        self.list_calls = []
+        self.merged_prs = []
         self.contents = {(name, self.BASE): "base text of %s: rule R-CODE-3\n" % name for name in self.LAW_FILES[:4]}
         self.contents[("REVIEW_LAWS.md", LEDGER_HEAD)] = "EDITED BY THE PR HEAD\n"
 
@@ -36766,6 +36775,9 @@ class TestReviewerSubagents(LedgerBase):
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             body = {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "list"]:
+            self.list_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.merged_prs), "")
         return super().route(argv, **kwargs)
 
     def review(self, who, *argv):
@@ -36816,6 +36828,113 @@ class TestReviewerSubagents(LedgerBase):
         shells = [r for a, r, e in perms if a == "shell" and e == "allow"]
         self.assertFalse([r for r in shells if r.split()[0] not in ("fleet-switchboard", "git", "gh")], shells)
         self.assertFalse([r for r in shells if "record" in r or "test" in r.split()[1:2] or "pytest" in r])
+
+    @staticmethod
+    def merged(number, merged, title="a change", body="", commits=("2026-01-01T10:00:00Z",), green="2026-01-01T10:30:00Z", lines=(10, 5)):
+        return {"number": number, "title": title, "body": body, "createdAt": commits[0], "mergedAt": merged, "additions": lines[0], "deletions": lines[1],
+                "commits": [{"committedDate": c} for c in commits],
+                "statusCheckRollup": [{"conclusion": "SUCCESS", "completedAt": green}, {"conclusion": "FAILURE", "completedAt": "2026-01-02T00:00:00Z"}]}
+
+    def test_review_measure_computes_each_column_and_the_two_groups_without_writing_anything(self):
+        self.merged_prs = [self.merged(1, "2026-01-01T12:00:00Z"), self.merged(2, "2026-01-02T12:00:00Z", lines=(100, 100)),
+                           self.merged(3, "2026-01-03T12:00:00Z", green="2026-01-03T10:10:00Z", commits=("2026-01-03T10:00:00Z",)),
+                           self.merged(4, "2026-01-04T12:00:00Z", title="Fix the thing from #2", body="")]
+        self.merged_prs[2]["commits"] = [{"committedDate": "2026-01-03T10:00:00Z"}]
+        self.merged_prs[2]["createdAt"] = "2026-01-03T10:00:00Z"
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2", "--split", "3", "--json")
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual([r["pr"] for r in data["baseline"]], [1, 2])
+        self.assertEqual([r["pr"] for r in data["after"]], [3, 4])
+        by = {r["pr"]: r for r in data["baseline"] + data["after"]}
+        self.assertEqual(by[1]["to_green_min"], 30.0)
+        self.assertEqual(by[3]["to_green_min"], 10.0)
+        self.assertEqual((by[2]["lines"], by[2]["escaped"], by[1]["escaped"]), (200, 1, 0), "the fix naming #2 within 14 days marks #2 only")
+        self.assertEqual(by[1]["rounds"], None, "no recorded review: blank, not zero")
+        self.assertEqual(self.list_calls[0][self.list_calls[0].index("--state") + 1], "merged")
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2", "--split", "3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("BASELINE (2 PRs", out)
+        self.assertIn("AFTER (2 PRs", out)
+        self.assertIn("median", out)
+
+    def test_review_measure_counts_recorded_review_heads_and_findings_and_refuses_bad_bounds_and_unknown_split(self):
+        self.merged_prs = [self.merged(7, "2026-01-01T12:00:00Z")]
+        entries = [{"kind": "review_record", "pr": "acme/app#7", "head": "a" * 40, "reviewer": "code", "blocks": 1, "notes": 2},
+                   {"kind": "review_record", "pr": "acme/app#7", "head": "b" * 40, "reviewer": "code", "blocks": 0, "notes": 1},
+                   {"kind": "review_record", "pr": "other/app#7", "head": "c" * 40, "reviewer": "code", "blocks": 9, "notes": 9}]
+        row = sb.measure_row(self.merged_prs[0], entries, self.merged_prs, "acme/app")
+        self.assertEqual((row["rounds"], row["blocks"], row["notes"]), (2, 1, 3))
+        for bad in (("--count", "0"), ("--count", "51"), ("--scan", "41"), ("--count", "10", "--scan", "5")):
+            with self.subTest(bad=bad):
+                code, out, err = self.review("coder", "measure", "acme/app", *bad)
+                self.assertEqual(code, sb.EXIT_USAGE)
+                self.assertIn("review measure", err)
+        code, out, err = self.review("coder", "measure", "acme/app", "--split", "999")
+        self.assertEqual(code, sb.EXIT_USAGE)
+        self.assertIn("#999", err)
+
+    def test_review_measure_strips_terminal_escapes_from_titles_and_reports_every_way_gh_can_fail(self):
+        self.merged_prs = [self.merged(1, "2026-01-01T12:00:00Z", title="evil \x1b[31mred\x07 title")]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertNotRegex(out, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("evil", out)
+        real = self.route
+        for answer, why in ((subprocess.CompletedProcess([], 1, "", "gh: boom"), "failed"), (subprocess.CompletedProcess([], 0, "not json", ""), "JSON"),
+                            (subprocess.CompletedProcess([], 0, "{}", ""), "not a list")):
+            with self.subTest(why=why):
+                self.route = lambda argv, answer=answer, **kw: answer if argv[1:3] == ["pr", "list"] else real(argv, **kw)
+                code, out, err = self.review("coder", "measure", "acme/app")
+                self.assertEqual(code, sb.EXIT_USAGE)
+                self.assertIn(why, err)
+
+    def test_review_measure_edges_the_escape_window_the_number_match_missing_checks_and_no_split(self):
+        base = self.merged(2, "2026-01-01T12:00:00Z")
+        for title, merged, body, expect in (("Fix it", "2026-01-16T12:00:01Z", "for #2", 0), ("Fix it", "2025-12-31T12:00:00Z", "for #2", 0),
+                                            ("Update things", "2026-01-02T12:00:00Z", "for #2", 0), ("Fix it", "2026-01-02T12:00:00Z", "for #20", 0),
+                                            ("Revert it", "2026-01-15T12:00:00Z", "reverts #2", 1)):
+            with self.subTest(title=title, merged=merged, body=body):
+                other = self.merged(9, merged, title=title, body=body)
+                self.assertEqual(sb.measure_row(base, [], [base, other], "acme/app")["escaped"], expect)
+        none_green = dict(base, statusCheckRollup=[{"conclusion": "FAILURE", "completedAt": "2026-01-01T11:00:00Z"}])
+        self.assertIsNone(sb.measure_row(none_green, [], [none_green], "acme/app")["to_green_min"])
+        early = dict(base, statusCheckRollup=[{"conclusion": "SUCCESS", "completedAt": "2025-01-01T00:00:00Z"}])
+        self.assertIsNone(sb.measure_row(early, [], [early], "acme/app")["to_green_min"])
+        self.assertEqual(sb._median([1, 2, 3, 10]), 2.5)
+        self.merged_prs = [self.merged(n, "2026-01-0%dT12:00:00Z" % n) for n in (1, 2, 3)]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("BASELINE (2 PRs", out)
+        self.assertNotIn("AFTER", out)
+        row = out.split("\n")[2].split()
+        self.assertEqual(row[-4:-1], ["-", "-", "-"], "no recorded review: rounds, blocks and notes print as dashes")
+
+    def test_review_measure_warns_loudly_and_carries_on_when_the_ledger_chain_is_damaged(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], "line 3: the chain breaks")):
+            code, out, err = self.review("coder", "measure", "acme/app", "--count", "1", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("review ledger is damaged (line 3: the chain breaks)", err)
+        self.assertIsNone(json.loads(out)["baseline"][0]["rounds"])
+
+    def test_review_measure_reads_the_ledger_for_this_repository_only(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        code, out, err = self.record("coder", "code", "approve", "--blocks", "0", "--notes", "2")
+        self.assertEqual(code, 0, err)
+        for repo, expect in (("acme/app", (1, 2)), ("other/app", (None, None))):
+            with self.subTest(repo=repo):
+                code, out, err = self.review("coder", "measure", repo, "--count", "1", "--json")
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)["baseline"][0]
+                self.assertEqual((row["rounds"], row["notes"]), expect)
+
+    def test_the_coder_pointer_names_only_rules_that_exist_in_the_standards(self):
+        standards = (REPO / "CODING_STANDARDS.md").read_text()
+        for path in (REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            line = [l for l in path.read_text().splitlines() if "CODING_STANDARDS.md" in l][0]
+            for number in re.findall(r"\d+", line.split("(cite", 1)[1].split(":", 1)[0]):
+                self.assertIn("**R-CODE-%s " % number, standards, path.name)
 
     def test_the_skill_and_the_docs_name_the_test_reviewer_and_say_five(self):
         skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
