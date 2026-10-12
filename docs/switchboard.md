@@ -4312,5 +4312,9 @@ offers a pull request (the `fleet-review` skill says how); each one loads the re
 `REVIEW_OVERLAY.md` as they stand at the PR's **base commit** (never its head: a PR cannot rewrite the law it is judged by), then an optional local overlay kept outside the repository at
 `$XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md`. A reviewer records its result with `fleet-switchboard review record <pr> --reviewer <role> --verdict ... [--blocks n --notes n
 --impact-action hold|second-review|none] --head <sha>`: a chained ledger entry at the PR's current head (a stale head is refused). `gates` prints a **shadow** line, `reviewers (shadow, not counted): n of 4
-recorded at <head>`, which never changes whether a PR is ready; a push voids the records. The record names the session that wrote it, which while agents share one GitHub account is a mistake guard, not a
-boundary. The test reviewer is a later slice, and the agent definitions are a permission surface: the owner decides who may install them.
+recorded at <head>`, which never changes whether a PR is ready; a push voids the records. The record names the session that ran the command and the reviewer role given with `--reviewer`; while agents share one GitHub account this is a mistake guard, not a boundary.
+**Two things are not verified.** (1) Whether OpenCode v2 honours `steps: 50` in an agent definition: the prompt's budget rule (record by about 35 tool calls, `incomplete` past 40, never approve when incomplete) is the guard. (2) Whether a
+Task-tool subagent session has a fleet identity of its own: unknown. If it does not, it runs `review record` under the CODER's session, so the record's `by` is the coder and the reviewer identity is only the `--reviewer` argument: a reviewer record is then the coder
+saying what the reviewer found, which is exactly the mistake-guard limit above (an independent verdict still comes from the independent review agent). The test reviewer is a later slice. The agent definitions are a permission surface:
+each grants exactly the shell reads `fleet-switchboard review laws *`, `fleet-switchboard review record *`, `git diff|log|show *` and `gh pr diff|view *`, plus read, glob and grep, and denies edit and the build and test commands;
+the owner decides who may install them.
