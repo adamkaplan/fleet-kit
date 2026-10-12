@@ -6,7 +6,6 @@ model: __PROVIDER__/__MODEL_ID__
 # the denies keep it out of what nothing in the job needs. Last match wins, any deny denies, nothing asks. A focus, not a fence: redirects and quoting are not policed.
 permissions:
   - {action: "*", resource: "*", effect: deny}
-  # tools: look anywhere in the fleet, write only in the opencode temp dir
   - {action: read, resource: "*", effect: allow}
   - {action: glob, resource: "*", effect: allow}
   - {action: grep, resource: "*", effect: allow}
@@ -70,10 +69,12 @@ permissions:
   - {action: shell, resource: "gh pr review*", effect: deny}
   - {action: shell, resource: "gh api *-X*", effect: deny}
   - {action: shell, resource: "gh api *--method*", effect: deny}
-  - {action: shell, resource: "gh api * -f *", effect: deny}
-  - {action: shell, resource: "gh api * -F *", effect: deny}
+  - {action: shell, resource: "gh api * -f*", effect: deny}
+  - {action: shell, resource: "gh api * -F*", effect: deny}
   - {action: shell, resource: "gh api *--input*", effect: deny}
   - {action: shell, resource: "gh api *--field*", effect: deny}
+  - {action: shell, resource: "gh api *--raw-field*", effect: deny}
+  - {action: shell, resource: "gh auth*", effect: deny}
   # git: any read; a write verb is denied where it stands as a word (git -c, --output, --exec and ext:: too)
   - {action: shell, resource: "git *", effect: allow}
   - {action: shell, resource: "git *push*", effect: deny}
@@ -92,6 +93,7 @@ permissions:
   - {action: shell, resource: "git *filter-branch*", effect: deny}
   - {action: shell, resource: "git *init*", effect: deny}
   - {action: shell, resource: "git *clean*", effect: deny}
+  - {action: shell, resource: "git *credential*", effect: deny}
   - {action: shell, resource: "git commit *", effect: deny}
   - {action: shell, resource: "git * commit *", effect: deny}
   - {action: shell, resource: "git merge *", effect: deny}
@@ -142,6 +144,8 @@ permissions:
   - {action: shell, resource: "az * status *", effect: allow}
   - {action: shell, resource: "az * query *", effect: allow}
   - {action: shell, resource: "az *secret*", effect: deny}
+  - {action: shell, resource: "az *credential*", effect: deny}
+  - {action: shell, resource: "az *appsettings*", effect: deny}
   - {action: shell, resource: "az *get-access-token*", effect: deny}
   - {action: shell, resource: "az rest*", effect: deny}
   - {action: shell, resource: "az containerapp*", effect: deny}
@@ -187,7 +191,6 @@ permissions:
   - {action: shell, resource: "cat *.config/gh*", effect: deny}
   - {action: shell, resource: "cat *id_rsa*", effect: deny}
   - {action: shell, resource: "cat *auth.json*", effect: deny}
-  # herdr: look around, rename and focus; never type into or stop another agent (only these shapes are allowed, so prompt, send, close, stop and start are denied by default)
   - {action: shell, resource: "herdr * list*", effect: allow}
   - {action: shell, resource: "herdr * get*", effect: allow}
   - {action: shell, resource: "herdr * read*", effect: allow}

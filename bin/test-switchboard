@@ -8598,7 +8598,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az containerapp show -n a -g g",
                         "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
-                        "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                        "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
