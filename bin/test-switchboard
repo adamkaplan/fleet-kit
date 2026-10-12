@@ -35199,6 +35199,20 @@ class TestPlanReviewCommands(LedgerBase):
         self.assertIn("PASS", out)
 
 
+class TestOwnerEvaluatorsAreRare(unittest.TestCase):
+    """The planning skill and the plan template say owner evaluators are rare and `claim: epic` (the cos rule: no routine PR waits on the owner)."""
+
+    def test_the_skill_and_the_template_say_so(self):
+        skill = (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text()
+        template = (REPO / "docs" / "plan-template.md").read_text()
+        for text in (skill, template):
+            self.assertIn("Owner evaluators are rare", text)
+            self.assertIn("own eyes are the test", text)
+            self.assertIn("claim: epic", text)
+            self.assertIn("never for a routine PR" if text is skill else "never waits on the owner", text)
+        self.assertIn("its own light plan", template)
+
+
 class TestReviewLawsStarterSet(Base):
     """#179 slice L1: the generic review laws and standards starter set (docs/review-laws/) and `review-laws install`."""
 
