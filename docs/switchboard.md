@@ -645,7 +645,7 @@ Behaviour is set by a few short maxims, not by long rules. A reasoning agent
 gets more from one well-chosen phrase than from a paragraph of conditions, and
 a short list stays read.
 
-**Shared by every role.**
+**Shared by every role** (the coder holds Chesterton's fence, cut the root and say it failed as R-CODE-15, 16 and 1 of `CODING_STANDARDS.md`, where the reviewers enforce them, and keeps a pointer instead of the text: see `review measure`).
 
 - **Festina lente.** Make haste slowly: the careful step is the fast one.
 - **Chesterton's fence.** Know why something is there before removing it.
