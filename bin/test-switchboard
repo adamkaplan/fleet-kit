@@ -35744,6 +35744,27 @@ class TestOwnerEvaluatorsAreRare(unittest.TestCase):
         self.assertIn("its own light plan", template)
 
 
+class TestOwnReviewLaws(unittest.TestCase):
+    """fleet-kit's own laws at its root: installed from the starter set, so `review laws` works on fleet-kit itself."""
+
+    FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
+    ID = re.compile(r"\bR-(?:LAW|CODE|SEC|TEST)-[0-9]+\b")
+
+    def test_the_four_files_exist_at_the_root_and_open_with_the_extends_line(self):
+        version = (REPO / "docs" / "review-laws" / "VERSION").read_text().strip()
+        for name in self.FILES:
+            with self.subTest(name=name):
+                self.assertTrue((REPO / name).is_file(), name)
+                self.assertEqual((REPO / name).read_text().splitlines()[0], "extends: fleet-kit-review-laws @ %s" % version)
+
+    def test_the_root_copy_starts_as_the_starter_set_no_rule_id_added_or_dropped(self):
+        for name in self.FILES:
+            with self.subTest(name=name):
+                root = set(self.ID.findall((REPO / name).read_text().split("\n## This repository")[0]))
+                starter = set(self.ID.findall((REPO / "docs" / "review-laws" / name).read_text()))
+                self.assertEqual((root - starter, starter - root), (set(), set()))
+
+
 class TestReviewLawsStarterSet(Base):
     """#179 slice L1: the generic review laws and standards starter set (docs/review-laws/) and `review-laws install`."""
 
@@ -36048,6 +36069,15 @@ class TestReviewerSubagents(LedgerBase):
         self.assertIn("Five reviewer agents", docs)
         self.assertIn("reviewer-test", docs)
         self.assertNotIn("the four reviewers", skill + docs)
+
+    def test_review_laws_prints_fleet_kits_own_root_files_from_the_base_commit(self):
+        for name in ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md"):
+            self.contents[(name, self.BASE)] = (REPO / name).read_text()
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertIn("R-CODE-1", out)
+        self.assertIn("R-TEST-1", out)
+        self.assertNotIn("none of", out)
 
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:
