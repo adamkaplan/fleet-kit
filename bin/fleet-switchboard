@@ -12803,12 +12803,16 @@ def _ledger_context(args, runner, now, writable, parts=None):
                                  plan_problem=plan_problem)
 
 
-def _scenario_of(ctx, sid):
+def _plan_usable(ctx):
     if ctx.plan is None:
         raise LedgerCommandError("no plan to bind to: %s" % (ctx.plan_problem or "pass --plan <owner/repo#N>, or put "
                                                               "`PLAN: <link>` in the PR body"))
     if ctx.plan["result"] != "pass":
         raise LedgerCommandError("the plan fails `plan check` (%d defect(s)): fix it first, nothing was recorded" % len(ctx.plan["defects"]))
+
+
+def _scenario_of(ctx, sid):
+    _plan_usable(ctx)
     found = next((x for x in ctx.plan["scenarios_parsed"] if x.get("id") == sid), None)
     if found is None:
         raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
@@ -12863,10 +12867,24 @@ def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
     ctx = _ledger_context(args, runner, now, True)
-    scenario = _scenario_of(ctx, args.scenario)
-    named = plan_ledger.evaluator_of(scenario)
-    if args.evaluator != named:
-        raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (args.scenario, named, args.evaluator))
+    every = bool(getattr(args, "all_scenarios", False))
+    if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
+        if args.scenario:
+            raise LedgerCommandError("--all takes no scenario id: it records every scenario the plan names for --as %s" % args.evaluator)
+        _plan_usable(ctx)
+        targets = [x for x in ctx.plan["scenarios_parsed"]
+                   if (x.get("claim") or "pr") == "pr" and plan_ledger.evaluator_of(x) == args.evaluator]
+        if not targets:
+            raise LedgerCommandError("no per-PR scenario of this plan is judged by %s: nothing was recorded" % args.evaluator)
+        named = args.evaluator
+    else:
+        if not args.scenario:
+            raise LedgerCommandError("name the scenario (`verdict S1 ...`), or use --all for every scenario judged by --as")
+        scenario = _scenario_of(ctx, args.scenario)
+        named = plan_ledger.evaluator_of(scenario)
+        targets = [scenario]
+        if args.evaluator != named:
+            raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (args.scenario, named, args.evaluator))
     senders = ctx.facts.get("notice_senders") or ()
     if named == "owner":
         # The owner's verdict comes only from the owner's own terminal: a caller with NO agent session. An agent (even an
@@ -12885,15 +12903,26 @@ def cmd_verdict(args, runner, now):
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
-                                    {"scenario": args.scenario, "by": caller if named != "owner" else "(not the owner's terminal)",
+                                    {"scenario": args.scenario or "--all", "by": caller if named != "owner" else "(not the owner's terminal)",
                                      "evaluator": named, "why": why})
         raise LedgerCommandError("refused: %s" % why)
-    entry = {"kind": "verdict", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
-             "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
-             "evaluator": named, "evidence": _evidence(args)}
-    stored = _record(ctx, args, now, entry)
-    print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, stored["seq"], args.scenario, args.result,
-                                                                         entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
+    if every and not args.head:   # the verdicts say "I judged THIS head": never guess it for a batch (the head may have moved)
+        raise LedgerCommandError("--all needs --head <sha> (the head you judged): a batch is never stamped with whatever the head is now")
+    head, evidence = _head_of(ctx, args), _evidence(args)
+    entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
+                "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
+                "evaluator": named, "evidence": evidence} for target in targets]
+    try:
+        stored = plan_ledger.append_many(ctx.state, entries, now())   # all of them or none
+    except plan_ledger.LedgerError as err:
+        raise LedgerCommandError("%s" % err) from None
+    for entry, one in zip(entries, stored):
+        if ctx.engine.audit is not None:
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr,
+                                    {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"],
+                                     "chain": one["hash"]})
+        print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
+                                                                             head[:8], ctx.pr, entry["plan_hash"][:19]))
     return EXIT_OK
 
 
@@ -12948,12 +12977,15 @@ def cmd_gates(args, runner, now):
     if args.pr == "preflight":
         args.pr = args.rest[0] if args.rest else ""
         return cmd_gates_preflight(args, runner, now)
+    if args.pr == "stats":
+        return cmd_gates_stats(args, runner, now)
     ctx = _ledger_context(args, runner, now, False)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
@@ -12969,7 +13001,82 @@ def cmd_gates(args, runner, now):
         if report.get("plan_changed"):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
-    return EXIT_OK if report["ready"] else EXIT_ERROR
+    ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
+    return EXIT_OK if ok else EXIT_ERROR
+
+
+def gates_stats_core(entries, merged_at, limit=10):
+    """Per gated PR that has merged: the evidence records by actor (the switchboard's own `ci` records are the automatic ones) and the
+    minutes from the first gate record to the merge. `entries` is the ledger; `merged_at(pr)` is the merge time (epoch seconds) or None.
+    Newest merged first, at most `limit`. Returns {"prs": [...], "unmerged": n}."""
+    by_pr = {}
+    for entry in entries:
+        if entry.get("pr") and entry.get("kind") in plan_ledger.EVIDENCE_KINDS and isinstance(entry.get("ts"), (int, float)):
+            by_pr.setdefault(entry["pr"], []).append(entry)
+    rows, unmerged = [], 0
+    for pr, items in by_pr.items():
+        merged = merged_at(pr)
+        if merged is None:
+            unmerged += 1
+            continue
+        actors = {}
+        for item in items:
+            actors[item.get("by") or "?"] = actors.get(item.get("by") or "?", 0) + 1
+        first = min(i["ts"] for i in items)
+        manual = sum(n for who, n in actors.items() if who != plan_ledger.CI_RECORDER)
+        rows.append({"pr": pr, "records": len(items), "by": dict(sorted(actors.items())), "manual_records": manual,
+                     "automatic_records": len(items) - manual, "minutes_to_merge": round(max(0.0, merged - first) / 60.0, 1),
+                     "merged_at": iso(merged)})
+    rows.sort(key=lambda r: r["merged_at"], reverse=True)
+    return {"prs": rows[:limit], "unmerged": unmerged}
+
+
+def cmd_gates_stats(args, runner, now):
+    """`gates stats [--limit N] [--json]`: what the gates cost per merged gated PR (records by actor, minutes from the first gate record
+    to the merge). Read-only: the ledger, and one `gh pr view` per PR in it."""
+    engine, state, config = build_engine(runner, now, "cli", writable=False)
+    entries, problem = plan_ledger.read_ledger(state)
+    cache = {}
+
+    def merged_at(pr):
+        if pr not in cache:
+            repo, _, number = pr.rpartition("#")
+            try:
+                raw = read_pr_json(engine, repo, int(number), "mergedAt,state")
+                when = raw.get("mergedAt") if raw.get("state") == "MERGED" else None
+                cache[pr] = datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() if when else None
+            except (NoticeError, ValueError, TypeError, AttributeError):
+                cache[pr] = None
+        return cache[pr]
+    got = gates_stats_core(entries, merged_at, max(1, getattr(args, "limit", 10) or 10))
+    if args.json:
+        print(json.dumps(dict(got, ledger_problem=problem), sort_keys=True))
+        return EXIT_OK
+    if problem:
+        print("LEDGER: %s" % problem)
+    print("gates cost per merged gated PR (newest first; %d gated PR(s) not merged yet)" % got["unmerged"])
+    for row in got["prs"]:
+        print("  %-28s %2d record(s) (%d by agents, %d automatic): %s; first record to merge %.1f min" % (
+            row["pr"], row["records"], row["manual_records"], row["automatic_records"],
+            ", ".join("%s %d" % kv for kv in row["by"].items()), row["minutes_to_merge"]))
+    if got["prs"]:
+        print("  mean: %.1f agent record(s), %.1f min first record to merge" % (
+            sum(r["manual_records"] for r in got["prs"]) / len(got["prs"]), sum(r["minutes_to_merge"] for r in got["prs"]) / len(got["prs"])))
+    return EXIT_OK
+
+
+def enforced_gates_of(ctx):
+    """The gates this PR's repo really refuses on, or None when it refuses on none (shadow, unlisted, off, killed, or an
+    `enforce` whose preflight does not pass and so runs as shadow): then `gates` judges the whole board, as it always did."""
+    try:
+        repo = plan_ledger.normal_repo(ctx.pr.rsplit("#", 1)[0])
+        setting = plan_ledger.repo_setting(ctx.config, repo)
+        if setting is None or not setting.get("enabled") or gates_off_path(ctx.state).exists():
+            return None
+        mode, _ = plan_ledger.effective_mode(ctx.config, setting, lambda: ci_recorder_proven(ctx.state, time.time()), cos_ready_check)
+        return list(setting.get("enforce_gates") or plan_ledger.DEFAULT_ENFORCED) if mode == "enforce" else None
+    except Exception:
+        return None
 
 
 
@@ -13591,6 +13698,11 @@ def add_ledger_parsers(sub):
     verdict = sub.add_parser("verdict", help="Record an evaluator's verdict for a scenario (only the evaluator the "
                                              "scenario names, never a writer of the PR)")
     common(verdict)
+    for action in verdict._actions:
+        if action.dest == "scenario":
+            action.nargs, action.default = "?", None   # `--all` takes no scenario id
+    verdict.add_argument("--all", dest="all_scenarios", action="store_true",
+                         help="Record the verdict for EVERY per-PR scenario of the plan judged by --as, at the current head (no scenario id)")
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
@@ -13610,6 +13722,9 @@ def add_ledger_parsers(sub):
     common(gates, scenario=False)
     gates.add_argument("rest", nargs="*", help="With `mode`: <owner/repo> <shadow|enforce|off>")
     gates.add_argument("--json", action="store_true")
+    gates.add_argument("--limit", type=int, default=10, help="With `stats`: how many merged PRs to show (default 10)")
+    gates.add_argument("--all", dest="all_gates", action="store_true",
+                       help="Exit by the whole board, not only the gates the repo enforces")
     check = sub.add_parser("gates-check", help="Is a ready or a merge allowed? Read-only: exit 0 allow, 10 refuse, anything else "
                                                "a fail-open. Only exit 10 refuses. Nothing calls it yet")
     check.add_argument("pr", help="The pull request: owner/repo#N or its URL")

@@ -129,6 +129,37 @@ def append_checked(state_dir, now, build):
     return stored
 
 
+def append_many(state_dir, entries_in, now):
+    """ALL of `entries_in`, or none: every entry is validated first, then the whole batch is chained and written with ONE write under
+    the exclusive lock, so a failure (an invalid entry, a broken chain, a failed write) leaves the ledger as it was. Returns the stored
+    entries."""
+    for entry in entries_in:
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
 # ----------------------------------------------------------------------------------- who may do what
 
 def evaluator_of(scenario):
@@ -362,11 +393,35 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             "ledger_problem": ledger_problem}
 
 
+SATISFIED = ("ok", "n/a", "untracked", "waived")
+
+
+def enforced_view(report, enforced):
+    """Add `enforced` (the gates the repo refuses on, or None when it refuses on none: shadow, unlisted or off) and
+    `ready_enforced` (those gates are all satisfied) to `report`. The full-board `ready` is left as it was."""
+    report["enforced"] = list(enforced) if enforced else None
+    rows = {r["gate"]: r for r in report["gates"]}
+    open_enforced = [g for g in (enforced or ()) if rows.get(g) and rows[g]["status"] not in SATISFIED]
+    report["ready_enforced"] = (not open_enforced) if enforced else report["ready"]
+    report["open_enforced"] = open_enforced
+    report["open_not_enforced"] = [r["gate"] for r in report["gates"]
+                                   if r["gate"] not in (enforced or ()) and r["status"] not in SATISFIED] if enforced else []
+    return report
+
+
 def render_gates(report, pr):
     """The lines `gates` prints."""
-    lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8],
-                                          "READY on the gates it tracks (this is not approval: see the untracked list)"
-                                          if report["ready"] else "NOT READY") + (
+    if report.get("enforced"):
+        names = ", ".join(report["enforced"])
+        state = ("READY for the enforced gates (%s)" % names if report["ready_enforced"]
+                 else "NOT READY for the enforced gates (%s): open %s" % (names, ", ".join(report["open_enforced"])))
+        if report["open_not_enforced"]:
+            state += "; not enforced: %s" % ", ".join(
+                "%s %s" % (g, next(r["status"] for r in report["gates"] if r["gate"] == g)) for g in report["open_not_enforced"])
+    else:
+        state = ("READY on the gates it tracks (this is not approval: see the untracked list)"
+                 if report["ready"] else "NOT READY")
+    lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8], state) + (
                  "; WAIVED (not passed): %s" % ", ".join(report["waived"]) if report.get("waived") else ""),
              "plan hash: %s" % (report.get("plan_hash") or "none")]
     if report.get("ledger_problem"):

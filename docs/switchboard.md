@@ -4158,6 +4158,19 @@ a fleet agent). `verdict <scenario> --pr <repo#N> --as owner --result ... --evid
 login, so the login cannot be the test; it is the session identity, which is a guard against mistakes and not a boundary (an agent that
 unsets its own session and pane variables looks like a person). There is no `plan_evaluators.owner` registry: the list is not consulted.
 
+**`gates <repo#N>` says what is enforced.** In a repo whose mode really is `enforce`, the first line reads `READY for the enforced gates (G0a, G1);
+not enforced: G5 missing` (or `NOT READY for the enforced gates (...): open G1`), and the **exit code follows those enforced gates only** (0 ready,
+1 not): that is the question `gh pr ready` and `gh pr merge` ask. A repo in `shadow`, unlisted, off, or whose `enforce` is downgraded by the preflight
+keeps the old line and the old exit (the whole board). `--all` exits by the whole board in every mode; `--json` adds `enforced`, `ready_enforced`
+and `open_enforced` next to the unchanged `ready`.
+
+**`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
+verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
+the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and
+refuses when the plan names no scenario for that role). `fleet-switchboard gates stats [--limit N] [--json]` reads the ledger and prints, for each merged gated PR
+(newest first, default 10), the evidence records by actor (the switchboard's own `ci` records are the automatic ones) and the minutes from the first gate record to the merge,
+so the steps and minutes the gates cost can be reported.
+
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
 check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
 verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
