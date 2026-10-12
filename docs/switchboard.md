@@ -4306,15 +4306,14 @@ Under `timeout` the short list lets ONLY these run: `fleet-switchboard` (any sub
 
 ## The reviewer subagents, `review laws` and `review record` (#179, slice L2)
 
-Four read-only reviewer agents ship in `agents/reviewers/` and are installed with the other kit agents: `reviewer-code`, `reviewer-architecture`, `reviewer-security` and `reviewer-impact`
-(`mode: subagent`, `steps: 50`, a deny-by-default allow-list of reading, the two `review` commands and a few git and gh reads, with the build and test commands denied last). The coder runs them before it
-offers a pull request (the `fleet-review` skill says how); each one loads the repository's laws with `fleet-switchboard review laws <pr>`, which prints `REVIEW_LAWS.md`, the standards and a
-`REVIEW_OVERLAY.md` as they stand at the PR's **base commit** (never its head: a PR cannot rewrite the law it is judged by), then an optional local overlay kept outside the repository at
-`$XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md`. A reviewer records its result with `fleet-switchboard review record <pr> --reviewer <role> --verdict ... [--blocks n --notes n
---impact-action hold|second-review|none] --head <sha>`: a chained ledger entry at the PR's current head (a stale head is refused). `gates` prints a **shadow** line, `reviewers (shadow, not counted): n of 4
-recorded at <head>`, which never changes whether a PR is ready; a push voids the records. The record names the session that ran the command and the reviewer role given with `--reviewer`; while agents share one GitHub account this is a mistake guard, not a boundary.
-**Two things are not verified.** (1) Whether OpenCode v2 honours `steps: 50` in an agent definition: the prompt's budget rule (record by about 35 tool calls, `incomplete` past 40, never approve when incomplete) is the guard. (2) Whether a
-Task-tool subagent session has a fleet identity of its own: unknown. If it does not, it runs `review record` under the CODER's session, so the record's `by` is the coder and the reviewer identity is only the `--reviewer` argument: a reviewer record is then the coder
-saying what the reviewer found, which is exactly the mistake-guard limit above (an independent verdict still comes from the independent review agent). The test reviewer is a later slice. The agent definitions are a permission surface:
-each grants exactly the shell reads `fleet-switchboard review laws *`, `fleet-switchboard review record *`, `git diff|log|show *` and `gh pr diff|view *`, plus read, glob and grep, and denies edit and the build and test commands;
-the owner decides who may install them.
+Four reviewer agents ship in `agents/reviewers/` and are installed with the other kit agents: `reviewer-code`, `reviewer-architecture`, `reviewer-security` and `reviewer-impact`. Each is `mode: subagent`,
+`steps: 50`, with a short permission block (about 38 lines of front matter; a test caps it at 40): deny by default; allowed = `read`, `glob`, `grep`, `fleet-switchboard review laws *`, `git diff|log|show *`, `gh pr diff|view *`;
+denied by name after the allows = `edit`, anything outside the checkout (`external_directory`), credential-looking paths (`.env*`, keys, `.ssh`, `.aws`, `.netrc`, `.config`, `*secret*`, `*credential*`), the flags that
+write or run something (`--output`, `--ext-diff`, `--textconv`, `--no-index`, `gh pr view --web`) and shell redirects. **A reviewer holds no write command**: it does not run `review record`, `send`, `report` or any `gh` write, and it
+returns its verdict as text. The coder runs the four before it offers a pull request (the `fleet-review` skill says how), receives each returned block, and records it: `fleet-switchboard review record <pr> --reviewer <role> --block <file or ->`
+reads the verdict, the head and the counts from the block (a blocking finding that cites no rule counts as a note) and writes a chained ledger entry per reviewer per head at the PR's current head; a block for another commit is refused.
+`fleet-switchboard review laws <pr>` prints `REVIEW_LAWS.md`, the three standards and a `REVIEW_OVERLAY.md` as they stand at the PR's **base commit** (never its head: a PR cannot rewrite the law it is judged by), then an optional local overlay
+kept outside the repository at `$XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md`. `gates` prints a **shadow** line, `reviewers (shadow, not counted; recorded by the PR's own session, so not independent): n of 4 recorded at <head>`,
+which never changes whether a PR is ready; a push voids the records. Because the coder's session makes the record, nothing here is independent evidence: the independent verdict still comes from the independent review agent.
+**Not verified:** whether OpenCode v2 honours `steps: 50` (the prompt's budget rule, answer by about 35 tool calls and `verdict: incomplete` past 40, never approve when incomplete, is the guard), and that the permission block behaves as written in a live v2 session
+(it was written against the same format as the chief of staff's list and is pinned by a test, not yet run through the permission harness). The test reviewer is a later slice, and the owner decides who may install the reviewers.

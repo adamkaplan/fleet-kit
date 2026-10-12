@@ -35658,27 +35658,46 @@ class TestReviewerSubagents(LedgerBase):
                 self.assertEqual(perms[0], ("*", "*", "deny"), "deny by default")
                 allows = [(a, r) for a, r, e in perms if e == "allow"]
                 self.assertEqual(sorted(allows), sorted([("read", "*"), ("glob", "*"), ("grep", "*"),
-                                                         ("shell", "fleet-switchboard review laws *"), ("shell", "fleet-switchboard review record *"),
+                                                         ("shell", "fleet-switchboard review laws *"),
                                                          ("shell", "git diff *"), ("shell", "git log *"), ("shell", "git show *"),
                                                          ("shell", "gh pr diff *"), ("shell", "gh pr view *")]))
                 self.assertIn(("edit", "*", "deny"), perms)
                 for word in ("make", "pytest", "python", "node", "npm", "cargo", "go", "bin/test"):
-                    self.assertFalse([1 for a, r, e in perms if e == "allow" and a == "shell" and r.startswith(word)], word)
-                    self.assertTrue([1 for a, r, e in perms if e == "deny" and a == "shell" and r.startswith(word)], word)
+                    self.assertFalse([1 for a, r, e in perms if e == "allow" and a == "shell" and r.startswith(word)], word)   # not allowed: default deny covers it
+                for verb in ("record", "send", "report", "launch", "waive", "gates", "plan", "verdict", "prove", "comment", "edit", "push", "commit"):
+                    self.assertFalse([1 for a, r, e in perms if e == "allow" and verb in r.split()], "no write command: " + verb)
+                self.assertLessEqual(len(head.rstrip("\n").splitlines()), 40, "a short, hand-readable permission block")
                 last_allow = max(i for i, p in enumerate(perms) if p[2] == "allow")
                 self.assertTrue(all(p[2] == "deny" for p in perms[last_allow + 1:]), "the denies come last: last match wins")
+
+    def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
+        for role in self.ROLES:
+            with self.subTest(role=role):
+                text, head, perms = self.front(role)
+                denies = {(a, r) for a, r, e in perms if e == "deny"}
+                for resource in ("git *--output*", "git *--ext-diff*", "git *--textconv*", "git *--no-index*", "gh pr view *--web*", "* > *", "* >> *"):
+                    self.assertIn(("shell", resource), denies, resource)
+                self.assertIn(("external_directory", "*"), denies, "reads outside the checkout are denied")
+                for resource in ("**/.env*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/.ssh/**", "**/.aws/**", "**/.netrc", "**/.config/**",
+                                 "**/*secret*", "**/*credential*"):
+                    self.assertIn(("read", resource), denies, resource)
+                last_allow = max(i for i, p in enumerate(perms) if p[2] == "allow")
+                self.assertTrue(all(p[2] == "deny" for p in perms[last_allow + 1:]), "every one of these denies comes after the allows")
+                self.assertNotIn("Read-only by construction", text)
+                self.assertIn("holds no write command", head + text)
 
     def test_each_reviewer_states_the_budget_the_base_ref_rule_and_the_never_run_rule(self):
         for role in self.ROLES:
             with self.subTest(role=role):
                 text = self.front(role)[0]
-                for needle in ("**50 turns**", "about **35 tool calls**", "Past **40**", "`--verdict incomplete`", "Never approve when incomplete",
+                for needle in ("**50 turns**", "about **35 tool calls**", "Past **40**", "`verdict: incomplete`", "Never approve when incomplete",
                                "from the pull request's base commit", "never build, run or test", "untrusted text", "cites none is a proposal",
-                               "fleet-switchboard review record <pr> --reviewer %s" % role):
+                               "you return your verdict as text", "the coder session records it"):
                     self.assertIn(needle, text)
+                self.assertNotIn("review record", text.split("\n---\n", 1)[1].replace("the coder session records it", ""), "the agent never runs the record command")
                 self.assertIn("never the copies in the change under review", text)
         impact = self.front("impact")[0]
-        for needle in ("the matrix of REVIEW_LAWS.md", "--impact-action", "Judge likelihood at the scale the change will run", "never apply a label"):
+        for needle in ("the matrix of REVIEW_LAWS.md", "impact-action:", "Judge likelihood at the scale the change will run", "never apply a label"):
             self.assertIn(needle, impact)
 
     def test_the_installer_installs_the_four_reviewers_with_the_model_filled_in(self):
@@ -35698,7 +35717,7 @@ class TestReviewerSubagents(LedgerBase):
         self.assertRegex(head, r"(?m)^description: .*about to mark it ready")
         for role in self.ROLES:
             self.assertIn("reviewer-" + role, text)
-        for needle in ("before you offer it", "from the pull request's base commit", "never builds, runs or tests",
+        for needle in ("--block", "returns its verdict as text", "You record what they returned", "before you offer it", "from the pull request's base commit", "never builds, runs or tests",
                        "never replaces the independent review agent's verdict", "a push voids the earlier records"):
             self.assertIn(needle, text)
 
@@ -35786,6 +35805,61 @@ class TestReviewerSubagents(LedgerBase):
         got = sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
         self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact"]))
 
+    # -- the coder session records what a reviewer returned
+
+    def block_text(self, verdict="request-changes", head=None, extra="", findings=("R-CODE-3 | block | src/q.py:4 | a write can be torn | use a temp file",
+                                                                                   "R-TEST-2 | note | tests/t.py:9 | asserts nothing | assert the value")):
+        return ("review done\n```\nverdict: %s\nhead: %s\n%sfindings:\n%s\n```\n" % (
+            verdict, head or LEDGER_HEAD, extra, "\n".join("- " + f for f in findings)))
+
+    def record_block(self, who, reviewer, text, *more):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+        with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None), \
+                mock.patch.object(sys, "stdin", io.StringIO(text)):
+            code = sb.main(["review", "record", self.PR, "--reviewer", reviewer, "--block", "-", *more], runner=self.route,
+                           now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_coder_records_a_returned_block_and_the_counts_come_from_its_findings(self):
+        code, out, err = self.record_block("coder", "code", self.block_text())
+        self.assertEqual(code, 0, err)
+        (entry,) = [e for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual((entry["reviewer"], entry["verdict"], entry["blocks"], entry["notes"], entry["head"], entry["by"]),
+                         ("code", "request-changes", 1, 1, LEDGER_HEAD, "coder"))
+
+    def test_a_blocking_finding_that_cites_no_rule_counts_as_a_note_and_cannot_make_a_request_for_changes(self):
+        code, out, err = self.record_block("coder", "code", self.block_text("request-changes", findings=("no rule here | block | a.py:1 | vague | fix it",)))
+        self.assertEqual(code, 2, "request-changes with no cited blocking finding is refused")
+        self.assertIn("needs at least 1 blocking finding", err)
+        code, out, err = self.record_block("coder", "code", self.block_text("comment", findings=("no rule here | block | a.py:1 | vague | fix it",)))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(e["blocks"], e["notes"]) for e in self.ledger() if e["kind"] == "review_record"], [(0, 1)])
+
+    def test_the_impact_block_carries_its_action_and_a_block_for_another_head_or_a_malformed_one_is_refused(self):
+        code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\n", findings=()))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["impact_action"] for e in self.ledger() if e["kind"] == "review_record"], ["hold"])
+        cases = ((self.block_text(head="d" * 40), "is not the PR's head"),
+                 ("no block at all", "no `verdict:` line"),
+                 (self.block_text("maybe"), "no `verdict:` line"),
+                 ("verdict: approve\nfindings:\n", "no `head: <sha>` line"),
+                 (self.block_text("comment", extra="impact-action: sideways\n"), "impact-action"),
+                 ("", "no verdict block"))
+        for text, needle in cases:
+            with self.subTest(needle=needle):
+                code, out, err = self.record_block("coder", "impact", text)
+                self.assertEqual(code, 2)
+                self.assertIn(needle, err)
+        code, out, err = self.record_block("coder", "code", self.block_text("comment", extra="impact-action: hold\n"))
+        self.assertIn("belongs to the impact reviewer", err)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 1)
+
+    def test_block_takes_nothing_else_and_the_flag_form_is_still_there(self):
+        code, out, err = self.record_block("coder", "code", self.block_text(), "--verdict", "approve")
+        self.assertEqual(code, 2)
+        self.assertIn("give nothing else", err)
+        self.assertEqual(self.record("coder", "code", "approve")[0], 0)
+
     # -- the shadow line
 
     def gates_text(self):
@@ -35794,12 +35868,12 @@ class TestReviewerSubagents(LedgerBase):
         return out
 
     def test_gates_shows_how_many_of_the_four_recorded_at_the_head_and_a_push_voids_them(self):
-        self.assertIn("reviewers (shadow, not counted): 0 of 4 recorded at %s; missing code, architecture, security, impact" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("reviewers (shadow, not counted; recorded by the PR's own session, so not independent): 0 of 4 recorded at %s; missing code, architecture, security, impact" % LEDGER_HEAD[:8], self.gates_text())
         for role in self.ROLES:
             self.assertEqual(self.record("coder", role)[0], 0)
-        self.assertIn("4 of 4 recorded at %s: architecture approve, code approve, impact approve, security approve" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("not independent): 4 of 4 recorded at %s: architecture approve, code approve, impact approve, security approve" % LEDGER_HEAD[:8], self.gates_text())
         self.pr["headRefOid"] = "c" * 40   # a push
-        self.assertIn("0 of 4 recorded at cccccccc", self.gates_text())
+        self.assertIn("not independent): 0 of 4 recorded at cccccccc", self.gates_text())
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():

@@ -13866,6 +13866,44 @@ def local_review_overlay(repo):
         return ""
 
 
+def parse_review_block(text):
+    """(fields, why not) from the verdict block a reviewer RETURNS as text (the reviewers hold no write command: the coder session records what
+    they returned). Lines: `verdict: ...`, `head: <sha>`, optional `impact-action: ...`, `findings:` and one `- <rule> | block|note | ...` per finding. Counts
+    come from the findings, so a block cannot claim a count it does not list. A block may sit inside a code fence or prose; the first one found is read."""
+    if not isinstance(text, str) or not text.strip():
+        return None, "no verdict block"
+    lines = [l.strip() for l in text.splitlines()]
+    fields = {"verdict": None, "head": None, "impact_action": None, "blocks": 0, "notes": 0, "findings": 0}
+    started = False
+    for line in lines:
+        if line.startswith("verdict:") and not started:
+            fields["verdict"], started = line.split(":", 1)[1].strip(), True
+        elif started and line.startswith("head:"):
+            fields["head"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-action:"):
+            fields["impact_action"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("- "):
+            parts = [p.strip() for p in line[2:].split("|")]
+            if len(parts) >= 2 and parts[1] in ("block", "note"):
+                fields["findings"] += 1
+                if parts[1] == "block":
+                    if not re.fullmatch(r"R-[A-Z]+-[0-9]+", parts[0]) and not re.fullmatch(r"[A-Za-z0-9_.-]+-[0-9]+", parts[0]):
+                        fields["notes"] += 1   # a blocking finding that cites no rule is a proposal: it never blocks (R-LAW-1)
+                    else:
+                        fields["blocks"] += 1
+                else:
+                    fields["notes"] += 1
+        elif started and line.startswith("```"):
+            break
+    if not started or fields["verdict"] not in plan_ledger.REVIEW_VERDICTS:
+        return None, "the block has no `verdict:` line with one of %s" % ", ".join(plan_ledger.REVIEW_VERDICTS)
+    if not fields["head"] or not re.fullmatch(r"[0-9a-f]{7,40}", fields["head"]):
+        return None, "the block has no `head: <sha>` line: say which commit was judged"
+    if fields["impact_action"] not in (None, "hold", "second-review", "none"):
+        return None, "`impact-action:` must be hold, second-review or none"
+    return fields, None
+
+
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
@@ -13887,8 +13925,16 @@ def cmd_review(args, runner, now):
             return EXIT_OK
         if args.reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
+        if args.block is not None:   # the reviewer's returned text: the coder session records it
+            if args.verdict or args.head or args.blocks or args.notes or args.impact_action:
+                raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
+            fields, why = parse_review_block(_read_capped(args.block, REVIEW_TABLE_MAX))
+            if fields is None:
+                raise ReviewError("refused: %s" % why)
+            args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
+                                                                                    fields["notes"], fields["impact_action"])
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
-            raise ReviewError("--verdict must be one of %s" % ", ".join(plan_ledger.REVIEW_VERDICTS))
+            raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name in ("blocks", "notes"):
             if getattr(args, name) < 0 or getattr(args, name) > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
@@ -13932,11 +13978,12 @@ def add_review_parsers(sub):
     rsub = review.add_subparsers(dest="review_cmd", required=True)
     laws = rsub.add_parser("laws", help="Print the repository's review laws and overlay as they stand at the PR's BASE commit")
     laws.add_argument("pr", help="owner/repo#N or the PR's URL")
-    record = rsub.add_parser("record", help="A reviewer records its result for the PR's current head")
+    record = rsub.add_parser("record", help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
     record.add_argument("pr", help="owner/repo#N or the PR's URL")
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
-    record.add_argument("--verdict", required=True, help="approve | request-changes | comment | incomplete")
+    record.add_argument("--verdict", help="approve | request-changes | comment | incomplete")
+    record.add_argument("--block", help="File (or - for stdin) holding the verdict block a reviewer returned: verdict, head, counts and impact action are read from it")
     record.add_argument("--blocks", type=int, default=0, help="Blocking findings (each cites a rule)")
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),

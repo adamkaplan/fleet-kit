@@ -452,7 +452,7 @@ def render_gates(report, pr):
             lines.append("  %s: %s" % (s["id"], note))
     reviews = report.get("reviews")
     if reviews:
-        lines.append("  reviewers (shadow, not counted): %d of %d recorded at %s%s" % (
+        lines.append("  reviewers (shadow, not counted; recorded by the PR's own session, so not independent): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
             ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))

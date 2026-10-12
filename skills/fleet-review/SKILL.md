@@ -11,8 +11,12 @@ tool and the pull request reference (`owner/repo#N`); they can run side by side.
 
 Each reviewer:
 - loads the repository's laws and overlay **from the pull request's base commit** with `fleet-switchboard review laws <pr>`, never from your branch (a pull request cannot rewrite the law it is judged by);
-- reads the change and judges it; it **never builds, runs or tests** anything and never edits a file; it has at most 50 turns and records `incomplete` rather than ending in silence;
-- records its result with `fleet-switchboard review record <pr> --reviewer <role> --head <sha> --verdict ...`, one record per reviewer per head.
+- reads the change and judges it; it **never builds, runs or tests** anything, writes nothing and holds no write command; it has at most 50 turns and answers `verdict: incomplete` rather than ending in silence;
+- **returns its verdict as text** (a `verdict:` block with `head:` and one line per finding).
+
+**You record what they returned**, one record per reviewer per head: put the returned block in a file (or pipe it) and run
+`fleet-switchboard review record <pr> --reviewer <role> --block <file or ->`. The verdict, the head and the counts are read from the block (a blocking finding that cites no rule counts as a note), and a block for any commit other
+than the PR's current head is refused. The record is made by your session, so `gates` labels it as not independent.
 
 Then fix the blocking findings (each cites a rule; a finding that cites none is only a proposal), functional first and then the standards, push, and run the reviewers again on the new head:
 a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (shadow, not counted)` line with how many of the four recorded at the current head; it does not block you yet.
