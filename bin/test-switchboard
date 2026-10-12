@@ -36170,7 +36170,7 @@ class TestReviewerSubagents(LedgerBase):
     """#179 slice L2: the four reviewer agents, `review laws` (from the base commit) and `review record` with its shadow line in `gates`."""
 
     BASE = "b" * 40
-    ROLES = ("code", "architecture", "security", "impact")
+    ROLES = ("code", "architecture", "security", "impact", "test")
     LAW_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md", "REVIEW_OVERLAY.md")
 
     def setUp(self):
@@ -36230,6 +36230,24 @@ class TestReviewerSubagents(LedgerBase):
                 self.assertLessEqual(len(head.rstrip("\n").splitlines()), 40, "a short, hand-readable permission block")
                 last_allow = max(i for i, p in enumerate(perms) if p[2] == "allow")
                 self.assertTrue(all(p[2] == "deny" for p in perms[last_allow + 1:]), "the denies come last: last match wins")
+
+    def test_the_test_reviewer_judges_by_the_test_standards_and_cannot_run_what_it_reads(self):
+        text, head, perms = self.front("test")
+        self.assertIn("R-TEST", text)
+        self.assertIn("TEST_STANDARDS.md", text)
+        self.assertNotIn("SECURITY_STANDARDS.md and REVIEW_LAWS", text)
+        shells = [r for a, r, e in perms if a == "shell" and e == "allow"]
+        self.assertFalse([r for r in shells if r.split()[0] not in ("fleet-switchboard", "git", "gh")], shells)
+        self.assertFalse([r for r in shells if "record" in r or "test" in r.split()[1:2] or "pytest" in r])
+
+    def test_the_skill_and_the_docs_name_the_test_reviewer_and_say_five(self):
+        skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("reviewer-test", skill)
+        self.assertIn("five", skill)
+        self.assertIn("Five reviewer agents", docs)
+        self.assertIn("reviewer-test", docs)
+        self.assertNotIn("the four reviewers", skill + docs)
 
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:
@@ -36332,7 +36350,7 @@ class TestReviewerSubagents(LedgerBase):
     def test_a_reviewer_records_one_chained_entry_at_the_current_head(self):
         code, out, err = self.record("coder", "code", "request-changes", "--blocks", "2", "--notes", "1", "--summary", "a write can be torn")
         self.assertEqual(code, 0, err)
-        self.assertIn("1 of 4 reviewers recorded", out)
+        self.assertIn("1 of 5 reviewers recorded", out)
         (entry,) = [e for e in self.ledger() if e["kind"] == "review_record"]
         self.assertEqual((entry["pr"], entry["head"], entry["reviewer"], entry["verdict"], entry["blocks"], entry["notes"], entry["by"]),
                          (self.PR, LEDGER_HEAD, "code", "request-changes", 2, 1, "coder"))
@@ -36369,7 +36387,7 @@ class TestReviewerSubagents(LedgerBase):
         self.record("coder", "code", "request-changes", "--blocks", "1")
         self.record("coder", "code", "approve")
         got = sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
-        self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact"]))
+        self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact", "test"]))
 
     # -- the coder session records what a reviewer returned
 
@@ -36433,13 +36451,13 @@ class TestReviewerSubagents(LedgerBase):
         self.assertIn(code, (0, 1), err)   # 1 is NOT READY: the shadow line is shown either way
         return out
 
-    def test_gates_shows_how_many_of_the_four_recorded_at_the_head_and_a_push_voids_them(self):
-        self.assertIn("reviewers (shadow, not counted; recorded by the PR's own session, so not independent): 0 of 4 recorded at %s; missing code, architecture, security, impact" % LEDGER_HEAD[:8], self.gates_text())
+    def test_gates_shows_how_many_of_the_five_recorded_at_the_head_and_a_push_voids_them(self):
+        self.assertIn("reviewers (shadow, not counted; recorded by the PR's own session, so not independent): 0 of 5 recorded at %s; missing code, architecture, security, impact, test" % LEDGER_HEAD[:8], self.gates_text())
         for role in self.ROLES:
             self.assertEqual(self.record("coder", role)[0], 0)
-        self.assertIn("not independent): 4 of 4 recorded at %s: architecture approve, code approve, impact approve, security approve" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("not independent): 5 of 5 recorded at %s: architecture approve, code approve, impact approve, security approve, test approve" % LEDGER_HEAD[:8], self.gates_text())
         self.pr["headRefOid"] = "c" * 40   # a push
-        self.assertIn("not independent): 0 of 4 recorded at cccccccc", self.gates_text())
+        self.assertIn("not independent): 0 of 5 recorded at cccccccc", self.gates_text())
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():
@@ -36449,10 +36467,10 @@ class TestReviewerSubagents(LedgerBase):
         before, reviews = ready()
         self.assertEqual(reviews["recorded"], {})
         for role in self.ROLES:
-            self.record("coder", role, "request-changes", "--blocks", "1")   # even four requests for changes
+            self.record("coder", role, "request-changes", "--blocks", "1")   # even five requests for changes
         after, reviews = ready()
         self.assertEqual(before, after)
-        self.assertEqual(len(reviews["recorded"]), 4)
+        self.assertEqual(len(reviews["recorded"]), 5)
 
     def test_the_docs_name_the_commands_and_the_agents(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
