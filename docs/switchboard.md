@@ -4165,7 +4165,7 @@ keeps the old line and the old exit (the whole board). `--all` exits by the whol
 and `open_enforced` next to the unchanged `ready`.
 
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
-verdict for **every** per-PR scenario of the PR's plan that names that evaluator, at the current head, in one command (the same checks as a single verdict, once:
+verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
 the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and
 refuses when the plan names no scenario for that role). `fleet-switchboard gates stats [--limit N] [--json]` reads the ledger and prints, for each merged gated PR
 (newest first, default 10), the evidence records by actor (the switchboard's own `ci` records are the automatic ones) and the minutes from the first gate record to the merge,

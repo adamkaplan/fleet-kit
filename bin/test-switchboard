@@ -17512,24 +17512,64 @@ class TestPlanLedger(LedgerBase):
     def test_all_records_every_scenario_the_role_judges_and_never_another_roles(self):
         self.assertEqual(self.prove("coder", "S2")[0], 0)
         code, out, err = self.run_as("tst", "verdict", "--pr", self.PR, "--as", "tester", "--all", "--result", "pass",
-                                     "--evidence", "ran the whole plan by hand: matches")
+                                     "--head", LEDGER_HEAD, "--evidence", "ran the whole plan by hand: matches")
         self.assertEqual(code, 0, err)
         self.assertEqual([(e["scenario"], e["evaluator"], e["by"]) for e in self.ledger() if e["kind"] == "verdict"],
                          [("S2", "tester", "tst")])
         self.assertEqual(out.count("recorded tester verdict"), 1)
         code, out, err = self.run_as("rev", "verdict", "--pr", self.PR, "--as", "reviewer", "--all", "--result", "pass",
-                                     "--evidence", "read the diff against the plan")
+                                     "--head", LEDGER_HEAD, "--evidence", "read the diff against the plan")
         self.assertEqual(code, 0, err)
         self.assertEqual({e["scenario"] for e in self.ledger() if e["kind"] == "verdict" and e["evaluator"] == "reviewer"}, {"S3"})
         # ci scenarios are judged by the recorder, so a registered ci agent records both of its scenarios in one command
-        code, out, err = self.run_as("cibot", "verdict", "--pr", self.PR, "--as", "ci", "--all", "--result", "pass", "--evidence", "ci run green")
+        code, out, err = self.run_as("cibot", "verdict", "--pr", self.PR, "--as", "ci", "--all", "--result", "pass", "--head", LEDGER_HEAD, "--evidence", "ci run green")
         self.assertEqual(code, 0, err)
         self.assertEqual(sorted(e["scenario"] for e in self.ledger() if e["kind"] == "verdict" and e["evaluator"] == "ci"), ["S1", "U1"])
+
+    def test_all_needs_the_head_and_refuses_one_that_is_not_the_current_head(self):
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        before = len(self.ledger())
+        base = ("verdict", "--pr", self.PR, "--as", "tester", "--all", "--result", "pass", "--evidence", "judged it")
+        code, out, err = self.run_as("tst", *base)
+        self.assertEqual(code, 2)
+        self.assertIn("--all needs --head", err)
+        code, out, err = self.run_as("tst", *base, "--head", LEDGER_NEW_HEAD)    # an older or other head than the PR's current one
+        self.assertEqual(code, 2)
+        self.assertIn("is not the PR's head", err)
+        self.assertEqual(len(self.ledger()), before)
+        self.assertEqual(self.run_as("tst", *base, "--head", LEDGER_HEAD)[0], 0)
+
+    def test_all_is_atomic_a_failure_midway_records_none(self):
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        before = self.ledger()
+        module = sb.load_plan_ledger()
+        real = module.entry_hash
+
+        def flaky(entry):
+            if entry.get("seq") == 3:   # the second entry of the batch
+                raise OSError("disk went away")
+            return real(entry)
+        with mock.patch.object(module, "entry_hash", flaky):
+            with self.assertRaises(OSError):
+                sb.plan_ledger.append_many(self.world.state, [
+                    {"kind": "verdict", "pr": self.PR, "scenario": "S1", "result": "pass", "by": "cibot"},
+                    {"kind": "verdict", "pr": self.PR, "scenario": "U1", "result": "pass", "by": "cibot"}], 5)
+        self.assertEqual(self.ledger(), before, "neither entry was written")
+        with self.assertRaises(sb.plan_ledger.LedgerError):   # an invalid entry anywhere refuses the whole batch
+            sb.plan_ledger.append_many(self.world.state, [
+                {"kind": "verdict", "pr": self.PR, "scenario": "S1", "result": "pass", "by": "cibot"},
+                {"kind": "verdict", "pr": self.PR, "scenario": "U1", "result": "maybe", "by": "cibot"}], 5)
+        self.assertEqual(self.ledger(), before)
+        stored = sb.plan_ledger.append_many(self.world.state, [
+            {"kind": "verdict", "pr": self.PR, "scenario": "S1", "result": "pass", "by": "cibot"},
+            {"kind": "verdict", "pr": self.PR, "scenario": "U1", "result": "pass", "by": "cibot"}], 5)
+        self.assertEqual([e["seq"] for e in stored], [2, 3])
+        self.assertEqual(sb.plan_ledger.read_ledger(self.world.state)[1], None, "the batch is a valid chain")
 
     def test_all_refuses_an_author_an_unregistered_agent_a_scenario_id_and_a_role_with_no_scenario(self):
         self.assertEqual(self.prove("coder", "S2")[0], 0)
         before = len(self.ledger())
-        base = ("verdict", "--pr", self.PR, "--all", "--result", "pass", "--evidence", "judged it")
+        base = ("verdict", "--pr", self.PR, "--all", "--result", "pass", "--head", LEDGER_HEAD, "--evidence", "judged it")
         code, out, err = self.run_as("coder", *base, "--as", "tester")
         self.assertEqual(code, 2)
         self.assertIn("an author cannot record a verdict", err)    # the author of the PR, registered or not

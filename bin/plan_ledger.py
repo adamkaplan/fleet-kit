@@ -129,6 +129,37 @@ def append_checked(state_dir, now, build):
     return stored
 
 
+def append_many(state_dir, entries_in, now):
+    """ALL of `entries_in`, or none: every entry is validated first, then the whole batch is chained and written with ONE write under
+    the exclusive lock, so a failure (an invalid entry, a broken chain, a failed write) leaves the ledger as it was. Returns the stored
+    entries."""
+    for entry in entries_in:
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
 # ----------------------------------------------------------------------------------- who may do what
 
 def evaluator_of(scenario):

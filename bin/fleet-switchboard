@@ -12904,14 +12904,23 @@ def cmd_verdict(args, runner, now):
                                     {"scenario": args.scenario or "--all", "by": caller if named != "owner" else "(not the owner's terminal)",
                                      "evaluator": named, "why": why})
         raise LedgerCommandError("refused: %s" % why)
+    if every and not args.head:   # the verdicts say "I judged THIS head": never guess it for a batch (the head may have moved)
+        raise LedgerCommandError("--all needs --head <sha> (the head you judged): a batch is never stamped with whatever the head is now")
     head, evidence = _head_of(ctx, args), _evidence(args)
-    for target in targets:
-        entry = {"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
-                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                 "evaluator": named, "evidence": evidence}
-        stored = _record(ctx, args, now, entry)
-        print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, stored["seq"], target["id"], args.result,
-                                                                             entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
+    entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
+                "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
+                "evaluator": named, "evidence": evidence} for target in targets]
+    try:
+        stored = plan_ledger.append_many(ctx.state, entries, now())   # all of them or none
+    except plan_ledger.LedgerError as err:
+        raise LedgerCommandError("%s" % err) from None
+    for entry, one in zip(entries, stored):
+        if ctx.engine.audit is not None:
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr,
+                                    {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"],
+                                     "chain": one["hash"]})
+        print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
+                                                                             head[:8], ctx.pr, entry["plan_hash"][:19]))
     return EXIT_OK
 
 
