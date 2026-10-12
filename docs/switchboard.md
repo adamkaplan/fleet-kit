@@ -4219,7 +4219,7 @@ that is determined to pass as the owner can, and only something it cannot reach 
 `gates ci-record` made the switchboard the `ci` recorder, but someone had to run it, so a push would leave every `proof: test` scenario without its
 verdict until a person did, and the preflight's 7-day proof would lapse. **The daemon now runs the same logic itself.** In every pass, after the decisions
 are derived, `ci_record_pass` looks at the open PRs of the repos listed in `plan_gates` (and not `enabled: false`) that carry a `PLAN: <link>` in their
-body (drafts are skipped), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
+body (**drafts too**: `gh pr ready` needs the `ci` verdict present, so a draft must already have it), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
 verdict for the per-PR scenarios that name `ci`: bound to that exact head and to the plan's current hash, never for a failing, pending or missing run,
 never twice (an identical verdict already in the ledger is left alone), and audited as `gate.ci_record`. Because those records are real, the preflight's
 "recorded successfully in the last 7 days" comes for free while any such PR exists. (A record where the plan has no `ci` scenario is audited with `ok: false`

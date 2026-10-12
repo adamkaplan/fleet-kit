@@ -13564,7 +13564,7 @@ def ci_record_pass(engine, now):
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             body = record.get("body") if isinstance(record, dict) and isinstance(record.get("body"), str) else ""
-            if not isinstance(number, int) or isinstance(number, bool) or record.get("draft") or not plan_ledger.PLAN_LINK_RE.search(body):
+            if not isinstance(number, int) or isinstance(number, bool) or not plan_ledger.PLAN_LINK_RE.search(body):   # drafts too: `gh pr ready` needs G1 present
                 continue
             held = state.checked.get((key, number))
             # Skip a PR that was checked and is not yet due: decided by when it was last CHECKED (not by what the check found), so a PR
