@@ -13275,6 +13275,10 @@ def write_impact_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
+class ImpactStateBusy(RuntimeError):
+    """The impact state lock could not be taken in time: nothing was done, try again."""
+
+
 class impact_state_lock:
     """ONE exclusive lock around everything that reads the impact state and acts on it: the daemon's `clear check -> label write -> applied record`
     and the owner's `clear record -> label removal` cannot interleave, so a clear is never lost and a cleared hold is never re-added.
@@ -13295,7 +13299,7 @@ class impact_state_lock:
                 if time.monotonic() >= deadline:
                     os.close(self.fd)
                     self.fd = None
-                    raise RuntimeError("the impact state is locked by another process (waited %d s)" % self.seconds) from None
+                    raise ImpactStateBusy("the impact state is locked by another process (waited %s s)" % self.seconds) from None
                 time.sleep(0.05)
 
     def __exit__(self, *exc):
@@ -13311,15 +13315,21 @@ def _impact_state_noted(engine, problem):
     if not problem:
         return
     path = Path(engine.state_dir) / IMPACT_STATE_FILE
-    aside = None
+    aside, failed = None, None
     if path.exists():
-        aside = path.with_name("%s.corrupt-%d" % (IMPACT_STATE_FILE, int(engine.now())))
+        aside = path.with_name("%s.corrupt-%d-%d" % (IMPACT_STATE_FILE, int(engine.now()), os.getpid()))
+        for n in range(1, 100):   # never replace an earlier quarantined copy: the clears in it are what the quarantine keeps
+            if not aside.exists():
+                break
+            aside = path.with_name("%s.corrupt-%d-%d-%d" % (IMPACT_STATE_FILE, int(engine.now()), os.getpid(), n))
         try:
-            os.replace(str(path), str(aside))
-        except OSError:
-            aside = None
+            os.rename(str(path), str(aside))
+        except OSError as err:
+            aside, failed = None, "%s" % (err.strerror or err)
     if engine.audit is not None:
-        engine._note("impact.state_unreadable", None, {"why": problem, "quarantined": aside.name if aside else None})
+        engine._note("impact.state_unreadable", None, {"why": problem, "quarantined": aside.name if aside else None, "quarantine_failed": failed})
+    if failed:   # the corrupt file is still there: writing now would overwrite it, so this write waits and is retried
+        raise RuntimeError("the corrupt %s could not be set aside (%s): nothing was written" % (IMPACT_STATE_FILE, failed))
 
 
 def apply_impact_hold(engine, repo, number, report, record):
@@ -13409,8 +13419,11 @@ def cmd_impact_clear(args, runner, now):
     except (NoticeError, IntentError) as err:
         sys.stderr.write("%s: impact clear: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_ERROR
-    except RuntimeError as err:   # the lock wait ran out, or there is no audit sink: one line, nothing half done
+    except ImpactStateBusy as err:   # the lock wait ran out: one line, nothing half done
         sys.stderr.write("%s: impact clear: %s; nothing was changed, try again in a moment\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    except RuntimeError as err:      # no audit sink, or the corrupt state file could not be set aside: retrying does not help until it is fixed
+        sys.stderr.write("%s: impact clear: refused: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
         return EXIT_ERROR
     return EXIT_OK
 

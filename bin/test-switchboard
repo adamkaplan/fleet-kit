@@ -19691,7 +19691,7 @@ class TestImpactHold(LedgerBase):
         return engine
 
     def test_an_owner_clear_cannot_interleave_with_the_daemons_write_and_is_never_lost(self):
-        refused, order = [], []
+        refused = []
         base = self.route
 
         def watching(argv, **kw):
@@ -19699,9 +19699,8 @@ class TestImpactHold(LedgerBase):
                 with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):     # the owner's clear arrives while the daemon holds the lock
                     try:
                         sb.impact_clear_core(self.clear_engine(), self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
-                    except RuntimeError as err:
+                    except sb.ImpactStateBusy as err:
                         refused.append(str(err))
-                order.append("add")
             return base(argv, **kw)
         self.route = watching
         self.passes()
@@ -19810,7 +19809,42 @@ class TestImpactHold(LedgerBase):
         self.assertIsNone(problem)
         self.assertIn("acme/app#9", state["applied"], "and a fresh, valid state file was written")
 
+    def test_a_second_corruption_never_replaces_an_earlier_quarantined_copy_and_a_failed_rename_writes_nothing(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        asides = []
+        for text in ("{first bad", "{second bad"):
+            path.write_text(text)
+            engine = self.clear_engine()
+            with sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(engine, "bad")
+            asides = sorted(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))
+        self.assertEqual(sorted(a.read_text() for a in asides), ["{first bad", "{second bad"], "both kept, same second or not")
+        path.write_text("{third bad")
+        with mock.patch.object(os, "rename", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(RuntimeError) as caught, sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(self.clear_engine(), "bad")
+        self.assertIn("could not be set aside", str(caught.exception))
+        self.assertEqual(path.read_text(), "{third bad", "the corrupt file is untouched when it cannot be set aside")
+        (event,) = [e for e in self.events("impact.state_unreadable") if e["detail"].get("quarantine_failed")]
+        self.assertIn("Permission denied", event["detail"]["quarantine_failed"])
+
+    def test_every_kind_of_bad_state_file_goes_through_a_pass_and_a_bad_budget_is_refused(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        for text in ("[1, 2]", "x" * (sb.IMPACT_STATE_MAX_BYTES + 5)):
+            path.write_text(text)
+            self.passes()
+            self.assertEqual(len(list(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))) >= 1, True)
+            for aside in self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"):
+                aside.unlink()
+            path.unlink(missing_ok=True)
+            del self.engine_cached
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in (-1, True, "3", 1.5):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, impact_hold={"enabled": True, "calls_per_pass": bad}))
+
     def test_a_missing_ledger_file_is_no_hold_not_unreadable(self):
+        """A regression guard: the read of a missing ledger is an empty ledger, so a clean floor is never held by the unknown-rating rule."""
         self.floor_pr(path="src/app.py")
         (self.world.state / "plan-ledger.jsonl").unlink(missing_ok=True)
         (self.world.state / "plan-ledger.head").unlink(missing_ok=True)
