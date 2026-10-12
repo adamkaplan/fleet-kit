@@ -172,3 +172,8 @@ scenarios:
 
 **3. An uncovered Done-when clause.** With `Done when: (1) ... (2) ...`, a plan whose scenarios only say `covers: DW-1`
 fails with `DW-2 is not covered by any S scenario`. Every clause needs a scenario that proves it.
+
+## The order of the evidence does not matter
+
+A proof (`prove`) and a verdict count when both exist at the same head and plan hash, in either order; the daemon records the `ci` verdict
+itself within minutes of green checks. A push voids every proof and verdict, so after one they are made again.

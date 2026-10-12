@@ -92,4 +92,6 @@ Bad, each fails `plan check` or a reviewer:
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
+the daemon records `ci` verdicts itself within minutes of green checks): your one extra step is `prove`. A push voids every proof and
+verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
