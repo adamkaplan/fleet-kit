@@ -1,5 +1,5 @@
 ---
-description: Reads the change's tests against its code and the repository's review laws (R-TEST) and returns its verdict as text. Deny by default; it holds no write command and never builds, runs, tests or edits anything.
+description: "Reads the change's tests against its code and the repository's review laws (R-TEST) and returns its verdict as text. Deny by default; it holds no write command and never builds, runs, tests or edits anything."
 mode: subagent
 model: __PROVIDER__/__MODEL_ID__
 steps: 50

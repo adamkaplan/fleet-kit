@@ -1,5 +1,5 @@
 ---
-description: Writes no file except the switchboard's ledger (through `review record`): deny by default; the allows are reading, the two `review` commands and a few git and gh reads; reads outside the checkout for a pull request. It reads the change and the repository's review laws and judges, and returns its verdict as text: it holds no write command and never builds, runs, tests or edits anything.
+description: "Reads one pull request's change against the repository's coding standards (R-CODE) and returns its verdict as text. Deny by default; it holds no write command and never builds, runs, tests or edits anything."
 mode: subagent
 model: __PROVIDER__/__MODEL_ID__
 steps: 50
