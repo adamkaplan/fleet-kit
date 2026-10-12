@@ -197,7 +197,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -2913,6 +2913,46 @@ class TestSteerToWorking(Base):
         code, _, err = main("send", "--from", "cos", "platform", "plain")
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.world.v2.interrupts), 1)  # a plain send never interrupts
+
+    def test_send_to_the_role_name_reaches_the_one_agent_with_that_role(self):
+        self.world = World(self, agents=())
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("platform", fleet={"role": "orchestrator", "reports_to": "chief-of-staff"})
+        outcome = self.world.engine.send("platform", "chief-of-staff", "a question")
+        self.assertTrue(outcome["sent"], outcome)
+        self.assertEqual(len(self.world.admissions("cos")), 1)
+        again = self.world.engine.send("platform", "cos", "by name still works")        # the registered name is unchanged
+        self.assertIn("sent", again)
+        self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})                    # two chiefs: the alias is ambiguous, taken literally
+        held = self.world.engine.send("platform", "chief-of-staff", "which one?")
+        self.assertFalse(held["sent"])
+        self.assertIn("no herdr pane shows a v2 session named chief-of-staff", held["reason"])
+
+    def test_a_send_that_hangs_ends_with_a_clear_line_within_the_bound_and_a_fast_one_is_untouched(self):
+        self.work()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "send_timeout_seconds": 0.3})
+        real = sb._cmd_send
+        started = []
+
+        def slow(args, runner, now):
+            started.append(1)
+            time.sleep(1.5)                                  # a delivery that takes far longer than the bound
+            return real(args, runner, now)
+        t0 = time.monotonic()
+        with mock.patch.object(sb, "_cmd_send", slow), captured() as (out, err):
+            code = sb.main(["send", "--from", "cos", "platform", "hi"], runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertLess(time.monotonic() - t0, 1.2, "it did not wait for the slow delivery")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("did not finish within 0.3 s", err.getvalue())
+        self.assertIn("pending platform", err.getvalue())
+        with captured() as (out, err):                       # the same command, not slow: unchanged
+            code = sb.main(["send", "--from", "cos", "platform", "ok"], runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(sb.DEFAULTS["send_timeout_seconds"], 60)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "send_timeout_seconds": 0})
 
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
