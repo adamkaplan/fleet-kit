@@ -29454,6 +29454,192 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestPrExplainer(DecisionsBase):
+    """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
+    command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
+    FILES = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}, {"path": "docs/switchboard.md"}, {"path": "README.md"}]
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        self.pr = {"title": "Add the parser", "body": "PLAN: https://example.test/acme/api/issues/9\n\ncanon: n/a text only\n\nWhat it does.\n", "files": self.FILES, "labels": []}
+
+    def cli(self, *argv):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+        def route(args, **kw):
+            if args[0] == FAKE_GH or args[0].endswith("gh"):
+                self.calls.append(list(args))
+                assert args[1:3] == ["pr", "view"], "pr-explain only reads: %r" % (args,)   # the read-only guarantee: a GET of the PR and nothing else
+                return subprocess.CompletedProcess(args, 0, json.dumps(dict(self.pr, state="OPEN", additions=3, deletions=1, changedFiles=4)), "")
+            return self.world.route(args, **kw)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def captain(self):
+        self.pr["labels"] = [{"name": "me:merge-captain"}]
+
+    def test_an_ordinary_pr_gets_the_why_block_only_and_one_read_of_the_pr(self):
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "a list showed nothing", "--after", "a list shows one agent")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("mermaid", out)
+        self.assertIn("before: a list showed nothing", out)
+        self.assertIn("after:  a list shows one agent", out)
+        self.assertEqual(len(self.calls), 1, "one GET of the PR, nothing else")
+
+    def test_a_captain_pr_gets_the_infographic_first_and_it_parses(self):
+        self.captain()
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a", "--irreversible", "a migration cannot be undone",
+                                  "--severity", "Marginal", "--probability", "Occasional")
+        self.assertEqual(code, 0, err)
+        self.assertLess(out.index("```mermaid"), out.index("```text"), "the diagram comes first in the block")
+        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
+        self.assertEqual(sb.mermaid_defects(diagram), [])
+        for label in ("Changes: Add the parser", "Touches: bin 2, docs 1, root files 1 (4 files)", "Irreversible: a migration cannot be undone", "Risk: Marginal x Occasional: Medium"):
+            self.assertIn(label, diagram)
+
+    def test_the_risk_cell_comes_from_the_single_source_matrix_and_a_wrong_name_is_refused(self):
+        self.assertEqual(sb.explainer_risk_cell(eliminated=True), "Eliminated (not rated)")
+        self.assertEqual(sb.explainer_risk_cell(), "not rated yet")
+        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        for severity in matrix["severities"]:
+            for probability in matrix["probabilities"]:
+                cell = matrix["cells"][severity][probability]
+                self.assertIn(": %s (" % cell["level"], sb.explainer_risk_cell(severity, probability))
+        self.captain()
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--severity", "Huge", "--probability", "Occasional")
+        self.assertEqual(code, 2)
+        self.assertIn("severity is one of", err)
+
+    def test_the_title_cannot_break_or_extend_the_diagram(self):
+        self.captain()
+        self.pr["title"] = 'x"] --> Z["evil"] %% <script> [bad](http://x) ' + "y" * 300
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
+        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
+        self.assertEqual(sb.mermaid_defects(diagram), [])
+        self.assertEqual(len(diagram.splitlines()), 4, "four lines: the header and the three edges, no node added by the title")
+        for bad in ('"] --> Z', "<script>", "](http", "%%"):
+            self.assertNotIn(bad, diagram)
+        self.assertTrue(all(len(line) < 160 for line in diagram.splitlines()))
+
+    def test_a_broken_or_foreign_diagram_is_refused(self):
+        good = 'flowchart LR\n  A["a"] --> B["b"]'
+        self.assertEqual(sb.mermaid_defects(good), [])
+        for text, want in (("", "does not open"), ("graph LR\n  A[a] --> B[b]", "does not open"), ('flowchart LR\n  A["a"]', "at least two nodes"),
+                           ('flowchart LR\n  A["a"] --> B', "never defined"), ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://x"', "not part of the supported"),
+                           ('flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', "not part of the supported")):
+            with self.subTest(text=text[:30]):
+                self.assertTrue(any(want in d for d in sb.mermaid_defects(text)), sb.mermaid_defects(text))
+
+    def test_text_that_would_end_or_split_the_block_cannot_break_check(self):
+        nasty = "ends <!-- pr-explainer:end --> early --> and ``` fences <!-- pr-explainer:begin --> here"
+        block = sb.explainer_block(nasty, nasty)
+        body = sb.explainer_insert("PLAN: https://example.test/1\n\ntext", block)
+        self.assertEqual((body.count(sb.EXPLAINER_BEGIN), body.count(sb.EXPLAINER_END)), (1, 1))
+        self.assertEqual(sb.explainer_defects(body, False), [])
+        self.pr["body"] = body
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", nasty, "--after", nasty)
+        self.assertEqual((out.count(sb.EXPLAINER_BEGIN), out.count(sb.EXPLAINER_END)), (1, 1))
+
+    def test_a_cut_file_list_is_said_in_the_diagram_not_hidden(self):
+        self.assertEqual(sb.explainer_count(4, 4), "4 files")
+        self.assertEqual(sb.explainer_count(1, 1), "1 file")
+        self.assertEqual(sb.explainer_count(100, 140), "100 of 140 files listed")
+        self.assertEqual(sb.explainer_count(4, None), "4 files")
+        self.captain()
+        self.pr["files"] = [{"path": "bin/f%d" % i} for i in range(100)]
+        self.pr["changedFiles"] = 140
+        with mock.patch.object(sb, "read_pr_json", return_value=dict(self.pr, state="OPEN")):
+            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
+        self.assertIn("100 of 140 files listed", out)
+        self.assertEqual(sb.mermaid_defects(re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)), [])
+
+    def test_a_diagram_outside_the_subset_is_refused_and_the_printed_block_has_no_image(self):
+        foreign = ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://example.test"', 'flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', 'graph LR\n  A["a"] --> B["b"]')
+        self.assertTrue(all(sb.mermaid_defects(text) for text in foreign))
+        self.captain()
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
+        for image in ("![", ".png", ".svg", "<img"):
+            self.assertNotIn(image, out)
+
+    def test_a_body_gets_at_most_one_block_however_often_it_is_inserted(self):
+        block = sb.explainer_block("old", "new", "flowchart LR\n  A[\"a\"] --> B[\"b\"]")
+        body = self.pr["body"]
+        once = sb.explainer_insert(body, block)
+        twice = sb.explainer_insert(once, sb.explainer_block("old2", "new2"))
+        thrice = sb.explainer_insert(twice, block)
+        for text in (once, twice, thrice):
+            self.assertEqual((text.count(sb.EXPLAINER_BEGIN), text.count(sb.EXPLAINER_END)), (1, 1))
+        self.assertEqual(thrice, once, "inserting the same block again replaces it")
+        self.assertIn("after:  new2", twice)
+        self.assertNotIn("old2", thrice)
+        # a body that somehow carries two blocks is repaired to one
+        doubled = once + "\n" + once
+        self.assertEqual(sb.explainer_insert(doubled, block).count(sb.EXPLAINER_BEGIN), 1)
+
+    def test_the_block_goes_after_the_lines_a_body_opens_with_so_a_gate_still_reads_the_first_line(self):
+        block = sb.explainer_block("b", "a")
+        for body in (self.pr["body"], "MERGE: captain\n\nPLAN: https://example.test/1\n\ntext", "just text", ""):
+            with self.subTest(body=body[:20]):
+                new = sb.explainer_insert(body, block)
+                self.assertIn("text" if "text" in body else "", new)
+                if body.startswith(("PLAN:", "MERGE:")):   # a body that opens with a gate line keeps it first, the block right after the header lines
+                    self.assertEqual(new.split("\n")[0], body.split("\n")[0])
+                    self.assertLess(new.index(body.split("\n")[0]), new.index(sb.EXPLAINER_BEGIN))
+                else:   # no header lines: the block opens the body
+                    self.assertEqual(new.split("\n")[0], sb.EXPLAINER_BEGIN)
+
+    def test_body_file_prints_the_whole_new_body_with_the_block_in_once(self):
+        path = self.world.state.parent / "body.md"
+        path.write_text(self.pr["body"])
+        for _ in range(2):   # running it on its own output changes nothing more
+            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a", "--body-file", str(path))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.count(sb.EXPLAINER_BEGIN), 1)
+            self.assertTrue(out.startswith("PLAN: https://example.test/acme/api/issues/9"))
+            path.write_text(out)
+        self.assertEqual(self.calls[0], self.calls[1])
+
+    def test_check_judges_the_description_the_pr_has(self):
+        block = sb.explainer_block("old", "new")
+        self.pr["body"] = sb.explainer_insert(self.pr["body"], block)
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+        self.assertEqual((code, out.strip()), (0, "explainer: PASS (ordinary PR)"))
+        for body, want in ((self.PR_NONE, "0 explainer blocks"), (self.PR_TWO, "2 explainer blocks"),
+                           (sb.explainer_insert("x", sb.explainer_block("old", "<what happens after>")), "placeholder"),
+                           ("x\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: only a before\n```\n" + sb.EXPLAINER_END, "`after:` line")):
+            with self.subTest(want=want):
+                self.pr["body"] = body
+                code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+                self.assertEqual(code, 1)
+                self.assertIn(want, out)
+        self.captain()
+        self.pr["body"] = sb.explainer_insert("x", block)   # a captain PR without the infographic
+        code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("infographic", out)
+        self.pr["body"] = sb.explainer_insert("x", sb.explainer_block("old", "new", sb.explainer_mermaid("t", ["a/b"], "none", "not rated yet")))
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+
+    PR_NONE = "text only"
+    PR_TWO = sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END + "\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END
+
+    def test_a_pr_that_cannot_be_read_is_an_error_and_a_bad_reference_is_usage(self):
+        self.assertEqual(self.cli("pr-explain", "not-a-pr")[0], 2)
+
+    def test_the_skill_says_what_the_explainer_is_and_is_not(self):
+        text = (REPO / "skills" / "fleet-explainer" / "SKILL.md").read_text()
+        flat = " ".join(text.split())
+        self.assertTrue(text.startswith("---\nname: fleet-explainer\ndescription: "))
+        self.assertLessEqual(len(text.split()), 600, "the skill must be cheap to load")
+        for phrase in ("is **not a reviewer**", "**read-only**", "**50-turn limit**", "fleet-switchboard pr-explain", "exactly two lines", "once", "No advice"):
+            self.assertIn(phrase, flat)
+        self.assertIn("fleet-explainer", sb.kit_skill_names(REPO))
+        self.assertIn('ln -s "$PWD/skills/fleet-explainer"', (REPO / "INSTALL.md").read_text())
+
+
 class TestPrNotices(DecisionsBase):
     def setUp(self):
         super().setUp()
