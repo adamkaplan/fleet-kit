@@ -25,6 +25,7 @@ The reviewers read this file together with `CODING_STANDARDS.md`, `SECURITY_STAN
 - **R-LAW-12 A false alarm costs little, a miss costs a lot.** When unsure between two likelihoods or severities, take the higher one. _check: note only: a tie-break, never a finding by itself._
 - **R-LAW-13 The floor is the matrix's companion.** A deterministic floor of path rules holds changes to the paths a repository names, whatever the rating says; its authority is the matrix (R-LAW-11), it can only add a hold and never lower one, and the size of a change is never a hold by itself. _check: test: the floor paths are listed in the repository's own copy, and the hold fixture is unchanged._
 - **R-LAW-14 Judgement rules are note only.** A rule marked `check: note only` can be cited in a finding but never blocks by itself; every other rule names how it is checked (`diff`, `search` or `test`), and a block rests on that check. _check: search: each rule line ends with a check hint._
+- **R-LAW-15 Owner evaluators are rare.** A plan names the owner as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and proves it once at the epic's integrated head, never per pull request; a routine pull request never waits on the owner. _check: search: a scenario with the evaluator `owner` also has `claim: epic`._
 
 ## Verdict format
 

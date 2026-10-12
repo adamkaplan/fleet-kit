@@ -35158,6 +35158,12 @@ class TestReviewLawsStarterSet(Base):
         self.assertIn("the impact matrix below", rules["R-LAW-11"])
         self.assertNotIn("also holds changes", text, "the floor is a numbered rule, not an uncited aside")
 
+    def test_owner_evaluators_are_rare_and_the_laws_say_so(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule = next(l for l in text.splitlines() if l.startswith("- **R-LAW-15 "))
+        for needle in ("Owner evaluators are rare", "own eyes are the test", "once at the epic's integrated head", "never waits on the owner", "claim: epic"):
+            self.assertIn(needle, rule)
+
     def test_every_rule_says_how_it_is_checked_and_a_note_only_rule_never_blocks_alone(self):
         kinds = set()
         for name in self.FILES:
