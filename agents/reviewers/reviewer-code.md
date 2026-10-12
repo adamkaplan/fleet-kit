@@ -33,8 +33,8 @@ permissions:
   - {action: shell, resource: "git *--textconv*", effect: deny}
   - {action: shell, resource: "git *--no-index*", effect: deny}
   - {action: shell, resource: "gh pr view *--web*", effect: deny}
-  - {action: shell, resource: "* > *", effect: deny}
-  - {action: shell, resource: "* >> *", effect: deny}
+  - {action: shell, resource: "*>*", effect: deny}
+  - {action: shell, resource: "*>>*", effect: deny}
 ---
 
 # Code reviewer

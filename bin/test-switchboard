@@ -35850,9 +35850,14 @@ class TestReviewerSubagents(LedgerBase):
             with self.subTest(role=role):
                 text, head, perms = self.front(role)
                 denies = {(a, r) for a, r, e in perms if e == "deny"}
-                for resource in ("git *--output*", "git *--ext-diff*", "git *--textconv*", "git *--no-index*", "gh pr view *--web*", "* > *", "* >> *"):
+                for resource in ("git *--output*", "git *--ext-diff*", "git *--textconv*", "git *--no-index*", "gh pr view *--web*", "*>*", "*>>*"):
                     self.assertIn(("shell", resource), denies, resource)
                 self.assertIn(("external_directory", "*"), denies, "reads outside the checkout are denied")
+                import fnmatch
+                for probe in (">/tmp/x", "2>/tmp/x", "&>x", "gh pr view 1 >/tmp/zz", "gh pr view 1 > /tmp/zz", "git diff >>x"):
+                    self.assertTrue(any(fnmatch.fnmatchcase(probe, r) for a, r in denies if a == "shell"), probe)
+                for allowed in ("gh pr view 1", "git diff abc..def", "git log -5"):
+                    self.assertFalse(any(fnmatch.fnmatchcase(allowed, r) for a, r in denies if a == "shell"), allowed)
                 for resource in ("**/.env*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/.ssh/**", "**/.aws/**", "**/.netrc", "**/.config/**",
                                  "**/*secret*", "**/*credential*"):
                     self.assertIn(("read", resource), denies, resource)
