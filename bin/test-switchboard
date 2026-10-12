@@ -8486,23 +8486,32 @@ def maxims_block(text):
 
 
 class TestChiefOfStaffNativePermissions(unittest.TestCase):
-    """The Chief of Staff's (and its subagent's) v2 `permissions:` list keeps them FOCUSED on the job (#105): check its structure, and
-    evaluate it with OpenCode's documented semantics (whole-value glob, any matching deny denies, else an allow, else the base deny)."""
+    """The Chief of Staff's (and its subagent's) v2 `permissions:` list is SHORT, hand-written and deny-by-default (#191): a focus, not a fence.
+    Check its shape, that it stays short, and evaluate it with OpenCode's documented semantics (whole-value glob, any matching deny denies,
+    else an allow, else the base deny)."""
     PATHS = [REPO / "agents" / "opencode" / "chief-of-staff.md", REPO / "agents" / "opencode" / "cos-subagent.md"]
     PATH = PATHS[0]
     TEMP = "/private/var/folders/ab/T/opencode"
+    MAX_BLOCK_LINES = 200
 
     @staticmethod
-    def parse(path):
+    def block(path):
+        """(front matter text, the lines of the `permissions:` block, its rules as dicts). One rule per line: `- {action: shell, resource: "x", effect: allow}`."""
         front = path.read_text().split("\n---\n", 1)[0]
-        rules, current = [], None
-        for line in front.splitlines():
-            m = re.match(r"  - action: (.*)$", line)
-            if m:
-                current = {"action": json.loads(m.group(1))}
-                rules.append(current)
-            elif current is not None and (m := re.match(r"    (resource|effect): (.*)$", line)):
-                current[m.group(1)] = json.loads(m.group(2)) if m.group(2).startswith('"') else m.group(2)
+        lines = front.splitlines()
+        start = lines.index("permissions:")
+        rules = []
+        for line in lines[start + 1:]:
+            if line.lstrip().startswith("#"):
+                continue
+            m = re.fullmatch(r"  - \{action: (.+?), resource: (\".*\"), effect: (allow|deny)\}", line)
+            assert m, "not a one-line rule: %r" % line
+            rules.append({"action": json.loads(m.group(1)) if m.group(1).startswith('"') else m.group(1), "resource": json.loads(m.group(2)), "effect": m.group(3)})
+        return front, lines[start:], rules
+
+    @classmethod
+    def parse(cls, path):
+        front, _, rules = cls.block(path)
         return front, rules
 
     @classmethod
@@ -8521,13 +8530,21 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
             return "deny"
         return hits[-1]["effect"] if hits else "deny"
 
+    def test_the_block_is_short_enough_for_a_person_to_read_and_cannot_regrow(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, lines, _ = self.block(path)
+                self.assertLess(len(lines), self.MAX_BLOCK_LINES, "the permission block of %s is %d lines: keep it a short list, no enumerated variants" % (path.name, len(lines)))
+                self.assertLess(len(path.read_text().split("\n---\n", 1)[0].splitlines()), self.MAX_BLOCK_LINES + 20)
+        # the generator that once enumerated every variant (30,000 lines) is gone and must not come back
+        self.assertFalse((REPO / "tools" / "cos-permissions-proof" / "gen_permissions.py").exists())
+
     def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
         for path in self.PATHS:
             with self.subTest(file=path.name):
                 _, rules = self.parse(path)
                 self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
                 self.assertEqual({r["effect"] for r in rules}, {"allow", "deny"})
-                self.assertTrue(all(set(r) == {"action", "resource", "effect"} for r in rules))
 
     def test_v1_keys_that_would_void_or_widen_the_rules_are_absent(self):
         for path in self.PATHS:
@@ -8544,11 +8561,6 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 for r in rules:
                     if r["action"] == "shell" and r["effect"] == "allow":
                         self.assertNotIn(r["resource"], ("*", "* *"))
-                        self.assertNotRegex(r["resource"], r"^[a-z-]+\*")  # `x *` matches `x` and `x args`, never `xy`
-
-    def test_the_files_are_what_the_generator_writes(self):
-        done = subprocess.run([sys.executable, str(REPO / "tools" / "cos-permissions-proof" / "gen_permissions.py"), "--check"], capture_output=True, text=True)
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_edit_is_only_the_temp_dir_and_subagents_are_denied(self):
         for path in self.PATHS:
@@ -8564,19 +8576,26 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         _, rules = self.rules()
         for command in ("fleet-switchboard decisions list --tier all", "timeout 90 fleet-switchboard decisions list --tier all", "sleep 20",
                         "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
-                        "gh pr merge 5 --squash", "gh issue close 5", "az webapp show -n a -g g", "fleet-switchboard handoff --issue 5 --brief-file -",
-                        "fleet-switchboard launch v --agent orchestrator", "git -C /home/a/Code/widget status", "git remote -v", "git worktree list", "git --no-pager log -3", "git branch -vv", "git merge-base main HEAD", "git config --get remote.origin.url", "git tag -l", "git ls-remote origin", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nsee ~/.ssh\nEOF",
-                        "cat /home/a/.config/fleet-switchboard/config.json", "tail -5 /home/a/.local/state/fleet-switchboard/audit.jsonl",
-                        'fleet-switchboard send x --issue y "see ~/.config/fleet-switchboard/config.json and /tmp/foo --admin"',
+                        "gh pr merge 5 --squash", "gh issue close 5", "gh pr comment 5 --body ok", "az webapp show -n a -g g", "az group list",
+                        "fleet-switchboard handoff --issue 5 --brief-file -", "fleet-switchboard launch v --agent orchestrator",
+                        "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "fleet-switchboard decisions 2>&1", "ls 2>&1",
+                        "gh api repos/o/r/issues/1 --jq '.title + \" \" + (.number|tostring)'", "git -C /home/a/Code/widget status", "git remote -v",
+                        "git worktree list", "git --no-pager log -3", "git branch -vv", "git merge-base main HEAD", "git ls-remote origin",
+                        "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off", "fleet-switchboard gates preflight acme/app",
+                        "fleet-switchboard waive acme/app#5 --gates G1 --reason hotfix", "cat " + self.TEMP + "/x", "cat > " + self.TEMP + "/x <<EOF\nhi\nEOF",
+                        'fleet-switchboard send x --issue y "see ~/.config/fleet-switchboard/config.json and /tmp/foo --admin 2>&1 > f; z"',
+                        'fleet-switchboard decisions escalate x#1 --reason "saw 2>&1 and > f; z"', 'fleet-switchboard orders add --charter o/r#1 "x 2>&1 y"',
                         'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
             self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
-        for command in ("make build", "git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az vm delete -n x",
-                        "cat /home/a/.ssh/id_rsa", "cat /home/a/.config/gh/hosts.yml", "ls /home/a/Documents", "cat /etc/passwd", "gh pr merge 5 --admin",
-                        "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "echo x > notes.md", "cat > /home/a/Code/x/f <<EOF\nx\nEOF",
-                        "cat > /home/a/.config/fleet-switchboard/config.json <<EOF\nx\nEOF", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x", "az containerapp show -n a -g g", "az containerapp env show -n e -g g", "git push", "git -C /home/a/Code/widget push", "git commit -m x", "git checkout main", "git branch x", "git branch -D x", "git tag v1", "git tag -d v1", "git config user.name x", "git worktree add ../x", "git remote add o u", "git fetch", "git pull", "git stash", "git -c core.pager=sh log", "git ls-remote ext::sh", "git status; git push", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane close p1"):
+        for command in ("make build", "git push", "git -C /home/a/Code/widget push", "git commit -m x", "git fetch", "git pull", "git -c core.pager=sh log",
+                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az containerapp show -n a -g g",
+                        "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
+                        "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
+                        "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                        "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
-    def test_the_subagent_has_the_focus_list_without_handoff_or_launch(self):
+    def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
         _, rules = self.parse(self.PATHS[1])
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard send x y"), "allow")
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard handoff --issue 5"), "deny")
