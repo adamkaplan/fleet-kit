@@ -173,11 +173,12 @@ it. Create the prefixed one alongside.
 ## STEP 8 — Install the skills
 
 ```
-CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination ~/.agents/skills/fleet-planning ~/.agents/skills/fleet-setup
+CHECK:   ls ~/.agents/skills/fleet-charter ~/.agents/skills/fleet-coordination ~/.agents/skills/fleet-explainer ~/.agents/skills/fleet-planning ~/.agents/skills/fleet-setup
          All present?  -> skip to STEP 9.
 DO:      mkdir -p ~/.agents/skills
          ln -s "$PWD/skills/fleet-charter"     ~/.agents/skills/fleet-charter
          ln -s "$PWD/skills/fleet-coordination" ~/.agents/skills/fleet-coordination
+         ln -s "$PWD/skills/fleet-explainer"    ~/.agents/skills/fleet-explainer
          ln -s "$PWD/skills/fleet-planning"     ~/.agents/skills/fleet-planning
          ln -s "$PWD/skills/fleet-setup"       ~/.agents/skills/fleet-setup
 VERIFY:  Copilot CLI:  copilot skill list
