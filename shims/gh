@@ -219,21 +219,24 @@ def signed_call(args, name):
     return new, None, temp
 
 
-# ---- the gate probe (plan-driven development, slice 3b: SHADOW ONLY). docs/plan-gate-engine-design.md, E1 and E3.
+# ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
 #
 # Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with
-# its own time bound, and writes down what the answer was. It NEVER blocks: the real gh always runs, whatever the answer, the
-# switchboard is missing, the check hangs or the arguments are a shape it does not understand. (Refusing is a later slice.)
+# its own time bound. Exit 10 (a refusal that applies in the repo's mode) stops the command: the one-line reason goes to stderr and
+# the real gh does not run. Everything else (fail-open, timeout, a missing switchboard, a shape not understood, the kill switches,
+# a valid waiver, a shadow repo) runs the real gh. In an enforcing repo a merge is bound to the checked head and --auto is refused.
 # `gh pr create` has no PR number before it runs, so it is not probed here. The probe is skipped altogether for a repo that is
 # not listed under `plan_gates` in the switchboard config, and for the switchboard's own gh calls (no recursion).
 GATE_SECONDS = 3.0
 GATE_SPOOL = "gate-failopen.jsonl"
 GATE_SPOOL_LIMIT = 262144
-BOOL_FLAGS = {"pr merge": {"-d", "--delete-branch", "--admin", "--auto", "--disable-auto", "-m", "--merge", "-r", "--rebase",
-                           "-s", "--squash"}, "pr ready": set()}
-VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-A", "--author-email", "-t", "--subject",
-               "--match-head-commit"}
-PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)/?$")
+BOOL_SHORT = {"pr merge": {"d": "--delete-branch", "m": "--merge", "r": "--rebase", "s": "--squash"}, "pr ready": {}}
+BOOL_LONG = {"pr merge": {"--delete-branch", "--admin", "--auto", "--disable-auto", "--merge", "--rebase", "--squash"},
+             "pr ready": set()}
+VALUE_SHORT = {"R": "--repo", "b": "--body", "F": "--body-file", "A": "--author-email", "t": "--subject"}
+VALUE_LONG = {"--repo", "--body", "--body-file", "--author-email", "--subject", "--match-head-commit"}
+PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)(?:/[^?#]*)?(?:[?#].*)?$")
+MATCH_FLAG = "--match-head-commit"
 
 
 def gate_seconds():
@@ -243,44 +246,119 @@ def gate_seconds():
         return GATE_SECONDS
 
 
-def gate_target(args):
-    """(check kind, repo or None, number) for a `pr ready` or `pr merge` whose shape is understood, else None. Anything else
-    (no PR given, a branch name, an unknown flag, more than one positional, `ready --undo`, `pr create`) is not probed."""
-    if len(args) < 3 or args[0] != "pr" or args[1] not in ("ready", "merge"):
+def gate_parse(args):
+    """Parse a `pr ready` or `pr merge` command line the way gh (cobra) does: `--flag value`, `--flag=value`, `-R value`,
+    `-Rvalue`, combined short booleans (`-sd`), `--bool=false`. Returns None for a shape not understood (an unknown flag,
+    `ready --undo`, `--`, more than one positional), else {"check", "repo", "ref", "auto", "match": [(start, stop, value)]}
+    where `ref` is the positional argument or None, and each `match` span is the args slice of one --match-head-commit."""
+    if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
         return None
     verb = "pr " + args[1]
-    repo, positional, i = None, [], 2
+    out = {"check": args[1], "repo": None, "ref": None, "auto": False, "match": []}
+    positional, i = [], 2
     while i < len(args):
         arg = args[i]
-        if arg == "--":
+        start = i
+        if arg == "--" or arg == "-":
             return None
-        if arg.startswith("-"):
+        value, name = None, None
+        if arg.startswith("--"):
             name, eq, inline = arg.partition("=")
-            if name in ("-R", "--repo"):
-                value = inline if eq else (args[i + 1] if i + 1 < len(args) else None)
-                if not value or not REPO_RE.match(value):
+            if name in VALUE_LONG:
+                if eq:
+                    value, i = inline, i + 1
+                else:
+                    value, i = (args[i + 1] if i + 1 < len(args) else None), i + 2
+            elif name in BOOL_LONG[verb]:
+                if eq and inline.lower() not in ("true", "false", "1", "0", "t", "f"):
                     return None
-                repo = value
-                i += 1 if eq else 2
-                continue
-            if name in VALUE_FLAGS:
-                i += 1 if eq else 2
-                continue
-            if arg in BOOL_FLAGS[verb]:
+                if name == "--auto":
+                    out["auto"] = (not eq) or inline.lower() in ("true", "1", "t")
                 i += 1
                 continue
-            return None   # an unknown flag (ready --undo among them): not understood, not probed
-        positional.append(arg)
-        i += 1
-    if len(positional) != 1:
+            else:
+                return None
+        elif arg.startswith("-"):
+            letters, j = arg[1:], 0
+            while j < len(letters):
+                letter = letters[j]
+                if letter in BOOL_SHORT[verb]:
+                    j += 1
+                    continue
+                if letter in VALUE_SHORT:
+                    name = VALUE_SHORT[letter]
+                    rest = letters[j + 1:]
+                    if rest:
+                        value, i = rest[1:] if rest.startswith("=") else rest, i + 1
+                    else:
+                        value, i = (args[i + 1] if i + 1 < len(args) else None), i + 2
+                    break
+                return None
+            else:
+                i += 1
+                continue
+        else:
+            positional.append(arg)
+            i += 1
+            continue
+        if name == "--repo":
+            if not value or not REPO_RE.match(value):
+                return None
+            out["repo"] = value
+        elif name == MATCH_FLAG:
+            out["match"].append((start, min(i, len(args)), value))
+    if len(positional) > 1:
         return None
-    ref = positional[0]
-    url = PR_URL_RE.match(ref)
-    if url:
-        return args[1], url.group(1), int(url.group(2))
-    if ref.isdigit() and int(ref) >= 1:
-        return args[1], repo, int(ref)
-    return None   # a branch name or something else
+    out["ref"] = positional[0] if positional else None
+    return out
+
+
+def gate_run_gh(gh, argv, deadline, env):
+    try:
+        done = subprocess.run([gh] + argv, capture_output=True, text=True, timeout=max(0.05, deadline - time.time()),
+                              stdin=subprocess.DEVNULL, env=env)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def gate_resolve(parsed, gh, env, deadline):
+    """(repo, number) of the PR the real gh would act on, or (None, why). Never guesses: a repo comes from the PR URL, -R, GH_REPO,
+    or the real gh's own answer for the current directory; a PR with no number (no argument, a branch name) is asked of the real gh."""
+    ref = parsed["ref"]
+    if ref is not None:
+        url = PR_URL_RE.match(ref)
+        if url:
+            return url.group(1), int(url.group(2))
+        if ref.isdigit() and int(ref) >= 1:
+            repo = parsed["repo"] or os.environ.get("GH_REPO")
+            if repo and not REPO_RE.match(repo):
+                return None, "GH_REPO is not owner/repo"
+            if not repo:
+                if gh is None:
+                    return None, "no real gh to ask which repo this directory is"
+                repo = gate_run_gh(gh, ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], deadline, env)
+                if not repo or not REPO_RE.match(repo):
+                    return None, "could not resolve the repo of this directory"
+            return repo, int(ref)
+    if gh is None:
+        return None, "no real gh to ask"
+    argv = ["pr", "view"] + ([ref] if ref is not None else [])
+    repo = parsed["repo"] or os.environ.get("GH_REPO")
+    if repo:
+        if not REPO_RE.match(repo):
+            return None, "GH_REPO is not owner/repo"
+        argv += ["-R", repo]
+    found = gate_run_gh(gh, argv + ["--json", "url", "-q", ".url"], deadline, env)
+    url = PR_URL_RE.match(found or "")
+    if not url:
+        return None, "could not resolve the PR (%s)" % (ref or "the current branch")
+    return url.group(1), int(url.group(2))
+
+
+def gate_clean(text):
+    """One printable line: control characters (terminal escapes) removed."""
+    return "".join(ch for ch in str(text) if ch.isprintable()).strip()
 
 
 def gate_repos():
@@ -302,7 +380,7 @@ def gate_spool(event, repo, number, check, detail):
     path = os.path.join(state, GATE_SPOOL)
     try:
         if os.path.isdir(state) and (not os.path.exists(path) or os.path.getsize(path) < GATE_SPOOL_LIMIT):
-            line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo, number), "for": check,
+            line = json.dumps({"ts": int(time.time()), "event": event, "pr": "%s#%d" % (repo or "unknown", number or 0), "for": check,
                                "detail": str(detail)[:200]}, sort_keys=True)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as out:
@@ -311,43 +389,98 @@ def gate_spool(event, repo, number, check, detail):
         pass
 
 
-def gate_probe(args, lookup):
-    """Ask the switchboard whether this ready or merge would be allowed, and write the answer down. Never raises, never blocks:
-    the caller runs the real gh whatever happens here."""
+def gate_probe(args, lookup, gh=None):
+    """Ask the switchboard whether this ready or merge is allowed. Returns None (run the real gh as given), ("refuse", line)
+    (print the line, exit non-zero, do not run gh) or ("args", new_args) (run gh with these). Never raises: every doubt is a
+    fail-open, recorded in the spool when the shim could not tell which PR it was. `gates-check` exits 10 only for a refusal that
+    applies in the repo's mode, and the shim also requires the reply to say `enforce`, so a shadow repo never refuses here."""
     try:
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return
-        target = gate_target(args)
-        if target is None:
-            return
-        check, repo, number = target
+            return None
+        if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
+            return None
         listed = gate_repos()
         if not listed:
-            return
+            return None   # no plan_gates: nothing is probed and nothing is asked
+        check = args[1]
+        parsed = gate_parse(args)
+        if parsed is None:
+            gate_spool("fail_open", None, None, check, "shape not understood: not checked")
+            return None
         binary = switchboard_binary()
+        deadline = time.time() + gate_seconds()
+        env = None
+        if gh is not None:
+            try:
+                env = account_env(gh, lookup)
+            except Exception:
+                env = None
+        repo, number = gate_resolve(parsed, gh, env, deadline)
         if repo is None:
-            repo = lookup.identity().get("repo") if binary else None
-        if not repo or repo.lower() not in listed:
-            return
+            gate_spool("fail_open", None, None, check, number)   # `number` carries the reason here
+            return None
+        if repo.lower() not in listed:
+            return None
         if not binary:
             gate_spool("fail_open", repo, number, check, "no switchboard to ask")
-            return
+            return None
         try:
             done = subprocess.run([binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"],
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
                                   env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
         except subprocess.TimeoutExpired:
             gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
-            return
+            return None
         except (OSError, subprocess.SubprocessError) as err:
             gate_spool("fail_open", repo, number, check, "could not run gates-check: %s" % err)
-            return
-        if done.returncode == 10:
-            gate_spool("would_refuse", repo, number, check, done.stdout.strip() or "refused (shadow: not enforced here)")
-        elif done.returncode != 0:
+            return None
+        try:
+            payload = json.loads(done.stdout)
+            if not isinstance(payload, dict):
+                payload = {}
+        except ValueError:
+            payload = {}
+        if done.returncode not in (0, 10):
             gate_spool("fail_open", repo, number, check, "gates-check exited %d" % done.returncode)
+            return None
+        if payload.get("mode") != "enforce":
+            if done.returncode == 10:
+                gate_spool("fail_open", repo, number, check, "exit 10 without an enforce reply: not refused")
+            return None
+        if done.returncode == 10:
+            message = gate_clean(str(payload.get("message") or "").splitlines()[0] if payload.get("message") else "")
+            if not message:
+                message = "fleet-switchboard: %s of %s#%d refused by the plan gates (no detail given)." % (check, repo, number)
+            gate_spool("refused", repo, number, check, message)
+            return ("refuse", message[:600])
+        if check == "merge":
+            return gate_bind_merge(args, parsed, repo, number, payload)
+        return None
     except Exception:
-        pass   # a probe must never stop a command
+        return None   # a probe must never stop a command
+
+
+def gate_bind_merge(args, parsed, repo, number, payload):
+    """In an enforcing repo the merge is bound to the head that was checked (a push between the check and the merge makes the
+    real merge fail), and `--auto` is refused: it merges later, at a head nobody checked. Every --match-head-commit the caller
+    gave (any spelling, repeated, empty or without a value) is dropped and replaced by one with the checked head; a caller value
+    that names another head is refused."""
+    ref = "%s#%d" % (repo, number)
+    if parsed["auto"]:
+        return ("refuse", "fleet-switchboard: merge of %s refused: --auto merges later at a head nobody checked while this repo enforces "
+                          "the plan gates. Way out: merge when ready, with --match-head-commit <sha>." % ref)
+    head = payload.get("head")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        gate_spool("fail_open", repo, number, "merge", "no head to bind the merge to")
+        return None
+    for _, _, given in parsed["match"]:
+        if given and given.strip().lower() != head:
+            return ("refuse", "fleet-switchboard: merge of %s refused: --match-head-commit %s is not the head the gates were checked at (%s). "
+                              "Way out: re-run with the current head." % (ref, gate_clean(given)[:40], head))
+    new = list(args)
+    for start, stop, _ in sorted(parsed["match"], reverse=True):
+        del new[start:stop]
+    return ("args", new + [MATCH_FLAG, head])
 
 
 def main(args):
@@ -361,7 +494,12 @@ def main(args):
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
-    gate_probe(args, lookup)   # shadow only: records, never blocks
+    verdict = gate_probe(args, lookup, gh)
+    if verdict is not None and verdict[0] == "refuse":
+        sys.stderr.write(gate_clean(verdict[1]) + "\n")
+        return 10
+    if verdict is not None:
+        args = verdict[1]
     env = account_env(gh, lookup)
     if plan is None:
         if env is not None:
