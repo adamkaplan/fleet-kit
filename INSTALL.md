@@ -494,6 +494,17 @@ dry run prints the profile path it would use; read it to the person. Never pass
 `--shared-profile` unless the person asks for it by name: it puts the files where
 their ordinary OpenCode reads them, and says so.
 
+After the agents are copied and the service has restarted, check that OpenCode registered them as written:
+
+```
+VERIFY:  ./bin/fleet-switchboard agents verify
+PROVES:  "agents: PASS (9 of 9 ...)". An agent whose front matter does not parse is
+         silently registered as a default primary agent with a handful of rules, and a
+         reviewer then cannot be run as a subagent. A FAIL line names the agent and
+         why. "not running" means nothing was checked (the service is down): start it
+         and run this again. It only reads (`opencode api GET /api/agent`).
+```
+
 If `status` begins with "No decision-model key", or says the key is only in an
 environment variable, that is STEP 18, not a failure.
 

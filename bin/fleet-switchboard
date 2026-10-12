@@ -14559,6 +14559,88 @@ def add_impact_parsers(sub):
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
 
 
+# ---------------------------------------------------------------- `agents verify` (#179): did the service register OUR agents as written?
+#
+# OpenCode v2 silently registers an agent whose front matter does not parse as a default PRIMARY agent with a handful of rules. The service is
+# asked (`opencode api GET /api/agent`, read-only) and each of our agents is compared with this table: its mode and a MINIMUM rule count. The
+# minimum sits well above what a default agent gets (10 to 14) and below what the file defines, so a failed parse fails it and a normal
+# edit does not. A service that is not running is said, not failed: nothing was installed wrongly.
+EXPECTED_AGENTS = {
+    "chief-of-staff": ("primary", 150),
+    "cos-subagent": ("primary", 150),
+    "orchestrator": ("primary", 14),
+    "coder": ("primary", 14),
+    "reviewer-code": ("subagent", 35),
+    "reviewer-architecture": ("subagent", 35),
+    "reviewer-security": ("subagent", 35),
+    "reviewer-impact": ("subagent", 35),
+    "reviewer-test": ("subagent", 35),
+}
+AGENTS_VERIFY_TIMEOUT = 20
+
+
+def agents_found(runner, opencode, timeout):
+    """(state, payload): ("down", why) when the service cannot be asked, else ("up", {name: (mode, rule count)}) or ("bad", why)."""
+    try:
+        done = runner([opencode, "api", "GET", "/api/agent"], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "down", "%s did not answer within %ds" % (opencode, timeout)
+    except OSError as err:
+        return "down", "cannot run %s: %s" % (opencode, err.strerror or err)
+    if done.returncode != 0:
+        return "down", "%s api GET /api/agent exited %s: %s" % (opencode, done.returncode, _one_line(done.stderr or done.stdout))
+    try:
+        rows = json.loads(done.stdout)["data"]
+        return "up", {row["id"]: (row["mode"], len(row["permissions"])) for row in rows}
+    except (ValueError, KeyError, TypeError) as err:
+        return "bad", "the service answered something that is not the agent list (%s)" % err
+
+
+def agents_problems(found, expected=None):
+    """One line per agent of ours that is missing, in the wrong mode or short of rules."""
+    problems = []
+    for name, (mode, floor) in sorted((expected or EXPECTED_AGENTS).items()):
+        if name not in found:
+            problems.append("%s: not registered (install it, then restart the service)" % name)
+            continue
+        got_mode, count = found[name]
+        if got_mode != mode:
+            problems.append("%s: registered as %s, expected %s (its front matter probably failed to parse: quote any description with a colon)" % (name, got_mode, mode))
+        elif count < floor:
+            problems.append("%s: %d rules, expected at least %d (its permission block did not load as written)" % (name, count, floor))
+    return problems
+
+
+def cmd_agents(args, runner, now):
+    """`agents verify`: read-only; exit 0 when every agent of ours is registered as written or the service is not running, 1 otherwise."""
+    state, payload = agents_found(runner, args.opencode, args.timeout)
+    if state == "down":
+        print("agents: the OpenCode service is not running or not reachable, so nothing was checked (%s). Start it, then run this again." % payload)
+        return EXIT_OK
+    if state == "bad":
+        sys.stderr.write("%s: agents verify: %s\n" % (PROG, payload))
+        return EXIT_ERROR
+    problems = agents_problems(payload)
+    if problems:
+        for line in problems:
+            print("FAIL  " + line)
+        print("agents: %d of %d agents are not registered as written" % (len(problems), len(EXPECTED_AGENTS)))
+        return EXIT_ERROR
+    print("agents: PASS (%d of %d registered with the expected mode and rule count)" % (len(EXPECTED_AGENTS), len(EXPECTED_AGENTS)))
+    return EXIT_OK
+
+
+def add_agents_parsers(sub):
+    agents = sub.add_parser("agents", help="Check that the service registered the kit's agents as written (read-only)")
+    agents_sub = agents.add_subparsers(dest="agents_action", required=True)
+    verify = agents_sub.add_parser("verify", help="Ask the running OpenCode service for its agents and compare each of ours with its expected mode and rule count",
+                                   description="Reads `opencode api GET /api/agent` and fails (exit 1) when an agent of the kit is missing, has the wrong mode or "
+                                               "too few rules. A service that is not running is reported, not failed. Run it after installing the agents and "
+                                               "restarting the service.")
+    verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
+    verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
+
+
 def add_review_laws_parsers(sub):
     laws = sub.add_parser("review-laws", help="The review laws starter set (#179)")
     laws_sub = laws.add_subparsers(dest="laws_action", required=True)

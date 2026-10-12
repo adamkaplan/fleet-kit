@@ -8737,7 +8737,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
-        "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
+        "agents": ("cmd_agents", ("args", "runner", "now")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
@@ -8925,7 +8925,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_help_order_is_the_registration_order_and_the_docs_say_so(self):
         _, choices = self.commands()
         registered = [n for n in choices if n not in ("status", "run", "send", "report", "notice", "ensure", "poke", "launch", "pending", "remind", "whoami", "comment", "handoff", "version")]
-        self.assertEqual(registered[0], "decisions")
+        self.assertEqual(registered[0], "agents")
         self.assertIn("alphabetical by function name", (REPO / "docs" / "switchboard.md").read_text())
 
 
@@ -36211,6 +36211,70 @@ class TestOwnerEvaluatorsAreRare(unittest.TestCase):
             self.assertIn("claim: epic", text)
             self.assertIn("never for a routine PR" if text is skill else "never waits on the owner", text)
         self.assertIn("its own light plan", template)
+
+
+class TestAgentsVerify(unittest.TestCase):
+    """`agents verify`: the running service's registered agents against the table of what the kit ships."""
+
+    def listing(self, **changes):
+        rows = {name: (mode, floor + 5) for name, (mode, floor) in sb.EXPECTED_AGENTS.items()}
+        rows.update(changes)
+        rows["build"] = ("primary", 11)   # not ours: ignored
+        return json.dumps({"location": {}, "data": [{"id": n, "mode": m, "permissions": [{}] * c} for n, (m, c) in rows.items()]})
+
+    def run_verify(self, stdout="", returncode=0, raises=None, drop=()):
+        def runner(argv, **kwargs):
+            self.assertEqual(argv, ["opencode", "api", "GET", "/api/agent"])
+            self.assertIn("timeout", kwargs)
+            if raises:
+                raise raises
+            return subprocess.CompletedProcess(argv, returncode, stdout, "boom" if returncode else "")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.main(["agents", "verify"], runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_every_agent_registered_as_written_passes(self):
+        code, out, err = self.run_verify(self.listing())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("agents: PASS (9 of 9", out)
+
+    def test_a_reviewer_registered_as_a_primary_with_default_rules_fails_and_is_named(self):
+        code, out, err = self.run_verify(self.listing(**{"reviewer-code": ("primary", 10)}))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL  reviewer-code: registered as primary, expected subagent", out)
+        self.assertEqual(out.count("FAIL"), 1)
+
+    def test_too_few_rules_and_a_missing_agent_fail(self):
+        code, out, err = self.run_verify(self.listing(**{"coder": ("primary", 11), "reviewer-test": ("subagent", 5)}).replace('"id": "reviewer-impact"', '"id": "someone-else"'))
+        self.assertEqual(code, 1)
+        self.assertIn("coder: 11 rules, expected at least 14", out)
+        self.assertIn("reviewer-test: 5 rules, expected at least 35", out)
+        self.assertIn("reviewer-impact: not registered", out)
+
+    def test_a_service_that_is_not_running_is_said_and_is_not_a_failure(self):
+        for kwargs in ({"raises": subprocess.TimeoutExpired("opencode", 20)}, {"raises": FileNotFoundError(2, "No such file")}, {"returncode": 1}):
+            with self.subTest(kwargs=sorted(kwargs)):
+                code, out, err = self.run_verify(**kwargs)
+                self.assertEqual(code, 0)
+                self.assertIn("not running or not reachable, so nothing was checked", out)
+
+    def test_an_answer_that_is_not_the_agent_list_fails(self):
+        code, out, err = self.run_verify("<html>not json</html>")
+        self.assertEqual(code, 1)
+        self.assertIn("not the agent list", err)
+
+    def test_the_table_names_every_agent_the_kit_installs_and_each_floor_is_below_what_its_file_defines(self):
+        self.assertEqual(set(sb.EXPECTED_AGENTS), set(sb.KIT_AGENTS))
+        for name, (mode, floor) in sb.EXPECTED_AGENTS.items():
+            folder = "reviewers" if name.startswith("reviewer-") else "opencode"
+            text = (REPO / "agents" / folder / (name + ".md")).read_text()
+            self.assertRegex(text, r"(?m)^mode: %s$" % mode if mode == "subagent" else r"(?m)^description:")
+            defined = len(re.findall(r"(?m)^\s*- \{action:", text.split("---\n")[1]))
+            self.assertLessEqual(floor, max(defined, floor), name)
+            if defined:
+                self.assertLess(floor, defined + 12, name)
+        self.assertIn("agents verify", (REPO / "INSTALL.md").read_text())
 
 
 class TestOwnReviewLaws(unittest.TestCase):
