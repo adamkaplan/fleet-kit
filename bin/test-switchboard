@@ -8782,7 +8782,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
-        "agents": ("cmd_agents", ("args", "runner", "now")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
+        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
@@ -36350,6 +36350,149 @@ class TestOwnerEvaluatorsAreRare(unittest.TestCase):
             self.assertIn("claim: epic", text)
             self.assertIn("never for a routine PR" if text is skill else "never waits on the owner", text)
         self.assertIn("its own light plan", template)
+
+
+class TestJobTool(unittest.TestCase):
+    """`job start` / `job status`: detached long runs, told apart by evidence (real processes, short ones)."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pids = []
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for pid in self.pids:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+
+    def job(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.dict(os.environ):
+            code = sb.main(["job", *argv])
+        return code, out.getvalue().strip(), err.getvalue()
+
+    def started(self, name, *command):
+        code, out, err = self.job("start", name, "--", *command)
+        self.assertEqual(code, 0, err)
+        record = sb.job_read(name, self.root)
+        self.pids.append(record["pid"])
+        return record
+
+    def wait_for(self, name, want, seconds=10):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            state = sb.job_state(sb.job_read(name, self.root), self.root)
+            if state[0] == want:
+                return state
+            time.sleep(0.05)
+        self.fail("job %s never read %s" % (name, want))
+
+    def test_a_finished_job_reads_its_exit_code_and_its_result_file(self):
+        self.started("suite", "sh", "-c", "echo hello; exit 3")
+        self.assertEqual(self.wait_for("suite", "finished"), ("finished", 3))
+        code, out, err = self.job("status", "suite")
+        self.assertEqual(code, 1, "a non-zero exit is not success")
+        self.assertRegex(out, r"^finished: suite exit code 3 after it started \d+s ago; result .*out\.log$")
+        self.assertEqual((self.root / "suite" / "out.log").read_text(), "hello\n")
+
+    def test_a_job_that_exits_zero_reads_finished_and_status_succeeds(self):
+        self.started("ok", "sh", "-c", "exit 0")
+        self.wait_for("ok", "finished")
+        self.assertEqual(self.job("status", "ok")[0], 0)
+
+    def test_a_killed_job_reads_dead_with_no_exit_code(self):
+        record = self.started("long", "sleep", "60")
+        code, out, err = self.job("status", "long")
+        self.assertEqual((code, out.split(":")[0]), (0, "alive"))
+        os.killpg(record["pid"], signal.SIGKILL)   # the whole group: what a restart does
+        self.assertEqual(self.wait_for("long", "dead"), ("dead", None))
+        code, out, err = self.job("status", "long")
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"^dead: long was killed \(no exit code\); it started \d+s ago; what it printed is in .*out\.log$")
+        self.assertFalse((self.root / "long" / "exit").exists())
+
+    def test_a_pid_reused_by_another_process_is_not_the_job(self):
+        record = self.started("reuse", "sleep", "60")
+        job = sb.job_read("reuse", self.root)
+        job["token"] = "Thu Jan  1 00:00:00 1970"   # the recorded start time is not this process's
+        (self.root / "reuse" / "job.json").write_text(json.dumps(job))
+        self.assertEqual(sb.job_state(sb.job_read("reuse", self.root), self.root)[0], "dead")
+
+    def test_a_name_still_alive_is_refused_and_a_finished_one_is_replaced(self):
+        self.started("again", "sleep", "60")
+        code, out, err = self.job("start", "again", "--", "true")
+        self.assertEqual(code, 1)
+        self.assertIn("is still running", err)
+        self.started("quick", "true")
+        self.wait_for("quick", "finished")
+        self.started("quick", "sh", "-c", "exit 2")
+        self.assertEqual(self.wait_for("quick", "finished"), ("finished", 2))
+
+    def test_a_bad_name_no_command_and_an_unknown_job_are_refused(self):
+        self.assertEqual(self.job("start", "Bad Name", "--", "true")[0], 2)
+        self.assertEqual(self.job("start", "x", "--")[0], 2)
+        code, out, err = self.job("status", "nope")
+        self.assertEqual(code, 1)
+        self.assertIn("no job named nope", err)
+
+    def test_asking_after_it_died_collects_it_so_nobody_else_is_told(self):
+        record = self.started("c", "sleep", "60")
+        os.killpg(record["pid"], signal.SIGKILL)
+        self.wait_for("c", "dead")
+        self.assertFalse((self.root / "c" / "collected").exists())
+        self.job("status", "c")
+        self.assertTrue((self.root / "c" / "collected").exists())
+
+
+class TestJobFacts(unittest.TestCase):
+    """A dead job its starter has not looked at is one line to the starter's boss, once."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        worker = types.SimpleNamespace(name="coder", session_id="ses_example1", conflict=False, problem=None,
+                                       fleet={"reports_to": "platform"}, status="idle")
+        boss = types.SimpleNamespace(name="platform", session_id="ses_example2", conflict=False, problem=None, fleet={}, status="idle")
+        self.discovery = types.SimpleNamespace(agents={"coder": worker, "platform": boss})
+        self.engine = types.SimpleNamespace(discovery=self.discovery, now=lambda: 2000.0)
+        self.source = sb.JobFacts()
+        self.source.bind(self.engine)
+
+    def record(self, name, session="ses_example1", pid=99999999, started=1000.0, **extra):
+        directory = self.root / name
+        directory.mkdir()
+        (directory / "job.json").write_text(json.dumps(dict({"name": name, "argv": ["x"], "pid": pid, "started": started, "token": None, "session": session}, **extra)))
+        return directory
+
+    def test_a_dead_job_of_a_worker_is_one_fact_for_its_boss_with_a_stable_key(self):
+        self.record("suite")
+        (fact,) = self.source()
+        self.assertEqual((fact.key, fact.recipient, fact.kind, fact.batch), ("job.dead:suite:1000", "platform", "job.dead", False))
+        self.assertIn("coder's job suite was killed before it finished", fact.summary)
+        self.assertEqual([f.key for f in self.source()], [fact.key], "the same key every time: delivery sends it once")
+
+    def test_a_collected_a_finished_an_alive_and_a_session_less_job_make_no_fact(self):
+        self.record("collected").joinpath("collected").write_text("1")
+        self.record("finished").joinpath("exit").write_text("0\n")
+        self.record("alive", pid=os.getpid())
+        self.record("nosession", session=None)
+        self.record("stranger", session="ses_unknown")
+        self.assertEqual(self.source(), [])
+
+    def test_the_source_is_registered_and_the_nudge_names_the_tool(self):
+        self.assertTrue(any(isinstance(x, sb.JobFacts) for x in sb.fact_sources(self.root)))
+        self.assertIn("job start <name> -- <command>", sb.NUDGE_TEXT % ("platform", "fleet-switchboard", "fleet-switchboard", "fleet-switchboard"))
+        for rel in ("agents/opencode/coder.md", "skills/fleet-coordination/SKILL.md", "docs/switchboard.md"):
+            self.assertIn("job status", (REPO / rel).read_text(), rel)
 
 
 class TestAgentsVerify(unittest.TestCase):
