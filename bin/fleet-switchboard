@@ -11993,6 +11993,18 @@ def _ask_facts(config, runner, now, ask_text, default_repo):
     return (repo, number, kind, plan_review.lineage_key(repo, parent) if parent else None, found.intent or "", found.done_when or "")
 
 
+def _abandoned(entries, review):
+    """True when the review was abandoned: it takes no verdict, no response, no closing round and no consensus (a new `start` for the ask is how
+    it goes on: the lineage's count continues)."""
+    return any(e.get("kind") == "abandoned" and e.get("review") == review for e in entries)
+
+
+def _refuse_if_abandoned(entries, review):
+    if _abandoned(entries, review):
+        raise ReviewError("refused: review %s was abandoned: it takes no more verdicts, responses, closing round or consensus "
+                          "(`plan review start` for the same ask opens a new review and the count continues)" % review)
+
+
 def _round_of(entries, review):
     rounds = [e for e in entries if e.get("kind") == "round" and e.get("review") == review]
     if not rounds:
@@ -12126,6 +12138,7 @@ def review_verdict(args, runner, now, socket_call=None):
     cfg = review_config(config)
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
+    _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
     sessions = _sessions_of(entries, args.review, rnd["round"])
@@ -12144,7 +12157,15 @@ def review_verdict(args, runner, now, socket_call=None):
         raise ReviewError("refused: %d objections in one verdict (at most %d): say the strongest" % (len(parsed["objections"]), REVIEW_OBJECTIONS_MAX))
     entry = {"kind": "lane", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"], "lane": args.lane,
              "verdict": parsed["verdict"], "plan_hash": rnd["plan_hash"], "objections": parsed["objections"], "by": caller}
-    _review_record(engine, state, entry, now)
+    def guarded(ledger, seq):
+        _refuse_if_abandoned(ledger, args.review)   # under the lock: an abandon that landed meanwhile still wins
+        if any(e.get("kind") == "lane" and e.get("review") == args.review and e.get("round") == rnd["round"] and e.get("lane") == args.lane for e in ledger):
+            raise ReviewError("refused: lane %s already has its verdict for this round" % args.lane)
+        return entry
+    stored = plan_ledger.append_checked(state, now(), guarded)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "plan.review.lane", rnd["lineage"], {"review": args.review, "round": rnd["round"], "lane": args.lane,
+                                                                                "seq": stored["seq"], "chain": stored["hash"]})
     made, trouble = _launch_waiting(engine, state, cfg, config, runner, now, rnd)
     out = {"recorded": args.lane, "verdict": parsed["verdict"], "objections": len(parsed["objections"]),
            "launched_next": [lane for lane, _, _ in made]}
@@ -12161,6 +12182,8 @@ def _closing_outcome(engine, state, cfg, config, runner, now, review):
     ledger alone; the consensus is bound to the final plan hash."""
     entries = review_entries(state)
     rnd = _round_of(entries, review)
+    if _abandoned(entries, review):
+        return {}
     if not rnd.get("closing") or any(l not in _verdicts_of(entries, review, rnd["round"]) for l in rnd["lanes"]):
         return {}
     lineage = [e for e in entries if e.get("lineage") == rnd["lineage"]]
@@ -12175,6 +12198,7 @@ def _closing_outcome(engine, state, cfg, config, runner, now, review):
 
     def write(ledger, seq):
         """Under the lock, from the ledger as it stands: the same tally, and not twice for one hash."""
+        _refuse_if_abandoned(ledger, review)
         mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
         again, _ = plan_review.decide_consensus([e for e in mine if e.get("kind") == "lane"], rnd["lanes"], rnd["plan_hash"],
                                                 rounds_left=plan_review._rounds_left(plan_review.lineage_state(mine, rnd["plan_hash"])))
@@ -12204,6 +12228,7 @@ def review_close(args, runner, now, socket_call=None):
     _, planner = review_caller(runner, now, "close a plan review")
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
+    _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
     if planner != rnd["by"] and planner != "owner":
         raise ReviewError("refused: only the planner who started the review (%s) closes it" % rnd["by"])
@@ -12228,6 +12253,7 @@ def review_close(args, runner, now, socket_call=None):
     plan_ref = "%s#%d" % (plan_repo, plan_number)
 
     def decide(ledger, seq):
+        _refuse_if_abandoned(ledger, args.review)
         mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
         later = [e for e in ledger if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
         if later:
@@ -12316,6 +12342,7 @@ def review_respond(args, runner, now, socket_call=None):
     _, planner = review_caller(runner, now, "respond to a plan review")
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
+    _refuse_if_abandoned(entries, args.review)
     rnd = _round_of(entries, args.review)
     if planner != rnd["by"] and planner != "owner":
         raise ReviewError("refused: only the planner who started the review (%s) answers it" % rnd["by"])
@@ -12364,6 +12391,7 @@ def review_respond(args, runner, now, socket_call=None):
 
     def decide(entries, seq):
         """Under the ledger lock: this review is still at the round the planner answered, and the round may open."""
+        _refuse_if_abandoned(entries, args.review)
         later = [e for e in entries if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
         if later:
             raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
@@ -12486,6 +12514,7 @@ def review_decide(args, runner, now):
     outcome = {}
 
     def build(entries, seq):
+        _refuse_if_abandoned(entries, args.review)
         escalations = _escalations(entries, args.review)
         esc = escalations.get(args.objection)
         if esc is None:
@@ -12515,7 +12544,7 @@ def review_decide(args, runner, now):
         rnd = _round_of(entries, args.review)
         # the last open objection was overridden and nothing awaits a revision: the consensus is written, marked overridden
         if not accepted or accepted[-1]["seq"] < max(e["seq"] for e in mine if e.get("kind") == "escalation"):
-            if not any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in entries):
+            if not _abandoned(entries, args.review) and not any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in entries):
                 consensus = plan_ledger.append_entry(state, {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-",
                                                              "lineage": rnd["lineage"], "review": args.review, "plan_hash": rnd["plan_hash"],
                                                              "plan_ref": rnd["plan_ref"], "tier": rnd["tier"], "lanes": rnd["lanes"],
@@ -12625,6 +12654,8 @@ def review_abandon(args, runner, now):
     engine, state, _ = build_engine(runner, now, "cli", writable=True)
     entries = review_entries(state)
     rnd = _round_of(entries, args.review)
+    if _abandoned(entries, args.review):
+        raise ReviewError("review %s is already abandoned" % args.review)
     reason = " ".join((args.reason or "").split())
     if len(reason) < plan_ledger.WAIVER_REASON_MIN:
         raise ReviewError("a reason of at least %d characters is required" % plan_ledger.WAIVER_REASON_MIN)

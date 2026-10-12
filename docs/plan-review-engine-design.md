@@ -251,3 +251,7 @@ R5 is built: the closing round, the consensus write, `plan review report`, and E
   part launches a session (the same path as `launch`) and re-reads the plan and the ask (about 3 GETs per relaunch, at most once per lane), so it is the part to keep
   in the manual `tick` until the lane agent definitions (R3) exist and have been proved. Recommended next step: a read-only daemon pass for reminders and
   escalations only, as its own small slice after R3; until then a person, an orchestrator or the chief of staff runs `plan review tick`.
+
+An abandoned review goes no further: `verdict`, `respond`, `close` and `decide` refuse it with a message (the check is repeated under the ledger lock, so an abandon that lands
+between a check and a write still wins), the consensus write refuses it, and abandoning twice is refused. `plan review start` for the same ask opens a new review and the lineage's
+count continues.

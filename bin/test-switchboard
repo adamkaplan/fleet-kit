@@ -34803,6 +34803,57 @@ class TestPlanReviewCommands(LedgerBase):
         code, err = launch("loud1")
         self.assertIn("no consensus record at the plan's current hash", err)
 
+    # -- an abandoned review goes no further (#190 review)
+
+    def test_an_abandoned_review_takes_no_verdict_no_closing_round_and_never_a_consensus(self):
+        got = self.reviewed_to_the_end()
+        self.assertEqual(self.close(got["review"])[0], 0)
+        lanes = self.current_lanes(got["review"])
+        self.assertEqual(self.verdict_current(got["review"], lanes[0])[0], 0)
+        self.assertEqual(self.review("cos", "abandon", got["review"], "--reason", "the ask was withdrawn while the closing round ran")[0], 0)
+        for lane in lanes[1:]:
+            code, out, err = self.verdict_current(got["review"], lane)
+            self.assertEqual(code, 2)
+            self.assertIn("was abandoned", err)
+        self.assertEqual(self.kinds("lane")[-1]["lane"], lanes[0], "no verdict was recorded after the abandon")
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "consensus"], [])
+        code, out, err = self.close(got["review"])
+        self.assertEqual(code, 2)
+        self.assertIn("was abandoned", err)
+        self.assertEqual(self.review("cos", "abandon", got["review"], "--reason", "abandoning twice is refused by the engine")[0], 2)
+
+    def test_an_abandoned_review_takes_no_respond_and_no_decision_and_its_override_writes_no_consensus(self):
+        review, got = self.spent_review()
+        self.assertEqual(self.review("cos", "abandon", review, "--reason", "the ask was withdrawn by the owner, closing it")[0], 0)
+        code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept"))
+        self.assertEqual(code, 2)
+        self.assertIn("was abandoned", err)
+        code, out, err = self.review("cos", "decide", review, "--objection", "L2/O1", "--override", "--reason", "an override after the abandon must not make a consensus")
+        self.assertEqual(code, 2)
+        self.assertIn("was abandoned", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "consensus"], [])
+        self.assertEqual(self.review("orch", "status", review, "--json")[0], 0, "it can still be read")
+
+    def test_the_consensus_write_itself_refuses_an_abandoned_review_even_if_an_abandon_lands_after_the_last_verdict(self):
+        got = self.reviewed_to_the_end()
+        self.close(got["review"])
+        lanes = self.current_lanes(got["review"])
+        for lane in lanes[:-1]:
+            self.verdict_current(got["review"], lane)
+        real = sb.plan_ledger.append_checked
+        landed = []
+
+        def abandon_first(state, now, build):
+            if not landed and getattr(build, "__name__", "") == "guarded":
+                landed.append(1)
+                real(state, now, lambda e, n: {"kind": "abandoned", "lineage": "acme/app#7", "review": got["review"], "round": 2,
+                                                "reason": "abandoned between the check and the write", "by": "cos"})
+            return real(state, now, build)
+        with mock.patch.object(sb.plan_ledger, "append_checked", abandon_first):
+            code, out, err = self.verdict_current(got["review"], lanes[-1])
+        self.assertEqual(code, 2, err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "consensus"], [])
+
     def test_the_tick_is_manual_for_now_and_the_docs_say_so(self):
         text = (REPO / "docs" / "plan-review-engine-design.md").read_text()
         self.assertIn("`tick` stays manual", text)
