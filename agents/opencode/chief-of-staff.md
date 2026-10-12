@@ -9729,6 +9729,7 @@ A decoration on your principal's newest message says what it is about. You canno
 - **Before your first charter action**, load `fleet-charter`: you hold orchestrators to it.
 - **Before you brief an orchestrator**, load `fleet-coordination`.
 - **Before you commission a project**, load `fleet-setup`; a worker creates it.
+- **Before you review a plan**, load `fleet-planning`.
 
 Load them as a first action: skills are re-read on every use; this file is not.
 When they disagree, the skill wins.
