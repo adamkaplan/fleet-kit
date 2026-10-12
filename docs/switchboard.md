@@ -4270,6 +4270,14 @@ The generated list (enumerating every flag and redirect form as its own deny) gr
 **Accepted gaps** (listed in the proof's `harmless` set): redirects to files (`> f`, `>> f`) and quoting are not policed; `git branch x`, `git tag v1`, `git config user.name x` and `git config --add/--global` run; `head`, `tail`, `grep` and `ls` of paths outside the job (documents, keychains, `~/.ssh`) run (only `cat` of credential paths is denied, and a heredoc that names one); `az * show` shapes could be abused with a write verb word; the pipeline-final-segment redirect is not seen by the engine at all.
 **Rollback:** restore the previous definition files and reinstall. Install: reinstall agents and restart the Chief of Staff (a running session keeps the definition it began with).
 
+## The review laws starter set and `review-laws install` (#179, slice L1)
+
+`docs/review-laws/` is the generic starter set every repository starts from: `REVIEW_LAWS.md` (numbered citable rules, the verdict format, what blocks, and the impact rating on
+MIL-STD-882E's categories with definitions rewritten for software and the mapping to the 4x5 matrix), `CODING_STANDARDS.md`, `SECURITY_STANDARDS.md` and `TEST_STANDARDS.md`, each
+opening with `extends: fleet-kit-review-laws @ review-laws-<n>` (the version is in `docs/review-laws/VERSION`; `docs/review-laws/impact-matrix.json` is the single source of the impact matrix, which a test keeps equal to the table in `REVIEW_LAWS.md`). `fleet-switchboard review-laws install <repo path>` copies the four files to the
+repository's root and prints what to edit; it never overwrites a copy the repository already has (`--force` replaces it), writes nothing else and does not touch the repository's
+`AGENTS.md` (the laws must not contradict it). Reviewers read these files from the base branch of a pull request. Plan: issue 179.
+
 ### Preflight and the Chief of Staff's definition (#191 follow-up)
 
 `gates preflight` / `enforce` check the INSTALLED chief-of-staff definition by **evaluating probe commands** against its shell rules with v2's semantics (**the last matching rule decides**, proved on the real harness: a deny only holds when it comes AFTER the allow that would admit the command; no match is the base deny), not by looking for exact resource strings. Both rule shapes are read: the installed one-line `{action: shell, resource: "x", effect: allow}` and the older block form. It must ALLOW `waive` (G1), `gates mode <repo> shadow` and `gates off`, and must DENY `gates mode <repo> enforce` (any casing), `gates on` and `waive ... --gates G6|G8`: a Chief of Staff that could turn enforcement on is as blocking as one that cannot turn it off.
