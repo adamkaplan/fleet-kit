@@ -172,3 +172,5 @@ scenarios:
 
 **3. An uncovered Done-when clause.** With `Done when: (1) ... (2) ...`, a plan whose scenarios only say `covers: DW-1`
 fails with `DW-2 is not covered by any S scenario`. Every clause needs a scenario that proves it.
+
+<!-- gate live probe: a harmless line, closed unmerged -->
