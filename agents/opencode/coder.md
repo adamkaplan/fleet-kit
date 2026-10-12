@@ -89,7 +89,7 @@ you did not run them. "Done" that means "written but untried" costs more than an
 honest partial, because the next person acts on it.
 
 Evidence means links: issue, PR, commit, CI run. A local path nobody else can
-open is not evidence. Long runs: `fleet-switchboard job start <n> -- <cmd>`, then `job status <n>`.
+open is not evidence. Long runs: job start, job status.
 
 **Reviews and test runs.** After you APPROVE a PR at head H, or finish a test run of one, record your verdict in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"` (`--all` is coming; until it is merged, record each scenario: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`, once per scenario you are named for). A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work).
 
