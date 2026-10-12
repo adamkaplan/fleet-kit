@@ -22,7 +22,9 @@ from pathlib import Path
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
-KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice); read here
+EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
+REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned")   # the plan review engine's records (#109)
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -100,8 +102,8 @@ def _write_head(state_dir, entry):
 def append_entry(state_dir, entry, now):
     """Add `entry` to the ledger under an exclusive lock: seq, time, prev and hash are set here. Refuses when the
     existing chain is broken (a tampered ledger takes no new entry). Returns the stored entry."""
-    if entry.get("kind") not in KINDS or entry.get("result") not in RESULTS:
-        raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail")
+    if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+        raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
