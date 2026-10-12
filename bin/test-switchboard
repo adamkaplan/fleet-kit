@@ -197,7 +197,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "poll_seconds": 5,
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -2927,51 +2927,6 @@ class TestSteerToWorking(Base):
         held = self.world.engine.send("platform", "chief-of-staff", "which one?")
         self.assertFalse(held["sent"])
         self.assertIn("no herdr pane shows a v2 session named chief-of-staff", held["reason"])
-
-    def cli_send(self, *argv):
-        with captured() as (out, err):
-            code = sb.main(["send", "--from", "cos", "platform"] + list(argv), runner=self.world.route, now=self.world.clock.now,
-                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-        return code, out.getvalue(), err.getvalue()
-
-    def test_a_send_that_hangs_ends_with_a_clear_line_not_a_silent_wait(self):
-        import threading
-        self.work()
-        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "send_timeout_seconds": 0.05})
-        release = threading.Event()
-        self.addCleanup(release.set)
-
-        def stuck(args, runner, now):
-            release.wait(30)                                  # a delivery that does not finish until the test lets it
-            return 0
-        with mock.patch.object(sb, "_cmd_send", stuck):
-            code, out, err = self.cli_send("hi")
-        self.assertEqual(code, sb.EXIT_ERROR)
-        self.assertIn("did not finish within 0.05 s", err)
-        self.assertIn("state is unknown", err)
-        self.assertIn("pending platform", err)
-
-    def test_a_fast_send_is_unchanged_and_the_bound_has_a_default_and_is_validated(self):
-        self.work()
-        code, out, err = self.cli_send("ok")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(sb.DEFAULTS["send_timeout_seconds"], 60)
-        for bad in (0, -1, "x"):
-            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
-                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "send_timeout_seconds": bad})
-
-    def test_run_bounded_hands_back_a_result_and_re_raises_the_workers_own_error(self):
-        self.assertEqual(sb.run_bounded(lambda: 7, 5), (True, 7))
-        with self.assertRaises(sb.InterruptRefused):
-            sb.run_bounded(lambda: (_ for _ in ()).throw(sb.InterruptRefused("no")), 5)
-
-    def test_a_broken_config_is_said_and_the_default_bound_applies(self):
-        self.work()
-        self.config_file.write_text("{not json")
-        with mock.patch.object(sb, "_cmd_send", lambda a, r, n: 0):
-            code, out, err = self.cli_send("hi")
-        self.assertIn("the config could not be read", err)
-        self.assertIn("default send bound of 60 s", err)
 
     def test_the_alias_with_no_chief_of_staff_is_taken_literally_and_an_interrupt_through_it_is_still_refused_to_a_non_boss(self):
         held = self.send(sender="coder", to="chief-of-staff")
