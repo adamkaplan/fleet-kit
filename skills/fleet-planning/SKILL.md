@@ -92,4 +92,4 @@ Bad, each fails `plan check` or a reviewer:
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+open. Owner evaluators are rare (only where the owner's own eyes are the test); a coder's only extra step is `prove`. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
