@@ -11886,7 +11886,8 @@ class ReviewError(Exception):
     """A `plan review` command that cannot go on (exit 2): said in one line, nothing was recorded."""
 
 
-REVIEW_ACTIONS = ("start", "verdict", "respond", "status", "abandon", "decide", "tick")
+REVIEW_ACTIONS = ("start", "verdict", "respond", "status", "abandon", "decide", "tick", "close", "report")
+DECISIONS_HEADING_RE = re.compile(r"(?m)^##[ \t]+Decisions[ \t]*$")
 REVIEW_TABLE_MAX = 65536     # bytes read from a response table or a verdict block
 REVIEW_OBJECTIONS_MAX = 20   # objections in one verdict
 
@@ -12149,7 +12150,140 @@ def review_verdict(args, runner, now, socket_call=None):
            "launched_next": [lane for lane, _, _ in made]}
     if trouble:
         out["waiting_lanes_not_launched"] = trouble
+    if rnd.get("closing"):
+        out.update(_closing_outcome(engine, state, cfg, config, runner, now, args.review))
     return out
+
+
+def _closing_outcome(engine, state, cfg, config, runner, now, review):
+    """Once every lane of a closing round has reported: write the consensus (every lane of the tier approved the exact final hash and nothing
+    blocking is open), or escalate a blocking objection raised on the final text, or say it is still pending. The tally is computed from the
+    ledger alone; the consensus is bound to the final plan hash."""
+    entries = review_entries(state)
+    rnd = _round_of(entries, review)
+    if not rnd.get("closing") or any(l not in _verdicts_of(entries, review, rnd["round"]) for l in rnd["lanes"]):
+        return {}
+    lineage = [e for e in entries if e.get("lineage") == rnd["lineage"]]
+    st = plan_review.lineage_state(lineage, rnd["plan_hash"])
+    lane_entries = [e for e in lineage if e.get("kind") == "lane"]
+    verdict, why = plan_review.decide_consensus(lane_entries, rnd["lanes"], rnd["plan_hash"], rounds_left=plan_review._rounds_left(st))
+    if verdict == "escalate":
+        out = _escalate(engine, state, cfg, config, runner, now, rnd, st, "", rnd["by"])
+        return {"tally": "escalate", "tally_why": why, "escalated": out["escalated"], "boss": out["boss"], "owner_only": out["owner_only"]}
+    if verdict != "consensus":
+        return {"tally": verdict, "tally_why": why}
+
+    def write(ledger, seq):
+        """Under the lock, from the ledger as it stands: the same tally, and not twice for one hash."""
+        mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
+        again, _ = plan_review.decide_consensus([e for e in mine if e.get("kind") == "lane"], rnd["lanes"], rnd["plan_hash"],
+                                                rounds_left=plan_review._rounds_left(plan_review.lineage_state(mine, rnd["plan_hash"])))
+        if again != "consensus":
+            raise ReviewError("the tally changed: no consensus")
+        if any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in ledger):
+            raise ReviewError("a consensus already exists at this hash")
+        return {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review,
+                "plan_hash": rnd["plan_hash"], "plan_ref": rnd["plan_ref"], "tier": rnd["tier"], "lanes": rnd["lanes"],
+                "rounds": st["rounds"], "closing_round": rnd["round"], "by": "plan-review"}
+    try:
+        stored = plan_ledger.append_checked(state, now(), write)
+    except ReviewError as err:
+        return {"tally": "pending", "tally_why": str(err)}
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "plan.review.consensus", rnd["lineage"], {"review": review, "plan_hash": rnd["plan_hash"],
+                                                                                    "seq": stored["seq"], "chain": stored["hash"]})
+    return {"tally": "consensus", "consensus_at": rnd["plan_hash"]}
+
+
+def review_close(args, runner, now, socket_call=None):
+    """The closing round: the planner publishes the FINAL synthesized revision (`plan check` PASS, a `## Decisions` section); every lane of the tier
+    then confirms that exact text or objects. Only an approve at that hash from every lane makes a consensus: no closing round, no consensus.
+    Outside the 3-round cap, once per final hash, never with a blocking objection open or an escalation undecided."""
+    config = load_config()
+    cfg = review_config(config)
+    _, planner = review_caller(runner, now, "close a plan review")
+    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
+    entries = review_entries(state)
+    rnd = _round_of(entries, args.review)
+    if planner != rnd["by"] and planner != "owner":
+        raise ReviewError("refused: only the planner who started the review (%s) closes it" % rnd["by"])
+    missing = [l for l in rnd["lanes"] if l not in _verdicts_of(entries, args.review, rnd["round"])]
+    if missing:
+        raise ReviewError("refused: lanes %s have not reported for round %d" % (", ".join(missing), rnd["round"]))
+    ns = types.SimpleNamespace(source=args.plan_ref, file=None, ask=None, done_when=None)
+    text, label, result = load_plan(ns, runner, now)
+    if result["result"] != "pass":
+        raise ReviewError("the final revision fails `plan check` (%d defect(s))" % len(result["defects"]))
+    if not DECISIONS_HEADING_RE.search(text):
+        raise ReviewError("the final revision has no `## Decisions` section (the synthesis the planner owes: decision, drivers, alternatives, why)")
+    plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
+    ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
+    problem = _plan_ask_problem(config, runner, now, plan_repo, plan_number, ask_repo, int(ask_number))
+    if problem:
+        raise ReviewError("refused: %s" % problem)
+    lanes = plan_review.lanes_for_tier(rnd["tier"], held_area=bool(rnd.get("held_area")))
+    used = len([e for e in entries if e.get("lineage") == rnd["lineage"] and e.get("kind") == "lane_session"])
+    if not plan_review.session_budget_ok(used, len(lanes), cfg["session_cap"]):
+        raise ReviewError("refused: the lineage has used %d of its %d lane sessions" % (used, cfg["session_cap"]))
+    plan_ref = "%s#%d" % (plan_repo, plan_number)
+
+    def decide(ledger, seq):
+        mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
+        later = [e for e in ledger if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
+        if later:
+            raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
+        ok, why = plan_review.may_open_round(plan_review.lineage_state(mine, result["plan_hash"]), closing=True, plan_hash=result["plan_hash"])
+        if not ok:
+            raise ReviewError("refused: %s" % why)
+        return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": True,
+                "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
+                "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
+                "held_area": rnd.get("held_area", False), "by": rnd["by"]}
+
+    stored = plan_ledger.append_checked(state, now(), decide)
+    made = _launch_lanes(engine, state, cfg, stored, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
+    return {"review": args.review, "closing_round": stored["round"], "lanes": lanes, "launched": made, "plan_hash": result["plan_hash"]}
+
+
+def review_report(args, runner, now):
+    """What the review cost and what the reviewers caught: per round and lane the wall time, the verdict and the objections by severity, how many
+    the planner accepted and rejected, the objection titles, the totals, and the rounds to consensus. Token and money cost are NOT measured (the
+    harness records none yet): it says so, and records the session names so a later measure can join them."""
+    config = load_config()
+    review_config(config)
+    state = ensure_state_dir()
+    entries = review_entries(state)
+    rnd = _round_of(entries, args.review)
+    mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
+    rounds = sorted([e for e in mine if e.get("kind") == "round" and e.get("review") == args.review], key=lambda e: e["round"])
+    out_rounds, caught, total_sessions = [], [], 0
+    for r in rounds:
+        starts = {}
+        for e in mine:
+            if e.get("kind") == "lane_session" and e.get("review") == args.review and e.get("round") == r["round"]:
+                starts.setdefault(e["lane"], e["ts"])
+                total_sessions += 1
+        lanes = {}
+        for e in mine:
+            if e.get("kind") == "lane" and e.get("review") == args.review and e.get("round") == r["round"]:
+                blocking = len([o for o in e["objections"] if o["severity"] == "blocking"])
+                lanes[e["lane"]] = {"verdict": e["verdict"], "blocking": blocking, "advisory": len(e["objections"]) - blocking,
+                                    "seconds": e["ts"] - starts.get(e["lane"], e["ts"])}
+                for o in e["objections"]:
+                    if o["state"] == "open":
+                        caught.append({"round": r["round"], "lane": e["lane"], "id": o["id"], "severity": o["severity"], "text": o["text"]})
+        responses = [e for e in mine if e.get("kind") == "response" and e.get("review") == args.review and e.get("round") == r["round"]]
+        out_rounds.append({"round": r["round"], "closing": bool(r.get("closing")), "lanes": lanes,
+                           "accepted": sum(e.get("accepted", 0) for e in responses), "rejected": sum(e.get("rejected", 0) for e in responses)})
+    consensus = next((e for e in reversed(mine) if e.get("kind") == "consensus" and e.get("review") == args.review), None)
+    end = consensus["ts"] if consensus else max(e["ts"] for e in mine)
+    return {"review": args.review, "lineage": rnd["lineage"], "tier": rounds[0]["tier"], "rounds": out_rounds,
+            "rounds_to_consensus": len([r for r in rounds if not r.get("closing")]) if consensus else None,
+            "consensus": ({"plan_hash": consensus["plan_hash"], "overridden_by": consensus.get("overridden_by")} if consensus else None),
+            "escalations": len([e for e in mine if e.get("kind") == "escalation" and e.get("review") == args.review]),
+            "sessions": total_sessions, "wall_seconds": end - rounds[0]["ts"],
+            "caught": caught[:60], "caught_total": len(caught),
+            "cost": "tokens and money are not measured (the harness records none yet); the lane session names are in the ledger to join a later measure"}
 
 
 def review_status(args, runner, now):
@@ -12166,10 +12300,12 @@ def review_status(args, runner, now):
     return {"review": args.review, "lineage": rnd["lineage"], "round": rnd["round"], "tier": rnd["tier"], "plan_hash": rnd["plan_hash"],
             "rounds_used": st["rounds"], "lanes": lanes, "open_blocking": st["open_blocking"], "open_review": st["open_review"],
             "undecided_escalation": st["undecided"],
-            "overridden": st["overridden"].get(rnd["plan_hash"]),
+            "overridden": st["overridden"].get(rnd["plan_hash"]), "consensus": rnd["plan_hash"] in st["consensus_hashes"],
+            "closing": bool(rnd.get("closing")),
             "next": ("respond: the planner answers the open objections" if all(l in verdicts for l in rnd["lanes"]) and st["open_blocking"]
-                     else "the closing round (a later slice)" if all(l in verdicts for l in rnd["lanes"]) else "waiting for the lanes"),
-            "note": "no consensus is written by this slice (the closing round and the consensus are a later slice)"}
+                     else ("the consensus is recorded" if rnd["plan_hash"] in st["consensus_hashes"]
+                           else "tally pending: see `plan review close` (the closing round)") if all(l in verdicts for l in rnd["lanes"])
+                     else "waiting for the lanes")}
 
 
 def review_respond(args, runner, now, socket_call=None):
@@ -12190,7 +12326,7 @@ def review_respond(args, runner, now, socket_call=None):
     mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
     st = plan_review.lineage_state(mine, rnd["plan_hash"])
     if not st["open_blocking"]:
-        raise ReviewError("nothing blocking is open: the next step is the closing round (a later slice), not another round")
+        raise ReviewError("nothing blocking is open: the next step is the closing round (`plan review close`), not another round")
     ok, why = plan_review.may_open_round(st)
     if not ok and st["undecided"]:
         raise ReviewError("refused: %s" % why)
@@ -12243,6 +12379,8 @@ def review_respond(args, runner, now, socket_call=None):
     stored = plan_ledger.append_checked(state, now(), decide)
     _review_record(engine, state, {"kind": "response", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"],
                                    "table_hash": hashlib.sha256(table.encode("utf-8")).hexdigest(), "plan_ref": plan_ref,
+                                   "accepted": len(re.findall(r"(?m)^\s*[A-Za-z0-9]+/O[0-9]{1,3}\s*:\s*accept\b", table)),
+                                   "rejected": len(re.findall(r"(?m)^\s*[A-Za-z0-9]+/O[0-9]{1,3}\s*:\s*reject\b", table)),
                                    "plan_hash": result["plan_hash"], "by": planner}, now)
     made = _launch_lanes(engine, state, cfg, stored, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
     return {"review": args.review, "round": stored["round"], "lanes": lanes, "launched": made, "plan_hash": result["plan_hash"]}
@@ -12504,8 +12642,9 @@ def cmd_plan_review(args, runner, now, socket_call=None):
     """`plan review start|verdict|respond|status|abandon`: exit 0 done, 2 refused or unusable. One JSON object on stdout with --json."""
     try:
         action = {"start": review_start, "verdict": review_verdict, "respond": review_respond, "status": review_status,
-                  "abandon": review_abandon, "decide": review_decide, "tick": review_tick}[args.review_action]
-        done = (action(args, runner, now, socket_call) if args.review_action in ("start", "respond", "verdict", "tick")
+                  "abandon": review_abandon, "decide": review_decide, "tick": review_tick, "close": review_close,
+                  "report": review_report}[args.review_action]
+        done = (action(args, runner, now, socket_call) if args.review_action in ("start", "respond", "verdict", "tick", "close")
                 else action(args, runner, now))
     except (ReviewError, PlanInputError, ValueError, ConfigError, IntentError, plan_ledger.LedgerError, CallerError, IdentityUncertain,
             LaunchError, OSError) as err:
@@ -13391,6 +13530,13 @@ def add_plan_parsers(sub):
     mode.add_argument("--override", action="store_true")
     decide.add_argument("--reason", required=True)
     decide.add_argument("--json", action="store_true")
+    close = review_sub.add_parser("close", help="The closing round: every lane confirms the final revision, then the consensus is recorded")
+    close.add_argument("review")
+    close.add_argument("--plan-ref", dest="plan_ref", required=True, help="owner/repo#N of the final revision (with a `## Decisions` section)")
+    close.add_argument("--json", action="store_true")
+    rreport = review_sub.add_parser("report", help="What the review cost and what the reviewers caught")
+    rreport.add_argument("review")
+    rreport.add_argument("--json", action="store_true")
     tick = review_sub.add_parser("tick", help="Housekeeping: relaunch a stuck lane once, then escalate it; remind an undecided escalation")
     tick.add_argument("--json", action="store_true")
 
