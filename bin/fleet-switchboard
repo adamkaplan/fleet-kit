@@ -10178,6 +10178,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["decisions"] = decisions_summary(state, now)
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
+        report["ci_record"] = ci_record_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
         report["stopped_news"] = stopped_news_summary(state, now())
@@ -10360,6 +10361,7 @@ def format_status(report):
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
+    lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
@@ -13396,9 +13398,13 @@ def cmd_gates_ci_record(args, runner, now):
 
 # ---- the daemon pass of the ci recorder (#107): so a push does not leave `proof: test` scenarios waiting for a hand-run command.
 # Shadow-safe by construction: it only records `ci` verdicts into the ledger and audit lines. It refuses nothing and writes NOTHING to
-# GitHub (GET reads only). Budgeted like the triage: `calls_per_pass`, `pass_seconds`, a 15 minute cache of each repo's open-PR list.
+# GitHub (GET reads only). Budgeted like the triage: `calls_per_pass`, `pass_seconds`, a 3 minute cache of each repo's open-PR list (a settled PR is looked at every 15 minutes).
 
-CI_RECORD_TTL = 900
+CI_RECORD_TTL = 900            # a settled PR (recorded, or nothing to record) is looked at again after this
+CI_RECORD_LIST_TTL = 180       # the open-PR list is re-read this often: a new PR, a push or an edited body is seen within minutes
+CI_RECORD_PENDING_RETRY = 60   # a PR whose checks are still running is looked at again this soon, so green is recorded within minutes
+CI_RECORD_FAILED_RETRY = 180   # a failing or missing run, or a plan that does not pass yet
+CI_RECORD_STATUS_FILE = "ci-record-status.json"
 CI_RECORD_PR_COST = 4   # calls one PR may use: its view, the plan issue and its comments (charged up front)
 CI_RECORD_RETRY = (300, 1800)   # an unreadable PR is retried after 5 minutes, doubling, to at most 30
 
@@ -13407,6 +13413,9 @@ class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
+        self.recorded = 0   # verdicts this process recorded
+        self.last_record = None
+        self.written = 0
 
 
 def ci_record_pass(engine, now):
@@ -13428,7 +13437,7 @@ def ci_record_pass(engine, now):
     started, seconds = engine.now(), cfg.get("pass_seconds", 10)
     budget = [cfg.get("calls_per_pass", 30)]
     stale = sorted(((state.lists.get(plan_ledger.normal_repo(r), (0, []))[0], r) for r in repos
-                    if now - state.lists.get(plan_ledger.normal_repo(r), (0, []))[0] >= CI_RECORD_TTL))
+                    if now - state.lists.get(plan_ledger.normal_repo(r), (0, []))[0] >= CI_RECORD_LIST_TTL))
     for _, repo in stale:
         if budget[0] < 2 or engine.now() - started >= seconds:
             break
@@ -13470,10 +13479,17 @@ def ci_record_pass(engine, now):
             got = ci_record_core(ctx, engine.now, quiet=True)
             if got["status"] == "unreadable":
                 raise RuntimeError(got["why"])
+            if got["recorded"]:
+                state.recorded += len(got["recorded"])
+                state.last_record = now
             retry_at = now + CI_RECORD_TTL
+            if got["status"] == "not-green":   # the checks are running (or failed): look again soon, not in a quarter of an hour
+                retry_at = now + (CI_RECORD_PENDING_RETRY if got["ci"] == "pending" else CI_RECORD_FAILED_RETRY)
+            elif got["status"] == "no-plan":
+                retry_at = now + CI_RECORD_FAILED_RETRY
             if got["head"] and got["head"] != listed_head:
                 # the head moved since the list was read: the next list refresh will show it, so wait for that, not every pass
-                retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_TTL)
+                retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_LIST_TTL)
             state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
         except Exception as err:
             fails += 1
@@ -13481,6 +13497,38 @@ def ci_record_pass(engine, now):
             state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": now + delay, "fails": fails}
             engine._note("ci_record.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 200),
                                                                       "retry_in": delay})
+    write_ci_record_status(engine, state, now, len(repos))
+
+
+def write_ci_record_status(engine, state, now, repos):
+    """What `status` shows of the daemon pass: the daemon is the one writer. At most once a minute, unless a verdict was just recorded."""
+    if state.written and now - state.written < 60 and state.last_record != now:
+        return
+    state.written = now
+    body = {"at": int(now), "repos": repos, "recorded": state.recorded,
+            "last_record": None if state.last_record is None else int(state.last_record)}
+    try:
+        temp = Path(engine.state_dir) / ("%s.%d.tmp" % (CI_RECORD_STATUS_FILE, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(body, sort_keys=True))
+        os.replace(str(temp), str(Path(engine.state_dir) / CI_RECORD_STATUS_FILE))
+    except OSError:
+        pass   # a status line is best effort
+
+
+def ci_record_status_line(state_dir, now_ts):
+    """The `status` line for the daemon's ci recorder pass, or None when it has never run."""
+    try:
+        raw = json.loads((Path(state_dir) / CI_RECORD_STATUS_FILE).read_text())
+        at, recorded = float(raw["at"]), int(raw["recorded"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ago = max(0, int(now_ts - at))
+    last = raw.get("last_record")
+    return "ci-record: last pass %s (%s ago), recorded %d since the daemon started%s" % (
+        iso(at), "%d s" % ago if ago < 120 else "%d min" % (ago // 60), recorded,
+        "; last record " + iso(last) if isinstance(last, (int, float)) else "")
 
 
 def cmd_gates_preflight(args, runner, now):

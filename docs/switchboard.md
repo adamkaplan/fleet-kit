@@ -4217,10 +4217,10 @@ open-PR list through the hub, each PR through `gh pr view`, the plan through the
 noted (`ci_record.unreadable`) and the old list kept; a PR that fails to read is noted (`ci_record.error`) and the next one still runs.
 
 **Budgeted like the triage.** `plan_gates.ci_record` takes `enabled` (default true), `calls_per_pass` (default 30, 4 to 100) and `pass_seconds` (default 10, 1 to
-60). Each repo's open-PR list is cached for **15 minutes** (so a push is noticed within a quarter of an hour; `gates ci-record <pr>` records at once), a PR is due again only 15 minutes after it was last **checked**
+60). Each repo's open-PR list is cached for **3 minutes** (so a new PR, a push or a body that gained its `PLAN:` line is noticed within minutes; `gates ci-record <pr>` records at once), a PR whose checks are **still running** is looked at again after **1 minute** (a failing run or a plan that does not pass yet, after 3), so green is recorded within about five minutes of going green without anyone running a command; a settled PR (recorded, or nothing to record) is due again only 15 minutes after it was last **checked**
 (the skip keys on when it was checked, not on what the check found); one that is **unreadable** is retried after 5 minutes, doubling to at most 30 (`ci_record.error` carries
 `retry_in`); one whose **head moved since the list** is checked again at the next list refresh, not every pass; a head the refreshed list shows differently is due at once.
-Each PR is charged 4 calls up front. A simulated 5-second loop makes a handful of reads in 15 minutes, not one per pass. The pass is off while the global `plan-gates.off` file
+Each PR is charged 4 calls up front. A simulated 5-second loop reads once per list interval, not once per pass. `status` shows `ci-record: last pass <time> (<ago> ago), recorded N since the daemon started` (the daemon writes `ci-record-status.json`, at most once a minute). **The order of the evidence does not matter:** a `ci` verdict recorded before the worker's `prove` counts once the proof exists at the same head and plan, and the other way round; a push voids both. The pass is off while the global `plan-gates.off` file
 exists. This slice also fixes `gates preflight`, which did not consult the recorder's proof (so it said BLOCKED even after a successful record) and made `gates mode`
 keep the `ci_record` settings when it rewrites the config.
 

@@ -18877,6 +18877,39 @@ class TestCiRecordPass(LedgerBase):
         (event,) = self.events("gate.ci_record")
         self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
 
+    def test_a_pr_whose_checks_are_running_is_recorded_within_five_minutes_of_going_green(self):
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()
+        self.assertEqual(self.verdicts(), [])
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        self.go(advance=sb.CI_RECORD_PENDING_RETRY + 1)           # one minute later, not a quarter of an hour
+        self.assertEqual(len(self.verdicts()), 2)
+        self.assertLess(sb.CI_RECORD_PENDING_RETRY + sb.CI_RECORD_LIST_TTL, 300)
+
+    def test_a_new_pr_or_an_edited_body_is_seen_within_the_list_interval(self):
+        self.hub.prs["acme/app"] = [self.listed(9, body="no plan yet")]
+        self.go()
+        self.assertEqual(self.verdicts(), [])
+        self.hub.prs["acme/app"] = [self.listed(9)]                # the PLAN line was added to the body
+        self.go(advance=sb.CI_RECORD_LIST_TTL + 1)
+        self.assertEqual(len(self.verdicts()), 2)
+
+    def test_the_order_of_proof_and_ci_verdict_does_not_matter(self):
+        self.go()                                                  # the ci verdict first
+        for sid in ("S1", "U1"):
+            self.assertEqual(self.run_as("coder", "prove", sid, "--pr", self.PR, "--evidence", "ran the suite: 12 passed")[0], 0)
+        out = self.run_as("coder", "gates", self.PR, "--json")[1]
+        g1 = next(r for r in json.loads(out)["gates"] if r["gate"] == "G1")
+        self.assertFalse([m for m in g1["missing"] if m.startswith(("S1: proof", "U1: proof", "S1: ci", "U1: ci"))], g1["missing"])
+
+    def test_status_says_when_the_pass_last_ran_and_what_it_recorded(self):
+        self.assertIsNone(sb.ci_record_status_line(self.world.state, self.t))
+        self.go()
+        line = sb.ci_record_status_line(self.world.state, self.t + 30)
+        self.assertIn("ci-record: last pass", line)
+        self.assertIn("recorded 2 since the daemon started", line)
+        self.assertIn("last record", line)
+
     def test_the_preflights_seven_day_proof_comes_for_free(self):
         self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
         self.go()
@@ -18907,7 +18940,7 @@ class TestCiRecordPass(LedgerBase):
         self.go()
         reads = len(self.hub.reads)
         self.go(advance=60)
-        self.assertEqual((len(self.verdicts()), len(self.hub.reads)), (2, reads), "inside 15 minutes nothing is read again")
+        self.assertEqual((len(self.verdicts()), len(self.hub.reads)), (2, reads), "inside the list interval nothing is read again")
         self.go(advance=sb.CI_RECORD_TTL + 1)
         self.assertEqual(len(self.verdicts()), 2, "the same head and plan record nothing twice")
 
@@ -18942,10 +18975,10 @@ class TestCiRecordPass(LedgerBase):
         calls = self.view_calls()
         self.pr["headRefOid"] = LEDGER_NEW_HEAD            # the list still says LEDGER_HEAD
         self.simulate(minutes=16)
-        self.assertLessEqual(len(calls), 3, calls)
-        self.assertEqual(len(self.hub.reads), 1 + 1, "the list is read at the start and once more after 15 minutes")
+        self.assertLessEqual(len(calls), 6, calls)                  # once per list refresh (every 3 minutes), never every pass
+        self.assertEqual(len(self.hub.reads), 1 + 5, "the list is read at the start and every 3 minutes after")
         self.hub.prs["acme/app"] = [self.listed(9, head=LEDGER_NEW_HEAD)]
-        self.go(advance=sb.CI_RECORD_TTL + 1)
+        self.go(advance=sb.CI_RECORD_LIST_TTL + 1)
         self.assertTrue(all(v[3] == LEDGER_NEW_HEAD for v in self.verdicts()))
 
     def test_a_steady_pr_is_checked_about_once_per_cache_interval_and_stays_inside_the_budget(self):
