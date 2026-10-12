@@ -130,6 +130,31 @@ def load_plan_ledger():
     return module
 
 
+def load_impact_floor():
+    """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
+    held = sys.modules.get("impact_floor")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("impact_floor", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["impact_floor"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("impact_floor", None)
+        raise
+    return module
+
+
+class _LazyImpactFloor:
+    def __getattr__(self, name):
+        return getattr(load_impact_floor(), name)
+
+
+impact_floor = _LazyImpactFloor()
+
+
 def load_plan_review():
     """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_review.py")
@@ -336,7 +361,7 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review"})
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - {"external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor"})
     if unknown:
         raise ConfigError(
             "%s contains key(s) this tool does not read: %s. "
@@ -385,6 +410,11 @@ def validate_config(raw, source="config"):
     validate_decisions_config(config, source)  # PR 14
     validate_external_config(config, source)
     validate_friction_config(config, source)
+    if config.get("impact_floor") is not None:   # #179 L3: a string where a list belongs must fail loudly, never hold nothing
+        try:
+            impact_floor.validate_config(config["impact_floor"])
+        except ValueError as err:
+            raise ConfigError("%s: %s" % (source, err)) from None
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
@@ -6275,6 +6305,10 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
+    except Exception as err:
+        engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -13031,6 +13065,120 @@ def gates_stats_core(entries, merged_at, limit=10):
     return {"prs": rows[:limit], "unmerged": unmerged}
 
 
+# ---------------------------------------------------------------- the impact floor (#179, slice L3): advisory, writes NOTHING
+
+def pr_floor_report(engine, repo, number, rated_pairs=()):
+    """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
+    `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
+    raw = read_pr_json(engine, repo, number, "files")
+    files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
+    globs, exclude, force = impact_floor.floor_for(repo, engine.config)
+    paths, renamed = [], []
+    for item in files:
+        paths.append(item.get("path"))
+        old = item.get("previous_filename") or item.get("previousFilename") or item.get("oldPath")
+        if isinstance(old, str) and old:
+            paths.append(old)   # a rename or copy out of a floor path counts through its OLD path
+        elif str(item.get("changeType") or "").upper() in ("RENAMED", "COPIED"):
+            renamed.append(item.get("path"))   # `gh pr view` does not say where it came from
+    total = raw.get("changedFiles") if isinstance(raw.get("changedFiles"), int) else len(files)
+    complete = len(files) >= total and not raw.get("truncated")
+    hit = impact_floor.floor_paths(paths, globs, exclude, force)
+    unknown = None
+    if globs and not complete:
+        unknown = "GitHub listed %d of %d changed files" % (len(files), total)
+    elif globs and renamed:
+        unknown = "%d renamed or copied file(s) with no known source path (%s)" % (len(renamed), ", ".join(renamed[:3]))
+    matrix = impact_floor.load_matrix()
+    rated = impact_floor.rate(matrix, list(rated_pairs))
+    decision, reasons = impact_floor.decide(hit, rated, unknown)
+    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
+            "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "decision": decision, "reasons": reasons}
+
+
+def cmd_impact(args, runner, now):
+    """`impact floor <repo#N> [--rating SEVERITY/PROBABILITY ...] [--json]`: what the deterministic floor (and an independent rating, if
+    given) would decide for a PR. Read-only: it writes no label, no comment and no audit line."""
+    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        sys.stderr.write("%s: impact floor: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    pairs = []
+    for item in args.rating or []:
+        severity, _, probability = item.partition("/")
+        pairs.append((severity.strip().capitalize(), probability.strip().capitalize()))
+    try:
+        matrix = impact_floor.load_matrix()
+        for severity, probability in pairs:
+            if severity not in matrix["severities"] or probability not in matrix["probabilities"] + matrix["not_rated"]:
+                raise ValueError("--rating SEVERITY/PROBABILITY: severity is one of %s, probability one of %s (got %s/%s)" % (
+                    ", ".join(matrix["severities"]), ", ".join(matrix["probabilities"] + matrix["not_rated"]), severity, probability))
+        report = pr_floor_report(engine, repo, number, pairs)
+    except (NoticeError, ValueError) as err:
+        sys.stderr.write("%s: impact floor: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (
+            report["pr"], (report["head"] or "unknown head")[:8], report["decision"].upper().replace("-", " ")))
+        for reason in report["reasons"]:
+            print("  %s" % reason)
+        for path in report["floor_paths"]:
+            print("  floor path: %s" % path)
+        if not report["globs"]:
+            print("  this repo names no floor globs (set impact_floor.repos in config.json)")
+        if report.get("unknown"):
+            print("  unknown floor, held on purpose: %s" % report["unknown"])
+    return EXIT_OK
+
+
+IMPACT_PASS_CALLS = 6        # `gh pr view` calls the daemon pass may spend per pass
+IMPACT_RETRY_SECONDS = 300   # a PR whose floor could not be read is retried after this
+
+
+def impact_would_hold_pass(engine, now):
+    """The daemon hook (#179 L3, ADVISORY): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the
+    floor once per (PR, head) and audit `gate.would_hold` when it holds. Writes NOTHING to GitHub: the label is slice L4. Reads one
+    `gh pr view` per new head, within IMPACT_PASS_CALLS per pass. Off with `impact_floor.enabled: false` or the global gates kill file.
+    Never raises."""
+    cfg = (engine.config.get("impact_floor") or {}) if isinstance(engine.config, dict) else {}
+    if cfg.get("enabled") is False or engine.state_dir is None or engine.audit is None or gates_off_path(engine.state_dir).exists():
+        return
+    state = getattr(engine, "ci_record_state", None)
+    if state is None:
+        return
+    seen = engine.__dict__.setdefault("impact_seen", {})
+    budget = cfg.get("calls_per_pass", IMPACT_PASS_CALLS)
+    for key, (_, records) in sorted(state.lists.items()):
+        for record in records:
+            number = record.get("number") if isinstance(record, dict) else None
+            head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
+                continue
+            globs = impact_floor.floor_for(key, engine.config)[0]
+            if not globs or seen.get((key, number)) == head or budget <= 0:
+                continue
+            retry = seen.get((key, number, "retry"))
+            if retry and now < retry:
+                continue
+            budget -= 1
+            try:
+                report = pr_floor_report(engine, key, number)
+            except Exception as err:
+                seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
+                engine._note("impact.error", "%s#%d" % (key, number), {"error": _one_line(str(err), 160)})
+                continue
+            seen[(key, number)] = report["head"] or head
+            if report["decision"] == "hold":
+                engine.audit.append(engine.actor, "gate.would_hold", report["pr"],
+                                    {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report["reasons"],
+                                     "complete": report["complete"], "unknown": report["unknown"], "advisory": True})
+
+
 def cmd_gates_stats(args, runner, now):
     """`gates stats [--limit N] [--json]`: what the gates cost per merged gated PR (records by actor, minutes from the first gate record
     to the merge). Read-only: the ledger, and one `gh pr view` per PR in it."""
@@ -13564,7 +13712,7 @@ def ci_record_pass(engine, now):
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             body = record.get("body") if isinstance(record, dict) and isinstance(record.get("body"), str) else ""
-            if not isinstance(number, int) or isinstance(number, bool) or record.get("draft") or not plan_ledger.PLAN_LINK_RE.search(body):
+            if not isinstance(number, int) or isinstance(number, bool) or not plan_ledger.PLAN_LINK_RE.search(body):   # drafts too: `gh pr ready` needs G1 present
                 continue
             held = state.checked.get((key, number))
             # Skip a PR that was checked and is not yet due: decided by when it was last CHECKED (not by what the check found), so a PR
@@ -13989,6 +14137,16 @@ def add_review_parsers(sub):
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+
+
+def add_impact_parsers(sub):
+    impact = sub.add_parser("impact", help="The impact hold's deterministic floor (#179, advisory: writes nothing)")
+    impact_sub = impact.add_subparsers(dest="impact_action", required=True)
+    floor = impact_sub.add_parser("floor", help="What the path-glob floor (and an optional independent rating) would decide for a PR")
+    floor.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    floor.add_argument("--rating", action="append", metavar="SEVERITY/PROBABILITY",
+                       help="An independent rating's impact, e.g. Critical/Remote (repeatable; it can only add a hold; Eliminated is not rated)")
+    floor.add_argument("--json", action="store_true")
 
 
 def add_review_laws_parsers(sub):
@@ -16592,6 +16750,7 @@ def build_parser():
     add_policy_parsers(sub)  # PR 9
     add_plan_parsers(sub)    # #135
     add_review_laws_parsers(sub)    # #179 slice L1
+    add_impact_parsers(sub)         # #179 slice L3
     add_ledger_parsers(sub)  # #107
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
@@ -16621,6 +16780,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_review_laws(args, runner, now)
     if args.action == "review":  # #179 L2: reads GitHub, `record` writes the ledger; never ensures the daemon
         return cmd_review(args, runner, now)
+    if args.action == "impact":  # #179 L3: reads one PR, writes nothing, never ensures the daemon
+        return cmd_impact(args, runner, now)
     if args.action == "plan":  # #135: reads only, never ensures the daemon
         if args.plan_action == "review":  # #109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled
             return cmd_plan_review(args, runner, now, socket_call)
