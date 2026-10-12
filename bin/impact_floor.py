@@ -14,8 +14,11 @@ from pathlib import Path
 # Excluded: definitions and docs are already captain PRs, and including them would hold nearly every PR.
 DEFAULT_FLOORS = {
     "adamkaplan/fleet-kit": {
-        "globs": ["shims/**", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "bin/plan_ledger.py"],
+        "globs": ["shims/**", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "bin/plan_ledger.py",
+                  "bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
         "exclude": ["agents/**", "skills/**", "docs/**", "AGENTS.md"],
+        # the logic and the table that decide holds are never excluded with the docs: changing them must hold
+        "force": ["bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
     },
 }
 ACTION_HOLD, ACTION_SECOND, ACTION_NONE = "H", "2", "."
@@ -23,6 +26,19 @@ MATRIX_PATH = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / 
 
 
 def _glob_regex(pattern):
+    return _compiled(pattern.lower())
+
+
+_CACHE = {}
+
+
+def _compiled(pattern):
+    if pattern not in _CACHE:
+        _CACHE[pattern] = _build(pattern)
+    return _CACHE[pattern]
+
+
+def _build(pattern):
     """`**` crosses directories, `*` and `?` do not; a trailing `/**` also matches the directory's own files at any depth."""
     out, i = [], 0
     while i < len(pattern):
@@ -45,25 +61,59 @@ def _glob_regex(pattern):
 
 
 def matches(path, patterns):
-    return any(_glob_regex(p).match(path) for p in patterns)
+    """Case-insensitive: the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x` are one file (a false hold costs little)."""
+    lowered = path.lower()
+    return any(_glob_regex(p).match(lowered) for p in patterns)
 
 
-def floor_paths(paths, globs, exclude=()):
-    """The paths of a change that trigger the floor: inside a floor glob and not excluded. A deletion counts like any change (the caller
-    passes deleted paths too); one outside the globs never does."""
-    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and not matches(p, exclude)})
+def floor_paths(paths, globs, exclude=(), force=()):
+    """The paths of a change that trigger the floor: inside a floor glob and not excluded (a `force` path is never excluded). A deletion
+    counts like any change (the caller passes deleted paths too; so does the OLD path of a rename); one outside the globs never does."""
+    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and (not matches(p, exclude) or matches(p, force))})
 
 
 def floor_for(repo, config=None):
-    """(globs, exclude) for `repo` from the config (`impact_floor.repos.<owner/repo>`), else the built-in proposal, else none."""
+    """(globs, exclude, force) for `repo` from the config (`impact_floor.repos.<owner/repo>`), else the built-in proposal, else none."""
     wanted = (repo or "").lower()
     for name, entry in (((config or {}).get("impact_floor") or {}).get("repos") or {}).items():
         if name.lower() == wanted and isinstance(entry, dict):
-            return list(entry.get("globs") or []), list(entry.get("exclude") or [])
+            return list(entry.get("globs") or []), list(entry.get("exclude") or []), list(entry.get("force") or [])
     for name, entry in DEFAULT_FLOORS.items():
         if name.lower() == wanted:
-            return list(entry["globs"]), list(entry["exclude"])
-    return [], []
+            return list(entry["globs"]), list(entry["exclude"]), list(entry.get("force") or [])
+    return [], [], []
+
+
+def validate_config(raw):
+    """Raise ValueError naming the key when `impact_floor` is not {enabled?, calls_per_pass?, repos: {owner/repo: {globs, exclude?, force?}}}
+    with lists of non-empty strings: a string where a list belongs must never silently hold nothing."""
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ValueError("'impact_floor' must be an object")
+    unknown = sorted(set(raw) - {"enabled", "calls_per_pass", "repos"})
+    if unknown:
+        raise ValueError("'impact_floor' has key(s) this tool does not read: %s" % ", ".join(unknown))
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        raise ValueError("'impact_floor.enabled' must be true or false")
+    calls = raw.get("calls_per_pass", 1)
+    if not isinstance(calls, int) or isinstance(calls, bool) or calls < 0:
+        raise ValueError("'impact_floor.calls_per_pass' must be a whole number, 0 or more")
+    repos = raw.get("repos", {})
+    if not isinstance(repos, dict):
+        raise ValueError("'impact_floor.repos' must be an object keyed by owner/repo")
+    for name, entry in repos.items():
+        if not isinstance(entry, dict):
+            raise ValueError("'impact_floor.repos.%s' must be an object" % name)
+        extra = sorted(set(entry) - {"globs", "exclude", "force"})
+        if extra:
+            raise ValueError("'impact_floor.repos.%s' has key(s) this tool does not read: %s" % (name, ", ".join(extra)))
+        for key in ("globs", "exclude", "force"):
+            value = entry.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(x, str) and x.strip() for x in value):
+                raise ValueError("'impact_floor.repos.%s.%s' must be a list of non-empty path globs, got %r" % (name, key, value))
+        if not entry.get("globs"):
+            raise ValueError("'impact_floor.repos.%s.globs' must name at least one glob" % name)
 
 
 def load_matrix(path=None):
@@ -90,10 +140,12 @@ def rate(matrix, impacts):
     return rated
 
 
-def decide(floor_hit, rated):
+def decide(floor_hit, rated, unknown=None):
     """The combined decision: "hold" when the floor holds (whatever the rating says: it cannot be lowered) or any rated impact is H;
     "second-review" when none holds and a rated impact asks for 2; else "none". Returns (decision, reasons)."""
     reasons = []
+    if unknown:   # the diff cannot be read in full: fail towards hold
+        reasons.append("floor unknown: %s" % unknown)
     if floor_hit:
         reasons.append("floor: %d path(s) inside the floor globs" % len(floor_hit))
     reasons.extend("rating: %s / %s is %s (hold)" % (s, p, level) for s, p, level, action in rated if action == ACTION_HOLD)

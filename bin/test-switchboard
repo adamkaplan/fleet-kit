@@ -19014,14 +19014,32 @@ class TestImpactFloorPure(unittest.TestCase):
         self.assertEqual(self.f.floor_paths(["tests/old_test.py", "docs/old.md"], globs, exclude), [])   # a deletion outside: no hold
         self.assertEqual(self.f.decide([], [])[0], "none")                                               # size is not an input at all
 
+    def test_matching_is_case_insensitive_and_a_rename_counts_through_its_old_path(self):
+        self.assertEqual(self.f.floor_paths(["SHIMS/x", "bin/Plan_ledger.py", "other/x"], ["shims/**", "bin/plan_ledger.py"]), ["SHIMS/x", "bin/Plan_ledger.py"])
+        self.assertEqual(self.f.floor_paths(["other/x", "shims/x"], ["shims/**"]), ["shims/x"])   # new path other/x, old path shims/x
+
+    def test_config_is_validated_a_string_where_a_list_belongs_fails_loudly(self):
+        self.f.validate_config({"repos": {"acme/app": {"globs": ["bin/**"], "exclude": []}}, "enabled": True})
+        for bad in ({"repos": {"acme/app": {"globs": "bin/**"}}}, {"repos": {"acme/app": {"globs": []}}}, {"repos": {"acme/app": {"globs": [1]}}},
+                    {"repos": []}, {"enabled": "yes"}, {"when": 1}, {"repos": {"acme/app": {"globs": ["a"], "x": 1}}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.f.validate_config(bad)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "impact_floor": {"repos": {"acme/app": {"globs": "bin/**"}}}})
+
+    def test_an_unknown_floor_holds(self):
+        decision, reasons = self.f.decide([], [], unknown="GitHub listed 100 of 3000 changed files")
+        self.assertEqual(decision, "hold")
+        self.assertIn("floor unknown", reasons[0])
+
     def test_the_built_in_floor_for_this_repo_names_the_proposed_globs_and_excludes_definitions_and_docs(self):
-        globs, exclude = self.f.floor_for("adamkaplan/fleet-kit")
+        globs, exclude, force = self.f.floor_for("adamkaplan/fleet-kit")
         hit = self.f.floor_paths(["shims/gh", "plugins/fleet-hooks/a.js", "templates/u.service", "tools/cos-permissions-proof/x.py",
                                   "bin/plan_ledger.py", "agents/opencode/coder.md", "skills/x/SKILL.md", "docs/a.md", "AGENTS.md",
-                                  "bin/fleet-switchboard"], globs, exclude)
-        self.assertEqual(hit, ["bin/plan_ledger.py", "plugins/fleet-hooks/a.js", "shims/gh", "templates/u.service",
-                               "tools/cos-permissions-proof/x.py"])
-        self.assertEqual(self.f.floor_for("someone/else"), ([], []))
+                                  "bin/fleet-switchboard", "bin/impact_floor.py", "docs/review-laws/impact-matrix.json", "docs/review-laws/REVIEW_LAWS.md"], globs, exclude, force)
+        self.assertEqual(hit, ["bin/impact_floor.py", "bin/plan_ledger.py", "docs/review-laws/impact-matrix.json", "plugins/fleet-hooks/a.js", "shims/gh",
+                               "templates/u.service", "tools/cos-permissions-proof/x.py"])
+        self.assertEqual(self.f.floor_for("someone/else"), ([], [], []))
 
 
 class TestImpactFloorCommandAndPass(LedgerBase):
@@ -19050,10 +19068,37 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         got = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--rating", "critical/remote", "--rating", "negligible/eliminated", "--json")[1])
         self.assertEqual((got["decision"], len(got["rated"])), ("hold", 1))
 
-    def test_a_partial_file_list_is_said_to_be_possibly_incomplete(self):
-        self.pr["changedFiles"] = 400
-        out = self.run_as("coder", "impact", "floor", self.PR)[1]
-        self.assertIn("the floor may be incomplete", out)
+    def test_a_huge_diff_with_a_truncated_file_list_holds_as_unknown_and_the_daemon_records_it(self):
+        self.pr.update({"changedFiles": 3000, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual((report["decision"], report["complete"], report["floor_paths"]), ("hold", False, []))
+        self.assertIn("GitHub listed 100 of 3000", report["unknown"])
+        self.assertIn("unknown floor, held on purpose", self.run_as("coder", "impact", "floor", self.PR)[1])
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        sb.ci_record_pass(engine, 100000.0)
+        sb.impact_would_hold_pass(engine, 100000.0)
+        (event,) = [e for e in self.world.audit() if e["event"] == "gate.would_hold"]
+        self.assertIn("GitHub listed 100 of 3000", event["detail"]["unknown"])
+
+    def test_a_rename_out_of_a_floor_path_still_holds_with_or_without_the_old_path(self):
+        self.pr.update({"changedFiles": 1, "files": [{"path": "elsewhere/0002.sql", "previous_filename": "migrations/0002.sql", "changeType": "RENAMED"}]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual((report["decision"], report["floor_paths"]), ("hold", ["migrations/0002.sql"]))
+        self.pr["files"] = [{"path": "elsewhere/0002.sql", "changeType": "RENAMED"}]          # gh gave no source path
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["decision"], "hold")
+        self.assertIn("renamed or copied", report["unknown"])
+        self.pr["files"] = [{"path": "elsewhere/a.py", "changeType": "MODIFIED"}]             # an ordinary change outside: still no hold
+        self.assertEqual(json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])["decision"], "none")
+
+    def test_a_malformed_rating_names_the_valid_cells(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, "--rating", "huge/often")
+        self.assertEqual(code, 2)
+        self.assertIn("Catastrophic", err)
+        self.assertIn("Improbable", err)
 
     def test_the_daemon_pass_audits_would_hold_once_per_head_and_writes_no_label(self):
         hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
