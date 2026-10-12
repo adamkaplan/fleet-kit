@@ -4164,6 +4164,15 @@ not enforced: G5 missing` (or `NOT READY for the enforced gates (...): open G1`)
 keeps the old line and the old exit (the whole board). `--all` exits by the whole board in every mode; `--json` adds `enforced`, `ready_enforced`
 and `open_enforced` next to the unchanged `ready`.
 
+**The impact floor (#179, slice L3: advisory, writes nothing).** `fleet-switchboard impact floor <repo#N> [--rating SEVERITY/PROBABILITY ...] [--json]` reads one
+PR's files and says what the deterministic hold floor would decide. The floor is **paths only**: a PR holds when it adds, changes or **deletes** a file inside its repo's floor
+globs (`bin/impact_floor.py` carries the proposal for this repo: `shims/**`, `plugins/fleet-hooks/**`, `templates/**`, `tools/cos-permissions-proof/**`, `bin/plan_ledger.py`, and the logic and table that decide holds, `bin/impact_floor.py` and `docs/review-laws/impact-matrix.json`, which a `force` list keeps out of the docs exclusion;
+excluded: `agents/**`, `skills/**`, `docs/**`, `AGENTS.md`; override per repo under `impact_floor.repos.<owner/repo>` with `globs`, `exclude` and `force`, validated as lists of strings: a string where a list belongs is a config error). Matching is **case-insensitive** (the fleet runs on case-insensitive checkouts). A deletion outside the globs never holds,
+and **size is never a hold by itself**. The independent rating (`--rating Critical/Remote`, repeatable) uses the standard's categories on the matrix in `docs/review-laws/impact-matrix.json`
+(the single source; `Eliminated` is not rated) and **can only add a hold, never lower the floor**: `hold` when the floor holds or any rated cell is `H`, `second-review` for a `2` cell, else `none`.
+The daemon's pass (`impact_would_hold_pass`, after the ci recorder, off with `impact_floor.enabled: false` or the global `plan-gates.off` file) judges each open PR of the repos under `plan_gates` once per head,
+at most 6 `gh pr view` reads per pass, and records `gate.would_hold` in the audit. **It writes no label, comment or ledger entry**: applying `hold-impact` is slice L4. **An unreadable diff fails towards hold:** when GitHub lists fewer files than the PR changed (its list is capped), or a renamed or copied file has no known source path, the floor decides `hold` with the reason `floor unknown` and the daemon records it (`unknown` in `gate.would_hold`); a rename whose old path is known counts through the old path like a deletion.
+
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
 verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
 the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and
@@ -4219,7 +4228,7 @@ that is determined to pass as the owner can, and only something it cannot reach 
 `gates ci-record` made the switchboard the `ci` recorder, but someone had to run it, so a push would leave every `proof: test` scenario without its
 verdict until a person did, and the preflight's 7-day proof would lapse. **The daemon now runs the same logic itself.** In every pass, after the decisions
 are derived, `ci_record_pass` looks at the open PRs of the repos listed in `plan_gates` (and not `enabled: false`) that carry a `PLAN: <link>` in their
-body (drafts are skipped), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
+body (**drafts too**: `gh pr ready` needs the `ci` verdict present, so a draft must already have it), reads each one's checks at its **current head** and, only when they are all complete and green, records the passing `ci`
 verdict for the per-PR scenarios that name `ci`: bound to that exact head and to the plan's current hash, never for a failing, pending or missing run,
 never twice (an identical verdict already in the ledger is left alone), and audited as `gate.ci_record`. Because those records are real, the preflight's
 "recorded successfully in the last 7 days" comes for free while any such PR exists. (A record where the plan has no `ci` scenario is audited with `ok: false`
