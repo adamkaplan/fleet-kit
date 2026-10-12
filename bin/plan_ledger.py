@@ -310,7 +310,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
 
 
 REVIEWERS = ("code", "architecture", "security", "impact", "test")
-REVIEWERS_NOW = ("code", "architecture", "security", "impact")   # the reviewers that exist today (the test reviewer is a later slice)
+REVIEWERS_NOW = ("code", "architecture", "security", "impact", "test")   # the reviewers that exist today
 REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
 
 

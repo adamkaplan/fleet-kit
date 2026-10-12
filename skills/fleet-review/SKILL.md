@@ -6,7 +6,7 @@ description: How a coder runs the reviewer subagents on its own pull request bef
 # Running the reviewers
 
 Make the change work first. Then, in a repository that has review laws (`REVIEW_LAWS.md` at its root; `fleet-switchboard review-laws install <repo path>` adds them), run the
-reviewer subagents on your pull request **before you offer it**: `reviewer-code`, `reviewer-architecture`, `reviewer-security` and `reviewer-impact`. Invoke each with the Task
+reviewer subagents on your pull request **before you offer it**: `reviewer-code`, `reviewer-architecture`, `reviewer-security`, `reviewer-impact` and `reviewer-test`. Invoke each with the Task
 tool and the pull request reference (`owner/repo#N`); they can run side by side.
 
 Each reviewer:
@@ -19,7 +19,7 @@ Each reviewer:
 than the PR's current head is refused. The record is made by your session, so `gates` labels it as not independent.
 
 Then fix the blocking findings (each cites a rule; a finding that cites none is only a proposal), functional first and then the standards, push, and run the reviewers again on the new head:
-a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (shadow, not counted)` line with how many of the four recorded at the current head; it does not block you yet.
+a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (shadow, not counted)` line with how many of the five recorded at the current head; it does not block you yet.
 
 Their result is feedback for you. It never replaces the independent review agent's verdict, and a hold is never decided by you or by a reviewer: the switchboard's matrix and path floor decide it.
-If you were asked to review a pull request rather than to author one, you are the independent reviewer, not one of these four: follow your own brief.
+If you were asked to review a pull request rather than to author one, you are the independent reviewer, not one of these five: follow your own brief.
