@@ -313,6 +313,8 @@ Formal approval means the required reviewer approved the full current commit SHA
 A pending review, a comment, or an approval against a stale head is not approval.
 If the head moved, the approval did not move with it.
 
+A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --evidence "<review url or what you ran>"`. (`--all` is coming; until it is merged, use the per-scenario form `verdict <scenario> --pr <repo#N> --as ... --head <sha>`.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review.
+
 A `[switchboard] standing orders` note is the owner's standing instruction for the
 charter (kept in the charter issue's `## Standing orders` section, one bullet per
 order): act on it without asking again, within its words. It covers nothing it

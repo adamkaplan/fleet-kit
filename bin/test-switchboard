@@ -7489,7 +7489,7 @@ class TestFrictionWake(FrictionBase):
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
-        self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "text": None})
+        self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
         self.pass_at(3600)
         self.assertEqual([self.friction(n) for n in ("platform", "web")], [[], []])
@@ -7508,12 +7508,11 @@ class TestFrictionWake(FrictionBase):
         self.assertEqual(self.pass_at(0)["sent"], [])  # 08:00, before the hour
         self.pass_at(3600)  # 09:00
         self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1))
-        for name in ("coder", "cos"):
-            self.assertEqual(self.friction(name), [])
+        self.assertEqual(self.friction("coder"), [])
         for _ in range(5):
             self.assertEqual(self.pass_at(600)["sent"], [], "nothing is sent again, queued or not")
         self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1), "not twice in a day")
-        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 2)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 3)  # two orchestrators and cos
         self.pass_at(86400)
         self.assertEqual(len(self.friction("platform")), 2, "and again the next day")
 
@@ -7559,6 +7558,48 @@ class TestFrictionWake(FrictionBase):
         self.pass_at(3600)
         self.assertIn("fleet-switchboard send improver --issue <n>", self.friction("platform")[0]["text"])
 
+    def test_cos_is_woken_in_the_same_slot_with_its_own_recipient_and_state_key(self):
+        self.pass_at(3600)
+        (found,) = self.friction("cos")
+        self.assertIn("fleet-switchboard send improver --issue <n>", found["text"])
+        self.assertIn("send improver a one-paragraph proposal", found["text"])
+        self.assertIn("cos:cos", sb.read_friction_state(self.world.state))
+        for _ in range(3):
+            self.pass_at(600)
+        self.assertEqual(len(self.friction("cos")), 1, "one wake per slot")
+        self.pass_at(86400)
+        self.assertEqual(len(self.friction("cos")), 2)
+
+    def test_cos_to_is_config_and_a_custom_text_does_not_replace_cos_text(self):
+        self.make({"cos_to": "tuner", "text": "What slowed you down?"})
+        self.pass_at(3600)
+        self.assertIn("send tuner", self.friction("cos")[0]["text"])
+        self.assertEqual(len(self.friction("platform")), 0)
+
+    def test_the_agent_named_by_cos_to_is_never_woken_about_itself(self):
+        self.make({"cos_to": "cos"})
+        self.pass_at(3600)
+        self.assertEqual(self.friction("cos"), [])
+        self.assertEqual(len(self.friction("platform")), 1)
+
+    def test_an_engaged_or_blocked_cos_is_skipped(self):
+        self.world.herdr.panes[self.world.panes["cos"]]["status"] = "blocked"
+        self.pass_at(3600)
+        self.assertEqual(self.friction("cos"), [])
+        self.assertEqual(len(self.friction("platform")), 1)
+
+    def test_status_shows_the_friction_line(self):
+        cfg = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "friction_wake": {"enabled": True}})
+        self.assertEqual(sb.friction_status_line(cfg, self.world.state),
+                         "friction wake: on, 09:00 to cos; cos to improver; last slot none yet")
+        self.pass_at(3600)
+        self.assertNotIn("none yet", sb.friction_status_line(cfg, self.world.state))
+        off = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertEqual(sb.friction_status_line(off, self.world.state), "friction wake: off")
+        text = (REPO / "bin" / "fleet-switchboard").read_text()   # and `status` prints it, indented under the others
+        self.assertIn('report["friction"] = friction_status_line(config, state)', text)
+        self.assertIn('lines.extend("      " + report["friction"]', text)
+
     def test_nobody_due_means_no_agent_is_read(self):
         self.pass_at(3600)
         before = len(self.world.v2.calls)
@@ -7568,7 +7609,7 @@ class TestFrictionWake(FrictionBase):
     def test_the_config_is_validated_like_the_others(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         for bad, word in (({"enabled": "yes"}, "enabled"), ({"hour": 24}, "hour"), ({"hour": "9"}, "hour"),
-                          ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"),
+                          ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"), ({"cos_to": "Bad Name"}, "'friction_wake.cos_to'"), ({"cos_to": 5}, "cos_to"),
                           ({"text": ""}, "text"), ({"text": 5}, "text"), ({"when": 9}, "friction_wake")):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError) as caught:
                 sb.validate_config(dict(base, friction_wake=bad))
@@ -8480,7 +8521,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -8490,7 +8531,8 @@ ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "c
 # #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
-ROLE_BYTE_LIMITS = {"coder": 6800, "orchestrator": 10650, "chief-of-staff": 11650, "cos-subagent": 3500}
+# one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+ROLE_BYTE_LIMITS = {"coder": 7250, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -8640,6 +8682,27 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         self.assertIn("keeps you **focused on your job**", text)
         self.assertNotIn("never merge,", text)
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
+
+
+class TestVerdictRecordingText(unittest.TestCase):
+    """The reviewer and tester roles record their verdict in ONE command as the last step of the review they already do (text only)."""
+    ONE = 'fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --evidence'
+
+    def test_the_skill_and_the_coder_definitions_say_the_one_command_and_the_per_scenario_fallback(self):
+        for rel in ("skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/copilot/coder.agent.md"):
+            with self.subTest(file=rel):
+                text = " ".join((REPO / rel).read_text().split())
+                self.assertIn(self.ONE, text)
+                self.assertIn("per-scenario form" if "SKILL" in rel else "until then record each scenario", text)
+                self.assertIn("A push voids it", text)
+
+    def test_the_orchestrator_definitions_point_at_it_and_the_planning_skill_says_owner_evaluators_are_rare(self):
+        for rel in ("agents/opencode/orchestrator.md", "agents/copilot/orchestrator.agent.md"):
+            with self.subTest(file=rel):
+                self.assertIn("Reviewers and testers record their verdicts when they finish", (REPO / rel).read_text())
+        planning = " ".join((REPO / "skills" / "fleet-planning" / "SKILL.md").read_text().split())
+        self.assertIn("Owner evaluators are rare", planning)
+        self.assertIn("a coder's only extra step is `prove`", planning)
 
 
 class TestPlanningSkill(unittest.TestCase):
@@ -35167,6 +35230,228 @@ class TestPlanReviewCommands(LedgerBase):
         code, out, err = self.run_as("coder", "plan", "check", "acme/app#7")
         self.assertEqual(code, 0, err)
         self.assertIn("PASS", out)
+
+
+class TestReviewLawsStarterSet(Base):
+    """#179 slice L1: the generic review laws and standards starter set (docs/review-laws/) and `review-laws install`."""
+
+    DIR = REPO / "docs" / "review-laws"
+    FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
+    PREFIX = {"REVIEW_LAWS.md": "LAW", "CODING_STANDARDS.md": "CODE", "SECURITY_STANDARDS.md": "SEC", "TEST_STANDARDS.md": "TEST"}
+    RULE = re.compile(r"^- \*\*R-(LAW|CODE|SEC|TEST)-([0-9]+) [^*]+\*\* .+$")
+
+    def rules(self, name):
+        text = (self.DIR / name).read_text()
+        body = text.split("\n## Rules\n", 1)[1]
+        lines = []
+        for line in body.splitlines():
+            if line.startswith("## "):
+                break
+            if line.strip():
+                lines.append(line)
+        return lines
+
+    def install(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["review-laws", "install", *argv], runner=lambda *a, **k: None, now=lambda: 0)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_every_file_opens_with_the_extends_line_naming_the_version(self):
+        version = (self.DIR / "VERSION").read_text().strip()
+        self.assertRegex(version, r"^review-laws-[0-9]+$")
+        for name in self.FILES:
+            self.assertEqual((self.DIR / name).read_text().splitlines()[0], "extends: fleet-kit-review-laws @ %s" % version, name)
+
+    def test_every_rule_is_a_numbered_citable_line_with_a_unique_sequential_id(self):
+        for name in self.FILES:
+            with self.subTest(name=name):
+                lines = self.rules(name)
+                self.assertGreaterEqual(len(lines), 10)
+                numbers = []
+                for line in lines:
+                    match = self.RULE.match(line)
+                    self.assertIsNotNone(match, "a rules line that is not a numbered rule: %r" % line[:80])
+                    self.assertEqual(match.group(1), self.PREFIX[name])
+                    numbers.append(int(match.group(2)))
+                self.assertEqual(numbers, list(range(1, len(numbers) + 1)), "ids are sequential and unique")
+
+    def test_the_standards_stay_short_enough_for_a_reviewer_to_carry(self):
+        for name in self.FILES[1:]:
+            self.assertLess(len((self.DIR / name).read_bytes()), 6144, name)
+        self.assertLess(len((self.DIR / "REVIEW_LAWS.md").read_bytes()), 10240)
+
+    def test_review_laws_cite_mil_std_882e_with_software_definitions_the_matrix_and_the_one_likelihood_sentence(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        self.assertIn("MIL-STD-882E", text)
+        for word in ("Catastrophic", "Critical", "Marginal", "Negligible", "Frequent", "Probable", "Occasional", "Remote", "Improbable",
+                     "Eliminated", "High", "Serious", "Medium", "Low"):
+            self.assertIn(word, text)
+        self.assertIn("not rated", text)
+        self.assertEqual(text.count("Judge likelihood at the scale the change will run"), 1)
+        self.assertNotIn("fleet-wide", text, "the single-item versus fleet-wide split is not adopted")
+        rows = [l for l in text.splitlines() if re.match(r"^\| (Catastrophic|Critical|Marginal|Negligible) \| (Serious|High|Medium|Low) \(", l)]
+        self.assertEqual(len(rows), 4)
+        cells = {}
+        for row in rows:
+            parts = [c.strip() for c in row.strip("|").split("|")]
+            self.assertEqual(len(parts), 6, row)
+            for cell in parts[1:]:
+                self.assertRegex(cell, r"^(High|Serious|Medium|Low) \([H2.]\)$")
+            cells[parts[0]] = parts[1:]
+        # the hold bands are exactly serious and high; medium asks for a second review; low does nothing
+        for severity, row in cells.items():
+            for cell in row:
+                level, action = re.match(r"^(\w+) \((.)\)$", cell).groups()
+                self.assertEqual(action, {"High": "H", "Serious": "H", "Medium": "2", "Low": "."}[level], cell)
+        self.assertEqual(cells["Catastrophic"], ["Serious (H)", "High (H)", "High (H)", "High (H)", "High (H)"])
+
+    def test_the_matrix_fixture_is_the_single_source_and_the_laws_table_equals_it(self):
+        fixture = json.loads((self.DIR / "impact-matrix.json").read_text())
+        self.assertEqual(fixture["severities"], ["Catastrophic", "Critical", "Marginal", "Negligible"])
+        self.assertEqual(fixture["probabilities"], ["Improbable", "Remote", "Occasional", "Probable", "Frequent"])
+        self.assertEqual(fixture["not_rated"], ["Eliminated"])
+        self.assertEqual(sorted(set(fixture["actions"].values())), sorted(["H", "2", "."]))
+        cells = fixture["cells"]
+        self.assertEqual(sum(len(row) for row in cells.values()), 20)
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        for severity in fixture["severities"]:
+            row = next(l for l in text.splitlines() if l.startswith("| %s | " % severity) and "(" in l)
+            parts = [c.strip() for c in row.strip("|").split("|")]
+            want = ["%s (%s)" % (cells[severity][p]["level"], cells[severity][p]["action"]) for p in fixture["probabilities"]]
+            self.assertEqual(parts[1:], want, severity)
+        for severity, row in cells.items():
+            for probability, cell in row.items():
+                self.assertEqual(cell["action"], fixture["actions"][cell["level"]], "%s/%s" % (severity, probability))
+        self.assertIn("impact-matrix.json", text, "the laws name their single source")
+
+    def test_the_laws_state_the_rules_the_plan_requires(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        for needle in ("50 turns", "`incomplete`", "never builds, runs or tests", "base branch", "A finding that cites none is a proposal",
+                       "must not contradict the repository's `AGENTS.md`", "untrusted text"):
+            self.assertIn(needle, text)
+
+    def test_the_scope_of_the_read_only_rule_and_the_floor_as_the_matrixs_companion_are_stated(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule2 = next(l for l in text.splitlines() if l.startswith("- **R-LAW-2 "))
+        self.assertIn("reviewer agent bound by these laws", rule2)
+        self.assertIn("independent verification agent", rule2)
+        self.assertIn("may run the repository's named checks", rule2)
+        self.assertIn("says so in its own copy", rule2)
+        rules = {l.split(" ", 2)[1].strip("*"): l for l in text.splitlines() if l.startswith("- **R-LAW-")}
+        self.assertIn("The floor is the matrix's companion", rules["R-LAW-13"])
+        self.assertIn("its authority is the matrix (R-LAW-11)", rules["R-LAW-13"])
+        self.assertIn("the impact matrix below", rules["R-LAW-11"])
+        self.assertNotIn("also holds changes", text, "the floor is a numbered rule, not an uncited aside")
+
+    def test_owner_evaluators_are_rare_and_the_laws_say_so(self):
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule = next(l for l in text.splitlines() if l.startswith("- **R-LAW-15 "))
+        for needle in ("Owner evaluators are rare", "own eyes are the test", "once at the epic's integrated head", "never waits on the owner", "claim: epic"):
+            self.assertIn(needle, rule)
+
+    def test_every_rule_says_how_it_is_checked_and_a_note_only_rule_never_blocks_alone(self):
+        kinds = set()
+        for name in self.FILES:
+            for line in self.rules(name):
+                match = re.search(r"_check: (diff|test|search|note only): [^_]+_$", line)
+                self.assertIsNotNone(match, "no check hint: %r" % line[:90])
+                kinds.add(match.group(1))
+        self.assertEqual(kinds, {"diff", "test", "search", "note only"})
+        text = (self.DIR / "REVIEW_LAWS.md").read_text()
+        rule14 = next(l for l in text.splitlines() if l.startswith("- **R-LAW-14 "))
+        self.assertIn("note only", rule14)
+        self.assertIn("never blocks by itself", rule14)
+        for rule in ("R-CODE-9", "R-CODE-10", "R-TEST-8"):
+            line = next(l for name in self.FILES for l in self.rules(name) if l.startswith("- **%s " % rule))
+            self.assertIn("check: note only", line, rule)
+
+    def test_the_standards_carry_the_review_findings_that_recur(self):
+        coding = "\n".join(self.rules("CODING_STANDARDS.md")).lower()
+        security = "\n".join(self.rules("SECURITY_STANDARDS.md")).lower()
+        for needle in ("fail open", "atomic", "check and act", "public-safe"):
+            self.assertIn(needle, coding)
+        for needle in ("identify the actor", "secret never becomes text", "untrusted text is data", "guardrail is not a boundary"):
+            self.assertIn(needle, security)
+
+    def test_the_starter_set_holds_no_private_name(self):
+        names = os.environ.get("FLEET_PRIVATE_NAMES_FILE")
+        script = REPO / "bin" / "check-public-names"
+        done = subprocess.run([sys.executable, str(script), "--root", str(self.DIR)] + (["--names-file", names] if names else []),
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_install_copies_exactly_the_four_files_each_opening_with_the_extends_line_and_says_what_to_edit(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        code, out, err = self.install(str(target))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), sorted(self.FILES), "nothing else is written, no stray temp file")
+        version = (self.DIR / "VERSION").read_text().strip()
+        for name in self.FILES:
+            self.assertEqual((target / name).read_text(), (self.DIR / name).read_text())
+            self.assertEqual((target / name).read_text().splitlines()[0], "extends: fleet-kit-review-laws @ %s" % version)
+            self.assertIn(name, out)
+        self.assertIn("What to edit", out)
+        self.assertIn("never loosen", out)
+
+    def test_install_never_overwrites_a_repositorys_own_copy_unless_forced_and_leaves_agents_md_alone(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        (target / "CODING_STANDARDS.md").write_text("our own rules\n")
+        (target / "AGENTS.md").write_text("build with make\n")
+        code, out, err = self.install(str(target))
+        self.assertEqual(code, 2)
+        self.assertIn("already has CODING_STANDARDS.md", err)
+        self.assertEqual((target / "CODING_STANDARDS.md").read_text(), "our own rules\n")
+        self.assertFalse((target / "REVIEW_LAWS.md").exists(), "nothing was written")
+        code, out, err = self.install(str(target), "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((target / "CODING_STANDARDS.md").read_text(), (self.DIR / "CODING_STANDARDS.md").read_text())
+        self.assertEqual((target / "AGENTS.md").read_text(), "build with make\n")
+        self.assertIn("AGENTS.md: it was not touched", out)
+
+    def test_install_never_follows_a_symlink_even_a_dangling_one_and_not_with_force(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        elsewhere = self.home / "elsewhere.md"
+        (target / "REVIEW_LAWS.md").symlink_to(elsewhere)   # dangling: the file it points at does not exist
+        for argv in ((str(target),), (str(target), "--force")):
+            code, out, err = self.install(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn("symbolic link", err)
+            self.assertFalse(elsewhere.exists(), "nothing was written through the link")
+            self.assertTrue((target / "REVIEW_LAWS.md").is_symlink())
+            self.assertFalse((target / "CODING_STANDARDS.md").exists())
+
+    def test_install_says_the_version_once(self):
+        target = self.home / "acme-widget"
+        target.mkdir()
+        code, out, err = self.install(str(target))
+        self.assertNotIn("vreview-laws", out)
+        self.assertIn("(review-laws-1)", out)
+
+    def test_install_refuses_a_path_that_is_not_a_directory(self):
+        code, out, err = self.install(str(self.home / "nowhere"))
+        self.assertEqual(code, 2)
+        self.assertIn("is not a directory", err)
+
+    def test_the_install_stays_in_step_with_the_starter_set(self):
+        # a starter set whose header differs from VERSION is refused by the command (it never copies an inconsistent set)
+        real = sb.review_laws_source
+        copy = self.home / "set"
+        shutil.copytree(self.DIR, copy)
+        (copy / "VERSION").write_text("2\n")
+        target = self.home / "t"
+        target.mkdir()
+        with mock.patch.object(sb, "review_laws_source", lambda: copy):
+            code, out, err = self.install(str(target))
+        self.assertEqual(code, 2)
+        self.assertIn("inconsistent", err)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_the_docs_name_the_command(self):
+        self.assertIn("review-laws install", (REPO / "docs" / "switchboard.md").read_text())
+
 
 plan_review = _load("t_plan_review", BIN / "plan_review.py")
 
