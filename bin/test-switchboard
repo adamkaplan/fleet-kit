@@ -163,6 +163,12 @@ class Base(unittest.TestCase):
         })
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The version of a program is asked for under a production bound (3 s) a loaded machine can overrun: tests get a bound that cannot
+        # expire, and a clean cache; the one test of the bound patches its own.
+        bound = mock.patch.object(sb, "PROGRAM_VERSION_SECONDS", 120)
+        bound.start()
+        self.addCleanup(bound.stop)
+        sb._VERSIONS.clear()
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
@@ -3134,17 +3140,31 @@ class TestPoke(Base):
         self.assertIn(False, results)  # the socket filled; the poke was dropped, not waited for
         self.assertLess(time.time() - started, 20)
 
-    def test_the_poke_command_is_silent_fast_and_always_exits_zero(self):
+    def test_the_poke_command_is_silent_and_always_exits_zero(self):
+        # Its speed is the alarm's job (test_a_poke_is_bounded_by_its_alarm), not a wall clock around a process start.
         for setup in ("no state dir", "a daemon"):
             if setup == "a daemon":
                 sock = sb.open_poke_socket(self.state)
                 self.addCleanup(sock.close)
-            started = time.time()
             result = self.run_cli(SWITCHBOARD, "poke")
             with self.subTest(setup=setup):
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-                self.assertLess(time.time() - started, 2)
         self.assertTrue(sb.wait_for_poke(sock, 1))  # and the one to a daemon arrived
+
+    def test_a_poke_is_bounded_by_its_alarm(self):
+        self.assertLessEqual(sb.POKE_ALARM, 2)
+        for raises in (False, True):
+            events = []
+
+            def send(*a, **k):
+                events.append("send")
+                if raises:
+                    raise OSError("down")
+
+            with self.subTest(raises=raises), mock.patch.object(sb.signal, "alarm", side_effect=lambda n: events.append(("alarm", n)) or 0), \
+                    mock.patch.object(sb, "send_poke", side_effect=send):
+                sb.cmd_poke(None)
+            self.assertEqual(events, [("alarm", sb.POKE_ALARM), "send", ("alarm", 0)])
 
     def test_poke_never_calls_herdr_or_v2_and_needs_no_config(self):
         def boom(argv, **kwargs):
@@ -10272,6 +10292,7 @@ class TestGhShimGateProbe(Base):
                            "if [ \"$1\" = gates-check ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
                            "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  if [ -n \"$FAKE_GATE_JSON\" ]; then echo \"$FAKE_GATE_JSON\"; else echo '{\"verdict\": \"x\"}'; fi; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % str(self.calls_log))
         self.sb.chmod(0o755)
+        subprocess.run([str(self.sb), "whoami", "--json"], capture_output=True, timeout=60)   # the first start of a new file is the slow one
         self.state = self.home / "state"
         self.state.mkdir()
         self.write_gates({"acme/app": {"mode": "shadow"}})
@@ -10283,7 +10304,8 @@ class TestGhShimGateProbe(Base):
 
     def run_shim(self, *args, env=None, binary=True):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home),
-                   "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
+                   "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS,
+                   "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS}   # the gate question's bound too: the largest the shim allows
         if binary:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
         environ.update(env or {})
@@ -10450,7 +10472,7 @@ class TestGhShimGateProbe(Base):
         source = SHIM.read_text()
         self.assertIn("GATE_SECONDS = 3.0", source)
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app", env={"FAKE_GATE_SLEEP": "30", "FLEET_SHIM_GATE_SECONDS": "0.01"})
-        self.assertLess(self.elapsed, 6, "a bound below 0.2 s is raised to 0.2 s, not 0")
+        self.assertLess(self.elapsed, 25, "a bound below 0.2 s is raised to 0.2 s, not 0")
 
     def test_with_no_switchboard_the_command_runs_and_the_gap_is_recorded(self):
         done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", binary=False, env={"HOME": str(self.home / "nohome")})
@@ -10525,8 +10547,15 @@ class TestGhShim(Base):
                         % str(self.log))
         fake.chmod(0o755)
         self.who = self.home / "whoami"
-        self.who.write_text("#!/bin/sh\n[ -n \"$FAKE_WHO_SLEEP\" ] && sleep \"$FAKE_WHO_SLEEP\"\n[ \"$1\" = whoami ] && echo \"${FAKE_WHO:-platform}\" && exit ${FAKE_WHO_EXIT:-0}\nexit 2\n")
+        # One process start answers: `whoami --json` gets the JSON a current switchboard gives; only FAKE_WHO_OLD=1 makes it an old
+        # one (plain text, so the shim asks again with a second start: the fallback, and only its test wants that).
+        self.who.write_text("#!/bin/sh\n[ -n \"$FAKE_WHO_SLEEP\" ] && sleep \"$FAKE_WHO_SLEEP\"\n[ \"$1\" = whoami ] || exit 2\n"
+                            "[ \"$FAKE_WHO_EXIT\" ] && exit $FAKE_WHO_EXIT\n"
+                            "if [ \"$2\" = --json ] && [ -z \"$FAKE_WHO_OLD\" ]; then echo \"{\\\"name\\\": \\\"${FAKE_WHO:-platform}\\\"}\"; exit 0; fi\n"
+                            "echo \"${FAKE_WHO:-platform}\"\n")
         self.who.chmod(0o755)
+        # The first start of a new file is the slow one on some machines (a scan of it): pay for it here, not inside the shim's deadline.
+        subprocess.run([str(self.who), "whoami", "--json"], capture_output=True, timeout=60)
 
     def run_shim(self, *args, stdin="", env=None, who=True):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
@@ -10588,8 +10617,8 @@ class TestGhShim(Base):
         """The signing tests failed on a busy machine ('from=agent' for 'from=platform'): the shim's 3 s lookup deadline ran out because the lookup (two process
         starts) was slow, not because the real switchboard was reached (the run's environment is scrubbed and its binary is the fake). Shown on purpose: with a
         deadline shorter than the lookup the name is `agent`; with the deadline the tests now use it is the name."""
-        slow = {"FAKE_WHO_SLEEP": "1.1"}
-        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env=dict(slow, FLEET_SHIM_LOOKUP_SECONDS="2"))
+        slow = {"FAKE_WHO_SLEEP": "1.5"}   # the old-style fake: two starts
+        done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env=dict(slow, FLEET_SHIM_LOOKUP_SECONDS="0.2"))
         self.assertIn("from=agent", seen["argv"][-1], "a lookup slower than its deadline falls back to agent")
         done, seen = self.run_shim("issue", "comment", "2", "--body", "hi", env=slow)
         self.assertIn("from=platform", seen["argv"][-1], "the same slow lookup within the tests' deadline is the name")
