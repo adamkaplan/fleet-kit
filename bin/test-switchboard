@@ -130,8 +130,17 @@ def remove_tree_patiently(tmp, tries=20, pause=0.1):
             time.sleep(pause)
 
 
-COS_ALLOWING = "".join('  - action: "shell"\n    resource: "%s"\n    effect: allow\n' % r
-                       for r in ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow"))
+def cos_rules_text(*rules, shape="flow"):
+    """A chief-of-staff definition's permission list from (resource, effect) pairs, in the installed one-line flow shape (#191) or the older block shape."""
+    if shape == "flow":
+        return '  - {action: "*", resource: "*", effect: deny}\n' + "".join('  - {action: shell, resource: "%s", effect: %s}\n' % r for r in rules)
+    return "".join('  - action: "shell"\n    resource: "%s"\n    effect: %s\n' % r for r in rules)
+
+
+COS_GUARDS = (("fleet-switchboard gates *enforce*", "deny"), ("fleet-switchboard gates *ENFORCE*", "deny"), ("fleet-switchboard gates on*", "deny"),
+              ("fleet-switchboard waive *G6*", "deny"), ("fleet-switchboard waive *G8*", "deny"))
+# the installed shape: broad allows, guards after them
+COS_ALLOWING = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), *COS_GUARDS)
 
 
 class Base(unittest.TestCase):
@@ -18242,9 +18251,14 @@ class TestPlanGatesCheck(LedgerBase):
 
     def test_enforce_is_blocked_until_the_installed_cos_definition_allows_the_way_out(self):
         cos = self.home / "cos-definition.md"
+        narrow = (("fleet-switchboard waive *", "allow"), ("fleet-switchboard gates mode * shadow", "allow"), ("fleet-switchboard gates off", "allow"))
         for text, lacks in ((None, "could not be read"), ("", "waive"), (COS_ALLOWING.replace("allow", "deny"), "waive"),
-                            (COS_ALLOWING.replace("gates mode * shadow", "gates mode * off"), "gates mode * shadow"),
-                            (COS_ALLOWING.replace("waive *", "waive"), "waive *")):
+                            (cos_rules_text(("fleet-switchboard waive *", "allow"), *COS_GUARDS), "gates mode acme/app shadow"),   # no gates allow
+                            (cos_rules_text(("fleet-switchboard gates *", "allow"), *COS_GUARDS), "waive acme/app#1"),             # no waive allow
+                            (cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow")), "turning enforcement on"),  # no guards: cos could turn it ON
+                            (cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), *COS_GUARDS[:3]), "waiving G6"),  # waive G6 open
+                            (cos_rules_text(*narrow, shape="block"), "waiving G6"),                                                  # the older shape, waive * unguarded
+                            (cos_rules_text(*narrow[:2]), "gates off")):                                                             # gates off missing
             with self.subTest(lacks=lacks):
                 cos.unlink(missing_ok=True)
                 if text is not None:
@@ -18259,9 +18273,22 @@ class TestPlanGatesCheck(LedgerBase):
                 self.set_gates({"acme/app": {"mode": "enforce"}})
                 code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "merge", "--json")
                 self.assertEqual((code, json.loads(out)["mode"]), (0, "shadow"), "set by hand, it still runs as shadow")
-        cos.write_text(COS_ALLOWING)
-        code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
-        self.assertNotIn("cannot yet turn enforcement off", out + err)
+        for good in (COS_ALLOWING, cos_rules_text(*COS_GUARDS, ("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow")),   # a deny placed first still wins
+                     cos_rules_text(*narrow, *COS_GUARDS, shape="block")):
+            cos.write_text(good)
+            code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
+            self.assertNotIn("cannot yet turn enforcement off", out + err)
+
+    def test_the_kits_own_chief_of_staff_definition_passes_the_cos_check_and_loses_it_without_its_guards(self):
+        text = (REPO / "agents" / "opencode" / "chief-of-staff.md").read_text()
+        self.assertEqual(sb.plan_ledger.cos_lacking(text), "")
+        self.assertEqual(sb.plan_ledger.cos_lacking((REPO / "agents" / "opencode" / "cos-subagent.md").read_text()), "")
+        # a hostile copy: the guards on turning gates ON are removed: the check must say so
+        unguarded = "\n".join(l for l in text.splitlines() if not ("fleet-switchboard gates" in l and ("enforce" in l.lower() or "gates on" in l)))
+        self.assertIn("turning enforcement on", sb.plan_ledger.cos_lacking(unguarded))
+        # and one without the allow for waive
+        no_waive = "\n".join(l for l in text.splitlines() if "fleet-switchboard waive *" not in l or "deny" in l)
+        self.assertIn("does not allow", sb.plan_ledger.cos_lacking(no_waive))
 
     def test_a_bad_mode_or_usage_is_refused(self):
         for argv in (("mode", "acme/app", "loud"), ("mode", "acme/app"), ("mode",)):

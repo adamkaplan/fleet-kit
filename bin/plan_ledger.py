@@ -497,25 +497,74 @@ def preflight(config, repo, ci_proven=None, cos_ready=None):
     return blocking, notes
 
 
-COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")
+COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow")   # kept for callers that name them
+# What the Chief of Staff MUST be able to run (the way out of a refusal), and what it must NOT be able to run (turning enforcement ON is the
+# owner's). Judged by evaluating each probe against the installed definition's shell rules, not by looking for exact resource strings.
+COS_MUST_ALLOW = ("fleet-switchboard waive acme/app#1 --gates G1 --reason hotfix", "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off")
+COS_MUST_DENY = ("fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                 "fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix", "fleet-switchboard waive acme/app#1 --gates G8 --reason hotfix")
+
+
+def cos_rules(text):
+    """The (action, resource, effect) rules of a definition's `permissions:` list, in order. Two shapes are read: the one-line flow
+    form `- {action: shell, resource: "x", effect: allow}` (the installed short list) and the older block form with `action:`,
+    `resource:` and `effect:` on separate lines."""
+    import json as _json
+    import re as _re
+    rules, action, resource = [], None, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        flow = _re.fullmatch(r"-\s*\{action:\s*(.+?),\s*resource:\s*(\".*\"),\s*effect:\s*(allow|deny|ask)\s*\}", line)
+        if flow:
+            try:
+                rules.append((flow.group(1).strip().strip('"'), _json.loads(flow.group(2)), flow.group(3)))
+            except ValueError:
+                pass
+            continue
+        line = line[2:].strip() if line.startswith("- ") else line
+        if line.startswith("action:"):
+            action = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("resource:"):
+            resource = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("effect:") and resource is not None:
+            rules.append((action or "shell", resource, line.split(":", 1)[1].strip().strip('"')))
+            resource = None
+    return rules
+
+
+def _glob_match(pattern, command):
+    """OpenCode's whole-value glob: `*` any run, `?` one character; a trailing ` *` also matches the bare command."""
+    import re as _re
+    rx = "".join(".*" if c == "*" else "." if c == "?" else _re.escape(c) for c in pattern)
+    if pattern.endswith(" *"):
+        rx = rx[:-len(_re.escape(" ") + ".*")] + "(?: .*)?"
+    return _re.fullmatch(rx, command, _re.S) is not None
+
+
+def cos_allows(rules, command):
+    """True when the shell `rules` let `command` run, as v2 decides it: any matching deny of the shell action denies, else a matching
+    allow allows, else the base deny. (A rule for the action `*` is the base: it is not a guard.)"""
+    hits = [(a, e) for a, r, e in rules if a in ("shell", "bash", "*") and _glob_match(r, command)]
+    if any(e == "deny" and a != "*" for a, e in hits):
+        return False
+    return any(e == "allow" for _, e in hits)
 
 
 def cos_lacking(text):
-    """What the installed chief-of-staff definition (its text, or None when unreadable) does not yet allow of COS_NEEDS: the
-    way out of a refusal. "" when both are allowed. A later `deny` of the same resource does not count as allowed."""
+    """What the installed chief-of-staff definition (its text, or None when unreadable) gets wrong about the way out of a refusal:
+    "" when it can run `waive` (G0 to G5), `gates mode <repo> shadow` and `gates off`, and CANNOT turn enforcement on (`gates mode ...
+    enforce`, `gates on`) or waive G6 or G8. A cos that could turn it on is as blocking as one that cannot turn it off."""
     if text is None:
         return "the installed chief-of-staff definition could not be read"
-    state = {}
-    resource = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("resource:"):
-            resource = line.split(":", 1)[1].strip().strip('"')
-        elif line.startswith("effect:") and resource is not None:
-            state[resource] = line.split(":", 1)[1].strip().strip('"')
-            resource = None
-    missing = [need for need in COS_NEEDS if state.get(need) != "allow"]
-    return "it does not allow `%s`" % "`, `".join(missing) if missing else ""
+    rules = cos_rules(text)
+    missing = [probe for probe in COS_MUST_ALLOW if not cos_allows(rules, probe)]
+    too_much = [probe for probe in COS_MUST_DENY if cos_allows(rules, probe)]
+    out = []
+    if missing:
+        out.append("it does not allow `%s`" % "`, `".join(missing))
+    if too_much:
+        out.append("it allows `%s` (turning enforcement on, or waiving G6 or G8, is not the chief of staff's)" % "`, `".join(too_much))
+    return "; ".join(out)
 
 
 def effective_mode(config, setting, ci_proven=None, cos_ready=None):
