@@ -655,8 +655,10 @@ class TestHerdrClient(Base):
         self.assertEqual((path, method), ("/s/herdr.sock", "layout.apply"))
         self.assertEqual(params, {"workspace_id": "w1", "tab_label": "coder", "root": {
             "type": "pane", "label": "coder", "cwd": "/work", "command": ["/bin/oc", "-s", "ses_1"],
-            "env": {"A": "b"}}})
+            "env": {"A": "b", "FLEET_SWITCHBOARD_OWN_GH": ""}}})   # the marker for the switchboard's own gh calls never reaches an agent's pane
         self.assertNotIn("focus", json.dumps(params).lower())
+        client.open_tab_running("w1", "coder", "/work", ["/bin/oc"], {"FLEET_SWITCHBOARD_OWN_GH": "1", "A": "b"})
+        self.assertEqual(sent[1][2]["root"]["env"], {"A": "b", "FLEET_SWITCHBOARD_OWN_GH": ""}, "an inherited marker is overridden, not passed on")
         with self.assertRaises(ValueError):
             client._socket("pane.send_text", {})
         self.assertEqual(len(sent), 1)
@@ -1558,6 +1560,8 @@ class FakeV2:
             return subprocess.CompletedProcess(argv, 1, "", "error: cannot reach the OpenCode service\n")
         if argv[1:2] != ["api"] or len(argv) < 3:
             return subprocess.CompletedProcess(argv, 2, "", "fake opencode: only `api` is modelled\n")
+        if argv[2] == "GET":   # `opencode api GET /api/agent` (the registered agents): not modelled here, so the service reads as unreachable
+            return subprocess.CompletedProcess(argv, 1, "", "fake opencode: GET is not modelled\n")
         op, params, body, rest = argv[2], {}, None, argv[3:]
         while rest:
             flag, value, rest = rest[0], rest[1], rest[2:]
@@ -3805,7 +3809,7 @@ class TestLaunch(Base):
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                     "FLEET_SWITCHBOARD_ROLE": "coder"})  # PR 18: who this pane is
+                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
@@ -3962,7 +3966,7 @@ class TestLaunch(Base):
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                 "FLEET_SWITCHBOARD_ROLE": "coder"})
+                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -4005,6 +4009,41 @@ class TestLaunch(Base):
                            socket_call=self.world.herdr.socket)
         self.assertNotEqual(code, 0)
         self.assertIn("--agent and --dir", err.getvalue())
+
+    def listing_runner(self, agents):
+        """The world's runner, with `opencode api GET /api/agent` answering `agents` ({name: mode}); None: the service is not reachable."""
+        def route(argv, **kwargs):
+            if argv[1:4] == ["api", "GET", "/api/agent"]:
+                if agents is None:
+                    raise FileNotFoundError(2, "No such file")
+                rows = [{"id": n, "mode": m, "permissions": []} for n, m in agents.items()]
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"data": rows}), "")
+            return self.world.route(argv, **kwargs)
+        return route
+
+    def cli_launch(self, runner, agent, name="coder9"):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err):
+            code = sb.main(["launch", name, "--agent", agent, "--dir", str(self.work)], runner=runner,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_launch_of_an_agent_the_service_does_not_know_is_refused_before_anything_is_created(self):
+        sessions = len(self.world.v2.sessions)
+        code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "orchestrator": "primary", "reviewer-code": "subagent"}), "tester")
+        self.assertEqual(code, 1)
+        self.assertIn("--agent 'tester' is not registered with the OpenCode service", err)
+        self.assertIn("primary agents registered: coder, orchestrator", err)
+        self.assertNotIn("reviewer-code", err.split("registered:")[1], "only primary agents are offered")
+        self.assertIn("agents verify", err)
+        self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
+
+    def test_a_registered_agent_launches_and_an_unreachable_service_does_not_block_it(self):
+        for n, agents in enumerate(({"coder": "primary"}, None)):
+            with self.subTest(agents=agents):
+                code, out, err = self.cli_launch(self.listing_runner(agents), "coder", name="coder%d" % (10 + n))
+                self.assertEqual(code, 0, err)
 
     def test_the_cli_takes_the_workspace_from_the_pane_it_runs_in(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
