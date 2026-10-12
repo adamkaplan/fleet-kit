@@ -14473,8 +14473,9 @@ def measure_row(pr, entries, all_prs, repo):
             continue
         if _MEASURE_FIX_RE.match(other.get("title") or "") and re.search(r"#%s\b" % number, (other.get("title") or "") + " " + (other.get("body") or "")):
             escaped += 1
+    # a title is the author's text: no terminal escapes reach the screen
     lines = (pr.get("additions") or 0) + (pr.get("deletions") or 0)
-    return {"pr": number, "title": _one_line(pr.get("title") or "", 50), "merged": pr.get("mergedAt"), "lines": lines, "to_green_min": to_green,
+    return {"pr": number, "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(pr.get("title") or "")), 50), "merged": pr.get("mergedAt"), "lines": lines, "to_green_min": to_green,
             "rounds": len(heads) if heads else None, "blocks": sum(e.get("blocks") or 0 for e in latest.values()) if heads else None,
             "notes": sum(e.get("notes") or 0 for e in latest.values()) if heads else None, "escaped": escaped}
 
@@ -14560,7 +14561,6 @@ def cmd_review_measure(args, runner, now):
     except (ReviewError, plan_ledger.LedgerError, ConfigError) as err:
         sys.stderr.write("%s: review measure: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
-
 
 
 def add_review_parsers(sub):

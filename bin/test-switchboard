@@ -36812,6 +36812,59 @@ class TestReviewerSubagents(LedgerBase):
         self.assertEqual(code, sb.EXIT_USAGE)
         self.assertIn("#999", err)
 
+    def test_review_measure_strips_terminal_escapes_from_titles_and_reports_every_way_gh_can_fail(self):
+        self.merged_prs = [self.merged(1, "2026-01-01T12:00:00Z", title="evil \x1b[31mred\x07 title")]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertNotRegex(out, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("evil", out)
+        real = self.route
+        for answer, why in ((subprocess.CompletedProcess([], 1, "", "gh: boom"), "failed"), (subprocess.CompletedProcess([], 0, "not json", ""), "JSON"),
+                            (subprocess.CompletedProcess([], 0, "{}", ""), "not a list")):
+            with self.subTest(why=why):
+                self.route = lambda argv, answer=answer, **kw: answer if argv[1:3] == ["pr", "list"] else real(argv, **kw)
+                code, out, err = self.review("coder", "measure", "acme/app")
+                self.assertEqual(code, sb.EXIT_USAGE)
+                self.assertIn(why, err)
+
+    def test_review_measure_edges_the_escape_window_the_number_match_missing_checks_and_no_split(self):
+        base = self.merged(2, "2026-01-01T12:00:00Z")
+        for title, merged, body, expect in (("Fix it", "2026-01-16T12:00:01Z", "for #2", 0), ("Fix it", "2025-12-31T12:00:00Z", "for #2", 0),
+                                            ("Update things", "2026-01-02T12:00:00Z", "for #2", 0), ("Fix it", "2026-01-02T12:00:00Z", "for #20", 0),
+                                            ("Revert it", "2026-01-15T12:00:00Z", "reverts #2", 1)):
+            with self.subTest(title=title, merged=merged, body=body):
+                other = self.merged(9, merged, title=title, body=body)
+                self.assertEqual(sb.measure_row(base, [], [base, other], "acme/app")["escaped"], expect)
+        none_green = dict(base, statusCheckRollup=[{"conclusion": "FAILURE", "completedAt": "2026-01-01T11:00:00Z"}])
+        self.assertIsNone(sb.measure_row(none_green, [], [none_green], "acme/app")["to_green_min"])
+        early = dict(base, statusCheckRollup=[{"conclusion": "SUCCESS", "completedAt": "2025-01-01T00:00:00Z"}])
+        self.assertIsNone(sb.measure_row(early, [], [early], "acme/app")["to_green_min"])
+        self.assertEqual(sb._median([1, 2, 3, 10]), 2.5)
+        self.merged_prs = [self.merged(n, "2026-01-0%dT12:00:00Z" % n) for n in (1, 2, 3)]
+        code, out, err = self.review("coder", "measure", "acme/app", "--count", "2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("BASELINE (2 PRs", out)
+        self.assertNotIn("AFTER", out)
+        self.assertIn(" -  ", out.split("\n")[2] + "  ", "a missing figure prints as a dash")
+
+    def test_review_measure_reads_the_ledger_for_this_repository_only(self):
+        self.merged_prs = [self.merged(9, "2026-01-01T12:00:00Z")]
+        code, out, err = self.record("coder", "code", "approve", "--blocks", "0", "--notes", "2")
+        self.assertEqual(code, 0, err)
+        for repo, expect in (("acme/app", (1, 2)), ("other/app", (None, None))):
+            with self.subTest(repo=repo):
+                code, out, err = self.review("coder", "measure", repo, "--count", "1", "--json")
+                self.assertEqual(code, 0, err)
+                row = json.loads(out)["baseline"][0]
+                self.assertEqual((row["rounds"], row["notes"]), expect)
+
+    def test_the_coder_pointer_names_only_rules_that_exist_in_the_standards(self):
+        standards = (REPO / "CODING_STANDARDS.md").read_text()
+        for path in (REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            line = [l for l in path.read_text().splitlines() if "CODING_STANDARDS.md" in l][0]
+            for number in re.findall(r"\d+", line.split("(cite", 1)[1].split(":", 1)[0]):
+                self.assertIn("**R-CODE-%s " % number, standards, path.name)
+
     def test_the_skill_and_the_docs_name_the_test_reviewer_and_say_five(self):
         skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
         docs = (REPO / "docs" / "switchboard.md").read_text()
