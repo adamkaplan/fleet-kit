@@ -232,6 +232,16 @@ slowed it or its coders down. Answer in one short paragraph to the agent it name
 `fleet-switchboard send`, only if something is worth fixing; otherwise do nothing and say
 nothing.
 
+## Long runs
+
+Anything that takes more than a few minutes (a full test suite, a build) is started with
+`fleet-switchboard job start <name> -- <command>`: it runs detached in its own session, and the
+exit code and what it printed are kept under the shared temp dir. Before you report it as running,
+ask `fleet-switchboard job status <name>`: one line, **alive**, **finished** (exit code and result
+file) or **dead** (killed, no exit code). A restart of the service or the pane can kill a plain
+background command without any message, and an agent that never looks keeps saying "running" for
+hours. A job found dead that you have not asked about is reported once to your boss.
+
 ## The report
 
 Acknowledge once at the start, naming the accepted scope, the next deliverable

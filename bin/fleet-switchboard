@@ -43,6 +43,7 @@ Python 3.9+, standard library only.
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -1321,7 +1322,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -4200,7 +4201,9 @@ REPORT_TRIAGE_DEFAULTS = {
     "news_threshold": 0.15, # the probability of news below which a stopped note is clearly no news
 }
 NUDGE_TEXT = ("You stopped without telling %s. If your work is done, failed, blocked or needs a decision, run: "
-              "%s report <state> \"one line\". If nothing changed since your last report, say nothing.")
+              "%s report <state> \"one line\". If nothing changed since your last report, say nothing. "
+              "A run you started that takes more than a few minutes belongs in `%s job start <name> -- <command>`; `%s job status <name>` says whether it is "
+              "alive, finished or dead.")
 
 
 def validate_report_triage_config(config, source):
@@ -4324,7 +4327,7 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
         verdict = ask_report_owed(engine, observation, boss, reply, audit)
         if verdict["outcome"] == "nudge":
             verdict["nudge"] = Fact(
-                nudge_key, observation.name, NUDGE, NUDGE_TEXT % (boss, PROG), observation.idle_at,
+                nudge_key, observation.name, NUDGE, NUDGE_TEXT % (boss, PROG, PROG, PROG), observation.idle_at,
                 issue=_issue_of(observation.fleet), batch=False, sender="switchboard")
     audit["outcome"], audit["reason"] = verdict["outcome"], verdict["reason"]
     try:
@@ -14911,6 +14914,255 @@ def add_agents_parsers(sub):
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
+
+
+# ---------------------------------------------------------------- `job`: a long run that survives being asked about, and says when it did not survive
+#
+# A restart of the service (or the pane) can silently kill a coder's background suite, and the coder keeps saying "running" for hours. `job start`
+# runs a command detached in its own session and records it under the shared temp dir; the wrapper writes the exit code to a file when the command
+# ends, so the three states are told apart by evidence: an exit file (finished, with its code), a live process that is the one that was started
+# (alive), neither (dead: killed, no exit code). A dead job its starter has not looked at is reported, once, to the starter's boss (JobFacts).
+JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+JOB_DEAD = "job.dead"
+JOBS_DIR_ENV = "FLEET_JOBS_DIR"
+JOB_WRAPPER = 'exit_path=$1; shift; "$@"; code=$?; printf "%s\\n" "$code" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"'
+
+
+JOB_SCAN_MAX = 200   # the most job directories one daemon pass looks at
+
+
+def jobs_dir():
+    return Path(os.environ.get(JOBS_DIR_ENV) or os.path.join(tempfile.gettempdir(), "fleet-jobs"))
+
+
+def job_private(path):
+    """True when `path` is a directory owned by this user that nobody else can enter or write: a shared temp dir is where another user could
+    plant a record, so a jobs dir that is not private is neither written nor believed."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
+def job_ensure_root(root):
+    """Create the jobs dir private (0700). Raises OSError when it exists and is not private."""
+    root = Path(root)
+    try:
+        os.makedirs(str(root), mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    if not job_private(root):
+        raise OSError(errno.EPERM, "%s is not a private directory (owned by you, mode 0700)" % root)
+
+
+def job_write_atomic(path, text):
+    """The file whole or not at all (a reader never sees half of it): a temp file beside it, renamed into place."""
+    temp = Path("%s.%d.tmp" % (path, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def job_paths(name, root=None):
+    base = Path(root or jobs_dir()) / name
+    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected"}
+
+
+def job_process_token(pid):
+    """What identifies THIS process among later ones with the same pid: its start time as ps prints it, or None when it cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    text = (done.stdout or "").strip()
+    return text if done.returncode == 0 and text else None
+
+
+def job_read(name, root=None):
+    paths = job_paths(name, root)
+    try:
+        if os.lstat(str(paths["record"])).st_uid != os.getuid():
+            return None   # a record someone else wrote is not believed
+        record = json.loads(paths["record"].read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("name") == name else None
+
+
+def job_state(record, root=None):
+    """("finished", exit code) | ("alive", None) | ("dead", None) | ("unknown", None): by evidence, never by a guess."""
+    paths = job_paths(record["name"], root)
+    try:
+        code = int(paths["exit"].read_text().strip())
+        return "finished", code
+    except (OSError, ValueError):
+        pass
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid < 2:
+        return "unknown", None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", None
+    except PermissionError:
+        return "alive", None   # it exists, owned by someone else: not ours to call dead
+    token = record.get("token")
+    now_token = job_process_token(pid)
+    if token and now_token and now_token != token:
+        return "dead", None    # the pid was reused by another process: ours is gone
+    return "alive", None
+
+
+def job_age(seconds):
+    seconds = max(0, int(seconds))
+    return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
+
+
+def job_line(record, state, code, now, root=None):
+    paths = job_paths(record["name"], root)
+    age = job_age(now - float(record.get("started") or now))
+    if state == "alive":
+        return "alive: %s pid %s, running %s; log %s" % (record["name"], record.get("pid"), age, paths["log"])
+    if state == "finished":
+        return "finished: %s exit code %d after it started %s ago; result %s" % (record["name"], code, age, paths["log"])
+    if state == "dead":
+        return "dead: %s was killed (no exit code); it started %s ago; what it printed is in %s" % (record["name"], age, paths["log"])
+    return "unknown: %s has no process id on record" % record["name"]
+
+
+def cmd_job(args, runner, now, spawn=subprocess.Popen):
+    """`job start <name> -- <command...>` and `job status <name>`. Start is detached and prints one line; status is one line."""
+    if not JOB_NAME_RE.match(args.name or ""):
+        sys.stderr.write("%s: job: name must match %s, got %r\n" % (PROG, JOB_NAME_RE.pattern, args.name))
+        return EXIT_USAGE
+    root = jobs_dir()
+    if args.job_action == "status":
+        record = job_read(args.name, root)
+        if record is None:
+            sys.stderr.write("%s: job: no job named %s under %s\n" % (PROG, args.name, root))
+            return EXIT_ERROR
+        state, code = job_state(record, root)
+        print(job_line(record, state, code, now(), root))
+        if state != "alive":   # whoever asked has now seen how it ended: it is collected, and nobody else is told
+            try:
+                job_write_atomic(job_paths(args.name, root)["collected"], str(int(now())))
+            except OSError:
+                pass
+        return EXIT_OK if state == "alive" or (state == "finished" and code == 0) else EXIT_ERROR
+    command = [part for part in (args.command or []) if part != "--"] if args.command and args.command[0] == "--" else list(args.command or [])
+    if not command:
+        sys.stderr.write("%s: job start: give the command after --, e.g. `job start suite -- bin/test-switchboard`\n" % PROG)
+        return EXIT_USAGE
+    try:
+        job_ensure_root(root)
+    except OSError as err:
+        sys.stderr.write("%s: job: %s\n" % (PROG, err.strerror or err))
+        return EXIT_ERROR
+    paths = job_paths(args.name, root)
+    lock = os.open(str(root / (args.name + ".lock")), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)   # the check and the start are one step: two starts of one name cannot both pass
+        earlier = job_read(args.name, root)
+        if earlier is not None and job_state(earlier, root)[0] == "alive":
+            sys.stderr.write("%s: job: %s is still running (pid %s): `job status %s`; pick another name or wait\n" % (PROG, args.name, earlier.get("pid"), args.name))
+            return EXIT_ERROR
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+        os.chmod(str(paths["dir"]), 0o700)
+        for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        log = os.open(str(paths["log"]), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            process = spawn(["/bin/sh", "-c", JOB_WRAPPER, "fleet-job", str(paths["exit"])] + command, stdin=subprocess.DEVNULL, stdout=log,
+                            stderr=subprocess.STDOUT, start_new_session=True, close_fds=True, cwd=os.getcwd())
+        except OSError as err:
+            sys.stderr.write("%s: job: cannot start %s: %s\n" % (PROG, command[0], err.strerror or err))
+            return EXIT_ERROR
+        finally:
+            os.close(log)
+        session, starter = job_starter(runner, now)
+        record = {"name": args.name, "argv": command, "pid": process.pid, "started": now(), "token": job_process_token(process.pid),
+                  "cwd": os.getcwd(), "session": session, "starter": starter}
+        job_write_atomic(paths["record"], json.dumps(record, indent=1, sort_keys=True) + "\n")
+    finally:
+        os.close(lock)
+    print("started: %s pid %d; `%s job status %s` says how it is; log %s" % (args.name, process.pid, PROG, args.name, paths["log"]))
+    return EXIT_OK
+
+
+def job_starter(runner, now):
+    """(session, fleet name) of the agent that starts a job, established the way every command does it (its OWN session, known to v2 as a
+    fleet agent), or (None, None): a job nobody can vouch for is never reported to anyone's boss."""
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        fleet = session_identity(engine.herdr, engine.v2, os.environ)
+    except Exception:
+        return None, None
+    return (os.environ.get(SESSION_ENV), fleet["name"]) if fleet else (None, None)
+
+
+def add_job_parsers(sub):
+    job = sub.add_parser("job", help="Run something longer than a few minutes detached, and ask whether it is alive, finished or dead",
+                         description="A restart can kill a background run silently. `job start NAME -- COMMAND...` runs it detached in its own session and records "
+                                     "it under the shared temp dir (or $FLEET_JOBS_DIR); `job status NAME` prints one line: alive, finished (with its exit code and the "
+                                     "result file) or dead (killed, no exit code). A job found dead that nobody asked about is reported once to its starter's boss.")
+    job_sub = job.add_subparsers(dest="job_action", required=True)
+    start = job_sub.add_parser("start", help="Start a command detached and record it")
+    start.add_argument("name", help="Lower case letters, digits, - and _ (at most 40)")
+    start.add_argument("command", nargs=argparse.REMAINDER, help="The command, after --")
+    status = job_sub.add_parser("status", help="One line: alive, finished (exit code, result file) or dead (killed, no exit code)")
+    status.add_argument("name")
+
+
+class JobFacts:
+    """`job.dead:<name>:<started>` for a job whose process is gone without an exit code and that its starter has not looked at: one line to the
+    starter's boss. The key is stable, so a message already delivered with it is never sent again; `job status` (the starter looking) ends it."""
+
+    __name__ = "job_facts"
+
+    def __init__(self, root=None):
+        self.root, self.engine = root, None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None)
+        root = Path(self.root or jobs_dir())
+        if engine is None or discovery is None or not job_private(root):   # a dir another user can write is not believed
+            return []
+        facts = []
+        for entry in sorted(root.iterdir())[:JOB_SCAN_MAX]:
+            if not JOB_NAME_RE.match(entry.name) or not entry.is_dir():
+                continue
+            record = job_read(entry.name, root)
+            if record is None or not record.get("session") or job_paths(entry.name, root)["collected"].exists():
+                continue
+            if job_state(record, root)[0] != "dead":
+                continue
+            worker = next((o for o in discovery.agents.values() if o.session_id == record["session"] and o.name == record.get("starter")
+                           and not o.conflict and not o.problem), None)
+            boss = boss_name(discovery, worker) if worker is not None else None
+            if boss is None:
+                continue
+            started = float(record.get("started") or 0)
+            facts.append(Fact("%s:%s:%d" % (JOB_DEAD, entry.name, int(started)), boss, JOB_DEAD,
+                              "%s's job %s was killed before it finished (no exit code; started %s ago): `%s job status %s` on its machine says so; "
+                              "what it printed is in %s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"]),
+                              started or engine.now(), batch=False, sender="switchboard"))
+        return facts
 
 
 def add_review_laws_parsers(sub):
