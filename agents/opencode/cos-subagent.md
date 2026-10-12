@@ -79,11 +79,10 @@ permissions:
   - {action: shell, resource: "uptime", effect: allow}
   - {action: shell, resource: "timeout ? fleet-switchboard *", effect: allow}
   - {action: shell, resource: "timeout ?? fleet-switchboard *", effect: allow}
-  - {action: shell, resource: "timeout * gh * view *", effect: allow}
-  - {action: shell, resource: "timeout * gh * list *", effect: allow}
-  - {action: shell, resource: "timeout * az * show *", effect: allow}
-  - {action: shell, resource: "timeout * az * list *", effect: allow}
-  - {action: shell, resource: "timeout * git ls-remote *", effect: allow}
+  - {action: shell, resource: "timeout * gh pr view *", effect: allow}
+  - {action: shell, resource: "timeout * gh issue view *", effect: allow}
+  - {action: shell, resource: "timeout * gh pr list *", effect: allow}
+  - {action: shell, resource: "timeout * gh issue list *", effect: allow}
   - {action: shell, resource: "herdr * list*", effect: allow}
   - {action: shell, resource: "herdr * get*", effect: allow}
   - {action: shell, resource: "herdr * read*", effect: allow}
@@ -100,8 +99,8 @@ permissions:
   - {action: shell, resource: "timeout * fleet-switchboard gates on*", effect: deny}
   - {action: shell, resource: "timeout * fleet-switchboard waive *G6*", effect: deny}
   - {action: shell, resource: "timeout * fleet-switchboard waive *G8*", effect: deny}
-  - {action: shell, resource: "timeout * az *secret*", effect: deny}
-  - {action: shell, resource: "timeout * az *get-access-token*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard decisions batch*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard launch *", effect: deny}
   - {action: shell, resource: "fleet-switchboard decisions batch*", effect: deny}
   - {action: shell, resource: "fleet-switchboard gates *enforce*", effect: deny}
   - {action: shell, resource: "fleet-switchboard gates *ENFORCE*", effect: deny}

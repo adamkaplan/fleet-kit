@@ -8608,7 +8608,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
                         "gh pr merge 5 --squash", "gh issue close 5", "gh pr comment 5 --body ok", "az webapp show -n a -g g", "az group list",
                         "fleet-switchboard handoff --issue 5 --brief-file -", "fleet-switchboard launch v --agent orchestrator",
-                        "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "fleet-switchboard decisions 2>&1", "ls 2>&1",
+                        "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api", "herdr pane read p1 --lines 50", "herdr api snapshot", "herdr tab rename t1 x", "fleet-switchboard decisions 2>&1", "ls 2>&1",
                         "gh api repos/o/r/issues/1 --jq '.title + \" \" + (.number|tostring)'", "git -C /home/a/Code/widget status", "git remote -v",
                         "git worktree list", "git --no-pager log -3", "git branch -vv", "git merge-base main HEAD", "git ls-remote origin",
                         "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off", "fleet-switchboard gates preflight acme/app",
@@ -8622,7 +8622,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
-                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x",
+                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
