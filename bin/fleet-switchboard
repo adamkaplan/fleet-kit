@@ -13804,7 +13804,148 @@ def cmd_review_laws(args, runner, now):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
+
+REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
+REVIEW_FILE_MAX = 30000      # bytes of one law file a reviewer is shown
+REVIEW_TOTAL_MAX = 90000     # bytes of all of them together
+
+
+def _review_pr(args, engine):
+    """(repo, number, ref, raw) of the PR in `args`, read with the PR's own account; raises ReviewError."""
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        raise ReviewError(str(err)) from None
+    try:
+        raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName")
+    except NoticeError as err:
+        raise ReviewError(str(err)) from None
+    return repo, number, "%s#%d" % (repo, number), raw
+
+
+def review_laws_text(engine, config, runner, now, repo, base_sha):
+    """The review laws of `repo` AS THEY STAND AT `base_sha` (the PR's base commit, never its head: a PR cannot rewrite the law it is judged
+    by), then the repository's overlay and a local overlay kept outside the repository. Returns (text, missing files)."""
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    parts, missing, total = [], [], 0
+    for name in REVIEW_LAW_FILES:
+        try:
+            got = reader._api("repos/%s/contents/%s?ref=%s" % (repo, name, base_sha), repo)
+        except IntentError:
+            missing.append(name)
+            continue
+        raw = got.get("content") if isinstance(got, dict) else None
+        if not isinstance(raw, str) or got.get("encoding") != "base64":
+            missing.append(name)
+            continue
+        try:
+            text = base64.b64decode(raw).decode("utf-8", "replace")
+        except ValueError:
+            missing.append(name)
+            continue
+        if len(text.encode("utf-8")) > REVIEW_FILE_MAX:
+            text = text.encode("utf-8")[:REVIEW_FILE_MAX].decode("utf-8", "ignore") + "\n[cut at %d bytes]" % REVIEW_FILE_MAX
+        total += len(text)
+        if total > REVIEW_TOTAL_MAX:
+            missing.append(name + " (over the total size limit)")
+            continue
+        parts.append("===== %s (from %s at the base commit %s) =====\n%s" % (name, repo, base_sha[:12], text))
+    local = local_review_overlay(repo)
+    if local:
+        parts.append("===== local overlay for %s (kept outside the repository) =====\n%s" % (repo, local))
+    return "\n\n".join(parts), missing
+
+
+def local_review_overlay(repo):
+    """The operator's own overlay for `repo`, if one exists: $XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md (capped)."""
+    path = config_path().parent / "review-overlay" / (repo.replace("/", "__").lower() + ".md")
+    try:
+        return path.read_text(encoding="utf-8")[:REVIEW_FILE_MAX]
+    except (OSError, UnicodeError):
+        return ""
+
+
+def cmd_review(args, runner, now):
+    """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
+    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
+        repo, number, ref, raw = _review_pr(args, engine)
+        head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
+        if args.review_cmd == "laws":
+            base = raw.get("baseRefOid")
+            if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
+                raise ReviewError("the PR's base commit is unknown: nothing is shown (the laws are read from the base, never the head)")
+            text, missing = review_laws_text(engine, config, runner, now, repo, base)
+            if not text:
+                raise ReviewError("%s has no review laws at its base commit %s (none of %s): install them with `review-laws install`" % (
+                    repo, base[:12], ", ".join(REVIEW_LAW_FILES)))
+            print(text)
+            if missing:
+                sys.stderr.write("%s: review laws: not at the base commit: %s\n" % (PROG, ", ".join(missing)))
+            return EXIT_OK
+        if args.reviewer not in plan_ledger.REVIEWERS:
+            raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
+        if args.verdict not in plan_ledger.REVIEW_VERDICTS:
+            raise ReviewError("--verdict must be one of %s" % ", ".join(plan_ledger.REVIEW_VERDICTS))
+        for name in ("blocks", "notes"):
+            if getattr(args, name) < 0 or getattr(args, name) > 200:
+                raise ReviewError("--%s must be a number from 0 to 200" % name)
+        if args.verdict == "approve" and args.blocks:
+            raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
+        if args.verdict == "request-changes" and not args.blocks:
+            raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
+        if args.impact_action and args.reviewer != "impact":
+            raise ReviewError("--impact-action belongs to the impact reviewer")
+        if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was recorded")
+        given = args.head or head
+        if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
+            raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+        kind = gates_caller_kind(runner, now)
+        if kind[0] == "unknown":
+            raise ReviewError("refused: %s" % kind[1])
+        by = kind[1] if kind[0] == "agent" else "person"
+        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
+                 "blocks": args.blocks, "notes": args.notes, "by": by,
+                 "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if args.impact_action:
+            entry["impact_action"] = args.impact_action
+        stored = plan_ledger.append_entry(state, entry, now())
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
+                                                                    "by": by, "seq": stored["seq"], "chain": stored["hash"]})
+        entries, problem = plan_ledger.read_ledger(state)
+        got = plan_ledger.review_records_at(entries, ref, head)
+        print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
+            args.reviewer, args.verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+            "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
+        return EXIT_OK
+    except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+
+
+def add_review_parsers(sub):
+    review = sub.add_parser("review", help="Reviewer subagents (#179): print the laws from the PR's base commit, record a reviewer's result")
+    rsub = review.add_subparsers(dest="review_cmd", required=True)
+    laws = rsub.add_parser("laws", help="Print the repository's review laws and overlay as they stand at the PR's BASE commit")
+    laws.add_argument("pr", help="owner/repo#N or the PR's URL")
+    record = rsub.add_parser("record", help="A reviewer records its result for the PR's current head")
+    record.add_argument("pr", help="owner/repo#N or the PR's URL")
+    record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
+    record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
+    record.add_argument("--verdict", required=True, help="approve | request-changes | comment | incomplete")
+    record.add_argument("--blocks", type=int, default=0, help="Blocking findings (each cites a rule)")
+    record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
+    record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
+                        help="The impact reviewer's action from the matrix")
+    record.add_argument("--summary", help="One line (at most 200 characters)")
+
+
 def add_review_laws_parsers(sub):
+    add_review_parsers(sub)
     laws = sub.add_parser("review-laws", help="The review laws starter set (#179)")
     laws_sub = laws.add_subparsers(dest="laws_action", required=True)
     install = laws_sub.add_parser("install", help="Copy the generic review laws and standards into a repository and say what to edit")
@@ -16431,6 +16572,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_policy_report(args, runner, now)
     if args.action == "review-laws":  # #179: copies files, never ensures the daemon
         return cmd_review_laws(args, runner, now)
+    if args.action == "review":  # #179 L2: reads GitHub, `record` writes the ledger; never ensures the daemon
+        return cmd_review(args, runner, now)
     if args.action == "plan":  # #135: reads only, never ensures the daemon
         if args.plan_action == "review":  # #109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled
             return cmd_plan_review(args, runner, now, socket_call)
@@ -16516,7 +16659,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 KIT_ROOT = Path(__file__).resolve().parent.parent
 STANDARD_MODEL = "github-copilot/claude-sonnet-5.5"  # the model every kit agent file gets
-KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent")
+KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent", "reviewer-code", "reviewer-architecture", "reviewer-security", "reviewer-impact")
 DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
 DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
 HOOKS_PLUGIN_FILE = "fleet-hooks.js"
@@ -16924,7 +17067,8 @@ def write_if_changed(path, content):
 
 def kit_agent_text(name, model, kit_root=KIT_ROOT):
     """A kit agent file with the model placeholder filled in."""
-    return (Path(kit_root) / "agents" / "opencode" / (name + ".md")).read_text().replace("__PROVIDER__/__MODEL_ID__", model)
+    folder = "reviewers" if name.startswith("reviewer-") else "opencode"   # the reviewer subagents are not fleet roles: they live in their own folder
+    return (Path(kit_root) / "agents" / folder / (name + ".md")).read_text().replace("__PROVIDER__/__MODEL_ID__", model)
 
 
 def install_agents(config_dir, model=STANDARD_MODEL, kit_root=KIT_ROOT):

@@ -13,6 +13,7 @@ The last line printed is `RESULT: PASS` or `RESULT: FAIL`, and the exit code
 is non-zero on failure.
 """
 import ast
+import base64
 import contextlib
 import copy
 import fcntl
@@ -35602,6 +35603,221 @@ class TestReviewLawsStarterSet(Base):
     def test_the_docs_name_the_command(self):
         self.assertIn("review-laws install", (REPO / "docs" / "switchboard.md").read_text())
 
+
+
+class TestReviewerSubagents(LedgerBase):
+    """#179 slice L2: the four reviewer agents, `review laws` (from the base commit) and `review record` with its shadow line in `gates`."""
+
+    BASE = "b" * 40
+    ROLES = ("code", "architecture", "security", "impact")
+    LAW_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md", "REVIEW_OVERLAY.md")
+
+    def setUp(self):
+        super().setUp()
+        self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main")
+        self.contents_calls = []
+        self.contents = {(name, self.BASE): "base text of %s: rule R-CODE-3\n" % name for name in self.LAW_FILES[:4]}
+        self.contents[("REVIEW_LAWS.md", LEDGER_HEAD)] = "EDITED BY THE PR HEAD\n"
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2]:
+            self.contents_calls.append(argv[2])
+            match = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2])
+            text = self.contents.get((match.group(1), match.group(2)))
+            if text is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            body = {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return super().route(argv, **kwargs)
+
+    def review(self, who, *argv):
+        return self.run_as(who, "review", *argv)
+
+    def record(self, who, reviewer, verdict="approve", *more, head=None):
+        argv = ["record", self.PR, "--reviewer", reviewer, "--verdict", verdict, *more]
+        if head:
+            argv += ["--head", head]
+        return self.review(who, *argv)
+
+    def front(self, role):
+        text = (REPO / "agents" / "reviewers" / ("reviewer-%s.md" % role)).read_text()
+        head = text.split("---\n")[1]
+        perms = [(m.group(1), m.group(2), m.group(3)) for m in re.finditer(r'- \{action: "?([^,"]+)"?, resource: "([^"]+)", effect: (allow|deny)\}', head)]
+        return text, head, perms
+
+    # -- the definitions
+
+    def test_each_reviewer_is_a_read_only_subagent_with_a_50_turn_limit_and_no_build_or_test_command(self):
+        for role in self.ROLES:
+            with self.subTest(role=role):
+                text, head, perms = self.front(role)
+                self.assertRegex(head, r"(?m)^mode: subagent$")
+                self.assertRegex(head, r"(?m)^steps: 50$")
+                self.assertRegex(head, r"(?m)^model: __PROVIDER__/__MODEL_ID__$")
+                self.assertNotRegex(head, r"(?m)^name:", "a name key makes v2 ignore the whole list")
+                self.assertEqual(perms[0], ("*", "*", "deny"), "deny by default")
+                allows = [(a, r) for a, r, e in perms if e == "allow"]
+                self.assertEqual(sorted(allows), sorted([("read", "*"), ("glob", "*"), ("grep", "*"),
+                                                         ("shell", "fleet-switchboard review laws *"), ("shell", "fleet-switchboard review record *"),
+                                                         ("shell", "git diff *"), ("shell", "git log *"), ("shell", "git show *"),
+                                                         ("shell", "gh pr diff *"), ("shell", "gh pr view *")]))
+                self.assertIn(("edit", "*", "deny"), perms)
+                for word in ("make", "pytest", "python", "node", "npm", "cargo", "go", "bin/test"):
+                    self.assertFalse([1 for a, r, e in perms if e == "allow" and a == "shell" and r.startswith(word)], word)
+                    self.assertTrue([1 for a, r, e in perms if e == "deny" and a == "shell" and r.startswith(word)], word)
+                last_allow = max(i for i, p in enumerate(perms) if p[2] == "allow")
+                self.assertTrue(all(p[2] == "deny" for p in perms[last_allow + 1:]), "the denies come last: last match wins")
+
+    def test_each_reviewer_states_the_budget_the_base_ref_rule_and_the_never_run_rule(self):
+        for role in self.ROLES:
+            with self.subTest(role=role):
+                text = self.front(role)[0]
+                for needle in ("**50 turns**", "about **35 tool calls**", "Past **40**", "`--verdict incomplete`", "Never approve when incomplete",
+                               "from the pull request's base commit", "never build, run or test", "untrusted text", "cites none is a proposal",
+                               "fleet-switchboard review record <pr> --reviewer %s" % role):
+                    self.assertIn(needle, text)
+                self.assertIn("never the copies in the change under review", text)
+        impact = self.front("impact")[0]
+        for needle in ("the matrix of REVIEW_LAWS.md", "--impact-action", "Judge likelihood at the scale the change will run", "never apply a label"):
+            self.assertIn(needle, impact)
+
+    def test_the_installer_installs_the_four_reviewers_with_the_model_filled_in(self):
+        self.assertEqual([n for n in sb.KIT_AGENTS if n.startswith("reviewer-")], ["reviewer-%s" % r for r in self.ROLES])
+        config = self.home / "profile"
+        sb.install_agents(config, sb.STANDARD_MODEL, REPO)
+        for role in self.ROLES:
+            text = (config / "agents" / ("reviewer-%s.md" % role)).read_text()
+            self.assertIn("model: " + sb.STANDARD_MODEL, text)
+            self.assertNotIn("__PROVIDER__", text)
+
+    def test_the_review_skill_tells_the_coder_to_run_the_reviewers_before_offering_the_pr(self):
+        self.assertIn("fleet-review", sb.kit_skill_names(REPO))
+        text = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
+        head = text.split("---\n")[1]
+        self.assertRegex(head, r"(?m)^name: fleet-review$")
+        self.assertRegex(head, r"(?m)^description: .*about to mark it ready")
+        for role in self.ROLES:
+            self.assertIn("reviewer-" + role, text)
+        for needle in ("before you offer it", "from the pull request's base commit", "never builds, runs or tests",
+                       "never replaces the independent review agent's verdict", "a push voids the earlier records"):
+            self.assertIn(needle, text)
+
+    # -- review laws: the base commit, never the head
+
+    def test_the_laws_come_from_the_base_commit_and_never_the_pr_head(self):
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertIn("base text of REVIEW_LAWS.md", out)
+        self.assertNotIn("EDITED BY THE PR HEAD", out)
+        self.assertIn("at the base commit %s" % self.BASE[:12], out)
+        self.assertTrue(self.contents_calls)
+        self.assertTrue(all(c.endswith("ref=" + self.BASE) for c in self.contents_calls), self.contents_calls)
+        self.assertNotIn("REVIEW_OVERLAY.md", out, "no overlay in the repository: none shown")
+        self.assertIn("not at the base commit: REVIEW_OVERLAY.md", err)
+
+    def test_a_repository_overlay_and_a_local_overlay_are_shown_after_the_laws(self):
+        self.contents[("REVIEW_OVERLAY.md", self.BASE)] = "extra law: no new dependencies\n"
+        overlay = self.home / "xdg-config" / "fleet-switchboard" / "review-overlay"
+        overlay.mkdir(parents=True)
+        (overlay / "acme__app.md").write_text("operator note: be strict on migrations\n")
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertLess(out.index("base text of REVIEW_LAWS.md"), out.index("extra law: no new dependencies"))
+        self.assertLess(out.index("extra law: no new dependencies"), out.index("operator note: be strict on migrations"))
+        self.assertIn("local overlay for acme/app (kept outside the repository)", out)
+
+    def test_no_laws_at_the_base_or_an_unknown_base_is_refused_with_the_way_out(self):
+        self.contents = {}
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 2)
+        self.assertIn("review-laws install", err)
+        self.pr.pop("baseRefOid")
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 2)
+        self.assertIn("base commit is unknown", err)
+
+    def test_a_law_file_over_the_size_limit_is_cut_and_says_so(self):
+        self.contents[("CODING_STANDARDS.md", self.BASE)] = "x" * (sb.REVIEW_FILE_MAX + 500)
+        code, out, err = self.review("coder", "laws", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertIn("[cut at %d bytes]" % sb.REVIEW_FILE_MAX, out)
+
+    # -- review record
+
+    def test_a_reviewer_records_one_chained_entry_at_the_current_head(self):
+        code, out, err = self.record("coder", "code", "request-changes", "--blocks", "2", "--notes", "1", "--summary", "a write can be torn")
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 of 4 reviewers recorded", out)
+        (entry,) = [e for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual((entry["pr"], entry["head"], entry["reviewer"], entry["verdict"], entry["blocks"], entry["notes"], entry["by"]),
+                         (self.PR, LEDGER_HEAD, "code", "request-changes", 2, 1, "coder"))
+        self.assertNotIn("result", entry)
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.world.state)[1])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "review.record"])
+
+    def test_a_record_for_a_stale_head_a_bad_reviewer_or_an_inconsistent_verdict_is_refused_and_writes_nothing(self):
+        cases = (("code", "approve", ("--head", "d" * 40), "is not the PR's head"),
+                 ("code", "approve", ("--head", "abc"), "is not the PR's head"),
+                 ("tester", "approve", (), "--reviewer must be one of"),
+                 ("code", "yes", (), "--verdict must be one of"),
+                 ("code", "approve", ("--blocks", "1"), "cannot carry blocking findings"),
+                 ("code", "request-changes", (), "needs at least 1 blocking finding"),
+                 ("code", "approve", ("--impact-action", "hold"), "belongs to the impact reviewer"),
+                 ("code", "approve", ("--blocks", "999"), "from 0 to 200"))
+        for reviewer, verdict, more, needle in cases:
+            with self.subTest(more=more, needle=needle):
+                code, out, err = self.review("coder", "record", self.PR, "--reviewer", reviewer, "--verdict", verdict, *more)
+                self.assertEqual(code, 2)
+                self.assertIn(needle, err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+
+    def test_the_impact_reviewer_records_its_action_and_an_unknown_identity_is_refused(self):
+        code, out, err = self.record("coder", "impact", "comment", "--impact-action", "second-review", "--notes", "1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"][0]["impact_action"], "second-review")
+        with mock.patch.object(sb, "gates_caller_kind", lambda *a, **k: ("unknown", "an uncertain identity")):
+            code, out, err = self.record("coder", "code")
+        self.assertEqual(code, 2)
+        self.assertIn("uncertain identity", err)
+
+    def test_the_latest_record_per_reviewer_at_the_head_counts(self):
+        self.record("coder", "code", "request-changes", "--blocks", "1")
+        self.record("coder", "code", "approve")
+        got = sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
+        self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact"]))
+
+    # -- the shadow line
+
+    def gates_text(self):
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertIn(code, (0, 1), err)   # 1 is NOT READY: the shadow line is shown either way
+        return out
+
+    def test_gates_shows_how_many_of_the_four_recorded_at_the_head_and_a_push_voids_them(self):
+        self.assertIn("reviewers (shadow, not counted): 0 of 4 recorded at %s; missing code, architecture, security, impact" % LEDGER_HEAD[:8], self.gates_text())
+        for role in self.ROLES:
+            self.assertEqual(self.record("coder", role)[0], 0)
+        self.assertIn("4 of 4 recorded at %s: architecture approve, code approve, impact approve, security approve" % LEDGER_HEAD[:8], self.gates_text())
+        self.pr["headRefOid"] = "c" * 40   # a push
+        self.assertIn("0 of 4 recorded at cccccccc", self.gates_text())
+
+    def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
+        def ready():
+            code, out, err = self.run_as("coder", "gates", self.PR, "--json")
+            body = json.loads(out)
+            return body["ready"], body["reviews"]
+        before, reviews = ready()
+        self.assertEqual(reviews["recorded"], {})
+        for role in self.ROLES:
+            self.record("coder", role, "request-changes", "--blocks", "1")   # even four requests for changes
+        after, reviews = ready()
+        self.assertEqual(before, after)
+        self.assertEqual(len(reviews["recorded"]), 4)
+
+    def test_the_docs_name_the_commands_and_the_agents(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        for needle in ("review laws", "review record", "reviewer-code", "reviewer-impact", "shadow"):
+            self.assertIn(needle, text)
 
 plan_review = _load("t_plan_review", BIN / "plan_review.py")
 
