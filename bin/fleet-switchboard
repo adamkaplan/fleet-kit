@@ -1193,9 +1193,12 @@ class HerdrClient:
     def open_tab_running(self, workspace, label, cwd, argv, env):
         """A new tab in `workspace` whose one pane execs `argv` directly. Never
         types, never takes focus. Returns {"tab_id", "pane_id"}."""
+        # A pane is an AGENT's: the marker a switchboard process carries for its own gh calls must not reach it (the gh shim would then skip
+        # the per-repo account), so it is named here with an empty value, which the shim does not read as set; an inherited one is overridden.
+        pane_env = dict(env, **{OWN_GH_ENV: ""})
         reply = self._socket("layout.apply", {
             "workspace_id": workspace, "tab_label": label,
-            "root": {"type": "pane", "label": label, "cwd": cwd, "command": list(argv), "env": dict(env)}})
+            "root": {"type": "pane", "label": label, "cwd": cwd, "command": list(argv), "env": pane_env}})
         layout = (reply or {}).get("result", {}).get("layout") if isinstance(reply, dict) else None
         root = layout.get("root") if isinstance(layout, dict) else None
         pane, tab = (root or {}).get("pane_id"), layout.get("tab_id") if isinstance(layout, dict) else None
@@ -3304,6 +3307,17 @@ class LaunchError(Exception):
 
 RESERVED_AGENT_NAMES = ("fleet-switchboard", "switchboard", "plan-review", "owner")   # names the switchboard itself acts under: no agent may take one
 LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lanes: only it launches them
+
+
+def launch_agent_problem(config, runner, agent):
+    """Why `agent` cannot be launched: the OpenCode service does not know it (an agent with no installed definition starts as the default Build
+    agent with the brief unsent). None when it is registered, or when the service cannot be asked (v2 then refuses it itself)."""
+    state, found = agents_found(runner, config.get("opencode") or "opencode", AGENTS_VERIFY_TIMEOUT)
+    if state != "up" or agent in found:
+        return None
+    known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
+    return ("--agent %r is not registered with the OpenCode service, so it would start as the default agent and the brief would not be sent "
+            "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
 def launch_problems(name, agent, directory, workspace, issue, charter=None):
@@ -10657,6 +10671,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
+    problem = launch_agent_problem(engine.config, runner, args.agent)
+    if problem:
+        raise LaunchError(problem)
     brief = read_brief(args.brief_file, sys.stdin)
     launch_gate_probe(engine, state, engine.config, args, brief, runner, now)   # #107 slice 3c: shadow only, never refuses
     launched = now()
