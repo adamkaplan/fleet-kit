@@ -17446,6 +17446,47 @@ class TestPlanLedger(LedgerBase):
         self.assertIn("judged by reviewer, not tester", err)
         self.assertEqual(len(self.ledger()), 2)
 
+    def test_all_records_every_scenario_the_role_judges_and_never_another_roles(self):
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        code, out, err = self.run_as("tst", "verdict", "--pr", self.PR, "--as", "tester", "--all", "--result", "pass",
+                                     "--evidence", "ran the whole plan by hand: matches")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(e["scenario"], e["evaluator"], e["by"]) for e in self.ledger() if e["kind"] == "verdict"],
+                         [("S2", "tester", "tst")])
+        self.assertEqual(out.count("recorded tester verdict"), 1)
+        code, out, err = self.run_as("rev", "verdict", "--pr", self.PR, "--as", "reviewer", "--all", "--result", "pass",
+                                     "--evidence", "read the diff against the plan")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({e["scenario"] for e in self.ledger() if e["kind"] == "verdict" and e["evaluator"] == "reviewer"}, {"S3"})
+        # ci scenarios are judged by the recorder, so a registered ci agent records both of its scenarios in one command
+        code, out, err = self.run_as("cibot", "verdict", "--pr", self.PR, "--as", "ci", "--all", "--result", "pass", "--evidence", "ci run green")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(e["scenario"] for e in self.ledger() if e["kind"] == "verdict" and e["evaluator"] == "ci"), ["S1", "U1"])
+
+    def test_all_refuses_an_author_an_unregistered_agent_a_scenario_id_and_a_role_with_no_scenario(self):
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        before = len(self.ledger())
+        base = ("verdict", "--pr", self.PR, "--all", "--result", "pass", "--evidence", "judged it")
+        code, out, err = self.run_as("coder", *base, "--as", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("an author cannot record a verdict", err)    # the author of the PR, registered or not
+        self.configure(evaluators={"reviewer": ["rev", "coder"], "tester": ["tst", "coder"], "ci": ["cibot"]})
+        code, out, err = self.run_as("coder", *base, "--as", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("an author cannot record a verdict", err)
+        code, out, err = self.run_as("other", *base, "--as", "reviewer")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered to record reviewer", err)
+        code, out, err = self.run_as("tst", "verdict", "S2", *base[1:], "--as", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("--all takes no scenario id", err)
+        code, out, err = self.run_as("own", *base, "--as", "owner")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.ledger()), before, "nothing was recorded by any refused call")
+        code, out, err = self.run_as("tst", "verdict", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "x ok")
+        self.assertEqual(code, 2)
+        self.assertIn("name the scenario", err)
+
     def test_only_a_registered_agent_may_record_and_by_default_nobody_may(self):
         self.assertEqual(self.prove("coder", "S3")[0], 0)
         code, out, err = self.verdict("other", "S3", "reviewer")
@@ -17669,6 +17710,58 @@ class TestPlanLedger(LedgerBase):
         self.assertIn("NOT READY", out)
         self.assertIn("missing:", out)
         self.assertIn("not tracked yet", out)
+
+    def test_the_summary_and_exit_follow_the_enforced_gates_and_all_asks_for_the_whole_board(self):
+        self.pr["body"] = "PLAN: acme/app#7"   # no canon line: G5 is open, and a repo need not enforce it
+        self.all_proven()
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 1, "shadow or unlisted: the whole board, as before")
+        self.assertIn("NOT READY", out)
+        board = self.gates()[1]
+        open_rows = [r["gate"] for r in board["gates"] if r["status"] in ("missing", "waiting")]
+        self.assertTrue(open_rows, "this PR has a gate open that a repo may not enforce (G5 canon)")
+        with mock.patch.object(sb, "enforced_gates_of", lambda ctx: ["G0a", "G1"]):
+            code, out, err = self.run_as("coder", "gates", self.PR)
+            self.assertEqual(code, 0, out)
+            first = out.splitlines()[0]
+            self.assertIn("READY for the enforced gates (G0a, G1); not enforced: ", first)
+            self.assertIn("%s missing" % open_rows[0], first)
+            self.assertEqual(self.run_as("coder", "gates", self.PR, "--all")[0], 1, "--all: the full board decides the exit")
+            code, report, err = self.gates()
+            self.assertEqual((code, report["enforced"], report["ready_enforced"], report["ready"]), (0, ["G0a", "G1"], True, False))
+        with mock.patch.object(sb, "enforced_gates_of", lambda ctx: ["G0a", "G1", "G5"]):
+            code, out, err = self.run_as("coder", "gates", self.PR)
+            self.assertEqual(code, 1)
+            self.assertIn("NOT READY for the enforced gates (G0a, G1, G5): open G5", out.splitlines()[0])
+
+    def test_a_proof_missing_on_an_enforced_gate_is_not_ready_for_the_enforced_gates(self):
+        with mock.patch.object(sb, "enforced_gates_of", lambda ctx: ["G0a", "G1"]):
+            code, out, err = self.run_as("coder", "gates", self.PR)
+            self.assertEqual(code, 1)
+            self.assertIn("NOT READY for the enforced gates (G0a, G1): open G1", out.splitlines()[0])
+
+    def test_stats_count_records_by_actor_and_minutes_to_merge_for_merged_prs_only(self):
+        entries = [{"pr": "acme/app#9", "kind": "proof", "by": "coder", "ts": 1000}, {"pr": "acme/app#9", "kind": "verdict", "by": "rev", "ts": 1300},
+                   {"pr": "acme/app#9", "kind": "verdict", "by": sb.plan_ledger.CI_RECORDER, "ts": 1200},
+                   {"pr": "acme/app#10", "kind": "proof", "by": "coder", "ts": 5000}]
+        got = sb.gates_stats_core(entries, lambda pr: 1000 + 1800 if pr.endswith("#9") else None)
+        self.assertEqual(got["unmerged"], 1)
+        (row,) = got["prs"]
+        self.assertEqual((row["pr"], row["records"], row["manual_records"], row["automatic_records"], row["minutes_to_merge"]),
+                         ("acme/app#9", 3, 2, 1, 30.0))
+        self.assertEqual(row["by"], {"coder": 1, "rev": 1, "switchboard": 1})
+
+    def test_stats_command_reads_the_ledger_and_the_merge_time(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.pr.update({"state": "MERGED", "mergedAt": "2030-01-01T00:00:00Z"})
+        code, out, err = self.run_as("coder", "gates", "stats")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9", out)
+        self.assertIn("1 record(s) (1 by agents, 0 automatic): coder 1", out)
+        code, out, err = self.run_as("coder", "gates", "stats", "--json")
+        self.assertEqual(json.loads(out)["prs"][0]["pr"], "acme/app#9")
+        self.pr.update({"state": "OPEN", "mergedAt": None})
+        self.assertIn("1 gated PR(s) not merged yet", self.run_as("coder", "gates", "stats")[1])
 
     def test_a_failing_proof_or_verdict_is_not_ready(self):
         self.all_proven()

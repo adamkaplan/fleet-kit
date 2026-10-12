@@ -362,11 +362,35 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             "ledger_problem": ledger_problem}
 
 
+SATISFIED = ("ok", "n/a", "untracked", "waived")
+
+
+def enforced_view(report, enforced):
+    """Add `enforced` (the gates the repo refuses on, or None when it refuses on none: shadow, unlisted or off) and
+    `ready_enforced` (those gates are all satisfied) to `report`. The full-board `ready` is left as it was."""
+    report["enforced"] = list(enforced) if enforced else None
+    rows = {r["gate"]: r for r in report["gates"]}
+    open_enforced = [g for g in (enforced or ()) if rows.get(g) and rows[g]["status"] not in SATISFIED]
+    report["ready_enforced"] = (not open_enforced) if enforced else report["ready"]
+    report["open_enforced"] = open_enforced
+    report["open_not_enforced"] = [r["gate"] for r in report["gates"]
+                                   if r["gate"] not in (enforced or ()) and r["status"] not in SATISFIED] if enforced else []
+    return report
+
+
 def render_gates(report, pr):
     """The lines `gates` prints."""
-    lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8],
-                                          "READY on the gates it tracks (this is not approval: see the untracked list)"
-                                          if report["ready"] else "NOT READY") + (
+    if report.get("enforced"):
+        names = ", ".join(report["enforced"])
+        state = ("READY for the enforced gates (%s)" % names if report["ready_enforced"]
+                 else "NOT READY for the enforced gates (%s): open %s" % (names, ", ".join(report["open_enforced"])))
+        if report["open_not_enforced"]:
+            state += "; not enforced: %s" % ", ".join(
+                "%s %s" % (g, next(r["status"] for r in report["gates"] if r["gate"] == g)) for g in report["open_not_enforced"])
+    else:
+        state = ("READY on the gates it tracks (this is not approval: see the untracked list)"
+                 if report["ready"] else "NOT READY")
+    lines = ["gates for %s at %s: %s" % (pr, (report.get("head") or "unknown head")[:8], state) + (
                  "; WAIVED (not passed): %s" % ", ".join(report["waived"]) if report.get("waived") else ""),
              "plan hash: %s" % (report.get("plan_hash") or "none")]
     if report.get("ledger_problem"):
