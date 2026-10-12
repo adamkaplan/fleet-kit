@@ -24,6 +24,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
+   **Owner evaluators are rare**: only where the owner's own eyes are the test (an infographic's look, an access grant), proved once with `claim: epic`; never for a routine PR.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
@@ -92,4 +93,4 @@ Bad, each fails `plan check` or a reviewer:
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+open. Owner evaluators are rare (only where the owner's own eyes are the test); a coder's only extra step is `prove`. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.

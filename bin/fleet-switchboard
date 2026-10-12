@@ -7932,14 +7932,15 @@ FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or yo
                  "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
                  "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
                  "If nothing, do nothing and say nothing.")
-FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "text": None}
+FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 
 
 def validate_friction_config(config, source):
     """`friction_wake`: absent or null is off. `hour` is 0-23 in the daemon's local time, or null for every 24 h
-    from the first wake; `to` is the agent a proposal goes to; `text` null is the default text."""
+    from the first wake; `to` is the agent an orchestrator's proposal goes to; `cos_to` the agent the Chief of Staff's
+    goes to; `text` null is the default text."""
     if "friction_wake" not in config:
         return
     raw = config["friction_wake"]
@@ -7960,6 +7961,8 @@ def validate_friction_config(config, source):
                           "from the first wake, got %r" % (where, hour))
     if not isinstance(section["to"], str) or not NAME_RE.match(section["to"]):
         raise ConfigError("%s.to' must be a fleet agent name, got %r" % (where, section["to"]))
+    if not isinstance(section["cos_to"], str) or not NAME_RE.match(section["cos_to"]):
+        raise ConfigError("%s.cos_to' must be a fleet agent name, got %r" % (where, section["cos_to"]))
     text = section["text"]
     if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > 1000):
         raise ConfigError("%s.text' must be a non-empty string of at most 1000 characters, or null, got %r"
@@ -7998,7 +8001,7 @@ def write_friction_state(state_dir, found):
 
 
 def friction_tick(engine, discovery):
-    """The end of a pass: an orchestrator whose slot has begun and has not been asked gets ONE reminder (the
+    """The end of a pass: an orchestrator (or the Chief of Staff, whose proposals go to `cos_to`) whose slot has begun and has not been asked gets ONE reminder (the
     ordinary kind, delivered by the next pass by the ordinary rule). Nothing is read from v2 and nothing is written
     unless someone is due; `friction-wake.json` records the slot asked, so a restart or a later pass makes no second
     one. An orchestrator a person has engaged with, or that is blocked or held, is skipped for now (asked again
@@ -8009,20 +8012,27 @@ def friction_tick(engine, discovery):
     now, state, asked, changed = engine.now(), read_friction_state(engine.state_dir), [], False
     text = section["text"] or FRICTION_TEXT % {"to": section["to"]}
     for name, seen in sorted(discovery.agents.items()):
-        if (seen.fleet or {}).get("role") != "orchestrator" or name == section["to"]:
+        role = (seen.fleet or {}).get("role")
+        if role == "chief-of-staff":  # its own proposals go to `cos_to`; its slot has a key of its own
+            if name == section["cos_to"]:
+                continue
+            key, wake_text = "cos:" + name, FRICTION_TEXT % {"to": section["cos_to"]}
+        elif role == "orchestrator" and name != section["to"]:
+            key, wake_text = name, text
+        else:
             continue
-        mine = state.get(name, {})
+        mine = state.get(key, {})
         anchor = mine.get("anchor") if _is_number(mine.get("anchor")) else None
         if section["hour"] is None and anchor is None:
             anchor, changed = int(now), True
-            state[name] = mine = dict(mine, anchor=anchor)
+            state[key] = mine = dict(mine, anchor=anchor)
         slot = friction_slot(now, section["hour"], anchor)
         if slot <= (mine.get("done") if _is_number(mine.get("done")) else 0) or now - slot >= FRICTION_GRACE:
             continue
         if hold_reason(seen) or seen.engaged(now, engine.engaged_seconds):
             continue
-        add_reminder(engine.state_dir, name, now, now, text)
-        state[name] = dict(mine, done=slot)
+        add_reminder(engine.state_dir, name, now, now, wake_text)
+        state[key] = dict(mine, done=slot)
         asked.append((name, slot))
         changed = True
         if engine.audit is not None:
@@ -8031,6 +8041,18 @@ def friction_tick(engine, discovery):
     if changed:
         write_friction_state(engine.state_dir, state)
     return asked
+
+
+def friction_status_line(config, state_dir, now=None):
+    """The `status` line for the daily friction wake, or None when the config cannot be read."""
+    section = (config or {}).get("friction_wake")
+    if not section or not section.get("enabled"):
+        return "friction wake: off"
+    hour = section["hour"]
+    slots = [v.get("done") for v in read_friction_state(state_dir).values() if _is_number(v.get("done"))]
+    last = iso(max(slots)) if slots else "none yet"
+    return "friction wake: on, %s to %s; cos to %s; last slot %s" % (
+        "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
 
 
 # ---- reminders
@@ -10156,6 +10178,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["decisions"] = decisions_summary(state, now)
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
+        if config_ok:
+            report["friction"] = friction_status_line(config, state)
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -10336,6 +10360,7 @@ def format_status(report):
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
+    lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
@@ -13652,6 +13677,84 @@ def add_ledger_parsers(sub):
     check.add_argument("--json", action="store_true")
 
 
+# ---------------------------------------------------------------- `review-laws install` (#179, slice L1)
+
+REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
+REVIEW_LAWS_EDIT = {
+    "REVIEW_LAWS.md": "the verdict format, the matrix cells you tighten (never loosen), and the floor paths your repository names",
+    "CODING_STANDARDS.md": "add the rules your repository's own code needs; remove none without saying why",
+    "SECURITY_STANDARDS.md": "add the rules for your repository's own identities, secrets and permissions",
+    "TEST_STANDARDS.md": "add how your repository's tests are run in CI and what they must cover",
+}
+
+
+def review_laws_source():
+    return Path(os.path.realpath(__file__)).parent.parent / "docs" / "review-laws"
+
+
+def cmd_review_laws(args, runner, now):
+    """`review-laws install <repo path>`: copy the generic starter set (REVIEW_LAWS.md, CODING_STANDARDS.md, SECURITY_STANDARDS.md,
+    TEST_STANDARDS.md, each opening with `extends: fleet-kit-review-laws @ review-laws-<n>`) to the root of a repository and say what to edit. It
+    writes only those files, never overwrites one the repository already has (`--force` replaces it), and touches nothing else (not
+    AGENTS.md: the laws must not contradict it, so the pointer line is the repository's own edit)."""
+    source = review_laws_source()
+    try:
+        version = (source / "VERSION").read_text().strip()
+        texts = {name: (source / name).read_text() for name in REVIEW_LAWS_FILES}
+    except OSError as err:
+        sys.stderr.write("%s: review-laws: the starter set is not readable (%s): %s\n" % (PROG, source, getattr(err, "strerror", None) or err))
+        return EXIT_USAGE
+    target = Path(args.repo).expanduser()
+    if not target.is_dir():
+        sys.stderr.write("%s: review-laws: %s is not a directory\n" % (PROG, args.repo))
+        return EXIT_USAGE
+    header = "extends: fleet-kit-review-laws @ %s" % version
+    bad = [n for n, text in texts.items() if text.splitlines()[0] != header]
+    if bad:
+        sys.stderr.write("%s: review-laws: the starter set is inconsistent: %s do not open with %r\n" % (PROG, ", ".join(bad), header))
+        return EXIT_USAGE
+    links = [n for n in REVIEW_LAWS_FILES if os.path.islink(str(target / n))]   # a link (even a dangling one) is never replaced, forced or not
+    if links:
+        sys.stderr.write("%s: review-laws: %s is a symbolic link in %s: nothing was written (a link could send the copy somewhere else; remove it yourself)\n"
+                         % (PROG, ", ".join(links), target))
+        return EXIT_USAGE
+    existing = [n for n in REVIEW_LAWS_FILES if os.path.lexists(str(target / n))]
+    if existing and not args.force:
+        sys.stderr.write("%s: review-laws: %s already has %s: nothing was written (the repository's own copies are its law; --force replaces them)\n"
+                         % (PROG, target, ", ".join(existing)))
+        return EXIT_USAGE
+    written = []
+    for name in REVIEW_LAWS_FILES:
+        temp = target / (".%s.%d.tmp" % (name, os.getpid()))
+        try:
+            temp.write_text(texts[name])
+            os.replace(str(temp), str(target / name))
+        except OSError as err:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            sys.stderr.write("%s: review-laws: could not write %s: %s (written so far: %s)\n"
+                             % (PROG, name, getattr(err, "strerror", None) or err, ", ".join(written) or "none"))
+            return EXIT_ERROR
+        written.append(name)
+    lines = ["review laws (%s) installed in %s. What to edit:" % (version, target)] + ["  %s: %s" % (n, REVIEW_LAWS_EDIT[n]) for n in written]
+    lines.append("Next: keep the `extends:` line (it says which version you started from); make sure the laws do not contradict your AGENTS.md "
+                 "(leave a pointer line there for any hygiene rule you moved); reviewers read these files from the base branch of a pull request.")
+    if (target / "AGENTS.md").exists():
+        lines.append("Your repository has an AGENTS.md: it was not touched.")
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+def add_review_laws_parsers(sub):
+    laws = sub.add_parser("review-laws", help="The review laws starter set (#179)")
+    laws_sub = laws.add_subparsers(dest="laws_action", required=True)
+    install = laws_sub.add_parser("install", help="Copy the generic review laws and standards into a repository and say what to edit")
+    install.add_argument("repo", help="Path of the repository (its root)")
+    install.add_argument("--force", action="store_true", help="Replace copies the repository already has")
+
+
 def add_plan_parsers(sub):
     plan = sub.add_parser("plan", help="Plan-driven development: check a plan's scenarios (gate G0a)")
     plan_sub = plan.add_subparsers(dest="plan_action", required=True)
@@ -16243,6 +16346,7 @@ def build_parser():
     add_foreground_parsers(sub)  # PR 8
     add_policy_parsers(sub)  # PR 9
     add_plan_parsers(sub)    # #135
+    add_review_laws_parsers(sub)    # #179 slice L1
     add_ledger_parsers(sub)  # #107
     add_v1_move_parsers(sub)  # PR 10
     add_install_parsers(sub)  # PR 16
@@ -16268,6 +16372,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         return cmd_poke(args)
     if args.action == "policy-report":
         return cmd_policy_report(args, runner, now)
+    if args.action == "review-laws":  # #179: copies files, never ensures the daemon
+        return cmd_review_laws(args, runner, now)
     if args.action == "plan":  # #135: reads only, never ensures the daemon
         if args.plan_action == "review":  # #109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled
             return cmd_plan_review(args, runner, now, socket_call)

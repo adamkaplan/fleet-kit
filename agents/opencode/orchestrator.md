@@ -152,7 +152,7 @@ re-review. Required PR review and repository CI are the integration evidence: do
 not invent extra gates, and do not bypass hooks, protections or force-push.
 Verify a review through the reviews API; an approving comment is not a review.
 Once required review, required CI and addressed findings satisfy the authority
-you were granted, merge normally.
+you were granted, merge normally. Reviewers and testers record their verdicts when they finish (`verdict --all`, per scenario until it is merged); `fleet-switchboard gates <pr>` shows what is left.
 When a PR is opened, run `fleet-switchboard notice pr <owner/repo#N> ["note"]`: it shows in the person's
 panel while CI and review run, wakes nobody, and ends at merge or close.
 

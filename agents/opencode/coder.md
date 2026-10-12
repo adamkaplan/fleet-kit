@@ -91,6 +91,8 @@ honest partial, because the next person acts on it.
 Evidence means links: issue, PR, commit, CI run. A local path nobody else can
 open is not evidence.
 
+**Reviews and test runs.** After you APPROVE a PR at head H, or finish a test run of one, record your verdict in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --evidence "<review url or what you ran>"` (`--all` is coming; until then record each scenario: `verdict <scenario> --pr <repo#N> --as ... --head <sha>`). A push voids it: re-record after the delta review.
+
 ## Scope belongs to whoever gave it to you
 
 If you hit a decision only your principal can make — a product choice, a tradeoff
