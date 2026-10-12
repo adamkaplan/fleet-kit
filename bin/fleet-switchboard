@@ -494,7 +494,7 @@ def validate_plan_evaluators(config, source):
         raise ConfigError("%s: 'plan_evaluators' must be an object of evaluator -> agent names, got %r" % (source, type(raw).__name__))
     unknown = sorted(set(raw) - set(PLAN_EVALUATOR_KINDS))
     if unknown:
-        warn_unknown_config("%s: 'plan_evaluators' names no evaluator %s (known: %s)" % (source, ", ".join(map(repr, unknown)),
+        raise ConfigError("%s: 'plan_evaluators' names no evaluator %s (known: %s)" % (source, ", ".join(map(repr, unknown)),
                                                                                     ", ".join(PLAN_EVALUATOR_KINDS)))
     for kind, names in raw.items():
         if not isinstance(names, list) or not all(isinstance(n, str) and NAME_RE.match(n) for n in names):

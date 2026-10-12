@@ -4954,9 +4954,12 @@ class TestGithubConfig(Base):
                     self.cfg(**{key: value})
                 self.assertIn(key, str(caught.exception))
 
-    def test_an_unknown_key_is_still_refused(self):
-        with self.assertRaises(sb.ConfigError):
+    def test_an_unknown_key_is_warned_about_not_refused(self):
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
             self.cfg(github_repo=["a/b"])
+        self.assertIn("github_repo", err.getvalue())
 
 
 class TestGithubVerification(Base):
@@ -7657,7 +7660,7 @@ class TestFrictionWake(FrictionBase):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         for bad, word in (({"enabled": "yes"}, "enabled"), ({"hour": 24}, "hour"), ({"hour": "9"}, "hour"),
                           ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"), ({"cos_to": "Bad Name"}, "'friction_wake.cos_to'"), ({"cos_to": 5}, "cos_to"),
-                          ({"text": ""}, "text"), ({"text": 5}, "text"), ({"when": 9}, "friction_wake")):
+                          ({"text": ""}, "text"), ({"text": 5}, "text")):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError) as caught:
                 sb.validate_config(dict(base, friction_wake=bad))
             self.assertIn(word, str(caught.exception))
@@ -9221,9 +9224,12 @@ class TestJevConfig(Base):
         self.assertEqual(config["jev"]["key_env"], "OPENROUTER_API_KEY")
         self.assertEqual(config["jev"]["timeout_seconds"], 20)
 
-    def test_unknown_subkeys_are_rejected(self):
-        with self.assertRaisesRegex(sb.ConfigError, "'jev' contains key.*api_key"):
+    def test_unknown_subkeys_are_warned_about_by_name_and_ignored(self):
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
             self.config(jev={"api_key": "x"})
+        self.assertRegex(err.getvalue(), "'jev' contains key.*api_key")
 
     def test_shadow_judges_follows_whether_jev_is_configured(self):
         self.assertTrue(self.config(jev={})["shadow_judges"])
@@ -11326,9 +11332,13 @@ class TestPolicyConfig(Base):
             sb.validate_config(dict({"policy": policy}, **extra))
         self.assertIn(fragment, str(caught.exception))
 
-    def test_unknown_subkeys_are_rejected_by_name(self):
-        self.check_rejected({"budgetms": 5}, "budgetms")
-        self.check_rejected({"enabled": False, "extra": 1}, "extra")
+    def test_unknown_subkeys_are_warned_about_by_name_and_ignored(self):
+        for policy, name in (({"budgetms": 5}, "budgetms"), ({"enabled": False, "extra": 1}, "extra")):
+            sb._WARNED_CONFIG.clear()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sb.validate_config({"policy": policy})
+            self.assertIn(name, err.getvalue())
 
     def test_each_value_is_checked(self):
         for policy, fragment in (({"enabled": "yes"}, "policy.enabled"), ({"budget_ms": 0}, "policy.budget_ms"),
@@ -15476,7 +15486,7 @@ class TestSweep(Base):
         self.assertNotIn("sweep", sb.validate_config(dict(base)))  # absent: adds nothing (the sweep runs in shadow)
         self.assertFalse(sb.validate_config(dict(base, sweep={}))["sweep"]["enabled"])  # present: shadow
         self.assertFalse(sb.validate_config(dict(base, sweep=None))["sweep"]["enabled"])
-        for bad in ({"enabled": "yes"}, {"aged_cos_hours": 0}, {"max_findings": 0}, {"person_names": []}, {"nope": 1}):
+        for bad in ({"enabled": "yes"}, {"aged_cos_hours": 0}, {"max_findings": 0}, {"person_names": []}):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, sweep=bad))
 
@@ -15976,7 +15986,7 @@ class TestTriage(Base):
         self.assertFalse(sb.validate_config(dict(base, triage={}))["triage"]["enabled"])
         self.assertIs(sb.validate_config(dict(base, triage=False))["triage"], False)
         for bad in ({"enabled": "yes"}, {"repos": ["notarepo"]}, {"sla": {"t1_days": 0}}, {"sla": {"nope": 1}},
-                    {"required_labels": {"a/b": "kind"}}, {"nope": 1}, {"sla_overrides": {"a/b": {"t1_days": -1}}}):
+                    {"required_labels": {"a/b": "kind"}}, {"sla_overrides": {"a/b": {"t1_days": -1}}}):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, triage=bad))
         self.assertEqual(sb.triage_sla({"sla": {"t1_days": 2}, "sla_overrides": {"a/b": {"t1_days": 5}}}, "a/b")["t1_days"], 5)
@@ -17002,8 +17012,6 @@ class TestUnreportedStop(ReportBase):
         self.assertEqual([f.kind for f in found], ["worker.idle"])
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"report_triage": {"owed_threshold": 0}})
-        with self.assertRaises(sb.ConfigError):
-            sb.validate_config({"report_triage": {"nonsense": 1}})
 
     def test_jev_failing_fails_open_to_one_stopped_fact(self):
         self.stop("JEV-DOWN: something happened")
@@ -34070,7 +34078,7 @@ class TestExternalDecisionConfig(unittest.TestCase):
                     {"kinds": ["permission"]}, {"kinds": []}, {"mapping_file": "relative.json"},
                     {"tier_map": {"cos": "x"}}, {"tier_map": {"orchestrator": "", "cos": "b", "human": "c"}},
                     {"poll_seconds": 0}, {"retry_base_seconds": 10, "retry_max_seconds": 5},
-                    {"outbox_alarm_depth": 0}, {"unknown": 1}):
+                    {"outbox_alarm_depth": 0}):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
                 self.check(dict(good, **bad))
         with self.assertRaises(sb.ConfigError):
