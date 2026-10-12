@@ -35970,6 +35970,13 @@ class TestOwnReviewLaws(unittest.TestCase):
                 self.assertTrue((REPO / name).is_file(), name)
                 self.assertEqual((REPO / name).read_text().splitlines()[0], "extends: fleet-kit-review-laws @ %s" % version)
 
+    def test_the_root_rules_are_byte_identical_to_the_starter_set_until_a_pr_says_otherwise(self):
+        for name in self.FILES:
+            with self.subTest(name=name):
+                root = (REPO / name).read_text().split("\n## This repository")[0]
+                starter = (REPO / "docs" / "review-laws" / name).read_text()
+                self.assertEqual(root.strip(), starter.strip(), "a deliberate edit of a standard changes this test in the same PR")
+
     def test_the_root_copy_starts_as_the_starter_set_no_rule_id_added_or_dropped(self):
         for name in self.FILES:
             with self.subTest(name=name):
