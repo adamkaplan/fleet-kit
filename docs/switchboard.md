@@ -2442,7 +2442,7 @@ fleet cannot be read the reminder waits for the next pass. Reminders without a c
 **The daily friction wake.** Off unless enabled. Add to `config.json` (the section is validated like the other keys):
 
 ```json
-"friction_wake": {"enabled": true, "hour": 9, "to": "cos", "text": null}
+"friction_wake": {"enabled": true, "hour": 9, "to": "cos", "cos_to": "improver", "text": null}
 ```
 
 | Key | Default | Meaning |
@@ -2450,14 +2450,17 @@ fleet cannot be read the reminder waits for the next pass. Reminders without a c
 | `enabled` | `false` | nothing happens, and nothing is read, unless `true` |
 | `hour` | `9` | local hour (0-23, the daemon's time zone) of the daily wake; `null` = every 24 h from the first wake |
 | `to` | `cos` | the agent a proposal goes to; named only in the text, and never woken by this |
-| `text` | `null` | the wake's text; `null` is `Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send <to> a one-paragraph proposal: fleet-switchboard send <to> --issue <n> "<proposal>". If nothing, do nothing and say nothing.` |
+| `cos_to` | `improver` | the agent the Chief of Staff's own friction proposals go to (changes that support the Chief of Staff's work are that orchestrator's to make); named only in the Chief of Staff's wake text, and the agent it names is never woken about itself |
+| `text` | `null` | the orchestrators' wake text (the Chief of Staff's is always the default text with `cos_to`); `null` is `Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send <to> a one-paragraph proposal: fleet-switchboard send <to> --issue <n> "<proposal>". If nothing, do nothing and say nothing.` |
 
-Each running agent whose fleet role is `orchestrator` (never the Chief of Staff, a coder, or the agent named by `to`) gets
-at most one wake per slot, delivered by the ordinary delivery rule. An orchestrator a person has prompted within the engagement window, or that is blocked or held, is
+Each running agent whose fleet role is `orchestrator` (never a coder, or the agent named by `to`) gets
+at most one wake per slot, and so does the Chief of Staff (the same slot and rule; its text names `cos_to`, and its slot is
+recorded under its own key, `cos:<name>`, in `friction-wake.json`), delivered by the ordinary delivery rule. An orchestrator a person has prompted within the engagement window, or that is blocked or held, is
 skipped for now and asked again until the slot is four hours old; then that day's wake is skipped. The wake is made at the end of a
 pass as an ordinary reminder to that orchestrator and recorded (audit event `friction.wake`; `friction-wake.json` in the
 state directory holds the slot last asked), so a restart or the next pass makes no second one. That file is disposable: a
-lost file means at most one extra wake.
+lost file means at most one extra wake. `fleet-switchboard status` shows one line, for example
+`friction wake: on, 09:00 to cos; cos to improver; last slot 2026-10-11T09:00:00Z` (`off` when disabled).
 
 ### Data
 

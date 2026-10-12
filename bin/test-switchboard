@@ -7478,7 +7478,7 @@ class TestFrictionWake(FrictionBase):
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
                           "orders_facts", "sweep_facts", "triage_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
-        self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "text": None})
+        self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
         self.pass_at(3600)
         self.assertEqual([self.friction(n) for n in ("platform", "web")], [[], []])
@@ -7497,12 +7497,11 @@ class TestFrictionWake(FrictionBase):
         self.assertEqual(self.pass_at(0)["sent"], [])  # 08:00, before the hour
         self.pass_at(3600)  # 09:00
         self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1))
-        for name in ("coder", "cos"):
-            self.assertEqual(self.friction(name), [])
+        self.assertEqual(self.friction("coder"), [])
         for _ in range(5):
             self.assertEqual(self.pass_at(600)["sent"], [], "nothing is sent again, queued or not")
         self.assertEqual((len(self.friction("platform")), len(self.friction("web"))), (1, 1), "not twice in a day")
-        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 2)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "friction.wake"]), 3)  # two orchestrators and cos
         self.pass_at(86400)
         self.assertEqual(len(self.friction("platform")), 2, "and again the next day")
 
@@ -7548,6 +7547,48 @@ class TestFrictionWake(FrictionBase):
         self.pass_at(3600)
         self.assertIn("fleet-switchboard send improver --issue <n>", self.friction("platform")[0]["text"])
 
+    def test_cos_is_woken_in_the_same_slot_with_its_own_recipient_and_state_key(self):
+        self.pass_at(3600)
+        (found,) = self.friction("cos")
+        self.assertIn("fleet-switchboard send improver --issue <n>", found["text"])
+        self.assertIn("send improver a one-paragraph proposal", found["text"])
+        self.assertIn("cos:cos", sb.read_friction_state(self.world.state))
+        for _ in range(3):
+            self.pass_at(600)
+        self.assertEqual(len(self.friction("cos")), 1, "one wake per slot")
+        self.pass_at(86400)
+        self.assertEqual(len(self.friction("cos")), 2)
+
+    def test_cos_to_is_config_and_a_custom_text_does_not_replace_cos_text(self):
+        self.make({"cos_to": "tuner", "text": "What slowed you down?"})
+        self.pass_at(3600)
+        self.assertIn("send tuner", self.friction("cos")[0]["text"])
+        self.assertEqual(len(self.friction("platform")), 0)
+
+    def test_the_agent_named_by_cos_to_is_never_woken_about_itself(self):
+        self.make({"cos_to": "cos"})
+        self.pass_at(3600)
+        self.assertEqual(self.friction("cos"), [])
+        self.assertEqual(len(self.friction("platform")), 1)
+
+    def test_an_engaged_or_blocked_cos_is_skipped(self):
+        self.world.herdr.panes[self.world.panes["cos"]]["status"] = "blocked"
+        self.pass_at(3600)
+        self.assertEqual(self.friction("cos"), [])
+        self.assertEqual(len(self.friction("platform")), 1)
+
+    def test_status_shows_the_friction_line(self):
+        cfg = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "friction_wake": {"enabled": True}})
+        self.assertEqual(sb.friction_status_line(cfg, self.world.state),
+                         "friction wake: on, 09:00 to cos; cos to improver; last slot none yet")
+        self.pass_at(3600)
+        self.assertNotIn("none yet", sb.friction_status_line(cfg, self.world.state))
+        off = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertEqual(sb.friction_status_line(off, self.world.state), "friction wake: off")
+        text = (REPO / "bin" / "fleet-switchboard").read_text()   # and `status` prints it, indented under the others
+        self.assertIn('report["friction"] = friction_status_line(config, state)', text)
+        self.assertIn('lines.extend("      " + report["friction"]', text)
+
     def test_nobody_due_means_no_agent_is_read(self):
         self.pass_at(3600)
         before = len(self.world.v2.calls)
@@ -7557,7 +7598,7 @@ class TestFrictionWake(FrictionBase):
     def test_the_config_is_validated_like_the_others(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         for bad, word in (({"enabled": "yes"}, "enabled"), ({"hour": 24}, "hour"), ({"hour": "9"}, "hour"),
-                          ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"),
+                          ({"hour": True}, "hour"), ({"to": "Bad Name"}, "'friction_wake.to'"), ({"cos_to": "Bad Name"}, "'friction_wake.cos_to'"), ({"cos_to": 5}, "cos_to"),
                           ({"text": ""}, "text"), ({"text": 5}, "text"), ({"when": 9}, "friction_wake")):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError) as caught:
                 sb.validate_config(dict(base, friction_wake=bad))
