@@ -8471,7 +8471,8 @@ ROLE_LINE_LIMITS = {"coder": 126, "orchestrator": 178, "chief-of-staff": 162, "c
 # #130: +200 B each for the parked sentence
 # #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
-ROLE_BYTE_LIMITS = {"coder": 6800, "orchestrator": 10650, "chief-of-staff": 11550, "cos-subagent": 3500}
+# #109: chief-of-staff +100 B: the fleet-planning load line
+ROLE_BYTE_LIMITS = {"coder": 6800, "orchestrator": 10650, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 

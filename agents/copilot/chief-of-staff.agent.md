@@ -70,6 +70,7 @@ steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file
 - **Before your first charter action**, load `fleet-charter`: you hold orchestrators to it.
 - **Before you brief an orchestrator**, load the `fleet-coordination` skill.
 - **Before you commission a project**, load `fleet-setup`; a worker creates it.
+- **Before you review a plan**, load `fleet-planning`.
 
 Load them as a real first action. Skills are re-read on every use; this file
 never reloads. When they disagree, the skill wins.
