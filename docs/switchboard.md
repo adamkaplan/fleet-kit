@@ -4080,12 +4080,19 @@ an epic claim names its integration branch is a later `plan check` change.)
 not treated here: when the shim is built, `--auto` is refused in `enforce`, which also stops any flow that auto-merges
 `merge-automatic` PRs; that cost is named in the design review and decided with the shim.
 
-## The `gh` shim's gate probe: shadow only (#107, slice 3b)
+## The `gh` shim's gate probe: refuses in an enforcing repo (#107)
 
 The `gh` shim now asks `gates-check` before `gh pr ready` and `gh pr merge` (E1 and E3 of
-[docs/plan-gate-engine-design.md](plan-gate-engine-design.md)) and writes the answer down. **It never blocks**: the real `gh`
-always runs, with its own exit code and output, whatever the answer is, the switchboard is missing, the check hangs, or the
-arguments are a shape the shim does not understand. Refusing is a later slice.
+[docs/plan-gate-engine-design.md](plan-gate-engine-design.md)) and writes the answer down. **A refusal stops the command**: when `gates-check` exits 10 (it does so only for a
+refusal that applies in the repo's mode, so a `shadow` repo never refuses) the shim prints the one-line reason to stderr, exits 10
+and does **not** run the real `gh`. Everything else runs the real `gh` as before, with its own exit code and output: a fail-open, a
+timeout, a missing switchboard, a shape the shim does not understand, a kill switch, the `plan-gates.off` file, a valid waiver.
+In an enforcing repo a merge is also **bound to the head that was checked** (the shim adds `--match-head-commit <sha>`; a
+different `--match-head-commit` is refused; a push after the check makes the real merge fail), and `--auto` is refused. If the
+check names no head the merge is allowed unbound and recorded as a fail-open. Every `--match-head-commit` the caller gave (any spelling: `--match-head-commit X`, `=X`, repeated, empty, without a value) is dropped and replaced by one with the checked head. The shim reads the command line as gh does (combined short flags such as `-sd`, `=value` on any flag, `--auto=false`) and finds the PR as gh would: `-R`, a PR URL, `GH_REPO`, else the real `gh repo view` for the current directory; a PR with no number (no argument or a branch name) is asked of the real `gh pr view`. If it cannot tell which PR or repo, or does not understand the shape, it runs the real `gh` and writes a `fail_open` line to the spool: it never guesses the fleet repo. A refusal is only enforced when the reply says `mode: enforce`, and control characters are stripped from what it prints. **Enforcement needs the way out first:** `gates preflight`, `gates mode <repo> enforce` and every check treat a repo as `shadow` (with the reason) until the installed chief-of-staff definition (`~/.config/opencode/agents/chief-of-staff.md`, or `$FLEET_COS_DEFINITION`) allows `fleet-switchboard waive *` and `fleet-switchboard gates mode * shadow`. The refusal line reads:
+`fleet-switchboard: merge of acme/app#12 refused: missing G1: <what is missing>. Way out: ask the chief of staff for a logged waiver
+(`fleet-switchboard waive acme/app#12 --gates G1 --reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow
+(`fleet-switchboard gates mode acme/app shadow`).` The spool also gets a `refused` line. `pr create` and `launch` are not enforced here.
 
 What it does: for a PR whose repo is listed under `plan_gates.repos` in the switchboard config (matched without regard to case;
 with no `plan_gates`, or another repo, nothing is probed and the cost is zero), it runs

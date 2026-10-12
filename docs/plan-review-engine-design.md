@@ -232,3 +232,26 @@ escalation in `respond`; the escalation message presents the lane's objection an
 for the same callers as `start` (a person, a registered orchestrator or the chief of staff) and records its closing of escalations as decisions with the
 action `abandoned`. Nothing runs `tick` on a schedule yet: a person, an orchestrator or the chief of staff runs it (wiring it into the daemon pass is a
 later step), so the 24-hour reminder and the stuck-lane handling happen only when someone does.
+
+R5 is built: the closing round, the consensus write, `plan review report`, and E4 quiet for reviewed plans.
+
+- **`plan review close <review> --plan-ref <final>`**: the planner publishes the final synthesized revision (it must pass `plan check` and carry a `## Decisions`
+  section); every lane of the tier then confirms that exact hash or objects. It runs outside the cap, once per final hash, only after every lane of the last round
+  reported, with no blocking objection open and no escalation undecided.
+- **The consensus** is written by the engine, never by a command: once every lane of the closing round has reported, the tally (computed from the ledger alone,
+  again under the ledger lock) must be `consensus`: an `approve` at the exact final hash from every lane of the tier and nothing blocking open. The entry carries
+  the final plan hash, tier, lanes and rounds. A blocking objection raised on the final text escalates instead. Editing the plan afterwards voids it.
+- **E4**: `launch_findings` already reads a `consensus` at the plan's current hash, so a plan reviewed by the engine makes the launch check quiet and an edit brings
+  `would_refuse` back; it stays shadow (enforcing it is the owner-held step). An overridden consensus is still shown.
+- **`plan review report <review>`**: per round and lane the wall time, verdict and objections by severity; how many the planner accepted and rejected (the response
+  entry records the counts); the objection titles (what the reviewers caught); sessions, wall time, rounds to consensus, escalations. Token and money cost are not
+  measured (the harness records none yet), and the report says so.
+- **`tick` stays manual in this slice, with a recommendation.** A daemon pass that runs the reminders and the unavailable-lane escalations needs no GitHub call at all (it
+  reads the ledger and sends messages through the outbox), so its call budget is 0 and it can run on every pass over the repos that have a review open. The relaunch
+  part launches a session (the same path as `launch`) and re-reads the plan and the ask (about 3 GETs per relaunch, at most once per lane), so it is the part to keep
+  in the manual `tick` until the lane agent definitions (R3) exist and have been proved. Recommended next step: a read-only daemon pass for reminders and
+  escalations only, as its own small slice after R3; until then a person, an orchestrator or the chief of staff runs `plan review tick`.
+
+An abandoned review goes no further: `verdict`, `respond`, `close` and `decide` refuse it with a message (the check is repeated under the ledger lock, so an abandon that lands
+between a check and a write still wins), the consensus write refuses it, and abandoning twice is refused. `plan review start` for the same ask opens a new review and the lineage's
+count continues.
