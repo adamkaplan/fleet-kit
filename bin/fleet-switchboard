@@ -10836,12 +10836,13 @@ def cmd_send(args, runner, now):
     and may still complete, never a silent multi-minute wait."""
     try:
         seconds = load_config()["send_timeout_seconds"]
-    except Exception:
+    except ConfigError as err:   # the command itself reports the config error below; the bound falls back to the default, and says so
         seconds = DEFAULTS["send_timeout_seconds"]
+        sys.stderr.write("%s: the config could not be read (%s): the default send bound of %s s applies\n" % (PROG, _one_line(str(err), 160), seconds))
     done, code = run_bounded(lambda: _cmd_send(args, runner, now), seconds)
     if not done:
-        sys.stderr.write("%s: send to %s did not finish within %s s (a slow v2 or herdr): it may still be delivered, so check `%s pending %s` "
-                         "before sending again\n" % (PROG, args.name, seconds, PROG, args.name))
+        sys.stderr.write("%s: send to %s did not finish within %s s (a slow v2 or herdr): it may still be delivered, or have been cut off "
+                         "part way: the state is unknown, so check `%s pending %s` and the recipient before sending again\n" % (PROG, args.name, seconds, PROG, args.name))
         return EXIT_ERROR
     return code
 
