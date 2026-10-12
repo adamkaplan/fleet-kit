@@ -23,7 +23,7 @@ LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
 GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
-REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder")   # the plan review engine's records (#109)
+REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 KINDS = EVIDENCE_KINDS + REVIEW_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
@@ -309,6 +309,22 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
+REVIEWERS = ("code", "architecture", "security", "impact", "test")
+REVIEWERS_NOW = ("code", "architecture", "security", "impact")   # the reviewers that exist today (the test reviewer is a later slice)
+REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
+
+
+def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
+    """The reviewer records of PR `pr` AT `head` (the latest per reviewer wins): {"expected", "recorded": {reviewer: verdict}, "missing"}.
+    A record at another head does not count: a push voids it. SHADOW: this is shown by `gates`, never counted towards ready, and a record
+    names the session that wrote it, which while agents share one account is a mistake guard and not a boundary."""
+    recorded = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
+            recorded[entry["reviewer"]] = entry.get("verdict")
+    return {"expected": list(expected), "recorded": recorded, "missing": [r for r in expected if r not in recorded]}
+
+
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
@@ -390,7 +406,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
     return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
-            "ledger_problem": ledger_problem}
+            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None}
 
 
 SATISFIED = ("ok", "n/a", "untracked", "waived")
@@ -434,6 +450,12 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+    reviews = report.get("reviews")
+    if reviews:
+        lines.append("  reviewers (shadow, not counted; recorded by the PR's own session, so not independent): %d of %d recorded at %s%s" % (
+            len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
+            ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
     if report["untracked"]:
         lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))
     return lines
