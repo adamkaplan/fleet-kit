@@ -19,4 +19,4 @@ python3 tools/cos-permissions-proof/run.py [--only allowed|hostile] [--out resul
 Needs `opencode` v2 on PATH and python3. About 20 seconds for the whole corpus with 3 jobs.
 Note: an agent definition with a `name:` key makes OpenCode v2 ignore the whole `permissions:` list; the proof would show everything running.
 
-Update (focus principle): the corpus is now the job's real shapes (`allowed`) and a short out-of-job list (`hostile`); `@TEMP@` stands for the opencode temp dir. The rules are written by `gen_permissions.py`.
+Update (#191, a short list): the permission block is hand-written and short (under 200 lines, one rule per line, deny by default); there is no generator any more (the one that enumerated every variant produced a 30,000-line file, and a test keeps it from coming back). The corpus is the job's real shapes (`allowed`) and a short out-of-job list (`hostile`); `@TEMP@` stands for the opencode temp dir. `harmless` lists the ACCEPTED GAPS of a focus-not-a-fence list (redirects, quoting, `git branch`/`tag`/`config` writes, `head`/`tail`/`grep`/`ls` of paths outside the job): they run, and are listed so the owner sees them.
