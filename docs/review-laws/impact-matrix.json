@@ -1,0 +1,120 @@
+{
+  "source": "MIL-STD-882E categories; cell assignments are this repository's own, stricter than the standard in places by design. This file is the single source of truth for the 4x5 impact matrix: the table in REVIEW_LAWS.md equals it (a test checks), and repo-side copies of REVIEW_LAWS.md copy that table.",
+  "severities": [
+    "Catastrophic",
+    "Critical",
+    "Marginal",
+    "Negligible"
+  ],
+  "probabilities": [
+    "Improbable",
+    "Remote",
+    "Occasional",
+    "Probable",
+    "Frequent"
+  ],
+  "not_rated": [
+    "Eliminated"
+  ],
+  "actions": {
+    "High": "H",
+    "Serious": "H",
+    "Medium": "2",
+    "Low": "."
+  },
+  "action_meaning": {
+    "H": "hold the pull request for the captain",
+    "2": "request a second independent review",
+    ".": "no action"
+  },
+  "cells": {
+    "Catastrophic": {
+      "Improbable": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Remote": {
+        "level": "High",
+        "action": "H"
+      },
+      "Occasional": {
+        "level": "High",
+        "action": "H"
+      },
+      "Probable": {
+        "level": "High",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "High",
+        "action": "H"
+      }
+    },
+    "Critical": {
+      "Improbable": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Remote": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Occasional": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Probable": {
+        "level": "High",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "High",
+        "action": "H"
+      }
+    },
+    "Marginal": {
+      "Improbable": {
+        "level": "Low",
+        "action": "."
+      },
+      "Remote": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Occasional": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Probable": {
+        "level": "Serious",
+        "action": "H"
+      },
+      "Frequent": {
+        "level": "Serious",
+        "action": "H"
+      }
+    },
+    "Negligible": {
+      "Improbable": {
+        "level": "Low",
+        "action": "."
+      },
+      "Remote": {
+        "level": "Low",
+        "action": "."
+      },
+      "Occasional": {
+        "level": "Low",
+        "action": "."
+      },
+      "Probable": {
+        "level": "Medium",
+        "action": "2"
+      },
+      "Frequent": {
+        "level": "Medium",
+        "action": "2"
+      }
+    }
+  }
+}
