@@ -34008,6 +34008,413 @@ class TestDecisionsPanelLinks(Base):
 
 
 
+
+class TestPlanReviewCommands(LedgerBase):
+    """#109 part 2, slice R2: `plan review start|verdict|respond|status|abandon`, the ledger records and the lane launching (fake herdr)."""
+
+    PLAN2 = LEDGER_PLAN.replace("Commissioning works.", "Commissioning works, with a rollback section.")
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "work"
+        self.work.mkdir()
+        self.world.add_agent("orch", fleet={"role": "orchestrator"})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.plan_issue2 = {"number": 8, "state": "open", "title": "plan v2", "body": self.PLAN2, "updated_at": "2026-01-01T00:00:00Z",
+                            "parent_issue_url": "https://api.github.com/repos/acme/app/issues/7"}   # a plan issue under the ask #7
+        self.enable()
+
+    def enable(self, **more):
+        cfg = {"enabled": True, "dir": str(self.work), "workspace": "w1", "max_parallel": 6}
+        cfg.update(more)
+        self.extra_config = {"plan_review": cfg}
+        self.configure()
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and re.search(r"/issues/(8|9|10)$", argv[2]):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue2), "")
+        return super().route(argv, **kwargs)
+
+    def review(self, who, *argv, stdin=None):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes.get(who) or who
+        with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            code = sb.main(["plan", "review", *argv], runner=self.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def start(self, who="orch", source="acme/app#7", ask="acme/app#7", *more):
+        code, out, err = self.review(who, "start", source, "--ask", ask, "--json", *more)
+        return code, (json.loads(out) if out.strip().startswith("{") else None), err
+
+    def block(self, lane, plan_hash, verdict="approve", lines=()):
+        return "```verdict\nlane: %s\nplan_hash: %s\nverdict: %s\n%s\n```\n" % (lane, plan_hash, verdict, "\n".join(lines))
+
+    def lane_verdict(self, started, lane, verdict="approve", lines=(), who=None):
+        pane = next(p for l, n, p in started["launched"] if l == lane)
+        return self.review(who or pane, "verdict", started["review"], "--lane", lane, "--json", stdin=self.block(lane, started["plan_hash"], verdict, lines))
+
+    def kinds(self, kind=None):
+        rows = [e for e in self.ledger() if e["kind"] in sb.plan_ledger.REVIEW_KINDS]
+        return [e for e in rows if kind is None or e["kind"] == kind]
+
+    def test_it_is_off_by_default_and_refuses_every_command(self):
+        self.extra_config = None
+        self.configure()
+        for argv in (("start", "acme/app#7", "--ask", "acme/app#7"), ("status", "rv1"), ("abandon", "rv1", "--reason", "x" * 30)):
+            code, out, err = self.review("orch", *argv)
+            self.assertEqual(code, 2)
+            self.assertIn("plan review engine is off", err)
+        self.assertEqual(self.kinds(), [])
+
+    def test_start_opens_a_full_review_for_an_ask_launches_the_lanes_and_records_them(self):
+        code, got, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((got["tier"], got["lanes"]), ("full", ["L1", "L2", "L3", "L4", "L5", "L6"]))
+        self.assertEqual(len(got["launched"]), 6)
+        (round_entry,) = self.kinds("round")
+        self.assertEqual((round_entry["round"], round_entry["closing"], round_entry["lineage"], round_entry["by"]),
+                         (1, False, "acme/app#7", "orch"))
+        self.assertEqual(round_entry["plan_hash"], got["plan_hash"])
+        sessions = {e["lane"]: e["session"] for e in self.kinds("lane_session")}
+        self.assertEqual(sorted(sessions), got["lanes"])
+        self.assertEqual(sessions["L2"], "planrev-%s-l2-r1" % got["review"])
+        self.assertEqual(sb.plan_ledger.read_ledger(self.world.state)[1], None, "the chain holds")
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "consensus"], [], "this slice never writes a consensus")
+
+    def test_the_lane_brief_carries_the_snapshot_the_ask_and_the_untrusted_warning(self):
+        seen = []
+        real = sb.launch_agent
+
+        def spy(engine, name, agent, *a, **k):
+            seen.append((name, agent, k.get("brief")))
+            return real(engine, name, agent, *a, **k)
+        with mock.patch.object(sb, "launch_agent", spy):
+            code, got, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.assertEqual({a for _, a, _ in seen}, {"plan-reviewer"})
+        brief = dict((n.rsplit("-", 2)[1], b) for n, _, b in seen)["l2"]
+        for needle in ("lane L2", "UNTRUSTED", got["plan_hash"], "Commissioning works", "bad build that passes", "plan_hash: " + got["plan_hash"]):
+            self.assertIn(needle, brief)
+
+    def test_only_a_person_an_orchestrator_or_the_chief_of_staff_may_start_and_a_failing_plan_is_refused(self):
+        code, out, err = self.review("coder", "start", "acme/app#7", "--ask", "acme/app#7")
+        self.assertEqual(code, 2)
+        self.assertIn("may not start a plan review", err)
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        code, out, err = self.review("orch", "start", "acme/app#7", "--ask", "acme/app#7")
+        self.assertEqual(code, 2)
+        self.assertIn("fails `plan check`", err)
+        self.assertEqual(self.kinds(), [])
+        self.assertEqual(self.start(who="cos")[0], 2, "the plan still fails")
+
+    def test_a_second_start_is_refused_while_a_review_is_open_and_a_plan_cannot_move_to_another_ask(self):
+        self.assertEqual(self.start()[0], 0)
+        code, got, err = self.start()
+        self.assertEqual(code, 2)
+        self.assertIn("already open", err)
+        code, got, err = self.start(who="cos", source="acme/app#7", ask="acme/app#8")
+        self.assertEqual(code, 2)
+
+    def test_the_start_limits_per_day_and_per_lineage_sessions(self):
+        self.enable(starts_per_day=1, session_cap=4)
+        code, got, err = self.start()
+        self.assertEqual(code, 2)
+        self.assertIn("lane sessions", err, "6 lanes against a cap of 4")
+        self.enable(starts_per_day=1)
+        self.assertEqual(self.start()[0], 0)
+        self.review("orch", "abandon", "rv1", "--reason", "a stalled review for the test")
+        code, got, err = self.start()
+        self.assertEqual(code, 2)
+        self.assertIn("in the last day", err)
+
+    def test_waves_launch_max_parallel_lanes_and_a_verdict_launches_the_next_one(self):
+        self.enable(max_parallel=2)
+        code, got, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.assertEqual([l for l, _, _ in got["launched"]], ["L1", "L2"])
+        code, out, err = self.lane_verdict(got, "L1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["launched_next"], ["L3"])
+        self.assertEqual(len(self.kinds("lane_session")), 3)
+
+    def test_a_lane_records_its_verdict_for_its_own_lane_only(self):
+        code, got, err = self.start()
+        pane_l2 = next(p for l, n, p in got["launched"] if l == "L2")
+        code, out, err = self.lane_verdict(got, "L2", "iterate", ["- id: O1; severity: blocking; state: open; text: a stub passes S1"])
+        self.assertEqual(code, 0, err)
+        (lane,) = self.kinds("lane")
+        self.assertEqual((lane["lane"], lane["verdict"], lane["plan_hash"], lane["by"]), ("L2", "iterate", got["plan_hash"], "planrev-%s-l2-r1" % got["review"]))
+        code, out, err = self.review(pane_l2, "verdict", got["review"], "--lane", "L2", stdin=self.block("L2", got["plan_hash"]))
+        self.assertEqual(code, 2)
+        self.assertIn("already has its verdict", err)
+        code, out, err = self.review(pane_l2, "verdict", got["review"], "--lane", "L3", stdin=self.block("L3", got["plan_hash"]))
+        self.assertEqual(code, 2)
+        self.assertIn("is not the session launched for lane L3", err)
+
+    def test_a_foreign_caller_the_planner_a_stale_hash_and_a_loose_block_are_refused(self):
+        code, got, err = self.start()
+        for who, text, needle in (("coder", self.block("L1", got["plan_hash"]), "not the session launched"),
+                                  ("orch", self.block("L1", got["plan_hash"]), "not the session launched"),
+                                  (None, self.block("L1", got["plan_hash"]), "uncertain|no herdr|run send"),
+                                  ):
+            with self.subTest(who=who):
+                code, out, err = self.review(who, "verdict", got["review"], "--lane", "L1", stdin=text)
+                self.assertEqual(code, 2)
+                self.assertTrue(re.search(needle, err), err)
+        pane = next(p for l, n, p in got["launched"] if l == "L1")
+        for text, needle in ((self.block("L1", "sha256:" + "0" * 64), "does not echo the plan hash"), ("I approve", "exactly 1 verdict block")):
+            code, out, err = self.review(pane, "verdict", got["review"], "--lane", "L1", stdin=text)
+            self.assertEqual(code, 2)
+            self.assertIn(needle, err)
+        self.assertEqual(self.kinds("lane"), [])
+
+    def test_status_shows_the_lanes_and_the_tally_and_never_a_consensus(self):
+        code, got, err = self.start()
+        self.lane_verdict(got, "L1")
+        self.lane_verdict(got, "L2", "iterate", ["- id: O1; severity: blocking; state: open; text: stub"])
+        code, out, err = self.review("orch", "status", got["review"], "--json")
+        self.assertEqual(code, 0, err)
+        status = json.loads(out)
+        self.assertEqual((status["lanes"]["L1"], status["lanes"]["L2"], status["lanes"]["L3"]), ("verdict:approve", "verdict:iterate", "running"))
+        self.assertEqual((status["open_blocking"], status["rounds_used"], status["next"]), (["L2/O1"], 1, "waiting for the lanes"))
+
+    def finish_round(self, got, objections):
+        for lane in got["lanes"]:
+            lines = objections.get(lane)
+            self.assertEqual(self.lane_verdict(got, lane, "iterate" if lines else "approve", lines or ())[0], 0)
+
+    tables = 0
+
+    def table(self, text):
+        self.tables += 1
+        path = self.home / ("table%d.md" % self.tables)
+        path.write_text(text)
+        return str(path)
+
+    def verdict_current(self, review, lane, verdict="approve", lines=()):
+        rows = self.ledger()
+        rnd = [e for e in rows if e["kind"] == "round" and e["review"] == review][-1]
+        pane = [e["pane"] for e in rows if e["kind"] == "lane_session" and e["review"] == review and e["round"] == rnd["round"] and e["lane"] == lane][-1]
+        return self.review(pane, "verdict", review, "--lane", lane, "--json", stdin=self.block(lane, rnd["plan_hash"], verdict, lines))
+
+    def current_lanes(self, review):
+        rows = self.ledger()
+        rnd = [e for e in rows if e["kind"] == "round" and e["review"] == review][-1]
+        return rnd["lanes"]
+
+    def test_respond_opens_the_next_round_for_the_lanes_that_still_object(self):
+        code, got, err = self.start()
+        self.finish_round(got, {"L2": ["- id: O1; severity: blocking; state: open; text: a stub passes"]})
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept, fixed in the revision"), "--json")
+        self.assertEqual(code, 0, err)
+        nxt = json.loads(out)
+        self.assertEqual((nxt["round"], "L2" in nxt["lanes"], "L3" in nxt["lanes"]), (2, True, False))
+        self.assertEqual(len(self.kinds("response")), 1)
+        second = self.kinds("round")[-1]
+        self.assertEqual((second["round"], second["plan_ref"], second["plan_hash"] != got["plan_hash"]), (2, "acme/app#8", True))
+
+    def test_respond_is_refused_until_every_lane_reported_and_for_a_bad_table_or_the_same_text_or_nothing_blocking(self):
+        code, got, err = self.start()
+        table = self.table("L2/O1: accept")
+        self.lane_verdict(got, "L1")
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", table)
+        self.assertIn("have not reported", err)
+        for lane in got["lanes"][1:]:
+            self.lane_verdict(got, lane, "iterate" if lane == "L2" else "approve", ["- id: O1; severity: blocking; state: open; text: stub"] if lane == "L2" else ())
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("no mention"))
+        self.assertIn("missing L2/O1", err)
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#7", "--table", table)
+        self.assertIn("same plan hash", err)
+        code, out, err = self.review("coder", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", table)
+        self.assertEqual(code, 2)
+        self.plan_issue2["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", table)
+        self.assertIn("fails `plan check`", err)
+
+    def test_nothing_blocking_means_the_next_step_is_the_closing_round_not_another_round(self):
+        code, got, err = self.start()
+        self.finish_round(got, {})
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("nothing"))
+        self.assertEqual(code, 2)
+        self.assertIn("closing round", err)
+
+    def test_the_cap_of_three_rounds_stops_respond_and_a_start_cannot_reset_it(self):
+        code, got, err = self.start()
+        review = got["review"]
+        obj = ["- id: O1; severity: blocking; state: open; text: a stub passes"]
+        for number in (8, 9):
+            for lane in self.current_lanes(review):
+                self.assertEqual(self.verdict_current(review, lane, "iterate" if lane == "L2" else "approve", obj if lane == "L2" else ())[0], 0)
+            self.plan_issue2 = {"number": number, "state": "open", "title": "p", "body": self.PLAN2 + "\nrevision %d\n" % number,
+                                "updated_at": "2026-01-01T00:00:00Z", "parent_issue_url": "https://api.github.com/repos/acme/app/issues/7"}
+            code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#%d" % number, "--table", self.table("L2/O1: reject, why"))
+            self.assertEqual(code, 0, err)
+        for lane in self.current_lanes(review):
+            self.assertEqual(self.verdict_current(review, lane, "iterate" if lane == "L2" else "approve", obj if lane == "L2" else ())[0], 0)
+        self.plan_issue2 = {"number": 10, "state": "open", "title": "p", "body": self.PLAN2 + "\nrevision 3\n", "updated_at": "2026-01-01T00:00:00Z",
+                            "parent_issue_url": "https://api.github.com/repos/acme/app/issues/7"}
+        code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#10", "--table", self.table("L2/O1: reject"))
+        self.assertEqual(code, 2)
+        self.assertIn("rounds are spent", err)
+        self.review("orch", "abandon", review, "--reason", "stopped to try a restart in the test")
+        self.enable(starts_per_day=9)
+        code, got2, err = self.start(who="cos")
+        self.assertEqual(code, 2)
+        self.assertIn("rounds are spent", err)
+
+    def test_abandon_clears_a_stalled_review_with_a_reason_and_the_count_continues(self):
+        code, got, err = self.start()
+        code, out, err = self.review("orch", "abandon", got["review"], "--reason", "short")
+        self.assertEqual(code, 2)
+        code, out, err = self.review("cos", "abandon", got["review"], "--reason", "the ask was withdrawn by the owner")
+        self.assertEqual(code, 0, err)
+        (entry,) = self.kinds("abandoned")
+        self.assertEqual((entry["by"], entry["lineage"]), ("cos", "acme/app#7"))
+        self.assertEqual(self.review("coder", "abandon", got["review"], "--reason", "y" * 30)[0], 2)
+        self.assertEqual(self.start(who="cos")[0], 0, "the open review is cleared")
+
+    # -- the #187 review
+
+    def test_the_ask_is_verified_from_the_plan_issue_so_naming_another_ask_cannot_reset_the_count(self):
+        code, got, err = self.start(ask="acme/app#8")   # plan #7 is not under ask #8 and is not #8
+        self.assertEqual(code, 2)
+        self.assertIn("is not the ask's plan", err)
+        self.assertEqual(self.kinds(), [])
+        self.assertEqual(self.start(source="acme/app#8", ask="acme/app#7")[0], 0, "plan #8 sits under ask #7")
+        self.review("orch", "abandon", "rv1", "--reason", "restart with another plan issue for the same ask")
+        self.plan_issue2.pop("parent_issue_url")
+        code, got, err = self.start(source="acme/app#8", ask="acme/app#7")
+        self.assertEqual(code, 2)
+        self.assertIn("is not the ask's plan", err)
+
+    def test_respond_checks_the_new_revision_is_still_under_the_ask(self):
+        code, got, err = self.start()
+        self.finish_round(got, {"L2": ["- id: O1; severity: blocking; state: open; text: stub"]})
+        self.plan_issue2.pop("parent_issue_url")
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept"))
+        self.assertEqual(code, 2)
+        self.assertIn("is not the ask's plan", err)
+        self.assertEqual(self.kinds("response"), [])
+
+    def test_a_lane_wide_approve_that_omits_an_id_keeps_its_lane_running_and_no_round_opens_without_lanes(self):
+        code, got, err = self.start()
+        review = got["review"]
+        obj = ["- id: O1; severity: blocking; state: open; text: stub"]
+        for lane in self.current_lanes(review):
+            self.verdict_current(review, lane, "iterate" if lane == "L2" else "approve", obj if lane == "L2" else ())
+        self.assertEqual(self.review("orch", "respond", review, "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: reject, why"))[0], 0)
+        self.assertEqual(self.current_lanes(review), ["L2"])
+        self.assertEqual(self.verdict_current(review, "L2", "approve")[0], 0)   # a lane-wide approve that omits O1
+        self.plan_issue2["body"] = self.PLAN2 + "\nrevision 2\n"
+        code, out, err = self.review("orch", "respond", review, "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept, fixed"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.current_lanes(review), ["L2"], "O1 is still open, so its lane runs again")
+        self.assertEqual(len([e for e in self.kinds("round")]), 3)
+
+    def test_two_concurrent_starts_open_one_review_with_distinct_ids(self):
+        results = []
+        real = sb.plan_ledger.append_checked
+
+        def slow(state, now, build):
+            def delayed(entries, seq):
+                time.sleep(0.2)   # widen the window between the check and the append
+                return build(entries, seq)
+            return real(state, now, delayed)
+
+        def one(who):
+            os.environ["HERDR_WORKSPACE_ID"] = "w1"
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+            engine_args = types.SimpleNamespace(source="acme/app#7", ask="acme/app#7", tier=None, json=True)
+            try:
+                with mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None):
+                    results.append(("ok", sb.review_start(engine_args, self.route, self.world.clock.now, self.world.herdr.socket)))
+            except sb.ReviewError as err:
+                results.append(("refused", str(err)))
+            except Exception as err:   # a fake that is not thread-safe must not hide the ledger result
+                results.append(("error", repr(err)))
+        with mock.patch.object(sb.plan_ledger, "append_checked", slow), mock.patch.object(sb, "_launch_lanes", lambda *a, **k: []), \
+                mock.patch.object(sb, "gates_caller_kind", lambda *a, **k: ("agent", "orch", "orchestrator")):
+            threads = [threading.Thread(target=one, args=(who,)) for who in ("orch", "cos")]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+        rounds = self.kinds("round")
+        self.assertEqual(len(rounds), 1, results)
+        self.assertEqual(sorted(r[0] for r in results), ["ok", "refused"], results)
+        self.assertEqual(rounds[0]["review"], "rv%d" % rounds[0]["seq"], "the review id comes from the appended sequence number")
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.world.state)[1])
+
+    def test_the_ledger_decides_inside_its_lock(self):
+        def refuse(entries, seq):
+            raise sb.plan_ledger.LedgerError("no")
+        with self.assertRaises(sb.plan_ledger.LedgerError):
+            sb.plan_ledger.append_checked(self.world.state, 5, refuse)
+        stored = sb.plan_ledger.append_checked(self.world.state, 5, lambda entries, seq: {"kind": "round", "n": seq})
+        self.assertEqual((stored["seq"], stored["n"]), (1, 1))
+
+    def test_a_response_table_needs_one_accept_or_reject_line_per_id_and_a_prefix_does_not_count(self):
+        code, got, err = self.start()
+        self.finish_round(got, {"L2": ["- id: O1; severity: blocking; state: open; text: stub"]})
+        for text in ("L2/O10: accept", "L2/O1 is noted", "see L2/O1 above"):
+            code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table(text))
+            self.assertEqual(code, 2, text)
+            self.assertIn("missing L2/O1", err)
+        self.assertEqual(self.kinds("response"), [], "a refusal leaves no response behind")
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: reject, out of scope"))
+        self.assertEqual(code, 0, err)
+
+    def test_a_budget_refusal_in_respond_leaves_no_response_entry(self):
+        self.enable(session_cap=6)
+        code, got, err = self.start()
+        self.assertEqual(code, 0, err)
+        self.finish_round(got, {"L2": ["- id: O1; severity: blocking; state: open; text: stub"]})
+        code, out, err = self.review("orch", "respond", got["review"], "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept"))
+        self.assertEqual(code, 2)
+        self.assertIn("lane sessions", err)
+        self.assertEqual((self.kinds("response"), len(self.kinds("round"))), ([], 1), "a refusal leaves no response and no round behind")
+
+    def test_a_verdict_over_the_size_or_objection_caps_is_refused(self):
+        code, got, err = self.start()
+        pane = next(p for l, n, p in got["launched"] if l == "L2")
+        many = ["- id: O%d; severity: advisory; state: open; text: x" % i for i in range(1, 22)]
+        code, out, err = self.review(pane, "verdict", got["review"], "--lane", "L2", stdin=self.block("L2", got["plan_hash"], "iterate", many))
+        self.assertEqual(code, 2)
+        self.assertIn("at most 20", err)
+        code, out, err = self.review(pane, "verdict", got["review"], "--lane", "L2", stdin="x" * 70000)
+        self.assertEqual(code, 2)
+        self.assertIn("over 65536 bytes", err)
+        self.assertEqual(self.kinds("lane"), [])
+
+    def test_the_ledger_takes_the_review_kinds_without_a_result_and_still_refuses_unknown_kinds(self):
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "round", "lineage": "a/b#1", "review": "rv1"}, 5)
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.world.state)[1])
+        with self.assertRaises(sb.plan_ledger.LedgerError):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "mystery"}, 6)
+        with self.assertRaises(sb.plan_ledger.LedgerError):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "proof"}, 6)   # an evidence entry still needs its result
+
+    def test_the_config_is_validated(self):
+        base = {"opencode": FAKE_OPENCODE}
+        for bad in ({"enabled": "yes"}, {"max_parallel": 0}, {"max_parallel": 9}, {"session_cap": 1}, {"held_globs": "shims/**"},
+                    {"lane_agent": "Bad Name"}, {"mystery": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict(base, plan_review=bad))
+        got = sb.validate_config(dict(base, plan_review={"enabled": True, "held_globs": ["shims/**"]}))["plan_review"]
+        self.assertEqual((got["enabled"], got["max_parallel"], got["lane_agent"], got["session_cap"]), (True, 3, "plan-reviewer", 24))
+        self.assertNotIn("plan_review", sb.validate_config(dict(base)))
+
+    def test_plan_check_is_unchanged(self):
+        code, out, err = self.run_as("coder", "plan", "check", "acme/app#7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("PASS", out)
+
 plan_review = _load("t_plan_review", BIN / "plan_review.py")
 
 
@@ -34143,24 +34550,24 @@ class TestPlanReviewCore(unittest.TestCase):
     def test_consensus_needs_an_approve_at_the_final_hash_from_every_lane_of_the_tier(self):
         lanes = plan_review.lanes_for_tier("normal")
         entries = [self.lane(l, "approve", self.H1) for l in lanes]
-        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H1)[0], "consensus")
-        self.assertEqual(plan_review.decide_consensus(entries[:-1], lanes, self.H1)[0], "pending")
+        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H1, rounds_left=True)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(entries[:-1], lanes, self.H1, rounds_left=True)[0], "pending")
 
     def test_a_revision_changed_after_a_lane_approved_gets_no_consensus_and_no_closing_round_means_none(self):
         lanes = ["L1", "L2"]
         earlier = [self.lane("L1", "approve", self.H1), self.lane("L2", "approve", self.H1)]
-        verdict, why = plan_review.decide_consensus(earlier, lanes, self.H2)
+        verdict, why = plan_review.decide_consensus(earlier, lanes, self.H2, rounds_left=True)
         self.assertEqual(verdict, "pending")
         self.assertIn("no closing round, no consensus", why)
         closing = earlier + [self.lane("L1", "approve", self.H2)]
-        self.assertEqual(plan_review.decide_consensus(closing, lanes, self.H2)[0], "pending")
+        self.assertEqual(plan_review.decide_consensus(closing, lanes, self.H2, rounds_left=True)[0], "pending")
         closing.append(self.lane("L2", "approve", self.H2))
-        self.assertEqual(plan_review.decide_consensus(closing, lanes, self.H2)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(closing, lanes, self.H2, rounds_left=True)[0], "consensus")
 
     def test_a_blocking_objection_on_the_final_text_escalates_it_cannot_start_another_round(self):
         lanes = ["L1", "L2"]
         entries = [self.lane("L1", "approve", self.H2), self.lane("L2", "iterate", self.H2, [self.obj("O9")])]
-        verdict, why = plan_review.decide_consensus(entries, lanes, self.H2)
+        verdict, why = plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=True)
         self.assertEqual(verdict, "escalate")
         self.assertIn("L2", why)
 
@@ -34168,23 +34575,23 @@ class TestPlanReviewCore(unittest.TestCase):
         lanes = ["L1", "L2"]
         entries = [self.lane("L2", "iterate", self.H1, [self.obj("O1")]), self.lane("L1", "approve", self.H2),
                    self.lane("L2", "approve", self.H2)]   # L2 approves round 2 without mentioning O1
-        verdict, why = plan_review.decide_consensus(entries, lanes, self.H2)
+        verdict, why = plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=True)
         self.assertEqual(verdict, "pending")
         self.assertIn("L2/O1", why)
         entries.append(self.lane("L2", "approve", self.H2, [self.obj("O1", state="resolved")]))
-        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H2)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=True)[0], "consensus")
         self.assertEqual(plan_review.survivors(entries[:1]), [("L2", "O1")])
 
     def test_each_objection_ends_in_an_explicit_state_a_rejection_must_be_accepted_by_its_lane(self):
         lanes = ["L1"]
         rejected = [self.lane("L1", "iterate", self.H1, [self.obj("O1")]), self.lane("L1", "approve", self.H2)]
-        self.assertEqual(plan_review.decide_consensus(rejected, lanes, self.H2)[0], "pending")
+        self.assertEqual(plan_review.decide_consensus(rejected, lanes, self.H2, rounds_left=True)[0], "pending")
         rejected.append(self.lane("L1", "approve", self.H2, [self.obj("O1", state="rejection_accepted")]))
-        self.assertEqual(plan_review.decide_consensus(rejected, lanes, self.H2)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(rejected, lanes, self.H2, rounds_left=True)[0], "consensus")
 
     def test_an_advisory_objection_never_blocks(self):
         entries = [self.lane("L1", "approve", self.H1, [self.obj("O1", severity="advisory")])]
-        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1, rounds_left=True)[0], "consensus")
 
     def test_who_may_override(self):
         person, boss = "person", "agent"
@@ -34237,7 +34644,7 @@ class TestPlanReviewCore(unittest.TestCase):
         lanes = ["L1", "L2"]
         entries = [self.lane("L2", "iterate", self.H1, [self.obj("O1")]), self.lane("L1", "approve", self.H2),
                    self.lane("L2", "approve", self.H2)]   # an old-hash objection, then a silent lane-wide approve
-        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H2)[0], "pending", "with rounds left it waits")
+        self.assertEqual(plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=True)[0], "pending", "with rounds left it waits")
         verdict, why = plan_review.decide_consensus(entries, lanes, self.H2, rounds_left=False)
         self.assertEqual(verdict, "escalate")
         self.assertIn("L2/O1", why)
@@ -34248,11 +34655,20 @@ class TestPlanReviewCore(unittest.TestCase):
         self.assertEqual(verdict, "escalate")
         self.assertIn("L2", why)
 
+    def test_a_consensus_never_clears_an_undecided_escalation_and_rounds_left_must_be_given(self):
+        entries = (self.rounds(3) + [self.lane("L2", "iterate", self.H1, [self.obj("O1")]), {"kind": "escalation", "objection": "L2/O1"},
+                                     {"kind": "consensus", "plan_hash": self.H2}])
+        state = plan_review.lineage_state(entries)
+        self.assertEqual((state["undecided"], state["escalated"], state["open_blocking"]), (["L2/O1"], True, ["L2/O1"]))
+        self.assertFalse(plan_review.may_start(state, self.H1)[0])
+        with self.assertRaises(TypeError):
+            plan_review.decide_consensus([], ["L1"], self.H1)   # no default: an unknown is not read as "rounds remain"
+
     def test_a_lanes_latest_entry_at_the_final_hash_counts_a_later_reject_undoes_an_approve(self):
         entries = [self.lane("L1", "approve", self.H1), self.lane("L1", "reject", self.H1, [self.obj("O1", severity="advisory")])]
-        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1)[0], "pending")
+        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1, rounds_left=True)[0], "pending")
         entries.append(self.lane("L1", "approve", self.H1))
-        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1)[0], "consensus")
+        self.assertEqual(plan_review.decide_consensus(entries, ["L1"], self.H1, rounds_left=True)[0], "consensus")
 
     def test_an_abandoned_review_clears_the_open_review_and_the_count_continues(self):
         entries = self.rounds(2) + [{"kind": "abandoned", "by": "cos", "reason": "the ask was withdrawn"}]

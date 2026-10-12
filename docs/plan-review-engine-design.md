@@ -193,3 +193,21 @@ counts by its latest entry at the final hash; a work item under an ask whose own
 (`ask_has_consensus` is read from the ledger by the caller); an `abandoned` entry (cos or the owner) clears a stalled open review without
 buying fresh rounds; `iterate` and `reject` need at least one objection; a lane's brief shows only its own earlier objections; an escalation
 message cuts the objection and the response to 600 characters each.
+
+R2 (the ledger records and the first commands) is built: `plan review start|verdict|respond|status|abandon`, off unless `plan_review.enabled` is true. New ledger
+kinds (`round`, `lane_session`, `lane`, `response`, `escalation`, `decision`, `abandoned`) need no result; the evidence kinds still do. `start` is for a
+person at a shell, a registered orchestrator or the chief of staff, loads and checks the plan, reads the ask from the issue (a charter is an epic, an
+issue with a parent a work item), computes the tier (path tokens in the plan text are checked against `plan_review.held_globs`; a work item under an ask
+with no consensus is full), applies the lineage, per-day and session limits, writes the `round` entry and launches the lanes (`plan-reviewer` agent) up to
+`max_parallel` at a time; a verdict launches the next waiting lane. `verdict` (the fallback) is accepted only from the session launched for that lane and
+round, never from the planner, once per lane per round, and only as a strict verdict block echoing the plan hash. `respond` is the planner's, after every
+lane reported: the table must name every open blocking objection (`<lane>/<id>`), the new revision must pass `plan check` with a new hash, and the next
+round runs only the lanes that still object (plus L1 when the scenarios changed). A plan source belongs to one ask: naming another ask for it is refused.
+Limits of this slice: the ask is named with `--ask` (deriving it from the `PLAN:` target's parent chain is later), no closing round, no consensus write, no
+escalation or `decide`, no daemon read of the lane's final message, no `report`.
+
+R2 review fixes: `start` and `respond` verify the ask from the plan issue itself (the plan issue is the ask or its parent chain reaches it; a mismatching
+`--ask` is refused, so naming another ask cannot reset the count); the next round's lanes come from the lineage's open objections (their lanes) plus L1
+on a changed scenario hash, and a round with no lane is refused; the check, the review id (from the appended sequence number) and the append are one
+critical section under the ledger lock (`append_checked`), so two concurrent starts cannot open two reviews; `respond` checks the budget before it
+records anything, requires one `<lane>/<id>: accept|reject` line per open objection, and `verdict` and the table are size-capped (64 KB; 20 objections).

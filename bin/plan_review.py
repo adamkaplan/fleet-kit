@@ -126,7 +126,7 @@ def lineage_state(entries, plan_hash=None):
     entry clears the open review (the count continues)."""
     rounds, post, closing, escalated, open_review = 0, 0, 0, False, False
     closing_hashes, latest, consensus, overridden = set(), {}, [], {}
-    for entry in entries:
+    for index, entry in enumerate(entries):
         kind = entry.get("kind")
         if kind == "round":
             open_review = True
@@ -150,8 +150,9 @@ def lineage_state(entries, plan_hash=None):
             open_review = False
             if entry.get("overridden_by"):
                 overridden[entry.get("plan_hash")] = entry["overridden_by"]
-            rounds, post, closing, escalated = 0, 0, 0, False
-            closing_hashes, latest = set(), {}
+            if not _undecided(entries[:index + 1]):   # a consensus never clears an escalation nobody decided
+                rounds, post, closing, escalated = 0, 0, 0, False
+                closing_hashes, latest = set(), {}
     open_blocking = sorted("%s/%s" % key for key, o in latest.items()
                            if o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES)
     return {"rounds": rounds, "post_escalation_rounds": post, "closing_rounds": closing, "closing_hashes": sorted(closing_hashes),
@@ -236,12 +237,13 @@ def survivors(lane_entries):
                   if o.get("severity") == "blocking" and o.get("state") not in CLOSED_STATES)
 
 
-def decide_consensus(lane_entries, tier_lanes, final_hash, rounds_left=True):
+def decide_consensus(lane_entries, tier_lanes, final_hash, *, rounds_left):
     """(verdict, why): "consensus", "pending" or "escalate", from the lane entries alone (all rounds, oldest first). Each lane counts by
     its LATEST entry at the final hash (a later reject undoes an earlier approve).
     Consensus needs, for EVERY lane of the tier, an `approve` as that latest entry, and no blocking objection left open.
     A blocking objection raised on the final text escalates (it cannot start another round). With no round left (`rounds_left` false)
-    any unresolved blocking objection, or a lane whose latest entry on the final text is not an approve, ESCALATES with its ids:
+    any unresolved blocking objection, or a lane whose latest entry on the final text is not an approve, ESCALATES with its ids
+    (`rounds_left` is REQUIRED: the caller must say, an unknown is not assumed to mean "rounds remain"):
     an objection that survives the rounds is never dropped and never left pending. A revision changed after a lane approved has no
     approval at its hash, so it stays pending until a closing round."""
     final = {}
