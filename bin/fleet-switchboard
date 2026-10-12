@@ -13106,20 +13106,25 @@ def gates_stats_core(entries, merged_at, limit=10):
 
 # ---------------------------------------------------------------- the impact floor (#179, slice L3): advisory, writes NOTHING
 
+IMPACT_REVIEW_REASON = "rating: the independent impact reviewer's action for this head is hold"
+
+
 def impact_review_hold(state_dir, pr, head):
-    """True when the independent impact reviewer's record for EXACTLY this head says `hold` (the L2 `review record --impact-action hold`).
-    An input that can only ADD a hold: nothing it says can lower the floor."""
+    """(hold, problem): `hold` is True when the independent impact reviewer's record for EXACTLY this head says `hold` (the L2 `review record
+    --impact-action hold`): an input that can only ADD a hold, nothing it says lowers the floor. **Fail mode: toward hold.** When the ledger
+    cannot be read or is not trustworthy the rating is UNKNOWN, and an unknown input holds (as an unreadable diff does, and as G1 already
+    refuses on a bad ledger): `hold` is True and `problem` says why; the caller audits it (`impact.ledger_unreadable`)."""
     try:
         entries, problem = plan_ledger.read_ledger(state_dir)
-    except Exception:
-        return False
+    except Exception as err:
+        entries, problem = [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
     if problem:
-        return False
+        return True, "the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(problem), 120)
     latest = None
     for entry in entries:
         if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
             latest = entry
-    return bool(latest and latest.get("impact_action") == "hold")
+    return bool(latest and latest.get("impact_action") == "hold"), None
 
 
 def pr_floor_report(engine, repo, number, rated_pairs=()):
@@ -13148,10 +13153,15 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     rated = impact_floor.rate(matrix, list(rated_pairs))
     decision, reasons = impact_floor.decide(hit, rated, unknown)
     head = raw.get("headRefOid")
-    if engine.state_dir is not None and isinstance(head, str) and impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head):
-        if decision != "hold":
+    if engine.state_dir is not None and isinstance(head, str):
+        review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
+        if problem:
+            engine._note("impact.ledger_unreadable", "%s#%d" % (repo, number), {"why": problem, "fails": "toward hold"}) if engine.audit is not None else None
+            reasons = reasons + [problem]
+        elif review:
+            reasons = reasons + [IMPACT_REVIEW_REASON]
+        if review:
             decision = "hold"
-        reasons = reasons + ["rating: the independent impact reviewer's action for this head is hold"]
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
             "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons}
@@ -13208,13 +13218,32 @@ IMPACT_RETRY_SECONDS = 300   # a PR whose floor could not be read is retried aft
 IMPACT_STATE_FILE = "impact-hold.json"   # {"clears": {pr: {head, reason, by, at}}, "applied": {pr: {head, merge_label_added}}}
 
 
+IMPACT_STATE_MAX_BYTES = 1000000
+IMPACT_LOCK_FILE = "impact-hold.lock"
+IMPACT_LOCK_SECONDS = 30
+
+
 def read_impact_state(state_dir):
+    """(state, problem): {"clears", "applied"} and None, or an EMPTY state and what is wrong when the file is corrupt, not an object or over
+    IMPACT_STATE_MAX_BYTES. A missing file is an empty state with no problem. A corrupt file is REPORTED, never silently read as empty."""
+    path = Path(state_dir) / IMPACT_STATE_FILE
+    empty = {"clears": {}, "applied": {}}
     try:
-        raw = json.loads((Path(state_dir) / IMPACT_STATE_FILE).read_text())
-    except (OSError, ValueError):
-        raw = {}
-    raw = raw if isinstance(raw, dict) else {}
-    return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
+        with open(str(path), "rb") as handle:
+            data = handle.read(IMPACT_STATE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return empty, None
+    except OSError as err:
+        return empty, "%s cannot be read: %s" % (IMPACT_STATE_FILE, err.strerror or err)
+    if len(data) > IMPACT_STATE_MAX_BYTES:
+        return empty, "%s is over %d bytes" % (IMPACT_STATE_FILE, IMPACT_STATE_MAX_BYTES)
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return empty, "%s is not valid JSON" % IMPACT_STATE_FILE
+    if not isinstance(raw, dict):
+        return empty, "%s is not an object" % IMPACT_STATE_FILE
+    return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}, None
 
 
 def write_impact_state(state_dir, data):
@@ -13223,14 +13252,57 @@ def write_impact_state(state_dir, data):
     fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(str(temp), str(path))
+
+
+class impact_state_lock:
+    """ONE exclusive lock around everything that reads the impact state and acts on it: the daemon's `clear check -> label write -> applied record`
+    and the owner's `clear record -> label removal` cannot interleave, so a clear is never lost and a cleared hold is never re-added.
+    Waits up to IMPACT_LOCK_SECONDS, then raises (a write that cannot take the lock is retried later, never done unlocked)."""
+
+    def __init__(self, state_dir, seconds=None):
+        self.path, self.seconds = Path(state_dir) / IMPACT_LOCK_FILE, IMPACT_LOCK_SECONDS if seconds is None else seconds
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + self.seconds
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    raise RuntimeError("the impact state is locked by another process (waited %d s)" % self.seconds) from None
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+def _impact_state_noted(engine, problem):
+    if problem and engine.audit is not None:
+        engine._note("impact.state_unreadable", None, {"why": problem})
 
 
 def apply_impact_hold(engine, repo, number, report, record):
     """Write the hold: add `<user>:merge-captain` and `<user>:hold-impact` to the PR, only those missing, never remove anything. Skipped
     when the owner cleared THIS head. Returns the number of gh calls spent. The labels are ensured once per repo per process."""
+    with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
+        return _apply_impact_hold_locked(engine, repo, number, report, record)
+
+
+def _apply_impact_hold_locked(engine, repo, number, report, record):
     pr, head = report["pr"], report["head"]
-    state = read_impact_state(engine.state_dir)
+    state, problem = read_impact_state(engine.state_dir)
+    _impact_state_noted(engine, problem)   # fails toward hold: a state file nobody can read hides no hold, and the owner can clear again
     cleared = state["clears"].get(pr) or {}
     if cleared.get("head") == head:
         return 0
@@ -13249,7 +13321,6 @@ def apply_impact_hold(engine, repo, number, report, record):
         spent += len(LABEL_SPECS)
     change_issue_labels(engine, runner, repo, number, add=missing)
     spent += 1
-    state = read_impact_state(engine.state_dir)
     state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in missing}
     write_impact_state(engine.state_dir, state)
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
@@ -13266,15 +13337,18 @@ def impact_clear_core(engine, runner, repo, number, who, reason):
     if not isinstance(head, str) or not head:
         raise NoticeError("the PR's head is unknown")
     names = label_names(engine.config)
-    state = read_impact_state(engine.state_dir)
-    ours = state["applied"].get(pr) or {}
-    remove = [names["hold-impact"]]
-    if ours.get("merge_label_added"):
-        remove.append(names["merge-captain"])
-    state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
-    write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
-    change_issue_labels(engine, runner, repo, number, remove=remove)
-    engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})
+    with impact_state_lock(engine.state_dir):   # the same lock as the daemon's write: the clear and its removal are one step
+        state, problem = read_impact_state(engine.state_dir)
+        _impact_state_noted(engine, problem)
+        ours = state["applied"].get(pr) or {}
+        remove = [names["hold-impact"]]
+        if ours.get("merge_label_added"):
+            remove.append(names["merge-captain"])
+        state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
+        write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
+        change_issue_labels(engine, runner, repo, number, remove=remove)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})
     return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head[:8], ", ".join(remove))]
 
 
@@ -13282,7 +13356,7 @@ def cmd_impact_clear(args, runner, now):
     """`impact clear <repo#N> --reason TEXT`: the owner's own terminal only (the Chief of Staff cannot: G6 is never waivable by it)."""
     kind = gates_caller_kind(runner, now)
     engine, _, _ = build_engine(runner, now, "cli")
-    reason = " ".join((args.reason or "").split())
+    reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())   # control characters never reach the log
     try:
         repo, number = parse_pr_ref(args.pr)
     except NoticeError as err:
@@ -13335,7 +13409,7 @@ def cmd_impact_hold(args, runner, now):
                 continue
             if report["decision"] != "hold":
                 continue
-            cleared = (read_impact_state(state)["clears"].get(report["pr"]) or {}).get("head") == report["head"]
+            cleared = (read_impact_state(state)[0]["clears"].get(report["pr"]) or {}).get("head") == report["head"]
             missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in item["labels"]]
             shown += 1
             print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if cleared else
@@ -13364,10 +13438,11 @@ def impact_would_hold_pass(engine, now):
             if isinstance(record, dict) and isinstance(record.get("number"), int) and (key, record["number"]) in reports:
                 # a PR already judged at this head: only a NEW independent `hold` can add one (no gh read; the floor is unchanged)
                 earlier = reports[(key, record["number"])]
-                if (earlier["decision"] != "hold" and earlier["head"] == ((record.get("head") or {}).get("sha"))
-                        and impact_floor.hold_mode(engine.config, key) == "enforce"
-                        and impact_review_hold(engine.state_dir, earlier["pr"], earlier["head"])):
-                    added = dict(earlier, decision="hold", reasons=earlier["reasons"] + ["rating: the independent impact reviewer's action for this head is hold"])
+                added_hold = (earlier["decision"] != "hold" and earlier["head"] == ((record.get("head") or {}).get("sha"))
+                              and impact_floor.hold_mode(engine.config, key) == "enforce"
+                              and impact_review_hold(engine.state_dir, earlier["pr"], earlier["head"]))
+                if added_hold and added_hold[0]:
+                    added = dict(earlier, decision="hold", reasons=earlier["reasons"] + [added_hold[1] or IMPACT_REVIEW_REASON])
                     try:
                         budget -= apply_impact_hold(engine, key, record["number"], added, record)
                         reports[(key, record["number"])] = added
