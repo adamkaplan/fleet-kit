@@ -36870,6 +36870,13 @@ class TestReviewerSubagents(LedgerBase):
         self.assertIn("**bare**", skill)
         self.assertIn("2>&1", skill)
 
+    def test_the_skill_says_to_run_the_panel_at_the_head_and_to_give_the_full_command_forms(self):
+        skill = " ".join((REPO / "skills" / "fleet-review" / "SKILL.md").read_text().split())
+        self.assertIn("Run it from a checkout at the pull request's head", skill)
+        self.assertIn("fleet-switchboard review laws owner/repo#N", skill)
+        self.assertIn("gh pr diff N --repo owner/repo", skill)
+        self.assertIn("a bare number is refused", skill)
+
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:
             with self.subTest(role=role):
