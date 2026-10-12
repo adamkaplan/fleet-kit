@@ -36275,6 +36275,7 @@ class TestAgentsVerify(unittest.TestCase):
             if defined:
                 self.assertLess(floor, defined + 12, name)
         self.assertIn("agents verify", (REPO / "INSTALL.md").read_text())
+        self.assertIn("agents verify", (REPO / "docs" / "switchboard.md").read_text())
 
 
 class TestOwnReviewLaws(unittest.TestCase):
