@@ -394,7 +394,7 @@ def validate_config(raw, source="config"):
 
 
 PLAN_REVIEW_DEFAULTS = {"enabled": False, "lane_timeout_seconds": 900, "max_parallel": 3, "session_cap": 24, "starts_per_day": 3,
-                        "held_globs": [], "lane_agent": "plan-reviewer", "dir": None, "workspace": None}
+                        "held_globs": [], "lane_agent": "plan-reviewer", "dir": None, "workspace": None, "escalation_hours": 24}
 
 
 def validate_plan_review_config(config, source):
@@ -410,7 +410,8 @@ def validate_plan_review_config(config, source):
     out = dict(PLAN_REVIEW_DEFAULTS, **raw)
     if not isinstance(out["enabled"], bool):
         raise ConfigError("%s: 'plan_review.enabled' must be true or false" % source)
-    for key, low, high in (("lane_timeout_seconds", 60, 7200), ("max_parallel", 1, 6), ("session_cap", 2, 200), ("starts_per_day", 1, 50)):
+    for key, low, high in (("lane_timeout_seconds", 60, 7200), ("max_parallel", 1, 6), ("session_cap", 2, 200), ("starts_per_day", 1, 50),
+                           ("escalation_hours", 1, 720)):
         if not isinstance(out[key], int) or isinstance(out[key], bool) or not low <= out[key] <= high:
             raise ConfigError("%s: 'plan_review.%s' must be a whole number from %d to %d" % (source, key, low, high))
     if not isinstance(out["held_globs"], list) or not all(isinstance(g, str) and g and len(g) <= 200 for g in out["held_globs"]):
@@ -10625,6 +10626,7 @@ def launch_gate_probe(engine, state, config, args, brief, runner, now):
                         plan = None
                 entries, problem = plan_ledger.read_ledger(state)
                 box["findings"] = plan_ledger.launch_findings(brief, plan, entries)
+                box["overridden"] = plan_ledger.consensus_overridden(entries, plan["plan_hash"]) if plan else None
                 box["problem"] = problem
             except BaseException as err:
                 box["error"] = "%s: %s" % (type(err).__name__, _one_line(str(err), 150))
@@ -10645,6 +10647,9 @@ def launch_gate_probe(engine, state, config, args, brief, runner, now):
             _gates_audit(engine, "gate.would_refuse", subject, {"for": "launch", "mode": setting["mode"],
                                                               "failed": [f["gate"] for f in findings], "reason": _one_line(why, 300)})
             sys.stderr.write("%s: gates: a launch under this brief would be refused (shadow: %s): %s\n" % (PROG, setting["mode"], _one_line(why, 240)))
+        elif box.get("overridden"):   # a consensus that is there only because an objection was overridden is shown, not hidden
+            _gates_audit(engine, "gate.consensus_overridden", subject, {"for": "launch", "overridden_by": box["overridden"]})
+            sys.stderr.write("%s: gates: the plan's consensus was OVERRIDDEN by %s (an objection was decided past)\n" % (PROG, box["overridden"]))
     except BaseException as err:
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise
@@ -10718,6 +10723,10 @@ def cmd_send(args, runner, now):
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
     except IssueRefError as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    lane_problem = review_lane_send_problem(config, args.name, sender)
+    if lane_problem:
+        sys.stderr.write("%s: not sent, %s\n" % (PROG, lane_problem))
         return EXIT_USAGE
     try:
         outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
@@ -11869,7 +11878,7 @@ class ReviewError(Exception):
     """A `plan review` command that cannot go on (exit 2): said in one line, nothing was recorded."""
 
 
-REVIEW_ACTIONS = ("start", "verdict", "respond", "status", "abandon")
+REVIEW_ACTIONS = ("start", "verdict", "respond", "status", "abandon", "decide", "tick")
 REVIEW_TABLE_MAX = 65536     # bytes read from a response table or a verdict block
 REVIEW_OBJECTIONS_MAX = 20   # objections in one verdict
 
@@ -11881,6 +11890,24 @@ def _read_capped(path, limit):
         raise ReviewError("the input is over %d bytes" % limit)
     return text
 PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_.@~+-]*(?:/[A-Za-z0-9_.@~+-]+)*")
+
+
+def review_lane_send_problem(config, recipient, sender):
+    """A plan review lane takes no message from an agent: its brief is its only input (the plan is untrusted text, and so is any message).
+    Only the switchboard itself may send to a lane of an open review. Applies only when the engine is on; fails open (None) on any trouble."""
+    try:
+        if sender == PROG or not (config.get("plan_review") or {}).get("enabled"):
+            return None
+        entries, problem = plan_ledger.read_ledger(ensure_state_dir())
+        if problem or not any(e.get("kind") == "lane_session" and e.get("session") == recipient for e in entries):
+            return None
+        review = next(e["review"] for e in entries if e.get("kind") == "lane_session" and e.get("session") == recipient)
+        rnd = _round_of(entries, review)
+        if plan_review.lineage_state([e for e in entries if e.get("lineage") == rnd["lineage"]], rnd["plan_hash"])["open_review"]:
+            return "%s is a reviewer lane of the open plan review %s: it takes no message from an agent" % (recipient, review)
+    except Exception:
+        return None
+    return None
 
 
 def review_config(config):
@@ -12058,7 +12085,7 @@ def review_start(args, runner, now, socket_call=None):
         chosen.update(review="rv%d" % seq, tier=tier, why=tier_why, lanes=lanes)   # the id comes from the appended sequence number
         return {"kind": "round", "lineage": lineage, "review": chosen["review"], "round": 1, "closing": False, "start": True,
                 "ask_number": ask_number, "plan_ref": plan_ref, "plan_hash": plan_hash, "scenario_hash": result.get("scenario_hash"),
-                "tier": tier, "tier_why": tier_why, "lanes": lanes, "by": planner}
+                "tier": tier, "tier_why": tier_why, "lanes": lanes, "held_area": bool(hits), "by": planner}
 
     stored = plan_ledger.append_checked(state, now(), decide)
     if engine.audit is not None:
@@ -12131,6 +12158,7 @@ def review_status(args, runner, now):
     return {"review": args.review, "lineage": rnd["lineage"], "round": rnd["round"], "tier": rnd["tier"], "plan_hash": rnd["plan_hash"],
             "rounds_used": st["rounds"], "lanes": lanes, "open_blocking": st["open_blocking"], "open_review": st["open_review"],
             "undecided_escalation": st["undecided"],
+            "overridden": st["overridden"].get(rnd["plan_hash"]),
             "next": ("respond: the planner answers the open objections" if all(l in verdicts for l in rnd["lanes"]) and st["open_blocking"]
                      else "the closing round (a later slice)" if all(l in verdicts for l in rnd["lanes"]) else "waiting for the lanes"),
             "note": "no consensus is written by this slice (the closing round and the consensus are a later slice)"}
@@ -12156,9 +12184,11 @@ def review_respond(args, runner, now, socket_call=None):
     if not st["open_blocking"]:
         raise ReviewError("nothing blocking is open: the next step is the closing round (a later slice), not another round")
     ok, why = plan_review.may_open_round(st)
-    if not ok:
-        raise ReviewError("refused: %s (an objection that survives escalates: a later slice)" % why)
+    if not ok and st["undecided"]:
+        raise ReviewError("refused: %s" % why)
     table = _read_capped(args.table, REVIEW_TABLE_MAX)
+    if not ok:   # the rounds are spent: what survives ESCALATES (recorded, and the boss told), it is never dropped
+        return _escalate(engine, state, cfg, config, runner, now, rnd, st, table, planner)
     answered = {m.group(1) for m in re.finditer(r"(?m)^\s*([A-Za-z0-9]+/O[0-9]{1,3})\s*:\s*(?:accept|reject)\b", table)}
     absent = [k for k in st["open_blocking"] if k not in answered]
     if absent:
@@ -12199,7 +12229,8 @@ def review_respond(args, runner, now, socket_call=None):
             raise ReviewError("refused: %s" % why_not)
         return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": False,
                 "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
-                "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes, "by": rnd["by"]}
+                "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
+                "held_area": rnd.get("held_area", False), "by": rnd["by"]}
 
     stored = plan_ledger.append_checked(state, now(), decide)
     _review_record(engine, state, {"kind": "response", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"],
@@ -12207,6 +12238,190 @@ def review_respond(args, runner, now, socket_call=None):
                                    "plan_hash": result["plan_hash"], "by": planner}, now)
     made = _launch_lanes(engine, state, cfg, stored, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
     return {"review": args.review, "round": stored["round"], "lanes": lanes, "launched": made, "plan_hash": result["plan_hash"]}
+
+
+def _boss_of_planner(engine, planner):
+    """The agent that decides an escalation: the planner's boss, else the chief of staff (a person planner has none)."""
+    discovery = engine.discover(engine.now())
+    me = discovery.agents.get(planner)
+    boss = boss_name(discovery, me) if me is not None else None
+    return boss or resolve_boss(discovery, "chief-of-staff") or "chief-of-staff"
+
+
+def _tell(engine, recipient, text):
+    """The switchboard's own message through the outbox (a sender no agent can be). Never raises: the ledger holds the fact either way."""
+    try:
+        outcome = engine.send(PROG, recipient, text)
+        return bool(outcome.get("sent"))
+    except (MessageTooLong, InterruptRefused, Exception):
+        return False
+
+
+def _response_of(table, key):
+    match = re.search(r"(?m)^\s*%s\s*:\s*((?:accept|reject)\b.*)$" % re.escape(key), table or "")
+    return match.group(1).strip() if match else ""
+
+
+def _escalate(engine, state, cfg, config, runner, now, rnd, st, table, planner):
+    """Record an `escalation` entry for every blocking objection still open (with the planner's response beside it) and tell the boss. After an
+    earlier escalation the rounds that follow it are spent: the escalation is then the owner's alone."""
+    owner_only = bool(st["escalated"])
+    boss = "owner" if owner_only else _boss_of_planner(engine, planner)
+    told = []
+    lanes_entries = [e for e in review_entries(state) if e.get("lineage") == rnd["lineage"] and e.get("kind") == "lane"]
+    objections = {}
+    for entry in lanes_entries:
+        for obj in entry.get("objections") or []:
+            objections["%s/%s" % (entry["lane"], obj["id"])] = dict(obj, lane=entry["lane"])
+    for key in st["open_blocking"]:
+        obj = objections.get(key, {"id": key.split("/", 1)[-1], "lane": key.split("/", 1)[0], "text": ""})
+        response = _response_of(table, key)
+        _review_record(engine, state, {"kind": "escalation", "lineage": rnd["lineage"], "review": rnd["review"], "round": rnd["round"],
+                                       "objection": key, "lane": obj["lane"], "text": plan_ledger.clip(obj.get("text"), 400),
+                                       "response": plan_ledger.clip(response, 400), "boss": boss, "owner_only": owner_only,
+                                       "plan_hash": rnd["plan_hash"], "held_area": bool(rnd.get("held_area")), "by": planner}, now)
+        recipient = "chief-of-staff" if owner_only else boss
+        told.append((key, _tell(engine, recipient, plan_review.escalation_message(rnd["lineage"], dict(obj, id=key), response))))
+    return {"review": rnd["review"], "escalated": [k for k, _ in told], "boss": boss, "owner_only": owner_only,
+            "told": [k for k, ok in told if ok], "not_delivered": [k for k, ok in told if not ok],
+            "next": "decide: `plan review decide %s --objection <lane/id> --accept|--override --reason ...`" % rnd["review"]}
+
+
+def _escalations(entries, review):
+    """The review's undecided escalations, newest entry per objection."""
+    latest = {}
+    for entry in entries:
+        if entry.get("review") != review:
+            continue
+        if entry.get("kind") == "escalation":
+            latest[entry["objection"]] = entry
+        elif entry.get("kind") == "decision":
+            latest.pop(entry.get("objection"), None)
+    return latest
+
+
+def review_decide(args, runner, now):
+    """Resolve an escalated objection: `--accept` (the planner revises, within the rounds left) or `--override` (with a reason): an override of
+    the last open one writes the `consensus` entry, marked `overridden_by` with the reason. The risk lane and held-PR areas: the owner only."""
+    config = load_config()
+    review_config(config)
+    engine, state, _ = build_engine(runner, now, "cli", writable=True)
+    got = gates_caller_kind(runner, now)
+    if got[0] == "person":
+        kind, who = "person", "owner"
+    elif got[0] == "agent":
+        kind, who = "agent", got[1]
+    else:
+        raise ReviewError("refused: %s" % got[1])
+    action = "override" if args.override else "accept"
+    reason = " ".join((args.reason or "").split())
+    if len(reason) < plan_ledger.WAIVER_REASON_MIN:
+        raise ReviewError("a reason of at least %d characters is required" % plan_ledger.WAIVER_REASON_MIN)
+    outcome = {}
+
+    def build(entries, seq):
+        escalations = _escalations(entries, args.review)
+        esc = escalations.get(args.objection)
+        if esc is None:
+            raise ReviewError("refused: %s has no undecided escalation in %s (open: %s)" % (args.objection, args.review, ", ".join(sorted(escalations)) or "none"))
+        ok, why = plan_review.decision_allowed(action, esc.get("lane"), esc.get("held_area"), esc.get("owner_only"), kind, who == esc.get("boss"))
+        if not ok:
+            _gates_audit(engine, "plan.review.decide.refused", args.review, {"by": who, "objection": args.objection, "why": why})
+            raise ReviewError("refused: %s" % why)
+        outcome.update(esc=esc, others=[k for k in escalations if k != args.objection])
+        return {"kind": "decision", "lineage": esc["lineage"], "review": args.review, "objection": args.objection, "action": action,
+                "reason": plan_ledger.clip(reason, 300), "by": who, "decider": kind}
+
+    stored = plan_ledger.append_checked(state, now(), build)
+    esc = outcome["esc"]
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "plan.review.decision", esc["lineage"], {"review": args.review, "objection": args.objection,
+                                                                                    "action": action, "by": who, "seq": stored["seq"]})
+    result = {"decided": args.objection, "action": action, "by": who}
+    entries = review_entries(state)
+    if action == "override" and not outcome["others"]:
+        mine = [e for e in entries if e.get("review") == args.review]
+        accepted = [e for e in mine if e.get("kind") == "decision" and e.get("action") == "accept"]
+        rnd = _round_of(entries, args.review)
+        # the last open objection was overridden and nothing awaits a revision: the consensus is written, marked overridden
+        if not accepted or accepted[-1]["seq"] < max(e["seq"] for e in mine if e.get("kind") == "escalation"):
+            if not any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in entries):
+                consensus = plan_ledger.append_entry(state, {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-",
+                                                             "lineage": rnd["lineage"], "review": args.review, "plan_hash": rnd["plan_hash"],
+                                                             "plan_ref": rnd["plan_ref"], "tier": rnd["tier"], "lanes": rnd["lanes"],
+                                                             "rounds": rnd["round"], "overridden_by": who, "override_reason": plan_ledger.clip(reason, 300),
+                                                             "by": "plan-review"}, now())
+                result["consensus"] = "written, overridden by %s" % who
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "plan.review.consensus", rnd["lineage"], {"review": args.review, "overridden_by": who,
+                                                                                                "seq": consensus["seq"], "chain": consensus["hash"]})
+    elif action == "accept":
+        _tell(engine, _round_of(entries, args.review)["by"], "Plan review %s: objection %s was accepted by %s: revise the plan (%s). Then `plan review respond`."
+              % (args.review, args.objection, who, plan_ledger.clip(reason, 200)))
+        result["next"] = "the planner revises and runs `plan review respond` (the rounds after an escalation are limited to %d)" % plan_review.POST_ESCALATION_ROUNDS
+    return result
+
+
+def review_tick(args, runner, now, socket_call=None):
+    """Housekeeping over the open reviews (run by a person, an orchestrator, the chief of staff or a timer): a lane with no verdict after
+    `lane_timeout_seconds` is relaunched once and then escalated as unavailable; an escalation nobody decided gets a reminder every
+    `escalation_hours`. Never counts a stalled lane as an approval."""
+    config = load_config()
+    cfg = review_config(config)
+    review_caller(runner, now, "run the plan review housekeeping")
+    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
+    entries = review_entries(state)
+    done = {"relaunched": [], "unavailable": [], "reminded": []}
+    reviews = sorted({e["review"] for e in entries if e.get("kind") == "round"})
+    for review in reviews:
+        rnd = _round_of(entries, review)
+        mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
+        st = plan_review.lineage_state(mine, rnd["plan_hash"])
+        if not st["open_review"]:
+            continue
+        sessions = [e for e in entries if e.get("kind") == "lane_session" and e.get("review") == review and e.get("round") == rnd["round"]]
+        times = {}
+        for e in sessions:
+            times[e["lane"]] = e["ts"]
+        verdict_lanes = set(_verdicts_of(entries, review, rnd["round"]))
+        for lane, started in sorted(plan_review.stuck_lanes(rnd["lanes"], times, verdict_lanes, now(), cfg["lane_timeout_seconds"]).items()):
+            tries = len([e for e in sessions if e["lane"] == lane])
+            if tries <= plan_review.LANE_RETRIES and lane not in [x[0] for x in done["unavailable"]]:
+                try:
+                    ns = types.SimpleNamespace(source=rnd["plan_ref"], file=None, ask=None, done_when=None)
+                    text = load_plan(ns, runner, now)[0]
+                    name = "planrev-%s-%s-r%d-retry%d" % (review, lane.lower(), rnd["round"], tries)
+                    brief = plan_review.lane_brief(lane, rnd["plan_ref"], rnd["plan_hash"], text, *_ask_texts(config, runner, now, rnd),
+                                                   carried=_carried(entries, rnd["lineage"], lane), closing=bool(rnd.get("closing")))
+                    made = launch_agent(engine, name, cfg["lane_agent"], cfg.get("dir") or os.getcwd(),
+                                        cfg.get("workspace") or os.environ.get("HERDR_WORKSPACE_ID"), role="reviewer", reports_to=None,
+                                        issue=rnd.get("ask_number"), brief=brief)
+                    _review_record(engine, state, {"kind": "lane_session", "lineage": rnd["lineage"], "review": review, "round": rnd["round"],
+                                                   "lane": lane, "session": name, "pane": made.get("pane"), "retry": tries, "by": "plan-review"}, now)
+                    done["relaunched"].append(lane)
+                    continue
+                except (LaunchError, PlanInputError, ValueError, ConfigError, IntentError):
+                    pass   # it cannot relaunch: it is unavailable
+            if any(e.get("kind") == "escalation" and e.get("review") == review and e.get("objection") == "%s/unavailable" % lane for e in entries):
+                continue
+            boss = _boss_of_planner(engine, rnd["by"])
+            _review_record(engine, state, {"kind": "escalation", "lineage": rnd["lineage"], "review": review, "round": rnd["round"],
+                                           "objection": "%s/unavailable" % lane, "lane": lane, "text": "lane %s gave no verdict after a relaunch" % lane,
+                                           "response": "", "boss": boss, "owner_only": False, "plan_hash": rnd["plan_hash"],
+                                           "held_area": bool(rnd.get("held_area")), "by": "plan-review"}, now)
+            _tell(engine, boss, "Plan review %s: lane %s is unavailable (no verdict after a relaunch); a stalled lane never counts as an approval. "
+                                "Decide with `plan review decide %s --objection %s/unavailable --accept|--override --reason ...`." % (review, lane, review, lane))
+            done["unavailable"].append((lane, boss))
+        for key, esc in _escalations(entries, review).items():
+            reminded = [e["ts"] for e in entries if e.get("kind") == "reminder" and e.get("review") == review and e.get("objection") == key]
+            if plan_review.reminder_due(esc["ts"], max(reminded) if reminded else None, now(), cfg["escalation_hours"]):
+                _review_record(engine, state, {"kind": "reminder", "lineage": rnd["lineage"], "review": review, "objection": key, "by": "plan-review"}, now)
+                _tell(engine, "chief-of-staff" if esc.get("owner_only") else esc.get("boss"),
+                      "Reminder: plan review %s has an escalation (%s) undecided for over %d hours." % (review, key, cfg["escalation_hours"]))
+                done["reminded"].append(key)
+        entries = review_entries(state)
+    done["unavailable"] = [l for l, _ in done["unavailable"]]
+    return done
 
 
 def review_abandon(args, runner, now):
@@ -12221,15 +12436,21 @@ def review_abandon(args, runner, now):
         raise ReviewError("a reason of at least %d characters is required" % plan_ledger.WAIVER_REASON_MIN)
     _review_record(engine, state, {"kind": "abandoned", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"],
                                    "reason": plan_ledger.clip(reason, 300), "by": who}, now)
-    return {"abandoned": args.review, "lineage": rnd["lineage"], "by": who}
+    closed = []
+    for key, esc in sorted(_escalations(review_entries(state), args.review).items()):   # an abandoned review's escalations are closed, so a new start is not refused for ever
+        _review_record(engine, state, {"kind": "decision", "lineage": rnd["lineage"], "review": args.review, "objection": key,
+                                       "action": "abandoned", "reason": plan_ledger.clip(reason, 300), "by": who, "decider": "abandon"}, now)
+        closed.append(key)
+    return {"abandoned": args.review, "lineage": rnd["lineage"], "by": who, "escalations_closed": closed}
 
 
 def cmd_plan_review(args, runner, now, socket_call=None):
     """`plan review start|verdict|respond|status|abandon`: exit 0 done, 2 refused or unusable. One JSON object on stdout with --json."""
     try:
         action = {"start": review_start, "verdict": review_verdict, "respond": review_respond, "status": review_status,
-                  "abandon": review_abandon}[args.review_action]
-        done = action(args, runner, now, socket_call) if args.review_action in ("start", "respond", "verdict") else action(args, runner, now)
+                  "abandon": review_abandon, "decide": review_decide, "tick": review_tick}[args.review_action]
+        done = (action(args, runner, now, socket_call) if args.review_action in ("start", "respond", "verdict", "tick")
+                else action(args, runner, now))
     except (ReviewError, PlanInputError, ValueError, ConfigError, IntentError, plan_ledger.LedgerError, CallerError, IdentityUncertain,
             LaunchError, OSError) as err:
         sys.stderr.write("%s: plan review: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -13106,6 +13327,16 @@ def add_plan_parsers(sub):
     abandon.add_argument("review")
     abandon.add_argument("--reason", required=True)
     abandon.add_argument("--json", action="store_true")
+    decide = review_sub.add_parser("decide", help="Resolve an escalated objection: accept it, or override it with a reason")
+    decide.add_argument("review")
+    decide.add_argument("--objection", required=True, help="<lane>/<id> as the escalation names it")
+    mode = decide.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--accept", action="store_true")
+    mode.add_argument("--override", action="store_true")
+    decide.add_argument("--reason", required=True)
+    decide.add_argument("--json", action="store_true")
+    tick = review_sub.add_parser("tick", help="Housekeeping: relaunch a stuck lane once, then escalate it; remind an undecided escalation")
+    tick.add_argument("--json", action="store_true")
 
 
 # ============================================================================
