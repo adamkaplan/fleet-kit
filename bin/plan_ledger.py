@@ -502,7 +502,26 @@ COS_NEEDS = ("fleet-switchboard waive *", "fleet-switchboard gates mode * shadow
 # owner's). Judged by evaluating each probe against the installed definition's shell rules, not by looking for exact resource strings.
 COS_MUST_ALLOW = ("fleet-switchboard waive acme/app#1 --gates G1 --reason hotfix", "fleet-switchboard gates mode acme/app shadow", "fleet-switchboard gates off")
 COS_MUST_DENY = ("fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                 "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 30 fleet-switchboard gates mode acme/app ENFORCE", "timeout 5 fleet-switchboard gates on",
+                 "timeout 5 fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix",
                  "fleet-switchboard waive acme/app#1 --gates G6 --reason hotfix", "fleet-switchboard waive acme/app#1 --gates G8 --reason hotfix")
+
+
+def _frontmatter(text):
+    """The front matter of a definition (between the first two `---` lines), or None when the text has none."""
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        return None
+    return text[4:].split("\n---\n", 1)[0]
+
+
+def _permission_lines(text):
+    """The lines of the `permissions:` block of a definition's FRONT MATTER only (body prose is never read). A text with no front matter is
+    taken as a bare rule list (a test's or a tool's input)."""
+    front = _frontmatter(text)
+    if front is None:
+        return text.splitlines()
+    lines = front.splitlines()
+    return lines[lines.index("permissions:") + 1:] if "permissions:" in lines else []
 
 
 def cos_rules(text):
@@ -512,7 +531,7 @@ def cos_rules(text):
     import json as _json
     import re as _re
     rules, action, resource = [], None, None
-    for raw in text.splitlines():
+    for raw in _permission_lines(text):
         line = raw.strip()
         flow = _re.fullmatch(r"-\s*\{action:\s*(.+?),\s*resource:\s*(\".*\"),\s*effect:\s*(allow|deny|ask)\s*\}", line)
         if flow:
@@ -542,12 +561,13 @@ def _glob_match(pattern, command):
 
 
 def cos_allows(rules, command):
-    """True when the shell `rules` let `command` run, as v2 decides it: any matching deny of the shell action denies, else a matching
-    allow allows, else the base deny. (A rule for the action `*` is the base: it is not a guard.)"""
-    hits = [(a, e) for a, r, e in rules if a in ("shell", "bash", "*") and _glob_match(r, command)]
-    if any(e == "deny" and a != "*" for a, e in hits):
-        return False
-    return any(e == "allow" for _, e in hits)
+    """True when the shell `rules` let `command` run, as v2 decides it: the LAST rule of the shell action (or the base `*`) that matches
+    wins, and a command no rule matches is denied. (So a deny only holds when it comes after the allow that would admit the command.)"""
+    verdict = "deny"
+    for action, resource, effect in rules:
+        if action in ("shell", "bash", "*") and _glob_match(resource, command):
+            verdict = effect
+    return verdict == "allow"
 
 
 def cos_lacking(text):
@@ -556,6 +576,9 @@ def cos_lacking(text):
     enforce`, `gates on`) or waive G6 or G8. A cos that could turn it on is as blocking as one that cannot turn it off."""
     if text is None:
         return "the installed chief-of-staff definition could not be read"
+    front = _frontmatter(text)
+    if front is not None and any(line.startswith("name:") for line in front.splitlines()):
+        return "its front matter has a `name:` key: OpenCode v2 then ignores the whole `permissions:` list"
     rules = cos_rules(text)
     missing = [probe for probe in COS_MUST_ALLOW if not cos_allows(rules, probe)]
     too_much = [probe for probe in COS_MUST_DENY if cos_allows(rules, probe)]

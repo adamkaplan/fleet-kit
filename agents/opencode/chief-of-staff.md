@@ -3,7 +3,8 @@ description: Fleet-level Chief of Staff. The single interface between your princ
 mode: primary
 model: __PROVIDER__/__MODEL_ID__
 # The Chief of Staff's permissions: a short, hand-written list a person can read in one sitting (#191). Deny by default; the allows are the job;
-# the denies keep it out of what nothing in the job needs. Last match wins, any deny denies, nothing asks. A focus, not a fence: redirects and quoting are not policed.
+# the denies keep it out of what nothing in the job needs. Last match wins, so the denies come last; nothing asks. A focus, not a fence: redirects and quoting are not policed.
+# Allows first, then denies; gates enforce/on and waive G6/G8 are denied bare and under `timeout`.
 permissions:
   - {action: "*", resource: "*", effect: deny}
   - {action: read, resource: "*", effect: allow}
@@ -19,9 +20,6 @@ permissions:
   - {action: external_directory, resource: "/Users/*/.config/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.local/state/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.config/opencode*", effect: allow}
-  - {action: subagent, resource: "*", effect: deny}
-  - {action: task, resource: "*", effect: deny}
-  # the switchboard: the coordination commands
   - {action: shell, resource: "fleet-switchboard send *", effect: allow}
   - {action: shell, resource: "fleet-switchboard report *", effect: allow}
   - {action: shell, resource: "fleet-switchboard remind *", effect: allow}
@@ -40,14 +38,6 @@ permissions:
   - {action: shell, resource: "fleet-switchboard labels *", effect: allow}
   - {action: shell, resource: "fleet-switchboard handoff *", effect: allow}
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
-  - {action: shell, resource: "fleet-switchboard decisions batch*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates *enforce*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates *ENFORCE*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates on*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard waive *G6*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard waive *G8*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
-  # gh: reads, and comment/close/edit/merge on PRs and issues
   - {action: shell, resource: "gh * view *", effect: allow}
   - {action: shell, resource: "gh * list *", effect: allow}
   - {action: shell, resource: "gh * status *", effect: allow}
@@ -65,6 +55,62 @@ permissions:
   - {action: shell, resource: "gh issue close *", effect: allow}
   - {action: shell, resource: "gh issue reopen *", effect: allow}
   - {action: shell, resource: "gh issue edit *", effect: allow}
+  - {action: shell, resource: "git *", effect: allow}
+  - {action: shell, resource: "az * show *", effect: allow}
+  - {action: shell, resource: "az * list *", effect: allow}
+  - {action: shell, resource: "az * log *", effect: allow}
+  - {action: shell, resource: "az * logs *", effect: allow}
+  - {action: shell, resource: "az * status *", effect: allow}
+  - {action: shell, resource: "az * query *", effect: allow}
+  - {action: shell, resource: "jq *", effect: allow}
+  - {action: shell, resource: "grep *", effect: allow}
+  - {action: shell, resource: "cut *", effect: allow}
+  - {action: shell, resource: "head *", effect: allow}
+  - {action: shell, resource: "tail *", effect: allow}
+  - {action: shell, resource: "sort *", effect: allow}
+  - {action: shell, resource: "uniq *", effect: allow}
+  - {action: shell, resource: "wc *", effect: allow}
+  - {action: shell, resource: "tr *", effect: allow}
+  - {action: shell, resource: "ls *", effect: allow}
+  - {action: shell, resource: "cat *", effect: allow}
+  - {action: shell, resource: "echo *", effect: allow}
+  - {action: shell, resource: "printf *", effect: allow}
+  - {action: shell, resource: "date *", effect: allow}
+  - {action: shell, resource: "sleep *", effect: allow}
+  - {action: shell, resource: "pwd", effect: allow}
+  - {action: shell, resource: "uptime", effect: allow}
+  - {action: shell, resource: "timeout ? fleet-switchboard *", effect: allow}
+  - {action: shell, resource: "timeout ?? fleet-switchboard *", effect: allow}
+  - {action: shell, resource: "timeout * gh * view *", effect: allow}
+  - {action: shell, resource: "timeout * gh * list *", effect: allow}
+  - {action: shell, resource: "timeout * az * show *", effect: allow}
+  - {action: shell, resource: "timeout * az * list *", effect: allow}
+  - {action: shell, resource: "timeout * git ls-remote *", effect: allow}
+  - {action: shell, resource: "herdr * list*", effect: allow}
+  - {action: shell, resource: "herdr * get*", effect: allow}
+  - {action: shell, resource: "herdr * read*", effect: allow}
+  - {action: shell, resource: "herdr pane current", effect: allow}
+  - {action: shell, resource: "herdr api snapshot", effect: allow}
+  - {action: shell, resource: "herdr workspace rename *", effect: allow}
+  - {action: shell, resource: "herdr tab rename *", effect: allow}
+  - {action: shell, resource: "herdr workspace focus *", effect: allow}
+  - {action: shell, resource: "herdr tab focus *", effect: allow}
+  - {action: subagent, resource: "*", effect: deny}
+  - {action: task, resource: "*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard gates *enforce*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard gates *ENFORCE*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard gates on*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard waive *G6*", effect: deny}
+  - {action: shell, resource: "timeout * fleet-switchboard waive *G8*", effect: deny}
+  - {action: shell, resource: "timeout * az *secret*", effect: deny}
+  - {action: shell, resource: "timeout * az *get-access-token*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard decisions batch*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard gates *enforce*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard gates *ENFORCE*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard gates on*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard waive *G6*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard waive *G8*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
   - {action: shell, resource: "gh repo edit*", effect: deny}
   - {action: shell, resource: "gh *--admin*", effect: deny}
   - {action: shell, resource: "gh *--auto*", effect: deny}
@@ -77,8 +123,6 @@ permissions:
   - {action: shell, resource: "gh api *--field*", effect: deny}
   - {action: shell, resource: "gh api *--raw-field*", effect: deny}
   - {action: shell, resource: "gh auth*", effect: deny}
-  # git: any read; a write verb is denied where it stands as a word (git -c, --output, --exec and ext:: too)
-  - {action: shell, resource: "git *", effect: allow}
   - {action: shell, resource: "git *push*", effect: deny}
   - {action: shell, resource: "git *checkout*", effect: deny}
   - {action: shell, resource: "git *switch*", effect: deny}
@@ -138,13 +182,6 @@ permissions:
   - {action: shell, resource: "git reflog expire*", effect: deny}
   - {action: shell, resource: "git reflog delete*", effect: deny}
   - {action: shell, resource: "git config *--unset*", effect: deny}
-  # az: status, list, show and log reads; no secret values, no containerapp, no writes
-  - {action: shell, resource: "az * show *", effect: allow}
-  - {action: shell, resource: "az * list *", effect: allow}
-  - {action: shell, resource: "az * log *", effect: allow}
-  - {action: shell, resource: "az * logs *", effect: allow}
-  - {action: shell, resource: "az * status *", effect: allow}
-  - {action: shell, resource: "az * query *", effect: allow}
   - {action: shell, resource: "az *secret*", effect: deny}
   - {action: shell, resource: "az *credential*", effect: deny}
   - {action: shell, resource: "az *appsettings*", effect: deny}
@@ -158,34 +195,7 @@ permissions:
   - {action: shell, resource: "az * delete *", effect: deny}
   - {action: shell, resource: "az * update *", effect: deny}
   - {action: shell, resource: "az * set *", effect: deny}
-  # shell helpers, pipes over read output, wrappers; message files go in the temp dir (cat > <temp dir>/x <<EOF)
-  - {action: shell, resource: "jq *", effect: allow}
-  - {action: shell, resource: "grep *", effect: allow}
-  - {action: shell, resource: "cut *", effect: allow}
-  - {action: shell, resource: "head *", effect: allow}
-  - {action: shell, resource: "tail *", effect: allow}
-  - {action: shell, resource: "sort *", effect: allow}
-  - {action: shell, resource: "uniq *", effect: allow}
-  - {action: shell, resource: "wc *", effect: allow}
-  - {action: shell, resource: "tr *", effect: allow}
-  - {action: shell, resource: "ls *", effect: allow}
-  - {action: shell, resource: "cat *", effect: allow}
-  - {action: shell, resource: "echo *", effect: allow}
-  - {action: shell, resource: "printf *", effect: allow}
-  - {action: shell, resource: "date *", effect: allow}
-  - {action: shell, resource: "sleep *", effect: allow}
-  - {action: shell, resource: "pwd", effect: allow}
-  - {action: shell, resource: "uptime", effect: allow}
-  - {action: shell, resource: "timeout ? fleet-switchboard *", effect: allow}
-  - {action: shell, resource: "timeout ?? fleet-switchboard *", effect: allow}
-  - {action: shell, resource: "timeout * gh * view *", effect: allow}
-  - {action: shell, resource: "timeout * gh * list *", effect: allow}
-  - {action: shell, resource: "timeout * gh api *", effect: allow}
-  - {action: shell, resource: "timeout * az * show *", effect: allow}
-  - {action: shell, resource: "timeout * az * list *", effect: allow}
-  - {action: shell, resource: "timeout * git ls-remote *", effect: allow}
   - {action: shell, resource: "jq *env*", effect: deny}
-  # credentials: cat of their paths (a heredoc that names one is refused too); head, tail, grep and ls of them are not policed
   - {action: shell, resource: "cat *.ssh*", effect: deny}
   - {action: shell, resource: "cat *.aws*", effect: deny}
   - {action: shell, resource: "cat *.azure*", effect: deny}
@@ -193,15 +203,6 @@ permissions:
   - {action: shell, resource: "cat *.config/gh*", effect: deny}
   - {action: shell, resource: "cat *id_rsa*", effect: deny}
   - {action: shell, resource: "cat *auth.json*", effect: deny}
-  - {action: shell, resource: "herdr * list*", effect: allow}
-  - {action: shell, resource: "herdr * get*", effect: allow}
-  - {action: shell, resource: "herdr * read*", effect: allow}
-  - {action: shell, resource: "herdr pane current", effect: allow}
-  - {action: shell, resource: "herdr api snapshot", effect: allow}
-  - {action: shell, resource: "herdr workspace rename *", effect: allow}
-  - {action: shell, resource: "herdr tab rename *", effect: allow}
-  - {action: shell, resource: "herdr workspace focus *", effect: allow}
-  - {action: shell, resource: "herdr tab focus *", effect: allow}
 ---
 
 # Chief of Staff

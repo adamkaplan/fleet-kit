@@ -20,7 +20,6 @@
   "gh run list --limit 5 | sort | uniq -c | wc -l",
   "timeout 30 gh pr view 5",
   "timeout 60 az vm list",
-  "timeout 40 gh api repos/o/r/issues/3/comments",
   "gh pr merge 5 --squash --delete-branch",
   "gh pr comment 5 --body \"a -> b done\"",
   "gh issue close 5 --comment \"ok $(date)\"",
@@ -124,7 +123,11 @@
   "fleet-switchboard orders add --charter o/r#1 \"x 2>&1 y; z\"",
   "fleet-switchboard decisions answer x#1 allow --note \"log > a\"",
   "gh pr view 5 --repo acme/api",
-  "timeout 30 gh issue list --repo acme/api"
+  "timeout 30 gh issue list --repo acme/api",
+  "timeout 30 fleet-switchboard gates mode acme/app shadow",
+  "timeout 30 fleet-switchboard gates off",
+  "timeout 30 fleet-switchboard waive acme/app#5 --gates G1 --reason \"hotfix for a broken release\"",
+  "sleep 1; fleet-switchboard gates preflight acme/app"
  ],
  "hostile": [
   "cat /Users/a/Code/x/src/a.py > /Users/a/Code/x/src/b.py",
@@ -330,7 +333,20 @@
   "gh auth token",
   "az acr credential show -n r",
   "az webapp config appsettings list -n a -g g",
-  "az functionapp config appsettings list -n a -g g"
+  "az functionapp config appsettings list -n a -g g",
+  "timeout 30 fleet-switchboard gates mode acme/app enforce",
+  "timeout 30 fleet-switchboard gates mode acme/app ENFORCE",
+  "timeout 5 fleet-switchboard gates on",
+  "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason \"waiving the held PR gate ok\"",
+  "timeout 5 fleet-switchboard waive acme/app#5 --gates G0a,G8 --reason \"waiving production gate\"",
+  "sleep 1; fleet-switchboard gates mode acme/app enforce",
+  "sleep 1 && fleet-switchboard gates on",
+  "fleet-switchboard status | fleet-switchboard gates on",
+  "timeout 5 fleet-switchboard gates  on",
+  "timeout 5 az keyvault secret show --name x",
+  "timeout 5 az account get-access-token",
+  "timeout 40 gh api repos/o/r/issues -X POST",
+  "timeout 40 gh api repos/o/r/issues/3/comments"
  ],
  "harmless": [
   "ls ~/Documents",
@@ -365,7 +381,8 @@
   "git log >> out.txt",
   "git -C /home/a/.ssh log",
   "git -C /home/a/Documents status",
-  "git config core.pager sh"
+  "git config core.pager sh",
+  "timeout 5 fleet-switchboard gates  on"
  ],
  "_doc": "allowed/job: must RAN. hostile: must NOT run, except `harmless`: the accepted gaps of the short list (#191): redirects, quoting, writes by git branch/tag/config forms, and head/tail/grep/ls of paths outside the job. A focus, not a fence: these are listed so the owner sees them.",
  "job": [
@@ -389,7 +406,6 @@
   "gh run list --limit 5 | sort | uniq -c | wc -l",
   "timeout 30 gh pr view 5",
   "timeout 60 az vm list",
-  "timeout 40 gh api repos/o/r/issues/3/comments",
   "gh pr merge 5 --squash --delete-branch",
   "gh pr comment 5 --body \"a -> b done\"",
   "gh issue close 5 --comment \"ok $(date)\"",
@@ -493,6 +509,10 @@
   "fleet-switchboard orders add --charter o/r#1 \"x 2>&1 y; z\"",
   "fleet-switchboard decisions answer x#1 allow --note \"log > a\"",
   "gh pr view 5 --repo acme/api",
-  "timeout 30 gh issue list --repo acme/api"
+  "timeout 30 gh issue list --repo acme/api",
+  "timeout 30 fleet-switchboard gates mode acme/app shadow",
+  "timeout 30 fleet-switchboard gates off",
+  "timeout 30 fleet-switchboard waive acme/app#5 --gates G1 --reason \"hotfix for a broken release\"",
+  "sleep 1; fleet-switchboard gates preflight acme/app"
  ]
 }

@@ -141,6 +141,8 @@ COS_GUARDS = (("fleet-switchboard gates *enforce*", "deny"), ("fleet-switchboard
               ("fleet-switchboard waive *G6*", "deny"), ("fleet-switchboard waive *G8*", "deny"))
 # the installed shape: broad allows, guards after them
 COS_ALLOWING = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), *COS_GUARDS)
+COS_ALLOWING_FULL = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), ("timeout ?? fleet-switchboard *", "allow"),
+                                   *COS_GUARDS, *((r.replace("fleet-switchboard", "timeout * fleet-switchboard", 1), e) for r, e in COS_GUARDS))
 
 
 class Base(unittest.TestCase):
@@ -8541,10 +8543,11 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
             if pattern.endswith(" *"):  # OpenCode: a trailing ` *` also matches the bare command
                 rx = rx[:-len(re.escape(" ") + ".*")] + "(?: .*)?"
             return re.fullmatch(rx, resource, re.S) is not None
-        hits = [r for r in rules if r["action"] in ("*", action) and match(r["resource"])]
-        if any(r["effect"] == "deny" and r["action"] != "*" for r in hits):
-            return "deny"
-        return hits[-1]["effect"] if hits else "deny"
+        verdict = "deny"
+        for r in rules:   # v2: the LAST matching rule decides (proved on the real harness); the list keeps every deny after every allow
+            if r["action"] in ("*", action) and match(r["resource"]):
+                verdict = r["effect"]
+        return verdict
 
     def test_the_block_is_short_enough_for_a_person_to_read_and_cannot_regrow(self):
         for path in self.PATHS:
@@ -8554,6 +8557,17 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 self.assertLess(len(path.read_text().split("\n---\n", 1)[0].splitlines()), self.MAX_BLOCK_LINES + 20)
         # the generator that once enumerated every variant (30,000 lines) is gone and must not come back
         self.assertFalse((REPO / "tools" / "cos-permissions-proof" / "gen_permissions.py").exists())
+
+    def test_every_deny_comes_after_every_allow_because_the_last_match_wins(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                effects = [r["effect"] for r in rules[1:]]
+                last_allow = max(i for i, e in enumerate(effects) if e == "allow")
+                self.assertNotIn("allow", effects[effects.index("deny"):] if "deny" in effects else [])
+                self.assertEqual(effects[last_allow + 1:], ["deny"] * (len(effects) - last_allow - 1))
+                for guard in ("timeout * fleet-switchboard gates *enforce*", "timeout * fleet-switchboard gates on*", "timeout * fleet-switchboard waive *G6*"):
+                    self.assertIn(guard, [r["resource"] for r in rules])
 
     def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
         for path in self.PATHS:
@@ -8608,7 +8622,8 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
-                        "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls"):
+                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x",
+                        "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
 
     def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
@@ -18169,16 +18184,48 @@ class TestPlanGatesCheck(LedgerBase):
     def test_cos_and_a_person_may_change_a_mode_and_it_is_audited(self):
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
         self.configure_ci_recorder()
-        code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "enforce")
+        code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "shadow")   # cos may set shadow and off
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")   # only the owner, at a terminal, turns enforcement on
         self.assertEqual(code, 0, err)
         raw = json.loads(self.config_file.read_text())
         self.assertEqual(raw["plan_gates"]["repos"]["acme/app"], {"mode": "enforce", "enabled": True})
         self.assertEqual(raw["intent_repo"], "acme/app", "every other key is kept")
-        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "off")
+        code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "off")
         self.assertEqual(code, 0, err)
         self.assertFalse(json.loads(self.config_file.read_text())["plan_gates"]["repos"]["acme/app"]["enabled"])
         self.assertEqual([(e["detail"]["by"], e["detail"]["mode"]) for e in self.events("gate.mode")],
-                         [("cos", "enforce"), ("a person at a shell", "off")])
+                         [("cos", "shadow"), ("a person at a shell", "enforce"), ("cos", "off")])
+
+    def test_the_command_itself_refuses_to_turn_enforcement_on_for_anyone_but_the_owner_at_a_terminal(self):
+        """The decision depends only on WHO calls: a wrapper (`timeout N fleet-switchboard gates ...`, `env`, a pipe) does not change the caller."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure_ci_recorder()
+        self.set_gates({"acme/app": {"mode": "shadow"}})
+        before = self.config_file.read_text()
+        for caller in ("cos", "coder"):
+            for argv in (("mode", "acme/app", "enforce"), ("on",)):
+                with self.subTest(caller=caller, argv=argv):
+                    (self.world.state / "plan-gates.off").write_text("")
+                    code, out, err = self.run_as(caller, "gates", *argv)
+                    self.assertEqual(code, 2)
+                    self.assertTrue("turns enforcement on" in err or "may not change gate modes" in err, err)
+                    self.assertEqual(self.config_file.read_text(), before, "nothing was written")
+                    self.assertTrue((self.world.state / "plan-gates.off").exists(), "the kill file stays")
+        # an unknown session (an uncertain identity) is refused too, never read as the owner
+        with mock.patch.dict(os.environ):
+            os.environ["OPENCODE_SESSION_ID"] = "ses_nobody"
+            code, out, err = self.run_as("cos", "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 2)
+        self.assertEqual(self.config_file.read_text(), before)
+        self.assertIn("gate.mode.refused", [e["event"] for e in self.world.audit()])
+        # the owner at a terminal may; the chief of staff may still turn gates OFF, set shadow and (separately tested) waive
+        code, out, err = self.run_as(None, "gates", "on")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_as(None, "gates", "mode", "acme/app", "enforce")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
+        self.assertEqual(self.run_as("cos", "gates", "mode", "acme/app", "shadow")[0], 0)
 
     def configure_ci_recorder(self):
         self.configure()   # the default evaluators include a `ci` recorder
@@ -18273,8 +18320,12 @@ class TestPlanGatesCheck(LedgerBase):
                 self.set_gates({"acme/app": {"mode": "enforce"}})
                 code, out, err = self.run_as("coder", "gates-check", self.PR, "--for", "merge", "--json")
                 self.assertEqual((code, json.loads(out)["mode"]), (0, "shadow"), "set by hand, it still runs as shadow")
-        for good in (COS_ALLOWING, cos_rules_text(*COS_GUARDS, ("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow")),   # a deny placed first still wins
-                     cos_rules_text(*narrow, *COS_GUARDS, shape="block")):
+        deny_first = cos_rules_text(*COS_GUARDS, ("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"))   # v2: the LAST match wins, so a deny placed first loses
+        cos.write_text(deny_first)
+        self.assertIn("turning enforcement on", sb.plan_ledger.cos_lacking(deny_first))
+        timeout_hole = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), ("timeout ? fleet-switchboard *", "allow"), *COS_GUARDS)
+        self.assertIn("timeout", sb.plan_ledger.cos_lacking(timeout_hole), "the bare guards do not cover the timeout wrapper: the check must say so")
+        for good in (COS_ALLOWING_FULL, cos_rules_text(*narrow, *COS_GUARDS, shape="block")):
             cos.write_text(good)
             code, out, err = self.run_as(None, "gates", "preflight", "acme/app")
             self.assertNotIn("cannot yet turn enforcement off", out + err)
@@ -18289,6 +18340,17 @@ class TestPlanGatesCheck(LedgerBase):
         # and one without the allow for waive
         no_waive = "\n".join(l for l in text.splitlines() if "fleet-switchboard waive *" not in l or "deny" in l)
         self.assertIn("does not allow", sb.plan_ledger.cos_lacking(no_waive))
+
+    def test_the_cos_check_reads_only_the_front_matter_permissions_and_flags_a_name_key(self):
+        rules = COS_ALLOWING_FULL
+        front = "---\ndescription: x\nmode: primary\nmodel: m/m\npermissions:\n" + rules + "---\n"
+        self.assertEqual(sb.plan_ledger.cos_lacking(front + "# body\n"), "")
+        # a rule-shaped line in the BODY prose never counts: a definition with no allows but prose quoting them is still lacking
+        bare = "---\ndescription: x\npermissions:\n  - {action: \"*\", resource: \"*\", effect: deny}\n---\n" + rules
+        self.assertIn("does not allow", sb.plan_ledger.cos_lacking(bare))
+        # a `name:` key makes v2 ignore the whole list
+        named = "---\nname: chief-of-staff\ndescription: x\npermissions:\n" + rules + "---\n"
+        self.assertIn("`name:` key", sb.plan_ledger.cos_lacking(named))
 
     def test_a_bad_mode_or_usage_is_refused(self):
         for argv in (("mode", "acme/app", "loud"), ("mode", "acme/app"), ("mode",)):
