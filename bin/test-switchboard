@@ -2963,11 +2963,19 @@ class TestSteerToWorking(Base):
         self.assertIn("did not finish within 0.05 s", err)
         self.assertIn("state is unknown", err)
         self.assertIn("pending platform", err)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "send_timeout_seconds": 0.05})
+        with mock.patch.object(sb, "_cmd_send", stuck):
+            code, out, err = self.cli_send("hi", to="plat\x1b[31mform")
+        self.assertNotIn("\x1b", err)
 
     def test_a_fast_send_is_unchanged_and_the_bound_has_a_default_and_is_validated(self):
         self.work()
         code, out, err = self.cli_send("ok")
         self.assertEqual(code, 0, err)
+        self.assertRegex(out.strip(), r"^msg_[0-9a-f]+$")                      # the message id, as before
+        self.assertIn("delivered to platform", err)
+
+    def test_the_bound_has_a_default_and_is_validated(self):
         self.assertEqual(sb.DEFAULTS["send_timeout_seconds"], 60)
         for bad in (0, -1, "x"):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
@@ -2985,15 +2993,6 @@ class TestSteerToWorking(Base):
             code, out, err = self.cli_send("hi")
         self.assertIn("the config could not be read", err)
         self.assertIn("default send bound of 60 s", err)
-
-    def test_the_sender_is_told_which_agent_the_role_name_reached(self):
-        self.world.add_agent("chief", fleet={"role": "chief-of-staff"})
-        code, out, err = self.cli_send("a question", to="chief-of-staff")
-        self.assertEqual(code, 0, err)
-        self.assertIn("delivered to chief (the role name chief-of-staff resolved to it)", err)
-        code, out, err = self.cli_send("by name", to="chief")
-        self.assertIn("delivered to chief\n", err)
-        self.assertNotIn("resolved", err)
 
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()

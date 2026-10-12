@@ -2341,7 +2341,6 @@ class Switchboard:
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
-        asked = recipient
         recipient = resolve_boss(discovery, recipient)   # `chief-of-staff` is the role: it reaches the one agent with that role (#80), as a report does
         if interrupt:
             target = discovery.agents.get(recipient)
@@ -2354,10 +2353,7 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
-        if recipient != asked:
-            outcome = dict(outcome, resolved_to=recipient)   # the sender is told which agent the role name reached
-        return outcome
+        return self.send_fact(fact, discovery, now, interrupt=interrupt)
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -10854,7 +10850,8 @@ def run_bounded(work, seconds):
 
 def cmd_send(args, runner, now):
     """`send`, bounded as a whole by `send_timeout_seconds` (default 60 s): past it the command exits 1 saying the delivery did not finish, may
-    still complete or have been cut off part way (the state is unknown), never a silent multi-minute wait."""
+    still complete or have been cut off part way (the state is unknown), never a silent multi-minute wait. FAIL MODE: the timeout fails CLOSED
+    (exit 1, "state unknown"): it never reports a delivery it did not see; an unreadable config falls OPEN to the default bound, and says so."""
     try:
         seconds = load_config()["send_timeout_seconds"]
     except ConfigError as err:   # the command itself reports the config error below; the bound falls back to the default, and says so
@@ -10864,7 +10861,8 @@ def cmd_send(args, runner, now):
     if not done:
         sys.stderr.write("%s: send to %s did not finish within %s s (a slow v2 or herdr): it may still be delivered, or have been cut off "
                          "part way: the state is unknown, so check `%s pending %s` and the recipient before sending again\n" % (
-                             PROG, args.name, seconds, PROG, args.name))
+                             PROG, _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.name), 80), seconds, PROG,
+                             _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.name), 80)))
         return EXIT_ERROR
     return code
 
@@ -10908,9 +10906,7 @@ def _cmd_send(args, runner, now):
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
     print(outcome["message_id"])
-    target = outcome.get("resolved_to")
-    sys.stderr.write("%s: %s delivered to %s%s\n" % (PROG, outcome["action"], target or args.name,
-                                                   " (the role name %s resolved to it)" % args.name if target else ""))
+    sys.stderr.write("%s: %s delivered to %s\n" % (PROG, outcome["action"], args.name))
     return EXIT_OK
 
 
