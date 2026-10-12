@@ -36049,6 +36049,36 @@ class TestReviewerSubagents(LedgerBase):
         self.assertIn("reviewer-test", docs)
         self.assertNotIn("the four reviewers", skill + docs)
 
+    def test_every_agent_definition_has_front_matter_that_a_yaml_parser_reads_as_written(self):
+        # An unquoted `description: ... : ...` fails to parse and OpenCode v2 then silently registers the file as a default primary agent.
+        for path in sorted((REPO / "agents").glob("*/*.md")):
+            with self.subTest(path=path.name):
+                parts = path.read_text().split("---\n")
+                self.assertGreaterEqual(len(parts), 3, "front matter is fenced by ---")
+                for line in parts[1].split("\n"):
+                    m = re.match(r"^([A-Za-z_][\w-]*):\s+(.*)$", line)
+                    if not m:
+                        continue
+                    value = m.group(2)
+                    if value[:1] in "\"'[{|>":
+                        continue
+                    self.assertNotIn(": ", value, "%s: quote the value (a ': ' inside an unquoted scalar breaks the parse)" % m.group(1))
+                    self.assertNotIn(" #", value, "%s: quote the value (' #' starts a comment)" % m.group(1))
+                    self.assertFalse(value.endswith(":"), m.group(1))
+
+    def test_each_reviewer_parses_as_a_subagent_with_a_quoted_description_and_enough_rules(self):
+        for role in self.ROLES:
+            with self.subTest(role=role):
+                text, head, perms = self.front(role)
+                self.assertRegex(head, r'(?m)^description: ".+"$')
+                self.assertNotIn("review record", re.search(r'(?m)^description: (.*)$', head).group(1), "the description must not claim a write it no longer has")
+                self.assertRegex(head, r"(?m)^mode: subagent$")
+                self.assertGreaterEqual(len(perms), 30, "a reviewer has its short permission block, not the default's few rules")
+
+    def test_the_skill_and_the_docs_say_how_to_verify_an_installed_agent(self):
+        for rel in ("skills/fleet-review/SKILL.md", "docs/switchboard.md"):
+            self.assertIn("opencode api GET /api/agent", (REPO / rel).read_text(), rel)
+
     def test_the_reviewers_cannot_write_files_open_a_browser_run_an_external_program_or_read_credentials(self):
         for role in self.ROLES:
             with self.subTest(role=role):
