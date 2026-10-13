@@ -642,8 +642,8 @@ class TestHerdrClient(Base):
         public = sorted(name for name, _ in inspect.getmembers(sb.HerdrClient, inspect.isfunction)
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
-                                  "pane_clear_token", "pane_close", "pane_process_info",
-                                  "pane_report_metadata_token", "workspace_create", "workspace_list"])  # PR 16
+                                  "pane_clear_token", "pane_close", "pane_get", "pane_process_info", "pane_read_visible",
+                                  "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
         body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
@@ -1861,7 +1861,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"])  # PR 16: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -1975,7 +1975,16 @@ class FakeHerdr:
                    ("agent", "prompt"): self._agent_prompt, ("pane", "report-metadata"): self._report_metadata,
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
-                   ("workspace", "create"): self._workspace_create}.get(tuple(args[:2]))
+                   ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get,
+                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
+        if tuple(args[:2]) == ("pane", "read"):
+            positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
+            if positional[0] not in self.panes:
+                return subprocess.CompletedProcess(argv, 1, "", "error: pane %s not found\n" % positional[0])
+            entry = self.panes[positional[0]]
+            if entry.get("read_fails"):
+                return subprocess.CompletedProcess(argv, 1, "", "error: read timed out\n")
+            return subprocess.CompletedProcess(argv, 0, entry.get("screen") or "  Build auto · model\n", "")
         if handler is None:
             return _usage(argv, "fake herdr: refused %r" % args)
         try:
@@ -2055,6 +2064,40 @@ class FakeHerdr:
         processes = [{"cmdline": program, "name": program.split(" ")[0].rsplit("/", 1)[-1], "pid": 4242}] if program else []
         return {"result": {"type": "pane_process_info", "process_info": {
             "pane_id": pane, "foreground_processes": processes, "shell_pid": 4242}}}
+
+    def tab_of(self, pane):
+        return "%s:t%s" % (pane.split(":")[0], pane.split("p")[-1])
+
+    def _pane_get(self, rest):
+        positional, _ = parse_flags(rest, ())
+        pane = positional[0]
+        if pane not in self.panes:
+            raise LookupError("pane %s not found" % pane)
+        entry = self.panes[pane]
+        session = self.v2.sessions.get(entry["session"]) or {}
+        name = (((session.get("metadata") or {}).get("fleet")) or {}).get("name") or "opencode"
+        title = entry.get("title") if entry.get("title") is not None else "OC | %s" % name
+        body = {"pane_id": pane, "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane), "cwd": entry.get("cwd") or "/tmp",
+                "agent_status": self.status(pane), "terminal_title_stripped": title}
+        return {"result": {"type": "pane_info", "pane": body}}
+
+    def _tab_get(self, rest):
+        positional, _ = parse_flags(rest, ())
+        members = [p for p in self.panes if self.tab_of(p) == positional[0]]
+        if not members:
+            raise LookupError("tab %s not found" % positional[0])
+        return {"result": {"type": "tab_info", "tab": {"tab_id": positional[0], "pane_count": len(members) + len(self.extra_panes.get(positional[0], []))}}}
+
+    extra_panes = {}
+
+    def _tab_close(self, rest):
+        positional, _ = parse_flags(rest, ())
+        for pane in list(self.panes):
+            if self.tab_of(pane) == positional[0]:
+                self.closed.append(pane)
+                del self.panes[pane]
+                return {"result": {"type": "ok"}}
+        raise LookupError("tab %s not found" % positional[0])
 
     def _pane_close(self, rest):
         positional, _ = parse_flags(rest, ())
@@ -2343,7 +2386,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -3878,6 +3921,16 @@ class TestLaunch(Base):
                                      sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state),
                                      self.world.clock.now, "cli")
         self.sleeps = []
+        patch = mock.patch.object(sb, "PANE_SETTLE_SECONDS", 0)       # the two looks before a close are instant in tests
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.terminal_problem = None                                  # None: the test shell is the operator's own terminal; a test sets a string to say it is not
+        term = mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem)
+        term.start()
+        self.addCleanup(term.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)            # restores HERDR_PANE_ID and the workspace even when an assertion fails
+        env.start()
+        self.addCleanup(env.stop)
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
@@ -4022,6 +4075,544 @@ class TestLaunch(Base):
             with self.subTest(overrides=overrides), self.assertRaises(sb.LaunchError):
                 self.launch(**overrides)
         self.assertEqual((self.world.v2.calls, self.world.herdr.socket_calls), ([], []))
+
+    # -- the control plane: a detached pane is found, and `reattach` repairs it without a prompt
+
+    def detach(self, name="platform", screen="  Build auto · model\n"):
+        """The pane is up, but shows a fresh Build screen: herdr's agent_session still names the old session (it is stale), the title does not."""
+        pane = self.world.panes[name]
+        self.world.herdr.panes[pane]["title"] = "OpenCode"
+        self.world.herdr.panes[pane]["screen"] = screen
+        self.world.herdr.panes[pane]["program"] = FAKE_OPENCODE            # a fresh opencode: no `-s <session>` (a stale screen)
+        self.world.v2.sessions[self.world.sessions[name]]["directory"] = str(self.work)
+        return pane
+
+    def health(self, offset=0):
+        self.engine.state_dir = self.world.state
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
+
+    def state(self, name="platform"):
+        obs = self.engine.discover(self.world.clock.now()).agents[name]
+        return sb.pane_state(self.engine, name, obs.session_id, obs.pane, ["platform", "coder"], [])[0]
+
+    def test_an_attached_pane_is_attached_a_fresh_screen_with_a_stale_session_value_is_detached_and_a_missing_pane_is_dead(self):
+        self.assertEqual(self.state(), sb.PANE_ATTACHED)                   # the title names the agent
+        pane = self.detach()
+        self.assertEqual(self.state(), sb.PANE_DETACHED)                   # herdr still lists the session, yet nothing on screen names it
+        self.world.herdr.panes[pane]["title"] = "opencode -s %s" % self.world.sessions["platform"]
+        self.assertEqual(self.state(), sb.PANE_ATTACHED)                   # the session id in the title is enough
+        obs = self.engine.discover(self.world.clock.now()).agents["platform"]
+        self.world.herdr.panes.pop(pane)
+        self.assertEqual(sb.pane_state(self.engine, "platform", obs.session_id, pane)[0], sb.PANE_DEAD)
+        self.world.herdr.down = True
+        self.assertEqual(sb.pane_state(self.engine, "platform", obs.session_id, pane)[0], sb.PANE_UNKNOWN, "unreachable herdr is never a verdict")
+
+    def test_the_daemon_pass_audits_a_detached_pane_once_wakes_the_chief_of_staff_and_status_shows_it(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.detach()
+        self.health()
+        self.health(1)
+        events = [e for e in self.world.audit() if e["event"] == "fleetpane.detached"]
+        self.assertEqual(len(events), 1)
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source())]
+        self.assertEqual([(f.recipient, f.kind) for f in facts], [("cos", "pane")])
+        self.assertIn("platform is DETACHED", facts[0].summary)
+        self.assertIn("reattach platform", facts[0].summary)
+        self.assertEqual(facts[0].key.split(":")[:3], ["pane", "platform", "detached"])
+        lines = sb.pane_health_status_lines(self.world.state)
+        self.assertIn("platform DETACHED", lines[0])
+
+    def fact_source(self):
+        source = sb.PaneFacts()
+        source.bind(self.engine)
+        return source
+
+    def test_reattach_releases_a_stale_fresh_screen_opens_a_tab_on_the_same_session_and_sends_no_prompt(self):
+        pane = self.detach()
+        session = self.world.sessions["platform"]
+        sessions, messages = set(self.world.v2.sessions), len(self.world.v2.sessions[session]["messages"])
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        done = json.loads(out.getvalue())
+        self.assertEqual(done["session"], session)
+        self.assertIn("closed", done["released"][0])
+        self.assertNotIn(pane, self.world.herdr.panes)                     # the stale tab is gone
+        self.assertIn(done["pane"], self.world.herdr.panes)
+        self.assertEqual(set(self.world.v2.sessions), sessions)
+        self.assertEqual(len(self.world.v2.sessions[session]["messages"]), messages, "no prompt, no brief")
+        self.assertEqual(self.world.herdr.typing_attempts, [])
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.reattached"]), 1)
+        self.assertEqual(self.engine.discover(self.world.clock.now()).agents["platform"].pane, done["pane"])
+
+    def test_reattach_refuses_a_pane_that_is_really_running_the_agent_and_one_showing_another_agent(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.v2.sessions[self.world.sessions["platform"]]["directory"] = str(self.work)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("already runs", err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [])
+        self.world.add_agent("coder")                                       # a second fleet agent whose name is on that screen
+        pane = self.detach(screen="  coder auto\n")                         # a screen that shows ANOTHER fleet agent is somebody's: not stale
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("shows another fleet agent", err.getvalue())
+        self.assertIn(pane, self.world.herdr.panes)
+        self.assertEqual(self.world.herdr.closed, [])
+
+    def test_a_resume_takes_repo_and_account_from_the_sessions_stored_metadata_and_refuses_a_different_caller_repo(self):
+        self.world.add_agent("ops", fleet={"role": "orchestrator", "repo": "acme-ops/service", "reports_to": "cos", "charter": 5})
+        session = self.world.sessions["ops"]
+        self.world.v2.sessions[session]["directory"] = str(self.work)
+        del self.world.herdr.panes[self.world.panes["ops"]]
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                             lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok-ops\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        done = sb.resume_agent(self.engine, "ops", session, "w1", patience=5, sleep=self.sleep)
+        env = self.world.herdr.panes[done["pane"]]["env"]
+        self.assertEqual((env["FLEET_SWITCHBOARD_REPO"], env["FLEET_SWITCHBOARD_ROLE"], env["GH_TOKEN"]), ("acme-ops/service", "orchestrator", "tok-ops"))
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        del self.world.herdr.panes[done["pane"]]
+        for argv in (["launch", "ops", "--resume", session, "--repo", "acme/other"], ["reattach", "ops", "--session", session, "--repo", "acme/other"]):
+            with captured() as (out, err):
+                code = sb.main(argv, runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertIn("differs from the session's stored repo acme-ops/service", err.getvalue())
+
+    def test_replace_closes_a_live_pane_with_the_wrong_account_under_the_same_guards_and_all_detached_walks_the_list(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.world.panes["platform"]
+        session = self.world.sessions["platform"]
+        self.world.v2.sessions[session]["directory"] = str(self.work)
+        herdr = self.world.herdr
+        # an idle pane that RUNS `opencode -s <the agent's session>` is live and attached: never closed, with or without --replace
+        for extra in ([], ["--replace"]):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"] + extra, runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertIn("runs its own live session", err.getvalue())
+            self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        # a plain title makes no difference
+        herdr.panes[pane]["title"] = "OpenCode"
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(herdr.closed, [])
+        # an opencode on ANOTHER session (named by its title) is not this agent's: without --replace it still "runs the agent" by title, with --replace it goes
+        herdr.panes[pane]["program"] = "%s -s ses_someone_else" % FAKE_OPENCODE
+        herdr.panes[pane]["title"] = "OC | platform"
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--replace", err.getvalue())
+        self.world.herdr.panes[pane]["status"] = "working"                  # a working pane is never replaced
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.world.herdr.closed, [])
+        self.world.herdr.panes[pane]["status"] = None
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [pane])
+        herdr.closed.clear()
+        with captured() as (out, err):
+            code = sb.main(["reattach", "--all-detached"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual((code, out.getvalue().strip()), (0, "no agent is detached or dead"))
+
+    def test_all_detached_walks_a_non_empty_list_says_each_failure_and_continues_and_the_account_warning_reaches_the_command(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.add_agent("ops", fleet={"role": "coder", "repo": "acme-ops/service"})
+        for name in ("platform", "ops"):
+            self.world.v2.sessions[self.world.sessions[name]]["directory"] = str(self.work)
+        self.detach("platform")
+        self.detach("ops")
+        sb.write_pane_health(self.world.state, {"agents": {}, "missing": {}, "states": {
+            "platform": {"state": "detached", "pane": self.world.panes["platform"], "session": self.world.sessions["platform"]},
+            "ops": {"state": "detached", "pane": self.world.panes["ops"], "session": self.world.sessions["ops"]},
+            "ghost": {"state": "dead", "pane": "w1:p99", "session": "ses_gone"}}})
+        base = self.world.route
+
+        def wrong_login(argv, **kw):
+            if argv[0] == "gh":
+                return subprocess.CompletedProcess(argv, 0, "default-work\n", "")
+            return base(argv, **kw)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "--all-detached"], runner=wrong_login, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 1)                                           # one failed (the ghost), so the exit says so
+        self.assertIn("ghost", err.getvalue())
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.reattached"]), 2, "the two repairable agents were both done")
+        self.assertEqual(len(self.world.herdr.closed), 2)
+
+    def test_replace_still_refuses_a_tab_with_a_second_pane(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.world.panes["platform"]
+        self.world.v2.sessions[self.world.sessions["platform"]]["directory"] = str(self.work)
+        self.world.herdr.panes[pane]["program"] = "-zsh"                   # not running the agent's session, so --replace may judge it
+        self.world.herdr.panes[pane]["title"] = "OC | platform"
+        self.world.herdr.extra_panes = {self.world.herdr.tab_of(pane): ["a person's shell"]}
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("holds 2 panes", err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [])
+        self.world.herdr.extra_panes = {}
+
+    def test_verify_account_failure_paths_say_a_fixed_line(self):
+        engine = self.engine
+        engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        fleet = {"repo": "acme-ops/service"}
+        self.assertIn("could not be verified", sb.verify_account(engine, lambda a, **k: subprocess.CompletedProcess(a, 1, "", "x"), fleet))
+        self.assertIn("could not be verified", sb.verify_account(engine, lambda a, **k: subprocess.CompletedProcess(a, 0, "\n", ""), fleet))
+        def boom(a, **k):
+            raise OSError("secret-token-text")
+        line = sb.verify_account(engine, boom, fleet)
+        self.assertIn("could not be verified", line)
+        self.assertNotIn("secret", line)
+        self.assertIsNone(sb.verify_account(engine, boom, {"repo": "acme/unmapped"}))
+
+    def test_the_account_is_verified_after_a_reattach_and_a_mismatch_is_said(self):
+        engine = self.engine
+        engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        ok = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "acct-ops\n", "")
+        bad = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "default-work\n", "")
+        fleet = {"repo": "acme-ops/service"}
+        self.assertIsNone(sb.verify_account(engine, ok, fleet))
+        self.assertIn("default-work but acme-ops/service maps to acct-ops", sb.verify_account(engine, bad, fleet))
+        self.assertIsNone(sb.verify_account(engine, bad, {}))
+
+    def test_a_pane_active_between_the_two_looks_or_blocked_or_unreadable_is_never_closed_even_with_replace(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        herdr = self.world.herdr
+
+        def run(*extra):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"] + list(extra), runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+            return code, err.getvalue()
+        shows = iter(["  Build — typing a new line\n"])
+        with mock.patch.object(sb.time, "sleep", lambda s: herdr.panes[pane].__setitem__("screen", next(shows))):
+            herdr.panes[pane]["screen"] = "  Build\n"
+            code, err = run()
+        self.assertNotEqual(code, 0)
+        self.assertIn("showed activity", err)
+        self.assertEqual(herdr.closed, [])
+        herdr.panes[pane]["screen"] = "  Build\n"
+        herdr.panes[pane]["status"] = "blocked"
+        code, err = run()
+        self.assertIn("is blocked", err)
+        self.assertEqual(herdr.closed, [])
+        herdr.panes[pane]["status"] = None
+        herdr.panes[pane]["read_fails"] = True
+        code, err = run("--replace")
+        self.assertNotEqual(code, 0)
+        self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        herdr.panes[pane]["read_fails"] = False
+        code, err = run()                                                   # two agreeing, quiet looks: the close is allowed
+        self.assertEqual(code, 0, err)
+        self.assertEqual(herdr.closed, [pane])
+
+    def test_only_the_operator_the_chief_of_staff_or_the_agents_own_boss_may_reattach_and_a_refusal_is_audited(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("boss", fleet={"role": "orchestrator"})
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        self.world.v2.sessions[self.world.sessions["platform"]]["metadata"]["fleet"]["reports_to"] = "boss"
+        pane = self.detach()
+        for who, ok in (("stranger", False), ("cos", True)):
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code == 0, ok, (who, err.getvalue()))
+            if not ok:
+                self.assertIn("may not reattach platform", err.getvalue())
+                self.assertIn(pane, self.world.herdr.panes)
+            else:
+                self.assertNotIn(pane, self.world.herdr.panes)
+        os.environ.pop("HERDR_PANE_ID", None)
+        refused = [e for e in self.world.audit() if e["event"] == "fleetpane.reattach_refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual((refused[0]["subject"], refused[0]["detail"]["why"].startswith("stranger may not reattach platform")), ("platform", True))
+        # no pane id and away from the owner's terminal: refused too; and an orchestrator who is NOT its boss
+        self.terminal_problem = "stdin is not a terminal"
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.world.panes["platform"] = self.engine.discover(self.world.clock.now()).agents["platform"].pane
+        pane2 = self.detach()
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.world.herdr.closed.count(pane2), 0)
+        self.world.add_agent("other-orch", fleet={"role": "orchestrator"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["other-orch"]
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("may not reattach platform", err.getvalue())
+        self.assertIn(pane2, self.world.herdr.panes)
+        self.terminal_problem = None
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.world.panes["platform"] = self.engine.discover(self.world.clock.now()).agents["platform"].pane   # the pane the cos reattach opened
+        pane = self.detach()                                                # a boss of the agent may
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.assertEqual(code, 0, err.getvalue())
+
+    def test_two_concurrent_reattaches_of_one_agent_open_one_tab_the_second_is_told_and_another_agent_is_not_blocked(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.detach()
+        before = len(self.world.herdr.socket_calls)
+        with sb.agent_lock(self.world.state, "platform"), mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0):   # a first reattach is running
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertIn("another reattach of platform is running", err.getvalue())
+            with captured() as (out, err):                                  # the same lock guards `launch --resume`
+                code = sb.main(["launch", "platform", "--resume", self.world.sessions["platform"]], runner=self.world.route,
+                               now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertEqual((len(self.world.herdr.socket_calls), self.world.herdr.closed), (before, []))
+            self.world.add_agent("ops")                                      # another agent's lock is a different file
+            self.world.v2.sessions[self.world.sessions["ops"]]["directory"] = str(self.work)
+            self.detach("ops")
+            with captured() as (out, err):
+                code = sb.main(["reattach", "ops"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+
+    def test_launch_resume_by_a_stranger_closes_nothing_and_the_boss_of_a_dead_agent_may_reattach_it(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.add_agent("boss", fleet={"role": "coder"})
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        self.world.v2.sessions[self.world.sessions["platform"]]["metadata"]["fleet"]["reports_to"] = "boss"
+        pane = self.detach()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
+        with captured() as (out, err):
+            code = sb.main(["launch", "platform", "--resume", self.world.sessions["platform"]], runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual((self.world.herdr.closed, pane in self.world.herdr.panes), ([], True))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.reattach_refused" and e["detail"].get("via") == "launch --resume"])
+        self.health()                                                      # the daemon remembers it, then its pane dies
+        del self.world.herdr.panes[pane]
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+
+    def test_a_shell_pane_is_closed_after_two_quiet_looks_and_an_unreadable_process_list_closes_nothing(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        herdr = self.world.herdr
+        herdr.panes[pane]["program"] = "-zsh"                              # a shell, not opencode
+        self.assertEqual(self.state(), sb.PANE_DETACHED)
+        base = self.world.route
+
+        def no_process_info(argv, **kw):
+            if argv[0] == FAKE_HERDR and argv[1:3] == ["pane", "process-info"]:
+                return subprocess.CompletedProcess(argv, 1, "", "error: timed out\n")
+            return base(argv, **kw)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=no_process_info, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(herdr.closed, [pane])
+
+    def test_the_session_match_is_exact_and_covers_both_flag_spellings(self):
+        sid = "ses_abc123"
+        for cmd, want in (("opencode -s ses_abc123", True), ("opencode --session ses_abc123", True), ("opencode --session=ses_abc123", True),
+                          ("opencode -s ses_abc1234", False), ("opencode -s ses_other", False), ("opencode", False), ("-zsh", False),
+                          ("echo ses_abc123", False)):
+            self.assertEqual(sb.runs_session([{"cmdline": cmd}], sid), want, cmd)
+
+    def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
+        pane = self.detach()
+        self.world.herdr.panes[pane]["read_fails"] = True
+        state, why, _ = sb.pane_state(self.engine, "platform", self.world.sessions["platform"], pane)
+        self.assertEqual(state, sb.PANE_UNKNOWN)
+        self.assertIn("could not be read", why)
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual((self.world.herdr.closed, pane in self.world.herdr.panes), ([], True))
+        self.world.herdr.panes[pane]["title"] = "OC | platform"                    # a title that names the agent needs no screen at all
+        self.assertEqual(sb.pane_state(self.engine, "platform", self.world.sessions["platform"], pane)[0], sb.PANE_ATTACHED)
+
+    def test_a_tab_with_a_second_pane_or_a_working_pane_is_never_closed_and_names_match_whole_words_only(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        self.world.herdr.extra_panes = {self.world.herdr.tab_of(pane): ["a person's shell"]}
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("holds 2 panes", err.getvalue())
+        self.world.herdr.extra_panes = {}
+        self.world.herdr.panes[pane]["status"] = "working"
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertIn("is working", err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [])
+        self.assertFalse(sb._names_agent("across the board", "cos", None))
+        self.assertTrue(sb._names_agent("OC | cos", "cos", None))
+        self.assertFalse(sb._names_agent("OpenCode", "build", None))
+
+    def test_the_second_pass_after_the_recheck_window_does_not_repeat_the_audit_and_a_recovery_is_audited(self):
+        pane = self.detach()
+        self.health()
+        self.health(sb.PANE_CHECK_SECONDS + 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.detached"]), 1)
+        self.world.herdr.panes[pane]["title"] = "OC | platform"
+        self.health(2 * sb.PANE_CHECK_SECONDS + 5)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.recovered"]), 1)
+
+    def test_every_guard_before_the_close_refuses_a_pane_that_changes_a_tab_that_cannot_be_read_and_another_agents_session(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        herdr = self.world.herdr
+        reads = []
+        real = sb.pane_state
+
+        def flipping(engine, name, session, p, names=(), sessions=()):
+            reads.append(1)
+            if len(reads) >= 2:                         # the re-judgement just before the close: the pane has changed under us
+                herdr.panes[pane]["title"] = "OC | platform"
+            return real(engine, name, session, p, names, sessions)
+        with mock.patch.object(sb, "pane_state", flipping):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("changed while it was being judged", err.getvalue())
+        self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        herdr.panes[pane]["title"] = "OpenCode"
+        base = self.world.route
+
+        def tab_get_fails(argv, **kw):
+            if argv[0] == FAKE_HERDR and argv[1:3] == ["tab", "get"]:
+                return subprocess.CompletedProcess(argv, 1, "", "error: timed out\n")
+            return base(argv, **kw)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=tab_get_fails, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot say what tab", err.getvalue())
+        self.assertEqual(herdr.closed, [])
+        other = self.world.add_agent("coder")
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--session", other], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("belongs to", err.getvalue())
+        self.assertEqual(herdr.closed, [])
+
+    def test_a_state_file_that_cannot_be_written_is_reported_by_the_pass_and_by_reattach_and_a_pane_with_no_tab_is_refused(self):
+        self.engine.state_dir = self.world.state
+        self.engine.discover(self.world.clock.now())
+        with mock.patch.object(sb, "write_pane_health", side_effect=OSError(28, "No space left")):
+            sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error"])
+        self.detach()
+        taken = self.engine.discover(self.world.clock.now()).agents["platform"]
+        with mock.patch.object(sb, "pane_state", return_value=(sb.PANE_DETACHED, "x", {"tab": None})):
+            with self.assertRaises(sb.LaunchError) as caught:
+                sb.release_stale_binding(self.engine, "platform", taken, taken.session_id)
+        self.assertIn("names no tab", str(caught.exception))
+
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.detach()
+        with mock.patch.object(sb, "write_pane_health", side_effect=OSError(28, "No space left")):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("pane-health.json was not updated", err.getvalue())
+
+    def test_a_pass_checks_at_most_the_budget_of_panes(self):
+        for n in range(sb.PANE_CHECKS_PER_PASS + 5):
+            self.world.add_agent("w%d" % n)
+        self.engine.state_dir = self.world.state
+        self.engine.discover(self.world.clock.now())
+        calls = []
+        real = sb.pane_state
+        with mock.patch.object(sb, "pane_state", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.assertEqual(len(calls), sb.PANE_CHECKS_PER_PASS)
+
+    def test_a_forgotten_dead_agent_stops_waking_and_the_charter_pane_line_is_rewritten_only_when_present(self):
+        self.engine.state_dir = self.world.state
+        sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
+                                                "states": {"gone": {"state": "dead", "at": 1, "pane": "w1:p9", "session": "ses_x"}}})
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, 1 + sb.PANE_FORGET_SECONDS + 5)
+        self.assertEqual(sb.read_pane_health(self.world.state)["agents"], {"platform": sb.read_pane_health(self.world.state)["agents"]["platform"]})
+        body = {"text": "Charter\npane: w1:p1\nowner: x\n"}
+        patches = []
+
+        def gh(argv, **kw):
+            if "--method" in argv and argv[argv.index("--method") + 1] == "PATCH":
+                patches.append(json.loads(kw["input"]))
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"body": body["text"]}), "")
+        self.engine.config = dict(self.engine.config, gh="gh")
+        note = sb.charter_pane_update(self.engine, gh, {"charter": 5, "repo": "acme/app"}, "w1:p7")
+        self.assertIn("now says pane: w1:p7", note)
+        self.assertEqual(patches[0]["body"], "Charter\npane: w1:p7\nowner: x\n")
+        body["text"] = "no pane line here\n"
+        self.assertIn("no `pane:` line", sb.charter_pane_update(self.engine, gh, {"charter": 5, "repo": "acme/app"}, "w1:p8"))
+        self.assertEqual(len(patches), 1)
+
+    def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.health()                                                      # the agent is remembered while it is alive
+        session = self.gone()
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.dead"])
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["session"], session)
+        del self.world.herdr.panes[json.loads(out.getvalue())["pane"]]
+        del self.world.v2.sessions[session]                               # the session itself is gone
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--session", session], runner=self.world.route, now=self.world.clock.now,
+                           socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no longer exists", err.getvalue())
+        self.assertIn("relaunch", err.getvalue())
+
+    def test_launch_resume_no_longer_refuses_a_stale_fresh_screen(self):
+        self.detach()
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["launch", "platform", "--resume", self.world.sessions["platform"]], runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
 
     def test_close_is_used_by_launch_alone(self):
         tree = ast.parse(SWITCHBOARD.read_text())
@@ -7787,7 +8378,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -9049,6 +9640,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
+        "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
