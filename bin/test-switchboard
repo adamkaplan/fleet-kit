@@ -4120,7 +4120,7 @@ class TestLaunch(Base):
         sessions = len(self.world.v2.sessions)
         code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "reviewer-code": "subagent"}), "reviewer-code")
         self.assertEqual(code, 1)
-        self.assertIn("--agent 'reviewer-code' is registered as a subagent agent, not a primary one", err)
+        self.assertIn("--agent 'reviewer-code' is registered as a subagent, not a primary agent", err)
         self.assertIn("Task tool", err)
         self.assertIn("primary agents registered: coder", err)
         self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
