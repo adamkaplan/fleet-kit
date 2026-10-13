@@ -39177,7 +39177,9 @@ class TestV2Http(V2TransportBase):
         self.assertEqual((self.service.requests, client.calls_by_transport()), ([], {}), "nothing was sent and nothing was counted")
 
     def test_the_config_key_forces_the_cli_route_and_a_bad_value_is_refused(self):
-        self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="auto").http)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("FLEET_SWITCHBOARD_V2_CLI", None)
+            self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="auto").http)
         self.assertIsNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="cli").http, "the kill switch: always `opencode api`")
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         self.assertEqual(sb.validate_config(dict(base))["v2_transport"], "auto")
@@ -39185,6 +39187,14 @@ class TestV2Http(V2TransportBase):
         for bad in ("http", "", None, 1, True):
             with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, v2_transport=bad))
+
+    def test_every_real_client_construction_passes_the_kill_switch(self):
+        sources = [(REPO / "bin" / "fleet-switchboard").read_text(), (REPO / "bin" / "judge-eval").read_text()]
+        sites = [line for text in sources for line in text.splitlines() if re.search(r"\bV2Client\(", line) and "class V2Client" not in line]
+        self.assertGreaterEqual(len(sites), 5)
+        for line in sites:
+            with self.subTest(line=line.strip()[:80]):
+                self.assertIn('transport=config["v2_transport"]', line, "a construction that omits it would ignore the kill switch")
 
     def test_a_fake_runner_or_the_cli_switch_means_no_http_route_at_all(self):
         self.assertIsNone(sb.V2Client("/fake/bin/opencode", {}, self.runner, 5).http)
