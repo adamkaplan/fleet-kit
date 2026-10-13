@@ -298,6 +298,7 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
@@ -435,6 +436,8 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    if config["v2_transport"] not in ("auto", "cli"):
+        raise ConfigError("%s: 'v2_transport' must be \"auto\" or \"cli\", got %r" % (source, config["v2_transport"]))
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
@@ -1135,7 +1138,7 @@ class V2Client:
     DELIVERIES = ("queue", "steer")
     ORDERS = ("desc", "asc")
 
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time, http=None, monotonic=time.monotonic):
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time, http=None, monotonic=time.monotonic, transport="auto"):
         self.binary = binary
         self.env = dict(env or {})
         self.runner = runner
@@ -1150,7 +1153,7 @@ class V2Client:
         self.count_errors = 0   # accounting that failed; a call never fails for it
         self._link_written = 0.0
         self._link_lock = threading.Lock()
-        if http is None and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
+        if http is None and transport == "auto" and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
             merged = dict(os.environ)
             merged.update(self.env)
             http = V2Http(v2_service_file(merged), timeout)   # a real run only: a fake runner stands for the CLI
@@ -10997,7 +11000,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             v2_ok, v2_line = False, ("not configured: set 'opencode' in %s to the absolute path of "
                                      "the OpenCode v2 binary" % config_path())
         else:
-            v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+            v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
             v2_ok, v2_line = _check(lambda: _v2_summary(v2.server_info()))
         herdr_ok, entries = _check(herdr.agent_list)
         herdr_line = "%d agent(s)" % len(entries) if herdr_ok else entries
@@ -11332,7 +11335,7 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
-    v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
     if actor == "daemon":
         v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
@@ -17228,7 +17231,7 @@ def build_policy_judge(config, runner, now):
     settings = config["policy"]
     jev_settings = dict(config["jev"], timeout_seconds=min(config["jev"]["timeout_seconds"], POLICY_WARM_SECONDS))
     jev = build_jev(dict(config, jev=jev_settings))
-    v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS))
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS), transport=config["v2_transport"])
     return PolicyJudge(config, v2, intent_reader_for(config, runner, now), jev, AuditLog(state / "audit.jsonl"), state, now)
 
 
@@ -18491,7 +18494,7 @@ def cmd_import_v1(args, runner, now):
     try:
         fleet = _import_fleet(args)
         export = read_v1_export(args, config, runner)
-        v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+        v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
         audit = None if args.dry_run else AuditLog(ensure_state_dir() / "audit.jsonl")
         report = import_v1_session(v2, audit, export, fleet, config["import_body_limit_bytes"],
                                    args.tool_output_limit, args.dry_run, args.dir)

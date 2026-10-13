@@ -212,7 +212,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90,
+            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -39175,6 +39175,16 @@ class TestV2Http(V2TransportBase):
             client.session_active()
         self.assertEqual(caught.exception.reason, "refused")
         self.assertEqual((self.service.requests, client.calls_by_transport()), ([], {}), "nothing was sent and nothing was counted")
+
+    def test_the_config_key_forces_the_cli_route_and_a_bad_value_is_refused(self):
+        self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="auto").http)
+        self.assertIsNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="cli").http, "the kill switch: always `opencode api`")
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["v2_transport"], "auto")
+        self.assertEqual(sb.validate_config(dict(base, v2_transport="cli"))["v2_transport"], "cli")
+        for bad in ("http", "", None, 1, True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, v2_transport=bad))
 
     def test_a_fake_runner_or_the_cli_switch_means_no_http_route_at_all(self):
         self.assertIsNone(sb.V2Client("/fake/bin/opencode", {}, self.runner, 5).http)
