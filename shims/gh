@@ -419,6 +419,37 @@ def take_over_review(args):
     return out, found, " ".join(reason.split())
 
 
+REVIEW_TAG_RE = re.compile(r"^\s*Review of ([0-9a-fA-F]{7,40})\s*[:\-]\s*(CHANGES[ _]REQUESTED|REQUEST[ _]CHANGES|APPROVED?)\b", re.I)
+REVIEW_FROM_RE = re.compile(r"fleet-switchboard:from=([A-Za-z0-9_-]{1,32})")
+
+
+def tagged_blockers(reviews, head):
+    """Independent reviews in this fleet are posted as COMMENTED reviews (one shared account cannot request changes on its own PRs), so the real
+    signal is the body's first line: `Review of <head sha>: CHANGES REQUESTED` or `APPROVE`. For each reviewer (login plus the `from=` tag a signed body
+    carries) the LATEST tagged review AT THE PR'S CURRENT HEAD decides: CHANGES REQUESTED blocks until a later one at that head says APPROVE. A tag for
+    another head, and any untagged comment, never blocks. Returns ["login/tag: CHANGES REQUESTED (Review of <sha>)"]."""
+    if not isinstance(head, str) or len(head) < 7:
+        return []
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        body = review.get("body") if isinstance(review.get("body"), str) else ""
+        first = body.strip().splitlines()[0] if body.strip() else ""
+        found = REVIEW_TAG_RE.match(first)
+        if not found:
+            continue
+        sha = found.group(1).lower()
+        if not head.lower().startswith(sha):
+            continue                                   # a verdict on another head says nothing about this one
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        tag = REVIEW_FROM_RE.search(body)
+        key = "%s%s" % (author or "?", "/" + tag.group(1) if tag else "")
+        word = found.group(2).upper().replace("_", " ")
+        latest[key] = ("CHANGES REQUESTED", sha) if word.startswith(("CHANGES", "REQUEST")) else ("APPROVE", sha)
+    return sorted("%s: CHANGES REQUESTED (Review of %s)" % (k, v[1][:8]) for k, v in latest.items() if v[0] == "CHANGES REQUESTED")
+
+
 def review_blockers(reviews):
     """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED; a plain comment decides nothing) is CHANGES_REQUESTED."""
     latest = {}
@@ -465,8 +496,9 @@ def review_probe(args, found, reason, lookup, gh):
         if not isinstance(data, dict):
             sys.stderr.write("gh: review check skipped (the reviews of %s#%d could not be read): not checked\n" % (repo, number))
             return None
-        blockers = ["%s: CHANGES_REQUESTED" % who for who in review_blockers(data.get("reviews"))]
         head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else ""
+        blockers = ["%s: CHANGES_REQUESTED" % who for who in review_blockers(data.get("reviews"))]
+        blockers += [gate_clean(b) for b in tagged_blockers(data.get("reviews"), head)]
         binary = switchboard_binary()
         if binary and head:
             done = lookup.run([binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head])

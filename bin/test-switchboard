@@ -11322,6 +11322,38 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(done.returncode, 7)
         self.assertIn("not checked", done.stderr)
 
+    def tagged(self, first, who="shared", tag="rev", at="2026-01-01T00:00:00Z", state="COMMENTED"):
+        body = "%s\n\nfindings...\n\n<!-- fleet-switchboard:from=%s -->" % (first, tag)
+        return {"state": state, "author": {"login": who}, "submittedAt": at, "body": body}
+
+    def test_a_commented_review_whose_first_line_says_changes_requested_at_the_current_head_blocks_and_a_later_approve_clears_it(self):
+        cr = self.tagged("Review of %s: CHANGES REQUESTED" % self.HEAD)
+        done, seen = self.merge(reviews=[cr])
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("shared/rev: CHANGES REQUESTED (Review of %s)" % self.HEAD[:8], done.stderr)
+        for spelling in ("Review of %s: CHANGES REQUESTED" % self.HEAD[:7], "review of %s - changes requested" % self.HEAD, "Review of %s: REQUEST CHANGES" % self.HEAD):
+            done, seen = self.merge(reviews=[self.tagged(spelling)])                  # a short sha prefix and the other spellings count
+            self.assertEqual(done.returncode, 10, spelling)
+        done, seen = self.merge(reviews=[cr, self.tagged("Review of %s: APPROVE" % self.HEAD)])
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        done, seen = self.merge(reviews=[cr, self.tagged("Review of %s: APPROVED" % self.HEAD, tag="other")])   # another reviewer's approve does not clear this one
+        self.assertEqual(done.returncode, 10)
+        done, seen = self.merge(reviews=[self.tagged("Review of %s: APPROVE" % self.HEAD), cr])                 # the latest one decides
+        self.assertEqual(done.returncode, 10)
+
+    def test_a_changes_requested_tag_at_an_old_head_and_untagged_comments_never_block(self):
+        old = "b" * 40
+        for reviews in ([self.tagged("Review of %s: CHANGES REQUESTED" % old)],
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": "CHANGES REQUESTED, please fix this"}],
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": "Looks fine.\nReview of %s: CHANGES REQUESTED" % self.HEAD}],   # not the FIRST line
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": None}],
+                        [self.tagged("Review of nothex: CHANGES REQUESTED")]):
+            with self.subTest(body=str(reviews[0].get("body"))[:40]):
+                done, seen = self.merge(reviews=reviews)
+                self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        done, seen = self.merge("--over-review", "the owner reviewed this head in person", reviews=[self.tagged("Review of %s: CHANGES REQUESTED" % self.HEAD)])
+        self.assertEqual(done.returncode, 7)                                    # the explicit override still works
+
     def test_an_override_whose_log_cannot_be_written_is_refused_and_a_pr_number_after_the_flag_is_not_its_reason(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
         done, seen = self.merge("--over-review", "a fine long reason here", reviews=block, env={"FLEET_SWITCHBOARD_STATE": str(self.home / "no-such-state")})
