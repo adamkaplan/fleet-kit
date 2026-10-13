@@ -1176,6 +1176,27 @@ class HerdrClient:
     def pane_close(self, pane):
         return self._call("pane", "close", pane)
 
+    def pane_get(self, pane):
+        """One pane as herdr shows it: {"pane_id", "workspace_id", "tab_id", "cwd", "terminal_title_stripped", "agent_status", ...}."""
+        return self._result(self._call("pane", "get", pane), "pane", dict)
+
+    def pane_read_visible(self, pane, lines=12):
+        """The last `lines` rows of what the pane shows on screen, as text. Reads only: nothing is typed and no key is sent."""
+        argv = [self.binary, "pane", "read", pane, "--source", "visible", "--lines", str(int(lines))]
+        try:
+            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise HerdrError("timeout", "herdr did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise HerdrError("unavailable", "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
+        if result.returncode != 0:
+            raise HerdrError("exit", _one_line(result.stderr) or _one_line(result.stdout) or "exit %d" % result.returncode)
+        return result.stdout or ""
+
+    def tab_close(self, tab):
+        """Close a tab (herdr closes its panes): only ever one the switchboard has proved is a stale, session-less screen."""
+        return self._call("tab", "close", tab)
+
     def workspace_list(self):
         """PR 16: every workspace, as herdr lists them: [{"workspace_id", "label", ...}]."""
         return self._result(self._call("workspace", "list"), "workspaces", list)
@@ -1323,7 +1344,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -3498,8 +3519,9 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     if not directory or not os.path.isabs(directory):
         raise LaunchError("session %s has no working directory to open the tab in" % session_id)
     taken = engine.discover(engine.now()).agents.get(name)
+    released = []
     if taken is not None:
-        raise LaunchError("a fleet agent named %s already runs in pane %s: close it first" % (name, taken.pane))
+        released = release_stale_binding(engine, name, taken, session_id)   # refuses (LaunchError) a pane that is really running it
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(fleet.get("role"), fleet.get("repo") or (engine.config.get("intent_repo")
                                                                if fleet.get("charter") else None)))  # PR 18
@@ -3517,7 +3539,265 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
         left = close_own_pane(engine, name, pane, "resume failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
         raise LaunchError("%s (session %s is untouched; %s)" % (_one_line(str(err)), session_id, left)) from err
-    return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+    done = {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+    if released:
+        done["released"] = released
+    return done
+
+
+# ======================================================================
+# The control plane (cos repairs a detached or dead pane through the switchboard, never by typing into one)
+#
+# A pane is ATTACHED when what it shows names the agent: its terminal title or the visible screen holds the agent's name or its session id.
+# herdr's own `agent_session` value is NOT trusted alone (it kept naming the old session while the pane showed a fresh Build screen). A pane
+# that shows something else is DETACHED; a pane herdr no longer has is DEAD. Both wake the Chief of Staff, which can `reattach`.
+# ======================================================================
+
+PANE_HEALTH_FILE = "pane-health.json"
+PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
+PANE_CHECKS_PER_PASS = 20    # `herdr pane get` + `pane read` pairs one pass may make
+PANE_MISSING_PASSES = 3      # a known agent absent from the herdr list this many passes in a row is DEAD (herdr restarts blink)
+PANE_ATTACHED, PANE_DETACHED, PANE_DEAD, PANE_UNKNOWN = "attached", "detached", "dead", "unknown"
+
+
+def _shown_text(title, visible):
+    return ("%s\n%s" % (title or "", visible or "")).lower()
+
+
+def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
+    """(state, why, info): `attached` when the pane's title or visible screen names the agent or its session; `detached` when it shows
+    something else; `dead` when herdr has no such pane; `unknown` when herdr cannot be read (never a verdict). `info` carries the pane's
+    workspace, tab, cwd and whether the screen shows ANOTHER fleet agent (then the pane is somebody's, not a stale screen)."""
+    try:
+        got = engine.herdr.pane_get(pane)
+    except HerdrError as err:
+        text = str(err).lower()
+        if "not found" in text or "no such" in text or "unknown pane" in text:
+            return PANE_DEAD, "herdr has no pane %s" % pane, {}
+        return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
+    try:
+        visible = engine.herdr.pane_read_visible(pane)
+    except HerdrError:
+        visible = ""
+    title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    text = _shown_text(title, visible)
+    info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
+            "title": _one_line(title, 80)}
+    if (name or "").lower() in text or (session_id or "").lower() in text:
+        return PANE_ATTACHED, "the pane shows %s" % name, info
+    others = [n for n in known_names if n and n != name and n.lower() in text] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
+    info["shows_another"] = others[:3]
+    return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, _one_line(title, 60), name, session_id), info
+
+
+def release_stale_binding(engine, name, taken, session_id):
+    """`taken` is the Observation herdr still lists under `name`. Returns what was released (lines), or raises LaunchError. A pane whose screen
+    names the agent is LIVE: refused, no double attach. A pane herdr no longer has, or one that shows a fresh screen with no session of any fleet
+    agent, is stale: its tab is closed (the only close this makes) and the binding is gone. Anything else (the pane shows another agent) is refused."""
+    discovery = getattr(engine, "discovery", None)
+    names = list(discovery.agents) if discovery is not None else []
+    sessions = [o.session_id for o in discovery.agents.values()] if discovery is not None else []
+    state, why, info = pane_state(engine, name, session_id, taken.pane, names, sessions)
+    if state == PANE_ATTACHED:
+        raise LaunchError("a fleet agent named %s already runs in pane %s (%s): close it first" % (name, taken.pane, why))
+    if state == PANE_UNKNOWN:
+        raise LaunchError("a fleet agent named %s is bound to pane %s and herdr cannot say what it shows: %s" % (name, taken.pane, why))
+    if state == PANE_DEAD:
+        return ["pane %s is gone: its binding is released" % taken.pane]
+    if info.get("shows_another"):
+        raise LaunchError("pane %s (bound to %s) shows another fleet agent (%s): not a stale screen, nothing was closed" % (
+            taken.pane, name, ", ".join(info["shows_another"])))
+    tab = info.get("tab")
+    if not tab:
+        raise LaunchError("pane %s is detached but herdr names no tab for it: nothing was closed" % taken.pane)
+    with engine._external("herdr.tab.close", name, {"pane": taken.pane, "tab": tab, "why": "stale binding: %s" % why}):
+        engine.herdr.tab_close(tab)
+    return ["pane %s was a detached screen with no session of its own (%s): tab %s closed" % (taken.pane, why, tab)]
+
+
+def read_pane_health(state_dir):
+    """{"agents": {name: {...}}, "states": {name: {...}}, "missing": {name: n}}; an unreadable file is an empty one."""
+    try:
+        raw = json.loads((Path(state_dir) / PANE_HEALTH_FILE).read_text())
+    except (OSError, ValueError):
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("agents", "states", "missing")}
+
+
+def write_pane_health(state_dir, data):
+    path = Path(state_dir) / PANE_HEALTH_FILE
+    temp = path.with_name("%s.%d.tmp" % (PANE_HEALTH_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
+    os.rename(str(temp), str(path))   # atomic over an existing file on POSIX
+
+
+def pane_health_pass(engine, now):
+    """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
+    audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
+    by PANE_CHECKS_PER_PASS and PANE_CHECK_SECONDS. Never raises."""
+    discovery = getattr(engine, "discovery", None)
+    if discovery is None or discovery.problems or engine.state_dir is None:
+        return
+    data = read_pane_health(engine.state_dir)
+    agents, states, missing = data["agents"], data["states"], data["missing"]
+    names = list(discovery.agents)
+    sessions = [o.session_id for o in discovery.agents.values()]
+    budget = PANE_CHECKS_PER_PASS
+    for name, obs in sorted(discovery.agents.items()):
+        if not obs.pane or not obs.session_id:
+            continue
+        missing.pop(name, None)
+        prev = states.get(name) or {}
+        due = prev.get("session") != obs.session_id or prev.get("pane") != obs.pane or now - (prev.get("at") or 0) >= PANE_CHECK_SECONDS
+        if due and budget > 0:
+            budget -= 1
+            state, why, info = pane_state(engine, name, obs.session_id, obs.pane, names, sessions)
+            if state != PANE_UNKNOWN:
+                if state != prev.get("state") and engine.audit is not None:
+                    event = {PANE_DETACHED: "fleetpane.detached", PANE_DEAD: "fleetpane.dead"}.get(state, "fleetpane.recovered" if prev.get("state") in (PANE_DETACHED, PANE_DEAD) else None)
+                    if event:
+                        engine.audit.append(engine.actor, event, name, {"pane": obs.pane, "session": obs.session_id, "why": why})
+                states[name] = {"state": state, "why": why, "pane": obs.pane, "session": obs.session_id, "at": int(now),
+                                "workspace": info.get("workspace"), "cwd": info.get("cwd")}
+        elif name not in states:
+            states[name] = {"state": PANE_UNKNOWN, "why": "not checked yet", "pane": obs.pane, "session": obs.session_id, "at": int(now)}
+        known = states.get(name) or {}
+        agents[name] = {"session": obs.session_id, "pane": obs.pane, "role": (obs.fleet or {}).get("role"), "charter": (obs.fleet or {}).get("charter"),
+                        "repo": (obs.fleet or {}).get("repo"), "workspace": known.get("workspace") or (agents.get(name) or {}).get("workspace"),
+                        "cwd": known.get("cwd") or (agents.get(name) or {}).get("cwd"), "seen": int(now)}
+    for name in list(agents):
+        if name in discovery.agents:
+            continue
+        missing[name] = int(missing.get(name, 0)) + 1
+        if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
+            states[name] = {"state": PANE_DEAD, "why": "herdr no longer lists %s (its pane %s is gone)" % (name, agents[name].get("pane")),
+                            "pane": agents[name].get("pane"), "session": agents[name].get("session"), "at": int(now)}
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.dead", name, {"pane": agents[name].get("pane"), "session": agents[name].get("session")})
+    engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents}
+    try:
+        write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
+    except OSError:
+        pass
+
+
+class PaneFacts:
+    """The control plane's wake: one fact per detached or dead agent for each Chief of Staff, keyed by agent, state and session so it is delivered
+    once per change. The text names the agent, its pane and session and says what to run (`reattach`)."""
+
+    __name__ = "pane_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        alerts = getattr(engine, "pane_alerts", None) if engine else None
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if not alerts or discovery is None or discovery.problems:
+            return []
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        out = []
+        for name, info in sorted(alerts.items()):
+            word = "DETACHED" if info["state"] == PANE_DETACHED else "DEAD"
+            summary = ("%s is %s: pane %s, session %s (%s). Repair it with `%s reattach %s`; if the session is gone, `relaunch` is the next step."
+                       % (name, word, info.get("pane"), info.get("session"), _one_line(info.get("why"), 120), PROG, name))
+            for chief in chiefs:
+                if chief != name:
+                    out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
+                                    float(info.get("at") or 0), sender="switchboard"))
+        return out
+
+
+def pane_health_status_lines(state_dir):
+    """The `status` lines for detached or dead agents (nothing when every pane is attached or unknown)."""
+    if state_dir is None:
+        return []
+    data = read_pane_health(state_dir)
+    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD)]
+    if not bad:
+        return []
+    return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
+            ] + ["        run `%s reattach <name>`" % PROG]
+
+
+def charter_pane_update(engine, runner, fleet, new_pane):
+    """Best effort: set the `pane:` line of the agent's charter issue to `new_pane`. Returns a note ('' when there was nothing to do)."""
+    charter, repo = fleet.get("charter"), fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
+    if not isinstance(charter, int) or isinstance(charter, bool) or not repo:
+        return ""
+    try:
+        got = _gh_write(engine, runner, repo, "repos/%s/issues/%d" % (repo, charter), "GET")
+        body = (json.loads(got.stdout or "{}") or {}).get("body") or ""
+        line = re.compile(r"^(pane:[ \t]*)\S.*$", re.M)
+        if not line.search(body):
+            return "charter #%d has no `pane:` line to update" % charter
+        updated = line.sub(lambda m: m.group(1) + new_pane, body, count=1)
+        if updated == body:
+            return ""
+        with engine._external("github.charter.pane", "%s#%d" % (repo, charter), {"pane": new_pane}):
+            _gh_write(engine, runner, repo, "repos/%s/issues/%d" % (repo, charter), "PATCH", {"body": updated})
+        return "charter %s#%d now says pane: %s" % (repo, charter, new_pane)
+    except (IntentError, ValueError) as err:
+        return "charter pane not updated: %s" % _one_line(str(err), 120)
+
+
+def cmd_reattach(args, runner, now, socket_call=None):
+    """`reattach <name> [--session ses_...] [--workspace W]`: put an agent back in a pane on its EXISTING session. Releases a stale binding first
+    (a pane herdr no longer has, or a detached fresh screen: its tab is closed), refuses when the old pane really runs the agent or the session is
+    gone (then `relaunch` is the proposal), sends no prompt, updates the charter's `pane:` line and audits."""
+    engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    name = args.name
+    discovery = engine.discover(engine.now())
+    known = read_pane_health(state)["agents"].get(name) or {}
+    seen = discovery.agents.get(name)
+    session_id = args.session or (seen.session_id if seen else None) or known.get("session")
+    if not session_id:
+        raise LaunchError("no session is known for %s: pass --session ses_... (the id of its OpenCode session)" % name)
+    workspace = args.workspace or known.get("workspace") or os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace and seen is not None and seen.pane:
+        try:
+            workspace = engine.herdr.pane_get(seen.pane).get("workspace_id")
+        except HerdrError:
+            workspace = None
+    if not workspace:
+        raise LaunchError("no workspace is known for %s: pass --workspace" % name)
+    try:
+        info = engine.v2.session_get(session_id)
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            raise LaunchError("session %s no longer exists: nothing to reattach. A fresh agent is `%s relaunch %s --charter <owner/repo#N>`, "
+                              "which is a proposal to the Chief of Staff for an orchestrator" % (session_id, PROG, name)) from None
+        raise
+    fleet = _fleet_meta(info) or {}
+    done = resume_agent(engine, name, session_id, workspace)
+    note = charter_pane_update(engine, runner, fleet, done["pane"])
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "fleetpane.reattached", name, {"session": session_id, "pane": done["pane"], "tab": done.get("tab"),
+                                                                     "released": done.get("released") or [], "charter": note})
+    data = read_pane_health(state)
+    data["states"].pop(name, None)
+    data["missing"].pop(name, None)
+    try:
+        write_pane_health(state, data)
+    except OSError:
+        pass
+    done = dict(done, charter=note or None)
+    print(json.dumps(done, sort_keys=True))
+    return EXIT_OK
+
+
+def add_reattach_parsers(sub):
+    reattach = sub.add_parser("reattach", help="Put a detached or dead agent back in a pane on its existing session (no prompt is sent)")
+    reattach.add_argument("name", help="The agent's fleet name")
+    reattach.add_argument("--session", help="Its OpenCode session id (default: the one the switchboard last saw)")
+    reattach.add_argument("--workspace", help="The herdr workspace for the new tab (default: where it last ran)")
 
 
 # ======================================================================
@@ -6359,6 +6639,10 @@ def publish_decisions(engine):
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
+    except Exception as err:
+        engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
@@ -10269,6 +10553,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        report["pane_lines"] = pane_health_status_lines(state)
         if config_ok:
             report["friction"] = friction_status_line(config, state)
         report["stopped_news"] = stopped_news_summary(state, now())
@@ -10454,6 +10739,7 @@ def format_status(report):
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
+    lines.extend(report.get("pane_lines") or [])
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour

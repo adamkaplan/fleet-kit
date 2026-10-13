@@ -4318,6 +4318,18 @@ opening with `extends: fleet-kit-review-laws @ review-laws-<n>` (the version is 
 repository's root and prints what to edit; it never overwrites a copy the repository already has (`--force` replaces it), writes nothing else and does not touch the repository's
 `AGENTS.md` (the laws must not contradict it). Reviewers read these files from the base branch of a pull request. Plan: issue 179.
 
+### The control plane: detached and dead panes, and `reattach` (#130)
+
+The Chief of Staff repairs a dead or detached agent through the switchboard, never by typing into a pane. The daemon (`pane_health_pass`, after discovery, one look per agent per 60 s, at most 20 per pass, reads only) judges
+each fleet agent's pane from **what it shows**, not from herdr's `agent_session` value (which kept naming the old session while the pane showed a fresh Build screen): a pane is **attached** when its terminal title or visible screen holds the agent's name or session id,
+**detached** when it shows something else, **dead** when herdr has no such pane (or no longer lists the agent for 3 passes in a row), **unknown** when herdr cannot be read (never a verdict). A change is audited (`fleetpane.detached`, `fleetpane.dead`, `fleetpane.recovered`),
+written to `pane-health.json`, shown by `status` (`panes  N agent(s) need repair`) and delivered **once per change** to every Chief of Staff as a fact naming the agent, pane and session and the command to run.
+
+`fleet-switchboard reattach <name> [--session ses_...] [--workspace W]` puts the agent back in a new tab on its EXISTING session (what `launch --resume` does), sending **no prompt**. It first releases a stale binding: a pane herdr no longer has is released; a detached pane whose screen
+names **no fleet agent** (a fresh screen with no session of its own) has its tab closed (the one close it makes, audited `herdr.tab.close`); it **refuses** a pane whose screen names the agent (no double attach: `already runs in pane`), a pane that shows another fleet agent, and a session that no
+longer exists (then `relaunch` is the next step). It updates the `pane:` line of the agent's charter issue and audits `fleetpane.reattached`. `launch --resume` uses the same release, which fixes its old `already runs in pane ... close it first` refusal for a fresh screen.
+The Chief of Staff's permission list gains exactly `fleet-switchboard reattach *`; no raw herdr pane or key command.
+
 ### Preflight and the Chief of Staff's definition (#191 follow-up)
 
 `gates preflight` / `enforce` check the INSTALLED chief-of-staff definition by **evaluating probe commands** against its shell rules with v2's semantics (**the last matching rule decides**, proved on the real harness: a deny only holds when it comes AFTER the allow that would admit the command; no match is the base deny), not by looking for exact resource strings. Both rule shapes are read: the installed one-line `{action: shell, resource: "x", effect: allow}` and the older block form. It must ALLOW `waive` (G1), `gates mode <repo> shadow` and `gates off`, and must DENY `gates mode <repo> enforce` (any casing), `gates on` and `waive ... --gates G6|G8`: a Chief of Staff that could turn enforcement on is as blocking as one that cannot turn it off.
