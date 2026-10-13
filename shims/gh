@@ -389,6 +389,101 @@ def gate_spool(event, repo, number, check, detail):
         pass
 
 
+OVER_REVIEW_FLAG = "--over-review"
+
+
+def take_over_review(args):
+    """(args without --over-review, found, reason): `--over-review <reason>` or `--over-review=<reason>` on `pr merge` is the shim's own flag: it is
+    stripped before the real gh sees it (gh would reject it)."""
+    if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+        return args, False, ""
+    out, found, reason, i = [], False, "", 0
+    while i < len(args):
+        arg = args[i]
+        if arg == OVER_REVIEW_FLAG:
+            found = True
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                reason, i = args[i + 1], i + 2
+            else:
+                i += 1
+            continue
+        if arg.startswith(OVER_REVIEW_FLAG + "="):
+            found, reason, i = True, arg.split("=", 1)[1], i + 1
+            continue
+        out.append(arg)
+        i += 1
+    return out, found, " ".join(reason.split())
+
+
+def review_blockers(reviews):
+    """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED; a plain comment decides nothing) is CHANGES_REQUESTED."""
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        state = str(review.get("state") or "").upper()
+        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[author] = state
+    return sorted(a for a, st in latest.items() if st == "CHANGES_REQUESTED")
+
+
+def review_probe(args, found, reason, lookup, gh):
+    """For `gh pr merge` in ANY repo (`--admin` too): refuse while a reviewer's latest decisive review is CHANGES_REQUESTED (not dismissed, not
+    superseded by that reviewer's later approval) or the switchboard holds a blocking `review record` at the PR's CURRENT head, naming them.
+    `--over-review <reason>` (at least 10 characters) goes ahead on purpose and is spooled for the audit (who, PR, head, reason). FAIL MODE: a read
+    that cannot be made (reviews API, switchboard) lets the merge through with one visible warning line: a flake never blocks, and is never silent.
+    Returns the refusal text, or None."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+            return None
+        parsed = gate_parse(args)
+        if parsed is None:
+            sys.stderr.write("gh: review check skipped (the merge command shape was not understood)\n")
+            return None
+        deadline = time.time() + gate_seconds()
+        env = None
+        try:
+            env = account_env(gh, lookup)
+        except Exception:
+            env = None
+        repo, number = gate_resolve(parsed, gh, env, deadline)
+        if repo is None:
+            sys.stderr.write("gh: review check skipped (%s)\n" % gate_clean(str(number)))
+            return None
+        raw = gate_run_gh(gh, ["pr", "view", str(number), "-R", repo, "--json", "reviews,headRefOid"], deadline, env)
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            sys.stderr.write("gh: review check skipped (the reviews of %s#%d could not be read): not checked\n" % (repo, number))
+            return None
+        blockers = ["%s: CHANGES_REQUESTED" % who for who in review_blockers(data.get("reviews"))]
+        head = data.get("headRefOid") if isinstance(data.get("headRefOid"), str) else ""
+        binary = switchboard_binary()
+        if binary and head:
+            done = lookup.run([binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head])
+            if done is not None and done.returncode == 0:
+                blockers += [gate_clean(line.strip()) for line in done.stdout.splitlines() if line.strip()][:5]
+            else:
+                sys.stderr.write("gh: review check: the switchboard's recorded verdicts could not be read: only GitHub's reviews were checked\n")
+        if not blockers:
+            return None
+        names = "; ".join(blockers[:5])
+        if found and len(reason) >= 10:
+            who = lookup.identity().get("name") or "agent"
+            gate_spool("over_review", repo, number, "merge", "by %s at %s: %s | over: %s" % (who, head[:12], reason, names))
+            sys.stderr.write("gh: merging %s#%d over a blocking review on purpose (%s); logged\n" % (repo, number, names))
+            return None
+        why = ("--over-review needs a reason of at least 10 characters" if found else
+               "resolve them, or pass --over-review '<reason of at least 10 characters>' (it is logged)")
+        return "gh: merge of %s#%d refused: blocking review(s): %s. %s" % (repo, number, names, why)
+    except Exception:
+        sys.stderr.write("gh: review check skipped (an unexpected error): not checked\n")
+        return None
+
+
 def gate_probe(args, lookup, gh=None):
     """Ask the switchboard whether this ready or merge is allowed. Returns None (run the real gh as given), ("refuse", line)
     (print the line, exit non-zero, do not run gh) or ("args", new_args) (run gh with these). Never raises: every doubt is a
@@ -494,6 +589,11 @@ def main(args):
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
+    args, over_found, over_reason = take_over_review(args)
+    refusal = review_probe(args, over_found, over_reason, lookup, gh)
+    if refusal is not None:
+        sys.stderr.write(refusal + "\n")
+        return 10
     verdict = gate_probe(args, lookup, gh)
     if verdict is not None and verdict[0] == "refuse":
         sys.stderr.write(gate_clean(verdict[1]) + "\n")

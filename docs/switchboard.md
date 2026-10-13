@@ -4334,6 +4334,14 @@ opening with `extends: fleet-kit-review-laws @ review-laws-<n>` (the version is 
 repository's root and prints what to edit; it never overwrites a copy the repository already has (`--force` replaces it), writes nothing else and does not touch the repository's
 `AGENTS.md` (the laws must not contradict it). Reviewers read these files from the base branch of a pull request. Plan: issue 179.
 
+### `gh pr merge` never goes over a blocking review unseen (the shim, any repo)
+
+Root fix for a merge made minutes after an unread CHANGES_REQUESTED. In **any** repo, `gh pr merge` (and `--admin`) through the shim is **refused** (exit 10) while a reviewer's LATEST decisive review on the PR is CHANGES_REQUESTED
+(not dismissed, not superseded by that reviewer's later approval; a plain comment decides nothing), or while the switchboard holds a blocking `review record` at the PR's CURRENT head
+(`fleet-switchboard review blockers <pr> [--head]` prints the reviewers whose latest recorded result at that head is request-changes). The refusal line names them. `--over-review <reason>` (at least 10 characters; also `--over-review=<reason>`)
+lets an orchestrator proceed on purpose: the shim strips it before the real `gh` sees the command and writes an `over_review` line (who, PR, head, reason, what was overridden) to the gate spool for the audit. **Fail mode:** if GitHub's reviews or the
+switchboard's records cannot be read, the merge goes through with one visible warning line (a flake never blocks, and is never silent). `pr ready` and the daemon's own calls are not checked.
+
 ### The control plane: detached and dead panes, and `reattach` (#130)
 
 The Chief of Staff repairs a dead or detached agent through the switchboard, never by typing into a pane. The daemon (`pane_health_pass`, after discovery, one look per agent per 60 s, at most 20 per pass, reads only) judges
