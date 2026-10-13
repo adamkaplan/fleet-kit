@@ -13164,7 +13164,7 @@ class TestFleetHooksPlugin(Base):
         self.assertFalse(env["hasCanary"])
         self.assertNotIn("OPENROUTER_API_KEY", env["keys"])
         self.assertIn("FLEET_SWITCHBOARD_LAB", env["keys"])
-        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB"},
+        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST"},   # the suite's own marker (refuse the real opencode) is passed on
                              {"PATH", "HOME", "TMPDIR", "LANG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"})
 
     def test_stricter_is_strict(self):
