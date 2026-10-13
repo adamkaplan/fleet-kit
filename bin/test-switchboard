@@ -37640,8 +37640,8 @@ class TestV2Light(Base):
         world.tick(90)
         report = world.engine.run_pass()
         self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
-        for op in self.HISTORY:
-            self.assertEqual(self.ops(world).get(op, 0), 0, self.ops(world))
+        self.assertEqual(self.ops(world).get("session.inbox.list", 0), 0, self.ops(world))
+        self.assertLessEqual(self.ops(world).get("session.message.list", 0), 2, "the engagement gate's read before the write, nothing else")
         world.tick(5)
         self.assertEqual(world.engine.run_pass()["sent"], [], "delivered on the send's own success: not sent again")
         mode = (world.state / sb.SENT_KEYS_FILE).stat().st_mode & 0o777
@@ -37650,6 +37650,53 @@ class TestV2Light(Base):
         world.tick(5)
         self.assertEqual(world.engine.run_pass()["sent"], [], "the ledger survives a restart")
         self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_a_person_typing_still_holds_the_wake_back_as_a_note_with_the_switch_on(self):
+        world = self.world(agents=("platform", "coder"))
+        world.you("platform")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        (admitted,) = world.admissions("platform")
+        self.assertEqual((admitted["resume"], admitted["delivery"]), (False, "steer"), "a note for an engaged person, not a wake")
+        self.assertTrue(any(len(c) > 2 and c[2] == "session.message.list" for c in world.v2.calls[mark:]), "the read just before the write is made")
+        mark = len(world.v2.calls)
+        world.tick(5)
+        world.engine.run_pass()
+        self.assertEqual(self.ops(world, mark).get("session.message.list", 0), 0, "and only then: nothing pending, no read")
+
+    def test_two_writers_do_not_lose_each_others_keys(self):
+        world = self.world(agents=("platform",))
+        first, second = sb.SentLedger(world.state), sb.SentLedger(world.state)
+        first.confirm("ses_example", ["k1"], 1.0)
+        second.confirm("ses_example", ["k2"], 2.0)   # the second never saw k1 in memory
+        first.confirm("ses_example", ["k3"], 3.0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).keys["ses_example"]), ["k1", "k2", "k3"])
+        self.assertEqual(sorted(second.known("ses_example", 0)), ["k1", "k2", "k3"], "a read sees what another process wrote")
+
+    def test_a_crash_between_the_write_and_the_record_is_at_most_once_and_says_so(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        os.environ[sb.FAULT_ENV] = "crash-after-send"
+        with self.assertRaises(sb.SimulatedCrash):
+            world.engine.run_pass()
+        os.environ[sb.FAULT_ENV] = ""
+        ledger = sb.SentLedger(world.state)
+        self.assertEqual(ledger.unknown_count(), 1)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "unknown fate counts as delivered: never blindly re-sent")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_a_refused_send_is_released_and_sent_again(self):
+        world = self.world(agents=("platform",))
+        ledger = world.engine.sent
+        ledger.reserve("ses_example", ["k1"], 1.0)
+        self.assertEqual(sorted(ledger.known("ses_example", 0)), ["k1"])
+        ledger.release("ses_example", ["k1"])
+        self.assertEqual(sorted(ledger.known("ses_example", 0)), [])
 
     def test_the_ledger_is_bounded_and_an_unreadable_file_is_an_empty_ledger(self):
         world = self.world(agents=("platform",))
