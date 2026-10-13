@@ -39489,6 +39489,36 @@ class TestEventFeedLines(unittest.TestCase):
         self.assertEqual(feed.reply_for("ses_w", 100000 + sb.FEED_TURN_SLACK_MS + 1), None, "a different turn: the caller reads")
         self.assertIsNone(feed.reply_for("ses_other", 100000))
 
+    def test_a_text_that_may_be_partial_or_the_last_turns_is_never_used(self):
+        feed = sb.EventFeed(None, now=lambda: 1000.0)
+        feed.handle(feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=1, text="second only"))   # connected mid-message: ordinal 0 never seen
+        feed.handle(feed_line("session.execution.succeeded", created=1000000))
+        self.assertIsNone(feed.reply_for("ses_w", 1000000), "a gap in the parts: the read decides")
+        many = sb.EventFeed(None, now=lambda: 2000.0)
+        for n in range(sb.FEED_TEXT_PARTS_MAX + 3):
+            many.handle(feed_line("session.text.ended", assistantMessageID="msg_b", ordinal=n, text="p%d" % n))
+        many.handle(feed_line("session.execution.succeeded", created=3000000))
+        self.assertIsNone(many.reply_for("ses_w", 3000000), "more parts than are kept: partial, so not used")
+        stale = sb.EventFeed(None, now=lambda: 1000.0)
+        stale.handle(feed_line("session.text.ended", assistantMessageID="msg_c", ordinal=0, text="turn one"))
+        stale.handle(feed_line("session.execution.succeeded", created=2000000))
+        self.assertEqual(stale.reply_for("ses_w", 2000000)[1], "turn one")
+        stale.handle(feed_line("session.execution.succeeded", created=9000000))   # turn two ended and said nothing the feed saw
+        self.assertIsNone(stale.reply_for("ses_w", 9000000), "the text is older than the previous turn's end: it is turn one's")
+        started = sb.EventFeed(None, now=lambda: 1000.0)
+        started.handle(feed_line("session.text.ended", assistantMessageID="msg_d", ordinal=0, text="old"))
+        started.handle(feed_line("session.execution.started"))
+        started.handle(feed_line("session.execution.succeeded", created=5000))
+        self.assertIsNone(started.reply_for("ses_w", 5000), "a new turn clears the last one's text")
+
+    def test_the_step_ended_and_failed_and_interrupted_branches(self):
+        feed = sb.EventFeed(None, now=lambda: 1000.0)
+        feed.handle(feed_line("session.step.ended", assistantMessageID="msg_s"))
+        self.assertEqual(feed.seen["ses_w"]["assistant"], "msg_s")
+        for kind in ("session.execution.failed", "session.execution.interrupted"):
+            feed.handle(feed_line(kind, created=7000))
+            self.assertEqual(feed.seen["ses_w"]["idle_ms"], 7000)
+
     def test_a_server_connected_line_and_a_line_without_a_session_name_nothing(self):
         feed = sb.EventFeed(None)
         feed.handle(feed_line("server.connected", session=None))
@@ -39506,10 +39536,12 @@ class TestEventFeedLines(unittest.TestCase):
 class TestEventFeedStream(V2TransportBase):
     """The reader over the HTTP route: lines, a quiet stretch, a closed stream, a refused password, a bad status; reconnect and backoff."""
 
-    def test_the_stream_yields_its_lines_a_quiet_stretch_as_none_and_ends_when_the_service_closes_it(self):
-        self.service.stream = [feed_line("server.connected", session=None), None, feed_line("session.execution.succeeded", created=1)]
+    def test_the_stream_says_it_opened_then_yields_its_lines_and_a_quiet_stretch_ends_it_like_a_close(self):
+        self.service.stream = [feed_line("server.connected", session=None), feed_line("session.execution.succeeded", created=1), None, feed_line("never", created=2)]
         got = list(self.route().stream_lines("/api/event"))
-        self.assertEqual([g if g is None else json.loads(g[5:])["type"] for g in got], ["server.connected", None, "session.execution.succeeded"])
+        self.assertIs(got[0], sb.STREAM_OPENED)
+        self.assertEqual([json.loads(g[5:])["type"] for g in got[1:]], ["server.connected", "session.execution.succeeded"],
+                         "a read timeout ends the connection: a response is never read on after one (the socket refuses it)")
 
     def test_a_refused_password_or_no_service_means_the_old_reads_and_another_status_is_an_error(self):
         route = self.route()
@@ -39544,8 +39576,24 @@ class TestEventFeedStream(V2TransportBase):
         feed.run()
         self.assertEqual(sleeps, [1, 2, 4, 8], "a stream that ends is a gap: reconnect, waiting longer each time")
         self.assertEqual(feed.status()["connects"], 4)
+        self.assertEqual(feed.status()["connects"], 4)
         self.assertTrue(feed.needs_resync, "after a gap the next tick re-syncs")
         self.assertEqual(feed.reply_for("ses_w", 7), ("msg_a", "hi"))
+
+    def test_a_service_that_stays_down_costs_nothing_no_gap_no_resync_no_audit_line(self):
+        world = World(self, agents=("platform", "coder"))
+        engine = world.new_engine()
+        self.service.up = False
+        waits = []
+        engine.feed = feed = sb.EventFeed(self.route(), engine.audit, world.clock.now, sleep=lambda s: (waits.append(s), len(waits) >= 5 and feed.stop()))
+        feed.run()
+        engine.discover(world.clock.now())
+        before = len(world.v2.calls)
+        for _ in range(3):
+            sb.feed_tick(engine)
+        self.assertEqual((feed.status()["connects"], feed.status()["errors"]), (0, 5))
+        self.assertEqual(len(world.v2.calls), before, "no read at all while the service is down")
+        self.assertEqual([e for e in world.audit() if e["event"] in ("event.resync", "event.missed")], [])
 
     def test_a_service_that_is_down_is_a_counted_error_not_a_crash(self):
         self.service.up = False
@@ -39566,6 +39614,7 @@ class TestEventFeedStream(V2TransportBase):
         feed.sleep = lambda s: feed.stop()
         feed.run()
         engine.discover(world.clock.now())
+        feed.connected = True    # the pass runs while the stream is up (the scripted one has ended)
         sb.feed_tick(engine)
         sb.record_v2_calls(engine)
         everything = json.dumps(feed.status()) + (world.state / "audit.jsonl").read_text() + (world.state / sb.V2_CALLS_FILE).read_text()
@@ -39685,6 +39734,33 @@ class TestEventFeedReads(ReportBase):
         feed.tick(engine, sessions)
         feed.tick(engine, sessions)
         self.assertEqual(engine.v2.calls, sb.FEED_RECONCILES_PER_PASS + 2 * sb.FEED_RECONCILES_PER_PASS, "the failed ones came round again")
+
+    def test_a_resync_is_spread_over_passes_and_a_flapping_stream_cannot_cause_a_read_storm(self):
+        now = [1000.0]
+
+        class Stub:
+            def __init__(stub):
+                stub.sessions = []
+
+            def message_list(stub, session, **k):
+                stub.sessions.append(session)
+                return []
+        feed = sb.EventFeed(None, None, lambda: now[0])
+        feed.connected, feed.needs_resync = True, True
+        engine = types.SimpleNamespace(v2=Stub())
+        sessions = ["s%d" % n for n in range(10)]
+        feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.sessions), sb.FEED_RESYNC_PER_PASS, "a burst is never made: the first pass reads a few")
+        self.assertTrue(feed.needs_resync, "the rest wait for the next passes")
+        feed.tick(engine, sessions)
+        feed.tick(engine, sessions)
+        self.assertEqual(sorted(engine.v2.sessions), sorted(sessions), "every session was read once, spread over three passes")
+        self.assertFalse(feed.needs_resync)
+        for _ in range(5):   # the stream flaps: a new gap each time, within the minimum interval
+            feed.needs_resync = True
+            now[0] += 5
+            feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.sessions), len(sessions), "no session is read again within the minimum interval, however often the stream reconnects")
 
     def test_a_feed_that_is_not_connected_does_no_reconciling_the_old_reads_are_all_there_is(self):
         feed = sb.EventFeed(None, None, lambda: 1000.0)

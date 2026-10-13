@@ -901,6 +901,8 @@ V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
 V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
 V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
 V2_STREAM_LINE_MAX = 1024 * 1024  # one event line of the stream; a larger one is refused
+V2_STREAM_IDLE_SECONDS = 300      # a stream that said nothing for this long is dropped and opened again (cheap: the re-sync is rate limited)
+STREAM_OPENED = object()          # what stream_lines yields once the service answered
 V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
 V2_SLOW_MIN_SAMPLES = 8
 V2_SLOW_WINDOW = 20
@@ -967,9 +969,9 @@ class V2Http:
         token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
         self._info = (host, port, "Basic " + token)
 
-    def stream_lines(self, path, idle_seconds=60):
-        """The lines of one SSE response (decoded, newline stripped), read on its OWN connection (never under the request lock). A quiet stretch of
-        `idle_seconds` yields None (so the caller can check whether to stop and read on); a closed stream ends the generator. Raises V2Unreachable
+    def stream_lines(self, path, idle_seconds=V2_STREAM_IDLE_SECONDS):
+        """STREAM_OPENED once the service answered 200, then the lines of one SSE response (decoded, newline stripped), read on its OWN connection (never
+        under the request lock). A quiet stretch of `idle_seconds` (the service sends no keep-alive) ends the generator like a closed stream. Raises V2Unreachable
         (no service, a refused connection, a password refused: use the old reads) or V2Error (any other status)."""
         with self._lock:
             if self._info is None:
@@ -989,14 +991,12 @@ class V2Http:
                 raise V2Unreachable("the service refused the password")
             if response.status != 200:
                 raise V2Error("http", response.status, "the event stream answered HTTP %d" % response.status)
+            yield STREAM_OPENED   # the service answered 200: only now is this a connection
             while True:
                 try:
                     raw = response.readline(V2_STREAM_LINE_MAX + 1)
-                except socket.timeout:
-                    yield None
-                    continue
                 except (OSError, http.client.HTTPException):
-                    return
+                    return   # a read timeout included: a response is not read on after a timeout (the socket refuses), so it ends and the caller reconnects
                 if not raw:
                     return
                 if len(raw) > V2_STREAM_LINE_MAX:
@@ -2294,6 +2294,8 @@ FEED_TYPES = frozenset(("session.execution.started", "session.execution.succeede
 FEED_RECONCILE_SECONDS = 600     # at most one bounded read per session in this time, in the absence of any event
 FEED_PAGE = 1                    # messages in a resync or reconcile read (the newest assistant message: bounded, far below 10)
 FEED_RECONCILES_PER_PASS = 2     # sessions reconciled in one pass: the work is spread, never a burst
+FEED_RESYNC_PER_PASS = 4         # sessions re-synced in one pass after a (re)connect: spread over passes, never a burst
+FEED_RESYNC_MIN_SECONDS = 120    # a session read this recently is not read again by a re-sync (a flapping stream cannot cause a read storm)
 FEED_SESSIONS_MAX = 500
 FEED_TEXT_PARTS_MAX = 20         # text parts of one assistant message kept
 FEED_BACKOFF_MAX = 60
@@ -2336,27 +2338,32 @@ class EventFeed:
                 if self.now() - started >= FEED_STABLE_SECONDS:
                     backoff = 1   # it lived: a long connection that ended is not a flapping one
             except (V2Unreachable, V2Error, OSError, http.client.HTTPException) as err:
-                self.connected = False
-                self.down_reason = type(err).__name__
-                self.counts["errors"] += 1
+                with self.lock:
+                    self.connected = False
+                    self.down_reason = type(err).__name__
+                    self.counts["errors"] += 1
             if self.stop_event.is_set():
                 break
             self.sleep(min(backoff, FEED_BACKOFF_MAX))
             backoff = min(backoff * 2, FEED_BACKOFF_MAX)
 
     def consume(self, lines):
-        """Read every line of one connection. A connection that ended is a gap: the next connect re-syncs."""
-        with self.lock:
-            self.connected, self.down_reason = True, None
-            self.counts["connects"] += 1
-            self.needs_resync = True   # events between two connections are missed by contract
-        for line in lines:
-            if self.stop_event.is_set():
-                break
-            if line is not None:
-                self.handle(line)
-        with self.lock:
-            self.connected = False
+        """Read every line of one connection. The gap is marked when the service ANSWERED (STREAM_OPENED), never before: a service that is down
+        opens nothing and costs nothing. A connection that ended is a gap too: the next open re-syncs."""
+        try:
+            for line in lines:
+                if self.stop_event.is_set():
+                    break
+                if line is STREAM_OPENED:
+                    with self.lock:
+                        self.connected, self.down_reason = True, None
+                        self.counts["connects"] += 1
+                        self.needs_resync = True   # events between two connections are missed by contract
+                elif line is not None:
+                    self.handle(line)
+        finally:
+            with self.lock:
+                self.connected = False
 
     def handle(self, line):
         if not line.startswith("data:"):
@@ -2379,28 +2386,41 @@ class EventFeed:
             if entry is None:
                 if len(self.seen) >= FEED_SESSIONS_MAX:
                     self.seen.pop(next(iter(self.seen)))
-                entry = self.seen[session] = {"assistant": None, "parts": {}, "idle_ms": None, "read": None, "event_at": None}
+                entry = self.seen[session] = {"assistant": None, "parts": {}, "complete": True, "idle_ms": None, "read": None, "event_at": None}
             entry["event_at"] = self.now()
             message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) else None
             if kind == "session.text.ended" and message and isinstance(data.get("text"), str):
                 if entry["assistant"] != message:
-                    entry["assistant"], entry["parts"] = message, {}
+                    entry["assistant"], entry["parts"], entry["complete"] = message, {}, True
+                if len(entry["parts"]) >= FEED_TEXT_PARTS_MAX:
+                    entry["complete"] = False   # more parts than are kept: the text would be partial, so it is not used
+                entry["parts_ms"] = int(self.now() * 1000)   # when the text last grew: it must come after the PREVIOUS turn ended
                 if len(entry["parts"]) < FEED_TEXT_PARTS_MAX:
-                    entry["parts"][data.get("ordinal") if isinstance(data.get("ordinal"), int) else len(entry["parts"])] = data["text"]
+                    entry["parts"][data.get("ordinal") if isinstance(data.get("ordinal"), int) else len(entry["parts"])] = data["text"][:SUMMARY_CAP]
             elif kind == "session.step.ended" and message and entry["assistant"] != message:
-                entry["assistant"], entry["parts"] = message, {}
+                entry["assistant"], entry["parts"], entry["complete"] = message, {}, True
+            elif kind == "session.execution.started":
+                entry["assistant"], entry["parts"], entry["complete"] = None, {}, True   # a new turn: nothing of the last one is its text
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
                 created = event.get("created")
+                entry["prev_idle_ms"] = entry["idle_ms"]
                 entry["idle_ms"] = int(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else int(self.now() * 1000)
 
     # -- what the pass thread asks
 
     def reply_for(self, session_id, idle_ms):
-        """(assistant message id, text) of the worker turn that ended at `idle_ms` as the events told it, or None (the caller reads, as before)."""
+        """(assistant message id, text) of the worker turn that ended at `idle_ms` as the events told it, or None (the caller reads, as before). None
+        unless the feed can vouch for the text: the turn's end was seen close to the stop's, the text arrived AFTER that turn started (a new turn clears
+        the old one) with its parts numbered 0, 1, 2... without a gap and none dropped. A summary from a hint that might be partial or the last turn's is
+        never reported: the read decides."""
         with self.lock:
             entry = self.seen.get(session_id)
             if entry is None or not entry["parts"] or entry["idle_ms"] is None or abs(entry["idle_ms"] - idle_ms) > FEED_TURN_SLACK_MS:
                 return None
+            if not entry.get("complete", True) or sorted(entry["parts"]) != list(range(len(entry["parts"]))):
+                return None
+            if entry.get("parts_ms", 0) <= (entry.get("prev_idle_ms") or 0):
+                return None   # the text is older than the previous turn's end: it is that turn's, not this one's
             return entry["assistant"], " ".join(entry["parts"][k] for k in sorted(entry["parts"]))
 
     def status(self):
@@ -2414,17 +2434,24 @@ class EventFeed:
         landed that no event announced). A read that fails (the breaker is open, the service is slow) is simply tried again at the next pass."""
         now = self.now()
         with self.lock:
-            resync, self.needs_resync = self.needs_resync, False
-            if not resync and not self.connected:
-                return
+            if not self.connected:
+                return   # no stream: the old reads are all there is, and a down service costs nothing here
+            if self.needs_resync:
+                pending = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RESYNC_MIN_SECONDS]
+                chosen = pending[:FEED_RESYNC_PER_PASS]
+                if len(pending) <= FEED_RESYNC_PER_PASS:
+                    self.needs_resync = False
+                resync = True
+            else:
+                resync = False
         if resync:
             done = 0
-            for session in sessions:
+            for session in chosen:
                 if self._read(engine, session, now, announced=False):
                     done += 1
             with self.lock:
-                self.counts["resyncs"] += 1
-            self._audit("event.resync", {"sessions": done, "reason": "start or reconnect: events while disconnected are missed by contract"})
+                self.counts["resyncs"] += 1 if not self.needs_resync else 0
+            self._audit("event.resync", {"sessions": done, "more": self.needs_resync, "reason": "start or reconnect: events while disconnected are missed by contract"})
             return
         with self.lock:
             due = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RECONCILE_SECONDS]
@@ -2439,7 +2466,7 @@ class EventFeed:
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
         with self.lock:
-            entry = self.seen.setdefault(session, {"assistant": None, "parts": {}, "idle_ms": None, "read": None, "event_at": None})
+            entry = self.seen.setdefault(session, {"assistant": None, "parts": {}, "complete": True, "idle_ms": None, "read": None, "event_at": None})
             known, entry["read"] = entry["assistant"], now
             missed = announced and isinstance(newest, str) and known != newest
             if isinstance(newest, str) and known != newest:
