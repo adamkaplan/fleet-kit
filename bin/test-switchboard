@@ -37591,6 +37591,83 @@ class TestV2ReadVolume(Base):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
 
 
+class TestV2Light(Base):
+    """v2_light (the owner's hotfix switch): every optional read of session history is OFF; a send is still delivered, once; the daemon
+    still finds its agents. A 20-agent idle fleet costs a handful of calls a minute."""
+
+    AGENTS = tuple("agent%d" % n for n in range(20))
+    HISTORY = ("session.message.list", "session.inbox.list")
+
+    def world(self, agents=None, **config):
+        config.setdefault("v2_cache_seconds", 900)
+        config.setdefault("v2_light", True)
+        return World(self, agents=agents or self.AGENTS, config=config)
+
+    @staticmethod
+    def ops(world, since=0):
+        return dict(collections.Counter(c[2] for c in world.v2.calls[since:] if len(c) > 2 and c[1] == "api"))
+
+    def test_the_default_is_off_and_it_must_be_a_boolean(self):
+        self.assertIs(sb.DEFAULTS["v2_light"], False)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "v2_light": "yes"})
+
+    def test_an_idle_fleet_of_twenty_makes_at_most_ten_calls_a_minute_and_reads_no_history(self):
+        world = self.world()
+        for _ in range(2):   # the first passes find the agents
+            world.engine.run_pass()
+            world.tick(30)
+        mark = len(world.v2.calls)
+        for _ in range(20):   # ten minutes at a 30 s poll
+            world.engine.run_pass()
+            world.tick(30)
+        found = self.ops(world, mark)
+        print("v2_light idle: %d calls in 10 minutes: %s" % (sum(found.values()), found))
+        self.assertLessEqual(sum(found.values()), 100, found)
+        for op in self.HISTORY:
+            self.assertEqual(self.ops(world).get(op, 0), 0, "%s is a history read: %s" % (op, self.ops(world)))
+
+    def test_without_the_switch_the_same_fleet_reads_history(self):
+        world = self.world(v2_light=False, v2_cache_seconds=0)
+        for _ in range(4):
+            world.engine.run_pass()
+            world.tick(30)
+        self.assertGreater(sum(self.ops(world).get(op, 0) for op in self.HISTORY), 20, self.ops(world))
+
+    def test_a_send_is_delivered_once_and_a_restart_does_not_deliver_it_again(self):
+        world = self.world(agents=("platform", "coder"))
+        world.fact("platform", "lab.fact:1", "First")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        for op in self.HISTORY:
+            self.assertEqual(self.ops(world).get(op, 0), 0, self.ops(world))
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "delivered on the send's own success: not sent again")
+        mode = (world.state / sb.SENT_KEYS_FILE).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "the ledger survives a restart")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_the_ledger_is_bounded_and_an_unreadable_file_is_an_empty_ledger(self):
+        world = self.world(agents=("platform",))
+        ledger = world.engine.sent
+        for n in range(sb.SENT_PER_SESSION + 50):
+            ledger.record("ses_example", ["k%d" % n], float(n))
+        self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
+        self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
+        (world.state / sb.SENT_KEYS_FILE).write_text("not json")
+        self.assertEqual(sb.SentLedger(world.state).keys, {})
+
+    def test_status_says_what_is_off(self):
+        world = self.world(agents=("platform",))
+        text = " ".join(sb.V2_LIGHT_OFF)
+        self.assertIn("compactions", text)
+        self.assertIn("brief scan", text)
+
+
 class TestDeliverWithTheMemoryOn(TestDeliver):
     """The delivery tests again, with the daemon's memory of its v2 reads ON (default 120 s): the decisions are the same."""
     V2_CACHE = 120

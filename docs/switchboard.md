@@ -4411,3 +4411,11 @@ Every v2 read is an `opencode api` process. A pass every 5 s that read every age
 - **Budget:** background reads (cache fills) are capped per pass (`v2_reads_per_pass`, 8) and per minute (`v2_reads_per_minute`, 90), shared out stalest agent first so every agent is refreshed in turn. Past a cap the remembered record is used (never dropped), a first read of an agent is always made, and the audit says how many reads a pass deferred (`v2_reads.deferred`).
 
 With `v2_cache_seconds: 0` every pass reads afresh again. The read before a write uses the same bounded prompt read (50 messages), so it does not widen that one case.
+
+#### `v2_light`: no optional reads of session history
+
+`v2_light: true` (default `false`) turns OFF every optional read of a session's history, until the daemon learns of those things from events instead of a timer. `status` shows `v2_light: ON (features off: ...)`. It only turns reads off: it never sends, never writes and never decides a write from fewer facts than the reads it replaces.
+
+Off: the person's last prompt (so engagement is not seen from the transcript), compaction reads (orders are delivered at a session's start only), the inbox unread badge and the conversion of lapsed notes, the summary of a finished turn and the classification of a stop (a stop is only its idle rider), the landed-checks that page synthetic messages (and the report-answered checks built on them), and the brief scan (a brief is never re-sent for want of looking).
+
+Kept: the write of a message and its own reply, `session.get` to find an agent (remembered for `v2_cache_seconds`), and the wake and rider path. What the daemon delivered is answered from a ledger written at send time from the send's own success, `sent-keys.json` in the state directory (0600, bounded to the newest 400 keys of the newest 200 sessions, kept across a restart). A key not in it is not delivered; the message id is derived from the keys, so a repeat is refused by v2 as a duplicate rather than doubled.
