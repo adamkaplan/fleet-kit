@@ -4125,6 +4125,10 @@ class TestLaunch(Base):
         self.assertIn("primary agents registered: coder", err)
         self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
 
+    def test_an_agent_registered_for_both_modes_launches(self):
+        code, out, err = self.cli_launch(self.listing_runner({"flex": "all", "coder": "primary"}), "flex", name="coder20")
+        self.assertEqual(code, 0, err)
+
     def test_a_registered_agent_launches_and_an_unreachable_service_does_not_block_it(self):
         for n, agents in enumerate(({"coder": "primary"}, None)):
             with self.subTest(agents=agents):

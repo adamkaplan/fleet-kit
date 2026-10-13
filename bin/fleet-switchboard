@@ -3321,7 +3321,7 @@ def launch_agent_problem(config, runner, agent):
         return None
     known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
     if agent in found:
-        if found[agent][0] == "primary":
+        if found[agent][0] in ("primary", "all"):   # `all` can run as a pane's agent too (OpenCode modes: primary, subagent, all)
             return None
         return ("--agent %r is registered as a %s agent, not a primary one: a launched pane runs a primary agent, and a %s is run by another agent's Task tool "
                 "(primary agents registered: %s)" % (agent, found[agent][0], found[agent][0], known))
