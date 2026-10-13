@@ -86,6 +86,7 @@ class Lookup:
     def __init__(self):
         self.deadline = time.monotonic() + lookup_seconds()
         self._ident = None
+        self.failed = False   # a lookup that should have answered did not (timed out, could not run, exited non-zero)
 
     def left(self):
         return max(0.0, self.deadline - time.monotonic())
@@ -93,10 +94,12 @@ class Lookup:
     def run(self, argv, **kwargs):
         """The command's result, or None when the deadline is spent, it timed out or could not run."""
         if self.left() <= 0:
+            self.failed = True
             return None
         try:
             return subprocess.run(argv, capture_output=True, text=True, timeout=self.left(), **kwargs)
         except (OSError, subprocess.SubprocessError):
+            self.failed = True
             return None
 
     def identity(self):
@@ -118,12 +121,51 @@ class Lookup:
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None}
             return self._ident
         plain = self.run([binary, "whoami"])   # an older switchboard: the name only
+        if plain is not None and plain.returncode != 0:
+            self.failed = True                 # neither form answered: a failure, not an old switchboard
         name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
         self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
         return self._ident
 
 
-def account_env(gh, lookup=None):
+class AccountLookupFailed(Exception):
+    """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
+
+
+WRITE_VERBS = {
+    "pr": {"merge", "ready", "comment", "edit", "close", "reopen", "review", "create", "update-branch", "lock", "unlock"},
+    "issue": {"comment", "edit", "close", "reopen", "create", "delete", "transfer", "pin", "unpin", "lock", "unlock", "develop"},
+    "label": {"create", "edit", "delete", "clone"},
+    "release": {"create", "edit", "delete", "upload", "delete-asset"},
+    "repo": {"create", "edit", "delete", "fork", "rename", "archive", "unarchive"},
+}
+
+
+def is_write(args):
+    """True when the gh command changes something on GitHub: a write verb of pr, issue, label, release or repo, or `gh api` with a method other
+    than GET (`-X`/`--method`, or fields, which make gh api a POST). Reads are everything else."""
+    try:
+        words = [a for a in args if not a.startswith("-")]
+        if len(args) >= 2 and args[0] in WRITE_VERBS and args[1] in WRITE_VERBS[args[0]]:
+            return True
+        if args and args[0] == "api":
+            method = None
+            for i, a in enumerate(args):
+                if a in ("-X", "--method") and i + 1 < len(args):
+                    method = args[i + 1].upper()
+                elif a.startswith("--method="):
+                    method = a.split("=", 1)[1].upper()
+                elif a.startswith("-X") and len(a) > 2:
+                    method = a[2:].upper()
+            if method is not None:
+                return method != "GET"
+            return any(a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=")) for a in args)
+        return False
+    except Exception:
+        return True   # cannot tell: treat as a write, the safe side
+
+
+def account_env(gh, lookup=None, strict=False):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
@@ -138,6 +180,8 @@ def account_env(gh, lookup=None):
         lookup = lookup or Lookup()
         repo = lookup.identity().get("repo")
         if not repo:
+            if strict and lookup.failed:
+                raise AccountLookupFailed("identity")
             return None
         account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
         if not isinstance(account, str) or not account:
@@ -145,7 +189,11 @@ def account_env(gh, lookup=None):
         clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
         got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
         token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
+        if not token and strict:
+            raise AccountLookupFailed("token")
         return dict(os.environ, GH_TOKEN=token) if token else None
+    except AccountLookupFailed:
+        raise
     except Exception:
         return None
 
@@ -500,7 +548,15 @@ def main(args):
         return 10
     if verdict is not None:
         args = verdict[1]
-    env = account_env(gh, lookup)
+    try:
+        env = account_env(gh, lookup, strict=is_write(args))
+    except AccountLookupFailed:
+        try:
+            env = account_env(gh, Lookup(), strict=True)   # retry the lookup ONCE with a fresh deadline
+        except AccountLookupFailed:
+            sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
+                             "fall back to the inherited token)\n")
+            return 1
     if plan is None:
         if env is not None:
             os.execve(gh, [gh] + args, env)

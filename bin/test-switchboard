@@ -16488,11 +16488,10 @@ class TestIdentityCheck(ReportBase):
     def test_the_lookup_is_one_call_under_one_short_deadline_and_a_wedged_switchboard_never_blocks_gh(self):
         users = {"acme-ops/service": "acct-ops"}
         done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, wedge=True, seconds=1,
-                                      args=("issue", "comment", "2", "--body", "hi"))
+                                      args=("issue", "list"))                          # a READ: gh still runs, with the inherited token
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertLess(self.shim_seconds, 6)                                          # not the 30 s the fake sleeps, nor 3 x 10 s
         self.assertEqual(seen["token"], "inherited-personal-token")                    # untouched
-        self.assertIn("from=agent", seen["argv"][-1])                                  # signed anonymously: the name was not found
         self.assertEqual(done.stderr, "")
         shim = self.shim()
         os.environ["FLEET_SHIM_LOOKUP_SECONDS"] = "99"
@@ -16503,6 +16502,60 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual(shim.lookup_seconds(), 3.0)
         os.environ.pop("FLEET_SHIM_LOOKUP_SECONDS")
         self.assertEqual(shim.lookup_seconds(), 3.0)
+
+    WRITES = (("pr", "merge", "5", "--merge"), ("pr", "ready", "5"), ("pr", "comment", "5", "--body", "x"), ("issue", "comment", "2", "--body", "hi"),
+              ("issue", "edit", "2", "--add-label", "x"), ("label", "create", "x"), ("api", "-X", "POST", "repos/a/b/issues"),
+              ("api", "--method", "PATCH", "repos/a/b/issues/1"), ("api", "-XDELETE", "repos/a/b/labels/x"), ("api", "-f", "a=b", "repos/a/b/issues"))
+    READS = (("issue", "list"), ("pr", "view", "5"), ("pr", "status"), ("api", "repos/a/b/issues"), ("api", "-X", "GET", "repos/a/b/issues"),
+             ("auth", "status"), ("repo", "view"))
+
+    def test_a_failed_account_lookup_refuses_every_write_and_lets_every_read_through(self):
+        users = {"acme-ops/service": "acct-ops"}
+        for label, kwargs in (("the identity lookup times out", dict(wedge=True, seconds=0.3)),
+                              ("the token lookup fails", dict(token_for={}))):
+            for args in self.WRITES:
+                with self.subTest(label, write=args):
+                    done, seen = self.run_gh_shim("acme-ops/service", users, kwargs.pop("token_for", {"acct-ops": "tok-ops"}) if False else
+                                                  kwargs.get("token_for", {"acct-ops": "tok-ops"}), args=args,
+                                                  **{k: v for k, v in kwargs.items() if k != "token_for"})
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertIn("account lookup failed, retry", done.stderr)
+                    self.assertIsNone(seen, "the real gh never ran: no write went out with the inherited token")
+            for args in self.READS:
+                with self.subTest(label, read=args):
+                    done, seen = self.run_gh_shim("acme-ops/service", users, kwargs.get("token_for", {"acct-ops": "tok-ops"}), args=args,
+                                                  **{k: v for k, v in kwargs.items() if k != "token_for"})
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(seen["token"], "inherited-personal-token")        # a read may keep falling through
+                    self.assertNotIn("account lookup failed", done.stderr)
+
+    def test_a_lookup_that_answers_leaves_writes_unchanged_and_the_retry_rescues_a_blip(self):
+        users = {"acme-ops/service": "acct-ops"}
+        for args in self.WRITES:
+            with self.subTest(write=args):
+                done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], "tok-ops")
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, who_repo_exit=2, args=("pr", "merge", "5"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "a switchboard too old for --json is not a failure")
+        done, seen = self.run_gh_shim("acme/api", users, {"acct-ops": "tok-ops"}, args=("pr", "merge", "5"))   # no mapping: not a failure
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"))
+        shim = self.shim()
+        calls = []
+        real = shim.account_env
+
+        def blip(gh, lookup=None, strict=False):
+            calls.append(strict)
+            if len(calls) == 1:
+                raise shim.AccountLookupFailed("identity")
+            return {"GH_TOKEN": "tok-ops"}
+        shim.account_env = blip
+        shim.real_gh = lambda: "/bin/true"
+        shim.os.execve = lambda *a: (_ for _ in ()).throw(SystemExit(0))
+        with self.assertRaises(SystemExit):
+            shim.main(["pr", "merge", "5"])
+        self.assertEqual(calls, [True, True], "retried once, and the retry went through")
+        shim.account_env = real
 
     def test_name_and_repo_come_from_one_whoami_call_and_a_signed_gh_call_replaces_the_token_too(self):
         users = {"acme-ops/service": "acct-ops"}
