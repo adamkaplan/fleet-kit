@@ -4753,7 +4753,8 @@ def decisions_from_github(engine, now):
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
-                      "parent": record.get("parent"), "closed": bool(record.get("closed"))})
+                      "parent": record.get("parent"), "closed": bool(record.get("closed")),
+                      "waits_for": record.get("waits_for") or []})
     return items, problems
 
 
@@ -5914,6 +5915,7 @@ def derive_decisions(engine, now):
         found, problems = read_source(engine, source, now, errors)
         decisions.extend(found)
     decision_core.order_decisions(decisions)
+    decision_core.annotate_order(decisions)   # optional order fields, only when some decision says what it waits for
     return decisions, errors
 
 
@@ -6440,20 +6442,24 @@ def format_decisions(report, now, view=None):
     if report["stale"]:
         return "Decisions unavailable: %s. Start it with `%s ensure`, or read the facts now with `%s decisions --fresh`." % (
             report["message"], PROG, PROG)
-    decisions = report["decisions"]
+    decisions = decision_core.arranged(report["decisions"])   # as listed, unless some decision says what it waits for (then: by order)
     human_only = view is None or view["tiers"] == ["human"]
     if not decisions:
         lines = ["No decisions are waiting on you." if human_only else "No decisions in this view."]
     else:
         agents = [d.get("agent") or "-" for d in decisions]
-        width_id, width_agent = max(len(d["id"]) for d in decisions), max(len(a) for a in agents)
+        indents = ["   " * min(d.get("depth") or 0, decision_core.ORDER_DEPTH_MAX) if isinstance(d.get("depth"), int) else "" for d in decisions]
+        width_id, width_agent = max(len(i) + len(d["id"]) for i, d in zip(indents, decisions)), max(len(a) for a in agents)
         lines = []
-        for decision, agent in zip(decisions, agents):
+        for decision, agent, indent in zip(decisions, agents, indents):
             since = parse_iso(decision.get("since"))
             tier = "" if human_only else "[%s]  " % decision.get("tier", "human")
-            lines.append("%s  waiting %s  %s%s  %s" % (decision["id"].ljust(width_id),
-                                                      format_age(now - since) if since is not None else "?",
-                                                      tier, agent.ljust(width_agent), decision["title"]))
+            note = {"next": "  [next]", "cycle": "  [cycle: they wait for each other]"}.get(decision.get("mark"), "")
+            if decision.get("blocked_by"):
+                note += "  [waits for %s]" % decision["blocked_by"]
+            lines.append("%s  waiting %s  %s%s  %s%s" % ((indent + decision["id"]).ljust(width_id),
+                                                        format_age(now - since) if since is not None else "?",
+                                                        tier, agent.ljust(width_agent), decision["title"], note))
         lines = [line.rstrip() for line in lines]
         if report.get("fresh"):  # --fresh says, for an open report, which send it looked at (or that there was none)
             lines = [line for pair in zip(lines, [("      " + d["considered"]) if d.get("considered") else None
@@ -6663,7 +6669,9 @@ SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
-               "S5": "cos-tier decision aged (and not already in the owner's tier)"}
+               "S5": "cos-tier decision aged (and not already in the owner's tier)",
+               "S7": "decisions that wait for each other (a cycle): none of them can be done first",
+               "S8": "a decision waits for an issue that is closed or missing"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -7052,6 +7060,16 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
+    for group in decision_core.find_cycles(decisions):   # S7: one finding per cycle, named by its first member
+        found.add(("S7", group[0]))
+    listed = {decision_core.decision_ref(d) for d in decisions} - {None}
+    for d in decisions:   # S8: waits for an issue that is in a watched repo, is not an open decision and is not an open item there
+        for target in d.get("waits_for") or []:
+            repo, _, number = target.rpartition("#")
+            picture = state.repos.get(repo)
+            if (target not in listed and picture is not None and not picture.get("error") and not picture.get("truncated")
+                    and number.isdigit() and int(number) not in picture["items"]):
+                found.add(("S8", target))
     state.unattributed = unattributed
     return sorted(found)
 
@@ -7060,7 +7078,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     """Re-check one finding against a fresh read of its issue or PR (and, when comments raised it, a fresh read of its
     last comments), so a cached copy cannot raise it. True: still holds. False: no longer (or never did). None: could not
     be checked now (no budget, a failed or truncated read): it is neither raised nor audited this pass."""
-    if kind == "S5":
+    if kind in ("S5", "S7"):
         return True  # about the decision list derived this very pass
     hub = getattr(engine, "hub", None)
     repo, _, number = ref.rpartition("#")
@@ -7073,6 +7091,12 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
+    if kind == "S8":   # a decision waits for this issue: it still holds when the issue is closed, or is not there at all
+        try:
+            data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+        except GitHubUnavailable as err:
+            return True if NOT_FOUND_RE.search(str(err)) else None
+        return None if not isinstance(data, dict) or "state" not in data else data.get("state") == "closed"
     try:
         data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
     except GitHubUnavailable:
@@ -9672,9 +9696,10 @@ class GitHubHub:
                 # a batch's rows come from the body this payload or listing already carries: no read of their own
                 rows = parse_decision_rows(issue["body"]) if "body" in issue else (known or {}).get("rows", [])
                 raised = signed_by_fleet(issue["body"]) if "body" in issue and rows else (known or {}).get("raised_by")
+                waits = decision_core.parse_waits_for(issue["body"], repo) if "body" in issue else (known or {}).get("waits_for", [])
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
                                       "parent": parent_of(issue), "tier": tier, "rows": rows,
-                                      "raised_by": raised if rows else None, "closed": closed}
+                                      "raised_by": raised if rows else None, "closed": closed, "waits_for": waits}
             else:
                 self.awaiting.pop(key, None)
 
@@ -9724,7 +9749,8 @@ class GitHubHub:
         with self.lock:
             records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
                         "parent": entry["parent"], "tier": entry["tier"], "rows": entry.get("rows", []),
-                        "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed"))}
+                        "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed")),
+                        "waits_for": entry.get("waits_for") or []}
                        for (repo, number), entry in sorted(self.awaiting.items())]
             errors = []
             for repo in sorted(self.watches):
