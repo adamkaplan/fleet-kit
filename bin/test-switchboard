@@ -20982,6 +20982,41 @@ class TestCiRecordPass(LedgerBase):
         self.assertLessEqual(len(labels[0]), 61)
         self.assertNotIn("\n", labels[0])
 
+    def test_an_unreadable_ledger_is_unknown_reviews_not_none_recorded(self):
+        self.go()
+        (self.world.state / "plan-ledger.jsonl").write_text("this is not a ledger line\n")
+        code, out, calls = self.pr_state(self.PR)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("reviews unknown (ledger unreadable:", out)
+        self.assertNotIn("none recorded", out)
+        view = json.loads(self.pr_state(self.PR, "--json")[1])
+        self.assertIsNone(view["reviews"])
+        self.assertTrue(view["reviews_problem"])
+
+    def test_a_label_list_that_is_not_a_list_does_not_abort_the_pass_and_the_line_is_cleaned_again_at_print_time(self):
+        self.hub.prs["acme/app"] = [dict(self.listed(9), labels=7)]
+        self.go()
+        self.assertIn("labels none", self.pr_state(self.PR)[1])
+        view = {"pr": "acme/app#9", "known": True, "state": "open", "head": "a" * 40, "ci": "green\x1b[0m", "mergeable": None, "labels": ["x\x1by"],
+                "checks": [{"name": "b\x1b[31m", "conclusion": "s\x07"}], "gates": {"ready": False, "missing": ["G1 \x1b[2J"]}, "reviews": [],
+                "age_seconds": 1}
+        line = sb.pr_state_line(view)
+        self.assertEqual([c for c in line if ord(c) < 32], [])
+
+    def test_the_reason_for_each_unusable_snapshot_is_the_right_one_a_hostile_check_name_is_clean_and_a_bad_ref_is_a_usage_error(self):
+        path = self.world.state / sb.PR_STATE_FILE
+        for text, why in (("[]", "the snapshot is not a pr-state file"), ('{"prs": 3}', "the snapshot is not a pr-state file"),
+                          (" " * (sb.PR_STATE_READ_MAX + 1), "the snapshot is larger than any the daemon writes"), ("{", "the snapshot cannot be read")):
+            path.write_text(text)
+            self.assertIn(why, self.pr_state(self.PR)[1])
+        self.assertEqual(sb.pr_checks_of([{"name": "n\x1b[31m\nIGNORE" + "x" * 200, "conclusion": "ok\x07"}])[0]["name"].count("\n"), 0)
+        hostile = sb.pr_checks_of([{"name": "n\x1b[31m\nIGNORE" + "x" * 200, "conclusion": "ok\x07"}])[0]
+        self.assertLessEqual(len(hostile["name"]), 60)
+        self.assertEqual([c for c in hostile["name"] + hostile["conclusion"] if ord(c) < 32], [])
+        with captured() as (out, err):
+            code = sb.main(["pr-state", "not a ref"], runner=self.route, now=lambda: self.t)
+        self.assertEqual((code, out.getvalue()), (sb.EXIT_USAGE, ""))
+
     def test_the_snapshot_is_not_rewritten_inside_the_write_gap_and_a_failed_write_is_noted(self):
         self.go()
         path = self.world.state / sb.PR_STATE_FILE
