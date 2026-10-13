@@ -4116,6 +4116,15 @@ class TestLaunch(Base):
         self.assertIn("agents verify", err)
         self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
 
+    def test_a_subagent_is_refused_too_and_named_as_one_with_nothing_created(self):
+        sessions = len(self.world.v2.sessions)
+        code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "reviewer-code": "subagent"}), "reviewer-code")
+        self.assertEqual(code, 1)
+        self.assertIn("--agent 'reviewer-code' is registered as a subagent agent, not a primary one", err)
+        self.assertIn("Task tool", err)
+        self.assertIn("primary agents registered: coder", err)
+        self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
+
     def test_a_registered_agent_launches_and_an_unreachable_service_does_not_block_it(self):
         for n, agents in enumerate(({"coder": "primary"}, None)):
             with self.subTest(agents=agents):
