@@ -15779,6 +15779,7 @@ def write_pr_state(engine, state, now):
         engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # `_note` says it once per change of the error; the age on every line shows a stale file
 
 
+PR_STATE_EXAMINED_STALE = 600   # seconds: checks and gates examined longer ago than this are shown as STALE, never READY-looking without their age
 PR_STATE_READ_MAX = 2 * 1024 * 1024   # the file the daemon writes is far smaller; past this it is not one
 
 
@@ -15835,42 +15836,52 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
         if isinstance(entry["gates"].get("error"), str):
             gates = {"error": _plain(entry["gates"]["error"], 120)}
     at = entry.get("at", now)
+    examined_at = entry.get("examined_at")
+    examined_age = max(0, int(now - examined_at)) if _finite(examined_at) and not stale_head else None
     view = {"pr": ref, "known": True, "state": _text(entry.get("state"), 20), "head": head, "mergeable": None if stale_head else _text(entry.get("mergeable"), 20),
             "ci": None if stale_head else _text(entry.get("ci"), 20), "checks": checks, "examined_head": examined,
             "labels": [name for name in (_plain(l, 60) for l in (entry.get("labels") if isinstance(entry.get("labels"), list) else [])[:20] if isinstance(l, str)) if name],
             "gates": gates, "reviews": reviews, "reviews_problem": _text(ledger_problem, 100) if ledger_problem else None,
-            "age_seconds": max(0, int(now - at)), "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
+            "age_seconds": max(0, int(now - at)), "examined_age_seconds": examined_age, "examined_stale": bool(examined_age is not None and examined_age > PR_STATE_EXAMINED_STALE),
+            "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
     if isinstance(entry.get("why"), str):
         view["why"] = _plain(entry["why"], 100)
     return view
 
 
+def _age_text(seconds):
+    return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
+
+
 def pr_state_line(view):
-    """One line for a view."""
+    """One line for a view. The checks and gates come from an EXAMINATION that can be older than the list that says the PR is open: their own
+    age is printed next to them, and past PR_STATE_EXAMINED_STALE they say STALE, so a READY never shows without how old it is."""
     if not view.get("known"):
         return "%s: unknown (%s); nothing was read from GitHub" % (view["pr"], view["why"])
     parts = [view["pr"], view.get("state") or "?", "head %s" % (view["head"] or "?")[:8]]
     if view.get("mergeable"):
         parts.append("mergeable %s" % view["mergeable"].lower())
     if view.get("checks") is not None:
-        parts.append("CI %s (%s)" % (_plain(view.get("ci") or "?", 20), ", ".join("%s: %s" % (_plain(c.get("name"), 60), _plain(c.get("conclusion"), 30)) for c in (view["checks"] if isinstance(view["checks"], list) else [])[:8] if isinstance(c, dict)) or "no checks"))
+        parts.append("CI %s%s (%s)" % (_plain(view.get("ci") or "?", 20), "" if view.get("examined_age_seconds") is None else " examined %s ago%s" % (_age_text(view["examined_age_seconds"]), "; STALE" if view.get("examined_stale") else ""), ", ".join("%s: %s" % (_plain(c.get("name"), 60), _plain(c.get("conclusion"), 30)) for c in (view["checks"] if isinstance(view["checks"], list) else [])[:8] if isinstance(c, dict)) or "no checks"))
     elif view.get("examined_head") and view["examined_head"] != view["head"]:
         parts.append("CI not examined at this head (last examined at %s)" % view["examined_head"][:8])
     else:
         parts.append("CI not examined")
     gates = view.get("gates")
+    examined = view.get("examined_age_seconds")
+    suffix = "" if examined is None else " [examined %s ago%s]" % (_age_text(examined), "; STALE" if view.get("examined_stale") else "")
     if gates is None:
         parts.append("gates unknown (no plan examined)")
     elif "error" in gates:
         parts.append("gates unknown (not evaluated: %s)" % gates["error"])
     else:
-        parts.append("gates %s" % ("READY" if gates["ready"] else "NOT (%s)" % ("; ".join(_plain(m, 160) for m in gates["missing"][:4]) or "see `gates`")))
+        parts.append("gates %s%s" % ("READY" if gates["ready"] else "NOT (%s)" % ("; ".join(_plain(m, 160) for m in gates["missing"][:4]) or "see `gates`"), suffix))
     if view.get("reviews") is None:
         parts.append("reviews unknown (ledger unreadable: %s)" % _plain(view.get("reviews_problem") or "?", 100))
     else:
         parts.append("reviews %s" % (", ".join("%s %s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20)) for r in view["reviews"]) or "none recorded at this head"))
     parts.append("labels %s" % (", ".join(_plain(l, 60) for l in view["labels"]) or "none"))
-    parts.append("cache %ds old" % view["age_seconds"])
+    parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
         parts.append(view["why"])
     return "; ".join(parts)

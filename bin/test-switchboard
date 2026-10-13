@@ -20884,7 +20884,7 @@ class TestCiRecordPass(LedgerBase):
         code, out, calls = self.pr_state(self.PR)
         self.assertEqual((code, calls), (0, []), "the daemon's cache and the local ledger: not one gh call")
         (line,) = out.strip().splitlines()
-        for part in ("acme/app#9", "open", "head " + LEDGER_HEAD[:8], "CI green", "gates NOT (", "reviews code approve", "labels none", "cache 0s old"):
+        for part in ("acme/app#9", "open", "head " + LEDGER_HEAD[:8], "CI green", "gates NOT (", "reviews code approve", "labels none", "list read 0s ago", "examined 0s ago"):
             self.assertIn(part, line)
         code, out, calls = self.pr_state(self.PR, "--json")
         view = json.loads(out)
@@ -20930,7 +20930,7 @@ class TestCiRecordPass(LedgerBase):
         self.go()
         code, out, calls = self.pr_state(self.PR, "--json")
         self.assertEqual(json.loads(out)["checks"], [{"name": "build", "conclusion": "success"}, {"name": "lint", "conclusion": "success"}])
-        self.assertIn("CI green (build: success, lint: success)", self.pr_state(self.PR)[1])
+        self.assertIn("CI green examined 0s ago (build: success, lint: success)", self.pr_state(self.PR)[1])
         self.assertIn("G1 S1: proof", self.pr_state(self.PR)[1], "one specific missing item, not only the word NOT")
 
     def test_a_moved_head_drops_what_was_examined_at_the_old_one(self):
@@ -21053,6 +21053,36 @@ class TestCiRecordPass(LedgerBase):
         for text in ('{"written_at": Infinity, "prs": {}}', '{"written_at": NaN, "prs": {}}', '{"written_at": true, "prs": {}}'):
             (self.world.state / sb.PR_STATE_FILE).write_text(text)
             self.assertIn("not a pr-state file", self.pr_state(self.PR)[1])
+
+    def test_the_examined_age_is_printed_next_to_the_checks_and_gates_and_old_ones_say_stale(self):
+        self.go()
+        view = json.loads(self.pr_state(self.PR, "--json")[1])
+        self.assertEqual((view["age_seconds"], view["examined_age_seconds"], view["examined_stale"]), (0, 0, False))
+        # the list is read again (fresh), the examination is not: the checks and gates are now 12 minutes old
+        self.t += 720
+        state = self.engine_cached.ci_record_state
+        state.pr_state[self.PR]["at"] = self.t - 5          # the list says: seen 5 s ago
+        state.pr_state_written = 0
+        sb.write_pr_state(self.engine_cached, state, self.t)
+        code, out, calls = self.pr_state(self.PR)
+        self.assertEqual(calls, [])
+        self.assertIn("list read 5s ago", out)
+        self.assertIn("examined 12m ago; STALE", out)
+        self.assertEqual(out.count("STALE"), 2, "next to the CI part and next to the gates part: a gates line never shows without its age")
+        view = json.loads(self.pr_state(self.PR, "--json")[1])
+        self.assertEqual((view["age_seconds"], view["examined_age_seconds"], view["examined_stale"]), (5, 720, True))
+        # inside the window: the age shows, the marker does not
+        state.pr_state[self.PR]["examined_at"] = self.t - 300
+        state.pr_state_written = 0
+        sb.write_pr_state(self.engine_cached, state, self.t)
+        line = self.pr_state(self.PR)[1]
+        self.assertIn("examined 5m ago", line)
+        self.assertNotIn("STALE", line)
+        # a PR the lists know but nothing examined: no examined age at all
+        state.pr_state[self.PR].pop("examined_at")
+        state.pr_state_written = 0
+        sb.write_pr_state(self.engine_cached, state, self.t)
+        self.assertIsNone(json.loads(self.pr_state(self.PR, "--json")[1])["examined_age_seconds"])
 
     def test_the_snapshot_is_not_rewritten_inside_the_write_gap_and_a_failed_write_is_noted(self):
         self.go()
