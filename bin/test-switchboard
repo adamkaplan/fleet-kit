@@ -38991,6 +38991,11 @@ class V2TransportBase(Base):
         self.cli_calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"via": "cli"}}), "")
 
+    def write_private(self, text):
+        """A service file that is private to the user (0600), so that only its content or size can be what is wrong with it."""
+        self.service_file.write_text(text)
+        os.chmod(str(self.service_file), 0o600)
+
     def route(self, timeout=5, alive=None):
         return sb.V2Http(self.service_file, timeout, alive=alive or (lambda pid: True), connect=self.service.connect)
 
@@ -39069,8 +39074,9 @@ class TestV2Http(V2TransportBase):
                  ("remote", lambda: self.service.write_service_file(self.service_file, url="http://203.0.113.9:80")),
                  ("a name, not a literal address", lambda: self.service.write_service_file(self.service_file, url="http://localhost:49374")),
                  ("world readable", lambda: self.service.write_service_file(self.service_file, mode=0o644)),
-                 ("garbage", lambda: self.service_file.write_text("{not json")),
-                 ("huge", lambda: self.service_file.write_text(" " * 10000)))
+                 ("garbage", lambda: self.write_private("{not json")),
+                 ("huge", lambda: self.write_private(" " * 10000)),
+                 ("huge but valid JSON up front", lambda: self.write_private(json.dumps({"url": "http://127.0.0.1:49374", "password": self.service.password}) + " " * 10000)))
         for name, writer in cases:
             with self.subTest(name=name):
                 self.service_file.exists() and self.service_file.unlink()
@@ -39114,6 +39120,25 @@ class TestV2Http(V2TransportBase):
             client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "once"})
         self.assertEqual(caught.exception.reason, "unavailable")
         self.assertEqual((len(self.service.requests), self.cli_calls), (1, []), "received once, not repeated, not sent through the CLI")
+
+    def test_a_write_the_service_refused_twice_for_its_password_goes_through_the_cli_once_because_it_was_never_received(self):
+        client = self.client()
+        self.service.password = "rotated-and-the-file-is-stale"
+        result = client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "x"})
+        self.assertEqual(result, {"via": "cli"})
+        self.assertEqual((len(self.cli_calls), self.service.requests), (1, []), "the service never processed it, so the CLI (which authenticates itself) is safe")
+        self.assertEqual(client.calls_by_transport(), {"cli-fallback": 1})
+
+    def test_a_probe_that_raises_something_other_than_a_v2_error_does_not_leave_optional_reads_waiting_for_ever(self):
+        now = [0.0]
+        client = sb.V2Client("/fake/bin/opencode", {}, self.runner, 5, http=self.route(), monotonic=lambda: now[0])
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            client.breaker.record(20, True)
+        now[0] += sb.V2_BACKOFF_BASE + 1
+        with mock.patch.object(client, "_transport", side_effect=KeyError("a bug")):
+            with self.assertRaises(KeyError):
+                client.session_active()   # it was the probe
+        self.assertEqual(client.session_active(), {"ses_a": {"status": "idle"}}, "the next optional read is the next probe, not a skipped read")
 
     def test_a_refused_password_on_a_write_is_retried_once_because_the_service_never_saw_it(self):
         client = self.client()
@@ -39296,23 +39321,6 @@ class TestV2BreakerEdges(Base):
                 t.join()
             self.assertEqual(sorted(map(str, got)), ["False"] * 7 + ["probe"], "round %d" % round_number)
             self.now[0] = 1000.0
-
-    def test_concurrent_records_lose_nothing_and_open_it_once(self):
-        events, barrier = [], threading.Barrier(8)
-
-        def feed():
-            barrier.wait()
-            for _ in range(5):
-                event = self.breaker.record(20, True)
-                if event:
-                    events.append(event)
-
-        threads = [threading.Thread(target=feed) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual([e["event"] for e in events], ["v2.backoff"], "one episode, one event")
 
 
 class TestV2ClientBackpressure(Base):

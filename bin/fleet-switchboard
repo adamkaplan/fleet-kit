@@ -1210,15 +1210,15 @@ class V2Client:
         if event is not None and self.on_event is not None:
             try:
                 self.on_event(event["event"], {k: v for k, v in event.items() if k != "event"})
-            except Exception:   # an audit trouble never fails a call
-                pass
+            except Exception:   # an audit trouble never fails a call, but it is counted
+                self.count_errors += 1
         self._write_link(event is not None)
 
     def _write_link(self, forced=False):
         """What `status` shows of the link, written by the daemon only, at most once a minute unless the breaker changed."""
         if self.state_dir is None:
             return
-        moment = time.time()
+        moment = self.clock()
         if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
             return
         self._link_written = moment
