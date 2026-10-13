@@ -7409,6 +7409,56 @@ class TestRemindCLI(PR4Base):
         self.assertNotIn("Traceback", err)
         self.assertEqual(sb.read_reminders(self.world.state), [])
 
+    def test_list_shows_only_the_callers_own_reminders_oldest_first_and_cancel_removes_only_those(self):
+        self.main("remind", "coder", "2h", "--from", "coder", "mine, later")
+        self.main("remind", "coder", "30m", "--from", "platform", "for me, sooner")
+        self.main("remind", "platform", "1h", "--from", "platform", "not mine")
+        code, out, err = self.main("remind", "--list", "--from", "coder")
+        self.assertEqual(code, 0, err)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("for me, sooner", lines[0])
+        self.assertIn("mine, later", lines[1])
+        self.assertNotIn("not mine", out)
+        mine = lines[0].split()[0]
+        other = next(i["id"] for i in sb.read_reminders(self.world.state) if i["text"] == "not mine")
+        for bad in (other, "nosuchid"):
+            with self.subTest(bad=bad):
+                code, _, err = self.main("remind", "--cancel", bad, "--from", "coder")
+                self.assertEqual(code, 2)
+                self.assertIn("no pending reminder", err)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 3)
+        code, out, err = self.main("remind", "--cancel", mine, "--from", "coder")
+        self.assertEqual((code, out.strip()), (0, "cancelled " + mine), err)
+        self.assertEqual(sorted(i["text"] for i in sb.read_reminders(self.world.state)), ["mine, later", "not mine"])
+        self.assertIn("reminder.cancel", [e["event"] for e in self.world.audit()])
+
+    def test_list_and_cancel_take_no_recipient_and_not_both_and_a_plain_remind_needs_its_three_parts(self):
+        for argv in (("remind", "--list", "platform"), ("remind", "--list", "--cancel", "x"), ("remind", "platform", "1h"), ("remind",)):
+            with self.subTest(argv=argv):
+                code, _, err = self.main(*argv, "--from", "coder")
+                self.assertEqual(code, 2, err)
+                self.assertIn("remind", err)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_a_reminder_about_an_issue_is_dropped_when_it_closes_unless_kept(self):
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--from", "coder", "about it")
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--keep-if-closed", "--from", "coder", "even so")
+        self.main("remind", "platform", "1h", "--from", "coder", "no issue")
+        by = {i["text"]: i for i in sb.read_reminders(self.world.state)}
+        self.assertEqual(by["about it"]["condition"], {"until_closed": "acme/api#41"})
+        self.assertNotIn("condition", by["even so"])
+        self.assertNotIn("condition", by["no issue"])
+
+    def test_a_reminder_armed_before_a_restart_fires_after_it(self):
+        code, _, err = self.main("remind", "platform", "10m", "--from", "coder", "still here")
+        self.assertEqual(code, 0, err)
+        restarted = self.world.new_engine()   # a new process: nothing but the state directory is shared
+        self.world.tick(600)
+        restarted.discover(self.world.clock.now())
+        facts = next(src for src in restarted.sources if isinstance(src, sb.ReminderFacts))()
+        self.assertEqual([f.summary for f in facts], ["still here"])
+
     def test_without_a_pane_it_says_so(self):
         code, _, err = self.main("remind", "platform", "1h", "later")
         self.assertEqual(code, 1)

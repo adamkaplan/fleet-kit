@@ -8443,6 +8443,41 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
+REMIND_LIST_MAX = 50   # reminders `remind --list` prints
+
+
+def remind_manage(args, engine, state, sender, moment):
+    """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
+    shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
+    if args.list_mine and args.cancel:
+        sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
+        return EXIT_USAGE
+    if args.name or args.when or args.text:
+        sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
+        return EXIT_USAGE
+    try:
+        mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    if args.list_mine:
+        mine.sort(key=lambda item: item["at"])
+        for item in mine[:REMIND_LIST_MAX]:
+            print("%s  %s  to=%s  issue=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item["text"], 120)))
+        if len(mine) > REMIND_LIST_MAX:
+            print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
+        if not mine:
+            sys.stderr.write("%s: no pending reminders for %s\n" % (PROG, sender))
+        return EXIT_OK
+    if args.cancel not in {item["id"] for item in mine}:
+        sys.stderr.write("%s: remind: no pending reminder %s of yours (see `%s remind --list`)\n" % (PROG, _one_line(args.cancel, 40), PROG))
+        return EXIT_USAGE
+    remove_reminders(state, {args.cancel})
+    engine.audit.append("cli", "reminder.cancel", sender, {"id": args.cancel})
+    print("cancelled %s" % args.cancel)
+    return EXIT_OK
+
+
 def cmd_remind(args, runner, now):
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
@@ -8454,6 +8489,11 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
+    if args.list_mine or args.cancel:
+        return remind_manage(args, engine, state, sender, moment)
+    if not args.name or not args.when or not args.text:
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
     except IssueRefError as err:
@@ -8466,6 +8506,8 @@ def cmd_remind(args, runner, now):
                 sys.stderr.write("%s: --until-closed/--until-merged take OWNER/REPO#N, got %r\n" % (PROG, flag[:60]))
                 return EXIT_USAGE
             condition[key] = flag
+    if number is not None and repo and not condition and not args.keep_if_closed:
+        condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
@@ -17791,9 +17833,13 @@ def build_parser():
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     remind = sub.add_parser("remind", help="A message to an agent that is due later")
-    remind.add_argument("name", help="The recipient's fleet name")
-    remind.add_argument("when", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
-    remind.add_argument("text", nargs="+", help="The reminder")
+    remind.add_argument("name", nargs="?", help="The recipient's fleet name")
+    remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
+    remind.add_argument("text", nargs="*", help="The reminder")
+    remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
+    remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
+                        "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     remind.add_argument("--until-closed", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this issue "
@@ -17892,7 +17938,11 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args, extra = parser.parse_known_args(argv)
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel):
+            args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+        elif extra:
+            parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
