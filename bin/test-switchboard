@@ -19817,28 +19817,29 @@ class TestImpactHold(LedgerBase):
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
         self.assertEqual(len(self.label_writes()), 1)
 
-    def test_an_owner_clear_and_the_daemons_write_cannot_interleave_a_clear_is_never_lost(self):
-        import threading
-        started, order = threading.Event(), []
-        base = self.route
-
-        def slow(argv, **kw):
-            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/labels"):
-                started.set()
-                time.sleep(0.4)                       # the daemon is mid-write when the owner's clear arrives
-                order.append("add")
-            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
-                order.append("remove")
-            return base(argv, **kw)
-        self.route = slow
-        daemon = threading.Thread(target=self.passes)
-        daemon.start()
-        self.assertTrue(started.wait(5))
+    def clear_engine(self):
         engine = self.world.new_engine("cli")
         engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
-        sb.impact_clear_core(engine, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
-        daemon.join(5)
-        self.assertEqual(order, ["add", "remove", "remove"], "the clear waited for the write and then removed what it added")
+        return engine
+
+    def test_an_owner_clear_cannot_interleave_with_the_daemons_write_and_is_never_lost(self):
+        refused = []
+        base = self.route
+
+        def watching(argv, **kw):
+            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/labels"):
+                with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):     # the owner's clear arrives while the daemon holds the lock
+                    try:
+                        sb.impact_clear_core(self.clear_engine(), self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+                    except sb.ImpactStateBusy as err:
+                        refused.append(str(err))
+            return base(argv, **kw)
+        self.route = watching
+        self.passes()
+        self.assertEqual(len(refused), 1)
+        self.assertIn("locked", refused[0])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "the interleaved clear recorded nothing: it cannot be half done")
+        sb.impact_clear_core(self.clear_engine(), self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")   # lock free now
         state, problem = sb.read_impact_state(self.world.state)
         self.assertIsNone(problem)
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
@@ -19849,12 +19850,49 @@ class TestImpactHold(LedgerBase):
 
     def test_a_write_that_cannot_take_the_lock_is_retried_later_never_done_unlocked(self):
         with sb.impact_state_lock(self.world.state):
-            with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0.2):
+            with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
                 self.passes()
         self.assertEqual(self.writes, [])
         self.assertTrue([e for e in self.events("impact.error") if "locked" in e["detail"]["error"]])
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
         self.assertEqual(len(self.label_writes()), 1)
+
+    def test_the_clear_command_says_one_line_when_the_lock_is_held_and_changes_nothing(self):
+        self.passes()
+        before = list(self.writes)
+        with sb.impact_state_lock(self.world.state), mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
+            code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")
+        self.assertEqual(code, 1)
+        self.assertIn("locked by another process", err)
+        self.assertIn("try again", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual((self.writes, sb.read_impact_state(self.world.state)[0]["clears"]), (before, {}))
+
+    def test_a_clear_is_logged_inside_the_lock_and_refused_with_no_audit_sink(self):
+        self.passes()
+        engine = self.clear_engine()
+        seen = []
+        real = engine.audit.append
+
+        def checking(*a, **k):
+            if a[1] == "gate.hold_cleared":
+                with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
+                    try:
+                        with sb.impact_state_lock(self.world.state):
+                            seen.append("lock was free")
+                    except RuntimeError:
+                        seen.append("lock held")
+            return real(*a, **k)
+        engine.audit.append = checking
+        sb.impact_clear_core(engine, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+        self.assertEqual(seen, ["lock held"])
+        silent = self.clear_engine()
+        silent.audit = None
+        writes = list(self.writes)
+        with self.assertRaises(RuntimeError) as caught:
+            sb.impact_clear_core(silent, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+        self.assertIn("no audit sink", str(caught.exception))
+        self.assertEqual(self.writes, writes, "refused before anything changed")
 
     def test_a_ledger_that_cannot_be_read_fails_toward_hold_and_says_so(self):
         self.floor_pr(path="src/app.py")                       # a clean floor: only the unknown rating can hold it
@@ -19884,7 +19922,7 @@ class TestImpactHold(LedgerBase):
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=9000)
         self.assertEqual(len(self.label_writes()), 2, "a new head is judged again, and the unknown rating holds it")
 
-    def test_a_corrupt_oversized_or_non_object_state_file_is_reported_not_read_as_empty(self):
+    def test_a_corrupt_oversized_or_non_object_state_file_is_reported_and_quarantined_never_overwritten(self):
         path = self.world.state / sb.IMPACT_STATE_FILE
         self.assertEqual(sb.read_impact_state(self.world.state)[1], None)                  # missing is fine
         for text, word in (("{not json", "not valid JSON"), ("[1, 2]", "not an object"), ("x" * (sb.IMPACT_STATE_MAX_BYTES + 5), "over")):
@@ -19892,10 +19930,72 @@ class TestImpactHold(LedgerBase):
             state, problem = sb.read_impact_state(self.world.state)
             self.assertEqual(state, {"clears": {}, "applied": {}})
             self.assertIn(word, problem)
-        path.write_text("{not json")
-        self.passes()                                          # fails toward hold, and the problem is audited
+        path.write_text("{not json, with another PR's clear in it")
+        self.passes()                                          # fails toward hold, the bad file is set aside, and the problem is audited
         self.assertEqual(len(self.label_writes()), 1)
-        self.assertTrue(self.events("impact.state_unreadable"))
+        (event,) = self.events("impact.state_unreadable")
+        aside = self.world.state / event["detail"]["quarantined"]
+        self.assertTrue(aside.name.startswith(sb.IMPACT_STATE_FILE + ".corrupt-"))
+        self.assertEqual(aside.read_text(), "{not json, with another PR's clear in it", "the original is kept, not overwritten")
+        state, problem = sb.read_impact_state(self.world.state)
+        self.assertIsNone(problem)
+        self.assertIn("acme/app#9", state["applied"], "and a fresh, valid state file was written")
+
+    def test_a_second_corruption_never_replaces_an_earlier_quarantined_copy_and_a_failed_rename_writes_nothing(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        asides = []
+        for text in ("{first bad", "{second bad"):
+            path.write_text(text)
+            engine = self.clear_engine()
+            with sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(engine, "bad")
+            asides = sorted(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))
+        self.assertEqual(sorted(a.read_text() for a in asides), ["{first bad", "{second bad"], "both kept, same second or not")
+        path.write_text("{third bad")
+        with mock.patch.object(os, "rename", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(RuntimeError) as caught, sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(self.clear_engine(), "bad")
+        self.assertIn("could not be set aside", str(caught.exception))
+        self.assertEqual(path.read_text(), "{third bad", "the corrupt file is untouched when it cannot be set aside")
+        (event,) = [e for e in self.events("impact.state_unreadable") if e["detail"].get("quarantine_failed")]
+        self.assertIn("Permission denied", event["detail"]["quarantine_failed"])
+
+    def test_every_kind_of_bad_state_file_goes_through_a_pass_and_a_bad_budget_is_refused(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        for text in ("[1, 2]", "x" * (sb.IMPACT_STATE_MAX_BYTES + 5)):
+            path.write_text(text)
+            self.passes()
+            self.assertEqual(len(list(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))) >= 1, True)
+            for aside in self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"):
+                aside.unlink()
+            path.unlink(missing_ok=True)
+            del self.engine_cached
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in (-1, True, "3", 1.5):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, impact_hold={"enabled": True, "calls_per_pass": bad}))
+
+    def test_a_missing_ledger_file_is_no_hold_not_unreadable(self):
+        """A regression guard: the read of a missing ledger is an empty ledger, so a clean floor is never held by the unknown-rating rule."""
+        self.floor_pr(path="src/app.py")
+        (self.world.state / "plan-ledger.jsonl").unlink(missing_ok=True)
+        (self.world.state / "plan-ledger.head").unlink(missing_ok=True)
+        self.assertEqual(sb.impact_review_hold(self.world.state, self.PR, LEDGER_HEAD), (False, None))
+        self.passes()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events("impact.ledger_unreadable"), [])
+
+    def test_impact_hold_calls_per_pass_is_accepted_and_bounds_the_pass(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        sb.validate_config(dict(base, impact_hold={"enabled": True, "calls_per_pass": 3}))
+        self.hold_config = {"enabled": True, "calls_per_pass": 0}
+        self.reconfigure()
+        self.passes()
+        self.assertEqual(self.writes, [], "a budget of 0 reads and writes nothing")
+        self.hold_config = {"enabled": True, "calls_per_pass": 30}
+        self.reconfigure()
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(len(self.label_writes()), 1)
 
     def test_control_characters_in_the_clear_reason_never_reach_the_record_or_the_log(self):
         self.passes()
@@ -19903,7 +20003,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 0, err)
         recorded = sb.read_impact_state(self.world.state)[0]["clears"]["acme/app#9"]["reason"]
         self.assertEqual(recorded, "a false hold [31m: the file is a fixture")
-        self.assertFalse(re.search(r"[\x00-\x1f\x7f]", json.dumps(self.events("gate.hold_cleared")[0]["detail"]["reason"]).replace("\\u001b", "")) and False)
+        self.assertEqual(self.events("gate.hold_cleared")[0]["detail"]["reason"], "a false hold [31m: the file is a fixture")
         self.assertNotIn("\x1b", self.events("gate.hold_cleared")[0]["detail"]["reason"])
 
     def test_the_hold_config_is_validated_and_the_label_is_in_the_held_set(self):
