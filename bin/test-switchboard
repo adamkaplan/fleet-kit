@@ -38932,7 +38932,7 @@ class FakeOpenCodeService:
         return 404, {"error": "no such path"}
 
     def connect(self, host, port, timeout=None):
-        return FakeConnection(self, timeout)
+        return FakeServiceConnection(self, timeout)
 
     def write_service_file(self, path, url="http://127.0.0.1:49374", pid=None, mode=0o600):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -38940,7 +38940,7 @@ class FakeOpenCodeService:
         os.chmod(str(path), mode)
 
 
-class FakeResponse:
+class FakeServiceResponse:
     def __init__(self, status, raw):
         self.status, self._raw, self.will_close = status, raw, False
 
@@ -38948,7 +38948,7 @@ class FakeResponse:
         return self._raw if amount is None else self._raw[:amount]
 
 
-class FakeConnection:
+class FakeServiceConnection:
     """What http.client.HTTPConnection gives V2Http, over the in-memory service."""
 
     def __init__(self, service, timeout):
@@ -38973,7 +38973,7 @@ class FakeConnection:
             raise http.client.RemoteDisconnected("Remote end closed connection without response")
         if self.service.delay > (self.timeout or 1e9):
             raise socket.timeout("timed out")
-        return FakeResponse(status, json.dumps(obj).encode())
+        return FakeServiceResponse(status, json.dumps(obj).encode())
 
     def close(self):
         self.sock = None
