@@ -11201,6 +11201,9 @@ class TestGhShimGateProbe(Base):
         fake = self.bin / "gh"
         fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
                         "if sys.argv[1:3] == ['repo', 'view']:\n    v = os.environ.get('FAKE_REPO')\n    print(v or ''); sys.exit(0 if v else 1)\n"
+                        "if sys.argv[1:3] == ['pr', 'view'] and 'reviews,headRefOid' in sys.argv:\n"
+                        "    if os.environ.get('FAKE_REVIEWS_EXIT'): sys.exit(int(os.environ['FAKE_REVIEWS_EXIT']))\n"
+                        "    print(os.environ.get('FAKE_REVIEWS') or '{\"reviews\": [], \"headRefOid\": \"' + 'a'*40 + '\"}'); sys.exit(0)\n"
                         "if sys.argv[1:3] == ['pr', 'view']:\n    v = os.environ.get('FAKE_PRURL')\n    print(v or ''); sys.exit(0 if v else 1)\n"
                         "json.dump({'argv': sys.argv[1:]}, open(%r,'w'))\n"
                         "print('real gh out'); sys.exit(7)\n" % str(self.log))
@@ -11209,8 +11212,9 @@ class TestGhShimGateProbe(Base):
         self.sb = self.home / "fakesb"
         self.sb.write_text("#!/bin/sh\n"
                            "if [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; else echo worker; fi; exit 0; fi\n"
+                           "if [ \"$1\" = review ] && [ \"$2\" = blockers ]; then\n  echo \"$@\" >> %r\n  [ -n \"$FAKE_BLOCKERS_EXIT\" ] && exit $FAKE_BLOCKERS_EXIT\n  [ -n \"$FAKE_BLOCKERS\" ] && echo \"$FAKE_BLOCKERS\"; exit 0; fi\n"
                            "if [ \"$1\" = gates-check ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
-                           "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  if [ -n \"$FAKE_GATE_JSON\" ]; then echo \"$FAKE_GATE_JSON\"; else echo '{\"verdict\": \"x\"}'; fi; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % str(self.calls_log))
+                           "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  if [ -n \"$FAKE_GATE_JSON\" ]; then echo \"$FAKE_GATE_JSON\"; else echo '{\"verdict\": \"x\"}'; fi; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % (str(self.calls_log) + ".review", str(self.calls_log)))
         self.sb.chmod(0o755)
         subprocess.run([str(self.sb), "whoami", "--json"], capture_output=True, timeout=60)   # the first start of a new file is the slow one
         self.state = self.home / "state"
@@ -11256,6 +11260,133 @@ class TestGhShimGateProbe(Base):
                 self.assertEqual(seen["argv"], list(args))
                 (call,) = self.gate_calls()
                 self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=1" % kind)
+
+    def review(self, state, who="rev", at="2026-01-01T00:00:00Z"):
+        return {"state": state, "author": {"login": who}, "submittedAt": at}
+
+    def merge(self, *extra, reviews=(), env=None, args=("pr", "merge", "12", "-R", "acme/app", "--merge")):
+        e = {"FAKE_REPO": "acme/app", "FAKE_REVIEWS": json.dumps({"reviews": list(reviews), "headRefOid": self.HEAD})}
+        e.update(env or {})
+        return self.run_shim(*args, *extra, env=e)
+
+    def test_a_merge_over_a_changes_requested_review_is_refused_naming_the_reviewer_in_any_repo(self):
+        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")])
+        self.assertEqual(done.returncode, 10)
+        self.assertIn("blocking review(s): reviewer-a: CHANGES_REQUESTED", done.stderr)
+        self.assertIn("--over-review", done.stderr)
+        self.assertIsNone(seen, "the real gh never ran")
+        done, seen = self.merge("--admin", reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")])
+        self.assertEqual((done.returncode, seen), (10, None))                    # --admin changes nothing
+        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")], env={"FAKE_REPO": "other/repo"},
+                                args=("pr", "merge", "12", "-R", "other/repo", "--merge"))
+        self.assertEqual(done.returncode, 10)                                    # a repo not listed under plan_gates is covered too
+
+    def test_a_dismissed_or_superseded_review_and_plain_comments_do_not_block(self):
+        for reviews in ([self.review("CHANGES_REQUESTED", "rev"), self.review("DISMISSED", "rev")],
+                        [self.review("CHANGES_REQUESTED", "rev"), self.review("APPROVED", "rev")],
+                        [self.review("CHANGES_REQUESTED", "rev"), self.review("COMMENTED", "other"), self.review("APPROVED", "rev")],
+                        [self.review("APPROVED", "rev"), self.review("COMMENTED", "rev")]):
+            with self.subTest(reviews=[r["state"] for r in reviews]):
+                done, seen = self.merge(reviews=reviews)
+                self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        done, seen = self.merge(reviews=[self.review("APPROVED", "a"), self.review("CHANGES_REQUESTED", "b")])   # one reviewer's block is enough
+        self.assertEqual(done.returncode, 10)
+
+    def test_a_recorded_blocking_verdict_at_the_current_head_blocks_and_is_named(self):
+        done, seen = self.merge(env={"FAKE_BLOCKERS": "security recorded request-changes (2 blocking finding(s)) at aaaaaaaa"})
+        self.assertEqual(done.returncode, 10)
+        self.assertIn("security recorded request-changes", done.stderr)
+        asked = (self.calls_log.parent / (self.calls_log.name + ".review")).read_text().split()
+        self.assertEqual(asked, ["review", "blockers", "acme/app#12", "--head", self.HEAD])      # the shim binds the question to the head it read
+
+    def test_over_review_with_a_reason_goes_ahead_is_stripped_and_logged_and_without_one_it_is_refused(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        done, seen = self.merge("--over-review", "the owner accepted the risk in chat", reviews=block)
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        self.assertNotIn("--over-review", " ".join(seen["argv"]))
+        self.assertNotIn("the owner accepted", " ".join(seen["argv"]))
+        self.assertIn("on purpose", done.stderr)
+        (line,) = [l for l in self.spool() if l["event"] == "over_review"]
+        self.assertIn("worker", line["detail"])
+        self.assertIn("the owner accepted the risk in chat", line["detail"])
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", line["detail"])
+        self.assertEqual(line["pr"], "acme/app#12")
+        done, seen = self.merge("--over-review=a reason of enough length", reviews=block)           # the = spelling
+        self.assertEqual(done.returncode, 7)
+        for extra in (("--over-review", "short"), ("--over-review",)):
+            done, seen = self.merge(*extra, reviews=block)
+            self.assertEqual((done.returncode, seen), (10, None))
+            self.assertIn("at least 10 characters", done.stderr)
+        done, seen = self.merge("--over-review", "a reason that nobody needs", reviews=[])           # nothing to override: just stripped
+        self.assertEqual((done.returncode, "--over-review" in " ".join(seen["argv"])), (7, False))
+
+    def test_a_reviews_api_or_switchboard_failure_lets_the_merge_through_with_a_visible_warning(self):
+        done, seen = self.merge(env={"FAKE_REVIEWS_EXIT": "1"})
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"))
+        self.assertIn("could not be read): not checked", done.stderr)
+        done, seen = self.merge(env={"FAKE_BLOCKERS_EXIT": "1"})
+        self.assertEqual(done.returncode, 7)
+        self.assertIn("recorded verdicts could not be read", done.stderr)
+        done, seen = self.merge(env={"FAKE_REVIEWS": "not json"})
+        self.assertEqual(done.returncode, 7)
+        self.assertIn("not checked", done.stderr)
+
+    def tagged(self, first, who="shared", tag="rev", at="2026-01-01T00:00:00Z", state="COMMENTED"):
+        body = "%s\n\nfindings...\n\n<!-- fleet-switchboard:from=%s -->" % (first, tag)
+        return {"state": state, "author": {"login": who}, "submittedAt": at, "body": body}
+
+    def test_a_commented_review_whose_first_line_says_changes_requested_at_the_current_head_blocks_and_a_later_approve_clears_it(self):
+        cr = self.tagged("Review of %s: CHANGES REQUESTED" % self.HEAD)
+        done, seen = self.merge(reviews=[cr])
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("shared/rev: CHANGES REQUESTED (Review of %s)" % self.HEAD[:8], done.stderr)
+        for spelling in ("Review of %s: CHANGES REQUESTED" % self.HEAD[:7], "review of %s - changes requested" % self.HEAD, "Review of %s: REQUEST CHANGES" % self.HEAD):
+            done, seen = self.merge(reviews=[self.tagged(spelling)])                  # a short sha prefix and the other spellings count
+            self.assertEqual(done.returncode, 10, spelling)
+        done, seen = self.merge(reviews=[cr, self.tagged("Review of %s: APPROVE" % self.HEAD)])
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        done, seen = self.merge(reviews=[cr, self.tagged("Review of %s: APPROVED" % self.HEAD, tag="other")])   # another reviewer's approve does not clear this one
+        self.assertEqual(done.returncode, 10)
+        done, seen = self.merge(reviews=[self.tagged("Review of %s: APPROVE" % self.HEAD), cr])                 # the latest one decides
+        self.assertEqual(done.returncode, 10)
+
+    def test_a_changes_requested_tag_at_an_old_head_and_untagged_comments_never_block(self):
+        old = "b" * 40
+        for reviews in ([self.tagged("Review of %s: CHANGES REQUESTED" % old)],
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": "CHANGES REQUESTED, please fix this"}],
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": "Looks fine.\nReview of %s: CHANGES REQUESTED" % self.HEAD}],   # not the FIRST line
+                        [{"state": "COMMENTED", "author": {"login": "shared"}, "body": None}],
+                        [self.tagged("Review of nothex: CHANGES REQUESTED")]):
+            with self.subTest(body=str(reviews[0].get("body"))[:40]):
+                done, seen = self.merge(reviews=reviews)
+                self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        done, seen = self.merge("--over-review", "the owner reviewed this head in person", reviews=[self.tagged("Review of %s: CHANGES REQUESTED" % self.HEAD)])
+        self.assertEqual(done.returncode, 7)                                    # the explicit override still works
+
+    def test_an_override_whose_log_cannot_be_written_is_refused_and_a_pr_number_after_the_flag_is_not_its_reason(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        done, seen = self.merge("--over-review", "a fine long reason here", reviews=block, env={"FLEET_SWITCHBOARD_STATE": str(self.home / "no-such-state")})
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("could not be logged", done.stderr)
+        done, seen = self.merge(reviews=block, args=("pr", "merge", "--over-review", "12", "-R", "acme/app", "--merge"))   # `12` is the PR
+        self.assertEqual(done.returncode, 10)
+        self.assertIn("at least 10 characters", done.stderr)
+        done, seen = self.merge("--over-review", "x" * 300, reviews=block)       # a long reason: the head and the overridden review still fit the line
+        self.assertEqual(done.returncode, 7)
+        line = [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"]
+        self.assertIn(self.HEAD[:12], line)
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", line)
+        done, seen = self.merge("--over-review", "a reason\x1b[31m with escapes", reviews=block)
+        logged = [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"]
+        self.assertNotIn("\x1b", logged)
+        self.assertIn("with escapes", logged)
+
+    def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        done, seen = self.merge(reviews=block, args=("pr", "ready", "12", "-R", "acme/app"))
+        self.assertEqual(done.returncode, 7)
+        done, seen = self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
+        self.assertEqual(done.returncode, 7)
 
     HEAD = "a" * 40
     REFUSAL = ("fleet-switchboard: merge of acme/app#12 refused: missing G1: no passing CI record at this head. Way out: ask the chief of "
@@ -39799,6 +39930,44 @@ class TestReviewerSubagents(LedgerBase):
         self.record("coder", "code", "approve")
         got = sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
         self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact", "test"]))
+
+    def blockers(self, *more, head=None):
+        with captured() as (out, err):
+            code = sb.main(["review", "blockers", self.PR] + (["--head", head] if head else []) + list(more), runner=self.route,
+                           now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_review_blockers_lists_only_the_reviewers_whose_latest_record_at_the_head_is_request_changes(self):
+        self.record("coder", "code", "request-changes", "--blocks", "2")
+        self.record("coder", "security", "request-changes", "--blocks", "1")
+        self.record("coder", "security", "approve")                          # supersedes its own earlier block
+        self.record("coder", "test", "request-changes", "--blocks", "1", "--head", LEDGER_HEAD)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "architecture",
+                                                       "verdict": "request-changes", "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 1)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#99", "head": LEDGER_HEAD, "reviewer": "impact",
+                                                       "verdict": "request-changes", "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 2)
+        code, out, err = self.blockers()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), ["code recorded request-changes (2 blocking finding(s)) at " + LEDGER_HEAD[:8],
+                                            "test recorded request-changes (1 blocking finding(s)) at " + LEDGER_HEAD[:8]])
+        code, out, err = self.blockers(head=LEDGER_NEW_HEAD)                  # another head: only what was recorded for THAT head
+        self.assertEqual(out.splitlines(), ["architecture recorded request-changes (1 blocking finding(s)) at " + LEDGER_NEW_HEAD[:8]])
+
+    def test_review_blockers_prints_nothing_for_a_clean_pr_and_refuses_an_untrustworthy_ledger_and_writes_nothing(self):
+        ledger = self.world.state / "plan-ledger.jsonl"
+        code, out, err = self.blockers()
+        self.assertEqual((code, out), (0, ""))
+        self.record("coder", "code", "request-changes", "--blocks", "1")
+        before = ledger.read_text()
+        code, out, err = self.blockers()                                       # the happy path wrote nothing
+        self.assertEqual(code, 0)
+        self.assertEqual(ledger.read_text(), before)
+        ledger.write_text(before.replace("request-changes", "approve-ish"))   # tampered: the chain breaks
+        tampered = ledger.read_text()
+        code, out, err = self.blockers()
+        self.assertEqual(code, 2)
+        self.assertIn("ledger is not trustworthy", err)
+        self.assertEqual(ledger.read_text(), tampered, "the refused path wrote nothing either")
 
     # -- the coder session records what a reviewer returned
 

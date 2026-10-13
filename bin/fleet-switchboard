@@ -16240,6 +16240,19 @@ def cmd_review(args, runner, now):
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
         head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
+        if args.review_cmd == "blockers":
+            entries, problem = plan_ledger.read_ledger(state)
+            if problem:
+                raise ReviewError("the ledger is not trustworthy: %s" % problem)
+            at = args.head or head
+            latest = {}
+            for entry in entries:
+                if entry.get("kind") == "review_record" and entry.get("pr") == ref and entry.get("head") == at:
+                    latest[entry.get("reviewer")] = entry
+            for reviewer, entry in sorted(latest.items()):
+                if entry.get("verdict") == "request-changes":
+                    print("%s recorded request-changes (%s blocking finding(s)) at %s" % (reviewer, entry.get("blocks"), (at or "")[:8]))
+            return EXIT_OK
         if args.review_cmd == "laws":
             base = raw.get("baseRefOid")
             if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
@@ -16444,6 +16457,9 @@ def add_review_parsers(sub):
     rsub = review.add_subparsers(dest="review_cmd", required=True)
     laws = rsub.add_parser("laws", help="Print the repository's review laws and overlay as they stand at the PR's BASE commit")
     laws.add_argument("pr", help="owner/repo#N or the PR's URL")
+    blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
+    blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
+    blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
     record = rsub.add_parser("record", help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
     record.add_argument("pr", help="owner/repo#N or the PR's URL")
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
