@@ -39,6 +39,7 @@ permissions:
   - {action: shell, resource: "fleet-switchboard handoff *", effect: allow}
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard relaunch *", effect: allow}
   - {action: shell, resource: "gh * view *", effect: allow}
   - {action: shell, resource: "gh * list *", effect: allow}
   - {action: shell, resource: "gh * status *", effect: allow}
@@ -217,7 +218,7 @@ is blocking. The `permissions` list above keeps you **focused on your job**: rea
 repos, the switchboard, GitHub and Azure status. It is a focus, not a fence against you: what serves the job is allowed, and what
 nothing in the job justifies is denied. Nothing asks and nothing prompts; a denied call just fails.
 
-Allowed: `fleet-switchboard` (send, report, remind, intent, status, pending, decisions, orders, notice, handoff, launch), `gh` reads
+Allowed: `fleet-switchboard` (send, report, remind, intent, status, pending, decisions, orders, notice, handoff, launch, reattach, relaunch), `gh` reads
 and the `gh` comment, close, edit and merge of PRs and issues, `az` status, list, show and log reads, `git` reads, pipes over read output
 (`grep cut head tail sort uniq wc jq tr`), `timeout N` and `sleep`, `$(cat <temp dir>/msg.txt)` to compose a message from a file, and a
 heredoc `cat > <temp dir>/file` to write that file. The opencode temp dir is yours to read and write (other agents' renders, audits and
