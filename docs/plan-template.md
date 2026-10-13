@@ -28,7 +28,10 @@ Recorded as an issue, or a section of one, **in the repo the work concerns**. Re
 5. **Areas touched**, and whether any is a held-PR area.
 6. **Risks and rollback**.
 7. **Open questions**.
-8. **Size and tier**.
+8. **Size and tier**. State the size as a **T-shirt in agent time** calibrated to this fleet: **S** under 1 hour, **M** a few hours, **L** about a day,
+   **XL** several days, each with what makes it that size (files, areas, risk), never human-days. A light plan may carry just `size: S`. A
+   recommendation never prefers the smaller option because it is less work when a larger one simplifies the system: say what each option
+   costs in size and choose on the result. Put the line `plan-format: 2` and a `size:` line in the plan (see the table: only plans that opt in are checked).
 9. **The integration-branch decision** (stay on main, or `integration/<epic-slug>`).
 
 Approvers: a work item's plan by its orchestrator (cos if it touches a held-PR area); an ask's by cos; an epic or
@@ -71,7 +74,8 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
 | Done-when | `--ask` (or `--done-when`) is the **authority** for the clauses. If the plan states its own Done-when it must be the same clauses: fewer or different ones fail (`done-when-differs`). A plan can never weaken coverage |
-| size | warning (not a failure). With a `slice` key on the scenarios: more than 30 in one slice, or more than 80 in total. With no slices: more than 30 in total |
+| `size` | only for a plan that carries the line `plan-format: 2` (or higher), so a plan written before the rule is not flagged: a plan with no `size:` line (`missing-size`); a `size:` that does not start with S, M, L or XL (`bad-size`); a size of S or M given in days or weeks, or any size given in human time (`size-in-days`; human-days and person-days are refused for every size) |
+| scenario count | warning (not a failure). With a `slice` key on the scenarios: more than 30 in one slice, or more than 80 in total. With no slices: more than 30 in total |
 
 The Done-when clauses are the numbered parts `(1) ... (2) ...` of the ask's `Done when:` line (`DW-n` is clause n); a
 line with no `(1)` is one clause.
