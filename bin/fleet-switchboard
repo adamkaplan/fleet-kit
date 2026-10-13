@@ -8472,7 +8472,9 @@ def remind_manage(args, engine, state, sender, moment):
     if args.cancel not in {item["id"] for item in mine}:
         sys.stderr.write("%s: remind: no pending reminder %s of yours (see `%s remind --list`)\n" % (PROG, _one_line(args.cancel, 40), PROG))
         return EXIT_USAGE
-    remove_reminders(state, {args.cancel})
+    if not remove_reminders(state, {args.cancel}):   # delivered or cancelled between the read and the removal
+        sys.stderr.write("%s: remind: reminder %s is already gone\n" % (PROG, _one_line(args.cancel, 40)))
+        return EXIT_USAGE
     engine.audit.append("cli", "reminder.cancel", sender, {"id": args.cancel})
     print("cancelled %s" % args.cancel)
     return EXIT_OK
@@ -17939,7 +17941,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     parser = build_parser()
     try:
         args, extra = parser.parse_known_args(argv)
-        if extra and args.action == "remind" and not (args.list_mine or args.cancel):
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
