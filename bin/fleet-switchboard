@@ -43,8 +43,8 @@ Python 3.9+, standard library only.
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import errno
 import collections
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -6380,12 +6380,13 @@ def v2_calls_summary(v2, now):
     count = getattr(v2, "calls_by_operation", None)
     if count is None:
         return None
-    return {"at": iso(now), "last_minute": count(60.0, now),
-            "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0, now).items())}}
+    return {"at": iso(now), "last_minute": count(60.0),   # the client's own clock: the calls were stamped with it
+            "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0).items())}}
 
 
 def record_v2_calls(engine):
     """After a pass: leave the figures where `status` can read them (a small file, renamed into place). Never raises."""
+    temp = None
     try:
         if engine.state_dir is None:
             return
@@ -6396,8 +6397,16 @@ def record_v2_calls(engine):
         temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
         temp.write_text(json.dumps(summary, sort_keys=True) + "\n")
         os.rename(str(temp), str(path))
-    except Exception:
-        pass   # evidence only
+    except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+        try:
+            engine._note("v2_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception:
+            pass
 
 
 def v2_calls_status(state_dir, now):
@@ -6412,7 +6421,7 @@ def v2_calls_status(state_dir, now):
         if at is not None and now - at > 120:
             text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
         return text
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):   # a record of any other shape is no record
         return None
 
 

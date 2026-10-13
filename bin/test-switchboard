@@ -37130,9 +37130,33 @@ class TestV2CallAccounting(Base):
         world.tick(300)
         self.assertIn("the daemon is not passing", sb.v2_calls_status(world.state, world.clock.now()))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
-        (self.state_dir / sb.V2_CALLS_FILE).write_text(json.dumps({"at": sb.iso(time.time()), "last_minute": {"session.get": 2}, "avg_5min": {"session.get": 1.0}}))
-        text = sb.format_status(sb.collect_status(world.route, time.time))
+        (self.state_dir / sb.V2_CALLS_FILE).write_text(json.dumps({"at": sb.iso(world.clock.now()), "last_minute": {"session.get": 2}, "avg_5min": {"session.get": 1.0}}))
+        text = sb.format_status(sb.collect_status(world.route, world.clock.now))
         self.assertRegex(text, r"(?m)^      v2 calls   2/min \(session.get 2; 5-min average 1/min\)$")
+
+    def test_a_real_pass_writes_the_record(self):
+        world = World(self, agents=("platform", "coder"))
+        world.engine.run_pass()
+        body = json.loads((world.state / sb.V2_CALLS_FILE).read_text())
+        self.assertGreater(sum(body["last_minute"].values()), 0, "the pass read v2 and the daemon left the figures")
+
+    def test_a_failure_to_record_is_said_once_leaves_no_temp_file_and_never_fails_the_pass(self):
+        world = World(self, agents=("platform",))
+        with mock.patch.object(sb.os, "rename", side_effect=OSError("disk full")):
+            world.engine.run_pass()
+            world.engine.run_pass()
+        errors = [e for e in world.audit() if e["event"] == "v2_calls.error"]
+        self.assertEqual(len(errors), 1, "said once per change, not once per pass")
+        self.assertIn("disk full", errors[0]["detail"]["error"])
+        self.assertEqual([p.name for p in world.state.iterdir() if p.name.endswith(".tmp") and "v2-calls" in p.name], [])
+        sb.record_v2_calls(types.SimpleNamespace(state_dir=None, v2=world.engine.v2, now=world.clock.now))   # nowhere to write: nothing happens
+
+    def test_a_corrupt_record_prints_no_line(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        for text in ("not json", "{}", '{"at": "x", "last_minute": 3, "avg_5min": {}}', "[]"):
+            with self.subTest(text=text):
+                (self.state_dir / sb.V2_CALLS_FILE).write_text(text)
+                self.assertIsNone(sb.v2_calls_status(self.state_dir, time.time()))
 
     def test_no_record_no_line_and_a_fake_client_leaves_no_file(self):
         self.assertIsNone(sb.v2_calls_status(self.state_dir, time.time()))
