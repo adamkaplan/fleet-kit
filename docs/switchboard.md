@@ -2411,7 +2411,14 @@ or an ISO time with a zone. The role files of the coder and the orchestrator and
 **Cancel a reminder that became moot.** `remind ... --until-closed OWNER/REPO#N` (an issue, or a pull request closed
 or merged) or `--until-merged OWNER/REPO#N` (a pull request merged) stores a condition; when the reminder is due the
 switchboard reads that state once, and when it holds the reminder is dropped unsent and audited (`reminder.drop`, with
-the reason). A state that cannot be read now leaves the reminder to deliver.
+the reason). A state that cannot be read now leaves the reminder to deliver. A reminder with `--issue` and no condition of its
+own gets `--until-closed` for that issue by default, so a reminder about finished work is dropped unsent; `--keep-if-closed` opts out.
+
+**See and cancel your own reminders.** `remind --list` prints the pending reminders set by you or for you, oldest first
+(id, time, recipient, issue, text; at most 50), and `remind --cancel <id>` removes one of them (audited as `reminder.cancel`);
+another agent's reminder is not shown and is refused as unknown. Reminders live in `reminders.json` in the state directory, are
+read by the daemon on every pass and are only removed once delivered, dropped or cancelled, so a daemon restart loses none
+(a test arms one, starts a new engine over the same state and sees it fire).
 
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
