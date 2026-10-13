@@ -16495,8 +16495,11 @@ def agent_definition(name, root=None):
                 if match is None:
                     unread += 1
                 elif section == "list":
-                    action = json.loads(match.group(1)) if match.group(1).startswith('"') else match.group(1)
-                    rules.add((action, json.loads(match.group(2)), match.group(3)))
+                    try:
+                        action = json.loads(match.group(1)) if match.group(1).startswith('"') else match.group(1)
+                        rules.add((action, json.loads(match.group(2)), match.group(3)))
+                    except ValueError:   # a quoted string that is not valid JSON (a bad escape): not read, so not verified, and said
+                        unread += 1
                 else:
                     rules.add(("shell" if match.group(1) == "bash" else match.group(1), "*", match.group(2)))
         return sorted(rules), unread, str(path)
