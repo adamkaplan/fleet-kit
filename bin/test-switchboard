@@ -38948,9 +38948,16 @@ class FakeOpenCodeService:
 class FakeServiceResponse:
     def __init__(self, status, raw):
         self.status, self._raw, self.will_close = status, raw, False
+        self.on_read = None   # a test hook: called before each read (to advance a fake clock)
 
     def read(self, amount=None):
-        return self._raw if amount is None else self._raw[:amount]
+        if self.on_read is not None:
+            self.on_read()
+        if amount is None:
+            raw, self._raw = self._raw, b""
+        else:
+            raw, self._raw = self._raw[:amount], self._raw[amount:]
+        return raw
 
 
 class FakeStreamResponse:
@@ -39131,6 +39138,46 @@ class TestV2Http(V2TransportBase):
         self.assertEqual(caught.exception.reason, "timeout")
         self.assertEqual((self.cli_calls, client.calls_by_transport()), ([], {"http": 1}), "it reached the service: counted, and not repeated")
 
+    def test_a_reply_that_trickles_in_is_cut_at_the_total_deadline_not_per_socket_operation(self):
+        now = [100.0]
+
+        class Trickle:
+            def __init__(trickle):
+                trickle.reads = 0
+
+            def read(trickle, amount=None):
+                trickle.reads += 1
+                now[0] += 2.0   # one byte, 2 s later: every socket operation is within its own timeout
+                return b"x"
+        trickle = Trickle()
+        with mock.patch.object(sb.time, "monotonic", lambda: now[0]):
+            with self.assertRaises(socket.timeout):
+                sb.V2Http._read_body(trickle, types.SimpleNamespace(sock=None), now[0] + 5.0)
+        self.assertEqual(trickle.reads, 3, "stopped at the total deadline (5 s), not after the whole reply")
+        sock = types.SimpleNamespace(timeouts=[], settimeout=lambda seconds: sock.timeouts.append(round(seconds, 1)))
+        conn = types.SimpleNamespace(sock=sock)
+        with mock.patch.object(sb.time, "monotonic", lambda: 100.0):
+            sb.V2Http._budget(conn, 103.0)
+            with self.assertRaises(socket.timeout):
+                sb.V2Http._budget(conn, 100.0)
+        self.assertEqual(sock.timeouts, [3.0], "the socket gets what is left of the total time: connect, send, headers and body share it")
+        done = type("Done", (), {"read": lambda self, amount=None, _b=[b"abc", b""]: _b.pop(0)})()
+        self.assertEqual(sb.V2Http._read_body(done, types.SimpleNamespace(sock=None), time.monotonic() + 5), b"abc")
+
+    def test_a_symlinked_service_file_and_an_open_directory_are_refused_and_the_service_not_contacted(self):
+        real = self.home / "opencode" / "real.json"
+        self.service_file.rename(real)
+        self.service_file.symlink_to(real)
+        before = len(self.service.requests)
+        self.assertEqual(self.client().session_active(), {"via": "cli"}, "a symlink is refused, not followed")
+        self.service_file.unlink()
+        real.rename(self.service_file)
+        os.chmod(str(self.service_file.parent), 0o777)
+        self.assertEqual(self.client().session_active(), {"via": "cli"}, "a directory others can write to cannot be trusted")
+        os.chmod(str(self.service_file.parent), 0o755)
+        self.assertEqual(len(self.service.requests), before)
+        self.assertEqual(self.client().session_active(), {"ses_a": {"status": "idle"}}, "and the same file in a closed directory is accepted")
+
     def test_a_reply_over_the_cap_is_refused_not_buffered(self):
         client = self.client()
         self.service.big = 5000
@@ -39227,6 +39274,43 @@ class TestV2Http(V2TransportBase):
         with mock.patch.dict(os.environ, {"FLEET_SWITCHBOARD_V2_CLI": "1"}):
             self.assertIsNone(sb.V2Client(sys.executable, {}, subprocess.run, 5).http)
         self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5).http, "a real run with a real binary uses the route")
+
+
+class TestDeliveryDuringABackoff(PR4Base):
+    """rev-wake's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
+
+    def open_the_breaker(self):
+        breaker = self.world.engine.v2.breaker
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            breaker.record(20, True)
+        self.assertEqual(breaker.state, "open")
+        return breaker
+
+    def test_the_person_is_typing_read_is_essential_and_an_ordinary_transcript_read_is_not(self):
+        client = self.world.engine.v2
+        self.assertTrue(client._is_essential("session.message.list", {"type": "user", "limit": 10}))
+        self.assertTrue(client._is_essential("session.message.list", {"type": "synthetic", "limit": 1}))
+        self.assertFalse(client._is_essential("session.message.list", {"type": "assistant", "limit": 1}))
+        self.assertFalse(client._is_essential("session.active"))
+
+    def test_a_pending_send_is_delivered_while_the_breaker_is_open(self):
+        breaker = self.open_the_breaker()
+        sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1, "delivered during the backoff")
+        self.assertEqual(breaker.state, "open", "and the breaker was not what let it through: optional reads stayed skipped")
+        with self.assertRaises(sb.V2Error):
+            self.world.engine.v2.session_active()
+
+    def test_with_the_user_read_optional_the_same_delivery_would_be_held(self):
+        self.open_the_breaker()
+        real = sb.V2Client._is_essential
+        with mock.patch.object(sb.V2Client, "_is_essential", lambda self_, op, params=None: False if op == "session.message.list" and (params or {}).get("type") == "user" else real(self_, op, params)):
+            sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
+            self.world.tick(5)
+            self.world.engine.run_pass()
+        self.assertEqual(self.world.admissions("platform"), [], "the failure rev-wake found: held while the person read is skipped")
 
 
 class TestV2Breaker(Base):
