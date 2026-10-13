@@ -1191,7 +1191,11 @@ class HerdrClient:
             raise HerdrError("unavailable", "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
         if result.returncode != 0:
             raise HerdrError("exit", _one_line(result.stderr) or _one_line(result.stdout) or "exit %d" % result.returncode)
-        return result.stdout or ""
+        return (result.stdout or "")[:PANE_READ_MAX]
+
+    def tab_get(self, tab):
+        """One tab as herdr shows it: {"tab_id", "pane_count", ...}."""
+        return self._result(self._call("tab", "get", tab), "tab", dict)
 
     def tab_close(self, tab):
         """Close a tab (herdr closes its panes): only ever one the switchboard has proved is a stale, session-less screen."""
@@ -3553,11 +3557,21 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
 # that shows something else is DETACHED; a pane herdr no longer has is DEAD. Both wake the Chief of Staff, which can `reattach`.
 # ======================================================================
 
+PANE_READ_MAX = 8000         # characters of a pane's screen kept
+PANE_FORGET_SECONDS = 3 * 86400   # a dead agent nobody repaired is forgotten (and stops waking cos) after this
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
 PANE_CHECKS_PER_PASS = 20    # `herdr pane get` + `pane read` pairs one pass may make
 PANE_MISSING_PASSES = 3      # a known agent absent from the herdr list this many passes in a row is DEAD (herdr restarts blink)
 PANE_ATTACHED, PANE_DETACHED, PANE_DEAD, PANE_UNKNOWN = "attached", "detached", "dead", "unknown"
+
+
+def _names_agent(text, name, session_id):
+    """True when `text` holds the agent's session id, or its name as a whole word (so `cos` is not found inside `across`)."""
+    lowered = (text or "").lower()
+    if session_id and session_id.lower() in lowered:
+        return True
+    return bool(name) and re.search(r"(?<![a-z0-9_-])%s(?![a-z0-9_-])" % re.escape(name.lower()), lowered) is not None
 
 
 def _shown_text(title, visible):
@@ -3575,19 +3589,23 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
         if "not found" in text or "no such" in text or "unknown pane" in text:
             return PANE_DEAD, "herdr has no pane %s" % pane, {}
         return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
+    title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
+            "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title), 80)}
+    if _names_agent(title, name, session_id):
+        return PANE_ATTACHED, "the pane's title names %s" % name, info
+    # FAIL MODE: a screen that cannot be read is UNKNOWN, never "nothing is shown": the verdict `detached` leads to a closed tab, so it needs
+    # positive evidence (a title that does not name the agent AND a screen that was read and does not either).
     try:
         visible = engine.herdr.pane_read_visible(pane)
-    except HerdrError:
-        visible = ""
-    title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    except HerdrError as err:
+        return PANE_UNKNOWN, "the title of pane %s does not name %s and its screen could not be read: %s" % (pane, name, _one_line(str(err), 80)), info
     text = _shown_text(title, visible)
-    info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
-            "title": _one_line(title, 80)}
-    if (name or "").lower() in text or (session_id or "").lower() in text:
+    if _names_agent(visible, name, session_id):
         return PANE_ATTACHED, "the pane shows %s" % name, info
-    others = [n for n in known_names if n and n != name and n.lower() in text] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
+    others = [n for n in known_names if n and n != name and _names_agent(text, n, None)] + [x for x in known_sessions if x and x != session_id and x.lower() in text]
     info["shows_another"] = others[:3]
-    return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, _one_line(title, 60), name, session_id), info
+    return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info
 
 
 def release_stale_binding(engine, name, taken, session_id):
@@ -3610,6 +3628,19 @@ def release_stale_binding(engine, name, taken, session_id):
     tab = info.get("tab")
     if not tab:
         raise LaunchError("pane %s is detached but herdr names no tab for it: nothing was closed" % taken.pane)
+    # The close ends EVERY pane of the tab and rests on a read made a moment ago: so the tab must hold only this pane, it must not be working,
+    # and the pane is judged AGAIN just before the close (a concurrent reattach or a person's typing changes it).
+    if str(info.get("status") or "").lower() == "working":
+        raise LaunchError("pane %s is working: it is not a stale screen, nothing was closed" % taken.pane)
+    try:
+        count = engine.herdr.tab_get(tab).get("pane_count")
+    except HerdrError as err:
+        raise LaunchError("herdr cannot say what tab %s holds (%s): nothing was closed" % (tab, _one_line(str(err), 80))) from None
+    if count != 1:
+        raise LaunchError("tab %s holds %s panes, not only the stale one: nothing was closed" % (tab, count))
+    again, why_again, again_info = pane_state(engine, name, session_id, taken.pane, names, sessions)
+    if again != PANE_DETACHED or again_info.get("shows_another") or again_info.get("tab") != tab:
+        raise LaunchError("pane %s changed while it was being judged (%s): nothing was closed" % (taken.pane, why_again))
     with engine._external("herdr.tab.close", name, {"pane": taken.pane, "tab": tab, "why": "stale binding: %s" % why}):
         engine.herdr.tab_close(tab)
     return ["pane %s was a detached screen with no session of its own (%s): tab %s closed" % (taken.pane, why, tab)]
@@ -3629,9 +3660,18 @@ def write_pane_health(state_dir, data):
     path = Path(state_dir) / PANE_HEALTH_FILE
     temp = path.with_name("%s.%d.tmp" % (PANE_HEALTH_FILE, os.getpid()))
     fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
-    os.rename(str(temp), str(path))   # atomic over an existing file on POSIX
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(str(temp), str(path))   # atomic over an existing file on POSIX
+    except OSError:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
 
 
 def pane_health_pass(engine, now):
@@ -3670,6 +3710,10 @@ def pane_health_pass(engine, now):
                         "cwd": known.get("cwd") or (agents.get(name) or {}).get("cwd"), "seen": int(now)}
     for name in list(agents):
         if name in discovery.agents:
+            continue
+        if (states.get(name) or {}).get("state") == PANE_DEAD and now - ((states.get(name) or {}).get("at") or now) > PANE_FORGET_SECONDS:
+            for table in (agents, states, missing):   # nobody repaired it in days: it stops waking cos
+                table.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:

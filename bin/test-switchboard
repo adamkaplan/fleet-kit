@@ -630,7 +630,7 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_get", "pane_process_info", "pane_read_visible",
-                                  "pane_report_metadata_token", "tab_close", "workspace_create", "workspace_list"])  # PR 16
+                                  "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
         body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
@@ -1845,7 +1845,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -1960,12 +1960,14 @@ class FakeHerdr:
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
                    ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get,
-                   ("tab", "close"): self._tab_close}.get(tuple(args[:2]))
+                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
         if tuple(args[:2]) == ("pane", "read"):
             positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
             if positional[0] not in self.panes:
                 return subprocess.CompletedProcess(argv, 1, "", "error: pane %s not found\n" % positional[0])
             entry = self.panes[positional[0]]
+            if entry.get("read_fails"):
+                return subprocess.CompletedProcess(argv, 1, "", "error: read timed out\n")
             return subprocess.CompletedProcess(argv, 0, entry.get("screen") or "  Build auto · model\n", "")
         if handler is None:
             return _usage(argv, "fake herdr: refused %r" % args)
@@ -2062,6 +2064,15 @@ class FakeHerdr:
         body = {"pane_id": pane, "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane), "cwd": entry.get("cwd") or "/tmp",
                 "agent_status": self.status(pane), "terminal_title_stripped": title}
         return {"result": {"type": "pane_info", "pane": body}}
+
+    def _tab_get(self, rest):
+        positional, _ = parse_flags(rest, ())
+        members = [p for p in self.panes if self.tab_of(p) == positional[0]]
+        if not members:
+            raise LookupError("tab %s not found" % positional[0])
+        return {"result": {"type": "tab_info", "tab": {"tab_id": positional[0], "pane_count": len(members) + len(self.extra_panes.get(positional[0], []))}}}
+
+    extra_panes = {}
 
     def _tab_close(self, rest):
         positional, _ = parse_flags(rest, ())
@@ -4125,6 +4136,72 @@ class TestLaunch(Base):
         self.assertIn("shows another fleet agent", err.getvalue())
         self.assertIn(pane, self.world.herdr.panes)
         self.assertEqual(self.world.herdr.closed, [])
+
+    def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
+        pane = self.detach()
+        self.world.herdr.panes[pane]["read_fails"] = True
+        state, why, _ = sb.pane_state(self.engine, "platform", self.world.sessions["platform"], pane)
+        self.assertEqual(state, sb.PANE_UNKNOWN)
+        self.assertIn("could not be read", why)
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual((self.world.herdr.closed, pane in self.world.herdr.panes), ([], True))
+        self.world.herdr.panes[pane]["title"] = "OC | platform"                    # a title that names the agent needs no screen at all
+        self.assertEqual(sb.pane_state(self.engine, "platform", self.world.sessions["platform"], pane)[0], sb.PANE_ATTACHED)
+
+    def test_a_tab_with_a_second_pane_or_a_working_pane_is_never_closed_and_names_match_whole_words_only(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        self.world.herdr.extra_panes = {self.world.herdr.tab_of(pane): ["a person's shell"]}
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("holds 2 panes", err.getvalue())
+        self.world.herdr.extra_panes = {}
+        self.world.herdr.panes[pane]["status"] = "working"
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertIn("is working", err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [])
+        self.assertFalse(sb._names_agent("across the board", "cos", None))
+        self.assertTrue(sb._names_agent("OC | cos", "cos", None))
+        self.assertFalse(sb._names_agent("OpenCode", "build", None))
+
+    def test_the_second_pass_after_the_recheck_window_does_not_repeat_the_audit_and_a_recovery_is_audited(self):
+        pane = self.detach()
+        self.health()
+        self.health(sb.PANE_CHECK_SECONDS + 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.detached"]), 1)
+        self.world.herdr.panes[pane]["title"] = "OC | platform"
+        self.health(2 * sb.PANE_CHECK_SECONDS + 5)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.recovered"]), 1)
+
+    def test_a_forgotten_dead_agent_stops_waking_and_the_charter_pane_line_is_rewritten_only_when_present(self):
+        self.engine.state_dir = self.world.state
+        sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
+                                                "states": {"gone": {"state": "dead", "at": 1, "pane": "w1:p9", "session": "ses_x"}}})
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, 1 + sb.PANE_FORGET_SECONDS + 5)
+        self.assertEqual(sb.read_pane_health(self.world.state)["agents"], {"platform": sb.read_pane_health(self.world.state)["agents"]["platform"]})
+        body = {"text": "Charter\npane: w1:p1\nowner: x\n"}
+        patches = []
+
+        def gh(argv, **kw):
+            if "--method" in argv and argv[argv.index("--method") + 1] == "PATCH":
+                patches.append(json.loads(kw["input"]))
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"body": body["text"]}), "")
+        self.engine.config = dict(self.engine.config, gh="gh")
+        note = sb.charter_pane_update(self.engine, gh, {"charter": 5, "repo": "acme/app"}, "w1:p7")
+        self.assertIn("now says pane: w1:p7", note)
+        self.assertEqual(patches[0]["body"], "Charter\npane: w1:p7\nowner: x\n")
+        body["text"] = "no pane line here\n"
+        self.assertIn("no `pane:` line", sb.charter_pane_update(self.engine, gh, {"charter": 5, "repo": "acme/app"}, "w1:p8"))
+        self.assertEqual(len(patches), 1)
 
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
