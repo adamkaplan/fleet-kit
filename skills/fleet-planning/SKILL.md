@@ -29,6 +29,9 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
+   **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
+   size (a light plan may carry just `size: S`). A recommendation never prefers the smaller option because it is less work when a larger one
+   simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` then flags a missing size and days for work under L.
 
 ## Check it
 
