@@ -693,6 +693,44 @@ def captain_entry(notice, facts, escalated, evidence):
     return entry
 
 
+_PR_URL = re.compile(r"https?://github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)/pull/([0-9]+)", re.I)
+_PR_SHORT = re.compile(r"(?<![\w/.:-])([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)#([0-9]+)")
+
+
+def named_prs(text):
+    """The pull requests a text names: {(owner/repo lower, number)} from a GitHub pull URL or an `owner/repo#N` ref. A bare `#N` names nothing here
+    (without its repo it could be any PR or issue)."""
+    text = str(text or "")
+    found = {(m.group(1).lower(), int(m.group(2))) for m in _PR_URL.finditer(text)}
+    return found | {(m.group(1).lower(), int(m.group(2))) for m in _PR_SHORT.finditer(_PR_URL.sub(" ", text))}
+
+
+def fold_reports_into_prs(decisions):
+    """A report that names a `pr:` decision (kind `captain`) by its URL or `owner/repo#N` is that PR's question: it is folded into the PR's row
+    (which gains `reported_by` and `reported_lines`, as an issue decision does) and has no row of its own, in whichever tier either is in. In
+    place; returns `decisions`. A report that names no such PR, or names more than one, stays. Only the first
+    DECISION_REPORT_TITLE_MAX characters of a report are searched (what the entry keeps)."""
+    prs = {(str(d["repo"]).lower(), d["number"]): d for d in decisions
+           if d.get("kind") == "captain" and d.get("repo") and isinstance(d.get("number"), int)}
+    if not prs:
+        return decisions
+    folded, lines = set(), {}
+    for d in decisions:
+        if d.get("kind") != "report":
+            continue
+        hit = [prs[ref] for ref in named_prs(d.get("title")) if ref in prs]
+        if len(hit) != 1:
+            continue
+        pr = hit[0]
+        folded.add(id(d))
+        pr["reported_by"] = sorted(set(pr.get("reported_by") or []) | {d.get("agent") or "-"})
+        lines.setdefault(id(pr), list(pr.get("reported_lines") or [])).append("%s: %s" % (d.get("agent") or "-", line_of(d.get("title"), FOLDED_LINE_MAX)))
+        pr["reported_lines"] = lines[id(pr)][-FOLDED_LINES_KEPT:]
+    if folded:
+        decisions[:] = [d for d in decisions if id(d) not in folded]
+    return decisions
+
+
 def order_decisions(decisions):
     """The list's order, in place: oldest first, ties by id."""
     decisions.sort(key=lambda d: (d["since"], d["id"]))
