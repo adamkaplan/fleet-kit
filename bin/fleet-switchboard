@@ -917,10 +917,11 @@ def v2_service_file(env):
 class V2Http:
     """One keep-alive connection for reads to the OpenCode service; see the section comment."""
 
-    def __init__(self, service_file, timeout, alive=None):
+    def __init__(self, service_file, timeout, alive=None, connect=None):
         self.file = Path(service_file)
         self.timeout = timeout
         self.alive = alive or self._pid_alive
+        self.connect = connect or http.client.HTTPConnection   # (host, port, timeout=) -> a connection; a test passes an in-memory one
         self._info = None        # (host, port, authorization) once read; never logged
         self._conn = None
         self._lock = threading.Lock()
@@ -938,13 +939,16 @@ class V2Http:
     def _load(self):
         try:
             with open(str(self.file), "rb") as handle:
+                found = os.fstat(handle.fileno())
+                if found.st_uid != os.getuid() or found.st_mode & 0o077:
+                    raise ValueError("not private to this user")   # the password in it is only trusted from a file only this user could write
                 raw = handle.read(V2_SERVICE_FILE_MAX + 1)
             if len(raw) > V2_SERVICE_FILE_MAX:
                 raise ValueError("too large")
             found = json.loads(raw.decode("utf-8"))
             url = urllib.parse.urlsplit(found["url"])
             password, pid = found["password"], found.get("pid")
-            if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1") or not url.port:
+            if url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1") or not url.port:
                 raise ValueError("not a loopback http address")   # the password goes nowhere else
             if not isinstance(password, str) or not 0 < len(password) <= 512 or re.search(r"[\x00-\x1f\x7f]", password):
                 raise ValueError("no usable password")
@@ -993,7 +997,7 @@ class V2Http:
     def _once(self, method, target, body):
         host, port, auth = self._info
         reuse = method == "GET" and self._conn is not None
-        conn = self._conn if reuse else http.client.HTTPConnection(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
+        conn = self._conn if reuse else self.connect(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
         headers = {"Authorization": auth, "Accept": "application/json"}
         data = None
         if body is not None:
@@ -1001,7 +1005,8 @@ class V2Http:
             headers["Content-Type"] = "application/json"
         sent = False
         try:
-            conn.connect() if conn.sock is None else None
+            if conn.sock is None:
+                conn.connect()
             sent = True   # from here on a write may have reached the service
             conn.request(method, target, body=data, headers=headers)
             response = conn.getresponse()
@@ -1037,11 +1042,14 @@ class _V2Unauthorized(Exception):
 
 
 class V2Breaker:
-    """Latency-driven backoff for the calls to the service (see the section comment). `record(seconds, timed_out)` returns an event or None:
-    {"event": "v2.backoff", "episode", "reason", "seconds"} when it opens, {"event": "v2.resume", "episode"} when it closes."""
+    """Latency-driven backoff for the calls to the service (see the section comment). `allows(essential)` returns False (skip the call), True, or
+    "probe" (go, and tell `record` or `abandon` it was the probe); `record(seconds, timed_out, probe)` returns an event or None:
+    {"event": "v2.backoff", "episode", "reason", "seconds"} when it opens, {"event": "v2.resume", "episode"} when it closes. One lock guards all
+    of it: the daemon has threads and one client."""
 
     def __init__(self, clock=time.monotonic):
         self.clock = clock
+        self.lock = threading.Lock()
         self.samples = []
         self.timeouts = 0
         self.state = "closed"      # closed | open (waiting) | probing
@@ -1053,6 +1061,10 @@ class V2Breaker:
         self.probe_out = False
 
     def p95(self):
+        with self.lock:
+            return self._p95()
+
+    def _p95(self):
         if not self.samples:
             return None
         ordered = sorted(self.samples)
@@ -1060,20 +1072,32 @@ class V2Breaker:
 
     def allows(self, essential):
         """Whether this call may go now. Essential calls always may; an optional one waits out the backoff, then one probe at a time."""
-        if essential or self.state == "closed":
-            return True
-        if self.state == "open" and self.clock() >= self.until and not self.probe_out:
-            self.state, self.probe_out = "probing", True
-            return True
-        if self.state == "probing" and not self.probe_out:
-            self.probe_out = True
-            return True
-        self.skipped += 1
-        return False
+        with self.lock:
+            if self.state == "closed":
+                return True
+            if essential:
+                return True
+            if self.state == "open" and self.clock() >= self.until and not self.probe_out:
+                self.state, self.probe_out = "probing", True
+                return "probe"
+            if self.state == "probing" and not self.probe_out:
+                self.probe_out = True
+                return "probe"
+            self.skipped += 1
+            return False
 
-    def record(self, seconds, timed_out):
+    def abandon(self):
+        """The probe call ended in something that is not an answer or a timeout (a bug, an interrupt): free the probe slot, learn nothing."""
+        with self.lock:
+            self.probe_out = False
+
+    def record(self, seconds, timed_out, probe=False):
+        with self.lock:
+            return self._record(seconds, timed_out, probe)
+
+    def _record(self, seconds, timed_out, probe):
         slow = timed_out or seconds > V2_SLOW_SECONDS
-        if self.state == "probing" and self.probe_out:
+        if probe and self.state == "probing":
             self.probe_out = False
             if slow:
                 self.level += 1
@@ -1087,12 +1111,12 @@ class V2Breaker:
         self.samples = (self.samples + [seconds])[-V2_SLOW_WINDOW:]
         self.timeouts = self.timeouts + 1 if timed_out else 0
         if self.state != "closed":
-            return None   # an essential call during a backoff: it is recorded, it changes nothing
+            return None   # an essential call during a backoff: it is recorded, it changes nothing (and is never mistaken for the probe)
         reason = None
         if self.timeouts >= V2_TIMEOUT_STREAK:
             reason = "%d calls in a row timed out" % self.timeouts
-        elif len(self.samples) >= V2_SLOW_MIN_SAMPLES and self.p95() > V2_SLOW_SECONDS:
-            reason = "p95 latency %.1f s is over %g s" % (self.p95(), V2_SLOW_SECONDS)
+        elif len(self.samples) >= V2_SLOW_MIN_SAMPLES and self._p95() > V2_SLOW_SECONDS:
+            reason = "p95 latency %.1f s is over %g s" % (self._p95(), V2_SLOW_SECONDS)
         if reason is None:
             return None
         self.episode += 1
@@ -1124,7 +1148,6 @@ class V2Client:
         self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation, transport) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
         self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
         self.count_errors = 0   # accounting that failed; a call never fails for it
-        self.skipped = 0        # optional reads the breaker skipped (never counted as calls: nothing was sent)
         self._link_written = 0.0
         if http is None and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
             merged = dict(os.environ)
@@ -1160,16 +1183,20 @@ class V2Client:
 
     def _call(self, operation, params=None, data=None, envelope=False):
         refuse_real_opencode_under_test(self.runner, self.binary)
-        if not self.breaker.allows(self._is_essential(operation, params)):
-            self.skipped += 1
+        ticket = self.breaker.allows(self._is_essential(operation, params))
+        if not ticket:
             raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
         started = self.monotonic()
         try:
             text = self._transport(operation, params, data)
         except V2Error as err:
-            self._record(self.monotonic() - started, err.reason == "timeout")
+            self._record(self.monotonic() - started, err.reason == "timeout", ticket == "probe")
             raise
-        self._record(self.monotonic() - started, False)
+        except BaseException:
+            if ticket == "probe":
+                self.breaker.abandon()   # not an answer: free the probe slot, or optional reads would wait for ever
+            raise
+        self._record(self.monotonic() - started, False, ticket == "probe")
         return self._decode(operation, text, envelope)
 
     def _is_essential(self, operation, params):
@@ -1178,8 +1205,8 @@ class V2Client:
             return True
         return operation == "session.message.list" and (params or {}).get("type") == "synthetic"   # the delivery rule's key read
 
-    def _record(self, seconds, timed_out):
-        event = self.breaker.record(seconds, timed_out)
+    def _record(self, seconds, timed_out, probe=False):
+        event = self.breaker.record(seconds, timed_out, probe)
         if event is not None and self.on_event is not None:
             try:
                 self.on_event(event["event"], {k: v for k, v in event.items() if k != "event"})
@@ -1197,7 +1224,7 @@ class V2Client:
         self._link_written = moment
         by = self.calls_by_transport(V2_CALLS_KEEP_SECONDS)
         body = {"at": int(moment), "transport": "http" if self.http is not None else "cli",
-                "fallbacks": by.get("cli-fallback", 0), "skipped": self.skipped,
+                "fallbacks": by.get("cli-fallback", 0), "skipped": self.breaker.skipped,
                 "breaker": self.breaker.state, "episodes": self.breaker.episode,
                 "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
         try:
@@ -1208,7 +1235,7 @@ class V2Client:
                 handle.write(json.dumps(body, sort_keys=True))
             os.replace(str(temp), str(target))
         except OSError:
-            pass   # a status line is best effort
+            self.count_errors += 1   # a status line is best effort; the failure is counted, and the line shows its own age
 
     def _transport(self, operation, params, data):
         """The reply text of one call: over HTTP when the service answers, else through the CLI (which also starts a stopped service)."""
