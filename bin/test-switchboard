@@ -38793,6 +38793,41 @@ class TestAgentsVerify(unittest.TestCase):
             self.assertEqual(unread, 0, "%s: %d lines of its permission block are not in a form the check reads" % (name, unread))
             self.assertTrue(rules, name)
 
+    def test_a_malformed_quoted_rule_is_unread_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "opencode"
+            folder.mkdir()
+            (folder / "coder.md").write_text('---\nname: coder\nmode: primary\npermissions:\n  - {action: edit, resource: "a\\qb", effect: allow}\n'
+                                             '  - {action: read, resource: "*", effect: allow}\n---\nbody\n')
+            rules, unread, _ = sb.agent_definition("coder", root)
+            self.assertEqual((rules, unread), ([("read", "*", "allow")], 1))
+            found = {"coder": ("primary", {("read", "*", "allow")})}
+            self.assertRegex("\n".join(sb.agents_problems(found, {"coder": "primary"}, root)), r"coder: 1 lines of the permission block in .*coder.md are not in a form")
+
+    def run_main_verify(self, *argv, definitions=True):
+        """`agents verify` through main() with a service answering from the shipped definitions, and (definitions False) none found beside the binary."""
+        listing = self.listing()
+
+        def runner(argv_, **kwargs):
+            return subprocess.CompletedProcess(argv_, 0, listing, "")
+        out, err = io.StringIO(), io.StringIO()
+        patched = unittest.mock.patch.object(sb, "agent_definition", lambda name, root=None: None) if not definitions else contextlib.nullcontext()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ), patched:
+            code = sb.main(["agents", "verify", *argv], runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_with_no_definitions_beside_the_binary_the_pass_says_mode_only_and_strict_exits_one(self):
+        code, out, err = self.run_main_verify(definitions=False)
+        self.assertEqual(code, 0, err)
+        self.assertIn("agents: PASS on mode only for 9 of 9", out)
+        self.assertIn("their rules were not compared", out)
+        code, out, err = self.run_main_verify("--strict", definitions=False)
+        self.assertEqual(code, 1)
+        self.assertIn("PASS on mode only", out)
+        code, out, err = self.run_main_verify("--strict")   # definitions present: a full PASS, strict or not
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("agents: PASS (9 of 9", out)
+
     def test_a_line_the_check_cannot_read_and_a_definition_that_is_not_there_are_said_not_passed(self):
         with tempfile.TemporaryDirectory() as root:
             folder = Path(root) / "opencode"
