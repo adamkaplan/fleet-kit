@@ -43,8 +43,8 @@ Python 3.9+, standard library only.
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import errno
 import collections
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -838,19 +838,58 @@ def valid_description(text):
         and "\n" not in text and "\r" not in text
 
 
+V2_CALLS_KEEP_SECONDS = 600   # how long a call is remembered, for the calls-per-minute figures
+V2_CALLS_KEEP_MAX = 50000     # and how many at most (a runaway cannot grow the list without bound)
+UNDER_TEST_ENV = "FLEET_SWITCHBOARD_UNDER_TEST"   # set by the test suite: the real opencode is then never run
+ALLOW_REAL_V2_ENV = "FLEET_SWITCHBOARD_ALLOW_REAL_V2"   # =1: a test that really means to talk to a service says so
+
+
+def refuse_real_opencode_under_test(runner, binary):
+    """Under the test suite, a call that would really run `opencode` (the real `subprocess.run`) is refused: a test that reached the live
+    service once helped take it down (tens of thousands of spawns). A fake runner is unaffected, and so is a test that says
+    FLEET_SWITCHBOARD_ALLOW_REAL_V2=1."""
+    if os.environ.get(UNDER_TEST_ENV) == "1" and os.environ.get(ALLOW_REAL_V2_ENV) != "1" and runner is subprocess.run:
+        raise V2Error("refused", None, "refusing to run the real %s under the test suite (set %s=1 to allow it in a test that means to)"
+                      % (binary, ALLOW_REAL_V2_ENV))
+
+
 class V2Client:
     """The one client for OpenCode v2. Every call is `<binary> api <operation>`."""
 
     DELIVERIES = ("queue", "steer")
     ORDERS = ("desc", "asc")
 
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20):
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time):
         self.binary = binary
         self.env = dict(env or {})
         self.runner = runner
         self.timeout = timeout
+        self.clock = clock
+        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
+        self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
+        self.count_errors = 0   # accounting that failed; a call never fails for it
+
+    def count_call(self, operation):
+        """Remember one call. NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
+        try:
+            now = self.clock()
+            with self.calls_lock:
+                self.calls.append((now, operation))
+                while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
+                    self.calls.popleft()
+        except Exception:
+            self.count_errors += 1
+
+    def calls_by_operation(self, window=60.0, now=None):
+        """{operation: calls} over the last `window` seconds (this process's own calls)."""
+        now = self.clock() if now is None else now
+        with self.calls_lock:
+            remembered = list(self.calls)
+        return dict(collections.Counter(op for at, op in remembered if at >= now - window))
 
     def _call(self, operation, params=None, data=None, envelope=False):
+        refuse_real_opencode_under_test(self.runner, self.binary)
+        self.count_call(operation)
         argv = [self.binary, "api", operation]
         for name, value in (params or {}).items():
             if value is not None:
@@ -2414,6 +2453,7 @@ class Switchboard:
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
+        record_v2_calls(self)
         return report
 
     # -- render: the sidebar badge and the toast
@@ -6522,6 +6562,62 @@ def external_status_line(config, state_dir, now):
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
 
 
+# ---------------------------------------------------------------- how many v2 calls the daemon makes (every one is an `opencode api` process)
+V2_CALLS_FILE = "v2-calls.json"
+
+
+def v2_calls_summary(v2, now):
+    """{"at", "last_minute": {op: n}, "avg_5min": {op: n/min}} from the client's own call record, or None when it keeps none (a fake in a test)."""
+    count = getattr(v2, "calls_by_operation", None)
+    if count is None:
+        return None
+    return {"at": iso(now), "last_minute": count(60.0),   # the client's own clock: the calls were stamped with it
+            "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0).items())}}
+
+
+def record_v2_calls(engine):
+    """After a pass: leave the figures where `status` can read them (a small file, renamed into place). Never raises."""
+    temp = None
+    try:
+        if engine.state_dir is None:
+            return
+        summary = v2_calls_summary(engine.v2, engine.now())
+        if summary is None:
+            return
+        path = Path(engine.state_dir) / V2_CALLS_FILE
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(summary, sort_keys=True) + "\n")
+        os.rename(str(temp), str(path))
+    except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+        try:
+            engine._note("v2_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception:
+            pass
+
+
+def v2_calls_status(state_dir, now):
+    """The `status` line text: `14/min (session.get 9, ...; 5-min average 11/min)`, or None without a record. Says so when the record is old."""
+    try:
+        body = json.loads((Path(state_dir) / V2_CALLS_FILE).read_text())
+        last = body["last_minute"]
+        by = ", ".join("%s %d" % (op, n) for op, n in sorted(last.items(), key=lambda kv: -kv[1])[:4])
+        average = sum(body["avg_5min"].values())
+        text = "%d/min (%s; 5-min average %.0f/min)" % (sum(last.values()), by or "none", average)
+        at = parse_iso(body.get("at"))
+        if at is not None and now - at > 120:
+            text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
+        return text
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):   # a record of any other shape is no record
+        return None
+
+
 def publish_decisions(engine):
     """The end of a pass: derive the list and hand it to the store (decisions.json when it changed, else a touch, so
     its age says the daemon is alive). Returns True when written."""
@@ -10517,6 +10613,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+        report["v2_calls"] = v2_calls_status(state, now())
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
@@ -10702,6 +10799,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
@@ -15178,7 +15276,10 @@ AGENTS_VERIFY_TIMEOUT = 20
 def agents_found(runner, opencode, timeout):
     """(state, payload): ("down", why) when the service cannot be asked, else ("up", {name: (mode, rule count)}) or ("bad", why)."""
     try:
+        refuse_real_opencode_under_test(runner, opencode)
         done = runner([opencode, "api", "GET", "/api/agent"], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except V2Error as err:
+        return "down", str(err)
     except subprocess.TimeoutExpired:
         return "down", "%s did not answer within %ds" % (opencode, timeout)
     except OSError as err:

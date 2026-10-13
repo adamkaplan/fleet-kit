@@ -28,6 +28,7 @@ import inspect
 import io
 import json
 import os
+os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")   # the suite never runs the real opencode (refuse_real_opencode_under_test)
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -188,8 +189,15 @@ class Base(unittest.TestCase):
         return path
 
     def run_cli(self, path, *argv):
+        env = dict(os.environ)
+        config = Path(env.get("XDG_CONFIG_HOME", "")) / "fleet-switchboard" / "config.json"
+        try:
+            if str(self.home) in config.read_text():   # its opencode is a fake script of this test's own, never the real service
+                env[sb.ALLOW_REAL_V2_ENV] = "1"
+        except OSError:
+            pass
         return subprocess.run([sys.executable, "-B", str(path), *argv],
-                              capture_output=True, text=True, env=dict(os.environ))
+                              capture_output=True, text=True, env=env)
 
 
 # ------------------------------------------------------------------ the config
@@ -13262,7 +13270,7 @@ class TestFleetHooksPlugin(Base):
         self.assertFalse(env["hasCanary"])
         self.assertNotIn("OPENROUTER_API_KEY", env["keys"])
         self.assertIn("FLEET_SWITCHBOARD_LAB", env["keys"])
-        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB"},
+        self.assertLessEqual(set(env["keys"]) - {"FLEET_SWITCHBOARD_LAB", "FLEET_SWITCHBOARD_UNDER_TEST"},   # the suite's own marker (refuse the real opencode) is passed on
                              {"PATH", "HOME", "TMPDIR", "LANG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"})
 
     def test_stricter_is_strict(self):
@@ -37227,6 +37235,171 @@ class TestDecisionsPanelOrder(unittest.TestCase):
         self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
                          "the panel's depth cap is the core's")
         self.assertNotIn("\u001b", self.r["hostile"])
+
+
+class TestV2CallAccounting(Base):
+    """Every v2 call is an `opencode api` process: they are counted, shown in `status`, and the suite can never reach the real service."""
+
+    def client(self, runner, clock):
+        return sb.V2Client("/opt/lab/bin/opencode", {}, runner, 5, clock=clock)
+
+    @staticmethod
+    def ok(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, '{"data": []}', "")
+
+    def test_every_call_is_counted_by_operation_over_a_window(self):
+        now = [1000.0]
+        v2 = self.client(self.ok, lambda: now[0])
+        for _ in range(3):
+            v2.session_get("ses_example1")
+        v2.inbox_list("ses_example1")
+        now[0] += 90
+        v2.message_list("ses_example1", limit=5)
+        self.assertEqual(v2.calls_by_operation(60.0), {"session.message.list": 1})
+        self.assertEqual(v2.calls_by_operation(300.0), {"session.get": 3, "session.inbox.list": 1, "session.message.list": 1})
+
+    def test_many_threads_calling_at_once_never_raise_and_every_call_is_counted(self):
+        v2 = self.client(self.ok, time.time)
+        errors, per_thread, threads = [], 1500, 8
+        def work():
+            try:
+                for n in range(per_thread):
+                    v2.session_get("ses_example1")
+                    if n % 5 == 0:
+                        v2.calls_by_operation(60.0)   # a reader at the same time
+            except BaseException as err:   # pragma: no cover - the failure this test exists to catch
+                errors.append(err)
+        pool = [threading.Thread(target=work) for _ in range(threads)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(v2.calls_by_operation(60.0), {"session.get": per_thread * threads})
+        self.assertEqual(v2.count_errors, 0)
+
+    def test_the_trim_the_append_and_the_read_all_run_under_the_lock(self):
+        class Recording:
+            held, entered = False, 0
+            def __enter__(self):
+                Recording.held, Recording.entered = True, Recording.entered + 1
+            def __exit__(self, *exc):
+                Recording.held = False
+        v2 = self.client(self.ok, lambda: 1.0)
+        v2.calls_lock = Recording()
+        seen = []
+        class Watched(collections.deque):
+            def append(self, item):
+                seen.append(Recording.held)
+                super().append(item)
+            def popleft(self):
+                seen.append(Recording.held)
+                return super().popleft()
+            def __iter__(self):
+                seen.append(Recording.held)
+                return super().__iter__()
+        watched = Watched(maxlen=sb.V2_CALLS_KEEP_MAX)
+        v2.calls = watched
+        v2.session_get("a")
+        v2.clock = lambda: 1.0 + sb.V2_CALLS_KEEP_SECONDS + 1   # the first call is now old: the next call trims it
+        v2.session_get("b")
+        v2.calls_by_operation(60.0)
+        self.assertGreaterEqual(len(seen), 4, "an append, an append, a trim and a read happened")
+        self.assertTrue(all(seen), "each of them under the lock: %r" % seen)
+
+    def test_the_list_is_bounded_and_a_call_never_fails_because_accounting_did(self):
+        v2 = self.client(self.ok, lambda: 1.0)
+        self.assertEqual(v2.calls.maxlen, sb.V2_CALLS_KEEP_MAX)
+        broken = self.client(self.ok, mock.Mock(side_effect=RuntimeError("clock broke")))
+        self.assertEqual(broken.session_get("x"), [], "the call went through")
+        self.assertEqual(broken.count_errors, 1, "and the accounting failure was counted")
+
+    def test_the_record_file_is_private(self):
+        world = World(self, agents=("platform",))
+        world.engine.v2 = self.client(self.ok, world.clock.now)
+        world.engine.v2.session_get("x")
+        sb.record_v2_calls(world.engine)
+        self.assertEqual(stat.S_IMODE((world.state / sb.V2_CALLS_FILE).stat().st_mode), 0o600)
+
+    def test_only_the_last_ten_minutes_are_remembered(self):
+        now = [0.0]
+        v2 = self.client(self.ok, lambda: now[0])
+        v2.session_get("a")
+        now[0] = sb.V2_CALLS_KEEP_SECONDS + 5
+        v2.session_get("b")
+        self.assertEqual(len(v2.calls), 1)
+
+    def test_a_failing_call_is_counted_too(self):
+        v2 = self.client(lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "boom"), lambda: 5.0)
+        with self.assertRaises(sb.V2Error):
+            v2.session_get("x")
+        self.assertEqual(v2.calls_by_operation(60.0, 5.0), {"session.get": 1})
+
+    def test_the_daemon_leaves_the_figures_and_status_prints_one_line(self):
+        world = World(self, agents=("platform",))
+        world.engine.v2 = self.client(self.ok, world.clock.now)
+        for op in ("session.get",) * 3 + ("session.message.list",):
+            world.engine.v2._call(op, {"sessionID": "s"})
+        sb.record_v2_calls(world.engine)
+        body = json.loads((world.state / sb.V2_CALLS_FILE).read_text())
+        self.assertEqual(body["last_minute"], {"session.get": 3, "session.message.list": 1})
+        line = sb.v2_calls_status(world.state, world.clock.now())
+        self.assertEqual(line, "4/min (session.get 3, session.message.list 1; 5-min average 1/min)")
+        world.tick(300)
+        self.assertIn("the daemon is not passing", sb.v2_calls_status(world.state, world.clock.now()))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        (self.state_dir / sb.V2_CALLS_FILE).write_text(json.dumps({"at": sb.iso(world.clock.now()), "last_minute": {"session.get": 2}, "avg_5min": {"session.get": 1.0}}))
+        text = sb.format_status(sb.collect_status(world.route, world.clock.now))
+        self.assertRegex(text, r"(?m)^      v2 calls   2/min \(session.get 2; 5-min average 1/min\)$")
+
+    def test_a_real_pass_writes_the_record(self):
+        world = World(self, agents=("platform", "coder"))
+        world.engine.run_pass()
+        body = json.loads((world.state / sb.V2_CALLS_FILE).read_text())
+        self.assertGreater(sum(body["last_minute"].values()), 0, "the pass read v2 and the daemon left the figures")
+
+    def test_a_failure_to_record_is_said_once_leaves_no_temp_file_and_never_fails_the_pass(self):
+        world = World(self, agents=("platform",))
+        with mock.patch.object(sb.os, "rename", side_effect=OSError("disk full")):
+            world.engine.run_pass()
+            world.engine.run_pass()
+        errors = [e for e in world.audit() if e["event"] == "v2_calls.error"]
+        self.assertEqual(len(errors), 1, "said once per change, not once per pass")
+        self.assertIn("disk full", errors[0]["detail"]["error"])
+        self.assertEqual([p.name for p in world.state.iterdir() if p.name.endswith(".tmp") and "v2-calls" in p.name], [])
+        sb.record_v2_calls(types.SimpleNamespace(state_dir=None, v2=world.engine.v2, now=world.clock.now))   # nowhere to write: nothing happens
+
+    def test_a_corrupt_record_prints_no_line(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        for text in ("not json", "{}", '{"at": "x", "last_minute": 3, "avg_5min": {}}', "[]"):
+            with self.subTest(text=text):
+                (self.state_dir / sb.V2_CALLS_FILE).write_text(text)
+                self.assertIsNone(sb.v2_calls_status(self.state_dir, time.time()))
+
+    def test_no_record_no_line_and_a_fake_client_leaves_no_file(self):
+        self.assertIsNone(sb.v2_calls_status(self.state_dir, time.time()))
+        world = World(self, agents=())
+        world.engine.v2 = types.SimpleNamespace()   # a client that keeps no record
+        sb.record_v2_calls(world.engine)
+        self.assertFalse((world.state / sb.V2_CALLS_FILE).exists(), "a client that keeps no record writes nothing")
+
+    def test_under_test_the_real_runner_is_refused_and_a_fake_is_not(self):
+        self.assertEqual(os.environ.get(sb.UNDER_TEST_ENV), "1")
+        real = sb.V2Client("/opt/lab/bin/opencode", {}, subprocess.run, 5)
+        with self.assertRaises(sb.V2Error) as caught:
+            real.session_get("ses_example1")
+        self.assertEqual(caught.exception.reason, "refused")
+        self.assertEqual(self.client(self.ok, time.time).session_get("x"), [])
+        self.assertEqual(sb.agents_found(subprocess.run, "/opt/lab/bin/opencode", 5)[0], "down")
+        with mock.patch.dict(os.environ, {sb.ALLOW_REAL_V2_ENV: "1"}):
+            with self.assertRaises(sb.V2Error) as caught:
+                real.session_get("ses_example1")
+            self.assertNotEqual(caught.exception.reason, "refused", "allowed: it tries (and the fake binary does not exist)")
+
+    def test_outside_the_suite_the_real_runner_is_not_refused(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV, None)
+            sb.refuse_real_opencode_under_test(subprocess.run, "opencode")
 
 
 class TestV2ReadVolume(Base):
