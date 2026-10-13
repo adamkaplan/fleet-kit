@@ -828,7 +828,8 @@ def _one_line(text, limit=300):
 
 
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
-MAX_READ_PAGES = 5   # pages of READ_LIMIT messages `delivered_keys` reads before it holds
+MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
+SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
 DESCRIPTION_MAX = 200  # characters of the one line v2's TUI shows for a synthetic message (PR 13)
 
 
@@ -1789,6 +1790,10 @@ class KeyTimes(set):
                 self.at[key] = created
 
 
+STATUS_REREAD_GAP = 5   # seconds: an agent whose state flaps is read again at most this often
+COMPACTION_TTL_MAX = 30   # seconds a compaction list is remembered (an orders fact for a compacted agent waits at most this long)
+
+
 class V2Reads:
     """What the daemon remembers of its reads of v2, and how much it may read.
 
@@ -1847,10 +1852,12 @@ class V2Reads:
         return entry[1] if entry else float("-inf")
 
     def forget(self, session_id):
-        """A write to this session (a note, a wake, a conversion) changed what is remembered about it."""
+        """A write to this session (a note, a wake, a conversion, a brief) changed what is remembered about it. The delivered-keys memory is kept
+        ON PURPOSE: delivered_keys probes the newest synthetic message before it trusts what it remembers, so a write shows there."""
         self.sessions.pop(session_id, None)
         self.inboxes.pop(session_id, None)
         self.prompts.pop(session_id, None)
+        self.compactions.pop(session_id, None)
 
     def session_info(self, session_id, status, now, fresh=False):
         """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
@@ -1863,6 +1870,11 @@ class V2Reads:
                 if not self.may_fill(now):
                     self.deferred += 1
                     return info
+            elif now - at < STATUS_REREAD_GAP or not self.may_fill(now):
+                # herdr says the state changed, but this agent was read a moment ago (a flapping agent is read at most once per gap) or the
+                # budget is spent: keep what is remembered and try again at the next pass; a read before a write is fresh whatever this says
+                self.deferred += 1
+                return info
         info = self.engine.v2.session_get(session_id) or {}
         if ttl > 0:
             self.sessions[session_id] = (info, now, status)
@@ -1905,8 +1917,9 @@ class V2Reads:
         return inbox
 
     def compaction_page(self, session_id, limit, now):
-        """The newest compactions of a session, remembered for 5 times `v2_cache_seconds` (a compaction is rare)."""
-        entry, ttl = self.compactions.get(session_id), self.ttl() * 5
+        """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
+        that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
+        entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
         if entry is not None and ttl > 0 and now - entry[1] < ttl:
             return entry[0]
         page = self.engine.v2.message_list(session_id, limit, type="compaction")
@@ -2155,7 +2168,7 @@ class Switchboard:
         # Only synthetic messages carry keys; asking for just those keeps the read
         # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
         # PR 8: more than READ_LIMIT of them are read page by page, up to MAX_READ_PAGES.
-        for page, more in self.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+        for page, more in self.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
             reached = False
             for message in page:
                 created = _created(message)
@@ -2163,13 +2176,13 @@ class Switchboard:
                     reached = True
                     break
                 keys.add_all(_fleet_keys(message), created)
-            if reached or len(page) < READ_LIMIT or more is False:
+            if reached or len(page) < SYNTHETIC_PAGE or more is False:
                 complete = True
             if complete:
                 break
         if complete and self.config["v2_cache_seconds"] > 0:
             if len(self._delivered) > 200:
-                self._delivered.clear()
+                self._delivered.pop(next(iter(self._delivered)))   # the oldest goes (dicts keep insertion order), not every recipient at once
             remembered_keys = KeyTimes()
             remembered_keys.update(keys)
             remembered_keys.at = dict(keys.at)
@@ -3559,17 +3572,15 @@ def send_brief(engine, name, session_id, brief):
     engine.reads.forget(session_id)   # a write: what was remembered of this session is old
 
 
-BRIEF_SCAN_PAGES = 25  # pages of READ_LIMIT messages; a session this long is not one that never got its brief
+BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session with more than that many is not one that never got its brief
 
 
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
-    more = None
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, max_pages=BRIEF_SCAN_PAGES):
-        if any((_fleet_meta(message) or {}).get("brief") for message in page):
-            return True
-    return bool(more)
+    page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
+    page = page if isinstance(page, list) else []
+    return any((_fleet_meta(message) or {}).get("brief") for message in page) or len(page) >= BRIEF_SCAN_USER
 
 
 VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to pick its Decisions view
@@ -4421,15 +4432,18 @@ def assigning_input(engine, observation, boss):
     Assigning: a prompt (yours, the fleet's task, or the brief `launch` sent), or a message from its boss
     (`send`, a handoff). Not assigning: a GitHub notice, a decoration, a reminder, a nudge, a toast, a
     report from one of its own workers. Newest first, within READ_LIMIT messages."""
-    for message in engine._messages(observation.session_id):
-        if not isinstance(message, dict):
-            continue
-        if message.get("type") == "user" or (
-                message.get("type") == "synthetic"
-                and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(message))):
-            created = _created(message)
-            return (message.get("id"), created) if message.get("id") and created is not None else None
-    return None
+    # Two small typed reads instead of a 200-message page of everything: the newest user message, and the newest of the last few synthetic ones
+    # that is a `send` from the boss. The newer of the two assigned it.
+    users = engine.v2.message_list(observation.session_id, limit=1, type="user")
+    synthetic = engine.v2.message_list(observation.session_id, limit=SYNTHETIC_PAGE, type="synthetic")
+    candidates = [m for m in (users if isinstance(users, list) else []) if isinstance(m, dict)]
+    candidates += [m for m in (synthetic if isinstance(synthetic, list) else []) if isinstance(m, dict)
+                   and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(m))][:1]
+    candidates = [m for m in candidates if m.get("id") and _created(m) is not None]
+    if not candidates:
+        return None
+    newest = max(candidates, key=_created)
+    return newest.get("id"), _created(newest)
 
 
 def report_jev(engine, settings):
@@ -5060,7 +5074,7 @@ def transcript_lines(engine, session_id, since):
     if cached is not None and cached[0] == newest_id and cached[1] <= since:
         return [line for line in cached[2] if line[0] >= since]  # nothing new since the last full read
     found, complete = [], False
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+    for page, more in engine.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
         for message in page:
             created = _created(message) if isinstance(message, dict) else None
             if created is None:

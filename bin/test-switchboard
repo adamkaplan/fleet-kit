@@ -2479,7 +2479,7 @@ class TestDerive(Base):
             self.world.tick(100)
         # PR 8 reads further pages, so the read is bounded to one page here: this test is about
         # the bound (more pages than MAX_READ_PAGES also holds: see TestMessagePaging).
-        with mock.patch.object(sb, "READ_LIMIT", 2), mock.patch.object(sb, "MAX_READ_PAGES", 1):
+        with mock.patch.object(sb, "SYNTHETIC_PAGE", 2), mock.patch.object(sb, "MAX_READ_PAGES", 1):
             _, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
             self.assertFalse(complete)
             plan = self.plan([fact("new")])
@@ -6987,7 +6987,7 @@ class TestWorkerDelivery(PR4Base):
         self.finish_turn()
         self.world.tick(90)
         self.world.engine.run_pass()
-        for n in range(sb.READ_LIMIT + 20):
+        for n in range(sb.SYNTHETIC_PAGE + 20):
             self.world.v2._message(self.world.v2.sessions[self.world.sessions["platform"]], "assistant", "chat", None,
                                    self.world.clock.now())
         self.world.tick(5)
@@ -10014,14 +10014,14 @@ class TestMessagePaging(Base):
         client = sb.V2Client(FAKE_OPENCODE, {}, FakeRunner(default=(0, '{"data": [{"id": "m"}]}', "")), 5)
         self.assertEqual(client.message_page(SES, 5), ([{"id": "m"}], None))
 
-    def test_450_messages_are_read_in_three_pages_and_none_is_missed(self):
+    def test_450_messages_are_read_in_nine_pages_of_fifty_and_none_is_missed(self):
         self.fill(450)
         keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
         self.assertTrue(complete)
         self.assertEqual(keys, {"k%d" % n for n in range(450)})
-        reads = [c for c in self.world.v2.calls if c[2] == "session.message.list" and "type=synthetic" in c]
-        self.assertEqual(len(reads), 3)
-        self.assertTrue(all("limit=%d" % sb.READ_LIMIT in c for c in reads))
+        reads = [c for c in self.world.v2.calls if c[2] == "session.message.list" and "type=synthetic" in c and "limit=%d" % sb.SYNTHETIC_PAGE in c]
+        self.assertEqual(len(reads), 9, "nine pages of fifty (the probe of limit 1 is not counted)")
+        self.assertTrue(all("limit=%d" % sb.SYNTHETIC_PAGE in c for c in reads))
         self.assertEqual([c for c in reads[1:] if "order=desc" in c or "order=asc" in c], [])
 
     def test_a_recipient_with_450_synthetic_messages_is_not_held(self):
@@ -10032,10 +10032,10 @@ class TestMessagePaging(Base):
 
     def test_the_read_stops_at_the_oldest_fact_without_reading_every_page(self):
         self.fill(450)
-        # the newest 200 are k250..k449, made at EPOCH+250 and later: a horizon of EPOCH+300 lies in the first page
-        keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH + 300)
+        # the newest 50 are k400..k449, made at EPOCH+400 and later: a horizon of EPOCH+420 lies in the first page
+        keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH + 420)
         self.assertTrue(complete)
-        self.assertEqual(len([c for c in self.world.v2.calls if c[2] == "session.message.list"]), 1,
+        self.assertEqual(len([c for c in self.world.v2.calls if c[2] == "session.message.list" and "limit=%d" % sb.SYNTHETIC_PAGE in c]), 1,
                          "the first page reaches the horizon, so no cursor is followed")
 
     def test_more_pages_than_the_bound_hold_rather_than_guess(self):
@@ -10059,14 +10059,14 @@ class TestMessagePaging(Base):
         self.assertIn("cannot read what cos already has", plan.reason)
 
     def test_a_full_page_with_no_next_cursor_is_the_end_not_a_hold(self):
-        self.fill(sb.READ_LIMIT)
+        self.fill(sb.SYNTHETIC_PAGE)
         keys, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
         self.assertTrue(complete)
-        self.assertEqual(len(keys), sb.READ_LIMIT)
+        self.assertEqual(len(keys), sb.SYNTHETIC_PAGE)
         self.assertEqual(len([c for c in self.world.v2.calls if c[2] == "session.message.list"]), 1)
 
     def test_an_answer_with_no_cursor_and_a_full_page_still_holds(self):
-        self.fill(sb.READ_LIMIT)
+        self.fill(sb.SYNTHETIC_PAGE)
         self.world.v2.page_of = lambda messages, params: copy.deepcopy(messages[:int(params["limit"])])
         _, complete = self.world.engine.delivered_keys(self.sid, EPOCH - 60)
         self.assertFalse(complete)
@@ -26039,14 +26039,21 @@ class TestBootstrapSendsTheBriefOnce(BootstrapCase):
         self.assertEqual(len(self.briefs(session)), 1)
 
     def test_a_listing_too_long_to_read_to_the_end_is_taken_to_hold_the_brief(self):
-        class Endless:
-            def message_pages(self, session, limit, type=None, max_pages=1):
-                for number in range(max_pages):
-                    yield [{"id": "msg_%d" % number, "type": "user"}], True
+        class Long:
+            def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+                return [{"id": "msg_%d" % n, "type": "user"} for n in range(limit)]   # a full page of the oldest user messages and no brief among them
 
         class Engine:
-            v2 = Endless()
-        self.assertTrue(sb.brief_in_transcript(Engine(), "ses_x"))
+            v2 = Long()
+        self.assertTrue(sb.brief_in_transcript(Engine(), "ses_x"), "more user messages than the read covers: taken to hold the brief")
+
+        class Short:
+            def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+                return [{"id": "msg_0", "type": "user"}]
+
+        class Engine2:
+            v2 = Short()
+        self.assertFalse(sb.brief_in_transcript(Engine2(), "ses_x"), "a short listing with no brief: not sent yet")
 
     def test_launch_and_bootstrap_send_it_by_the_one_function(self):
         self.assertIn("send_brief(", inspect.getsource(sb.launch_agent))
@@ -37155,6 +37162,42 @@ class TestV2ReadVolume(Base):
         self.assertLessEqual(self.ops(world, mark).get("session.get", 0), 6)
         self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20, "an agent is never lost to the cap: its remembered record is used")
 
+    def test_a_state_flap_storm_is_read_at_most_once_per_gap_and_counts_against_the_budget(self):
+        world = self.world(v2_reads_per_pass=1000, v2_reads_per_minute=1000)
+        self.passes(world, 2)
+        sid = world.sessions["agent3"]
+        pane = world.panes["agent3"]
+        mark = len(world.v2.calls)
+        for n in range(40):                      # the status flips every pass, a second apart
+            world.herdr.panes[pane]["status"] = "working" if n % 2 else "idle"
+            world.engine.run_pass()
+            world.tick(1)
+        gets = [self.params(c)["sessionID"] for c in world.v2.calls[mark:] if len(c) > 2 and c[2] == "session.get"]
+        self.assertLessEqual(gets.count(sid), 40 // sb.STATUS_REREAD_GAP + 1, "40 flips in 40 s: one read per gap")
+        tight = self.world(v2_reads_per_pass=0, v2_reads_per_minute=1000)
+        self.passes(tight, 2)
+        tight.herdr.panes[tight.panes["agent3"]]["status"] = "working"
+        mark = len(tight.v2.calls)
+        tight.tick(10)
+        tight.engine.run_pass()
+        self.assertEqual([c for c in tight.v2.calls[mark:] if len(c) > 2 and c[2] == "session.get" and tight.sessions["agent3"] in " ".join(c)], [],
+                         "a state change is a read like any other: with no budget it waits for the next pass")
+
+    def test_no_read_in_a_long_history_is_bigger_than_fifty_messages_including_the_assigning_one(self):
+        world = self.world()
+        sid = world.sessions["agent1"]
+        session = world.v2.sessions[sid]
+        for n in range(900):
+            kind = "user" if n % 3 == 0 else "synthetic" if n % 3 == 1 else "assistant"
+            world.v2._message(session, kind, "m%d" % n, {"fleet": {"from": "fleet-task", "keys": ["send:agent0:%d" % n]}} if kind != "assistant" else None, world.clock.now())
+            world.tick(0)
+        observation = world.engine.discover(world.clock.now()).agents["agent1"]
+        self.passes(world, 4)
+        found = sb.assigning_input(world.engine, observation, "agent0")
+        self.assertIsNotNone(found)
+        sizes = [int(self.params(c)["limit"]) for c in world.v2.calls if len(c) > 2 and c[2] == "session.message.list" and "limit" in self.params(c)]
+        self.assertLessEqual(max(sizes), 50, sorted(set(sizes)))
+
     def test_a_state_change_in_herdr_reads_the_record_at_once(self):
         world = self.world()
         self.passes(world, 2)
@@ -37301,15 +37344,18 @@ class TestV2ReadCorrectness(Base):
             world.v2._message(session, "user", "more %d" % n, {"fleet": {"from": "fleet-task"}}, world.clock.now())
         self.assertEqual(world.engine.reads.human_prompts_newest(sid), [], "buried under more than the wide read covers: said in the docstring, and a write is re-checked")
 
-    def test_compactions_are_remembered_five_times_as_long_as_a_record(self):
-        world = self.world(v2_cache_seconds=10)
+    def test_compactions_are_remembered_for_the_memory_but_never_more_than_thirty_seconds_and_a_write_forgets_them(self):
+        world = self.world(v2_cache_seconds=300)
         sid, engine = world.sessions["coder"], world.engine
         engine.reads.compaction_page(sid, 5, world.clock.now())
         mark = len(world.v2.calls)
-        engine.reads.compaction_page(sid, 5, world.clock.now() + 49)
+        engine.reads.compaction_page(sid, 5, world.clock.now() + 29)
         self.assertEqual(self.count(world, "session.message.list", mark), 0)
-        engine.reads.compaction_page(sid, 5, world.clock.now() + 51)
-        self.assertEqual(self.count(world, "session.message.list", mark), 1)
+        engine.reads.compaction_page(sid, 5, world.clock.now() + 31)
+        self.assertEqual(self.count(world, "session.message.list", mark), 1, "at most 30 s, whatever v2_cache_seconds says")
+        engine.reads.forget(sid)
+        engine.reads.compaction_page(sid, 5, world.clock.now() + 32)
+        self.assertEqual(self.count(world, "session.message.list", mark), 2, "a write to the session forgets it")
 
     def test_a_prompt_is_read_again_only_when_the_session_moved_and_forget_clears_it(self):
         world = self.world()
@@ -37338,10 +37384,23 @@ class TestV2ReadCorrectness(Base):
     def test_the_brief_a_launch_sends_forgets_what_was_remembered(self):
         world = self.world()
         sid = world.sessions["coder"]
+        info = world.v2.op_session_get({"sessionID": sid}, None)
         world.engine.reads.inbox(sid, world.clock.now())
-        self.assertIn(sid, world.engine.reads.inboxes)
-        source = (REPO / "bin" / "fleet-switchboard").read_text()
-        self.assertIn("engine.reads.forget(session_id)", source.split("def send_brief")[1].split("\ndef ")[0])
+        world.engine.reads.human_prompt(sid, info, world.clock.now())
+        self.assertTrue(sid in world.engine.reads.inboxes and sid in world.engine.reads.prompts)
+        world.v2.prompt = lambda *args, **kwargs: None   # the fake takes no brief: what matters is what the daemon forgets afterwards
+        sb.send_brief(world.engine, "coder", sid, "Do the thing")
+        self.assertFalse(sid in world.engine.reads.inboxes or sid in world.engine.reads.prompts or sid in world.engine.reads.sessions)
+
+    def test_the_delivered_keys_memory_drops_its_oldest_entry_not_all_of_them(self):
+        world = self.world()
+        engine = world.engine
+        engine._delivered = {"ses_%d" % n: (None, 0, sb.KeyTimes()) for n in range(201)}
+        sid = world.sessions["coder"]
+        engine.delivered_keys(sid, world.clock.now() - 100)
+        self.assertEqual(len(engine._delivered), 201, "one in, the oldest out")
+        self.assertNotIn("ses_0", engine._delivered)
+        self.assertIn("ses_200", engine._delivered)
 
 
 class TestAgentsVerify(unittest.TestCase):
