@@ -37679,6 +37679,7 @@ class TestV2Light(Base):
         world = self.world(agents=("platform",))
         world.fact("platform", "lab.fact:1")
         world.tick(90)
+        self.addCleanup(os.environ.__setitem__, sb.FAULT_ENV, "")
         os.environ[sb.FAULT_ENV] = "crash-after-send"
         with self.assertRaises(sb.SimulatedCrash):
             world.engine.run_pass()
@@ -37690,30 +37691,129 @@ class TestV2Light(Base):
         self.assertEqual(world.engine.run_pass()["sent"], [], "unknown fate counts as delivered: never blindly re-sent")
         self.assertEqual(len(world.admissions("platform")), 1)
 
-    def test_a_refused_send_is_released_and_sent_again(self):
-        world = self.world(agents=("platform",))
-        ledger = world.engine.sent
-        ledger.reserve("ses_example", ["k1"], 1.0)
-        self.assertEqual(sorted(ledger.known("ses_example", 0)), ["k1"])
-        ledger.release("ses_example", ["k1"])
-        self.assertEqual(sorted(ledger.known("ses_example", 0)), [])
-
-    def test_the_ledger_is_bounded_and_an_unreadable_file_is_an_empty_ledger(self):
+    def test_the_ledger_is_bounded(self):
         world = self.world(agents=("platform",))
         ledger = world.engine.sent
         for n in range(sb.SENT_PER_SESSION + 50):
-            ledger.record("ses_example", ["k%d" % n], float(n))
+            ledger.reserve("ses_example", ["k%d" % n], float(n))
+            ledger.confirm("ses_example", ["k%d" % n], float(n))
         self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
         self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
-        (world.state / sb.SENT_KEYS_FILE).write_text("not json")
-        self.assertEqual(sb.SentLedger(world.state).keys, {})
+        for n in range(sb.SENT_SESSIONS + 20):
+            ledger.confirm("ses_%d" % n, ["k"], float(1000 + n))
+        self.assertEqual(len(ledger.keys), sb.SENT_SESSIONS)
 
-    def test_status_says_what_is_off(self):
+    def test_a_missing_ledger_is_empty_but_a_corrupt_one_stops_the_sends_and_is_not_overwritten(self):
         world = self.world(agents=("platform",))
-        text = " ".join(sb.V2_LIGHT_OFF)
-        self.assertIn("compactions", text)
-        self.assertIn("brief scan", text)
+        self.assertEqual(sb.SentLedger(world.state).keys, {})
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text("not json")
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(path.read_text(), "not json", "the evidence is kept")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [], "nothing is sent on a ledger that cannot be trusted")
+        self.assertEqual(len(world.admissions("platform")), 0)
 
+    def test_a_ledger_that_cannot_be_written_refuses_the_send(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        (world.state / (sb.SENT_KEYS_FILE + ".lock")).mkdir()   # a directory where the lock file goes: it cannot be opened
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [])
+        self.assertEqual(len(world.admissions("platform")), 0, "no ledger, no write")
+        self.assertTrue(report["errors"])
+
+    def refuse_with(self, world, error):
+        def refuse(params, body):
+            raise error
+        real = world.v2.op_session_synthetic
+        world.v2.op_session_synthetic = refuse
+        return real
+
+    def test_a_definite_refusal_is_released_and_goes_next_pass(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        real = self.refuse_with(world, FakeHTTP(400, "BadRequest", "no"))
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released: not left unknown")
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), [])
+        world.v2.op_session_synthetic = real
+        world.tick(5)
+        self.assertEqual([s["keys"] for s in world.engine.run_pass()["sent"]], [["lab.fact:1"]])
+
+    def test_a_timeout_or_unreadable_reply_keeps_the_reservation_and_is_not_sent_again(self):
+        for error in (sb.V2Error("timeout", None, "no answer"), sb.V2Error("bad_json", None, "garbage")):
+            with self.subTest(reason=error.reason):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                real = self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 1, "fate unknown: reserved")
+                world.v2.op_session_synthetic = real
+                world.tick(5)
+                self.assertEqual(world.engine.run_pass()["sent"], [], "counts as delivered: at most once")
+                self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_409_is_delivered(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.refuse_with(world, FakeHTTP(409, "Conflict", "exists"))
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), ["lab.fact:1"])
+
+    def test_concurrent_writers_lose_nothing(self):
+        world = self.world(agents=("platform",))
+        barrier = threading.Barrier(4)
+
+        def write(n):
+            ledger = sb.SentLedger(world.state)
+            barrier.wait()
+            for i in range(15):
+                ledger.confirm("ses_example", ["w%d-%d" % (n, i)], float(n * 100 + i))
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(sb.SentLedger(world.state).keys["ses_example"]), 60)
+
+    def test_status_says_what_is_off_and_how_many_sends_are_of_unknown_fate(self):
+        world = self.world(agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_light": True})
+        sb.SentLedger(world.state).reserve("ses_example", ["k1"], 1.0)
+        report = sb.collect_status(world.route, world.clock.now)
+        self.assertIn("ON (features off:", report["v2_light"])
+        self.assertIn("compactions", report["v2_light"])
+        self.assertIn("1 send(s) of unknown fate", report["v2_light"])
+        self.assertIn("v2_light", sb.format_status(report))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertNotIn("v2_light", sb.collect_status(world.route, world.clock.now))
+
+    def test_each_optional_read_is_off_and_answers_what_it_did_not_see(self):
+        world = self.world(agents=("platform",))
+        engine, sid = world.engine, world.sessions["platform"]
+        world.you("platform", "hello")
+        mark = list(world.v2.calls)
+        self.assertTrue(sb.brief_in_transcript(engine, sid), "no scan: taken to hold the brief, never sent twice")
+        self.assertEqual(engine.reads.compaction_page(sid, 5, world.clock.now()), [])
+        self.assertEqual(engine.reads.human_prompts_newest(sid), [])
+        self.assertEqual(sb.inbox_human_prompts(engine, sid), [])
+        self.assertEqual(sb.transcript_lines(engine, sid, 0), [])
+        self.assertEqual(sb.synthetic_lines(engine, sid, 0, waiting=True), [])
+        self.assertEqual(engine.reads.inbox(sid, world.clock.now()), [])
+        self.assertEqual(world.v2.calls, mark, "none of them made a call")
+        self.assertTrue(engine.reads.human_prompts_newest(sid, fresh=True), "the read before a write is still made")
 
 class TestDeliverWithTheMemoryOn(TestDeliver):
     """The delivery tests again, with the daemon's memory of its v2 reads ON (default 120 s): the decisions are the same."""

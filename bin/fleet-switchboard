@@ -1820,7 +1820,8 @@ V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before 
                 "stopped/finished summary and stop classification", "landed-checks that page messages (a sent-key ledger answers instead)",
                 "report-answered checks", "brief scan")
 SENT_KEYS_FILE = "sent-keys.json"
-SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds: the newest keys of the newest sessions
+SENT_PER_SESSION, SENT_SESSIONS = 400, 200
+SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one   # the ledger's bounds: the newest keys of the newest sessions
 
 
 class SentLedger:
@@ -1837,26 +1838,40 @@ class SentLedger:
         self.lock = self.path.with_name(SENT_KEYS_FILE + ".lock") if self.path is not None else None
 
     def load(self):
+        """(sent, unknown). A MISSING file is an empty ledger; a file that is there and cannot be read or parsed is not: the ledger
+        fails CLOSED (a V2Error, so the callers hold the send and say why), never forgetting what was delivered."""
+        if self.path is None:
+            return {}, {}
         try:
-            body = json.loads(self.path.read_text()) if self.path is not None else {}
+            if self.path.stat().st_size > SENT_FILE_MAX:
+                raise V2Error("ledger_corrupt", None, "sent-keys.json is larger than any ledger the daemon writes: nothing is sent until it is moved aside")
+            text = self.path.read_text()
+        except FileNotFoundError:
+            return {}, {}
+        except OSError as err:
+            raise V2Error("ledger_unreadable", None, "sent-keys.json cannot be read (%s): nothing is sent until it can be" % err)
+        try:
+            body = json.loads(text)
             sessions = {sid: {str(k): v for k, v in entries.items() if isinstance(v, (int, float))}
                         for sid, entries in (body.get("sessions") or {}).items()}
             unknown = {sid: {str(k): v for k, v in entries.items() if isinstance(v, (int, float))}
                        for sid, entries in (body.get("unknown") or {}).items()}
-            return sessions, unknown
-        except (OSError, ValueError, AttributeError, TypeError):
-            return {}, {}   # no ledger, or an unreadable one: start empty
+        except (ValueError, AttributeError, TypeError):
+            raise V2Error("ledger_corrupt", None, "sent-keys.json is not a ledger: nothing is sent until it is moved aside (it is never read as empty)")
+        return sessions, unknown
 
     @property
     def keys(self):
         return self.load()[0]
 
     def update(self, change):
-        """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically."""
+        """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically. A ledger that cannot be
+        locked, read or written raises (V2Error): the caller does not send."""
         if self.path is None:
             return
         try:
-            with open(str(self.lock), "a") as guard:
+            fd = os.open(str(self.lock), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as guard:
                 fcntl.flock(guard, fcntl.LOCK_EX)
                 sessions, unknown = self.load()
                 change(sessions, unknown)
@@ -1872,8 +1887,8 @@ class SentLedger:
                         table.clear()
                         table.update(keep)
                 self.save(sessions, unknown)
-        except OSError:
-            pass   # a ledger that cannot be written is not a failed send
+        except OSError as err:
+            raise V2Error("ledger_unwritable", None, "sent-keys.json cannot be written (%s): nothing is sent until it can be" % err)
 
     def reserve(self, session_id, keys, created):
         def change(sessions, unknown):
@@ -1915,14 +1930,16 @@ class SentLedger:
             fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as handle:
                 handle.write(json.dumps({"sessions": sessions, "unknown": unknown}, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             os.rename(str(temp), str(self.path))
-        except Exception:
+        except Exception as err:
             if temp is not None:
                 try:
                     temp.unlink()
                 except OSError:
                     pass
-            raise OSError("sent-keys.json could not be written")
+            raise OSError("sent-keys.json could not be written: %s" % err)
 
 
 class KeyTimes(set):
@@ -2483,10 +2500,16 @@ class Switchboard:
                     raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
                                          % message_id)
                 result["id"] = record.get("id") if isinstance(record, dict) else None
-        except V2Error:
-            if self.light:
-                self.sent.release(observation.session_id, keys)   # a refused send: not delivered (a repeat is refused by v2 by its derived id)
-            raise
+        except V2Error as err:
+            if not self.light:
+                raise
+            if err.reason == "http" and err.status == 409:
+                pass   # v2 already holds this message (its id is derived from the keys): it IS delivered
+            elif (err.reason == "http" and err.status is not None) or err.reason in ("unavailable", "refused"):
+                self.sent.release(observation.session_id, keys)   # a definite refusal, or the call never ran: the write did not land
+                raise
+            else:
+                raise   # timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
