@@ -16447,26 +16447,70 @@ def add_impact_parsers(sub):
 
 # ---------------------------------------------------------------- `agents verify` (#179): did the service register OUR agents as written?
 #
-# OpenCode v2 silently registers an agent whose front matter does not parse as a default PRIMARY agent with a handful of rules. The service is
-# asked (`opencode api GET /api/agent`, read-only) and each of our agents is compared with this table: its mode and a MINIMUM rule count. The
-# minimum sits above what a default agent gets (10 to 14) and at or below what the file defines, so a failed parse fails it and a normal
-# edit does not. A service that is not running is said, not failed: nothing was installed wrongly.
+# OpenCode v2 silently registers an agent whose front matter does not parse as a default PRIMARY agent with a handful of rules of its own making.
+# The service is asked (`opencode api GET /api/agent`, read-only) and each of our agents is compared with its definition: its mode, and EVERY rule its
+# front matter declares (a `permissions:` list of {action, resource, effect}, or a `permission:` map, where `edit: allow` is action edit, resource `*`
+# and `bash` is action `shell`) must be among the registered rules with the same effect. Not a count (the service adds default rules of its own, and
+# the number of them changes between versions) and not an order (the last match wins, but a present rule is a loaded one). A default agent has none of
+# ours, so a failed parse fails it. A service that is not running is said, not failed: nothing was installed wrongly.
 EXPECTED_AGENTS = {
-    "chief-of-staff": ("primary", 150),
-    "cos-subagent": ("primary", 150),
-    "orchestrator": ("primary", 16),
-    "coder": ("primary", 16),
-    "reviewer-code": ("subagent", 35),
-    "reviewer-architecture": ("subagent", 35),
-    "reviewer-security": ("subagent", 35),
-    "reviewer-impact": ("subagent", 35),
-    "reviewer-test": ("subagent", 35),
+    "chief-of-staff": "primary",
+    "cos-subagent": "primary",
+    "orchestrator": "primary",
+    "coder": "primary",
+    "reviewer-code": "subagent",
+    "reviewer-architecture": "subagent",
+    "reviewer-security": "subagent",
+    "reviewer-impact": "subagent",
+    "reviewer-test": "subagent",
 }
 AGENTS_VERIFY_TIMEOUT = 20
+AGENT_DEFINITION_DIRS = ("opencode", "reviewers")
+_RULE_LINE = re.compile(r'^\s*-\s*\{action:\s*(.+?),\s*resource:\s*(".*"),\s*effect:\s*(allow|deny|ask)\}\s*$')
+_MAP_LINE = re.compile(r'^  ([A-Za-z_][A-Za-z0-9_]*):\s*(allow|deny|ask)\s*(?:#.*)?$')
+
+
+def agent_definition(name, root=None):
+    """(rules, unread, path) of the kit's definition of agent `name`: its declared rules as a sorted list of (action, resource, effect), the
+    lines of its permission block that the parser could not read (so they could not be checked), and the file used; None when the
+    definition cannot be found (an install without the kit's agents directory)."""
+    base = Path(root) if root is not None else Path(os.path.realpath(__file__)).parent.parent / "agents"
+    for folder in AGENT_DEFINITION_DIRS:
+        path = base / folder / (name + ".md")
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        front = text.split("\n---\n", 1)[0].splitlines()[1:]   # without the opening ---
+        rules, unread, section = set(), 0, None
+        for line in front:
+            if line.startswith("permissions:"):
+                section = "list"
+            elif line.startswith("permission:"):
+                section = "map"
+            elif line and not line.startswith((" ", "#")):
+                section = None
+            elif section and line.strip() and not line.lstrip().startswith("#"):
+                match = _RULE_LINE.match(line) if section == "list" else _MAP_LINE.match(line)
+                if match is None:
+                    unread += 1
+                elif section == "list":
+                    action = json.loads(match.group(1)) if match.group(1).startswith('"') else match.group(1)
+                    rules.add((action, json.loads(match.group(2)), match.group(3)))
+                else:
+                    rules.add(("shell" if match.group(1) == "bash" else match.group(1), "*", match.group(2)))
+        return sorted(rules), unread, str(path)
+    return None
+
+
+def agent_definition_rules(name, root=None):
+    """The declared rules of the definition (see `agent_definition`), or None when it cannot be found."""
+    found = agent_definition(name, root)
+    return None if found is None else found[0]
 
 
 def agents_found(runner, opencode, timeout):
-    """(state, payload): ("down", why) when the service cannot be asked, else ("up", {name: (mode, rule count)}) or ("bad", why)."""
+    """(state, payload): ("down", why) when the service cannot be asked, else ("up", {name: (mode, {(action, resource, effect)})}) or ("bad", why)."""
     try:
         refuse_real_opencode_under_test(runner, opencode)
         done = runner([opencode, "api", "GET", "/api/agent"], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
@@ -16480,23 +16524,36 @@ def agents_found(runner, opencode, timeout):
         return "down", "%s api GET /api/agent exited %s: %s" % (opencode, done.returncode, _one_line(done.stderr or done.stdout))
     try:
         rows = json.loads(done.stdout)["data"]
-        return "up", {row["id"]: (row["mode"], len(row["permissions"])) for row in rows}
-    except (ValueError, KeyError, TypeError) as err:
+        return "up", {row["id"]: (row["mode"], {(p.get("action"), p.get("resource"), p.get("effect")) for p in row["permissions"] if isinstance(p, dict)})
+                      for row in rows}
+    except (ValueError, KeyError, TypeError, AttributeError) as err:
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
-def agents_problems(found, expected=None):
-    """One line per agent of ours that is missing, in the wrong mode or short of rules."""
+def agents_problems(found, expected=None, root=None, unchecked=None):
+    """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
+    the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
     problems = []
-    for name, (mode, floor) in sorted((expected or EXPECTED_AGENTS).items()):
+    for name, mode in sorted((expected or EXPECTED_AGENTS).items()):
         if name not in found:
             problems.append("%s: not registered (install it, then restart the service)" % name)
             continue
-        got_mode, count = found[name]
+        got_mode, registered = found[name]
         if got_mode != mode:
             problems.append("%s: registered as %s, expected %s (its front matter probably failed to parse: quote any description with a colon)" % (name, got_mode, mode))
-        elif count < floor:
-            problems.append("%s: %d rules, expected at least %d (its permission block did not load as written)" % (name, count, floor))
+            continue
+        definition = agent_definition(name, root)
+        if definition is None:
+            if unchecked is not None:
+                unchecked.append(name)   # no definition to compare with: the mode was checked, the rules were not
+            continue
+        declared, unread, path = definition
+        if unread:
+            problems.append("%s: %d lines of the permission block in %s are not in a form this check reads, so they were not verified" % (name, unread, path))
+        missing = [rule for rule in declared if rule not in registered]
+        if missing:
+            problems.append("%s: %d of its %d rules (from %s) are not registered as written, for example %s %s %s (its permission block did not load as written)"
+                            % (name, len(missing), len(declared), path, missing[0][0], missing[0][1], missing[0][2]))
     return problems
 
 
@@ -16509,22 +16566,27 @@ def cmd_agents(args, runner, now):
     if state == "bad":
         sys.stderr.write("%s: agents verify: %s\n" % (PROG, payload))
         return EXIT_ERROR
-    problems = agents_problems(payload)
+    unchecked = []
+    problems = agents_problems(payload, unchecked=unchecked)
     if problems:
         for line in problems:
             print("FAIL  " + line)
-        print("agents: %d of %d agents are not registered as written" % (len(problems), len(EXPECTED_AGENTS)))
+        print("agents: %d problems among %d agents" % (len(problems), len(EXPECTED_AGENTS)))
         return EXIT_ERROR
-    print("agents: PASS (%d of %d registered with the expected mode and rule count)" % (len(EXPECTED_AGENTS), len(EXPECTED_AGENTS)))
+    if unchecked:
+        print("agents: PASS on mode only for %d of %d (%s): their definitions were not found beside this binary, so their rules were not compared"
+              % (len(unchecked), len(EXPECTED_AGENTS), ", ".join(unchecked)))
+        return EXIT_ERROR if args.strict else EXIT_OK
+    print("agents: PASS (%d of %d registered with the expected mode and every rule their definitions declare; rules loaded, not proof they take effect: the last match wins)" % (len(EXPECTED_AGENTS), len(EXPECTED_AGENTS)))
     return EXIT_OK
 
 
 def add_agents_parsers(sub):
     agents = sub.add_parser("agents", help="Check that the service registered the kit's agents as written (read-only)")
     agents_sub = agents.add_subparsers(dest="agents_action", required=True)
-    verify = agents_sub.add_parser("verify", help="Ask the running OpenCode service for its agents and compare each of ours with its expected mode and rule count",
+    verify = agents_sub.add_parser("verify", help="Ask the running OpenCode service for its agents and compare each of ours with its expected mode and the rules its definition declares",
                                    description="Reads `opencode api GET /api/agent` and fails (exit 1) when an agent of the kit is missing, has the wrong mode or "
-                                               "too few rules. A service that is not running is reported, not failed. Run it after installing the agents and "
+                                               "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")

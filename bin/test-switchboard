@@ -38718,13 +38718,26 @@ class TestV2ReadCorrectness(Base):
 
 
 class TestAgentsVerify(unittest.TestCase):
-    """`agents verify`: the running service's registered agents against the table of what the kit ships."""
+    """`agents verify`: the running service's registered agents against the rules each kit definition declares (not a count: the service adds default
+    rules of its own and their number changes between versions)."""
 
-    def listing(self, **changes):
-        rows = {name: (mode, floor + 5) for name, (mode, floor) in sb.EXPECTED_AGENTS.items()}
+    DEFAULTS_10 = [{"action": "read", "resource": "*.env", "effect": "ask"}, {"action": "*", "resource": "*", "effect": "allow"}] + [
+        {"action": "default%d" % n, "resource": "*", "effect": "allow"} for n in range(8)]
+    DEFAULTS_5 = DEFAULTS_10[:5]
+
+    @staticmethod
+    def rows_of(name, drop=(), flip=()):
+        rules = [r for r in sb.agent_definition_rules(name) if r not in drop]
+        return [{"action": a, "resource": res, "effect": ({"allow": "deny", "deny": "allow", "ask": "allow"}[e] if (a, res, e) in flip else e)}
+                for a, res, e in rules]
+
+    def listing(self, defaults=None, **changes):
+        """The service's answer: each agent of ours with its own rules (as `agents verify` reads them) plus `defaults`; `changes` {name: (mode, rows)}."""
+        defaults = self.DEFAULTS_10 if defaults is None else defaults
+        rows = {name: (mode, self.rows_of(name) + defaults) for name, mode in sb.EXPECTED_AGENTS.items()}
         rows.update(changes)
-        rows["build"] = ("primary", 11)   # not ours: ignored
-        return json.dumps({"location": {}, "data": [{"id": n, "mode": m, "permissions": [{}] * c} for n, (m, c) in rows.items()]})
+        rows["build"] = ("primary", list(defaults))   # not ours: ignored
+        return json.dumps({"location": {}, "data": [{"id": n, "mode": m, "permissions": r} for n, (m, r) in rows.items()]})
 
     def run_verify(self, stdout="", returncode=0, raises=None, drop=()):
         def runner(argv, **kwargs):
@@ -38738,23 +38751,71 @@ class TestAgentsVerify(unittest.TestCase):
             code = sb.main(["agents", "verify"], runner=runner)
         return code, out.getvalue(), err.getvalue()
 
-    def test_every_agent_registered_as_written_passes(self):
-        code, out, err = self.run_verify(self.listing())
-        self.assertEqual((code, err), (0, ""))
-        self.assertIn("agents: PASS (9 of 9", out)
+    def test_every_agent_registered_as_written_passes_under_a_ten_rule_and_a_five_rule_default(self):
+        for defaults in (self.DEFAULTS_10, self.DEFAULTS_5, []):
+            with self.subTest(defaults=len(defaults)):
+                code, out, err = self.run_verify(self.listing(defaults))
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn("agents: PASS (9 of 9", out)
 
     def test_a_reviewer_registered_as_a_primary_with_default_rules_fails_and_is_named(self):
-        code, out, err = self.run_verify(self.listing(**{"reviewer-code": ("primary", 10)}))
+        code, out, err = self.run_verify(self.listing(**{"reviewer-code": ("primary", list(self.DEFAULTS_10))}))
         self.assertEqual(code, 1)
         self.assertIn("FAIL  reviewer-code: registered as primary, expected subagent", out)
         self.assertEqual(out.count("FAIL"), 1)
 
-    def test_too_few_rules_and_a_missing_agent_fail(self):
-        code, out, err = self.run_verify(self.listing(**{"coder": ("primary", 11), "reviewer-test": ("subagent", 5)}).replace('"id": "reviewer-impact"', '"id": "someone-else"'))
+    def test_a_default_agent_with_none_of_our_rules_fails_whatever_its_default_count(self):
+        """The parse failure: OpenCode registers a default primary agent. For the coder that is the mode it should have, so the rules decide."""
+        for defaults in (self.DEFAULTS_10, self.DEFAULTS_5):
+            with self.subTest(defaults=len(defaults)):
+                code, out, err = self.run_verify(self.listing(**{"coder": ("primary", list(defaults))}))
+                self.assertEqual(code, 1)
+                self.assertRegex(out, r"FAIL  coder: \d+ of its \d+ rules \(from .*coder.md\) are not registered as written")
+
+    def test_a_missing_rule_and_a_rule_with_another_effect_fail_and_a_missing_agent_too(self):
+        coder = sb.agent_definition_rules("coder")
+        listing = self.listing(**{"coder": ("primary", self.rows_of("coder", drop=[coder[-1]]) + self.DEFAULTS_5),
+                                  "orchestrator": ("primary", self.rows_of("orchestrator", flip=[sb.agent_definition_rules("orchestrator")[0]]) + self.DEFAULTS_5)})
+        code, out, err = self.run_verify(listing.replace('"id": "reviewer-impact"', '"id": "someone-else"'))
         self.assertEqual(code, 1)
-        self.assertIn("coder: 11 rules, expected at least 16", out)
-        self.assertIn("reviewer-test: 5 rules, expected at least 35", out)
+        self.assertRegex(out, r"coder: 1 of its %d rules \(from .*coder.md\) are not registered as written" % len(coder))
+        self.assertRegex(out, r"orchestrator: 1 of its \d+ rules \(from .*orchestrator.md\)")
         self.assertIn("reviewer-impact: not registered", out)
+
+    def test_the_order_of_the_registered_rules_does_not_matter(self):
+        rows = list(reversed(self.rows_of("coder") + self.DEFAULTS_5))
+        code, out, err = self.run_verify(self.listing(**{"coder": ("primary", rows)}))
+        self.assertEqual((code, err), (0, ""))
+
+    def test_every_shipped_definition_is_read_whole_no_line_of_its_permission_block_is_skipped(self):
+        for name in sb.EXPECTED_AGENTS:
+            rules, unread, path = sb.agent_definition(name)
+            self.assertEqual(unread, 0, "%s: %d lines of its permission block are not in a form the check reads" % (name, unread))
+            self.assertTrue(rules, name)
+
+    def test_a_line_the_check_cannot_read_and_a_definition_that_is_not_there_are_said_not_passed(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "opencode"
+            folder.mkdir()
+            (folder / "coder.md").write_text("---\nname: coder\nmode: primary\npermission:\n  edit: allow\n  bash:\n    git *: allow\n---\nbody\n")
+            found = {"coder": ("primary", {("edit", "*", "allow")})}
+            self.assertRegex("\n".join(sb.agents_problems(found, {"coder": "primary"}, root)), r"coder: 2 lines of the permission block in .*coder.md are not in a form")
+            unchecked = []
+            self.assertEqual(sb.agents_problems(found, {"coder": "primary"}, root + "/none", unchecked), [])
+            self.assertEqual(unchecked, ["coder"], "the rules were not compared: said, not passed")
+            self.assertEqual(sb.agents_problems({"coder": ("subagent", set())}, {"coder": "primary"}, root + "/none"), [
+                "coder: registered as subagent, expected primary (its front matter probably failed to parse: quote any description with a colon)"], "the mode is still checked")
+
+    def test_the_definitions_are_read_as_the_service_registers_them(self):
+        """A permission map entry `edit: allow` is action edit, resource `*`; `bash` is action `shell`. A list entry keeps its action, resource and effect."""
+        rules = sb.agent_definition_rules("coder")
+        self.assertIn(("edit", "*", "allow"), rules)
+        self.assertIn(("shell", "*", "allow"), rules)
+        self.assertIn(("external_directory", "*", "allow"), rules)
+        self.assertNotIn(("bash", "*", "allow"), rules)
+        self.assertIn(("*", "*", "deny"), sb.agent_definition_rules("reviewer-code"))
+        self.assertIn(("shell", "fleet-switchboard review laws *", "allow"), sb.agent_definition_rules("reviewer-code"))
+        self.assertIsNone(sb.agent_definition_rules("nobody"))
 
     def test_a_service_that_is_not_running_is_said_and_is_not_a_failure(self):
         for kwargs in ({"raises": subprocess.TimeoutExpired("opencode", 20)}, {"raises": FileNotFoundError(2, "No such file")}, {"returncode": 1}):
@@ -38772,25 +38833,18 @@ class TestAgentsVerify(unittest.TestCase):
             self.assertEqual(sb.main(["agents", "verify"], runner=down), 0)
         self.assertEqual(out.getvalue().count("nothing was checked"), 2)
 
-    def test_the_coder_and_orchestrator_floor_is_above_what_a_default_agent_gets(self):
-        self.assertGreater(sb.EXPECTED_AGENTS["coder"][1], 14)   # the default plan agent has 14 rules
-        self.assertGreater(sb.EXPECTED_AGENTS["orchestrator"][1], 14)
-
     def test_an_answer_that_is_not_the_agent_list_fails(self):
         code, out, err = self.run_verify("<html>not json</html>")
         self.assertEqual(code, 1)
         self.assertIn("not the agent list", err)
 
-    def test_the_table_names_every_agent_the_kit_installs_and_each_floor_is_below_what_its_file_defines(self):
+    def test_the_table_names_every_agent_the_kit_installs_and_each_definition_declares_rules_and_the_mode(self):
         self.assertEqual(set(sb.EXPECTED_AGENTS), set(sb.KIT_AGENTS))
-        for name, (mode, floor) in sb.EXPECTED_AGENTS.items():
+        for name, mode in sb.EXPECTED_AGENTS.items():
             folder = "reviewers" if name.startswith("reviewer-") else "opencode"
             text = (REPO / "agents" / folder / (name + ".md")).read_text()
             self.assertRegex(text, r"(?m)^mode: %s$" % mode if mode == "subagent" else r"(?m)^description:")
-            defined = len(re.findall(r"(?m)^\s*- \{action:", text.split("---\n")[1]))
-            self.assertLessEqual(floor, max(defined, floor), name)
-            if defined:
-                self.assertLess(floor, defined + 12, name)
+            self.assertTrue(sb.agent_definition_rules(name), "%s declares no rules the check can read: its permission block would not be verified" % name)
         self.assertIn("agents verify", (REPO / "INSTALL.md").read_text())
         self.assertIn("agents verify", (REPO / "docs" / "switchboard.md").read_text())
         self.assertIn("--strict", (REPO / "INSTALL.md").read_text())
