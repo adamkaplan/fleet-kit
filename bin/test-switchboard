@@ -39967,6 +39967,23 @@ class TestEventFeedStreamEdges(V2TransportBase):
         crashing.run()
         self.assertEqual((crashing.status()["errors"], crashing.status()["down"]), (1, "RuntimeError"), "counted, and the loop goes on instead of dying")
 
+    def test_a_read_timeout_yields_the_idle_marker_and_any_other_error_does_not(self):
+        self.service.stream = [feed_line("session.step.ended", assistantMessageID="m"), None]
+        got = list(self.route(5).stream_lines("/api/event"))
+        self.assertIs(got[0], sb.STREAM_OPENED)
+        self.assertIs(got[-1], sb.STREAM_IDLE, "quiet for the whole idle time: ours to end")
+        original = sb.FakeServiceResponse.readline if hasattr(sb, "FakeServiceResponse") else None
+        conn_class = type(self.service.connect("h", 1, timeout=5))
+        real_get = conn_class.getresponse
+
+        def broken(conn):
+            response = real_get(conn)
+            response.readline = lambda limit=-1: (_ for _ in ()).throw(OSError("connection reset"))
+            return response
+        with mock.patch.object(conn_class, "getresponse", broken):
+            got = list(self.route(5).stream_lines("/api/event"))
+        self.assertEqual(got, [sb.STREAM_OPENED], "a reset is not the idle end: the next open is a gap")
+
     def test_a_non_200_answer_is_an_error_and_no_gap_is_marked(self):
         self.service.stream_status = 500
         feed = sb.EventFeed(self.route(5), None, sleep=lambda s: feed.stop())
@@ -40163,6 +40180,33 @@ class TestEventFeedReads(unittest.TestCase):
         feed.consume(iter([sb.STREAM_OPENED]))
         self.assertTrue(feed.needs_resync, "a close or a drop is a gap")
 
+    def test_an_idle_end_followed_by_a_failed_open_is_not_remembered_the_next_open_is_a_gap(self):
+        feed = sb.EventFeed(None)
+        feed.consume(iter([sb.STREAM_OPENED, sb.STREAM_IDLE]))
+        self.assertTrue(feed.quiet_end)
+
+        class Down:
+            def stream_lines(self, path):
+                raise sb.V2Unreachable("down")
+        failing = sb.EventFeed(Down(), None, sleep=lambda s: failing.stop())
+        failing.quiet_end = True
+        failing.run()
+        self.assertFalse(failing.quiet_end, "a failed open means events may have been missed: the idle exemption is gone")
+        failing.needs_resync = False
+        failing.stop_event.clear()
+        failing.consume(iter([sb.STREAM_OPENED]))
+        self.assertTrue(failing.needs_resync, "idle end, a failed open, then a successful one must resync")
+
+    def test_the_sessions_kept_stay_bounded_when_failed_reads_name_new_ones(self):
+        feed = sb.EventFeed(None, None, lambda: 1.0)
+        feed.connected, feed.needs_resync = True, False
+        feed.need("t")
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(message_list=lambda *a, **k: (_ for _ in ()).throw(sb.V2Error("backoff", None, "x"))))
+        with mock.patch.object(sb, "FEED_SESSIONS_MAX", 3):
+            for n in range(10):
+                feed._read(engine, "ses_%d" % n, 1.0, announced=True)
+        self.assertLessEqual(feed.status()["sessions"], 3)
+
     def test_ids_over_the_cap_are_not_kept_and_the_generator_is_closed_when_the_feed_stops(self):
         feed = sb.EventFeed(None)
         feed.handle(feed_line("session.step.ended", session="s" * (sb.FEED_ID_MAX + 1), assistantMessageID="m"))
@@ -40182,7 +40226,7 @@ class TestEventFeedReads(unittest.TestCase):
         feed.consume(gen)
         self.assertEqual(closed, [True], "closed at once, not when collected")
 
-    def test_four_or_more_persistently_failing_sessions_go_to_the_back_and_the_reconcile_still_runs(self):
+    def test_at_least_a_whole_pass_of_persistently_failing_sessions_go_to_the_back_and_the_rest_are_reached(self):
         now = [1000.0]
 
         class Flaky:
@@ -40191,19 +40235,20 @@ class TestEventFeedReads(unittest.TestCase):
 
             def message_list(f, session, **k):
                 f.calls.append(session)
-                if session in ("s0", "s1", "s2", "s3", "s4"):
+                if session in failing:
                     raise sb.V2Error("backoff", None, "skipped")
                 return [{"id": "m"}]
+        sessions = ["s%d" % n for n in range(sb.FEED_RESYNC_PER_PASS + 6)]
+        failing = set(sessions[:sb.FEED_RESYNC_PER_PASS + 1])   # more than a whole pass of sessions keep failing
         feed = self.feed(now)
         feed.needs_resync = True
         engine = types.SimpleNamespace(v2=Flaky())
-        sessions = ["s%d" % n for n in range(10)]
         for _ in range(4):
             now[0] += 200
             feed.tick(engine, sessions)
-        self.assertTrue(set(sessions[5:]) <= set(engine.v2.calls), "the healthy sessions were reached although 5 others keep failing")
+        self.assertTrue(set(sessions[len(failing):]) <= set(engine.v2.calls), "the healthy sessions were reached although a whole pass of others keeps failing")
 
-    def test_a_failing_few_cannot_starve_the_rest_and_failures_are_counted(self):
+    def test_a_feed_that_is_not_connected_reads_nothing_the_old_reads_are_all_there_is(self):
         feed = sb.EventFeed(None, None, lambda: 1000.0)
         feed.needs_resync = True
         feed.need("test")

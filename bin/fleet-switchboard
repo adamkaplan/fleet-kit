@@ -2512,6 +2512,7 @@ class EventFeed:
                     backoff = 1   # it lived: a long connection that ended is not a flapping one
             except Exception as err:   # anything at all: one bad connection is a counted error, never a dead reader thread
                 with self.lock:
+                    self.quiet_end = False   # a failed open: events may have been missed meanwhile, so the next open is a gap whatever ended the last connection
                     self.connected = False
                     self.down_reason = type(err).__name__
                     self.counts["errors"] += 1
@@ -2563,11 +2564,7 @@ class EventFeed:
             self.counts["events"] += 1
             if session is None:
                 return
-            entry = self.seen.get(session)
-            if entry is None:
-                if len(self.seen) >= FEED_SESSIONS_MAX:
-                    self.seen.pop(next(iter(self.seen)))
-                entry = self.seen[session] = {"assistant": None, "idle_ms": None, "read": None, "event_at": None}
+            entry = self._entry(session)
             entry["event_at"] = self.now()
             message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
             if message and kind in ("session.text.ended", "session.step.ended"):
@@ -2578,6 +2575,15 @@ class EventFeed:
                 entry["idle_ms"] = int(created) if finite else int(self.now() * 1000)
 
     # -- what the pass thread asks
+
+    def _entry(self, session):
+        """The remembered state of a session, made if new (at most FEED_SESSIONS_MAX are kept: the oldest goes). Call with the lock held."""
+        entry = self.seen.get(session)
+        if entry is None:
+            if len(self.seen) >= FEED_SESSIONS_MAX:
+                self.seen.pop(next(iter(self.seen)))
+            entry = self.seen[session] = {"assistant": None, "idle_ms": None, "read": None, "event_at": None}
+        return entry
 
     def need(self, name):
         """A reader that wants the feed's help registers here; until one does the feed reads nothing (it only observes)."""
@@ -2633,12 +2639,12 @@ class EventFeed:
         except V2Error:
             with self.lock:
                 self.counts["read_errors"] += 1
-                entry = self.seen.setdefault(session, {"assistant": None, "idle_ms": None, "read": None, "event_at": None})
+                entry = self._entry(session)
                 entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
         with self.lock:
-            entry = self.seen.setdefault(session, {"assistant": None, "idle_ms": None, "read": None, "event_at": None})
+            entry = self._entry(session)
             known, entry["read"] = entry["assistant"], now
             missed = announced and known is not None and isinstance(newest, str) and known != newest   # a session no event ever named has nothing to have missed
             if isinstance(newest, str) and known != newest:
