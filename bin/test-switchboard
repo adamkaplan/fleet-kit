@@ -203,7 +203,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [],
+            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -2129,7 +2129,8 @@ class World:
         self.sessions, self.panes = {}, {}
         for name in agents:
             self.add_agent(name)
-        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+               "v2_cache_seconds": 0}   # the scenarios of old read the world afresh every pass; TestV2ReadVolume turns the memory on
         raw.update(config or {})
         self.config = sb.validate_config(raw)
         self.engine = self.new_engine()
@@ -2409,7 +2410,8 @@ class TestDiscovery(Base):
         self.assertIsNone(seen.last_human_prompt)
         self.assertFalse(seen.engaged(world.clock.now(), 600))
         argv = [a for a in world.v2.calls if a[2] == "session.message.list"][-1]
-        self.assertIn("limit=%d" % sb.READ_LIMIT, argv)
+        self.assertIn("limit=%d" % sb.V2Reads.PROMPT_READ, argv)   # a small read of the newest user messages, not a 200-message page
+        self.assertIn("type=user", argv)
 
     def test_two_sessions_with_one_name_are_a_conflict(self):
         world = World(self, agents=("platform",))
@@ -37085,8 +37087,8 @@ class TestV2ReadVolume(Base):
     AGENTS = tuple("agent%d" % n for n in range(20))
 
     def world(self, **config):
-        world = World(self, agents=self.AGENTS, config=config)
-        return world
+        config.setdefault("v2_cache_seconds", 120)   # the memory on (the other tests' World has it off)
+        return World(self, agents=self.AGENTS, config=config)
 
     @staticmethod
     def ops(world, since=0):
@@ -37198,6 +37200,19 @@ class TestV2ReadVolume(Base):
         engine.reads.forget(sid)
         engine.reads.inbox(sid, world.clock.now())
         self.assertEqual(self.ops(world, mark), {"session.inbox.list": 1})
+
+    def test_an_agent_with_something_pending_has_its_inbox_read_afresh_every_pass_the_others_do_not(self):
+        world = self.world()
+        self.passes(world, 2)
+        engine = world.engine
+        observation = engine.discover(world.clock.now()).agents["agent7"]
+        plan = types.SimpleNamespace(pending=[object()])
+        mark = len(world.v2.calls)
+        engine.unread_count(observation, {})
+        self.assertEqual(self.ops(world, mark), {}, "nothing pending: the remembered inbox")
+        engine.unread_count(observation, {"agent7": plan})
+        engine.unread_count(observation, {"agent7": plan})
+        self.assertEqual(self.ops(world, mark), {"session.inbox.list": 2}, "pending: read afresh every time, so a new note is noticed at the next pass")
 
     def test_delivered_keys_probes_with_one_small_read_when_nothing_changed(self):
         world = self.world()

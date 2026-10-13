@@ -2395,7 +2395,8 @@ class Switchboard:
         the facts in switchboard notes that wait in v2's inbox for a turn to
         carry them, plus the facts held for the agent. A note a turn has
         carried is read; a wake starts its own turn, so it is never unread."""
-        inbox = self.reads.inbox(observation.session_id, self.now())
+        # An agent with something pending (a held plan) is never served from memory: a send or a note for it is noticed at the next pass.
+        inbox = self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
         waiting = [item for item in (inbox if isinstance(inbox, list) else [])
                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
                    and item.get("delivery") == "steer" and item.get("resume") is not True]
