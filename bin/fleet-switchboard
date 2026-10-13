@@ -3314,11 +3314,17 @@ LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lane
 
 def launch_agent_problem(config, runner, agent):
     """Why `agent` cannot be launched: the OpenCode service does not know it (an agent with no installed definition starts as the default Build
-    agent with the brief unsent). None when it is registered, or when the service cannot be asked (v2 then refuses it itself)."""
+    agent with the brief unsent), or knows it only as a subagent (a pane runs a primary agent). None when it is a registered primary agent, or when
+    the service cannot be asked (v2 then refuses it itself)."""
     state, found = agents_found(runner, config.get("opencode") or "opencode", AGENTS_VERIFY_TIMEOUT)
-    if state != "up" or agent in found:
+    if state != "up":
         return None
     known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
+    if agent in found:
+        if found[agent][0] in ("primary", "all"):   # `all` can run as a pane's agent too (OpenCode modes: primary, subagent, all)
+            return None
+        return ("--agent %r is registered as a %s, not a primary agent: a launched pane runs a primary agent, and a subagent is run by another agent's Task tool "
+                "(primary agents registered: %s)" % (agent, found[agent][0], known))
     return ("--agent %r is not registered with the OpenCode service, so it would start as the default agent and the brief would not be sent "
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
