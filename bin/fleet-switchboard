@@ -46,6 +46,7 @@ import http.client
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import collections
 import errno
 import fcntl
 import getpass
@@ -297,6 +298,10 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
+    "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
+    "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
+    "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
@@ -430,6 +435,9 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
+        if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
+            raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
@@ -824,13 +832,29 @@ def _one_line(text, limit=300):
 
 
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
-MAX_READ_PAGES = 5   # pages of READ_LIMIT messages `delivered_keys` reads before it holds
+MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
+SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
 DESCRIPTION_MAX = 200  # characters of the one line v2's TUI shows for a synthetic message (PR 13)
 
 
 def valid_description(text):
     return isinstance(text, str) and bool(text.strip()) and len(text) <= DESCRIPTION_MAX \
         and "\n" not in text and "\r" not in text
+
+
+V2_CALLS_KEEP_SECONDS = 600   # how long a call is remembered, for the calls-per-minute figures
+V2_CALLS_KEEP_MAX = 50000     # and how many at most (a runaway cannot grow the list without bound)
+UNDER_TEST_ENV = "FLEET_SWITCHBOARD_UNDER_TEST"   # set by the test suite: the real opencode is then never run
+ALLOW_REAL_V2_ENV = "FLEET_SWITCHBOARD_ALLOW_REAL_V2"   # =1: a test that really means to talk to a service says so
+
+
+def refuse_real_opencode_under_test(runner, binary):
+    """Under the test suite, a call that would really run `opencode` (the real `subprocess.run`) is refused: a test that reached the live
+    service once helped take it down (tens of thousands of spawns). A fake runner is unaffected, and so is a test that says
+    FLEET_SWITCHBOARD_ALLOW_REAL_V2=1."""
+    if os.environ.get(UNDER_TEST_ENV) == "1" and os.environ.get(ALLOW_REAL_V2_ENV) != "1" and runner is subprocess.run:
+        raise V2Error("refused", None, "refusing to run the real %s under the test suite (set %s=1 to allow it in a test that means to)"
+                      % (binary, ALLOW_REAL_V2_ENV))
 
 
 # ---------------------------------------------------------------- the v2 transport: HTTP to the background service, and backpressure
@@ -1082,21 +1106,25 @@ class V2Breaker:
 
 class V2Client:
     """The one client for OpenCode v2. A call goes over HTTP to the background service when it can (see the transport section above), else
-    through `<binary> api <operation>`; every call is timed by the breaker."""
+    through `<binary> api <operation>`; every call is counted (one record, with its transport) and timed by the breaker."""
 
     DELIVERIES = ("queue", "steer")
     ORDERS = ("desc", "asc")
 
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, http=None, clock=time.monotonic):
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time, http=None, monotonic=time.monotonic):
         self.binary = binary
         self.env = dict(env or {})
         self.runner = runner
         self.timeout = timeout
         self.clock = clock
-        self.breaker = V2Breaker(clock)
+        self.monotonic = monotonic   # durations of calls, for the breaker: never the wall clock
+        self.breaker = V2Breaker(monotonic)
         self.on_event = None      # callable(name, detail): the engine's audit of `v2.backoff` and `v2.resume`
         self.state_dir = None     # set for the daemon: where `v2-link.json` (what `status` shows) is written
-        self.counts = {"http": 0, "cli": 0, "fallback": 0, "skipped": 0}
+        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation, transport) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
+        self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
+        self.count_errors = 0   # accounting that failed; a call never fails for it
+        self.skipped = 0        # optional reads the breaker skipped (never counted as calls: nothing was sent)
         self._link_written = 0.0
         if http is None and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
             merged = dict(os.environ)
@@ -1104,26 +1132,51 @@ class V2Client:
             http = V2Http(v2_service_file(merged), timeout)   # a real run only: a fake runner stands for the CLI
         self.http = http
 
+    def count_call(self, operation, transport="cli"):
+        """Remember one call and the way it travelled ("http", "cli", or "cli-fallback": the CLI after the HTTP route could not serve it).
+        NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
+        try:
+            now = self.clock()
+            with self.calls_lock:
+                self.calls.append((now, operation, transport))
+                while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
+                    self.calls.popleft()
+        except Exception:
+            self.count_errors += 1
+
+    def _recent(self, window, now):
+        now = self.clock() if now is None else now
+        with self.calls_lock:
+            remembered = list(self.calls)
+        return [call for call in remembered if call[0] >= now - window]
+
+    def calls_by_operation(self, window=60.0, now=None):
+        """{operation: calls} over the last `window` seconds (this process's own calls, whatever the transport)."""
+        return dict(collections.Counter(call[1] for call in self._recent(window, now)))
+
+    def calls_by_transport(self, window=60.0, now=None):
+        """{transport: calls} over the last `window` seconds: how many went over HTTP, through the CLI, or through the CLI after a fallback."""
+        return dict(collections.Counter(call[2] for call in self._recent(window, now)))
+
+    def _call(self, operation, params=None, data=None, envelope=False):
+        refuse_real_opencode_under_test(self.runner, self.binary)
+        if not self.breaker.allows(self._is_essential(operation, params)):
+            self.skipped += 1
+            raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
+        started = self.monotonic()
+        try:
+            text = self._transport(operation, params, data)
+        except V2Error as err:
+            self._record(self.monotonic() - started, err.reason == "timeout")
+            raise
+        self._record(self.monotonic() - started, False)
+        return self._decode(operation, text, envelope)
+
     def _is_essential(self, operation, params):
         spec = V2_HTTP_OPERATIONS.get(operation)
         if spec is None or spec[0] != "GET" or operation in V2_ESSENTIAL_READS:
             return True
         return operation == "session.message.list" and (params or {}).get("type") == "synthetic"   # the delivery rule's key read
-
-    def _call(self, operation, params=None, data=None, envelope=False):
-        if not self.breaker.allows(self._is_essential(operation, params)):
-            self.counts["skipped"] += 1
-            raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
-        started = self.clock()
-        timed_out = False
-        try:
-            text = self._transport(operation, params, data)
-        except V2Error as err:
-            timed_out = err.reason == "timeout"
-            self._record(self.clock() - started, timed_out)
-            raise
-        self._record(self.clock() - started, False)
-        return self._decode(operation, text, envelope)
 
     def _record(self, seconds, timed_out):
         event = self.breaker.record(seconds, timed_out)
@@ -1142,7 +1195,9 @@ class V2Client:
         if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
             return
         self._link_written = moment
-        body = {"at": int(moment), "transport": "http" if self.http is not None else "cli", "calls": dict(self.counts),
+        by = self.calls_by_transport(V2_CALLS_KEEP_SECONDS)
+        body = {"at": int(moment), "transport": "http" if self.http is not None else "cli",
+                "fallbacks": by.get("cli-fallback", 0), "skipped": self.skipped,
                 "breaker": self.breaker.state, "episodes": self.breaker.episode,
                 "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
         try:
@@ -1164,13 +1219,16 @@ class V2Client:
                 try:
                     status, text = self.http.request(spec[0], target, data)
                 except V2Unreachable:
-                    self.counts["fallback"] += 1
-                else:
-                    self.counts["http"] += 1
-                    if status >= 400:
-                        raise V2Error("http", status, _one_line(text) or "HTTP %d" % status)
-                    return text
-        self.counts["cli"] += 1
+                    self.count_call(operation, "cli-fallback")   # the HTTP route reached nothing: the CLI call is the one that counts
+                    return self._cli(operation, params, data)
+                except V2Error:
+                    self.count_call(operation, "http")           # it reached the service (a timeout, a refused size, a dropped write)
+                    raise
+                self.count_call(operation, "http")
+                if status >= 400:
+                    raise V2Error("http", status, _one_line(text) or "HTTP %d" % status)
+                return text
+        self.count_call(operation, "cli")
         return self._cli(operation, params, data)
 
     @staticmethod
@@ -2135,6 +2193,144 @@ class KeyTimes(set):
                 self.at[key] = created
 
 
+STATUS_REREAD_GAP = 5   # seconds: an agent whose state flaps is read again at most this often
+COMPACTION_TTL_MAX = 30   # seconds a compaction list is remembered (an orders fact for a compacted agent waits at most this long)
+
+
+class V2Reads:
+    """What the daemon remembers of its reads of v2, and how much it may read.
+
+    Every v2 read is an `opencode api` process, and a session's record, its inbox and its transcript almost never change between two passes (a
+    pass every few seconds), so a pass that read each agent afresh cost tens of calls and, with many agents, took the service down. Now:
+
+      - a session's record (`session.get`) is remembered for `v2_cache_seconds`, and re-read at once when herdr says the agent's state changed;
+      - the newest human prompt is read as ONE small `message.list` (type user, PROMPT_READ messages), and only when the session's `time.updated`
+        moved, never a 200-message page;
+      - a session's inbox, and its compaction list, are remembered for `v2_cache_seconds` and 5 times that;
+      - background reads (cache fills) are capped per pass and per minute: past the cap what is remembered is kept (a read nobody has made yet is
+        still made), and the stalest agent is read first the next pass (`stale_first`), so every agent is refreshed in turn.
+
+    A read just BEFORE A WRITE is never served from here (`fresh=True`): invariant 4 holds. `v2_cache_seconds` 0 remembers nothing."""
+
+    PROMPT_READ = 10
+    PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
+
+    def human_prompts_newest(self, session_id):
+        """The person's prompts (user messages without `metadata.fleet`), newest first, from at most two small reads: the newest PROMPT_READ user
+        messages, and only if they are ALL the fleet's (a person's prompt may sit behind them) the newest PROMPT_READ_WIDE. A prompt buried
+        under more fleet messages than that is not seen: the person is then not counted as engaged by this read, and a write is re-checked anyway."""
+        for limit in (self.PROMPT_READ, self.PROMPT_READ_WIDE):
+            page = self.engine.v2.message_list(session_id, limit=limit, type="user")
+            page = page if isinstance(page, list) else []
+            found = [m for m in page if isinstance(m, dict) and _fleet_meta(m) is None]
+            if found or len(page) < limit:
+                return found
+        return []
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.sessions, self.prompts, self.inboxes, self.compactions = {}, {}, {}, {}   # session id -> remembered answer; memory only
+        self.pass_fills, self.deferred, self.minute = 0, 0, collections.deque()
+
+    def begin_pass(self):
+        self.pass_fills, self.deferred = 0, 0
+
+    def ttl(self):
+        return self.engine.config["v2_cache_seconds"]
+
+    def may_fill(self, now):
+        """True while this pass and this minute have background reads left."""
+        while self.minute and self.minute[0] < now - 60:
+            self.minute.popleft()
+        return (self.pass_fills < self.engine.config["v2_reads_per_pass"]
+                and len(self.minute) < self.engine.config["v2_reads_per_minute"])
+
+    def filled(self, now):
+        self.pass_fills += 1
+        self.minute.append(now)
+
+    def stale_first(self, session_id):
+        """Sort key: the agent whose record is oldest (or never read) comes first."""
+        entry = self.sessions.get(session_id)
+        return entry[1] if entry else float("-inf")
+
+    def forget(self, session_id):
+        """A write to this session (a note, a wake, a conversion, a brief) changed what is remembered about it. The delivered-keys memory is kept
+        ON PURPOSE: delivered_keys probes the newest synthetic message before it trusts what it remembers, so a write shows there."""
+        self.sessions.pop(session_id, None)
+        self.inboxes.pop(session_id, None)
+        self.prompts.pop(session_id, None)
+        self.compactions.pop(session_id, None)
+
+    def session_info(self, session_id, status, now, fresh=False):
+        """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
+        entry, ttl = self.sessions.get(session_id), self.ttl()
+        if entry is not None and not fresh and ttl > 0:
+            info, at, was = entry
+            if was == status:
+                if now - at < ttl:
+                    return info
+                if not self.may_fill(now):
+                    self.deferred += 1
+                    return info
+            elif now - at < STATUS_REREAD_GAP or not self.may_fill(now):
+                # herdr says the state changed, but this agent was read a moment ago (a flapping agent is read at most once per gap) or the
+                # budget is spent: keep what is remembered and try again at the next pass; a read before a write is fresh whatever this says
+                self.deferred += 1
+                return info
+        info = self.engine.v2.session_get(session_id) or {}
+        if ttl > 0:
+            self.sessions[session_id] = (info, now, status)
+            if not fresh:
+                self.filled(now)
+        return info
+
+    def human_prompt(self, session_id, info, now, fresh=False):
+        """When the newest prompt a PERSON typed was created (a user message without `metadata.fleet`), or None. Read again only when the session's
+        `time.updated` moved."""
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        updated, entry = times.get("updated"), self.prompts.get(session_id)
+        if entry is not None and not fresh and updated is not None and entry[0] == updated:
+            return entry[1]
+        if entry is not None and not fresh and not self.may_fill(now):
+            self.deferred += 1
+            return entry[1]
+        newest = self.human_prompts_newest(session_id)
+        found = _created(newest[0]) if newest else None
+        if self.ttl() > 0 and updated is not None:
+            self.prompts[session_id] = (updated, found)
+            if not fresh:
+                self.filled(now)
+        return found
+
+    def inbox(self, session_id, now, fresh=False):
+        """`session.inbox.list`, remembered (and read again when the daemon itself wrote to the session)."""
+        entry, ttl = self.inboxes.get(session_id), self.ttl()
+        if entry is not None and not fresh and ttl > 0:
+            if now - entry[1] < ttl:
+                return entry[0]
+            if not self.may_fill(now):
+                self.deferred += 1
+                return entry[0]
+        inbox = self.engine.v2.inbox_list(session_id)
+        if ttl > 0:
+            self.inboxes[session_id] = (inbox, now)
+            if not fresh:
+                self.filled(now)
+        return inbox
+
+    def compaction_page(self, session_id, limit, now):
+        """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
+        that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
+        entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
+        if entry is not None and ttl > 0 and now - entry[1] < ttl:
+            return entry[0]
+        page = self.engine.v2.message_list(session_id, limit, type="compaction")
+        if ttl > 0:
+            self.compactions[session_id] = (page, now)
+        return page
+
+
 class Switchboard:
     """observe -> derive -> decide -> deliver, for every fleet agent.
 
@@ -2167,6 +2363,8 @@ class Switchboard:
         self.executable = config["opencode_executable"] or config["opencode"]
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
+        self.reads = V2Reads(self)
+        self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
@@ -2197,33 +2395,29 @@ class Switchboard:
         page = self.v2.message_list(session_id, limit=READ_LIMIT)  # newest first (S5)
         return page if isinstance(page, list) else []
 
-    def last_human_prompt(self, session_id, now, inbox=False):
+    def last_human_prompt(self, session_id, now, inbox=False, info=None, fresh=False):
         """Your newest prompt in the engagement window: type `user` without `metadata.fleet`.
-        `inbox` (a Chief of Staff, PR 8) also counts one still waiting in v2's inbox."""
+        `inbox` (a Chief of Staff, PR 8) also counts one still waiting in v2's inbox. The transcript is not paged: the newest human prompt is one
+        small read, made again only when the session changed (V2Reads.human_prompt)."""
         start = now - self.engaged_seconds
         if inbox:
             waiting = inbox_human_prompts(self, session_id)
             if waiting and (_created(waiting[0]) or 0) >= start:
                 return _created(waiting[0])
-        for message in self._messages(session_id):
-            created = _created(message)
-            if created is not None and created < start:
-                break  # older than the window: stop reading
-            if message.get("type") == "user" and _fleet_meta(message) is None:
-                return created
-        return None
+        created = self.reads.human_prompt(session_id, info or {}, now, fresh)
+        return created if created is not None and created >= start else None
 
     NOT_FLEET_SECONDS = 120  # how long "this session is no fleet agent" is believed
 
-    def _observe_entry(self, entry, now):
-        """An Observation for one herdr agent, or None when it is not a fleet agent."""
+    def _observe_entry(self, entry, now, fresh=False):
+        """An Observation for one herdr agent, or None when it is not a fleet agent. `fresh` reads v2 again whatever is remembered (before a write)."""
         session_id = agent_session(entry)
         if session_id is None:
             return None
         if self._not_fleet.get(session_id, 0) > now:
             return None  # asked recently and it was not one: herdr lists every pane of every workspace
         try:
-            info = self.v2.session_get(session_id) or {}
+            info = self.reads.session_info(session_id, entry.get("agent_status"), now, fresh)
         except V2Error as err:
             if err.reason == "http" and err.status == 404:
                 self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS  # a pane of someone else's OpenCode
@@ -2243,7 +2437,7 @@ class Switchboard:
             return observation
         try:
             observation.last_human_prompt = self.last_human_prompt(
-                session_id, now, inbox=fleet.get("role") == "chief-of-staff")
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
         except V2Error as err:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
@@ -2278,9 +2472,7 @@ class Switchboard:
                 found.problems.append("herdr unreachable: %s" % err)
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
+        for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
             try:
                 observation = self._observe_entry(entry, now)
             except V2Error as err:
@@ -2304,7 +2496,7 @@ class Switchboard:
             return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
         entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
         try:
-            fresh = self._observe_entry(entry, now)
+            fresh = self._observe_entry(entry, now, fresh=True)   # a read before a write is never from memory (invariant 4)
         except V2Error as err:
             return None, "v2 unreachable: %s" % err
         if fresh is None or fresh.name != previous.name:
@@ -2365,10 +2557,23 @@ class Switchboard:
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
         keys, complete = KeyTimes(), False
+        # A recipient with something pending is asked about every pass: ONE small read (its newest synthetic message) says whether anything it
+        # carries changed; if not, the keys found last time (which reached back to `since`) still hold, and the pages are not read again.
+        remembered = self._delivered.get(session_id) if self.config["v2_cache_seconds"] > 0 else None
+        newest = self.v2.message_list(session_id, limit=1, type="synthetic") if self.config["v2_cache_seconds"] > 0 else None   # BEFORE the pages: a message that lands during the read changes it
+        newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
+        if remembered is not None and remembered[0] == newest_id and remembered[1] <= since:
+            keys, complete = KeyTimes(), True
+            keys.update(remembered[2])
+            keys.at = dict(remembered[2].at)
+            inbox = self.v2.inbox_list(session_id)   # never from memory: a note another process wrote counts as delivered
+            for item in inbox if isinstance(inbox, list) else []:
+                keys.add_all(_fleet_keys(item), _created(item))
+            return keys, complete
         # Only synthetic messages carry keys; asking for just those keeps the read
         # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
         # PR 8: more than READ_LIMIT of them are read page by page, up to MAX_READ_PAGES.
-        for page, more in self.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+        for page, more in self.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
             reached = False
             for message in page:
                 created = _created(message)
@@ -2376,10 +2581,17 @@ class Switchboard:
                     reached = True
                     break
                 keys.add_all(_fleet_keys(message), created)
-            if reached or len(page) < READ_LIMIT or more is False:
+            if reached or len(page) < SYNTHETIC_PAGE or more is False:
                 complete = True
             if complete:
                 break
+        if complete and self.config["v2_cache_seconds"] > 0:
+            if len(self._delivered) > 200:
+                self._delivered.pop(next(iter(self._delivered)))   # the oldest goes (dicts keep insertion order), not every recipient at once
+            remembered_keys = KeyTimes()
+            remembered_keys.update(keys)
+            remembered_keys.at = dict(keys.at)
+            self._delivered[session_id] = (newest_id, since, remembered_keys)   # memory only: the messages' keys, before the inbox's are added
         inbox = self.v2.inbox_list(session_id)
         for item in inbox if isinstance(inbox, list) else []:
             keys.add_all(_fleet_keys(item), _created(item))
@@ -2501,6 +2713,7 @@ class Switchboard:
                 raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
                                      % message_id)
             result["id"] = record.get("id") if isinstance(record, dict) else None
+        self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
@@ -2514,11 +2727,14 @@ class Switchboard:
             return []
         if observation.engaged(now, self.engaged_seconds):
             return []
-        inbox = self.v2.inbox_list(observation.session_id)
-        notes = [item for item in (inbox if isinstance(inbox, list) else [])
-                 if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
-                 and item.get("delivery") == "steer" and item.get("resume") is not True
-                 and not _is_orders_note(item)]  # PR 17: an unread orders note never becomes a wake
+        def lapsed(inbox):
+            return [item for item in (inbox if isinstance(inbox, list) else [])
+                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
+                    and item.get("delivery") == "steer" and item.get("resume") is not True
+                    and not _is_orders_note(item)]  # PR 17: an unread orders note never becomes a wake
+        notes = lapsed(self.reads.inbox(observation.session_id, now))
+        if notes:   # what is remembered says a note waits: read it afresh before acting on it (a write follows)
+            notes = lapsed(self.reads.inbox(observation.session_id, now, fresh=True))
         converted = []
         for item in notes:
             if not fault("no-recheck"):
@@ -2537,6 +2753,7 @@ class Switchboard:
                         "delivery": delivery, "keys": _fleet_keys(item), "why": "note outlived engagement"}) as result:
                     record = self.v2.inbox_update(observation.session_id, item.get("id"), delivery)
                     result["delivery"] = record.get("delivery") if isinstance(record, dict) else None
+            self.reads.forget(observation.session_id)
             converted.append(item.get("id"))
         return converted
 
@@ -2554,6 +2771,7 @@ class Switchboard:
         report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
                   "badges": [], "toasts": []}
         self.pass_toasts = {}
+        self.reads.begin_pass()
         discovery = self.discover(now)
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -2599,6 +2817,9 @@ class Switchboard:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
         finish_pass(self, discovery, report)
+        if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
+            self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
+        record_v2_calls(self)
         return report
 
     # -- render: the sidebar badge and the toast
@@ -2608,7 +2829,8 @@ class Switchboard:
         the facts in switchboard notes that wait in v2's inbox for a turn to
         carry them, plus the facts held for the agent. A note a turn has
         carried is read; a wake starts its own turn, so it is never unread."""
-        inbox = self.v2.inbox_list(observation.session_id)
+        # An agent with something pending (a held plan) is never served from memory: a send or a note for it is noticed at the next pass.
+        inbox = self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
         waiting = [item for item in (inbox if isinstance(inbox, list) else [])
                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
                    and item.get("delivery") == "steer" and item.get("resume") is not True]
@@ -3670,11 +3892,17 @@ LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lane
 
 def launch_agent_problem(config, runner, agent):
     """Why `agent` cannot be launched: the OpenCode service does not know it (an agent with no installed definition starts as the default Build
-    agent with the brief unsent). None when it is registered, or when the service cannot be asked (v2 then refuses it itself)."""
+    agent with the brief unsent), or knows it only as a subagent (a pane runs a primary agent). None when it is a registered primary agent, or when
+    the service cannot be asked (v2 then refuses it itself)."""
     state, found = agents_found(runner, config.get("opencode") or "opencode", AGENTS_VERIFY_TIMEOUT)
-    if state != "up" or agent in found:
+    if state != "up":
         return None
     known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
+    if agent in found:
+        if found[agent][0] in ("primary", "all"):   # `all` can run as a pane's agent too (OpenCode modes: primary, subagent, all)
+            return None
+        return ("--agent %r is registered as a %s, not a primary agent: a launched pane runs a primary agent, and a subagent is run by another agent's Task tool "
+                "(primary agents registered: %s)" % (agent, found[agent][0], known))
     return ("--agent %r is not registered with the OpenCode service, so it would start as the default agent and the brief would not be sent "
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
@@ -3753,19 +3981,18 @@ def send_brief(engine, name, session_id, brief):
     later run finds out it was sent."""
     with engine._external("v2.session.prompt", name, {"session": session_id, "brief_chars": len(brief)}):
         engine.v2.prompt(session_id, brief, {"fleet": {"from": "switchboard", "brief": True}})
+    engine.reads.forget(session_id)   # a write: what was remembered of this session is old
 
 
-BRIEF_SCAN_PAGES = 25  # pages of READ_LIMIT messages; a session this long is not one that never got its brief
+BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session with more than that many is not one that never got its brief
 
 
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
-    more = None
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, max_pages=BRIEF_SCAN_PAGES):
-        if any((_fleet_meta(message) or {}).get("brief") for message in page):
-            return True
-    return bool(more)
+    page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
+    page = page if isinstance(page, list) else []
+    return any((_fleet_meta(message) or {}).get("brief") for message in page) or len(page) >= BRIEF_SCAN_USER
 
 
 VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to pick its Decisions view
@@ -3950,7 +4177,7 @@ def inbox_human_prompts(engine, session_id):
 
 def newest_prompts(engine, session_id):
     """Your prompts to a Chief of Staff, newest first: the inbox's (not yet consumed), then the transcript's."""
-    return inbox_human_prompts(engine, session_id) + human_prompts(engine._messages(session_id))
+    return inbox_human_prompts(engine, session_id) + engine.reads.human_prompts_newest(session_id)   # small reads of the newest user messages, not a 200-message page
 
 
 def acting(engine):
@@ -4617,15 +4844,18 @@ def assigning_input(engine, observation, boss):
     Assigning: a prompt (yours, the fleet's task, or the brief `launch` sent), or a message from its boss
     (`send`, a handoff). Not assigning: a GitHub notice, a decoration, a reminder, a nudge, a toast, a
     report from one of its own workers. Newest first, within READ_LIMIT messages."""
-    for message in engine._messages(observation.session_id):
-        if not isinstance(message, dict):
-            continue
-        if message.get("type") == "user" or (
-                message.get("type") == "synthetic"
-                and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(message))):
-            created = _created(message)
-            return (message.get("id"), created) if message.get("id") and created is not None else None
-    return None
+    # Two small typed reads instead of a 200-message page of everything: the newest user message, and the newest of the last few synthetic ones
+    # that is a `send` from the boss. The newer of the two assigned it.
+    users = engine.v2.message_list(observation.session_id, limit=1, type="user")
+    synthetic = engine.v2.message_list(observation.session_id, limit=SYNTHETIC_PAGE, type="synthetic")
+    candidates = [m for m in (users if isinstance(users, list) else []) if isinstance(m, dict)]
+    candidates += [m for m in (synthetic if isinstance(synthetic, list) else []) if isinstance(m, dict)
+                   and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(m))][:1]
+    candidates = [m for m in candidates if m.get("id") and _created(m) is not None]
+    if not candidates:
+        return None
+    newest = max(candidates, key=_created)
+    return newest.get("id"), _created(newest)
 
 
 def report_jev(engine, settings):
@@ -5256,7 +5486,7 @@ def transcript_lines(engine, session_id, since):
     if cached is not None and cached[0] == newest_id and cached[1] <= since:
         return [line for line in cached[2] if line[0] >= since]  # nothing new since the last full read
     found, complete = [], False
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+    for page, more in engine.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
         for message in page:
             created = _created(message) if isinstance(message, dict) else None
             if created is None:
@@ -6696,6 +6926,69 @@ def external_status_line(config, state_dir, now):
     failures = body.get("permanent_failures") or 0
     return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
+
+
+# ---------------------------------------------------------------- how many v2 calls the daemon makes (every one is an `opencode api` process)
+V2_CALLS_FILE = "v2-calls.json"
+
+
+def v2_calls_summary(v2, now):
+    """{"at", "last_minute": {op: n}, "avg_5min": {op: n/min}} from the client's own call record, or None when it keeps none (a fake in a test)."""
+    count = getattr(v2, "calls_by_operation", None)
+    if count is None:
+        return None
+    summary = {"at": iso(now), "last_minute": count(60.0),   # the client's own clock: the calls were stamped with it
+               "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0).items())}}
+    by_transport = getattr(v2, "calls_by_transport", None)
+    if by_transport is not None:
+        summary["by_transport"] = by_transport(60.0)   # the same record, the way each call travelled: http, cli, cli-fallback
+    return summary
+
+
+def record_v2_calls(engine):
+    """After a pass: leave the figures where `status` can read them (a small file, renamed into place). Never raises."""
+    temp = None
+    try:
+        if engine.state_dir is None:
+            return
+        summary = v2_calls_summary(engine.v2, engine.now())
+        if summary is None:
+            return
+        path = Path(engine.state_dir) / V2_CALLS_FILE
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(summary, sort_keys=True) + "\n")
+        os.rename(str(temp), str(path))
+    except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+        try:
+            engine._note("v2_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception:
+            pass
+
+
+def v2_calls_status(state_dir, now):
+    """The `status` line text: `14/min (session.get 9, ...; 5-min average 11/min)`, or None without a record. Says so when the record is old."""
+    try:
+        body = json.loads((Path(state_dir) / V2_CALLS_FILE).read_text())
+        last = body["last_minute"]
+        by = ", ".join("%s %d" % (op, n) for op, n in sorted(last.items(), key=lambda kv: -kv[1])[:4])
+        average = sum(body["avg_5min"].values())
+        text = "%d/min (%s; 5-min average %.0f/min)" % (sum(last.values()), by or "none", average)
+        travelled = body.get("by_transport")
+        if isinstance(travelled, dict) and travelled:
+            text += "; by transport: " + ", ".join("%s %d" % (name, n) for name, n in sorted(travelled.items()) if isinstance(n, int))
+        at = parse_iso(body.get("at"))
+        if at is not None and now - at > 120:
+            text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
+        return text
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):   # a record of any other shape is no record
+        return None
 
 
 def publish_decisions(engine):
@@ -8824,6 +9117,43 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
+REMIND_LIST_MAX = 50   # reminders `remind --list` prints
+
+
+def remind_manage(args, engine, state, sender, moment):
+    """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
+    shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
+    if args.list_mine and args.cancel:
+        sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
+        return EXIT_USAGE
+    if args.name or args.when or args.text:
+        sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
+        return EXIT_USAGE
+    try:
+        mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    if args.list_mine:
+        mine.sort(key=lambda item: item["at"])
+        for item in mine[:REMIND_LIST_MAX]:
+            print("%s  %s  to=%s  issue=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item["text"], 120)))
+        if len(mine) > REMIND_LIST_MAX:
+            print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
+        if not mine:
+            sys.stderr.write("%s: no pending reminders for %s\n" % (PROG, sender))
+        return EXIT_OK
+    if args.cancel not in {item["id"] for item in mine}:
+        sys.stderr.write("%s: remind: no pending reminder %s of yours (see `%s remind --list`)\n" % (PROG, _one_line(args.cancel, 40), PROG))
+        return EXIT_USAGE
+    if not remove_reminders(state, {args.cancel}):   # delivered or cancelled between the read and the removal
+        sys.stderr.write("%s: remind: reminder %s is already gone\n" % (PROG, _one_line(args.cancel, 40)))
+        return EXIT_USAGE
+    engine.audit.append("cli", "reminder.cancel", sender, {"id": args.cancel})
+    print("cancelled %s" % args.cancel)
+    return EXIT_OK
+
+
 def cmd_remind(args, runner, now):
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
@@ -8835,6 +9165,11 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
+    if args.list_mine or args.cancel:
+        return remind_manage(args, engine, state, sender, moment)
+    if not args.name or not args.when or not args.text:
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
     except IssueRefError as err:
@@ -8847,6 +9182,8 @@ def cmd_remind(args, runner, now):
                 sys.stderr.write("%s: --until-closed/--until-merged take OWNER/REPO#N, got %r\n" % (PROG, flag[:60]))
                 return EXIT_USAGE
             condition[key] = flag
+    if number is not None and repo and not condition and not args.keep_if_closed:
+        condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
@@ -10649,6 +10986,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["github"] = github_status(config, state, fleets, now())
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
+        report["v2_calls"] = v2_calls_status(state, now())
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
@@ -10835,6 +11173,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
@@ -14571,18 +14910,18 @@ def ci_record_status_line(state_dir, now_ts):
 
 
 def v2_link_status_line(state_dir, now_ts):
-    """The `status` line for the daemon's link to the OpenCode service, or None when the daemon has not written one."""
+    """The `status` line for the daemon's link to the OpenCode service (route and breaker; the call counts are the `v2 calls` line), or None."""
     try:
         raw = json.loads((Path(state_dir) / V2_LINK_STATUS_FILE).read_text())
-        at, calls = float(raw["at"]), raw["calls"]
+        at, fallbacks, skipped = float(raw["at"]), int(raw["fallbacks"]), int(raw["skipped"])
         transport, breaker = str(raw["transport"])[:8], str(raw["breaker"])[:8]
     except (OSError, ValueError, KeyError, TypeError):
         return None
     ago = max(0, int(now_ts - at))
     p95 = raw.get("p95_ms")
-    return "v2-link: %s (%s ago): %s calls over HTTP, %s through the CLI (%s fell back); breaker %s%s%s" % (
-        transport, "%d s" % ago if ago < 120 else "%d min" % (ago // 60), calls.get("http"), calls.get("cli"), calls.get("fallback"),
-        "CLOSED" if breaker == "closed" else "OPEN: optional reads are being skipped (v2.backoff)" if breaker != "closed" else breaker,
+    return "v2-link: %s (%s ago): %d fell back to the CLI in the last 10 min; breaker %s%s%s" % (
+        transport, "%d s" % ago if ago < 120 else "%d min" % (ago // 60), fallbacks,
+        "CLOSED" if breaker == "closed" else "OPEN: optional reads are being skipped (v2.backoff), %d so far" % skipped,
         "; p95 %d ms" % p95 if isinstance(p95, int) else "", "; %s episode(s) so far" % raw.get("episodes") if raw.get("episodes") else "")
 
 
@@ -15330,7 +15669,10 @@ AGENTS_VERIFY_TIMEOUT = 20
 def agents_found(runner, opencode, timeout):
     """(state, payload): ("down", why) when the service cannot be asked, else ("up", {name: (mode, rule count)}) or ("bad", why)."""
     try:
+        refuse_real_opencode_under_test(runner, opencode)
         done = runner([opencode, "api", "GET", "/api/agent"], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except V2Error as err:
+        return "down", str(err)
     except subprocess.TimeoutExpired:
         return "down", "%s did not answer within %ds" % (opencode, timeout)
     except OSError as err:
@@ -18225,9 +18567,13 @@ def build_parser():
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     remind = sub.add_parser("remind", help="A message to an agent that is due later")
-    remind.add_argument("name", help="The recipient's fleet name")
-    remind.add_argument("when", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
-    remind.add_argument("text", nargs="+", help="The reminder")
+    remind.add_argument("name", nargs="?", help="The recipient's fleet name")
+    remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
+    remind.add_argument("text", nargs="*", help="The reminder")
+    remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
+    remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
+                        "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     remind.add_argument("--until-closed", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this issue "
@@ -18326,7 +18672,11 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args, extra = parser.parse_known_args(argv)
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+            args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+        elif extra:
+            parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
@@ -20030,7 +20380,7 @@ class OrdersFacts:
             try:
                 orders = engine.charter_orders(observation, charter)
                 compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
-                    engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+                    engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
             except (IntentError, V2Error) as err:  # one agent's trouble never hides the others; nothing is guessed
                 engine._note("orders.unreadable", observation.name, {"charter": charter,
                                                                       "error": _one_line(str(err), 200)})
@@ -20052,7 +20402,7 @@ class OrdersFacts:
         try:
             found = read_cos_orders(engine.config)
             compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
-                engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+                engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
         except (CosOrdersError, V2Error) as err:  # nothing is guessed; a file too large is refused, not cut
             engine._note("orders.unreadable", observation.name, {"cos": True, "error": _one_line(str(err), 200)})
             return None
