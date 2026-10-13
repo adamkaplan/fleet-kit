@@ -15465,6 +15465,21 @@ class TestSweep(Base):
         self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#77")], "77 is closed; 78 is open; 79 is not listed but a fresh read shows it open")
         self.assertTrue(all(call[1].startswith("issues/") for call in self.hub.single), "only reads: the sweep writes nothing to GitHub")
 
+    def test_s8_a_target_that_is_not_there_is_found_and_a_truncated_or_unreadable_picture_is_not_judged(self):
+        original = self.hub._read_one
+        def gone(repo, path, now, fresh=False):
+            raise sb.GitHubUnavailable("gh api repos/acme/api/issues/88 failed: gh: Not Found (HTTP 404)")
+        self.hub._read_one = gone
+        self.sweep([dict(self.human(10), waits_for=["acme/api#88"])])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#88")], "missing counts like closed")
+        self.hub._read_one = original
+        state = sb.sweep_state(self.engine)
+        state.repos["acme/api"]["truncated"] = True
+        self.hub.closed = {89}   # it IS closed: only the truncated picture keeps the sweep from saying so
+        with mock.patch.object(sb, "sweep_refresh"):   # keep the picture as set: a refresh would read it afresh
+            self.sweep([dict(self.human(11), waits_for=["acme/api#89"])])
+        self.assertEqual([f for f in self.found() if f == ("S8", "acme/api#89")], [], "a truncated picture cannot say it is absent")
+
     def test_s8_a_waited_for_issue_in_a_repo_that_is_not_watched_is_not_judged(self):
         self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
         self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
@@ -36790,6 +36805,14 @@ class TestDecisionOrder(unittest.TestCase):
         self.assertRegex(lines[2], r"^#3 .*\[next\]$", "the first item that CAN be done is next, not a cycle member")
         self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2"]])
 
+    def test_a_self_wait_and_a_three_cycle_are_cycles_and_the_rest_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#3"]), self.entry("#3", 3, ["acme/api#1"]),
+                     self.entry("#4", 4, ["acme/api#4"]), self.entry("#5", 5, ["acme/api#6"]), self.entry("#6", 6, ["acme/api#5"]), self.entry("#7", 7)]
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2", "acme/api#3"], ["acme/api#4"], ["acme/api#5", "acme/api#6"]])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d.get("mark")) for d in sb.decision_core.arranged(decisions)],
+                         [("#1", "cycle"), ("#2", "cycle"), ("#3", "cycle"), ("#4", "cycle"), ("#5", "cycle"), ("#6", "cycle"), ("#7", "next")])
+
     def test_a_wait_for_something_that_is_not_an_open_decision_blocks_nothing(self):
         decisions = [self.entry("#1", 1, ["acme/api#99"]), self.entry("#2", 2)]
         sb.decision_core.annotate_order(decisions)
@@ -36817,7 +36840,7 @@ class TestDecisionOrder(unittest.TestCase):
         for needle in ("Waits for:", "`next`", "`cycle`", "**S7**", "**S8**", "writes nothing to GitHub"):
             self.assertIn(needle, section)
 
-    def test_a_report_or_request_is_never_a_target_and_the_awaiting_record_carries_the_line(self):
+    def test_a_report_is_never_a_target_so_nothing_waits_under_it(self):
         decisions = [self.entry("r1", 5, kind="report"), self.entry("#6", 6, ["acme/api#5"])]
         sb.decision_core.annotate_order(decisions)
         self.assertEqual(decisions[1]["depth"], 0, "a report is not an issue decision: nothing waits under it")
@@ -36888,7 +36911,8 @@ class TestDecisionsPanelOrder(unittest.TestCase):
             self.assertFalse(any(l.startswith("  ") and "Item" in l for l in self.r[name]), name)
 
     def test_the_helpers_cap_the_depth_and_strip_control_characters(self):
-        self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", 4, 0, 0])
+        self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
+                         "the panel's depth cap is the core's")
         self.assertNotIn("\u001b", self.r["hostile"])
 
 
