@@ -11336,7 +11336,9 @@ class TestGhShimGateProbe(Base):
         self.assertIn(self.HEAD[:12], line)
         self.assertIn("reviewer-a: CHANGES_REQUESTED", line)
         done, seen = self.merge("--over-review", "a reason\x1b[31m with escapes", reviews=block)
-        self.assertNotIn("\x1b", [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"])
+        logged = [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"]
+        self.assertNotIn("\x1b", logged)
+        self.assertIn("with escapes", logged)
 
     def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
@@ -39575,16 +39577,20 @@ class TestReviewerSubagents(LedgerBase):
         self.assertEqual(out.splitlines(), ["architecture recorded request-changes (1 blocking finding(s)) at " + LEDGER_NEW_HEAD[:8]])
 
     def test_review_blockers_prints_nothing_for_a_clean_pr_and_refuses_an_untrustworthy_ledger_and_writes_nothing(self):
+        ledger = self.world.state / "plan-ledger.jsonl"
         code, out, err = self.blockers()
         self.assertEqual((code, out), (0, ""))
         self.record("coder", "code", "request-changes", "--blocks", "1")
-        before = (self.world.state / "plan-ledger.jsonl").read_text()
-        (self.world.state / "plan-ledger.jsonl").write_text(before.replace("request-changes", "approve-ish"))   # tampered: the chain breaks
+        before = ledger.read_text()
+        code, out, err = self.blockers()                                       # the happy path wrote nothing
+        self.assertEqual(code, 0)
+        self.assertEqual(ledger.read_text(), before)
+        ledger.write_text(before.replace("request-changes", "approve-ish"))   # tampered: the chain breaks
+        tampered = ledger.read_text()
         code, out, err = self.blockers()
         self.assertEqual(code, 2)
         self.assertIn("ledger is not trustworthy", err)
-        (self.world.state / "plan-ledger.jsonl").write_text(before)
-        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 1, "reading wrote nothing")
+        self.assertEqual(ledger.read_text(), tampered, "the refused path wrote nothing either")
 
     # -- the coder session records what a reviewer returned
 

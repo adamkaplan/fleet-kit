@@ -474,6 +474,8 @@ def review_probe(args, found, reason, lookup, gh):
                 blockers += [gate_clean(line.strip()) for line in done.stdout.splitlines() if line.strip()][:5]
             else:
                 sys.stderr.write("gh: review check: the switchboard's recorded verdicts could not be read: only GitHub's reviews were checked\n")
+        elif not binary or not head:
+            sys.stderr.write("gh: review check: the switchboard's recorded verdicts could not be read (no switchboard or no head): only GitHub's reviews were checked\n")
         if not blockers:
             return None
         names = "; ".join(blockers[:5])
