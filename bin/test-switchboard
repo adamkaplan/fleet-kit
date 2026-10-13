@@ -2130,7 +2130,7 @@ class World:
         for name in agents:
             self.add_agent(name)
         raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
-               "v2_cache_seconds": 0}   # the scenarios of old read the world afresh every pass; TestV2ReadVolume turns the memory on
+               "v2_cache_seconds": getattr(test, "V2_CACHE", 0)}   # the scenarios of old read the world afresh every pass; TestV2ReadVolume and the *WithTheMemoryOn classes turn it on
         raw.update(config or {})
         self.config = sb.validate_config(raw)
         self.engine = self.new_engine()
@@ -37231,6 +37231,117 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestDeliverWithTheMemoryOn(TestDeliver):
+    """The delivery tests again, with the daemon's memory of its v2 reads ON (default 120 s): the decisions are the same."""
+    V2_CACHE = 120
+
+
+class TestWorkerDeliveryWithTheMemoryOn(TestWorkerDelivery):
+    """Worker facts and their delivery again, with the memory on."""
+    V2_CACHE = 120
+
+
+class TestV2ReadCorrectness(Base):
+    """The remembered reads never make the daemon act on a stale world: keys, prompts, compactions, the budget."""
+
+    def world(self, **config):
+        config.setdefault("v2_cache_seconds", 120)
+        return World(self, agents=("coder", "platform"), config=config)
+
+    def synthetic(self, world, sid, key, text="note"):
+        world.v2._message(world.v2.sessions[sid], "synthetic", text, {"fleet": {"keys": [key], "from": "switchboard"}}, world.clock.now())
+
+    @staticmethod
+    def count(world, op, since=0):
+        return len([c for c in world.v2.calls[since:] if len(c) > 2 and c[2] == op])
+
+    def test_a_synthetic_message_that_lands_after_the_probe_is_found_and_the_pages_are_read_again(self):
+        world = self.world()
+        sid, engine = world.sessions["coder"], world.engine
+        self.synthetic(world, sid, "k1")
+        since = world.clock.now() - 100
+        first, complete = engine.delivered_keys(sid, since)
+        self.assertEqual((sorted(first), complete), (["k1"], True))
+        mark = len(world.v2.calls)
+        again, _ = engine.delivered_keys(sid, since)
+        self.assertEqual(sorted(again), ["k1"])
+        self.assertEqual(self.count(world, "session.message.list", mark), 1, "nothing changed: the probe alone")
+        world.tick(3)
+        self.synthetic(world, sid, "k2")
+        mark = len(world.v2.calls)
+        later, _ = engine.delivered_keys(sid, since)
+        self.assertEqual(sorted(later), ["k1", "k2"], "the new key is found, not served from memory")
+        self.assertGreater(self.count(world, "session.message.list", mark), 1, "the pages were read again")
+
+    def test_an_earlier_since_than_the_remembered_one_reads_the_pages_again(self):
+        world = self.world()
+        sid, engine = world.sessions["coder"], world.engine
+        self.synthetic(world, sid, "old")
+        world.tick(500)
+        self.synthetic(world, sid, "new")
+        recent, _ = engine.delivered_keys(sid, world.clock.now() - 100)
+        self.assertEqual(sorted(recent), ["new"])
+        older, _ = engine.delivered_keys(sid, world.clock.now() - 1000)
+        self.assertEqual(sorted(older), ["new", "old"], "a longer look-back is a new read, not the remembered short one")
+
+    def test_a_person_s_prompt_behind_more_than_ten_fleet_messages_is_still_seen(self):
+        world = self.world()
+        sid = world.sessions["coder"]
+        session = world.v2.sessions[sid]
+        world.v2._message(session, "user", "please stop", None, world.clock.now())          # a person
+        for n in range(15):
+            world.tick(1)
+            world.v2._message(session, "user", "task %d" % n, {"fleet": {"from": "fleet-task"}}, world.clock.now())
+        prompts = world.engine.reads.human_prompts_newest(sid)
+        self.assertEqual([m["text"] for m in prompts], ["please stop"])
+        for n in range(60):
+            world.tick(1)
+            world.v2._message(session, "user", "more %d" % n, {"fleet": {"from": "fleet-task"}}, world.clock.now())
+        self.assertEqual(world.engine.reads.human_prompts_newest(sid), [], "buried under more than the wide read covers: said in the docstring, and a write is re-checked")
+
+    def test_compactions_are_remembered_five_times_as_long_as_a_record(self):
+        world = self.world(v2_cache_seconds=10)
+        sid, engine = world.sessions["coder"], world.engine
+        engine.reads.compaction_page(sid, 5, world.clock.now())
+        mark = len(world.v2.calls)
+        engine.reads.compaction_page(sid, 5, world.clock.now() + 49)
+        self.assertEqual(self.count(world, "session.message.list", mark), 0)
+        engine.reads.compaction_page(sid, 5, world.clock.now() + 51)
+        self.assertEqual(self.count(world, "session.message.list", mark), 1)
+
+    def test_a_prompt_is_read_again_only_when_the_session_moved_and_forget_clears_it(self):
+        world = self.world()
+        sid, engine = world.sessions["coder"], world.engine
+        info = world.v2.op_session_get({"sessionID": sid}, None)
+        engine.reads.human_prompt(sid, info, world.clock.now())
+        mark = len(world.v2.calls)
+        engine.reads.human_prompt(sid, info, world.clock.now())
+        self.assertEqual(self.count(world, "session.message.list", mark), 0, "time.updated did not move")
+        engine.reads.forget(sid)
+        engine.reads.human_prompt(sid, info, world.clock.now())
+        self.assertEqual(self.count(world, "session.message.list", mark), 1, "forgotten: read again")
+
+    def test_a_prompt_read_past_the_budget_returns_what_is_remembered(self):
+        world = self.world(v2_reads_per_pass=0)
+        sid, engine = world.sessions["coder"], world.engine
+        info = world.v2.op_session_get({"sessionID": sid}, None)
+        engine.reads.human_prompt(sid, info, world.clock.now())   # the first read is always made
+        moved = dict(info, time=dict(info["time"], updated=info["time"]["updated"] + 5000))
+        mark = len(world.v2.calls)
+        engine.reads.begin_pass()
+        engine.reads.human_prompt(sid, moved, world.clock.now())
+        self.assertEqual(self.count(world, "session.message.list", mark), 0, "no budget: the remembered prompt stands")
+        self.assertEqual(engine.reads.deferred, 1)
+
+    def test_the_brief_a_launch_sends_forgets_what_was_remembered(self):
+        world = self.world()
+        sid = world.sessions["coder"]
+        world.engine.reads.inbox(sid, world.clock.now())
+        self.assertIn(sid, world.engine.reads.inboxes)
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        self.assertIn("engine.reads.forget(session_id)", source.split("def send_brief")[1].split("\ndef ")[0])
 
 
 class TestAgentsVerify(unittest.TestCase):

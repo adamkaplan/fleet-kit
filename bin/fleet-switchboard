@@ -1805,6 +1805,19 @@ class V2Reads:
     A read just BEFORE A WRITE is never served from here (`fresh=True`): invariant 4 holds. `v2_cache_seconds` 0 remembers nothing."""
 
     PROMPT_READ = 10
+    PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
+
+    def human_prompts_newest(self, session_id):
+        """The person's prompts (user messages without `metadata.fleet`), newest first, from at most two small reads: the newest PROMPT_READ user
+        messages, and only if they are ALL the fleet's (a person's prompt may sit behind them) the newest PROMPT_READ_WIDE. A prompt buried
+        under more fleet messages than that is not seen: the person is then not counted as engaged by this read, and a write is re-checked anyway."""
+        for limit in (self.PROMPT_READ, self.PROMPT_READ_WIDE):
+            page = self.engine.v2.message_list(session_id, limit=limit, type="user")
+            page = page if isinstance(page, list) else []
+            found = [m for m in page if isinstance(m, dict) and _fleet_meta(m) is None]
+            if found or len(page) < limit:
+                return found
+        return []
 
     def __init__(self, engine):
         self.engine = engine
@@ -1867,8 +1880,8 @@ class V2Reads:
         if entry is not None and not fresh and not self.may_fill(now):
             self.deferred += 1
             return entry[1]
-        page = self.engine.v2.message_list(session_id, limit=self.PROMPT_READ, type="user")
-        found = next((_created(m) for m in (page if isinstance(page, list) else []) if isinstance(m, dict) and _fleet_meta(m) is None), None)
+        newest = self.human_prompts_newest(session_id)
+        found = _created(newest[0]) if newest else None
         if self.ttl() > 0 and updated is not None:
             self.prompts[session_id] = (updated, found)
             if not fresh:
@@ -2386,6 +2399,8 @@ class Switchboard:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
         finish_pass(self, discovery, report)
+        if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
+            self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
         return report
 
     # -- render: the sidebar badge and the toast
@@ -3541,6 +3556,7 @@ def send_brief(engine, name, session_id, brief):
     later run finds out it was sent."""
     with engine._external("v2.session.prompt", name, {"session": session_id, "brief_chars": len(brief)}):
         engine.v2.prompt(session_id, brief, {"fleet": {"from": "switchboard", "brief": True}})
+    engine.reads.forget(session_id)   # a write: what was remembered of this session is old
 
 
 BRIEF_SCAN_PAGES = 25  # pages of READ_LIMIT messages; a session this long is not one that never got its brief
@@ -3738,8 +3754,7 @@ def inbox_human_prompts(engine, session_id):
 
 def newest_prompts(engine, session_id):
     """Your prompts to a Chief of Staff, newest first: the inbox's (not yet consumed), then the transcript's."""
-    page = engine.v2.message_list(session_id, limit=V2Reads.PROMPT_READ, type="user")   # the newest few user messages, not a 200-message page of everything
-    return inbox_human_prompts(engine, session_id) + human_prompts(page if isinstance(page, list) else [])
+    return inbox_human_prompts(engine, session_id) + engine.reads.human_prompts_newest(session_id)   # small reads of the newest user messages, not a 200-message page
 
 
 def acting(engine):
