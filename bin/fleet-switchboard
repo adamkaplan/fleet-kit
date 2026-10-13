@@ -3724,8 +3724,8 @@ def pane_health_pass(engine, now):
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents}
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
-    except OSError:
-        pass
+    except OSError as err:
+        engine._note("fleetpane.error", None, {"error": "pane-health.json not written: %s" % _one_line(str(err), 100)})
 
 
 class PaneFacts:
@@ -3820,7 +3820,10 @@ def cmd_reattach(args, runner, now, socket_call=None):
                               "which is a proposal to the Chief of Staff for an orchestrator" % (session_id, PROG, name)) from None
         raise
     fleet = _fleet_meta(info) or {}
-    done = resume_agent(engine, name, session_id, workspace)
+    try:
+        done = resume_agent(engine, name, session_id, workspace)
+    except LaunchError as err:
+        raise LaunchError("%s (if the stale tab was already closed, run `%s reattach %s` again: nothing else was changed)" % (err, PROG, name)) from err
     note = charter_pane_update(engine, runner, fleet, done["pane"])
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.reattached", name, {"session": session_id, "pane": done["pane"], "tab": done.get("tab"),

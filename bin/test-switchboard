@@ -4180,6 +4180,54 @@ class TestLaunch(Base):
         self.health(2 * sb.PANE_CHECK_SECONDS + 5)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.recovered"]), 1)
 
+    def test_every_guard_before_the_close_refuses_a_pane_that_changes_a_tab_that_cannot_be_read_and_another_agents_session(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.detach()
+        herdr = self.world.herdr
+        reads = []
+        real = sb.pane_state
+
+        def flipping(engine, name, session, p, names=(), sessions=()):
+            reads.append(1)
+            if len(reads) >= 2:                         # the re-judgement just before the close: the pane has changed under us
+                herdr.panes[pane]["title"] = "OC | platform"
+            return real(engine, name, session, p, names, sessions)
+        with mock.patch.object(sb, "pane_state", flipping):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        herdr.panes[pane]["title"] = "OpenCode"
+        base = self.world.route
+
+        def tab_get_fails(argv, **kw):
+            if argv[0] == FAKE_HERDR and argv[1:3] == ["tab", "get"]:
+                return subprocess.CompletedProcess(argv, 1, "", "error: timed out\n")
+            return base(argv, **kw)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=tab_get_fails, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot say what tab", err.getvalue())
+        self.assertEqual(herdr.closed, [])
+        other = self.world.add_agent("coder")
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--session", other], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("belongs to", err.getvalue())
+        self.assertEqual(herdr.closed, [])
+
+    def test_a_pass_checks_at_most_the_budget_of_panes(self):
+        for n in range(sb.PANE_CHECKS_PER_PASS + 5):
+            self.world.add_agent("w%d" % n)
+        self.engine.state_dir = self.world.state
+        self.engine.discover(self.world.clock.now())
+        calls = []
+        real = sb.pane_state
+        with mock.patch.object(sb, "pane_state", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.assertEqual(len(calls), sb.PANE_CHECKS_PER_PASS)
+
     def test_a_forgotten_dead_agent_stops_waking_and_the_charter_pane_line_is_rewritten_only_when_present(self):
         self.engine.state_dir = self.world.state
         sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
