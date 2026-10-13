@@ -212,7 +212,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
+            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto",
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -38913,11 +38913,16 @@ class FakeOpenCodeService:
     def __init__(self, password="pw-secret-1"):
         self.password, self.up, self.delay, self.drop, self.big = password, True, 0.0, False, 0
         self.requests, self.connections = [], 0
+        self.stream = []           # lines GET /api/event streams; a None is a quiet stretch (a read timeout); the stream then closes
+        self.stream_status = 200
 
     def answer(self, method, path, body, authorization):
         token = base64.b64encode(("opencode:" + self.password).encode()).decode()
         if authorization != "Basic " + token:
             return 401, {"error": "unauthorized"}
+        if path == "/api/event":
+            self.requests.append((method, path, body))
+            return self.stream_status, "STREAM"
         self.requests.append((method, path, body))
         if path.startswith("/api/session/ses_a/message"):
             return 200, {"data": [{"id": "msg_%d" % i, "pad": "x" * (self.big or 1)} for i in range(1 if self.big else 2)], "cursor": {"next": None}}
@@ -38948,6 +38953,25 @@ class FakeServiceResponse:
         return self._raw if amount is None else self._raw[:amount]
 
 
+class FakeStreamResponse:
+    """An event stream response: readline gives the scripted lines, a None raises the read timeout, the end is b""."""
+
+    def __init__(self, status, lines):
+        self.status, self.lines, self.will_close = status, lines, True
+
+    def readline(self, limit=-1):
+        if not self.lines:
+            return b""
+        line = self.lines.pop(0)
+        if line is None:
+            raise socket.timeout("timed out")
+        raw = (line + "\n").encode()
+        return raw[:limit] if limit and limit > 0 else raw
+
+    def read(self, amount=None):
+        return b"{}"
+
+
 class FakeServiceConnection:
     """What http.client.HTTPConnection gives V2Http, over the in-memory service."""
 
@@ -38968,6 +38992,8 @@ class FakeServiceConnection:
     def getresponse(self):
         method, target, body, auth = self.pending
         status, obj = self.service.answer(method, target, body, auth)
+        if obj == "STREAM":
+            return FakeStreamResponse(status, list(self.service.stream))
         if self.service.drop:
             self.broken = True
             raise http.client.RemoteDisconnected("Remote end closed connection without response")
@@ -39432,6 +39458,258 @@ class TestV2ClientBackpressure(Base):
         line = sb.v2_link_status_line(self.home, time.time())
         self.assertIn("breaker CLOSED", line)
         self.assertIn("fell back to the CLI", line)
+
+
+# ---- the event feed (#290 slice 2)
+
+def feed_line(kind, session="ses_w", created=None, **data):
+    body = {"id": "evt_%s" % kind, "type": kind, "data": dict({"sessionID": session}, **data)}
+    if created is not None:
+        body["created"] = created
+    return "data: " + json.dumps(body)
+
+
+class TestEventFeedLines(unittest.TestCase):
+    def test_only_the_wanted_events_are_kept_and_a_message_is_its_parts_in_order(self):
+        feed = sb.EventFeed(None)
+        for line in ("event: x", "data: not json", "data: []", feed_line("session.tool.success", assistantMessageID="msg_t", content="x" * 5000),
+                     feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=1, text="second"),
+                     feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="first"),
+                     feed_line("session.execution.succeeded", created=5000)):
+            feed.handle(line)
+        self.assertEqual(feed.reply_for("ses_w", 5000), ("msg_a", "first second"))
+        self.assertEqual(feed.status()["events"], 3, "the tool output and the junk were not kept")
+
+    def test_a_newer_assistant_message_starts_its_own_text_and_a_turn_far_from_the_stop_is_not_the_one_the_feed_saw(self):
+        feed = sb.EventFeed(None)
+        feed.handle(feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="old"))
+        feed.handle(feed_line("session.text.ended", assistantMessageID="msg_b", ordinal=0, text="new"))
+        feed.handle(feed_line("session.execution.succeeded", created=100000))
+        self.assertEqual(feed.reply_for("ses_w", 100000), ("msg_b", "new"))
+        self.assertEqual(feed.reply_for("ses_w", 100000 + sb.FEED_TURN_SLACK_MS + 1), None, "a different turn: the caller reads")
+        self.assertIsNone(feed.reply_for("ses_other", 100000))
+
+    def test_a_server_connected_line_and_a_line_without_a_session_name_nothing(self):
+        feed = sb.EventFeed(None)
+        feed.handle(feed_line("server.connected", session=None))
+        feed.handle('data: {"type": "session.text.ended", "data": {"text": "t"}}')
+        self.assertEqual(feed.status()["sessions"], 0)
+
+    def test_the_sessions_kept_are_bounded(self):
+        feed = sb.EventFeed(None)
+        with mock.patch.object(sb, "FEED_SESSIONS_MAX", 3):
+            for n in range(10):
+                feed.handle(feed_line("session.execution.succeeded", session="ses_%d" % n, created=1))
+        self.assertEqual(feed.status()["sessions"], 3)
+
+
+class TestEventFeedStream(V2TransportBase):
+    """The reader over the HTTP route: lines, a quiet stretch, a closed stream, a refused password, a bad status; reconnect and backoff."""
+
+    def test_the_stream_yields_its_lines_a_quiet_stretch_as_none_and_ends_when_the_service_closes_it(self):
+        self.service.stream = [feed_line("server.connected", session=None), None, feed_line("session.execution.succeeded", created=1)]
+        got = list(self.route().stream_lines("/api/event"))
+        self.assertEqual([g if g is None else json.loads(g[5:])["type"] for g in got], ["server.connected", None, "session.execution.succeeded"])
+
+    def test_a_refused_password_or_no_service_means_the_old_reads_and_another_status_is_an_error(self):
+        route = self.route()
+        self.service.password = "rotated"
+        with self.assertRaises(sb.V2Unreachable):
+            list(route.stream_lines("/api/event"))
+        self.service.password = "pw-secret-1"
+        self.service.stream_status = 500
+        with self.assertRaises(sb.V2Error):
+            list(self.route().stream_lines("/api/event"))
+        self.service.stream_status = 200
+        self.service.up = False
+        with self.assertRaises(sb.V2Unreachable):
+            list(self.route().stream_lines("/api/event"))
+
+    def test_an_oversized_line_is_refused(self):
+        self.service.stream = ["data: " + "x" * 5000]
+        with mock.patch.object(sb, "V2_STREAM_LINE_MAX", 1000):
+            with self.assertRaises(sb.V2Error):
+                list(self.route().stream_lines("/api/event"))
+
+    def test_the_feed_reads_on_one_connection_marks_a_gap_on_every_connect_and_reconnects_with_growing_waits(self):
+        sleeps, feed = [], None
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 4:
+                feed.stop()
+        feed = sb.EventFeed(self.route(), None, sleep=sleep)
+        self.service.stream = [feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="hi"), feed_line("session.execution.succeeded", created=7)]
+        feed.needs_resync = False
+        feed.run()
+        self.assertEqual(sleeps, [1, 2, 4, 8], "a stream that ends is a gap: reconnect, waiting longer each time")
+        self.assertEqual(feed.status()["connects"], 4)
+        self.assertTrue(feed.needs_resync, "after a gap the next tick re-syncs")
+        self.assertEqual(feed.reply_for("ses_w", 7), ("msg_a", "hi"))
+
+    def test_a_service_that_is_down_is_a_counted_error_not_a_crash(self):
+        self.service.up = False
+        feed = sb.EventFeed(self.route(), None, sleep=lambda s: feed.stop())
+        feed.run()
+        self.assertEqual((feed.status()["errors"], feed.status()["connected"]), (1, False))
+
+    def test_the_password_is_in_no_feed_state_no_audit_line_and_no_status_file(self):
+        world = World(self, agents=("platform", "coder"))
+        engine = world.new_engine()
+        route = self.route()
+        engine.feed = feed = sb.EventFeed(route, engine.audit, world.clock.now, sleep=lambda s: feed.stop())
+        self.service.up = False
+        feed.run()
+        self.service.up = True
+        self.service.stream = [feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="hi")]
+        feed.stop_event.clear()
+        feed.sleep = lambda s: feed.stop()
+        feed.run()
+        engine.discover(world.clock.now())
+        sb.feed_tick(engine)
+        sb.record_v2_calls(engine)
+        everything = json.dumps(feed.status()) + (world.state / "audit.jsonl").read_text() + (world.state / sb.V2_CALLS_FILE).read_text()
+        self.assertIn("event.resync", everything)
+        self.assertNotIn(self.service.password, everything)
+        self.assertNotIn("Basic ", everything)
+
+
+class TestEventFeedReads(ReportBase):
+    """What the pass thread does with the feed: the finished turn's text without a read, the bounded re-sync, the reconciliation."""
+
+    def cli(self, *argv, **env):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "jev": {"replay": write_report_replay(self.home)}})
+        os.environ[sb.LAB_ENV] = "1"
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def reads(self, world=None):
+        """The reads of a worker's newest assistant message (the finished-turn text, the feed's bounded read): the other reads are other features'."""
+        world = world or self.world
+        return [a for a in world.v2.calls if a[2] == "session.message.list" and "type=assistant" in a]
+
+    def idle_ms(self, name="coder"):
+        return int(round(self.world.engine.discovery.agents[name].idle_at * 1000))
+
+    def test_a_finished_turn_is_reported_with_its_text_from_the_event_and_no_read_at_all(self):
+        self.stop("ALL DONE: the migration is finished")
+        session = self.world.sessions["coder"]
+        before = len(self.reads())
+        feed = sb.EventFeed(None)
+        self.world.engine.discover(self.world.clock.now())
+        feed.handle(feed_line("session.text.ended", session=session, assistantMessageID="msg_z", ordinal=0, text="ALL DONE: the migration is finished"))
+        feed.handle(feed_line("session.execution.succeeded", session=session, created=self.idle_ms()))
+        self.world.engine.feed = feed
+        facts = self.facts_of_idle()
+        self.assertEqual(len(self.reads()), before, "the event said it: 0 reads of the transcript")
+        self.assertIn("ALL DONE: the migration is finished", facts[0].summary)
+
+    def test_without_the_events_the_same_turn_is_read_once_and_says_the_same(self):
+        self.stop("ALL DONE: the migration is finished")
+        before = len(self.reads())
+        facts = self.facts_of_idle()
+        self.assertEqual(len(self.reads()) - before, 1, "no feed: one small read, as before")
+        self.assertIn("ALL DONE: the migration is finished", facts[0].summary)
+
+    def facts_of_idle(self):
+        found = [f for f in self.derive() if f.kind == "worker.idle"]
+        self.assertTrue(found)
+        return found
+
+    def test_a_restart_resyncs_once_with_one_bounded_read_per_session_and_one_audit_line_and_the_pending_send_arrives_once(self):
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.admissions("platform"), [], "pending: the recipient cannot be written to")
+        engine = self.world.new_engine()        # the restart: nothing remembered
+        self.world.engine = engine
+        engine.feed = feed = sb.EventFeed(None, engine.audit, self.world.clock.now)
+        feed.connected = True                   # the stream is up again
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "idle"
+        before = len(self.reads())
+        self.world.tick(5)
+        engine.run_pass()
+        resync = [a for a in self.reads()[before:] if "assistant" in " ".join(a) and "limit=%d" % sb.FEED_PAGE in " ".join(a)]
+        self.assertLessEqual(len(resync), 2, "at most one bounded read per session")
+        lines = [e for e in self.world.audit() if e["event"] == "event.resync"]
+        self.assertEqual((len(lines), lines[0]["detail"]["sessions"]), (1, len(resync)))
+        engine.run_pass()
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "event.resync"]), 1, "once, not on every pass")
+        self.assertEqual(len(self.world.admissions("platform")), 1, "the pending send reached the agent exactly once")
+
+    def test_an_assistant_message_no_event_announced_is_found_by_one_bounded_read_and_said_to_be_missed(self):
+        class Stub:
+            def __init__(stub):
+                stub.pages, stub.calls = [[{"id": "msg_new"}]], []
+
+            def message_list(stub, session, limit=None, order=None, type=None, cursor=None):
+                stub.calls.append((session, limit, type))
+                return stub.pages[0]
+        now = [1000.0]
+        audits = []
+        feed = sb.EventFeed(None, types.SimpleNamespace(append=lambda actor, name, subject, detail: audits.append((name, detail))), lambda: now[0])
+        feed.connected, feed.needs_resync = True, False
+        feed.handle(feed_line("session.text.ended", session="ses_a", assistantMessageID="msg_old", ordinal=0, text="t"))
+        engine = types.SimpleNamespace(v2=Stub())
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual(engine.v2.calls, [("ses_a", sb.FEED_PAGE, "assistant")], "one bounded read, newest assistant message only")
+        self.assertEqual(audits, [("event.missed", {"session": "ses_a", "last_seen": "msg_old", "found": "msg_new"})])
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual(len(engine.v2.calls), 1, "within the interval: no read")
+        now[0] += sb.FEED_RECONCILE_SECONDS + 1
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual((len(engine.v2.calls), len(audits)), (2, 1), "read again after the interval; nothing new, so nothing missed")
+        self.assertEqual(feed.status()["missed"], 1)
+
+    def test_the_reconciliation_is_spread_and_a_read_that_fails_is_tried_again_not_counted(self):
+        class Stub:
+            fail = True
+
+            def __init__(stub):
+                stub.calls = 0
+
+            def message_list(stub, *a, **k):
+                stub.calls += 1
+                if stub.fail:
+                    raise sb.V2Error("backoff", None, "skipped")
+                return []
+        feed = sb.EventFeed(None, None, lambda: 1000.0)
+        feed.connected, feed.needs_resync = True, False
+        engine = types.SimpleNamespace(v2=Stub())
+        sessions = ["s%d" % n for n in range(10)]
+        feed.tick(engine, sessions)
+        self.assertEqual(engine.v2.calls, sb.FEED_RECONCILES_PER_PASS, "at most this many per pass")
+        engine.v2.fail = False
+        feed.tick(engine, sessions)
+        feed.tick(engine, sessions)
+        self.assertEqual(engine.v2.calls, sb.FEED_RECONCILES_PER_PASS + 2 * sb.FEED_RECONCILES_PER_PASS, "the failed ones came round again")
+
+    def test_a_feed_that_is_not_connected_does_no_reconciling_the_old_reads_are_all_there_is(self):
+        feed = sb.EventFeed(None, None, lambda: 1000.0)
+        feed.needs_resync = False
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(message_list=lambda *a, **k: self.fail("a read while the stream is down")))
+        feed.tick(engine, ["ses_a"])
+
+    def test_the_status_line_says_the_stream_is_up_or_that_the_old_reads_are_in_use(self):
+        world = World(self, agents=("platform",))
+        world.engine.v2 = types.SimpleNamespace(calls_by_operation=lambda *a, **k: {}, calls_by_transport=lambda *a, **k: {"http": 0})
+        world.engine.feed = feed = sb.EventFeed(None)
+        feed.connected = True
+        sb.record_v2_calls(world.engine)
+        self.assertIn("events: stream", sb.v2_calls_status(world.state, world.clock.now()))
+        feed.connected = False
+        sb.record_v2_calls(world.engine)
+        self.assertIn("events: DOWN: old reads", sb.v2_calls_status(world.state, world.clock.now()))
+
+    def test_the_config_key_defaults_to_auto_and_off_or_a_bad_value_is_validated(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["v2_events"], "auto")
+        self.assertEqual(sb.validate_config(dict(base, v2_events="off"))["v2_events"], "off")
+        for bad in ("stream", "", None, 1, True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, v2_events=bad))
 
 
 def main(argv):
