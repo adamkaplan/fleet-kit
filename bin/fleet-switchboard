@@ -4424,6 +4424,14 @@ def _shown_text(title, visible):
     return ("%s\n%s" % (title or "", visible or "")).lower()
 
 
+def runs_session(processes, session_id):
+    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session."""
+    if not session_id:
+        return False
+    pattern = re.compile(r"(?:^|\s)(?:-s|--session)(?:\s+|=)%s(?:\s|$)" % re.escape(session_id))
+    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes)
+
+
 def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
     """(state, why, info): `attached` when the pane's title or visible screen names the agent or its session; `detached` when it shows
     something else; `dead` when herdr has no such pane; `unknown` when herdr cannot be read (never a verdict). `info` carries the pane's
@@ -4436,8 +4444,17 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
             return PANE_DEAD, "herdr has no pane %s" % pane, {}
         return PANE_UNKNOWN, "herdr cannot say what pane %s shows: %s" % (pane, _one_line(str(err), 100)), {}
     title = got.get("terminal_title_stripped") or got.get("terminal_title") or ""
+    # POSITIVE attach evidence first: the pane's foreground process is opencode on THIS session. Whatever its title says, it is live and attached.
+    # A process list that cannot be read is unknown (a close needs proof, and no proof is not stale).
+    try:
+        processes = engine.herdr.pane_process_info(pane)
+    except HerdrError as err:
+        return PANE_UNKNOWN, "herdr cannot say what pane %s runs: %s" % (pane, _one_line(str(err), 80)), {}
     info = {"workspace": got.get("workspace_id"), "tab": got.get("tab_id"), "cwd": got.get("cwd"), "status": got.get("agent_status"),
             "title": _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", title), 80)}
+    if runs_session(processes, session_id):
+        info["live_session"] = True
+        return PANE_ATTACHED, "the pane runs opencode on %s's session %s" % (name, session_id), info
     if _names_agent(title, name, session_id):
         return PANE_ATTACHED, "the pane's title names %s" % name, info
     # FAIL MODE: a screen that cannot be read is UNKNOWN, never "nothing is shown": the verdict `detached` leads to a closed tab, so it needs
@@ -4470,6 +4487,9 @@ def release_stale_binding(engine, name, taken, session_id, replace=False):
     names = list(discovery.agents) if discovery is not None else []
     sessions = [o.session_id for o in discovery.agents.values()] if discovery is not None else []
     state, why, info = pane_state(engine, name, session_id, taken.pane, names, sessions)
+    if state == PANE_ATTACHED and info.get("live_session"):
+        raise LaunchError("a fleet agent named %s already runs in pane %s: it runs its own live session (%s), so it is attached and is never closed, "
+                          "with or without --replace; a wrong account is fixed by restarting that agent, not by closing its pane here" % (name, taken.pane, why))
     if state == PANE_ATTACHED and not replace:
         raise LaunchError("a fleet agent named %s already runs in pane %s (%s): close it first (or `reattach --replace` when it runs with the wrong "
                           "account or repo)" % (name, taken.pane, why))
@@ -4499,6 +4519,8 @@ def release_stale_binding(engine, name, taken, session_id, replace=False):
     time.sleep(PANE_SETTLE_SECONDS)
     again, why_again, again_info = pane_state(engine, name, session_id, taken.pane, names, sessions)
     after = pane_screen(engine, taken.pane)
+    if again_info.get("live_session"):
+        raise LaunchError("pane %s now runs %s's own live session: nothing was closed" % (taken.pane, name))
     if again != (PANE_ATTACHED if replace and state == PANE_ATTACHED else PANE_DETACHED) or again_info.get("shows_another") or again_info.get("tab") != tab:
         raise LaunchError("pane %s changed while it was being judged (%s): nothing was closed" % (taken.pane, why_again))
     if str(again_info.get("status") or "").lower() in ("working", "blocked"):
