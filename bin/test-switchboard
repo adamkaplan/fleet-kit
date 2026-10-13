@@ -14,6 +14,7 @@ is non-zero on failure.
 """
 import ast
 import base64
+import collections
 import contextlib
 import errno
 import copy
@@ -1730,8 +1731,11 @@ class FakeV2:
             (body.get("location") or {}).get("directory"))])
 
     def _info(self, s):
+        stamps = [self.clock.ms(s["created"])] + [m["time"]["created"] for m in s["messages"] if isinstance(m.get("time"), dict) and "created" in m["time"]]
+        if s["idle"] is not None:
+            stamps.append(self.clock.ms(s["idle"]))
         return {"id": s["id"], "title": s["title"], "metadata": copy.deepcopy(s["metadata"]),
-                "time": {"created": self.clock.ms(s["created"]),
+                "time": {"created": self.clock.ms(s["created"]), "updated": max(stamps),
                          "idle": None if s["idle"] is None else self.clock.ms(s["idle"])},
                 "outcome": s["outcome"], "location": {"directory": s.get("directory")}}
 
@@ -37072,6 +37076,146 @@ class TestDecisionsPanelOrder(unittest.TestCase):
         self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
                          "the panel's depth cap is the core's")
         self.assertNotIn("\u001b", self.r["hostile"])
+
+
+class TestV2ReadVolume(Base):
+    """The daemon's reads of v2 (each an `opencode api` process): many idle agents over many passes cost a small bounded number of calls, a long
+    history never triggers a big read, and a read before a write is never from memory."""
+
+    AGENTS = tuple("agent%d" % n for n in range(20))
+
+    def world(self, **config):
+        world = World(self, agents=self.AGENTS, config=config)
+        return world
+
+    @staticmethod
+    def ops(world, since=0):
+        found = collections.Counter(call[2] for call in world.v2.calls[since:] if len(call) > 2 and call[1] == "api")
+        return dict(found)
+
+    @staticmethod
+    def params(call):
+        return {call[i + 1].split("=", 1)[0]: call[i + 1].split("=", 1)[1] for i, x in enumerate(call) if x == "--param"}
+
+    def passes(self, world, count, gap=5):
+        for _ in range(count):
+            world.engine.run_pass()
+            world.tick(gap)
+
+    def test_twenty_idle_agents_over_thirty_passes_cost_a_small_bounded_number_of_calls(self):
+        world = self.world()
+        self.passes(world, 30)
+        total = sum(self.ops(world).values())
+        self.assertLessEqual(total, 260, self.ops(world))
+        uncached = self.world(v2_cache_seconds=0)
+        self.passes(uncached, 30)
+        before = sum(self.ops(uncached).values())
+        self.assertGreater(before, 5 * total, "without the memory the same passes read about %d times: %s" % (before, self.ops(uncached)))
+
+    def test_once_warm_a_pass_of_idle_agents_reads_almost_nothing(self):
+        world = self.world()
+        self.passes(world, 2)
+        mark = len(world.v2.calls)
+        self.passes(world, 10)   # 50 s: inside the 120 s memory
+        self.assertLessEqual(sum(self.ops(world, mark).values()), 12, self.ops(world, mark))
+
+    def test_no_pass_reads_a_two_hundred_message_page_of_a_long_history(self):
+        world = self.world()
+        sid = world.sessions["agent0"]
+        for n in range(500):
+            world.v2.sessions[sid]["messages"].append({"id": "msg_%d" % n, "type": "assistant", "time": {"created": world.clock.ms(world.clock.now())}, "text": "x"})
+        self.passes(world, 6)
+        limits = [self.params(call).get("limit") for call in world.v2.calls if len(call) > 2 and call[2] == "session.message.list"]
+        self.assertNotIn("200", limits)
+        self.assertTrue(set(limits) <= {"10", "1"}, set(limits))
+
+    def test_a_cache_fill_budget_per_pass_shares_the_reads_out_in_turn(self):
+        world = self.world(v2_cache_seconds=30, v2_reads_per_pass=3, v2_reads_per_minute=1000)
+        self.passes(world, 1)                       # the first read of every agent is always made
+        world.tick(40)                              # all 20 records are now old
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        gets = [call for call in world.v2.calls[mark:] if len(call) > 2 and call[2] == "session.get"]
+        self.assertLessEqual(len(gets), 3, "3 background reads in one pass, the rest wait")
+        seen = {self.params(call)["sessionID"] for call in gets}
+        for _ in range(8):
+            mark = len(world.v2.calls)
+            world.engine.run_pass()
+            seen |= {self.params(call)["sessionID"] for call in world.v2.calls[mark:] if len(call) > 2 and call[2] == "session.get"}
+        self.assertEqual(len(seen), 20, "every agent is refreshed within a few passes: the stalest goes first")
+
+    def test_a_per_minute_cap_keeps_what_is_remembered_and_the_stale_record_is_still_used(self):
+        world = self.world(v2_cache_seconds=30, v2_reads_per_pass=100, v2_reads_per_minute=5)
+        self.passes(world, 1)
+        world.tick(40)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        self.assertLessEqual(self.ops(world, mark).get("session.get", 0), 6)
+        self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20, "an agent is never lost to the cap: its remembered record is used")
+
+    def test_a_state_change_in_herdr_reads_the_record_at_once(self):
+        world = self.world()
+        self.passes(world, 2)
+        sid = world.sessions["agent3"]
+        world.v2.start_turn(sid, "a task", fleet=True, lasts=30)   # herdr now says working
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        gets = [self.params(call)["sessionID"] for call in world.v2.calls[mark:] if len(call) > 2 and call[2] == "session.get"]
+        self.assertIn(sid, gets)
+        self.assertLessEqual(len(gets), 2, "only the agent whose state changed")
+
+    def test_a_read_before_a_write_is_never_from_memory(self):
+        world = self.world()
+        self.passes(world, 2)
+        previous = world.engine.discover(world.clock.now()).agents["agent2"]
+        mark = len(world.v2.calls)
+        fresh, why = world.engine.reobserve(previous, world.clock.now())
+        self.assertIsNotNone(fresh, why)
+        ops = self.ops(world, mark)
+        self.assertEqual((ops.get("session.get"), ops.get("session.message.list")), (1, 1), "reobserve reads the record and the prompts again")
+
+    def test_a_person_typing_is_seen_by_the_next_refresh_and_at_once_by_a_fresh_read(self):
+        world = self.world()
+        self.passes(world, 2)
+        sid = world.sessions["agent4"]
+        world.v2.start_turn(sid, "hello there", fleet=False, lasts=1)   # a person's prompt
+        world.tick(2)
+        previous = world.engine.discover(world.clock.now()).agents["agent4"]
+        fresh, _ = world.engine.reobserve(previous, world.clock.now())
+        self.assertIsNotNone(fresh.last_human_prompt, "a fresh read sees the prompt at once")
+        world.tick(125)
+        self.assertIsNotNone(world.engine.discover(world.clock.now()).agents["agent4"].last_human_prompt, "and the daemon's own read catches up within the memory")
+
+    def test_the_inbox_is_remembered_and_read_again_after_the_daemon_writes_to_the_session(self):
+        world = self.world()
+        self.passes(world, 2)
+        sid = world.sessions["agent5"]
+        engine = world.engine
+        engine.reads.inbox(sid, world.clock.now())
+        mark = len(world.v2.calls)
+        engine.reads.inbox(sid, world.clock.now())
+        self.assertEqual(self.ops(world, mark), {}, "remembered")
+        engine.reads.forget(sid)
+        engine.reads.inbox(sid, world.clock.now())
+        self.assertEqual(self.ops(world, mark), {"session.inbox.list": 1})
+
+    def test_delivered_keys_probes_with_one_small_read_when_nothing_changed(self):
+        world = self.world()
+        engine = world.engine
+        sid = world.sessions["agent6"]
+        engine.delivered_keys(sid, world.clock.now() - 100)
+        mark = len(world.v2.calls)
+        keys, complete = engine.delivered_keys(sid, world.clock.now() - 100)
+        self.assertTrue(complete)
+        self.assertEqual(self.ops(world, mark), {"session.message.list": 1, "session.inbox.list": 1}, "one probe and the inbox: no pages")
+
+    def test_zero_remembers_nothing_and_a_bad_setting_is_refused(self):
+        world = self.world(v2_cache_seconds=0)
+        self.passes(world, 3)
+        self.assertGreaterEqual(self.ops(world).get("session.get", 0), 60)
+        for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
+            with self.subTest(key=key), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
 
 
 class TestAgentsVerify(unittest.TestCase):
