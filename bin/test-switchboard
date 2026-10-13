@@ -39226,6 +39226,21 @@ class TestV2Breaker(Base):
         self.assertEqual([e["episode"] for e in again], [2])
 
 
+class SlowProbeBreaker(sb.V2Breaker):
+    """A breaker whose `probe_out` hands the processor to another thread between being read and being written (no wait): an unguarded
+    check-then-set shows itself at once."""
+
+    @property
+    def probe_out(self):
+        seen = self._probe_out
+        time.sleep(0)
+        return seen
+
+    @probe_out.setter
+    def probe_out(self, value):
+        self._probe_out = value
+
+
 class TestV2BreakerEdges(Base):
     def setUp(self):
         super().setUp()
@@ -39259,21 +39274,28 @@ class TestV2BreakerEdges(Base):
         self.breaker.abandon()
         self.assertEqual(self.breaker.allows(False), "probe")
 
-    def test_two_threads_asking_at_once_get_exactly_one_probe(self):
-        self.open_it()
-        got, barrier = [], threading.Barrier(8)
+    def test_threads_asking_at_once_get_exactly_one_probe_each_round(self):
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)   # threads switch as often as Python allows, so an unguarded check-then-set shows itself
+        self.addCleanup(sys.setswitchinterval, previous)
+        for round_number in range(40):
+            breaker = SlowProbeBreaker(lambda: self.now[0])
+            for _ in range(sb.V2_TIMEOUT_STREAK):
+                breaker.record(20, True)
+            got, barrier = [], threading.Barrier(8)
 
-        def ask():
-            barrier.wait()
-            got.append(self.breaker.allows(False))
+            def ask():
+                barrier.wait()
+                got.append(breaker.allows(False))
 
-        threads = [threading.Thread(target=ask) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(sorted(map(str, got)), ["False"] * 7 + ["probe"])
-        self.assertEqual(self.breaker.skipped, 7)
+            threads = [threading.Thread(target=ask) for _ in range(8)]
+            self.now[0] += sb.V2_BACKOFF_BASE + 1
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(sorted(map(str, got)), ["False"] * 7 + ["probe"], "round %d" % round_number)
+            self.now[0] = 1000.0
 
     def test_concurrent_records_lose_nothing_and_open_it_once(self):
         events, barrier = [], threading.Barrier(8)
