@@ -6612,6 +6612,21 @@ def apply_notice_effects(engine):
     return False
 
 
+def pr_checks_of(rollup, limit=30):
+    """[{"name", "conclusion"}] of the checks of a statusCheckRollup, as lower-case words (`success`, `failure`, `in_progress`...), at most `limit`."""
+    found = []
+    for check in rollup if isinstance(rollup, list) else []:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name") or check.get("context") or check.get("workflowName")
+        word = check.get("conclusion") or check.get("state") or check.get("status") or ""
+        if isinstance(name, str) and isinstance(word, str):
+            found.append({"name": _one_line(name, 60), "conclusion": _one_line(word, 30).lower() or "pending"})
+        if len(found) >= limit:
+            break
+    return found
+
+
 def pr_ci_of(rollup):
     """`green`, `failing`, `pending` or `none` from gh's statusCheckRollup (check runs and status contexts)."""
     if not isinstance(rollup, list) or not rollup:
@@ -6830,6 +6845,7 @@ def pr_facts_from(data):
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
+            "checks": pr_checks_of(data.get("statusCheckRollup")),
             "head": head}
 
 
@@ -15593,6 +15609,8 @@ class CiRecordState:
         self.recorded = 0   # verdicts this process recorded
         self.last_record = None
         self.written = 0
+        self.pr_state = {}  # "owner/repo#N" -> the cached state `pr-state` shows (written to pr-state.json)
+        self.pr_state_written = 0
 
 
 def ci_record_pass(engine, now):
@@ -15627,6 +15645,7 @@ def ci_record_pass(engine, now):
             budget[0] -= 1
             state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
             engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
+    pr_state_from_lists(state, repos)
     todo = []
     for repo in repos:
         key = plan_ledger.normal_repo(repo)
@@ -15668,6 +15687,7 @@ def ci_record_pass(engine, now):
                 # the head moved since the list was read: the next list refresh will show it, so wait for that, not every pass
                 retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_LIST_TTL)
             state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
+            pr_state_enrich(state, repo, number, ctx, now)
         except Exception as err:
             fails += 1
             delay = min(CI_RECORD_RETRY[1], CI_RECORD_RETRY[0] * 2 ** (fails - 1))   # unreadable: 5 min, 10, 20, then 30
@@ -15675,6 +15695,161 @@ def ci_record_pass(engine, now):
             engine._note("ci_record.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 200),
                                                                       "retry_in": delay})
     write_ci_record_status(engine, state, now, len(repos))
+    write_pr_state(engine, state, now)
+
+
+# ---- `pr-state`: what the daemon already knows of a PR, for an agent that would otherwise poll GitHub in a loop. The daemon's ci recorder
+# pass keeps this picture (the open-PR lists it reads anyway, and for a PR under a plan the head, checks per job and the gates it evaluates
+# for the ledger); it leaves it in `pr-state.json` (0600, renamed into place, bounded). The command reads that file and the local ledger and
+# makes NO call to GitHub: a PR the daemon has not cached is `unknown`, never fetched.
+PR_STATE_FILE = "pr-state.json"
+PR_STATE_MAX = 400          # PRs kept in the file: the most recently seen
+PR_STATE_WRITE_GAP = 20     # seconds between writes of the file (unless something changed enough to matter: the pass always writes the first)
+
+
+def pr_state_from_lists(state, repos):
+    """The base entry of every open PR the pass's lists hold (head, draft, labels, when the list was read); a PR that left the list since is marked so."""
+    for repo in repos:
+        key = plan_ledger.normal_repo(repo)
+        at, records = state.lists.get(key, (0, []))
+        seen = set()
+        for record in records:
+            number = record.get("number") if isinstance(record, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool):
+                continue
+            ref = "%s#%d" % (key, number)
+            seen.add(ref)
+            head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
+            labels = sorted(str(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or [])[:20]
+            old = state.pr_state.get(ref) or {}
+            entry = {"state": "draft" if record.get("draft") else "open", "head": head, "labels": labels, "at": at, "listed_at": at}
+            if old.get("head") == head and old.get("checks") is not None:   # what the examination found at this very head stays until it is examined again
+                entry.update({k: old[k] for k in ("checks", "ci", "mergeable", "gates", "examined_at") if k in old})
+            state.pr_state[ref] = entry
+        for ref, old in list(state.pr_state.items()):
+            if ref.startswith(key + "#") and ref not in seen and old.get("state") in ("open", "draft") and at > old.get("listed_at", 0):
+                state.pr_state[ref] = dict(old, state="gone", at=at, why="no longer in the open list (merged or closed)")
+
+
+def pr_state_enrich(state, repo, number, ctx, now):
+    """What one examination of a PR under a plan adds: its checks per job, CI, mergeability, and the gates the ledger evaluates (ready, what is missing)."""
+    ref = "%s#%d" % (plan_ledger.normal_repo(repo), number)
+    entry = state.pr_state.get(ref)
+    facts = ctx.facts or {}
+    if entry is None or not facts.get("head"):
+        return
+    entry.update({"checks": facts.get("checks") or [], "ci": facts.get("ci"), "mergeable": facts.get("mergeable"), "examined_at": now, "at": now})
+    if facts.get("state") in ("merged", "closed"):
+        entry["state"] = facts["state"]
+    try:
+        report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, facts, ctx.pr, now=now)
+        missing = [("%s %s" % (g["gate"], m))[:160] for g in report.get("gates", []) if g.get("tracked") and g.get("status") == "missing" for m in g.get("missing", [])][:12]
+        entry["gates"] = {"ready": bool(report.get("ready")), "missing": missing}
+    except Exception:   # the picture is best effort: the gates are said unknown rather than guessed
+        entry.pop("gates", None)
+
+
+def write_pr_state(engine, state, now):
+    """After a pass: leave the picture where `pr-state` reads it (renamed into place, 0600, bounded). Never raises."""
+    if not state.pr_state or (state.pr_state_written and now - state.pr_state_written < PR_STATE_WRITE_GAP):
+        return
+    state.pr_state_written = now
+    try:
+        newest = sorted(state.pr_state.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:PR_STATE_MAX]
+        body = {"written_at": int(now), "daemon_pid": os.getpid(), "prs": dict(newest)}
+        path = Path(engine.state_dir) / PR_STATE_FILE
+        temp = path.with_name("%s.%d.tmp" % (PR_STATE_FILE, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(body, sort_keys=True))
+        os.replace(str(temp), str(path))
+    except OSError:
+        pass   # best effort
+
+
+def pr_state_read(state_dir, now):
+    """(body, why): the file the daemon left, or (None, why) when there is none or it is not one."""
+    try:
+        body = json.loads((Path(state_dir) / PR_STATE_FILE).read_text())
+        if isinstance(body, dict) and isinstance(body.get("prs"), dict) and isinstance(body.get("written_at"), (int, float)):
+            return body, None
+        return None, "the snapshot is not a pr-state file"
+    except FileNotFoundError:
+        return None, "no snapshot: the daemon is not running, or has not passed over a watched repo yet"
+    except (OSError, ValueError):
+        return None, "the snapshot cannot be read"
+
+
+def pr_state_view(ref, body, entries, now, ledger_ref=None):
+    """The answer for `ref` (`owner/repo#N`) as a dict, from the snapshot and the local ledger only."""
+    entry = (body or {}).get("prs", {}).get(ref)
+    if entry is None:
+        return {"pr": ref, "known": False, "why": "not watched, or not cached by the daemon yet"}
+    head = entry.get("head")
+    reviews = []
+    if head:
+        for reviewer in plan_ledger.REVIEWERS_NOW:
+            found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == head and e.get("reviewer") == reviewer]
+            if found:
+                reviews.append({"reviewer": reviewer, "verdict": found[-1].get("verdict"), "head": head})
+    view = {"pr": ref, "known": True, "state": entry.get("state"), "head": head, "mergeable": entry.get("mergeable"), "ci": entry.get("ci"),
+            "checks": entry.get("checks"), "labels": entry.get("labels") or [], "gates": entry.get("gates"), "reviews": reviews,
+            "age_seconds": max(0, int(now - entry.get("at", now))), "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
+    if entry.get("why"):
+        view["why"] = entry["why"]
+    return view
+
+
+def pr_state_line(view):
+    """One line for a view."""
+    if not view.get("known"):
+        return "%s: unknown (%s); nothing was read from GitHub" % (view["pr"], view["why"])
+    parts = [view["pr"], view.get("state") or "?", "head %s" % (view["head"] or "?")[:8]]
+    if view.get("mergeable"):
+        parts.append("mergeable %s" % view["mergeable"].lower())
+    if view.get("checks") is not None:
+        parts.append("CI %s (%s)" % (view.get("ci") or "?", ", ".join("%s: %s" % (c["name"], c["conclusion"]) for c in view["checks"][:8]) or "no checks"))
+    else:
+        parts.append("CI not examined")
+    gates = view.get("gates")
+    parts.append("gates %s" % ("unknown (no plan examined)" if gates is None else "READY" if gates["ready"] else "NOT (%s)" % ("; ".join(gates["missing"][:4]) or "see `gates`")))
+    parts.append("reviews %s" % (", ".join("%s %s" % (r["reviewer"], r["verdict"]) for r in view["reviews"]) or "none recorded at this head"))
+    parts.append("labels %s" % (", ".join(view["labels"]) or "none"))
+    parts.append("cache %ds old" % view["age_seconds"])
+    if view.get("why"):
+        parts.append(view["why"])
+    return "; ".join(parts)
+
+
+def cmd_pr_state(args, runner, now):
+    """`pr-state <owner/repo#N>`: what the daemon already knows, from its cache and the local ledger: ZERO GitHub calls, one line (or --json).
+    `unknown` when the daemon has no data for the PR (never fetched to fill it); fails soft when the daemon has left no snapshot."""
+    try:
+        repo, number, typed = _ledger_pr(args)
+        ref = "%s#%d" % (plan_ledger.normal_repo(repo), number)
+    except (LedgerCommandError, ValueError) as err:
+        sys.stderr.write("%s: pr-state: %s\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_USAGE
+    state = ensure_state_dir()
+    body, why = pr_state_read(state, now())
+    if body is None:
+        print(json.dumps({"pr": ref, "known": False, "why": why}, sort_keys=True) if args.json else "%s: unknown (%s); nothing was read from GitHub" % (ref, why))
+        return EXIT_OK
+    entries, _problem = plan_ledger.read_ledger(state)
+    view = pr_state_view(ref, body, entries, now(), typed)
+    print(json.dumps(view, sort_keys=True) if args.json else pr_state_line(view))
+    return EXIT_OK
+
+
+cmd_pr_state.direct = True   # reads a file: no daemon start, no GitHub
+
+
+def add_pr_state_parsers(sub):
+    state = sub.add_parser("pr-state", help="One line of what the daemon already knows of a PR: head, state, checks per job, gates, reviews, labels (zero GitHub calls)",
+                           description="Reads the daemon's cached picture of the PR (pr-state.json) and the local ledger, and prints one line. It never calls GitHub: "
+                                       "a PR the daemon has not cached is 'unknown'. Use it instead of polling GitHub in a shell loop; wait with `remind`.")
+    state.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    state.add_argument("--json", action="store_true", help="The same, as one JSON object")
 
 
 def write_ci_record_status(engine, state, now, repos):

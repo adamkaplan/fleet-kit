@@ -9413,7 +9413,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -9427,7 +9427,8 @@ ROLE_LINE_LIMITS = {"coder": 128, "orchestrator": 178, "chief-of-staff": 162, "c
 # two maxims restored in the coder: +2 lines, +200 B
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
-ROLE_BYTE_LIMITS = {"coder": 7650, "orchestrator": 10800, "chief-of-staff": 11650, "cos-subagent": 3500}
+# `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
+ROLE_BYTE_LIMITS = {"coder": 7790, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -9639,7 +9640,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
-        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")),
+        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -9949,6 +9950,14 @@ class TestAgentDefinitions(unittest.TestCase):
                 else:
                     self.assertRegex(text.split("\n---\n")[0], r"(?m)^name: %s$" % role_of(path))
                 self.assertRegex(text, r"(?m)^model: __(PROVIDER__/__MODEL_ID|MODEL_ID)__$")
+
+    def test_the_coder_and_the_orchestrator_say_never_poll_github_in_a_shell_loop_and_name_pr_state(self):
+        sentence = "Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`."
+        found = [p for p in AGENT_FILES if role_of(p) in ("coder", "orchestrator")]
+        self.assertEqual(len(found), 4, "coder and orchestrator, opencode and copilot")
+        for path in found:
+            with self.subTest(file=path.name):
+                self.assertEqual(path.read_text().count(sentence), 1)
 
     def test_the_role_files_do_not_grow(self):
         for path in AGENT_FILES:
@@ -20856,6 +20865,73 @@ class TestCiRecordPass(LedgerBase):
         self.assertIn("ci-record: last pass", line)
         self.assertIn("recorded 2 since the daemon started", line)
         self.assertIn("last record", line)
+
+    def pr_state(self, ref, *more):
+        """`pr-state` through main() with a runner that counts every gh spawn: (exit code, stdout, gh calls)."""
+        calls = []
+
+        def runner(argv, **kwargs):
+            if argv[0] == FAKE_GH:
+                calls.append(list(argv))
+            return self.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["pr-state", ref, *more], runner=runner, now=lambda: self.t)
+        return code, out.getvalue(), calls
+
+    def test_pr_state_answers_from_the_daemons_cache_in_one_line_with_no_gh_spawn(self):
+        self.go()
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "code", "verdict": "approve"}, self.t)
+        code, out, calls = self.pr_state(self.PR)
+        self.assertEqual((code, calls), (0, []), "the daemon's cache and the local ledger: not one gh call")
+        (line,) = out.strip().splitlines()
+        for part in ("acme/app#9", "open", "head " + LEDGER_HEAD[:8], "CI green", "gates NOT (", "reviews code approve", "labels none", "cache 0s old"):
+            self.assertIn(part, line)
+        code, out, calls = self.pr_state(self.PR, "--json")
+        view = json.loads(out)
+        self.assertEqual((view["known"], view["state"], view["head"], view["ci"], calls), (True, "open", LEDGER_HEAD, "green", []))
+        self.assertEqual(view["reviews"], [{"reviewer": "code", "verdict": "approve", "head": LEDGER_HEAD}])
+        self.assertIn("checks", view)
+
+    def test_pr_state_of_a_pr_the_daemon_has_not_cached_is_unknown_and_nothing_is_fetched(self):
+        self.go()
+        code, out, calls = self.pr_state("acme/app#99")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("acme/app#99: unknown (not watched, or not cached by the daemon yet); nothing was read from GitHub", out)
+
+    def test_pr_state_fails_soft_when_the_daemon_has_left_no_snapshot(self):
+        code, out, calls = self.pr_state(self.PR)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("unknown (no snapshot: the daemon is not running", out)
+        (self.world.state / sb.PR_STATE_FILE).write_text("not json")
+        code, out, calls = self.pr_state(self.PR)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("the snapshot cannot be read", out)
+
+    def test_pr_state_marks_a_pr_that_left_the_open_list_and_a_draft_and_the_labels(self):
+        self.hub.prs["acme/app"] = [dict(self.listed(9, draft=True), labels=[{"name": "osuser:hold-impact"}])]
+        self.go()
+        self.assertIn("draft", self.pr_state(self.PR)[1])
+        self.assertIn("labels osuser:hold-impact", self.pr_state(self.PR)[1])
+        self.hub.prs["acme/app"] = []
+        self.go(advance=sb.CI_RECORD_LIST_TTL + 1)
+        code, out, calls = self.pr_state(self.PR)
+        self.assertIn("gone", out)
+        self.assertIn("no longer in the open list (merged or closed)", out)
+        self.assertEqual(calls, [])
+
+    def test_the_snapshot_file_is_private_and_bounded(self):
+        self.go()
+        path = self.world.state / sb.PR_STATE_FILE
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        engine = self.engine_cached
+        state = engine.ci_record_state
+        state.pr_state = {"acme/app#%d" % n: {"state": "open", "head": None, "labels": [], "at": float(n)} for n in range(sb.PR_STATE_MAX + 50)}
+        state.pr_state_written = 0
+        sb.write_pr_state(engine, state, self.t + 100)
+        kept = json.loads(path.read_text())["prs"]
+        self.assertEqual(len(kept), sb.PR_STATE_MAX)
+        self.assertIn("acme/app#%d" % (sb.PR_STATE_MAX + 49), kept)
+        self.assertNotIn("acme/app#0", kept)
 
     def test_the_preflights_seven_day_proof_comes_for_free(self):
         self.assertIn("BLOCKED", self.run_as(None, "gates", "preflight", "acme/app")[1])
