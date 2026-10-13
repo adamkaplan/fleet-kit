@@ -41,6 +41,9 @@ Rules this file keeps from the start:
 Python 3.9+, standard library only.
 """
 import argparse
+import base64
+import http.client
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
@@ -295,7 +298,9 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
+    "v2_light": False,             # the owner's hotfix switch: ON turns OFF every optional read of session history (see V2_LIGHT_OFF); sends and writes are untouched
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
     "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
@@ -432,6 +437,10 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    if not isinstance(config["v2_light"], bool):
+        raise ConfigError("%s: 'v2_light' must be true or false, got %r" % (source, config["v2_light"]))
+    if config["v2_transport"] not in ("auto", "cli"):
+        raise ConfigError("%s: 'v2_transport' must be \"auto\" or \"cli\", got %r" % (source, config["v2_transport"]))
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
@@ -812,7 +821,8 @@ class V2Error(Exception):
     """A v2 call that did not return usable JSON.
 
     reason: "http" (v2 answered with an HTTP error), "exit" (non-zero exit, no
-    HTTP status), "timeout", "bad_json" or "unavailable" (could not run).
+    HTTP status), "timeout", "bad_json", "unavailable" (could not run), "too_large" (a reply over the cap), "refused" (a real run under the test suite) or "backoff" (an optional
+    read skipped while the service is slow).
     """
 
     def __init__(self, reason, status=None, detail=None):
@@ -853,43 +863,457 @@ def refuse_real_opencode_under_test(runner, binary):
                       % (binary, ALLOW_REAL_V2_ENV))
 
 
+# ---------------------------------------------------------------- the v2 transport: HTTP to the background service, and backpressure
+#
+# `opencode api <op>` starts a whole process per call (0.13 to 1.5 s measured, against 5 to 17 ms for the same call over HTTP, with identical
+# JSON). The background service writes its address and password to `<state>/opencode/service.json` (mode 0600); the daemon talks to it directly
+# over loopback, keeps one connection alive for reads, and falls back to the CLI on ANY trouble with the HTTP route (the CLI also starts a
+# stopped service, so the fallback is also the recovery). Writes use a fresh connection and are never replayed after they may have been
+# received. The password is sent only to a loopback address and is never logged, audited, printed or put in an error.
+# The operation table was read from the service's own /openapi.json (OpenCode 2.0.24); an operation not in it, or a path parameter it does not
+# know, goes through the CLI. FLEET_SWITCHBOARD_V2_CLI=1 turns the HTTP route off.
+#
+# Backpressure: V2Breaker watches the latency of every call. When calls are slow (p95 over V2_SLOW_SECONDS) or time out in a row it opens for an
+# exponentially growing time (V2_BACKOFF_BASE .. V2_BACKOFF_MAX): OPTIONAL reads are skipped (V2Error "backoff": the callers already hold on a
+# V2Error) while writes and the reads a delivery or a blocked worker needs go on; it resumes gradually (one probe at a time, V2_RECOVER_OK good
+# probes to close). Fail mode: OPEN for essential calls on purpose (a wake must not be lost to a slow service), closed for optional reads.
+
+V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters, query parameters)
+    "server.info": ("GET", "/api/info", (), ()),
+    "session.active": ("GET", "/api/session/active", (), ()),
+    "session.create": ("POST", "/api/session", (), ()),
+    "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
+    "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
+    "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
+    "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
+    "session.inbox.update": ("PATCH", "/api/session/{sessionID}/inbox/{inboxID}", ("sessionID", "inboxID"), ()),
+    "session.interrupt": ("POST", "/api/session/{sessionID}/interrupt", ("sessionID",), ("resume",)),
+    "session.permission.list": ("GET", "/api/session/{sessionID}/permission", ("sessionID",), ()),
+    "session.permission.reply": ("POST", "/api/session/{sessionID}/permission/{requestID}/reply", ("sessionID", "requestID"), ()),
+    "session.form.list": ("GET", "/api/session/{sessionID}/form", ("sessionID",), ()),
+    "session.form.reply": ("POST", "/api/session/{sessionID}/form/{formID}/reply", ("sessionID", "formID"), ()),
+    "session.prompt": ("POST", "/api/session/{sessionID}/prompt", ("sessionID",), ()),
+    "session.synthetic": ("POST", "/api/session/{sessionID}/synthetic", ("sessionID",), ()),
+    "experimental.session.import": ("POST", "/api/experimental/session/import", (), ()),
+}
+V2_ESSENTIAL_READS = ("session.get", "session.inbox.list", "session.permission.list", "session.form.list")   # discovery and the re-check before a write (session.get), a delivery and a blocked worker need these
+V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
+V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
+V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
+V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
+V2_SLOW_MIN_SAMPLES = 8
+V2_SLOW_WINDOW = 20
+V2_TIMEOUT_STREAK = 3             # timeouts in a row that open it
+V2_BACKOFF_BASE = 10.0
+V2_BACKOFF_MAX = 300.0
+V2_RECOVER_OK = 3                 # good probes in a row that close it
+V2_LINK_STATUS_FILE = "v2-link.json"
+V2_LINK_WRITE_SECONDS = 60
+
+
+class V2Unreachable(Exception):
+    """The HTTP route cannot serve this call (no service file, a stale one, refused, a bad password twice): the caller uses the CLI."""
+
+
+def v2_service_file(env):
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "opencode" / "service.json"
+
+
+class V2Http:
+    """One keep-alive connection for reads to the OpenCode service; see the section comment."""
+
+    def __init__(self, service_file, timeout, alive=None, connect=None):
+        self.file = Path(service_file)
+        self.timeout = timeout
+        self.alive = alive or self._pid_alive
+        self.connect = connect or http.client.HTTPConnection   # (host, port, timeout=) -> a connection; a test passes an in-memory one
+        self._info = None        # (host, port, authorization) once read; never logged
+        self._conn = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _pid_alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True   # not ours to signal, so it exists
+        return True
+
+    def _load(self):
+        try:
+            parent = os.lstat(str(self.file.parent))
+            if parent.st_uid != os.getuid() or parent.st_mode & 0o022 or stat.S_ISLNK(parent.st_mode):
+                raise ValueError("the directory is not the user's own and closed to others")   # whoever can write the directory can swap the file
+            fd = os.open(str(self.file), os.O_RDONLY | os.O_NOFOLLOW)   # a symlink is refused, not followed
+            with os.fdopen(fd, "rb") as handle:
+                found = os.fstat(handle.fileno())
+                if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
+                    raise ValueError("not private to this user")   # the password in it is only trusted from a file only this user could write
+                raw = handle.read(V2_SERVICE_FILE_MAX + 1)
+            if len(raw) > V2_SERVICE_FILE_MAX:
+                raise ValueError("too large")
+            found = json.loads(raw.decode("utf-8"))
+            url = urllib.parse.urlsplit(found["url"])
+            password, pid = found["password"], found.get("pid")
+            if url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1") or not url.port:
+                raise ValueError("not a loopback http address")   # the password goes nowhere else
+            if not isinstance(password, str) or not 0 < len(password) <= 512 or re.search(r"[\x00-\x1f\x7f]", password):
+                raise ValueError("no usable password")
+            host, port = url.hostname, url.port
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise V2Unreachable("no usable service file") from None
+        if isinstance(pid, int) and not self.alive(pid):
+            raise V2Unreachable("the service file names a process that is gone")
+        token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
+        self._info = (host, port, "Basic " + token)
+
+    def close(self):
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def request(self, method, target, body=None):
+        """(status, text). Raises V2Unreachable (use the CLI) or V2Error (timeout, too large, or a write whose fate is unknown)."""
+        with self._lock:
+            for attempt in (0, 1):
+                if self._info is None:
+                    self._load()
+                try:
+                    return self._once(method, target, body)
+                except _V2Unauthorized:
+                    self._info = None   # the service restarted with a new password: read the file again, once
+                    self.close()
+                    if attempt:
+                        raise V2Unreachable("the service refused the password twice") from None
+                except V2Error:
+                    raise
+                except (OSError, http.client.HTTPException) as err:
+                    self.close()
+                    if isinstance(err, socket.timeout):
+                        raise V2Error("timeout", None, "no answer within %ss" % self.timeout) from None
+                    if method != "GET" and getattr(err, "sent", True):
+                        raise V2Error("unavailable", None, "the service dropped a %s (it may or may not have been received)" % method) from None
+                    self._info = None   # it may have moved: read the file again, once
+                    if attempt:
+                        raise V2Unreachable("the service does not answer") from None
+        raise V2Unreachable("the service does not answer")
+
+    @staticmethod
+    def _budget(conn, deadline):
+        """Give the socket only the time the call has left (connect, send, status line, headers and body all share ONE deadline); none left is a timeout."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("the call did not finish within its total time")
+        sock = getattr(conn, "sock", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(left)
+
+    @staticmethod
+    def _read_body(response, conn, deadline):
+        """The whole reply body, at most V2_HTTP_MAX_BODY + 1 bytes, within a TOTAL deadline: each socket operation has its own timeout, so a service
+        that answers a byte at a time could otherwise hold the one client far longer than `timeout`."""
+        chunks, size = [], 0
+        while size <= V2_HTTP_MAX_BODY:
+            V2Http._budget(conn, deadline)
+            chunk = response.read(min(65536, V2_HTTP_MAX_BODY + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
+
+    def _once(self, method, target, body):
+        deadline = time.monotonic() + self.timeout
+        host, port, auth = self._info
+        reuse = method == "GET" and self._conn is not None
+        conn = self._conn if reuse else self.connect(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
+        headers = {"Authorization": auth, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        sent = False
+        try:
+            if conn.sock is None:
+                conn.connect()
+            sent = True   # from here on a write may have reached the service
+            self._budget(conn, deadline)
+            conn.request(method, target, body=data, headers=headers)
+            self._budget(conn, deadline)
+            response = conn.getresponse()
+            raw = self._read_body(response, conn, deadline)
+        except (OSError, http.client.HTTPException) as err:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            if conn is self._conn:
+                self._conn = None
+            err.sent = sent
+            raise
+        if len(raw) > V2_HTTP_MAX_BODY:
+            conn.close()
+            self._conn = None
+            raise V2Error("too_large", None, "a reply over %d bytes was refused" % V2_HTTP_MAX_BODY)
+        if response.status == 401:
+            conn.close()
+            self._conn = None
+            raise _V2Unauthorized()
+        if method == "GET" and not response.will_close:
+            self._conn = conn
+        else:
+            conn.close()
+            if conn is self._conn:
+                self._conn = None
+        return response.status, raw.decode("utf-8", "replace")
+
+
+class _V2Unauthorized(Exception):
+    pass
+
+
+class V2Breaker:
+    """Latency-driven backoff for the calls to the service (see the section comment). `allows(essential)` returns False (skip the call), True, or
+    "probe" (go, and tell `record` or `abandon` it was the probe); `record(seconds, timed_out, probe)` returns an event or None:
+    {"event": "v2.backoff", "episode", "reason", "seconds"} when it opens, {"event": "v2.resume", "episode"} when it closes. One lock guards all
+    of it: the daemon has threads and one client."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.samples = []
+        self.timeouts = 0
+        self.state = "closed"      # closed | open (waiting) | probing
+        self.until = 0.0
+        self.level = 0
+        self.good = 0
+        self.episode = 0
+        self.skipped = 0
+        self.probe_out = False
+
+    def p95(self):
+        with self.lock:
+            return self._p95()
+
+    def _p95(self):
+        if not self.samples:
+            return None
+        ordered = sorted(self.samples)
+        return ordered[min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)]
+
+    def allows(self, essential):
+        """Whether this call may go now. Essential calls always may; an optional one waits out the backoff, then one probe at a time."""
+        with self.lock:
+            if self.state == "closed":
+                return True
+            if essential:
+                return True
+            if self.state == "open" and self.clock() >= self.until and not self.probe_out:
+                self.state, self.probe_out = "probing", True
+                return "probe"
+            if self.state == "probing" and not self.probe_out:
+                self.probe_out = True
+                return "probe"
+            self.skipped += 1
+            return False
+
+    def abandon(self):
+        """The probe call ended in something that is not an answer or a timeout (a bug, an interrupt): free the probe slot, learn nothing."""
+        with self.lock:
+            self.probe_out = False
+
+    def record(self, seconds, timed_out, probe=False):
+        with self.lock:
+            return self._record(seconds, timed_out, probe)
+
+    def _record(self, seconds, timed_out, probe):
+        slow = timed_out or seconds > V2_SLOW_SECONDS
+        if probe and self.state == "probing":
+            self.probe_out = False
+            if slow:
+                self.level += 1
+                self.state, self.good, self.until = "open", 0, self.clock() + self._wait()
+                return {"event": "v2.backoff", "episode": self.episode, "reason": "a probe was slow or timed out", "seconds": int(self._wait())}
+            self.good += 1
+            if self.good >= V2_RECOVER_OK:
+                self.state, self.level, self.good, self.samples, self.timeouts = "closed", 0, 0, [], 0
+                return {"event": "v2.resume", "episode": self.episode}
+            return None
+        self.samples = (self.samples + [seconds])[-V2_SLOW_WINDOW:]
+        self.timeouts = self.timeouts + 1 if timed_out else 0
+        if self.state != "closed":
+            return None   # an essential call during a backoff: it is recorded, it changes nothing (and is never mistaken for the probe)
+        reason = None
+        if self.timeouts >= V2_TIMEOUT_STREAK:
+            reason = "%d calls in a row timed out" % self.timeouts
+        elif len(self.samples) >= V2_SLOW_MIN_SAMPLES and self._p95() > V2_SLOW_SECONDS:
+            reason = "p95 latency %.1f s is over %g s" % (self._p95(), V2_SLOW_SECONDS)
+        if reason is None:
+            return None
+        self.episode += 1
+        self.level, self.good, self.state = 0, 0, "open"
+        self.until = self.clock() + self._wait()
+        return {"event": "v2.backoff", "episode": self.episode, "reason": reason, "seconds": int(self._wait())}
+
+    def _wait(self):
+        return min(V2_BACKOFF_MAX, V2_BACKOFF_BASE * (2 ** self.level))
+
+
 class V2Client:
-    """The one client for OpenCode v2. Every call is `<binary> api <operation>`."""
+    """The one client for OpenCode v2. A call goes over HTTP to the background service when it can (see the transport section above), else
+    through `<binary> api <operation>`; every call is counted (one record, with its transport) and timed by the breaker."""
 
     DELIVERIES = ("queue", "steer")
     ORDERS = ("desc", "asc")
 
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time):
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time, http=None, monotonic=time.monotonic, transport="auto"):
         self.binary = binary
         self.env = dict(env or {})
         self.runner = runner
         self.timeout = timeout
         self.clock = clock
-        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
+        self.monotonic = monotonic   # durations of calls, for the breaker: never the wall clock
+        self.breaker = V2Breaker(monotonic)
+        self.on_event = None      # callable(name, detail): the engine's audit of `v2.backoff` and `v2.resume`
+        self.state_dir = None     # set for the daemon: where `v2-link.json` (what `status` shows) is written
+        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation, transport) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
         self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
         self.count_errors = 0   # accounting that failed; a call never fails for it
+        self._link_written = 0.0
+        self._link_lock = threading.Lock()
+        if http is None and transport == "auto" and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
+            merged = dict(os.environ)
+            merged.update(self.env)
+            http = V2Http(v2_service_file(merged), timeout)   # a real run only: a fake runner stands for the CLI
+        self.http = http
 
-    def count_call(self, operation):
-        """Remember one call. NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
+    def count_call(self, operation, transport="cli"):
+        """Remember one call and the way it travelled ("http", "cli", or "cli-fallback": the CLI after the HTTP route could not serve it).
+        NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
         try:
             now = self.clock()
             with self.calls_lock:
-                self.calls.append((now, operation))
+                self.calls.append((now, operation, transport))
                 while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
                     self.calls.popleft()
         except Exception:
             self.count_errors += 1
 
-    def calls_by_operation(self, window=60.0, now=None):
-        """{operation: calls} over the last `window` seconds (this process's own calls)."""
+    def _recent(self, window, now):
         now = self.clock() if now is None else now
         with self.calls_lock:
             remembered = list(self.calls)
-        return dict(collections.Counter(op for at, op in remembered if at >= now - window))
+        return [call for call in remembered if call[0] >= now - window]
+
+    def calls_by_operation(self, window=60.0, now=None):
+        """{operation: calls} over the last `window` seconds (this process's own calls, whatever the transport)."""
+        return dict(collections.Counter(call[1] for call in self._recent(window, now)))
+
+    def calls_by_transport(self, window=60.0, now=None):
+        """{transport: calls} over the last `window` seconds: how many went over HTTP, through the CLI, or through the CLI after a fallback."""
+        return dict(collections.Counter(call[2] for call in self._recent(window, now)))
 
     def _call(self, operation, params=None, data=None, envelope=False):
         refuse_real_opencode_under_test(self.runner, self.binary)
-        self.count_call(operation)
+        ticket = self.breaker.allows(self._is_essential(operation, params))
+        if not ticket:
+            raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
+        started = self.monotonic()
+        try:
+            text = self._transport(operation, params, data)
+        except V2Error as err:
+            self._record(self.monotonic() - started, err.reason == "timeout", ticket == "probe")
+            raise
+        except BaseException:
+            if ticket == "probe":
+                self.breaker.abandon()   # not an answer: free the probe slot, or optional reads would wait for ever
+            raise
+        self._record(self.monotonic() - started, False, ticket == "probe")
+        return self._decode(operation, text, envelope)
+
+    def _is_essential(self, operation, params=None):
+        spec = V2_HTTP_OPERATIONS.get(operation)
+        if spec is None or spec[0] != "GET" or operation in V2_ESSENTIAL_READS:
+            return True
+        return operation == "session.message.list" and (params or {}).get("type") in ("synthetic", "user")   # the delivery rule's key read, and the person-is-typing read every observation (so every re-check before a write) makes
+
+    def _record(self, seconds, timed_out, probe=False):
+        event = self.breaker.record(seconds, timed_out, probe)
+        if event is not None and self.on_event is not None:
+            try:
+                self.on_event(event["event"], {k: v for k, v in event.items() if k != "event"})
+            except Exception:   # an audit trouble never fails a call, but it is counted
+                self.count_errors += 1
+        self._write_link(event is not None)
+
+    def _write_link(self, forced=False):
+        """What `status` shows of the link, written by the daemon only, at most once a minute unless the breaker changed."""
+        if self.state_dir is None:
+            return
+        with self._link_lock:   # the daemon has threads: one writer at a time, and the once-a-minute check is part of it
+            self._write_link_locked(forced)
+
+    def _write_link_locked(self, forced):
+        moment = self.clock()
+        if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
+            return
+        self._link_written = moment
+        by = self.calls_by_transport(V2_CALLS_KEEP_SECONDS)
+        body = {"at": int(moment), "transport": "http" if self.http is not None else "cli",
+                "fallbacks": by.get("cli-fallback", 0), "skipped": self.breaker.skipped,
+                "breaker": self.breaker.state, "episodes": self.breaker.episode,
+                "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
+        try:
+            target = Path(self.state_dir) / V2_LINK_STATUS_FILE
+            temp = target.with_name("%s.%d.tmp" % (V2_LINK_STATUS_FILE, os.getpid()))
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(body, sort_keys=True))
+            os.replace(str(temp), str(target))
+        except OSError:
+            self.count_errors += 1   # a status line is best effort; the failure is counted, and the line shows its own age
+
+    def _transport(self, operation, params, data):
+        """The reply text of one call: over HTTP when the service answers, else through the CLI (which also starts a stopped service)."""
+        spec = V2_HTTP_OPERATIONS.get(operation)
+        if self.http is not None and spec is not None:
+            target = self._target(spec, params)
+            if target is not None:
+                try:
+                    status, text = self.http.request(spec[0], target, data)
+                except V2Unreachable:
+                    self.count_call(operation, "cli-fallback")   # the HTTP route reached nothing: the CLI call is the one that counts
+                    return self._cli(operation, params, data)
+                except V2Error:
+                    self.count_call(operation, "http")           # it reached the service (a timeout, a refused size, a dropped write)
+                    raise
+                self.count_call(operation, "http")
+                if status >= 400:
+                    raise V2Error("http", status, _one_line(text) or "HTTP %d" % status)
+                return text
+        self.count_call(operation, "cli")
+        return self._cli(operation, params, data)
+
+    @staticmethod
+    def _target(spec, params):
+        """The request path and query of one call, or None when a parameter is one the table does not know (then the CLI decides)."""
+        method, template, path_names, query_names = spec
+        given = {name: value for name, value in (params or {}).items() if value is not None}
+        if set(given) - set(path_names) - set(query_names) or any(name not in given for name in path_names):
+            return None
+        path = template
+        for name in path_names:
+            path = path.replace("{%s}" % name, urllib.parse.quote(str(given[name]), safe=""))
+        query = [(name, str(given[name])) for name in query_names if name in given]
+        return path + ("?" + urllib.parse.urlencode(query) if query else "")
+
+    def _cli(self, operation, params, data):
         argv = [self.binary, "api", operation]
         for name, value in (params or {}).items():
             if value is not None:
@@ -921,7 +1345,11 @@ class V2Client:
                 # v2 put the error body on stdout and `HTTP <code> <reason>` on stderr.
                 raise V2Error("http", int(match.group(1)), _one_line(stdout) or _one_line(stderr))
             raise V2Error("exit", None, _one_line(stderr) or _one_line(stdout) or "exit %d" % result.returncode)
-        if not stdout.strip():
+        return stdout
+
+    @staticmethod
+    def _decode(operation, stdout, envelope):
+        if not (stdout or "").strip():
             return None
         try:
             body = json.loads(stdout)
@@ -930,6 +1358,11 @@ class V2Client:
         if isinstance(body, dict) and "data" in body:
             return body if envelope else body["data"]  # PR 8: paging needs the cursor beside the data
         return body
+
+    @staticmethod
+    def _limit(limit):
+        """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
+        return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
 
     def server_info(self):
         return self._call("server.info")
@@ -953,7 +1386,7 @@ class V2Client:
         if order is not None and order not in self.ORDERS:
             raise ValueError("order must be one of %s" % ", ".join(self.ORDERS))
         return self._call("session.message.list", {
-            "sessionID": session_id, "limit": limit, "order": order, "type": type, "cursor": cursor})
+            "sessionID": session_id, "limit": self._limit(limit), "order": order, "type": type, "cursor": cursor})
 
     def message_page(self, session_id, limit=None, type=None, cursor=None):
         """PR 8: one page of `session.message.list` with its cursor: (messages, cursor).
@@ -965,7 +1398,7 @@ class V2Client:
         if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_LIMIT):
             raise ValueError("cursor must be v2's opaque token (a non-empty string), got %r" % (cursor,))
         body = self._call("session.message.list", {
-            "sessionID": session_id, "limit": limit, "type": type, "cursor": cursor}, envelope=True)
+            "sessionID": session_id, "limit": self._limit(limit), "type": type, "cursor": cursor}, envelope=True)
         if isinstance(body, dict):
             found = body.get("cursor")
             return (body["data"] if isinstance(body.get("data"), list) else []), \
@@ -1813,6 +2246,149 @@ def adopt_inherited_lock(path):
         return None
 
 
+V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before a write is still made)", "compactions (orders after one)", "inbox unread badge and lapsed-note conversion",
+                "stopped/finished summary and stop classification", "landed-checks that page messages (a sent-key ledger answers instead)",
+                "report-answered checks", "brief scan")
+SENT_KEYS_FILE = "sent-keys.json"
+SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds
+SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one
+
+
+class SentLedger:
+    """v2_light: the keys the daemon itself delivered, per session, kept in `sent-keys.json` (0600, renamed into place, bounded) so a restart
+    keeps them. Two writers (the daemon and a CLI `send`) share it: every change is a locked read-modify-write (flock), every read
+    sees the file as it is now.
+
+    At most once: a send is `reserve`d BEFORE the write and `confirm`ed after it. A crash between the two leaves the key
+    UNKNOWN (`unknown` in the file): it counts as delivered, is never sent again by itself, and `status` says how many there are. A
+    send that FAILED (a V2Error) is `release`d: nothing was admitted, or v2 refuses a repeat (the message id is derived from the keys)."""
+
+    def __init__(self, state_dir):
+        self.path = Path(state_dir) / SENT_KEYS_FILE if state_dir is not None else None
+        self.lock = self.path.with_name(SENT_KEYS_FILE + ".lock") if self.path is not None else None
+
+    def load(self):
+        """(sent, unknown). A MISSING file is an empty ledger; a file that is there and cannot be read or parsed is not: the ledger
+        fails CLOSED (a V2Error, so the callers hold the send and say why), never forgetting what was delivered."""
+        if self.path is None:
+            return {}, {}
+        try:
+            with open(str(self.path)) as handle:
+                text = handle.read(SENT_FILE_MAX + 1)   # never more than the cap: the file can grow between a stat and a read
+            if len(text) > SENT_FILE_MAX:
+                raise V2Error("ledger_corrupt", None, "sent-keys.json is larger than any ledger the daemon writes: nothing is sent until it is moved aside")
+        except FileNotFoundError:
+            return {}, {}
+        except OSError as err:
+            raise V2Error("ledger_unreadable", None, "sent-keys.json cannot be read (%s): nothing is sent until it can be" % err)
+        try:
+            body = json.loads(text)
+            tables = []
+            for name in ("sessions", "unknown"):
+                table = {}
+                for sid, entries in (body.get(name) or {}).items():
+                    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in entries.values()):
+                        raise ValueError("a key without a time")
+                    table[sid] = {str(k): v for k, v in entries.items()}
+                tables.append(table)
+            sessions, unknown = tables
+        except (ValueError, AttributeError, TypeError):
+            raise V2Error("ledger_corrupt", None, "sent-keys.json is not a ledger: nothing is sent until it is moved aside (it is never read as empty)")
+        return sessions, unknown
+
+    @property
+    def keys(self):
+        return self.load()[0]
+
+    def update(self, change):
+        """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically. A ledger that cannot be
+        locked, read or written raises (V2Error): the caller does not send. With no state directory there is nowhere to keep it: that fails closed too."""
+        if self.path is None:
+            raise V2Error("ledger_unwritable", None, "v2_light needs a state directory for sent-keys.json: nothing is sent without one")
+        try:
+            fd = os.open(str(self.lock), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                sessions, unknown = self.load()
+                change(sessions, unknown)
+                # Only `sessions` is trimmed: an unknown-fate reservation is what says "do not send again", so it stays (bounded by SENT_FILE_MAX)
+                for mine in sessions.values():
+                    if len(mine) > SENT_PER_SESSION:
+                        for key, _ in sorted(mine.items(), key=lambda kv: kv[1])[:len(mine) - SENT_PER_SESSION]:
+                            del mine[key]
+                for sid in [sid for sid, mine in sessions.items() if not mine]:
+                    del sessions[sid]
+                if len(sessions) > SENT_SESSIONS:
+                    keep = sorted(sessions.items(), key=lambda kv: max(kv[1].values() or [0]), reverse=True)[:SENT_SESSIONS]
+                    sessions.clear()
+                    sessions.update(keep)
+                self.save(sessions, unknown)
+        except OSError as err:
+            raise V2Error("ledger_unwritable", None, "sent-keys.json cannot be written (%s): nothing is sent until it can be" % err)
+
+    def reserve(self, session_id, keys, created):
+        """Reserve `keys` unless one is already in the ledger (sent or of unknown fate): True when reserved, False when another sender
+        (the daemon, a CLI `send`) already has it. One locked step, so two senders never both write the same key."""
+        taken = []
+
+        def change(sessions, unknown):
+            have = set(sessions.get(session_id, {})) | set(unknown.get(session_id, {}))
+            if have & set(keys):
+                taken.append(True)
+                return
+            unknown.setdefault(session_id, {}).update({key: created for key in keys})
+        self.update(change)
+        return not taken
+
+    def confirm(self, session_id, keys, created):
+        def change(sessions, unknown):
+            sessions.setdefault(session_id, {}).update({key: created for key in keys})
+            for key in keys:
+                unknown.get(session_id, {}).pop(key, None)
+        self.update(change)
+
+    def release(self, session_id, keys):
+        def change(sessions, unknown):
+            for key in keys:
+                unknown.get(session_id, {}).pop(key, None)
+        self.update(change)
+
+    def known(self, session_id, since):
+        sessions, unknown = self.load()
+        found = KeyTimes()
+        for table in (sessions, unknown):   # an unknown-fate send counts as delivered: at most once
+            for key, created in table.get(session_id, {}).items():
+                if created >= since:
+                    found.add_all([key], created)
+        return found
+
+    def unknown_count(self):
+        return sum(len(mine) for mine in self.load()[1].values())
+
+    def save(self, sessions, unknown):
+        temp = None
+        try:
+            temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"sessions": sessions, "unknown": unknown}, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(str(temp), str(self.path))
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)   # the rename itself must survive a power loss
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception as err:
+            if temp is not None:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            raise OSError("sent-keys.json could not be written: %s" % err)
+
+
 class KeyTimes(set):
     """The keys `delivered_keys` found, a plain set, with `at[key]`: when the message that carries it was
     created (the oldest, when several do; None when v2 gave no time). PR 13 reads when a report arrived."""
@@ -1851,10 +2427,12 @@ class V2Reads:
     PROMPT_READ = 10
     PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
 
-    def human_prompts_newest(self, session_id):
+    def human_prompts_newest(self, session_id, fresh=False):
         """The person's prompts (user messages without `metadata.fleet`), newest first, from at most two small reads: the newest PROMPT_READ user
         messages, and only if they are ALL the fleet's (a person's prompt may sit behind them) the newest PROMPT_READ_WIDE. A prompt buried
         under more fleet messages than that is not seen: the person is then not counted as engaged by this read, and a write is re-checked anyway."""
+        if self.engine.light and not fresh:
+            return []   # v2_light: no background read. The read just before a write (fresh) is still made: the engagement gate keeps its facts
         for limit in (self.PROMPT_READ, self.PROMPT_READ_WIDE):
             page = self.engine.v2.message_list(session_id, limit=limit, type="user")
             page = page if isinstance(page, list) else []
@@ -1931,7 +2509,9 @@ class V2Reads:
         if entry is not None and not fresh and not self.may_fill(now):
             self.deferred += 1
             return entry[1]
-        newest = self.human_prompts_newest(session_id)
+        if self.engine.light and not fresh:
+            return None
+        newest = self.human_prompts_newest(session_id, fresh)
         found = _created(newest[0]) if newest else None
         if self.ttl() > 0 and updated is not None:
             self.prompts[session_id] = (updated, found)
@@ -1941,6 +2521,8 @@ class V2Reads:
 
     def inbox(self, session_id, now, fresh=False):
         """`session.inbox.list`, remembered (and read again when the daemon itself wrote to the session)."""
+        if self.engine.light:
+            return []
         entry, ttl = self.inboxes.get(session_id), self.ttl()
         if entry is not None and not fresh and ttl > 0:
             if now - entry[1] < ttl:
@@ -1958,6 +2540,8 @@ class V2Reads:
     def compaction_page(self, session_id, limit, now):
         """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
         that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
+        if self.engine.light:
+            return []
         entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
         if entry is not None and ttl > 0 and now - entry[1] < ttl:
             return entry[0]
@@ -1979,6 +2563,8 @@ class Switchboard:
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
+            v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
@@ -1998,6 +2584,8 @@ class Switchboard:
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
         self.reads = V2Reads(self)
+        self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
+        self.sent = SentLedger(self.state_dir) if self.light else None
         self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
@@ -2035,7 +2623,7 @@ class Switchboard:
         small read, made again only when the session changed (V2Reads.human_prompt)."""
         start = now - self.engaged_seconds
         if inbox:
-            waiting = inbox_human_prompts(self, session_id)
+            waiting = inbox_human_prompts(self, session_id, fresh)
             if waiting and (_created(waiting[0]) or 0) >= start:
                 return _created(waiting[0])
         created = self.reads.human_prompt(session_id, info or {}, now, fresh)
@@ -2190,6 +2778,8 @@ class Switchboard:
         """Keys already in the session: its messages since `since`, read newest
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
+        if self.light:
+            return self.sent.known(session_id, since), True   # what the daemon delivered, from its ledger: no read
         keys, complete = KeyTimes(), False
         # A recipient with something pending is asked about every pass: ONE small read (its newest synthetic message) says whether anything it
         # carries changed; if not, the keys found last time (which reached back to `since`) still hold, and the pages are not read again.
@@ -2277,7 +2867,19 @@ class Switchboard:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
                               "already has is unknown" % (READ_LIMIT, recipient, iso(since)))
-        return decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        if self.light and plan is not None and plan.action in ("note", "wake"):
+            # v2_light: nothing reads a person's prompt in the background. A delivery is about to happen (the batch is ripe and nothing
+            # holds it): only now does the engagement gate get its one small read, so a note is still a note and a wake still a wake.
+            # A plan that waits or holds reads nothing.
+            try:
+                observation.last_human_prompt = self.last_human_prompt(
+                    observation.session_id, now, inbox=(observation.fleet or {}).get("role") == "chief-of-staff", info={}, fresh=True)
+            except V2Error as err:
+                return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
+                              "cannot read %s's transcript: %s" % (recipient, err))
+            plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        return plan
 
     # -- deliver
 
@@ -2339,15 +2941,31 @@ class Switchboard:
                 reply = self.v2.interrupt(observation.session_id, False)
                 result["interrupted"] = reply.get("interrupted") if isinstance(reply, dict) else None
             detail["interrupted"] = True
-        with self._external("v2.synthetic", plan.recipient, detail) as result:
-            record = self.v2.synthetic(observation.session_id, text,
-                                       {"fleet": {"keys": keys, "from": "switchboard"}},
-                                       resume, delivery, message_id, description)
-            if fault("crash-after-send"):
-                raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
-                                     % message_id)
-            result["id"] = record.get("id") if isinstance(record, dict) else None
+        if self.light and not self.sent.reserve(observation.session_id, keys, self.now()):   # before the write: a crash after it leaves the fate unknown, never "not sent"
+            return {"sent": False, "action": "delivered", "reason": "another sender already holds these keys in the sent-keys ledger"}
+        try:
+            with self._external("v2.synthetic", plan.recipient, detail) as result:
+                record = self.v2.synthetic(observation.session_id, text,
+                                           {"fleet": {"keys": keys, "from": "switchboard"}},
+                                           resume, delivery, message_id, description)
+                if fault("crash-after-send"):
+                    raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
+                                         % message_id)
+                result["id"] = record.get("id") if isinstance(record, dict) else None
+        except V2Error as err:
+            if not self.light:
+                raise
+            if err.reason == "http" and err.status == 409:
+                pass   # v2 already holds this message (its id is derived from the keys): it IS delivered
+            elif (err.reason == "http" and isinstance(err.status, int) and 400 <= err.status < 500 and err.status != 408) \
+                    or err.reason in ("unavailable", "refused"):
+                self.sent.release(observation.session_id, keys)   # a definite refusal (a 4xx other than 408/409: not admitted), or the call never ran: the write did not land
+                raise
+            else:
+                raise   # a 5xx, 408, timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
+        if self.light:
+            self.sent.confirm(observation.session_id, keys, self.now())
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
@@ -2357,7 +2975,7 @@ class Switchboard:
         engagement window becomes a wake: `inbox.update` to queue, then to
         steer (v2 refuses steer to steer). Only on an idle agent. Returns the
         converted inbox ids."""
-        if fault("no-note-conversion") or hold_reason(observation) or observation.status != "idle":
+        if self.light or fault("no-note-conversion") or hold_reason(observation) or observation.status != "idle":
             return []
         if observation.engaged(now, self.engaged_seconds):
             return []
@@ -2464,7 +3082,7 @@ class Switchboard:
         carry them, plus the facts held for the agent. A note a turn has
         carried is read; a wake starts its own turn, so it is never unread."""
         # An agent with something pending (a held plan) is never served from memory: a send or a note for it is noticed at the next pass.
-        inbox = self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
+        inbox = [] if self.light else self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
         waiting = [item for item in (inbox if isinstance(inbox, list) else [])
                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
                    and item.get("delivery") == "steer" and item.get("resume") is not True]
@@ -3624,6 +4242,8 @@ BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session w
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
+    if getattr(engine, "light", False):
+        return True   # v2_light: no scan; a brief is never sent twice for want of looking
     page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
     page = page if isinstance(page, list) else []
     return any((_fleet_meta(message) or {}).get("brief") for message in page) or len(page) >= BRIEF_SCAN_USER
@@ -3795,9 +4415,11 @@ def next_poll(engine, poll):
     return poll
 
 
-def inbox_human_prompts(engine, session_id):
+def inbox_human_prompts(engine, session_id, fresh=False):
     """Your steered prompts still waiting in v2's inbox (SF1: there within ~0.1 s, consumed at the
     next step boundary), as message-like records, newest first. Not yet seen by the model."""
+    if getattr(engine, "light", False) and not fresh:
+        return []   # v2_light: only the read just before a write (the engagement gate) is made
     inbox = engine.v2.inbox_list(session_id)
     found = []
     for item in inbox if isinstance(inbox, list) else []:
@@ -4346,6 +4968,8 @@ class WorkerFacts:
         cached = self._summaries.get((session_id, idle_ms))
         if cached is not None:
             return cached
+        if self.engine.light:
+            return ""
         page = self.engine.v2.message_list(session_id, limit=1, type="assistant")
         text = _one_line(reply_text(page[0]) if isinstance(page, list) and page else "", SUMMARY_CAP)
         if len(self._summaries) > 500:
@@ -4508,6 +5132,8 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
     {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
     now = engine.now()
+    if getattr(engine, "light", False):
+        return None   # v2_light: no transcript read, so a stop is only its idle rider
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
@@ -5096,6 +5722,8 @@ def synthetic_lines(engine, session_id, since, waiting=False):
     stay open. The inbox is read every time (one small read; it is not in the cache, because it changes without the
     transcript's newest id changing). The boss's side (the reports) stays the transcript's: a report is listed once
     the boss has it."""
+    if getattr(engine, "light", False):
+        return []
     found = transcript_lines(engine, session_id, since)
     if not waiting:
         return found
@@ -5114,6 +5742,8 @@ def synthetic_lines(engine, session_id, since, waiting=False):
 
 def transcript_lines(engine, session_id, since):
     """The transcript's synthetic lines since `since`, newest message first (cached by the newest synthetic id)."""
+    if getattr(engine, "light", False):
+        return []
     newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
     newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
     cached = engine.synthetic_cache.get(session_id)
@@ -6571,8 +7201,12 @@ def v2_calls_summary(v2, now):
     count = getattr(v2, "calls_by_operation", None)
     if count is None:
         return None
-    return {"at": iso(now), "last_minute": count(60.0),   # the client's own clock: the calls were stamped with it
-            "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0).items())}}
+    summary = {"at": iso(now), "last_minute": count(60.0),   # the client's own clock: the calls were stamped with it
+               "avg_5min": {op: round(n / 5.0, 1) for op, n in sorted(count(300.0).items())}}
+    by_transport = getattr(v2, "calls_by_transport", None)
+    if by_transport is not None:
+        summary["by_transport"] = by_transport(60.0)   # the same record, the way each call travelled: http, cli, cli-fallback
+    return summary
 
 
 def record_v2_calls(engine):
@@ -6610,6 +7244,9 @@ def v2_calls_status(state_dir, now):
         by = ", ".join("%s %d" % (op, n) for op, n in sorted(last.items(), key=lambda kv: -kv[1])[:4])
         average = sum(body["avg_5min"].values())
         text = "%d/min (%s; 5-min average %.0f/min)" % (sum(last.values()), by or "none", average)
+        travelled = body.get("by_transport")
+        if isinstance(travelled, dict) and travelled:
+            text += "; by transport: " + ", ".join("%s %d" % (name, n) for name, n in sorted(travelled.items()) if isinstance(n, int))
         at = parse_iso(body.get("at"))
         if at is not None and now - at > 120:
             text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
@@ -10592,7 +11229,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             v2_ok, v2_line = False, ("not configured: set 'opencode' in %s to the absolute path of "
                                      "the OpenCode v2 binary" % config_path())
         else:
-            v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+            v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
             v2_ok, v2_line = _check(lambda: _v2_summary(v2.server_info()))
         herdr_ok, entries = _check(herdr.agent_list)
         herdr_line = "%d agent(s)" % len(entries) if herdr_ok else entries
@@ -10614,9 +11251,17 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
+        if config_ok and config.get("v2_light"):
+            try:
+                unknown = SentLedger(state).unknown_count()
+                ledger = "; %d send(s) of unknown fate, counted as delivered (sent-keys.json)" % unknown if unknown else ""
+            except V2Error as err:   # status never crashes on a bad state file: it says the ledger is unusable and that the sends are stopped
+                ledger = "; sent-keys ledger: UNREADABLE (sends stopped: fail closed): %s" % _one_line(str(err), 160)
+            report["v2_light"] = "ON (features off: %s)%s" % ("; ".join(V2_LIGHT_OFF), ledger)
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
         report["stopped_news"] = stopped_news_summary(state, now())
@@ -10800,9 +11445,11 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
+    lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
+    lines.extend("      " + report["v2_link"] for _ in [0] if report.get("v2_link"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
@@ -10925,7 +11572,9 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
-    v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
+    if actor == "daemon":
+        v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
     engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
@@ -14532,6 +15181,22 @@ def ci_record_status_line(state_dir, now_ts):
         "; last record " + iso(last) if isinstance(last, (int, float)) else "")
 
 
+def v2_link_status_line(state_dir, now_ts):
+    """The `status` line for the daemon's link to the OpenCode service (route and breaker; the call counts are the `v2 calls` line), or None."""
+    try:
+        raw = json.loads((Path(state_dir) / V2_LINK_STATUS_FILE).read_text())
+        at, fallbacks, skipped = float(raw["at"]), int(raw["fallbacks"]), int(raw["skipped"])
+        transport, breaker = str(raw["transport"])[:8], str(raw["breaker"])[:8]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ago = max(0, int(now_ts - at))
+    p95 = raw.get("p95_ms")
+    return "v2-link: %s (%s ago): %d fell back to the CLI in the last 10 min; breaker %s%s%s" % (
+        transport, "%d s" % ago if ago < 120 else "%d min" % (ago // 60), fallbacks,
+        "CLOSED" if breaker == "closed" else "OPEN: optional reads are being skipped (v2.backoff), %d so far" % skipped,
+        "; p95 %d ms" % p95 if isinstance(p95, int) else "", "; %s episode(s) so far" % raw.get("episodes") if raw.get("episodes") else "")
+
+
 def cmd_gates_preflight(args, runner, now):
     config = load_config()
     blocking, notes = plan_ledger.preflight(config, args.pr, lambda: ci_recorder_proven(ensure_state_dir(), now()), cos_ready_check)
@@ -16803,7 +17468,7 @@ def build_policy_judge(config, runner, now):
     settings = config["policy"]
     jev_settings = dict(config["jev"], timeout_seconds=min(config["jev"]["timeout_seconds"], POLICY_WARM_SECONDS))
     jev = build_jev(dict(config, jev=jev_settings))
-    v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS))
+    v2 = V2Client(config["opencode"], config["opencode_env"], runner, min(config["call_timeout_seconds"], POLICY_WARM_SECONDS), transport=config["v2_transport"])
     return PolicyJudge(config, v2, intent_reader_for(config, runner, now), jev, AuditLog(state / "audit.jsonl"), state, now)
 
 
@@ -18066,7 +18731,7 @@ def cmd_import_v1(args, runner, now):
     try:
         fleet = _import_fleet(args)
         export = read_v1_export(args, config, runner)
-        v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+        v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
         audit = None if args.dry_run else AuditLog(ensure_state_dir() / "audit.jsonl")
         report = import_v1_session(v2, audit, export, fleet, config["import_body_limit_bytes"],
                                    args.tool_output_limit, args.dry_run, args.dir)

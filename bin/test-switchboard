@@ -25,6 +25,7 @@ import hmac
 import importlib.machinery
 import importlib.util
 import inspect
+import http.client
 import io
 import json
 import os
@@ -211,7 +212,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -422,7 +423,10 @@ class TestV2Client(Base):
         source = class_source("V2Client")
         self.assertEqual(source.count("self.runner("), 1)
         self.assertEqual(source.count('"api"'), 1)
-        self.assertIn("self.runner(", class_source("V2Client", "_call"))
+        self.assertIn("self.runner(", class_source("V2Client", "_cli"))   # the CLI route; the HTTP route has its own class and is reached from `_transport`
+        self.assertEqual((source.count("self._cli("), class_source("V2Client", "_transport").count("self._cli(")), (2, 2),
+                         "only the transport step reaches the CLI (directly, or after the HTTP route could not serve the call)")
+        self.assertIn("self._transport(", class_source("V2Client", "_call"))
 
     def test_env_is_the_process_env_with_the_config_env_on_top(self):
         os.environ["XDG_DATA_HOME"] = "/live/data"
@@ -37347,7 +37351,8 @@ class TestV2CallAccounting(Base):
         body = json.loads((world.state / sb.V2_CALLS_FILE).read_text())
         self.assertEqual(body["last_minute"], {"session.get": 3, "session.message.list": 1})
         line = sb.v2_calls_status(world.state, world.clock.now())
-        self.assertEqual(line, "4/min (session.get 3, session.message.list 1; 5-min average 1/min)")
+        self.assertEqual(body["by_transport"], {"cli": 4}, "the same record, with the way each call travelled")
+        self.assertEqual(line, "4/min (session.get 3, session.message.list 1; 5-min average 1/min); by transport: cli 4")
         world.tick(300)
         self.assertIn("the daemon is not passing", sb.v2_calls_status(world.state, world.clock.now()))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -37593,6 +37598,313 @@ class TestV2ReadVolume(Base):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
 
+
+class TestV2Light(Base):
+    """v2_light (the owner's hotfix switch): every optional read of session history is OFF; a send is still delivered, once; the daemon
+    still finds its agents. A 20-agent idle fleet costs a handful of calls a minute."""
+
+    AGENTS = tuple("agent%d" % n for n in range(20))
+    HISTORY = ("session.message.list", "session.inbox.list")
+
+    def world(self, agents=None, **config):
+        config.setdefault("v2_cache_seconds", 900)
+        config.setdefault("v2_light", True)
+        return World(self, agents=agents or self.AGENTS, config=config)
+
+    @staticmethod
+    def ops(world, since=0):
+        return dict(collections.Counter(c[2] for c in world.v2.calls[since:] if len(c) > 2 and c[1] == "api"))
+
+    def test_the_default_is_off_and_it_must_be_a_boolean(self):
+        self.assertIs(sb.DEFAULTS["v2_light"], False)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "v2_light": "yes"})
+
+    def test_an_idle_fleet_of_twenty_makes_at_most_ten_calls_a_minute_and_reads_no_history(self):
+        world = self.world()
+        for _ in range(2):   # the first passes find the agents
+            world.engine.run_pass()
+            world.tick(30)
+        mark = len(world.v2.calls)
+        for _ in range(20):   # ten minutes at a 30 s poll
+            world.engine.run_pass()
+            world.tick(30)
+        found = self.ops(world, mark)
+        print("v2_light idle: %d calls in 10 minutes: %s" % (sum(found.values()), found))
+        self.assertLessEqual(sum(found.values()), 100, found)
+        for op in self.HISTORY:
+            self.assertEqual(self.ops(world).get(op, 0), 0, "%s is a history read: %s" % (op, self.ops(world)))
+
+    def test_without_the_switch_the_same_fleet_reads_history(self):
+        world = self.world(v2_light=False, v2_cache_seconds=0)
+        for _ in range(4):
+            world.engine.run_pass()
+            world.tick(30)
+        self.assertGreater(sum(self.ops(world).get(op, 0) for op in self.HISTORY), 20, self.ops(world))
+
+    def test_a_send_is_delivered_once_and_a_restart_does_not_deliver_it_again(self):
+        world = self.world(agents=("platform", "coder"))
+        world.fact("platform", "lab.fact:1", "First")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        self.assertEqual(self.ops(world).get("session.inbox.list", 0), 0, self.ops(world))
+        self.assertLessEqual(self.ops(world).get("session.message.list", 0), 2, "the engagement gate's read before the write, nothing else")
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "delivered on the send's own success: not sent again")
+        mode = (world.state / sb.SENT_KEYS_FILE).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "the ledger survives a restart")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_a_person_typing_still_holds_the_wake_back_as_a_note_with_the_switch_on(self):
+        world = self.world(agents=("platform", "coder"))
+        world.you("platform")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        (admitted,) = world.admissions("platform")
+        self.assertEqual((admitted["resume"], admitted["delivery"]), (False, "steer"), "a note for an engaged person, not a wake")
+        self.assertTrue(any(len(c) > 2 and c[2] == "session.message.list" for c in world.v2.calls[mark:]), "the read just before the write is made")
+        mark = len(world.v2.calls)
+        world.tick(5)
+        world.engine.run_pass()
+        self.assertEqual(self.ops(world, mark).get("session.message.list", 0), 0, "and only then: nothing pending, no read")
+
+    def test_two_writers_do_not_lose_each_others_keys(self):
+        world = self.world(agents=("platform",))
+        first, second = sb.SentLedger(world.state), sb.SentLedger(world.state)
+        first.confirm("ses_example", ["k1"], 1.0)
+        second.confirm("ses_example", ["k2"], 2.0)   # the second never saw k1 in memory
+        first.confirm("ses_example", ["k3"], 3.0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).keys["ses_example"]), ["k1", "k2", "k3"])
+        self.assertEqual(sorted(second.known("ses_example", 0)), ["k1", "k2", "k3"], "a read sees what another process wrote")
+
+    def test_a_crash_between_the_write_and_the_record_is_at_most_once_and_says_so(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.addCleanup(os.environ.__setitem__, sb.FAULT_ENV, "")
+        os.environ[sb.FAULT_ENV] = "crash-after-send"
+        with self.assertRaises(sb.SimulatedCrash):
+            world.engine.run_pass()
+        os.environ[sb.FAULT_ENV] = ""
+        ledger = sb.SentLedger(world.state)
+        self.assertEqual(ledger.unknown_count(), 1)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "unknown fate counts as delivered: never blindly re-sent")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_the_ledger_is_bounded(self):
+        world = self.world(agents=("platform",))
+        ledger = world.engine.sent
+        for n in range(sb.SENT_PER_SESSION + 50):
+            ledger.reserve("ses_example", ["k%d" % n], float(n))
+            ledger.confirm("ses_example", ["k%d" % n], float(n))
+        self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
+        self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
+        for n in range(sb.SENT_SESSIONS + 20):
+            ledger.confirm("ses_%d" % n, ["k"], float(1000 + n))
+        self.assertEqual(len(ledger.keys), sb.SENT_SESSIONS)
+
+    def test_a_missing_ledger_is_empty_but_a_corrupt_one_stops_the_sends_and_is_not_overwritten(self):
+        world = self.world(agents=("platform",))
+        self.assertEqual(sb.SentLedger(world.state).keys, {})
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text('{"sessions": {"ses_example": {"k": "not a time"}}}')
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        path.write_text("not json")
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(path.read_text(), "not json", "the evidence is kept")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [], "nothing is sent on a ledger that cannot be trusted")
+        self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_ledger_that_cannot_be_written_refuses_the_send(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        (world.state / (sb.SENT_KEYS_FILE + ".lock")).mkdir()   # a directory where the lock file goes: it cannot be opened
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [])
+        self.assertEqual(len(world.admissions("platform")), 0, "no ledger, no write")
+        self.assertTrue(report["errors"])
+
+    def refuse_with(self, world, error):
+        def refuse(params, body):
+            raise error
+        real = world.v2.op_session_synthetic
+        world.v2.op_session_synthetic = refuse
+        return real
+
+    def test_a_definite_refusal_is_released_and_goes_next_pass(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        real = self.refuse_with(world, FakeHTTP(400, "BadRequest", "no"))
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released: not left unknown")
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), [])
+        world.v2.op_session_synthetic = real
+        world.tick(5)
+        self.assertEqual([s["keys"] for s in world.engine.run_pass()["sent"]], [["lab.fact:1"]])
+
+    def test_a_key_another_sender_holds_is_not_sent_again(self):
+        world = self.world(agents=("platform",))
+        sid = world.sessions["platform"]
+        self.assertTrue(sb.SentLedger(world.state).reserve(sid, ["lab.fact:1"], 1.0))
+        self.assertFalse(sb.SentLedger(world.state).reserve(sid, ["lab.fact:1"], 2.0), "the second sender is refused")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+        self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_ripe_delivery_reads_the_prompt_once_and_a_waiting_or_held_plan_reads_nothing(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(5)   # inside the batch window: a plan that waits
+        mark = len(world.v2.calls)
+        report = world.engine.run_pass()
+        self.assertEqual(report["waiting"], ["platform"])
+        self.assertEqual(self.ops(world, mark).get("session.message.list", 0), 0, "waiting: no read")
+        world.tick(90)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        reads = self.ops(world, mark).get("session.message.list", 0)
+        self.assertTrue(1 <= reads <= 2, "ripe: the read that decides note or wake, and the one before the write (%d)" % reads)
+
+    def test_a_stop_a_summary_and_a_lapsed_note_read_nothing_and_say_nothing(self):
+        world = self.world(agents=("platform",))
+        engine, sid = world.engine, world.sessions["platform"]
+        world.v2._message(world.v2.sessions[sid], "assistant", "all done", None, world.clock.now())
+        source = sb.WorkerFacts()
+        source.bind(engine)
+        observation = sb.Observation("platform", sid, world.panes["platform"], "idle", {"name": "platform", "reports_to": "boss"},
+                                     idle_at=world.clock.now() - 10, outcome="ok")
+        mark = list(world.v2.calls)
+        self.assertEqual(source.last_reply(sid, 1), "", "no summary is read")
+        self.assertIsNone(sb.triage_stop(engine, source, observation, "boss", 1, ""), "a stop is only its idle rider")
+        self.assertEqual(engine.convert_lapsed_notes(observation, world.clock.now()), [])
+        self.assertEqual(world.v2.calls, mark, "none of the three made a call")
+
+    def test_an_oversized_or_unreadable_ledger_stops_the_sends_and_is_kept(self):
+        world = self.world(agents=("platform",))
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text(" " * (sb.SENT_FILE_MAX + 1))
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(len(path.read_text()), sb.SENT_FILE_MAX + 1, "kept as it was")
+        path.unlink()
+        path.mkdir()   # a directory where the file goes: not missing, not readable
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+
+    def test_a_call_that_never_ran_is_released_and_unknown_reservations_are_never_trimmed(self):
+        for error in (sb.V2Error("unavailable", None, "cannot run"), sb.V2Error("refused", None, "no")):
+            with self.subTest(reason=error.reason):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released")
+        ledger = sb.SentLedger(world.state)
+        ledger.reserve("ses_example", ["old"], 1.0)
+        for n in range(sb.SENT_PER_SESSION + 20):
+            ledger.confirm("ses_example", ["k%d" % n], float(10 + n))
+        self.assertIn("old", ledger.known("ses_example", 0), "an unknown-fate reservation outlives the trim")
+
+    def test_a_timeout_or_unreadable_reply_keeps_the_reservation_and_is_not_sent_again(self):
+        for error in (sb.V2Error("timeout", None, "no answer"), sb.V2Error("bad_json", None, "garbage"), sb.V2Error("http", 500, "boom"),
+                      sb.V2Error("http", 504, "gateway"), sb.V2Error("http", 408, "slow")):
+            with self.subTest(reason=error.reason, status=error.status):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                real = self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 1, "fate unknown: reserved")
+                world.v2.op_session_synthetic = real
+                world.tick(5)
+                self.assertEqual(world.engine.run_pass()["sent"], [], "counts as delivered: at most once")
+                self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_409_is_delivered(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.refuse_with(world, FakeHTTP(409, "Conflict", "exists"))
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), ["lab.fact:1"])
+
+    def test_concurrent_writers_lose_nothing(self):
+        world = self.world(agents=("platform",))
+        barrier = threading.Barrier(4)
+
+        def write(n):
+            ledger = sb.SentLedger(world.state)
+            barrier.wait()
+            for i in range(15):
+                ledger.confirm("ses_example", ["w%d-%d" % (n, i)], float(n * 100 + i))
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(sb.SentLedger(world.state).keys["ses_example"]), 60)
+
+    def test_status_says_what_is_off_and_how_many_sends_are_of_unknown_fate(self):
+        world = self.world(agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_light": True})
+        sb.SentLedger(world.state).reserve("ses_example", ["k1"], 1.0)
+        report = sb.collect_status(world.route, world.clock.now)
+        self.assertIn("ON (features off:", report["v2_light"])
+        self.assertIn("compactions", report["v2_light"])
+        self.assertIn("1 send(s) of unknown fate", report["v2_light"])
+        self.assertIn("v2_light", sb.format_status(report))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertNotIn("v2_light", sb.collect_status(world.route, world.clock.now))
+
+    def test_status_on_a_corrupt_ledger_says_so_and_exits_zero(self):
+        world = self.world(agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_light": True})
+        (world.state / sb.SENT_KEYS_FILE).write_text("not json")
+        report = sb.collect_status(world.route, world.clock.now)
+        self.assertIn("sent-keys ledger: UNREADABLE (sends stopped: fail closed)", report["v2_light"])
+        self.assertIn("UNREADABLE", sb.format_status(report))
+        with captured() as (out, err):
+            code = sb.main(["status"], runner=world.route, now=world.clock.now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("sent-keys ledger: UNREADABLE (sends stopped: fail closed)", out.getvalue())
+
+    def test_each_optional_read_is_off_and_answers_what_it_did_not_see(self):
+        world = self.world(agents=("platform",))
+        engine, sid = world.engine, world.sessions["platform"]
+        world.you("platform", "hello")
+        mark = list(world.v2.calls)
+        self.assertTrue(sb.brief_in_transcript(engine, sid), "no scan: taken to hold the brief, never sent twice")
+        self.assertEqual(engine.reads.compaction_page(sid, 5, world.clock.now()), [])
+        self.assertEqual(engine.reads.human_prompts_newest(sid), [])
+        self.assertEqual(sb.inbox_human_prompts(engine, sid), [])
+        self.assertEqual(sb.transcript_lines(engine, sid, 0), [])
+        self.assertEqual(sb.synthetic_lines(engine, sid, 0, waiting=True), [])
+        self.assertEqual(engine.reads.inbox(sid, world.clock.now()), [])
+        self.assertEqual(world.v2.calls, mark, "none of them made a call")
+        self.assertTrue(engine.reads.human_prompts_newest(sid, fresh=True), "the read before a write is still made")
 
 class TestDeliverWithTheMemoryOn(TestDeliver):
     """The delivery tests again, with the daemon's memory of its v2 reads ON (default 120 s): the decisions are the same."""
@@ -38899,6 +39211,621 @@ class TestPlanReviewCore(unittest.TestCase):
         for needle in ("acme/app#7", "O3", "L3", "no rollback", "rejected: out of scope"):
             self.assertIn(needle, text)
         self.assertIn("(none recorded)", plan_review.escalation_message("x#1", {"id": "O1", "lane": "L1"}, None))
+
+
+# ---- the v2 transport: HTTP to the service with a CLI fallback, and the backpressure breaker (an owner order)
+
+class FakeOpenCodeService:
+    """The OpenCode service, in memory: no socket, no thread, no sleep. It answers like the service (Basic auth `opencode:<password>`, the paths of
+    the operation table); `connect` is the connection factory a test gives V2Http. Knobs: `up`, `delay` (a delay longer than the client's timeout
+    is a timeout), `drop` (the service closes without a reply after receiving the request), `big` (bytes in a transcript reply), `password`."""
+
+    def __init__(self, password="pw-secret-1"):
+        self.password, self.up, self.delay, self.drop, self.big = password, True, 0.0, False, 0
+        self.requests, self.connections = [], 0
+
+    def answer(self, method, path, body, authorization):
+        token = base64.b64encode(("opencode:" + self.password).encode()).decode()
+        if authorization != "Basic " + token:
+            return 401, {"error": "unauthorized"}
+        self.requests.append((method, path, body))
+        if path.startswith("/api/session/ses_a/message"):
+            return 200, {"data": [{"id": "msg_%d" % i, "pad": "x" * (self.big or 1)} for i in range(1 if self.big else 2)], "cursor": {"next": None}}
+        if path == "/api/info":
+            return 200, {"version": "2.0.24"}
+        if path == "/api/session/active":
+            return 200, {"ses_a": {"status": "idle"}}
+        if path.startswith("/api/session/ses_a/synthetic") and method == "POST":
+            return 200, {"ok": True}
+        if path == "/api/session/ses_missing":
+            return 404, {"_tag": "SessionNotFoundError"}
+        return 404, {"error": "no such path"}
+
+    def connect(self, host, port, timeout=None):
+        return FakeServiceConnection(self, timeout)
+
+    def write_service_file(self, path, url="http://127.0.0.1:49374", pid=None, mode=0o600):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps({"id": "x", "version": "2.0.24", "url": url, "pid": pid or os.getpid(), "password": self.password}))
+        os.chmod(str(path), mode)
+
+
+class FakeServiceResponse:
+    def __init__(self, status, raw):
+        self.status, self._raw, self.will_close = status, raw, False
+        self.on_read = None   # a test hook: called before each read (to advance a fake clock)
+
+    def read(self, amount=None):
+        if self.on_read is not None:
+            self.on_read()
+        if amount is None:
+            raw, self._raw = self._raw, b""
+        else:
+            raw, self._raw = self._raw[:amount], self._raw[amount:]
+        return raw
+
+
+class FakeServiceConnection:
+    """What http.client.HTTPConnection gives V2Http, over the in-memory service."""
+
+    def __init__(self, service, timeout):
+        self.service, self.timeout, self.sock, self.pending, self.broken = service, timeout, None, None, False
+
+    def connect(self):
+        if not self.service.up:
+            raise ConnectionRefusedError(61, "Connection refused")
+        self.sock = object()
+        self.service.connections += 1
+
+    def request(self, method, target, body=None, headers=None):
+        if self.broken or not self.service.up:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.pending = (method, target, body or b"", (headers or {}).get("Authorization"))
+
+    def getresponse(self):
+        method, target, body, auth = self.pending
+        status, obj = self.service.answer(method, target, body, auth)
+        if self.service.drop:
+            self.broken = True
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        if self.service.delay > (self.timeout or 1e9):
+            raise socket.timeout("timed out")
+        return FakeServiceResponse(status, json.dumps(obj).encode())
+
+    def close(self):
+        self.sock = None
+
+
+class V2TransportBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.service = FakeOpenCodeService()
+        self.service_file = self.home / "opencode" / "service.json"
+        self.service.write_service_file(self.service_file)
+        self.cli_calls = []
+
+    def runner(self, argv, **kwargs):
+        self.cli_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"via": "cli"}}), "")
+
+    def write_private(self, text):
+        """A service file that is private to the user (0600), so that only its content or size can be what is wrong with it."""
+        self.service_file.write_text(text)
+        os.chmod(str(self.service_file), 0o600)
+
+    def route(self, timeout=5, alive=None):
+        return sb.V2Http(self.service_file, timeout, alive=alive or (lambda pid: True), connect=self.service.connect)
+
+    def client(self, timeout=5, **kwargs):
+        return sb.V2Client("/fake/bin/opencode", {}, self.runner, timeout, http=self.route(timeout), **kwargs)
+
+
+class TestV2Http(V2TransportBase):
+    def test_a_read_goes_over_http_with_the_operations_own_path_and_query_and_the_same_decoded_result(self):
+        client = self.client()
+        self.assertEqual(client.server_info(), {"version": "2.0.24"})
+        page, cursor = client.message_page("ses_a", 5, "synthetic", None)
+        self.assertEqual([m["id"] for m in page], ["msg_0", "msg_1"])
+        self.assertEqual(cursor, {"next": None})
+        self.assertEqual(client.message_list("ses_a", limit=900), [{"id": "msg_0", "pad": "x"}, {"id": "msg_1", "pad": "x"}])
+        self.assertEqual(self.cli_calls, [], "no process was started")
+        paths = [p for _, p, _ in self.service.requests]
+        self.assertEqual(paths[0], "/api/info")
+        self.assertEqual(paths[1], "/api/session/ses_a/message?limit=5&type=synthetic")
+        self.assertEqual(paths[2], "/api/session/ses_a/message?limit=%d" % sb.V2_READ_LIMIT_MAX, "a page is never larger than the cap")
+        self.assertEqual(client.calls_by_transport(), {"http": 3}, "one record: every call, with the way it travelled")
+        self.assertEqual(client.calls_by_operation(), {"server.info": 1, "session.message.list": 2})
+
+    def test_a_write_carries_its_json_body_and_a_session_id_is_quoted(self):
+        client = self.client()
+        client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_1", "text": "hi"})
+        method, path, body = self.service.requests[-1]
+        self.assertEqual((method, path, json.loads(body)), ("POST", "/api/session/ses_a/synthetic", {"id": "msg_1", "text": "hi"}))
+        self.assertIsNone(sb.V2Client._target(sb.V2_HTTP_OPERATIONS["session.get"], {"sessionID": "a b/c", "extra": "x"}), "an unknown parameter goes to the CLI")
+        self.assertEqual(sb.V2Client._target(sb.V2_HTTP_OPERATIONS["session.get"], {"sessionID": "a b/c"}), "/api/session/a%20b%2Fc")
+
+    def test_reads_share_one_keep_alive_connection_and_a_write_uses_its_own(self):
+        client = self.client()
+        for _ in range(20):
+            client.session_active()
+        self.assertEqual((len(self.service.requests), self.service.connections), (20, 1))
+        client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_1", "text": "hi"})
+        self.assertEqual(self.service.connections, 2)
+
+    def test_an_http_error_is_a_v2_error_with_the_status_and_the_body_like_the_cli(self):
+        client = self.client()
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_get("ses_missing")
+        self.assertEqual((caught.exception.reason, caught.exception.status), ("http", 404))
+        self.assertIn("SessionNotFoundError", str(caught.exception))
+        self.assertEqual(self.cli_calls, [], "a service answer is never retried through the CLI")
+
+    def test_a_new_password_after_a_service_restart_is_read_again_once(self):
+        client = self.client()
+        client.session_active()
+        self.service.up = False
+        self.service.password = "pw-secret-2"
+        self.service.up = True
+        self.service.write_service_file(self.service_file)
+        self.assertEqual(client.session_active(), {"ses_a": {"status": "idle"}}, "the restart is survived mid-run")
+        self.assertEqual((self.cli_calls, client.calls_by_transport()), ([], {"http": 2}))
+
+    def test_a_dead_keep_alive_connection_is_replaced_and_the_read_goes_on(self):
+        client = self.client()
+        client.session_active()
+        self.service.up = False
+        client.http._conn.sock = object()    # the connection looks open to the client
+        self.service.up = True
+        client.http._conn.broken = True
+        self.assertEqual(client.session_active(), {"ses_a": {"status": "idle"}})
+        self.assertEqual(self.cli_calls, [])
+
+    def test_a_wrong_password_twice_falls_back_to_the_cli_and_never_loops(self):
+        client = self.client()
+        self.service.password = "changed-and-the-file-is-stale"
+        self.assertEqual(client.session_active(), {"via": "cli"})
+        self.assertEqual((len(self.cli_calls), client.calls_by_transport()), (1, {"cli-fallback": 1}), "a fallback counts once, as the CLI call that served it")
+
+    def test_a_bad_service_file_uses_the_cli_and_the_service_is_not_contacted(self):
+        cases = (("none", lambda: None), ("stale pid", lambda: self.service.write_service_file(self.service_file, pid=99999999)),
+                 ("remote", lambda: self.service.write_service_file(self.service_file, url="http://203.0.113.9:80")),
+                 ("a name, not a literal address", lambda: self.service.write_service_file(self.service_file, url="http://localhost:49374")),
+                 ("world readable", lambda: self.service.write_service_file(self.service_file, mode=0o644)),
+                 ("garbage", lambda: self.write_private("{not json")),
+                 ("huge", lambda: self.write_private(" " * 10000)),
+                 ("huge but valid JSON up front", lambda: self.write_private(json.dumps({"url": "http://127.0.0.1:49374", "password": self.service.password}) + " " * 10000)))
+        for name, writer in cases:
+            with self.subTest(name=name):
+                self.service_file.exists() and self.service_file.unlink()
+                writer()
+                self.cli_calls.clear()
+                before = len(self.service.requests)
+                client = sb.V2Client("/fake/bin/opencode", {}, self.runner, 5, http=self.route(alive=lambda pid: pid != 99999999))
+                self.assertEqual(client.session_active(), {"via": "cli"})
+                self.assertEqual(len(self.service.requests), before, "the service was not contacted")
+        for good in ("http://127.0.0.1:49374", "http://[::1]:49374"):
+            with self.subTest(good=good):
+                self.service.write_service_file(self.service_file, url=good)
+                self.assertEqual(self.client().session_active(), {"ses_a": {"status": "idle"}})
+
+    def test_a_connection_refused_falls_back_to_the_cli_which_may_start_the_service(self):
+        client = self.client()
+        self.service.up = False
+        self.assertEqual(client.session_active(), {"via": "cli"})
+        self.assertEqual(client.calls_by_transport(), {"cli-fallback": 1})
+
+    def test_a_slow_service_is_a_timeout_error_and_is_not_asked_again_through_the_cli(self):
+        client = self.client(timeout=5)
+        self.service.delay = 6
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_active()
+        self.assertEqual(caught.exception.reason, "timeout")
+        self.assertEqual((self.cli_calls, client.calls_by_transport()), ([], {"http": 1}), "it reached the service: counted, and not repeated")
+
+    def test_a_reply_that_trickles_in_is_cut_at_the_total_deadline_not_per_socket_operation(self):
+        now = [100.0]
+
+        class Trickle:
+            def __init__(trickle):
+                trickle.reads = 0
+
+            def read(trickle, amount=None):
+                trickle.reads += 1
+                now[0] += 2.0   # one byte, 2 s later: every socket operation is within its own timeout
+                return b"x"
+        trickle = Trickle()
+        with mock.patch.object(sb.time, "monotonic", lambda: now[0]):
+            with self.assertRaises(socket.timeout):
+                sb.V2Http._read_body(trickle, types.SimpleNamespace(sock=None), now[0] + 5.0)
+        self.assertEqual(trickle.reads, 3, "stopped at the total deadline (5 s), not after the whole reply")
+        sock = types.SimpleNamespace(timeouts=[], settimeout=lambda seconds: sock.timeouts.append(round(seconds, 1)))
+        conn = types.SimpleNamespace(sock=sock)
+        with mock.patch.object(sb.time, "monotonic", lambda: 100.0):
+            sb.V2Http._budget(conn, 103.0)
+            with self.assertRaises(socket.timeout):
+                sb.V2Http._budget(conn, 100.0)
+        self.assertEqual(sock.timeouts, [3.0], "the socket gets what is left of the total time: connect, send, headers and body share it")
+        done = type("Done", (), {"read": lambda self, amount=None, _b=[b"abc", b""]: _b.pop(0)})()
+        self.assertEqual(sb.V2Http._read_body(done, types.SimpleNamespace(sock=None), time.monotonic() + 5), b"abc")
+
+    def test_a_symlinked_service_file_and_an_open_directory_are_refused_and_the_service_not_contacted(self):
+        real = self.home / "opencode" / "real.json"
+        self.service_file.rename(real)
+        self.service_file.symlink_to(real)
+        before = len(self.service.requests)
+        self.assertEqual(self.client().session_active(), {"via": "cli"}, "a symlink is refused, not followed")
+        self.service_file.unlink()
+        real.rename(self.service_file)
+        os.chmod(str(self.service_file.parent), 0o777)
+        self.assertEqual(self.client().session_active(), {"via": "cli"}, "a directory others can write to cannot be trusted")
+        os.chmod(str(self.service_file.parent), 0o755)
+        self.assertEqual(len(self.service.requests), before)
+        self.assertEqual(self.client().session_active(), {"ses_a": {"status": "idle"}}, "and the same file in a closed directory is accepted")
+
+    def test_a_reply_over_the_cap_is_refused_not_buffered(self):
+        client = self.client()
+        self.service.big = 5000
+        with mock.patch.object(sb, "V2_HTTP_MAX_BODY", 1000):
+            with self.assertRaises(sb.V2Error) as caught:
+                client.message_list("ses_a", limit=5)
+        self.assertEqual(caught.exception.reason, "too_large")
+
+    def test_a_write_that_may_have_been_received_is_never_replayed_or_sent_again_through_the_cli(self):
+        client = self.client()
+        self.service.drop = True
+        with self.assertRaises(sb.V2Error) as caught:
+            client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "once"})
+        self.assertEqual(caught.exception.reason, "unavailable")
+        self.assertEqual((len(self.service.requests), self.cli_calls), (1, []), "received once, not repeated, not sent through the CLI")
+
+    def test_a_write_the_service_refused_twice_for_its_password_goes_through_the_cli_once_because_it_was_never_received(self):
+        client = self.client()
+        self.service.password = "rotated-and-the-file-is-stale"
+        result = client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "x"})
+        self.assertEqual(result, {"via": "cli"})
+        self.assertEqual((len(self.cli_calls), self.service.requests), (1, []), "the service never processed it, so the CLI (which authenticates itself) is safe")
+        self.assertEqual(client.calls_by_transport(), {"cli-fallback": 1})
+
+    def test_a_probe_that_raises_something_other_than_a_v2_error_does_not_leave_optional_reads_waiting_for_ever(self):
+        now = [0.0]
+        client = sb.V2Client("/fake/bin/opencode", {}, self.runner, 5, http=self.route(), monotonic=lambda: now[0])
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            client.breaker.record(20, True)
+        now[0] += sb.V2_BACKOFF_BASE + 1
+        with mock.patch.object(client, "_transport", side_effect=KeyError("a bug")):
+            with self.assertRaises(KeyError):
+                client.session_active()   # it was the probe
+        self.assertEqual(client.session_active(), {"ses_a": {"status": "idle"}}, "the next optional read is the next probe, not a skipped read")
+
+    def test_a_refused_password_on_a_write_is_retried_once_because_the_service_never_saw_it(self):
+        client = self.client()
+        client.session_active()
+        self.service.password = "rotated"
+        self.service.write_service_file(self.service_file)
+        client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "x"})
+        self.assertEqual([m for m, _, _ in self.service.requests].count("POST"), 1)
+        self.assertEqual(self.cli_calls, [])
+
+    def test_the_password_is_in_no_error_no_status_file_and_no_audit_event(self):
+        world = World(self, agents=("platform",))
+        engine = world.new_engine()
+        engine.v2 = client = self.client()
+        engine.v2.on_event = lambda name, detail: engine._note(name, "v2", detail)
+        client.state_dir = world.state
+        self.service.drop = True
+        with self.assertRaises(sb.V2Error) as caught:
+            client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_9", "text": "x"})
+        self.service.drop = False
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            self.service.delay = 99
+            with self.assertRaises(sb.V2Error):
+                client.session_active()
+        client._write_link(True)
+        everything = str(caught.exception) + (world.state / sb.V2_LINK_STATUS_FILE).read_text() + (world.state / "audit.jsonl").read_text()
+        self.assertIn("v2.backoff", everything, "the audit has the episode")
+        self.assertNotIn(self.service.password, everything)
+        self.assertNotIn("Basic ", everything)
+
+    def test_under_the_test_suite_a_real_run_is_refused_before_the_http_route_or_the_cli_is_reached(self):
+        client = sb.V2Client("/fake/bin/opencode", {}, subprocess.run, 5, http=self.route())
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_active()
+        self.assertEqual(caught.exception.reason, "refused")
+        self.assertEqual((self.service.requests, client.calls_by_transport()), ([], {}), "nothing was sent and nothing was counted")
+
+    def test_the_config_key_forces_the_cli_route_and_a_bad_value_is_refused(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("FLEET_SWITCHBOARD_V2_CLI", None)
+            self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="auto").http)
+        self.assertIsNone(sb.V2Client(sys.executable, {}, subprocess.run, 5, transport="cli").http, "the kill switch: always `opencode api`")
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["v2_transport"], "auto")
+        self.assertEqual(sb.validate_config(dict(base, v2_transport="cli"))["v2_transport"], "cli")
+        for bad in ("http", "", None, 1, True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, v2_transport=bad))
+
+    def test_every_real_client_construction_passes_the_kill_switch(self):
+        sources = [(REPO / "bin" / "fleet-switchboard").read_text(), (REPO / "bin" / "judge-eval").read_text()]
+        sites = [line for text in sources for line in text.splitlines() if re.search(r"\bV2Client\(", line) and "class V2Client" not in line]
+        self.assertGreaterEqual(len(sites), 5)
+        for line in sites:
+            with self.subTest(line=line.strip()[:80]):
+                self.assertIn('transport=config["v2_transport"]', line, "a construction that omits it would ignore the kill switch")
+
+    def test_a_fake_runner_or_the_cli_switch_means_no_http_route_at_all(self):
+        self.assertIsNone(sb.V2Client("/fake/bin/opencode", {}, self.runner, 5).http)
+        with mock.patch.dict(os.environ, {"FLEET_SWITCHBOARD_V2_CLI": "1"}):
+            self.assertIsNone(sb.V2Client(sys.executable, {}, subprocess.run, 5).http)
+        self.assertIsNotNone(sb.V2Client(sys.executable, {}, subprocess.run, 5).http, "a real run with a real binary uses the route")
+
+
+class TestDeliveryDuringABackoff(PR4Base):
+    """rev-wake's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
+
+    def open_the_breaker(self):
+        breaker = self.world.engine.v2.breaker
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            breaker.record(20, True)
+        self.assertEqual(breaker.state, "open")
+        return breaker
+
+    def test_the_person_is_typing_read_is_essential_and_an_ordinary_transcript_read_is_not(self):
+        client = self.world.engine.v2
+        self.assertTrue(client._is_essential("session.message.list", {"type": "user", "limit": 10}))
+        self.assertTrue(client._is_essential("session.message.list", {"type": "synthetic", "limit": 1}))
+        self.assertFalse(client._is_essential("session.message.list", {"type": "assistant", "limit": 1}))
+        self.assertFalse(client._is_essential("session.active"))
+
+    def test_a_pending_send_is_delivered_while_the_breaker_is_open(self):
+        breaker = self.open_the_breaker()
+        sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
+        self.world.tick(5)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1, "delivered during the backoff")
+        self.assertEqual(breaker.state, "open", "and the breaker was not what let it through: optional reads stayed skipped")
+        with self.assertRaises(sb.V2Error):
+            self.world.engine.v2.session_active()
+
+    def test_with_the_user_read_optional_the_same_delivery_would_be_held(self):
+        self.open_the_breaker()
+        real = sb.V2Client._is_essential
+        with mock.patch.object(sb.V2Client, "_is_essential", lambda self_, op, params=None: False if op == "session.message.list" and (params or {}).get("type") == "user" else real(self_, op, params)):
+            sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
+            self.world.tick(5)
+            self.world.engine.run_pass()
+        self.assertEqual(self.world.admissions("platform"), [], "the failure rev-wake found: held while the person read is skipped")
+
+
+class TestV2Breaker(Base):
+    """The breaker with a fake clock: slow or timing-out calls open it, optional reads are skipped, essential calls go on, it resumes gradually."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = [1000.0]
+        self.breaker = sb.V2Breaker(lambda: self.now[0])
+
+    def slow(self, n, seconds=sb.V2_SLOW_SECONDS + 1, timed_out=False):
+        events = []
+        for _ in range(n):
+            event = self.breaker.record(seconds, timed_out)
+            if event:
+                events.append(event)
+        return events
+
+    def test_it_stays_closed_while_calls_are_fast_and_while_there_are_too_few_samples(self):
+        self.assertEqual(self.slow(30, 0.05), [])
+        self.assertTrue(self.breaker.allows(False))
+        fresh = sb.V2Breaker(lambda: self.now[0])
+        self.assertEqual([fresh.record(60, False) for _ in range(sb.V2_SLOW_MIN_SAMPLES - 1)], [None] * (sb.V2_SLOW_MIN_SAMPLES - 1))
+
+    def test_a_slow_p95_opens_it_once_per_episode_and_optional_reads_are_skipped_but_essential_calls_go_on(self):
+        events = self.slow(sb.V2_SLOW_MIN_SAMPLES)
+        self.assertEqual([e["event"] for e in events], ["v2.backoff"])
+        self.assertIn("p95", events[0]["reason"])
+        self.assertEqual(self.slow(5), [], "no second v2.backoff while the same episode goes on")
+        self.assertFalse(self.breaker.allows(False))
+        self.assertTrue(self.breaker.allows(True), "a wake or delivery is never skipped")
+        self.assertEqual(self.breaker.skipped, 1)
+
+    def test_timeouts_in_a_row_open_it_even_with_few_samples(self):
+        events = self.slow(sb.V2_TIMEOUT_STREAK, 20, True)
+        self.assertEqual(len(events), 1)
+        self.assertIn("timed out", events[0]["reason"])
+
+    def test_after_the_backoff_one_probe_at_a_time_a_slow_probe_doubles_the_wait_and_good_probes_close_it(self):
+        self.slow(sb.V2_TIMEOUT_STREAK, 20, True)
+        self.now[0] += sb.V2_BACKOFF_BASE - 1
+        self.assertFalse(self.breaker.allows(False), "still inside the backoff")
+        self.now[0] += 2
+        self.assertTrue(self.breaker.allows(False), "the first probe")
+        self.assertFalse(self.breaker.allows(False), "only one probe at a time")
+        event = self.breaker.record(20, True, probe=True)
+        self.assertEqual((event["event"], event["seconds"]), ("v2.backoff", int(sb.V2_BACKOFF_BASE * 2)))
+        self.assertEqual(event["episode"], 1, "a failed probe is the same episode")
+        self.now[0] += sb.V2_BACKOFF_BASE * 2 + 1
+        closed = None
+        for _ in range(sb.V2_RECOVER_OK):
+            self.assertEqual(self.breaker.allows(False), "probe")
+            closed = self.breaker.record(0.05, False, probe=True)
+        self.assertEqual(closed, {"event": "v2.resume", "episode": 1})
+        self.assertEqual(self.breaker.state, "closed")
+        self.assertTrue(self.breaker.allows(False))
+
+    def test_the_wait_is_capped_and_a_new_episode_gets_a_new_number(self):
+        self.breaker.level = 40
+        self.assertEqual(self.breaker._wait(), sb.V2_BACKOFF_MAX)
+        self.slow(sb.V2_TIMEOUT_STREAK, 20, True)
+        self.now[0] += sb.V2_BACKOFF_BASE + 1
+        self.breaker.allows(False)
+        for _ in range(sb.V2_RECOVER_OK):
+            self.breaker.record(0.05, False, probe=True)
+            self.breaker.allows(False)
+        again = self.slow(sb.V2_TIMEOUT_STREAK, 20, True)
+        self.assertEqual([e["episode"] for e in again], [2])
+
+
+class SlowProbeBreaker(sb.V2Breaker):
+    """A breaker whose `probe_out` hands the processor to another thread between being read and being written (no wait): an unguarded
+    check-then-set shows itself at once."""
+
+    @property
+    def probe_out(self):
+        seen = self._probe_out
+        time.sleep(0)
+        return seen
+
+    @probe_out.setter
+    def probe_out(self, value):
+        self._probe_out = value
+
+
+class TestV2BreakerEdges(Base):
+    def setUp(self):
+        super().setUp()
+        self.now = [1000.0]
+        self.breaker = sb.V2Breaker(lambda: self.now[0])
+
+    def open_it(self):
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            self.breaker.record(20, True)
+        self.now[0] += sb.V2_BACKOFF_BASE + 1
+
+    def test_exactly_the_slow_threshold_is_not_slow_and_one_hair_over_is(self):
+        fresh = sb.V2Breaker(lambda: self.now[0])
+        self.assertEqual([fresh.record(sb.V2_SLOW_SECONDS, False) for _ in range(sb.V2_SLOW_MIN_SAMPLES + 2)], [None] * (sb.V2_SLOW_MIN_SAMPLES + 2))
+        over = sb.V2Breaker(lambda: self.now[0])
+        events = [over.record(sb.V2_SLOW_SECONDS + 0.001, False) for _ in range(sb.V2_SLOW_MIN_SAMPLES)]
+        self.assertEqual([e["event"] for e in events if e], ["v2.backoff"])
+
+    def test_an_essential_call_finishing_during_a_probe_is_not_the_probes_result(self):
+        self.open_it()
+        self.assertEqual(self.breaker.allows(False), "probe")
+        self.assertIsNone(self.breaker.record(99, True), "a slow essential call: it is not the probe")
+        self.assertEqual((self.breaker.state, self.breaker.level, self.breaker.probe_out), ("probing", 0, True))
+        self.assertIsNone(self.breaker.record(0.01, False))
+        self.assertEqual(self.breaker.good, 0, "a fast essential call is not a good probe either")
+
+    def test_a_probe_that_ends_in_no_answer_frees_the_slot_instead_of_blocking_optional_reads_for_ever(self):
+        self.open_it()
+        self.assertEqual(self.breaker.allows(False), "probe")
+        self.assertFalse(self.breaker.allows(False))
+        self.breaker.abandon()
+        self.assertEqual(self.breaker.allows(False), "probe")
+
+    def test_threads_asking_at_once_get_exactly_one_probe_each_round(self):
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)   # threads switch as often as Python allows, so an unguarded check-then-set shows itself
+        self.addCleanup(sys.setswitchinterval, previous)
+        for round_number in range(40):
+            breaker = SlowProbeBreaker(lambda: self.now[0])
+            for _ in range(sb.V2_TIMEOUT_STREAK):
+                breaker.record(20, True)
+            got, barrier = [], threading.Barrier(8)
+
+            def ask():
+                barrier.wait()
+                got.append(breaker.allows(False))
+
+            threads = [threading.Thread(target=ask) for _ in range(8)]
+            self.now[0] += sb.V2_BACKOFF_BASE + 1
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(sorted(map(str, got)), ["False"] * 7 + ["probe"], "round %d" % round_number)
+            self.now[0] = 1000.0
+
+
+class TestV2ClientBackpressure(Base):
+    """The client over a latency-injecting fake CLI: the breaker's effect on real calls, the audit once per episode, the status line."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = [0.0]
+        self.calls = []
+        self.delay = 0.1
+        self.timeout = False
+
+    def runner(self, argv, **kwargs):
+        self.calls.append(argv[2])
+        self.clock[0] += self.delay
+        if self.timeout:
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"data": []}), "")
+
+    def client(self):
+        return sb.V2Client("/fake/bin/opencode", {}, self.runner, 1, monotonic=lambda: self.clock[0])
+
+    def test_after_timeouts_an_optional_read_fails_fast_without_a_process_and_a_write_still_goes(self):
+        client = self.client()
+        self.timeout = True
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            with self.assertRaises(sb.V2Error):
+                client.session_active()
+        self.timeout = False
+        before = len(self.calls)
+        with self.assertRaises(sb.V2Error) as caught:
+            client.session_active()
+        self.assertEqual(caught.exception.reason, "backoff")
+        self.assertEqual(len(self.calls), before, "no process was started for a skipped read")
+        client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_1", "text": "wake"})
+        client.session_get("ses_a")   # discovery and the re-check before a write: a delivery cannot go without it
+        client.inbox_list("ses_a")
+        client.message_page("ses_a", 10, "synthetic")
+        self.assertEqual(len(self.calls), before + 4, "a write, the session read, the inbox and the delivery key read all went through")
+        self.assertEqual(client.breaker.skipped, 1, "the one skipped read is counted once, in one place")
+        with self.assertRaises(sb.V2Error):
+            client.message_list("ses_a", limit=5)   # an ordinary transcript read is optional
+
+    def test_it_resumes_by_itself_once_the_service_answers_quickly_again(self):
+        client = self.client()
+        self.timeout = True
+        for _ in range(sb.V2_TIMEOUT_STREAK):
+            with self.assertRaises(sb.V2Error):
+                client.session_active()
+        self.timeout = False
+        self.clock[0] += sb.V2_BACKOFF_BASE + 1
+        for _ in range(sb.V2_RECOVER_OK):
+            client.session_active()
+        self.assertEqual(client.breaker.state, "closed")
+        client.session_get("ses_a")
+
+    def test_the_engine_audits_one_v2_backoff_per_episode_and_the_daemons_link_status_says_so(self):
+        world = World(self, agents=("platform",))
+        engine = world.new_engine()
+        client = engine.v2
+        client.monotonic = lambda: self.clock[0]
+        client.breaker.clock = client.monotonic
+        client.state_dir = world.state
+        world.v2.fail_with = None
+        real = client.runner
+
+        def slow(argv, **kwargs):
+            self.clock[0] += 30
+            return real(argv, **kwargs)
+        client.runner = slow
+        for _ in range(sb.V2_SLOW_MIN_SAMPLES + 4):
+            try:
+                client.session_active()
+            except sb.V2Error:
+                pass
+        events = [e for e in world.audit() if e["event"] in ("v2.backoff", "v2.resume")]
+        self.assertEqual([e["event"] for e in events], ["v2.backoff"], "one line for the episode, not one per skipped read")
+        self.assertEqual(events[0]["detail"]["episode"], 1)
+        line = sb.v2_link_status_line(world.state, time.time())
+        self.assertIn("OPEN", line)
+        self.assertIn("v2.backoff", line)
+        self.assertEqual(stat.S_IMODE((world.state / sb.V2_LINK_STATUS_FILE).stat().st_mode), 0o600)
+
+    def test_a_status_line_is_only_shown_for_a_written_file_and_reads_closed_when_healthy(self):
+        self.assertIsNone(sb.v2_link_status_line(self.home, time.time()))
+        client = self.client()
+        client.state_dir = self.home
+        client.session_active()
+        line = sb.v2_link_status_line(self.home, time.time())
+        self.assertIn("breaker CLOSED", line)
+        self.assertIn("fell back to the CLI", line)
 
 
 def main(argv):
