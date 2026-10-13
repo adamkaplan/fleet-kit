@@ -414,7 +414,9 @@ class TestV2Client(Base):
         source = class_source("V2Client")
         self.assertEqual(source.count("self.runner("), 1)
         self.assertEqual(source.count('"api"'), 1)
-        self.assertIn("self.runner(", class_source("V2Client", "_call"))
+        self.assertIn("self.runner(", class_source("V2Client", "_cli"))   # the CLI route; the HTTP route has its own class and is reached from `_transport`
+        self.assertEqual(source.count("self._cli("), 1, "only the transport step reaches the CLI")
+        self.assertIn("self._transport(", class_source("V2Client", "_call"))
 
     def test_env_is_the_process_env_with_the_config_env_on_top(self):
         os.environ["XDG_DATA_HOME"] = "/live/data"
