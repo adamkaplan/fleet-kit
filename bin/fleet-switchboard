@@ -6612,6 +6612,11 @@ def apply_notice_effects(engine):
     return False
 
 
+def _plain(text, limit=300):
+    """One line with every control character (ESC included) turned into a space, bounded: for text GitHub's users write (a label, a check name)."""
+    return _one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)), limit)
+
+
 def pr_checks_of(rollup, limit=30):
     """[{"name", "conclusion"}] of the checks of a statusCheckRollup, as lower-case words (`success`, `failure`, `in_progress`...), at most `limit`."""
     found = []
@@ -6621,7 +6626,7 @@ def pr_checks_of(rollup, limit=30):
         name = check.get("name") or check.get("context") or check.get("workflowName")
         word = check.get("conclusion") or check.get("state") or check.get("status") or ""
         if isinstance(name, str) and isinstance(word, str):
-            found.append({"name": _one_line(name, 60), "conclusion": _one_line(word, 30).lower() or "pending"})
+            found.append({"name": _plain(name, 60), "conclusion": _plain(word, 30).lower() or "pending"})
         if len(found) >= limit:
             break
     return found
@@ -15720,11 +15725,11 @@ def pr_state_from_lists(state, repos):
             ref = "%s#%d" % (key, number)
             seen.add(ref)
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
-            labels = sorted(str(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or [])[:20]
+            labels = sorted(_plain(l.get("name") if isinstance(l, dict) else l, 60) for l in record.get("labels") or [])[:20]   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
             entry = {"state": "draft" if record.get("draft") else "open", "head": head, "labels": labels, "at": at, "listed_at": at}
             if old.get("head") == head and old.get("checks") is not None:   # what the examination found at this very head stays until it is examined again
-                entry.update({k: old[k] for k in ("checks", "ci", "mergeable", "gates", "examined_at") if k in old})
+                entry.update({k: old[k] for k in ("checks", "ci", "mergeable", "gates", "examined_at", "examined_head") if k in old})
             state.pr_state[ref] = entry
         for ref, old in list(state.pr_state.items()):
             if ref.startswith(key + "#") and ref not in seen and old.get("state") in ("open", "draft") and at > old.get("listed_at", 0):
@@ -15738,15 +15743,16 @@ def pr_state_enrich(state, repo, number, ctx, now):
     facts = ctx.facts or {}
     if entry is None or not facts.get("head"):
         return
-    entry.update({"checks": facts.get("checks") or [], "ci": facts.get("ci"), "mergeable": facts.get("mergeable"), "examined_at": now, "at": now})
+    entry.update({"checks": facts.get("checks") or [], "ci": facts.get("ci"), "mergeable": facts.get("mergeable"), "examined_at": now, "at": now,
+                  "examined_head": facts.get("head")})
     if facts.get("state") in ("merged", "closed"):
         entry["state"] = facts["state"]
     try:
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, facts, ctx.pr, now=now)
-        missing = [("%s %s" % (g["gate"], m))[:160] for g in report.get("gates", []) if g.get("tracked") and g.get("status") == "missing" for m in g.get("missing", [])][:12]
+        missing = [_plain("%s %s" % (g["gate"], m), 160) for g in report.get("gates", []) if g.get("tracked") and g.get("status") == "missing" for m in g.get("missing", [])][:12]
         entry["gates"] = {"ready": bool(report.get("ready")), "missing": missing}
-    except Exception:   # the picture is best effort: the gates are said unknown rather than guessed
-        entry.pop("gates", None)
+    except Exception as err:   # the picture is best effort: the gates are said not evaluated (not "no plan"), never guessed
+        entry["gates"] = {"error": _one_line("%s: %s" % (type(err).__name__, err), 120)}
 
 
 def write_pr_state(engine, state, now):
@@ -15762,15 +15768,28 @@ def write_pr_state(engine, state, now):
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps(body, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(str(temp), str(path))
-    except OSError:
-        pass   # best effort
+    except OSError as err:
+        try:
+            temp.unlink()
+        except (OSError, UnboundLocalError):
+            pass
+        engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # said once per change; the age on every line shows a stale file
+
+
+PR_STATE_READ_MAX = 2 * 1024 * 1024   # the file the daemon writes is far smaller; past this it is not one
 
 
 def pr_state_read(state_dir, now):
     """(body, why): the file the daemon left, or (None, why) when there is none or it is not one."""
     try:
-        body = json.loads((Path(state_dir) / PR_STATE_FILE).read_text())
+        with open(str(Path(state_dir) / PR_STATE_FILE)) as handle:
+            text = handle.read(PR_STATE_READ_MAX + 1)
+        if len(text) > PR_STATE_READ_MAX:
+            return None, "the snapshot is larger than any the daemon writes"
+        body = json.loads(text)
         if isinstance(body, dict) and isinstance(body.get("prs"), dict) and isinstance(body.get("written_at"), (int, float)):
             return body, None
         return None, "the snapshot is not a pr-state file"
@@ -15792,8 +15811,11 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None):
             found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == head and e.get("reviewer") == reviewer]
             if found:
                 reviews.append({"reviewer": reviewer, "verdict": found[-1].get("verdict"), "head": head})
-    view = {"pr": ref, "known": True, "state": entry.get("state"), "head": head, "mergeable": entry.get("mergeable"), "ci": entry.get("ci"),
-            "checks": entry.get("checks"), "labels": entry.get("labels") or [], "gates": entry.get("gates"), "reviews": reviews,
+    examined = entry.get("examined_head")
+    stale_head = bool(examined and head and examined != head)   # what was examined belongs to another head: it is not shown as this head's
+    view = {"pr": ref, "known": True, "state": entry.get("state"), "head": head, "mergeable": None if stale_head else entry.get("mergeable"),
+            "ci": None if stale_head else entry.get("ci"), "checks": None if stale_head else entry.get("checks"),
+            "examined_head": examined, "labels": entry.get("labels") or [], "gates": None if stale_head else entry.get("gates"), "reviews": reviews,
             "age_seconds": max(0, int(now - entry.get("at", now))), "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
     if entry.get("why"):
         view["why"] = entry["why"]
@@ -15809,12 +15831,19 @@ def pr_state_line(view):
         parts.append("mergeable %s" % view["mergeable"].lower())
     if view.get("checks") is not None:
         parts.append("CI %s (%s)" % (view.get("ci") or "?", ", ".join("%s: %s" % (c["name"], c["conclusion"]) for c in view["checks"][:8]) or "no checks"))
+    elif view.get("examined_head") and view["examined_head"] != view["head"]:
+        parts.append("CI not examined at this head (last examined at %s)" % view["examined_head"][:8])
     else:
         parts.append("CI not examined")
     gates = view.get("gates")
-    parts.append("gates %s" % ("unknown (no plan examined)" if gates is None else "READY" if gates["ready"] else "NOT (%s)" % ("; ".join(gates["missing"][:4]) or "see `gates`")))
+    if gates is None:
+        parts.append("gates unknown (no plan examined)")
+    elif "error" in gates:
+        parts.append("gates unknown (not evaluated: %s)" % gates["error"])
+    else:
+        parts.append("gates %s" % ("READY" if gates["ready"] else "NOT (%s)" % ("; ".join(gates["missing"][:4]) or "see `gates`")))
     parts.append("reviews %s" % (", ".join("%s %s" % (r["reviewer"], r["verdict"]) for r in view["reviews"]) or "none recorded at this head"))
-    parts.append("labels %s" % (", ".join(view["labels"]) or "none"))
+    parts.append("labels %s" % (", ".join(_plain(l, 60) for l in view["labels"]) or "none"))
     parts.append("cache %ds old" % view["age_seconds"])
     if view.get("why"):
         parts.append(view["why"])
