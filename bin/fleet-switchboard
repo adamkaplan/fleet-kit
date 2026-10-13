@@ -301,6 +301,7 @@ DEFAULTS = {
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
+    "v2_light": False,             # the owner's hotfix switch: ON turns OFF every optional read of session history (see V2_LIGHT_OFF); sends and writes are untouched
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
     "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
@@ -439,6 +440,8 @@ def validate_config(raw, source="config"):
         envs[key] = dict(env)
     if config["v2_events"] not in ("auto", "off"):
         raise ConfigError("%s: 'v2_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_events"]))
+    if not isinstance(config["v2_light"], bool):
+        raise ConfigError("%s: 'v2_light' must be true or false, got %r" % (source, config["v2_light"]))
     if config["v2_transport"] not in ("auto", "cli"):
         raise ConfigError("%s: 'v2_transport' must be \"auto\" or \"cli\", got %r" % (source, config["v2_transport"]))
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
@@ -2290,6 +2293,139 @@ def adopt_inherited_lock(path):
         return None
 
 
+V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before a write is still made)", "compactions (orders after one)", "inbox unread badge and lapsed-note conversion",
+                "stopped/finished summary and stop classification", "landed-checks that page messages (a sent-key ledger answers instead)",
+                "report-answered checks", "brief scan")
+SENT_KEYS_FILE = "sent-keys.json"
+SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds
+SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one
+
+
+class SentLedger:
+    """v2_light: the keys the daemon itself delivered, per session, kept in `sent-keys.json` (0600, renamed into place, bounded) so a restart
+    keeps them. Two writers (the daemon and a CLI `send`) share it: every change is a locked read-modify-write (flock), every read
+    sees the file as it is now.
+
+    At most once: a send is `reserve`d BEFORE the write and `confirm`ed after it. A crash between the two leaves the key
+    UNKNOWN (`unknown` in the file): it counts as delivered, is never sent again by itself, and `status` says how many there are. A
+    send that FAILED (a V2Error) is `release`d: nothing was admitted, or v2 refuses a repeat (the message id is derived from the keys)."""
+
+    def __init__(self, state_dir):
+        self.path = Path(state_dir) / SENT_KEYS_FILE if state_dir is not None else None
+        self.lock = self.path.with_name(SENT_KEYS_FILE + ".lock") if self.path is not None else None
+
+    def load(self):
+        """(sent, unknown). A MISSING file is an empty ledger; a file that is there and cannot be read or parsed is not: the ledger
+        fails CLOSED (a V2Error, so the callers hold the send and say why), never forgetting what was delivered."""
+        if self.path is None:
+            return {}, {}
+        try:
+            if self.path.stat().st_size > SENT_FILE_MAX:
+                raise V2Error("ledger_corrupt", None, "sent-keys.json is larger than any ledger the daemon writes: nothing is sent until it is moved aside")
+            text = self.path.read_text()
+        except FileNotFoundError:
+            return {}, {}
+        except OSError as err:
+            raise V2Error("ledger_unreadable", None, "sent-keys.json cannot be read (%s): nothing is sent until it can be" % err)
+        try:
+            body = json.loads(text)
+            tables = []
+            for name in ("sessions", "unknown"):
+                table = {}
+                for sid, entries in (body.get(name) or {}).items():
+                    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in entries.values()):
+                        raise ValueError("a key without a time")
+                    table[sid] = {str(k): v for k, v in entries.items()}
+                tables.append(table)
+            sessions, unknown = tables
+        except (ValueError, AttributeError, TypeError):
+            raise V2Error("ledger_corrupt", None, "sent-keys.json is not a ledger: nothing is sent until it is moved aside (it is never read as empty)")
+        return sessions, unknown
+
+    @property
+    def keys(self):
+        return self.load()[0]
+
+    def update(self, change):
+        """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically. A ledger that cannot be
+        locked, read or written raises (V2Error): the caller does not send."""
+        if self.path is None:
+            return
+        try:
+            fd = os.open(str(self.lock), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX)
+                sessions, unknown = self.load()
+                change(sessions, unknown)
+                # Only `sessions` is trimmed: an unknown-fate reservation is what says "do not send again", so it stays (bounded by SENT_FILE_MAX)
+                for mine in sessions.values():
+                    if len(mine) > SENT_PER_SESSION:
+                        for key, _ in sorted(mine.items(), key=lambda kv: kv[1])[:len(mine) - SENT_PER_SESSION]:
+                            del mine[key]
+                for sid in [sid for sid, mine in sessions.items() if not mine]:
+                    del sessions[sid]
+                if len(sessions) > SENT_SESSIONS:
+                    keep = sorted(sessions.items(), key=lambda kv: max(kv[1].values() or [0]), reverse=True)[:SENT_SESSIONS]
+                    sessions.clear()
+                    sessions.update(keep)
+                self.save(sessions, unknown)
+        except OSError as err:
+            raise V2Error("ledger_unwritable", None, "sent-keys.json cannot be written (%s): nothing is sent until it can be" % err)
+
+    def reserve(self, session_id, keys, created):
+        def change(sessions, unknown):
+            unknown.setdefault(session_id, {}).update({key: created for key in keys})
+        self.update(change)
+
+    def confirm(self, session_id, keys, created):
+        def change(sessions, unknown):
+            sessions.setdefault(session_id, {}).update({key: created for key in keys})
+            for key in keys:
+                unknown.get(session_id, {}).pop(key, None)
+        self.update(change)
+
+    def release(self, session_id, keys):
+        def change(sessions, unknown):
+            for key in keys:
+                unknown.get(session_id, {}).pop(key, None)
+        self.update(change)
+
+    def known(self, session_id, since):
+        sessions, unknown = self.load()
+        found = KeyTimes()
+        for table in (sessions, unknown):   # an unknown-fate send counts as delivered: at most once
+            for key, created in table.get(session_id, {}).items():
+                if created >= since:
+                    found.add_all([key], created)
+        return found
+
+    def unknown_count(self):
+        return sum(len(mine) for mine in self.load()[1].values())
+
+    def save(self, sessions, unknown):
+        temp = None
+        try:
+            temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"sessions": sessions, "unknown": unknown}, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(str(temp), str(self.path))
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)   # the rename itself must survive a power loss
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception as err:
+            if temp is not None:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            raise OSError("sent-keys.json could not be written: %s" % err)
+
+
 class KeyTimes(set):
     """The keys `delivered_keys` found, a plain set, with `at[key]`: when the message that carries it was
     created (the oldest, when several do; None when v2 gave no time). PR 13 reads when a report arrived."""
@@ -2512,8 +2648,8 @@ def start_event_feed(engine, config, now):
 def feed_tick(engine):
     """After a pass: the feed's bounded reads. Never raises; a pass never fails for the feed."""
     feed = getattr(engine, "feed", None)
-    if feed is None:
-        return
+    if feed is None or getattr(engine, "light", False):
+        return   # v2_light: no optional read of session history, and the feed's resync and reconcile reads are such reads
     try:
         discovery = getattr(engine, "discovery", None)
         sessions = sorted({o.session_id for o in discovery.agents.values() if getattr(o, "session_id", None)}) if discovery else []
@@ -2540,10 +2676,12 @@ class V2Reads:
     PROMPT_READ = 10
     PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
 
-    def human_prompts_newest(self, session_id):
+    def human_prompts_newest(self, session_id, fresh=False):
         """The person's prompts (user messages without `metadata.fleet`), newest first, from at most two small reads: the newest PROMPT_READ user
         messages, and only if they are ALL the fleet's (a person's prompt may sit behind them) the newest PROMPT_READ_WIDE. A prompt buried
         under more fleet messages than that is not seen: the person is then not counted as engaged by this read, and a write is re-checked anyway."""
+        if self.engine.light and not fresh:
+            return []   # v2_light: no background read. The read just before a write (fresh) is still made: the engagement gate keeps its facts
         for limit in (self.PROMPT_READ, self.PROMPT_READ_WIDE):
             page = self.engine.v2.message_list(session_id, limit=limit, type="user")
             page = page if isinstance(page, list) else []
@@ -2620,7 +2758,9 @@ class V2Reads:
         if entry is not None and not fresh and not self.may_fill(now):
             self.deferred += 1
             return entry[1]
-        newest = self.human_prompts_newest(session_id)
+        if self.engine.light and not fresh:
+            return None
+        newest = self.human_prompts_newest(session_id, fresh)
         found = _created(newest[0]) if newest else None
         if self.ttl() > 0 and updated is not None:
             self.prompts[session_id] = (updated, found)
@@ -2630,6 +2770,8 @@ class V2Reads:
 
     def inbox(self, session_id, now, fresh=False):
         """`session.inbox.list`, remembered (and read again when the daemon itself wrote to the session)."""
+        if self.engine.light:
+            return []
         entry, ttl = self.inboxes.get(session_id), self.ttl()
         if entry is not None and not fresh and ttl > 0:
             if now - entry[1] < ttl:
@@ -2647,6 +2789,8 @@ class V2Reads:
     def compaction_page(self, session_id, limit, now):
         """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
         that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
+        if self.engine.light:
+            return []
         entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
         if entry is not None and ttl > 0 and now - entry[1] < ttl:
             return entry[0]
@@ -2690,6 +2834,8 @@ class Switchboard:
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
         self.reads = V2Reads(self)
+        self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
+        self.sent = SentLedger(self.state_dir) if self.light else None
         self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
@@ -2727,7 +2873,7 @@ class Switchboard:
         small read, made again only when the session changed (V2Reads.human_prompt)."""
         start = now - self.engaged_seconds
         if inbox:
-            waiting = inbox_human_prompts(self, session_id)
+            waiting = inbox_human_prompts(self, session_id, fresh)
             if waiting and (_created(waiting[0]) or 0) >= start:
                 return _created(waiting[0])
         created = self.reads.human_prompt(session_id, info or {}, now, fresh)
@@ -2882,6 +3028,8 @@ class Switchboard:
         """Keys already in the session: its messages since `since`, read newest
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
+        if self.light:
+            return self.sent.known(session_id, since), True   # what the daemon delivered, from its ledger: no read
         keys, complete = KeyTimes(), False
         # A recipient with something pending is asked about every pass: ONE small read (its newest synthetic message) says whether anything it
         # carries changed; if not, the keys found last time (which reached back to `since`) still hold, and the pages are not read again.
@@ -2969,6 +3117,15 @@ class Switchboard:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
                               "already has is unknown" % (READ_LIMIT, recipient, iso(since)))
+        if self.light and pending:
+            # v2_light: nothing reads a person's prompt in the background, but a recipient with something pending is about to be written to:
+            # the engagement gate gets its one small read now (never on a timer), so a note is still a note and a wake still a wake.
+            try:
+                observation.last_human_prompt = self.last_human_prompt(
+                    observation.session_id, now, inbox=(observation.fleet or {}).get("role") == "chief-of-staff", info={}, fresh=True)
+            except V2Error as err:
+                return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
+                              "cannot read %s's transcript: %s" % (recipient, err))
         return decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
 
     # -- deliver
@@ -3031,15 +3188,31 @@ class Switchboard:
                 reply = self.v2.interrupt(observation.session_id, False)
                 result["interrupted"] = reply.get("interrupted") if isinstance(reply, dict) else None
             detail["interrupted"] = True
-        with self._external("v2.synthetic", plan.recipient, detail) as result:
-            record = self.v2.synthetic(observation.session_id, text,
-                                       {"fleet": {"keys": keys, "from": "switchboard"}},
-                                       resume, delivery, message_id, description)
-            if fault("crash-after-send"):
-                raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
-                                     % message_id)
-            result["id"] = record.get("id") if isinstance(record, dict) else None
+        if self.light:
+            self.sent.reserve(observation.session_id, keys, self.now())   # before the write: a crash after it leaves the fate unknown, never "not sent"
+        try:
+            with self._external("v2.synthetic", plan.recipient, detail) as result:
+                record = self.v2.synthetic(observation.session_id, text,
+                                           {"fleet": {"keys": keys, "from": "switchboard"}},
+                                           resume, delivery, message_id, description)
+                if fault("crash-after-send"):
+                    raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
+                                         % message_id)
+                result["id"] = record.get("id") if isinstance(record, dict) else None
+        except V2Error as err:
+            if not self.light:
+                raise
+            if err.reason == "http" and err.status == 409:
+                pass   # v2 already holds this message (its id is derived from the keys): it IS delivered
+            elif (err.reason == "http" and isinstance(err.status, int) and 400 <= err.status < 500 and err.status != 408) \
+                    or err.reason in ("unavailable", "refused"):
+                self.sent.release(observation.session_id, keys)   # a definite refusal (a 4xx other than 408/409: not admitted), or the call never ran: the write did not land
+                raise
+            else:
+                raise   # a 5xx, 408, timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
+        if self.light:
+            self.sent.confirm(observation.session_id, keys, self.now())
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
@@ -3049,7 +3222,7 @@ class Switchboard:
         engagement window becomes a wake: `inbox.update` to queue, then to
         steer (v2 refuses steer to steer). Only on an idle agent. Returns the
         converted inbox ids."""
-        if fault("no-note-conversion") or hold_reason(observation) or observation.status != "idle":
+        if self.light or fault("no-note-conversion") or hold_reason(observation) or observation.status != "idle":
             return []
         if observation.engaged(now, self.engaged_seconds):
             return []
@@ -3157,7 +3330,7 @@ class Switchboard:
         carry them, plus the facts held for the agent. A note a turn has
         carried is read; a wake starts its own turn, so it is never unread."""
         # An agent with something pending (a held plan) is never served from memory: a send or a note for it is noticed at the next pass.
-        inbox = self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
+        inbox = [] if self.light else self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
         waiting = [item for item in (inbox if isinstance(inbox, list) else [])
                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
                    and item.get("delivery") == "steer" and item.get("resume") is not True]
@@ -4317,6 +4490,8 @@ BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session w
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
+    if getattr(engine, "light", False):
+        return True   # v2_light: no scan; a brief is never sent twice for want of looking
     page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
     page = page if isinstance(page, list) else []
     return any((_fleet_meta(message) or {}).get("brief") for message in page) or len(page) >= BRIEF_SCAN_USER
@@ -4488,9 +4663,11 @@ def next_poll(engine, poll):
     return poll
 
 
-def inbox_human_prompts(engine, session_id):
+def inbox_human_prompts(engine, session_id, fresh=False):
     """Your steered prompts still waiting in v2's inbox (SF1: there within ~0.1 s, consumed at the
     next step boundary), as message-like records, newest first. Not yet seen by the model."""
+    if getattr(engine, "light", False) and not fresh:
+        return []   # v2_light: only the read just before a write (the engagement gate) is made
     inbox = engine.v2.inbox_list(session_id)
     found = []
     for item in inbox if isinstance(inbox, list) else []:
@@ -5039,6 +5216,8 @@ class WorkerFacts:
         cached = self._summaries.get((session_id, idle_ms))
         if cached is not None:
             return cached
+        if self.engine.light:
+            return ""
         page = self.engine.v2.message_list(session_id, limit=1, type="assistant")
         text = _one_line(reply_text(page[0]) if isinstance(page, list) and page else "", SUMMARY_CAP)
         if len(self._summaries) > 500:
@@ -5201,6 +5380,8 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
     {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
     now = engine.now()
+    if getattr(engine, "light", False):
+        return None   # v2_light: no transcript read, so a stop is only its idle rider
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
@@ -5789,6 +5970,8 @@ def synthetic_lines(engine, session_id, since, waiting=False):
     stay open. The inbox is read every time (one small read; it is not in the cache, because it changes without the
     transcript's newest id changing). The boss's side (the reports) stays the transcript's: a report is listed once
     the boss has it."""
+    if getattr(engine, "light", False):
+        return []
     found = transcript_lines(engine, session_id, since)
     if not waiting:
         return found
@@ -5807,6 +5990,8 @@ def synthetic_lines(engine, session_id, since, waiting=False):
 
 def transcript_lines(engine, session_id, since):
     """The transcript's synthetic lines since `since`, newest message first (cached by the newest synthetic id)."""
+    if getattr(engine, "light", False):
+        return []
     newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
     newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
     cached = engine.synthetic_cache.get(session_id)
@@ -11320,6 +11505,13 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
+        if config_ok and config.get("v2_light"):
+            try:
+                unknown = SentLedger(state).unknown_count()
+                ledger = "; %d send(s) of unknown fate, counted as delivered (sent-keys.json)" % unknown if unknown else ""
+            except V2Error as err:   # status never crashes on a bad state file: it says the ledger is unusable and that the sends are stopped
+                ledger = "; sent-keys ledger: UNREADABLE (sends stopped: fail closed): %s" % _one_line(str(err), 160)
+            report["v2_light"] = "ON (features off: %s)%s" % ("; ".join(V2_LIGHT_OFF), ledger)
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
@@ -11507,6 +11699,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
+    lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
