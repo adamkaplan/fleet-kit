@@ -4137,6 +4137,59 @@ class TestLaunch(Base):
         self.assertIn(pane, self.world.herdr.panes)
         self.assertEqual(self.world.herdr.closed, [])
 
+    def test_a_resume_takes_repo_and_account_from_the_sessions_stored_metadata_and_refuses_a_different_caller_repo(self):
+        self.world.add_agent("ops", fleet={"role": "orchestrator", "repo": "acme-ops/service", "reports_to": "cos", "charter": 5})
+        session = self.world.sessions["ops"]
+        self.world.v2.sessions[session]["directory"] = str(self.work)
+        del self.world.herdr.panes[self.world.panes["ops"]]
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                             lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok-ops\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        done = sb.resume_agent(self.engine, "ops", session, "w1", patience=5, sleep=self.sleep)
+        env = self.world.herdr.panes[done["pane"]]["env"]
+        self.assertEqual((env["FLEET_SWITCHBOARD_REPO"], env["FLEET_SWITCHBOARD_ROLE"], env["GH_TOKEN"]), ("acme-ops/service", "orchestrator", "tok-ops"))
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        del self.world.herdr.panes[done["pane"]]
+        for argv in (["launch", "ops", "--resume", session, "--repo", "acme/other"], ["reattach", "ops", "--session", session, "--repo", "acme/other"]):
+            with captured() as (out, err):
+                code = sb.main(argv, runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertIn("differs from the session's stored repo acme-ops/service", err.getvalue())
+
+    def test_replace_closes_a_live_pane_with_the_wrong_account_under_the_same_guards_and_all_detached_walks_the_list(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.world.panes["platform"]                                 # attached and idle: refused without --replace
+        self.world.v2.sessions[self.world.sessions["platform"]]["directory"] = str(self.work)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--replace", err.getvalue())
+        self.world.herdr.panes[pane]["status"] = "working"                  # a working pane is never replaced
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.world.herdr.closed, [])
+        self.world.herdr.panes[pane]["status"] = None
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [pane])
+        with captured() as (out, err):
+            code = sb.main(["reattach", "--all-detached"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual((code, out.getvalue().strip()), (0, "no agent is detached or dead"))
+
+    def test_the_account_is_verified_after_a_reattach_and_a_mismatch_is_said(self):
+        engine = self.engine
+        engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        ok = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "acct-ops\n", "")
+        bad = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "default-work\n", "")
+        fleet = {"repo": "acme-ops/service"}
+        self.assertIsNone(sb.verify_account(engine, ok, fleet))
+        self.assertIn("default-work but acme-ops/service maps to acct-ops", sb.verify_account(engine, bad, fleet))
+        self.assertIsNone(sb.verify_account(engine, bad, {}))
+
     def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
         pane = self.detach()
         self.world.herdr.panes[pane]["read_fails"] = True

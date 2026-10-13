@@ -3509,7 +3509,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
 
 
-def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep):
+def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep, replace=False):
     """Open a new tab on a fleet agent's EXISTING session: a restart that keeps its conversation.
 
     The session must carry metadata.fleet.name == `name` (so a wrong id cannot start someone
@@ -3531,16 +3531,24 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     taken = engine.discover(engine.now()).agents.get(name)
     released = []
     if taken is not None:
-        released = release_stale_binding(engine, name, taken, session_id)   # refuses (LaunchError) a pane that is really running it
+        released = release_stale_binding(engine, name, taken, session_id, replace=replace)   # refuses (LaunchError) a pane that is really running it
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
-    env.update(view_env(fleet.get("role"), fleet.get("repo") or (engine.config.get("intent_repo")
-                                                               if fleet.get("charter") else None)))  # PR 18
+    # Everything about who the agent is comes from the session's STORED fleet metadata, never from the caller: a reattached agent keeps its
+    # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
+    repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
+    env.update(view_env(fleet.get("role"), repo))  # PR 18
+    accounts = getattr(engine, "accounts", None)
+    if fleet.get("repo") and accounts is not None:
+        try:
+            env.update(accounts.token_env(fleet["repo"]))   # the repo's own account, as launch gives it
+        except AccountError as err:
+            raise LaunchError(str(err)) from None
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
         with engine._external("herdr.layout.apply", name, {
                 "workspace": workspace, "label": name, "cwd": directory, "argv": argv,
-                "env_names": sorted(env), "session": session_id, "resume": True}) as result:
+                "env_names": sorted(env), "session": session_id, "resume": True, "repo": fleet.get("repo")}) as result:
             opened = engine.herdr.open_tab_running(workspace, name, directory, argv, env)
             pane = result["pane"] = opened["pane_id"]
             result["tab"] = opened["tab_id"]
@@ -3614,7 +3622,7 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
     return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info
 
 
-def release_stale_binding(engine, name, taken, session_id):
+def release_stale_binding(engine, name, taken, session_id, replace=False):
     """`taken` is the Observation herdr still lists under `name`. Returns what was released (lines), or raises LaunchError. A pane whose screen
     names the agent is LIVE: refused, no double attach. A pane herdr no longer has, or one that shows a fresh screen with no session of any fleet
     agent, is stale: its tab is closed (the only close this makes) and the binding is gone. Anything else (the pane shows another agent) is refused."""
@@ -3622,13 +3630,14 @@ def release_stale_binding(engine, name, taken, session_id):
     names = list(discovery.agents) if discovery is not None else []
     sessions = [o.session_id for o in discovery.agents.values()] if discovery is not None else []
     state, why, info = pane_state(engine, name, session_id, taken.pane, names, sessions)
-    if state == PANE_ATTACHED:
-        raise LaunchError("a fleet agent named %s already runs in pane %s (%s): close it first" % (name, taken.pane, why))
+    if state == PANE_ATTACHED and not replace:
+        raise LaunchError("a fleet agent named %s already runs in pane %s (%s): close it first (or `reattach --replace` when it runs with the wrong "
+                          "account or repo)" % (name, taken.pane, why))
     if state == PANE_UNKNOWN:
         raise LaunchError("a fleet agent named %s is bound to pane %s and herdr cannot say what it shows: %s" % (name, taken.pane, why))
     if state == PANE_DEAD:
         return ["pane %s is gone: its binding is released" % taken.pane]
-    if info.get("shows_another"):
+    if info.get("shows_another") and state != PANE_ATTACHED:
         raise LaunchError("pane %s (bound to %s) shows another fleet agent (%s): not a stale screen, nothing was closed" % (
             taken.pane, name, ", ".join(info["shows_another"])))
     tab = info.get("tab")
@@ -3645,7 +3654,7 @@ def release_stale_binding(engine, name, taken, session_id):
     if count != 1:
         raise LaunchError("tab %s holds %s panes, not only the stale one: nothing was closed" % (tab, count))
     again, why_again, again_info = pane_state(engine, name, session_id, taken.pane, names, sessions)
-    if again != PANE_DETACHED or again_info.get("shows_another") or again_info.get("tab") != tab:
+    if again != (PANE_ATTACHED if replace and state == PANE_ATTACHED else PANE_DETACHED) or again_info.get("shows_another") or again_info.get("tab") != tab:
         raise LaunchError("pane %s changed while it was being judged (%s): nothing was closed" % (taken.pane, why_again))
     with engine._external("herdr.tab.close", name, {"pane": taken.pane, "tab": tab, "why": "stale binding: %s" % why}):
         engine.herdr.tab_close(tab)
@@ -3805,6 +3814,8 @@ def cmd_reattach(args, runner, now, socket_call=None):
     """`reattach <name> [--session ses_...] [--workspace W]`: put an agent back in a pane on its EXISTING session. Releases a stale binding first
     (a pane herdr no longer has, or a detached fresh screen: its tab is closed), refuses when the old pane really runs the agent or the session is
     gone (then `relaunch` is the proposal), sends no prompt, updates the charter's `pane:` line and audits."""
+    if getattr(args, "all_detached", False):
+        return cmd_reattach_all(args, runner, now, socket_call)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     name = args.name
     discovery = engine.discover(engine.now())
@@ -3829,8 +3840,10 @@ def cmd_reattach(args, runner, now, socket_call=None):
                               "which is a proposal to the Chief of Staff for an orchestrator" % (session_id, PROG, name)) from None
         raise
     fleet = _fleet_meta(info) or {}
+    if getattr(args, "repo", None) and fleet.get("repo") and args.repo != fleet["repo"]:
+        raise LaunchError("--repo %s differs from the session's stored repo %s: a reattach keeps what the session says, never the caller's" % (args.repo, fleet["repo"]))
     try:
-        done = resume_agent(engine, name, session_id, workspace)
+        done = resume_agent(engine, name, session_id, workspace, replace=getattr(args, "replace", False))
     except LaunchError as err:
         raise LaunchError("%s (if the stale tab was already closed, run `%s reattach %s` again: nothing else was changed)" % (err, PROG, name)) from err
     note = charter_pane_update(engine, runner, fleet, done["pane"])
@@ -3847,15 +3860,62 @@ def cmd_reattach(args, runner, now, socket_call=None):
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.error", name, {"error": "pane-health.json not written: %s" % _one_line(str(err), 100)})
     done = dict(done, charter=note or None)
+    problem = verify_account(engine, runner, fleet)
+    if problem:
+        done["account_warning"] = problem
+        sys.stderr.write("%s: WARNING: %s\n" % (PROG, problem))
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK
 
 
+def verify_account(engine, runner, fleet):
+    """None when `gh api user` with the token the pane was given names the account `gh_users` maps to the agent's repo (or there is no mapping),
+    else a one-line problem. Reads only; the token is only in the child's environment."""
+    repo, accounts = fleet.get("repo"), getattr(engine, "accounts", None)
+    if not repo or accounts is None:
+        return None
+    try:
+        want = accounts.account_for(repo)
+        if want is None:
+            return None
+        env = accounts.env_for(repo)
+        got = runner([engine.config["gh"], "api", "user", "--jq", ".login"], capture_output=True, text=True,
+                     timeout=engine.config["call_timeout_seconds"], **({"env": env} if env is not None else {}))
+    except Exception as err:
+        return "the gh account could not be verified: %s" % _one_line(str(err), 80)
+    login = (got.stdout or "").strip()
+    if got.returncode != 0 or not login:
+        return "the gh account for %s could not be verified (gh api user failed)" % repo
+    return None if login.lower() == str(want).lower() else "the pane's gh account is %s but %s maps to %s" % (login, repo, want)
+
+
+def cmd_reattach_all(args, runner, now, socket_call=None):
+    """`reattach --all-detached`: every agent the daemon found detached or dead, one by one; each failure is said and the rest continue."""
+    engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    names = sorted(n for n, v in read_pane_health(state)["states"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD))
+    if not names:
+        print("no agent is detached or dead")
+        return EXIT_OK
+    failed = 0
+    for name in names:
+        one = types.SimpleNamespace(name=name, session=None, workspace=args.workspace, repo=None, replace=False, all_detached=False)
+        try:
+            code = cmd_reattach(one, runner, now, socket_call)
+        except (LaunchError, V2Error, HerdrError) as err:
+            sys.stderr.write("%s: %s: %s\n" % (PROG, name, _one_line(str(err), 200)))
+            code = EXIT_ERROR
+        failed += code != EXIT_OK
+    return EXIT_ERROR if failed else EXIT_OK
+
+
 def add_reattach_parsers(sub):
     reattach = sub.add_parser("reattach", help="Put a detached or dead agent back in a pane on its existing session (no prompt is sent)")
-    reattach.add_argument("name", help="The agent's fleet name")
+    reattach.add_argument("name", nargs="?", help="The agent's fleet name")
+    reattach.add_argument("--all-detached", action="store_true", dest="all_detached", help="Every agent the daemon found detached or dead")
+    reattach.add_argument("--replace", action="store_true", help="Also replace a pane that runs the agent but with the wrong account or repo (same guards: not working, alone in its tab)")
     reattach.add_argument("--session", help="Its OpenCode session id (default: the one the switchboard last saw)")
     reattach.add_argument("--workspace", help="The herdr workspace for the new tab (default: where it last ran)")
+    reattach.add_argument("--repo", help="Refused when it differs from the session's stored repo (a reattach keeps the stored identity)")
 
 
 # ======================================================================
@@ -11083,6 +11143,11 @@ def cmd_launch(args, runner, now, socket_call=None):
     workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     if args.resume:
+        given = getattr(args, "repo", None)
+        if given:
+            stored = ((engine.v2.session_get(args.resume).get("metadata") or {}).get("fleet") or {}).get("repo")
+            if stored and given != stored:
+                raise LaunchError("--repo %s differs from the session's stored repo %s: a resume keeps what the session says, never the caller's" % (given, stored))
         done = resume_agent(engine, args.name, args.resume, workspace)
         print(json.dumps(done, sort_keys=True))
         return EXIT_OK
