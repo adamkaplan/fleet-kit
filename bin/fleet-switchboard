@@ -3698,7 +3698,7 @@ BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session w
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
-    if engine.light:
+    if getattr(engine, "light", False):
         return True   # v2_light: no scan; a brief is never sent twice for want of looking
     page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
     page = page if isinstance(page, list) else []
@@ -3874,7 +3874,7 @@ def next_poll(engine, poll):
 def inbox_human_prompts(engine, session_id):
     """Your steered prompts still waiting in v2's inbox (SF1: there within ~0.1 s, consumed at the
     next step boundary), as message-like records, newest first. Not yet seen by the model."""
-    if engine.light:
+    if getattr(engine, "light", False):
         return []
     inbox = engine.v2.inbox_list(session_id)
     found = []
@@ -4588,7 +4588,7 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     """What an unreported stop calls for: None (reported, too old, or not readable: only the idle rider), or
     {"outcome": "nudge", "nudge": Fact} / {"outcome": "silent"} / {"outcome": "stopped"}. Audited once."""
     now = engine.now()
-    if engine.light:
+    if getattr(engine, "light", False):
         return None   # v2_light: no transcript read, so a stop is only its idle rider
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
@@ -5178,7 +5178,7 @@ def synthetic_lines(engine, session_id, since, waiting=False):
     stay open. The inbox is read every time (one small read; it is not in the cache, because it changes without the
     transcript's newest id changing). The boss's side (the reports) stays the transcript's: a report is listed once
     the boss has it."""
-    if engine.light:
+    if getattr(engine, "light", False):
         return []
     found = transcript_lines(engine, session_id, since)
     if not waiting:
@@ -5198,7 +5198,7 @@ def synthetic_lines(engine, session_id, since, waiting=False):
 
 def transcript_lines(engine, session_id, since):
     """The transcript's synthetic lines since `since`, newest message first (cached by the newest synthetic id)."""
-    if engine.light:
+    if getattr(engine, "light", False):
         return []
     newest = engine.v2.message_list(session_id, limit=1, type="synthetic")  # one small read per pass
     newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
