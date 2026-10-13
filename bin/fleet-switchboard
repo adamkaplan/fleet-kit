@@ -5913,6 +5913,7 @@ def derive_decisions(engine, now):
     for source in (x for x in sources if x.entries):  # PR notices: information rather than decisions (never folded, never counted)
         found, problems = read_source(engine, source, now, errors)
         decisions.extend(found)
+    decision_core.fold_reports_into_prs(decisions)   # a report naming a `pr:` decision is that PR's question: one row, not two
     decision_core.order_decisions(decisions)
     return decisions, errors
 

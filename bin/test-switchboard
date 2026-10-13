@@ -29982,6 +29982,52 @@ class TestCaptainPrs(DecisionsBase):
         human = sb.decisions_view({"role": "human"}, {})
         self.assertEqual(sb.select_decisions(self.listed(), human), [])
 
+    def reports(self):
+        return [d for d in self.listed() if d.get("kind") == "report"]
+
+    def test_a_report_on_an_issue_that_names_the_pr_as_owner_repo_n_is_folded_into_the_pr_row(self):
+        self.ask_the_boss("Merge acme/api#7 now, or wait for the second review?", issue=2)
+        self.assertEqual(self.reports(), [], "no row of its own")
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["reported_by"]), ("captain", ["coder"]))
+        self.assertEqual(len(entry["reported_lines"]), 1)
+        self.assertTrue(entry["reported_lines"][0].startswith("coder: "))
+        self.assertIn("second review", entry["reported_lines"][0])
+
+    def test_a_report_that_names_the_pr_by_its_url_is_folded_too(self):
+        self.ask_the_boss("Is https://github.com/acme/api/pull/7 ready to merge?", issue=2)
+        self.assertEqual(self.reports(), [])
+        self.assertEqual(self.only()["reported_by"], ["coder"])
+
+    def test_the_report_row_is_gone_in_whichever_tier_the_pr_row_is_in(self):
+        self.ask_the_boss("Merge acme/api#7?", issue=2)
+        before = self.only()
+        self.assertEqual(before["tier"], "cos")
+        escalated = dict(before)
+        escalated["tier"] = "human"
+        folded = [escalated, {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder",
+                              "since": before["since"], "title": "question: Merge acme/api#7?"}]
+        sb.decision_core.fold_reports_into_prs(folded)
+        self.assertEqual([d["id"] for d in folded], [before["id"]], "the report row leaves with the PR row escalated")
+
+    def test_only_a_report_that_names_exactly_one_listed_pr_folds(self):
+        listed = lambda *n: [{"id": "pr:api#%d" % x, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": x, "since": "2027-01-01T00:00:00Z"} for x in n]
+        report = lambda text, i: {"id": "r%d" % i, "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder", "since": "2027-01-01T00:00:00Z", "title": text}
+        cases = [("names no PR", "which engine?"), ("two PRs", "acme/api#7 or acme/api#8?"), ("a bare number", "is #7 ready?"),
+                 ("a PR that is not listed", "acme/api#99 and the URL https://github.com/acme/api/pull/98"), ("another repo's PR 7", "acme/web#7 ready?")]
+        decisions = listed(7, 8) + [report(text, i) for i, (_, text) in enumerate(cases)]
+        sb.decision_core.fold_reports_into_prs(decisions)
+        self.assertEqual([d["id"] for d in decisions if d["kind"] == "report"], ["r%d" % i for i in range(5)], "all five stay")
+        self.assertTrue(all("reported_by" not in d for d in decisions if d["kind"] == "captain"))
+        both = listed(7) + [report("acme/api#7 and also https://github.com/acme/api/pull/7", 9)]
+        sb.decision_core.fold_reports_into_prs(both)
+        self.assertEqual([d["kind"] for d in both], ["captain"], "the same PR named twice is one PR")
+        self.assertEqual(sb.decision_core.named_prs("see HTTPS://GITHUB.COM/Acme/Api/pull/7 and Acme/Api#8"), {("acme/api", 7), ("acme/api", 8)})
+
+    def test_a_list_with_no_captain_pr_is_untouched(self):
+        decisions = [{"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder", "since": "x", "title": "acme/api#7?"}]
+        self.assertEqual(sb.decision_core.fold_reports_into_prs(list(decisions)), decisions)
+
     def test_the_author_reviewing_their_own_pr_is_ignored(self):
         self.answer(captain_pr(reviews=[("coder-bot", "APPROVED", HEAD_A)]))
         self.assertEqual(self.only()["kind"], "notice")
