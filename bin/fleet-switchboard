@@ -941,9 +941,13 @@ class V2Http:
 
     def _load(self):
         try:
-            with open(str(self.file), "rb") as handle:
+            parent = os.lstat(str(self.file.parent))
+            if parent.st_uid != os.getuid() or parent.st_mode & 0o022 or stat.S_ISLNK(parent.st_mode):
+                raise ValueError("the directory is not the user's own and closed to others")   # whoever can write the directory can swap the file
+            fd = os.open(str(self.file), os.O_RDONLY | os.O_NOFOLLOW)   # a symlink is refused, not followed
+            with os.fdopen(fd, "rb") as handle:
                 found = os.fstat(handle.fileno())
-                if found.st_uid != os.getuid() or found.st_mode & 0o077:
+                if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
                     raise ValueError("not private to this user")   # the password in it is only trusted from a file only this user could write
                 raw = handle.read(V2_SERVICE_FILE_MAX + 1)
             if len(raw) > V2_SERVICE_FILE_MAX:
@@ -997,7 +1001,27 @@ class V2Http:
                         raise V2Unreachable("the service does not answer") from None
         raise V2Unreachable("the service does not answer")
 
+    @staticmethod
+    def _read_body(response, conn, deadline):
+        """The whole reply body, at most V2_HTTP_MAX_BODY + 1 bytes, within a TOTAL deadline: each socket operation has its own timeout, so a service
+        that answers a byte at a time could otherwise hold the one client far longer than `timeout`."""
+        chunks, size = [], 0
+        while size <= V2_HTTP_MAX_BODY:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("the reply did not finish within the call's total time")
+            sock = getattr(conn, "sock", None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                sock.settimeout(left)
+            chunk = response.read(min(65536, V2_HTTP_MAX_BODY + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
+
     def _once(self, method, target, body):
+        deadline = time.monotonic() + self.timeout
         host, port, auth = self._info
         reuse = method == "GET" and self._conn is not None
         conn = self._conn if reuse else self.connect(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
@@ -1013,7 +1037,7 @@ class V2Http:
             sent = True   # from here on a write may have reached the service
             conn.request(method, target, body=data, headers=headers)
             response = conn.getresponse()
-            raw = response.read(V2_HTTP_MAX_BODY + 1)
+            raw = self._read_body(response, conn, deadline)
         except (OSError, http.client.HTTPException) as err:
             try:
                 conn.close()
@@ -1203,11 +1227,11 @@ class V2Client:
         self._record(self.monotonic() - started, False, ticket == "probe")
         return self._decode(operation, text, envelope)
 
-    def _is_essential(self, operation, params):
+    def _is_essential(self, operation, params=None):
         spec = V2_HTTP_OPERATIONS.get(operation)
         if spec is None or spec[0] != "GET" or operation in V2_ESSENTIAL_READS:
             return True
-        return operation == "session.message.list" and (params or {}).get("type") == "synthetic"   # the delivery rule's key read
+        return operation == "session.message.list" and (params or {}).get("type") in ("synthetic", "user")   # the delivery rule's key read, and the person-is-typing read every observation (so every re-check before a write) makes
 
     def _record(self, seconds, timed_out, probe=False):
         event = self.breaker.record(seconds, timed_out, probe)
