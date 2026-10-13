@@ -27,6 +27,7 @@ import inspect
 import io
 import json
 import os
+os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")   # the suite never runs the real opencode (refuse_real_opencode_under_test)
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -187,8 +188,15 @@ class Base(unittest.TestCase):
         return path
 
     def run_cli(self, path, *argv):
+        env = dict(os.environ)
+        config = Path(env.get("XDG_CONFIG_HOME", "")) / "fleet-switchboard" / "config.json"
+        try:
+            if str(self.home) in config.read_text():   # its opencode is a fake script of this test's own, never the real service
+                env[sb.ALLOW_REAL_V2_ENV] = "1"
+        except OSError:
+            pass
         return subprocess.run([sys.executable, "-B", str(path), *argv],
-                              capture_output=True, text=True, env=dict(os.environ))
+                              capture_output=True, text=True, env=env)
 
 
 # ------------------------------------------------------------------ the config
@@ -37072,6 +37080,84 @@ class TestDecisionsPanelOrder(unittest.TestCase):
         self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
                          "the panel's depth cap is the core's")
         self.assertNotIn("\u001b", self.r["hostile"])
+
+
+class TestV2CallAccounting(Base):
+    """Every v2 call is an `opencode api` process: they are counted, shown in `status`, and the suite can never reach the real service."""
+
+    def client(self, runner, clock):
+        return sb.V2Client("/opt/lab/bin/opencode", {}, runner, 5, clock=clock)
+
+    @staticmethod
+    def ok(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, '{"data": []}', "")
+
+    def test_every_call_is_counted_by_operation_over_a_window(self):
+        now = [1000.0]
+        v2 = self.client(self.ok, lambda: now[0])
+        for _ in range(3):
+            v2.session_get("ses_example1")
+        v2.inbox_list("ses_example1")
+        now[0] += 90
+        v2.message_list("ses_example1", limit=5)
+        self.assertEqual(v2.calls_by_operation(60.0), {"session.message.list": 1})
+        self.assertEqual(v2.calls_by_operation(300.0), {"session.get": 3, "session.inbox.list": 1, "session.message.list": 1})
+
+    def test_only_the_last_ten_minutes_are_remembered(self):
+        now = [0.0]
+        v2 = self.client(self.ok, lambda: now[0])
+        v2.session_get("a")
+        now[0] = sb.V2_CALLS_KEEP_SECONDS + 5
+        v2.session_get("b")
+        self.assertEqual(len(v2.calls), 1)
+
+    def test_a_failing_call_is_counted_too(self):
+        v2 = self.client(lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "boom"), lambda: 5.0)
+        with self.assertRaises(sb.V2Error):
+            v2.session_get("x")
+        self.assertEqual(v2.calls_by_operation(60.0, 5.0), {"session.get": 1})
+
+    def test_the_daemon_leaves_the_figures_and_status_prints_one_line(self):
+        world = World(self, agents=("platform",))
+        world.engine.v2 = self.client(self.ok, world.clock.now)
+        for op in ("session.get",) * 3 + ("session.message.list",):
+            world.engine.v2._call(op, {"sessionID": "s"})
+        sb.record_v2_calls(world.engine)
+        body = json.loads((world.state / sb.V2_CALLS_FILE).read_text())
+        self.assertEqual(body["last_minute"], {"session.get": 3, "session.message.list": 1})
+        line = sb.v2_calls_status(world.state, world.clock.now())
+        self.assertEqual(line, "4/min (session.get 3, session.message.list 1; 5-min average 1/min)")
+        world.tick(300)
+        self.assertIn("the daemon is not passing", sb.v2_calls_status(world.state, world.clock.now()))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        (self.state_dir / sb.V2_CALLS_FILE).write_text(json.dumps({"at": sb.iso(time.time()), "last_minute": {"session.get": 2}, "avg_5min": {"session.get": 1.0}}))
+        text = sb.format_status(sb.collect_status(world.route, time.time))
+        self.assertRegex(text, r"(?m)^      v2 calls   2/min \(session.get 2; 5-min average 1/min\)$")
+
+    def test_no_record_no_line_and_a_fake_client_leaves_no_file(self):
+        self.assertIsNone(sb.v2_calls_status(self.state_dir, time.time()))
+        world = World(self, agents=())
+        world.engine.v2 = types.SimpleNamespace()   # a client that keeps no record
+        sb.record_v2_calls(world.engine)
+        self.assertFalse((world.state / sb.V2_CALLS_FILE).exists(), "a client that keeps no record writes nothing")
+
+    def test_under_test_the_real_runner_is_refused_and_a_fake_is_not(self):
+        self.assertEqual(os.environ.get(sb.UNDER_TEST_ENV), "1")
+        real = sb.V2Client("/opt/lab/bin/opencode", {}, subprocess.run, 5)
+        with self.assertRaises(sb.V2Error) as caught:
+            real.session_get("ses_example1")
+        self.assertEqual(caught.exception.reason, "refused")
+        self.assertEqual(self.client(self.ok, time.time).session_get("x"), [])
+        self.assertEqual(sb.agents_found(subprocess.run, "/opt/lab/bin/opencode", 5)[0], "down")
+        with mock.patch.dict(os.environ, {sb.ALLOW_REAL_V2_ENV: "1"}):
+            with self.assertRaises(sb.V2Error) as caught:
+                real.session_get("ses_example1")
+            self.assertNotEqual(caught.exception.reason, "refused", "allowed: it tries (and the fake binary does not exist)")
+
+    def test_outside_the_suite_the_real_runner_is_not_refused(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV, None)
+            sb.refuse_real_opencode_under_test(subprocess.run, "opencode")
 
 
 class TestAgentsVerify(unittest.TestCase):
