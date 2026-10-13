@@ -212,7 +212,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -37595,6 +37595,275 @@ class TestV2ReadVolume(Base):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
 
+
+class TestV2Light(Base):
+    """v2_light (the owner's hotfix switch): every optional read of session history is OFF; a send is still delivered, once; the daemon
+    still finds its agents. A 20-agent idle fleet costs a handful of calls a minute."""
+
+    AGENTS = tuple("agent%d" % n for n in range(20))
+    HISTORY = ("session.message.list", "session.inbox.list")
+
+    def world(self, agents=None, **config):
+        config.setdefault("v2_cache_seconds", 900)
+        config.setdefault("v2_light", True)
+        return World(self, agents=agents or self.AGENTS, config=config)
+
+    @staticmethod
+    def ops(world, since=0):
+        return dict(collections.Counter(c[2] for c in world.v2.calls[since:] if len(c) > 2 and c[1] == "api"))
+
+    def test_the_default_is_off_and_it_must_be_a_boolean(self):
+        self.assertIs(sb.DEFAULTS["v2_light"], False)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "v2_light": "yes"})
+
+    def test_an_idle_fleet_of_twenty_makes_at_most_ten_calls_a_minute_and_reads_no_history(self):
+        world = self.world()
+        for _ in range(2):   # the first passes find the agents
+            world.engine.run_pass()
+            world.tick(30)
+        mark = len(world.v2.calls)
+        for _ in range(20):   # ten minutes at a 30 s poll
+            world.engine.run_pass()
+            world.tick(30)
+        found = self.ops(world, mark)
+        print("v2_light idle: %d calls in 10 minutes: %s" % (sum(found.values()), found))
+        self.assertLessEqual(sum(found.values()), 100, found)
+        for op in self.HISTORY:
+            self.assertEqual(self.ops(world).get(op, 0), 0, "%s is a history read: %s" % (op, self.ops(world)))
+
+    def test_without_the_switch_the_same_fleet_reads_history(self):
+        world = self.world(v2_light=False, v2_cache_seconds=0)
+        for _ in range(4):
+            world.engine.run_pass()
+            world.tick(30)
+        self.assertGreater(sum(self.ops(world).get(op, 0) for op in self.HISTORY), 20, self.ops(world))
+
+    def test_a_send_is_delivered_once_and_a_restart_does_not_deliver_it_again(self):
+        world = self.world(agents=("platform", "coder"))
+        world.fact("platform", "lab.fact:1", "First")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        self.assertEqual(self.ops(world).get("session.inbox.list", 0), 0, self.ops(world))
+        self.assertLessEqual(self.ops(world).get("session.message.list", 0), 2, "the engagement gate's read before the write, nothing else")
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "delivered on the send's own success: not sent again")
+        mode = (world.state / sb.SENT_KEYS_FILE).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "the ledger survives a restart")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_a_person_typing_still_holds_the_wake_back_as_a_note_with_the_switch_on(self):
+        world = self.world(agents=("platform", "coder"))
+        world.you("platform")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        (admitted,) = world.admissions("platform")
+        self.assertEqual((admitted["resume"], admitted["delivery"]), (False, "steer"), "a note for an engaged person, not a wake")
+        self.assertTrue(any(len(c) > 2 and c[2] == "session.message.list" for c in world.v2.calls[mark:]), "the read just before the write is made")
+        mark = len(world.v2.calls)
+        world.tick(5)
+        world.engine.run_pass()
+        self.assertEqual(self.ops(world, mark).get("session.message.list", 0), 0, "and only then: nothing pending, no read")
+
+    def test_two_writers_do_not_lose_each_others_keys(self):
+        world = self.world(agents=("platform",))
+        first, second = sb.SentLedger(world.state), sb.SentLedger(world.state)
+        first.confirm("ses_example", ["k1"], 1.0)
+        second.confirm("ses_example", ["k2"], 2.0)   # the second never saw k1 in memory
+        first.confirm("ses_example", ["k3"], 3.0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).keys["ses_example"]), ["k1", "k2", "k3"])
+        self.assertEqual(sorted(second.known("ses_example", 0)), ["k1", "k2", "k3"], "a read sees what another process wrote")
+
+    def test_a_crash_between_the_write_and_the_record_is_at_most_once_and_says_so(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.addCleanup(os.environ.__setitem__, sb.FAULT_ENV, "")
+        os.environ[sb.FAULT_ENV] = "crash-after-send"
+        with self.assertRaises(sb.SimulatedCrash):
+            world.engine.run_pass()
+        os.environ[sb.FAULT_ENV] = ""
+        ledger = sb.SentLedger(world.state)
+        self.assertEqual(ledger.unknown_count(), 1)
+        world.engine = world.new_engine()   # a restart
+        world.tick(5)
+        self.assertEqual(world.engine.run_pass()["sent"], [], "unknown fate counts as delivered: never blindly re-sent")
+        self.assertEqual(len(world.admissions("platform")), 1)
+
+    def test_the_ledger_is_bounded(self):
+        world = self.world(agents=("platform",))
+        ledger = world.engine.sent
+        for n in range(sb.SENT_PER_SESSION + 50):
+            ledger.reserve("ses_example", ["k%d" % n], float(n))
+            ledger.confirm("ses_example", ["k%d" % n], float(n))
+        self.assertEqual(len(ledger.keys["ses_example"]), sb.SENT_PER_SESSION)
+        self.assertIn("k%d" % (sb.SENT_PER_SESSION + 49), ledger.keys["ses_example"])
+        for n in range(sb.SENT_SESSIONS + 20):
+            ledger.confirm("ses_%d" % n, ["k"], float(1000 + n))
+        self.assertEqual(len(ledger.keys), sb.SENT_SESSIONS)
+
+    def test_a_missing_ledger_is_empty_but_a_corrupt_one_stops_the_sends_and_is_not_overwritten(self):
+        world = self.world(agents=("platform",))
+        self.assertEqual(sb.SentLedger(world.state).keys, {})
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text('{"sessions": {"ses_example": {"k": "not a time"}}}')
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        path.write_text("not json")
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(path.read_text(), "not json", "the evidence is kept")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [], "nothing is sent on a ledger that cannot be trusted")
+        self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_ledger_that_cannot_be_written_refuses_the_send(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        (world.state / (sb.SENT_KEYS_FILE + ".lock")).mkdir()   # a directory where the lock file goes: it cannot be opened
+        report = world.engine.run_pass()
+        self.assertEqual(report["sent"], [])
+        self.assertEqual(len(world.admissions("platform")), 0, "no ledger, no write")
+        self.assertTrue(report["errors"])
+
+    def refuse_with(self, world, error):
+        def refuse(params, body):
+            raise error
+        real = world.v2.op_session_synthetic
+        world.v2.op_session_synthetic = refuse
+        return real
+
+    def test_a_definite_refusal_is_released_and_goes_next_pass(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        real = self.refuse_with(world, FakeHTTP(400, "BadRequest", "no"))
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released: not left unknown")
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), [])
+        world.v2.op_session_synthetic = real
+        world.tick(5)
+        self.assertEqual([s["keys"] for s in world.engine.run_pass()["sent"]], [["lab.fact:1"]])
+
+    def test_an_oversized_or_unreadable_ledger_stops_the_sends_and_is_kept(self):
+        world = self.world(agents=("platform",))
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text(" " * (sb.SENT_FILE_MAX + 1))
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(len(path.read_text()), sb.SENT_FILE_MAX + 1, "kept as it was")
+        path.unlink()
+        path.mkdir()   # a directory where the file goes: not missing, not readable
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+
+    def test_a_call_that_never_ran_is_released_and_unknown_reservations_are_never_trimmed(self):
+        for error in (sb.V2Error("unavailable", None, "cannot run"), sb.V2Error("refused", None, "no")):
+            with self.subTest(reason=error.reason):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released")
+        ledger = sb.SentLedger(world.state)
+        ledger.reserve("ses_example", ["old"], 1.0)
+        for n in range(sb.SENT_PER_SESSION + 20):
+            ledger.confirm("ses_example", ["k%d" % n], float(10 + n))
+        self.assertIn("old", ledger.known("ses_example", 0), "an unknown-fate reservation outlives the trim")
+
+    def test_a_timeout_or_unreadable_reply_keeps_the_reservation_and_is_not_sent_again(self):
+        for error in (sb.V2Error("timeout", None, "no answer"), sb.V2Error("bad_json", None, "garbage"), sb.V2Error("http", 500, "boom"),
+                      sb.V2Error("http", 504, "gateway"), sb.V2Error("http", 408, "slow")):
+            with self.subTest(reason=error.reason, status=error.status):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                real = self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 1, "fate unknown: reserved")
+                world.v2.op_session_synthetic = real
+                world.tick(5)
+                self.assertEqual(world.engine.run_pass()["sent"], [], "counts as delivered: at most once")
+                self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_409_is_delivered(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.refuse_with(world, FakeHTTP(409, "Conflict", "exists"))
+        report = world.engine.run_pass()
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1"]])
+        self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0)
+        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), ["lab.fact:1"])
+
+    def test_concurrent_writers_lose_nothing(self):
+        world = self.world(agents=("platform",))
+        barrier = threading.Barrier(4)
+
+        def write(n):
+            ledger = sb.SentLedger(world.state)
+            barrier.wait()
+            for i in range(15):
+                ledger.confirm("ses_example", ["w%d-%d" % (n, i)], float(n * 100 + i))
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(sb.SentLedger(world.state).keys["ses_example"]), 60)
+
+    def test_status_says_what_is_off_and_how_many_sends_are_of_unknown_fate(self):
+        world = self.world(agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_light": True})
+        sb.SentLedger(world.state).reserve("ses_example", ["k1"], 1.0)
+        report = sb.collect_status(world.route, world.clock.now)
+        self.assertIn("ON (features off:", report["v2_light"])
+        self.assertIn("compactions", report["v2_light"])
+        self.assertIn("1 send(s) of unknown fate", report["v2_light"])
+        self.assertIn("v2_light", sb.format_status(report))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertNotIn("v2_light", sb.collect_status(world.route, world.clock.now))
+
+    def test_status_on_a_corrupt_ledger_says_so_and_exits_zero(self):
+        world = self.world(agents=("platform",))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_light": True})
+        (world.state / sb.SENT_KEYS_FILE).write_text("not json")
+        report = sb.collect_status(world.route, world.clock.now)
+        self.assertIn("sent-keys ledger: UNREADABLE (sends stopped: fail closed)", report["v2_light"])
+        self.assertIn("UNREADABLE", sb.format_status(report))
+        with captured() as (out, err):
+            code = sb.main(["status"], runner=world.route, now=world.clock.now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("sent-keys ledger: UNREADABLE (sends stopped: fail closed)", out.getvalue())
+
+    def test_each_optional_read_is_off_and_answers_what_it_did_not_see(self):
+        world = self.world(agents=("platform",))
+        engine, sid = world.engine, world.sessions["platform"]
+        world.you("platform", "hello")
+        mark = list(world.v2.calls)
+        self.assertTrue(sb.brief_in_transcript(engine, sid), "no scan: taken to hold the brief, never sent twice")
+        self.assertEqual(engine.reads.compaction_page(sid, 5, world.clock.now()), [])
+        self.assertEqual(engine.reads.human_prompts_newest(sid), [])
+        self.assertEqual(sb.inbox_human_prompts(engine, sid), [])
+        self.assertEqual(sb.transcript_lines(engine, sid, 0), [])
+        self.assertEqual(sb.synthetic_lines(engine, sid, 0, waiting=True), [])
+        self.assertEqual(engine.reads.inbox(sid, world.clock.now()), [])
+        self.assertEqual(world.v2.calls, mark, "none of them made a call")
+        self.assertTrue(engine.reads.human_prompts_newest(sid, fresh=True), "the read before a write is still made")
 
 class TestDeliverWithTheMemoryOn(TestDeliver):
     """The delivery tests again, with the daemon's memory of its v2 reads ON (default 120 s): the decisions are the same."""
