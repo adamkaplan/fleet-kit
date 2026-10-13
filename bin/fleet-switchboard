@@ -15725,7 +15725,7 @@ def pr_state_from_lists(state, repos):
             ref = "%s#%d" % (key, number)
             seen.add(ref)
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
-            labels = sorted(_plain(l.get("name") if isinstance(l, dict) else l, 60) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20])   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
+            labels = sorted(_plain(name, 60) for name in ((l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20]) if isinstance(name, str) and name)   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
             entry = {"state": "draft" if record.get("draft") else "open", "head": head, "labels": labels, "at": at, "listed_at": at}
             if old.get("head") == head and old.get("checks") is not None:   # what the examination found at this very head stays until it is examined again
@@ -15799,26 +15799,44 @@ def pr_state_read(state_dir, now):
         return None, "the snapshot cannot be read"
 
 
+def _text(value, limit):
+    """`value` as plain bounded text when it is a string, else None."""
+    return _plain(value, limit) if isinstance(value, str) else None
+
+
 def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None):
-    """The answer for `ref` (`owner/repo#N`) as a dict, from the snapshot and the local ledger only."""
-    entry = (body or {}).get("prs", {}).get(ref)
+    """The answer for `ref` (`owner/repo#N`) as a dict, from the snapshot and the local ledger only. Every string in it is plain bounded text and
+    every field is shape-checked: the snapshot is a same-user file, not a boundary, and a malformed entry is `unknown`, never a traceback."""
+    entry = (body or {}).get("prs", {}).get(ref) if isinstance((body or {}).get("prs"), dict) else None
+    unknown = {"pr": ref, "known": False, "why": "not watched, or not cached by the daemon yet"}
     if entry is None:
-        return {"pr": ref, "known": False, "why": "not watched, or not cached by the daemon yet"}
-    head = entry.get("head")
+        return unknown
+    if not isinstance(entry, dict) or not isinstance(entry.get("at", 0), (int, float)) or isinstance(entry.get("at", 0), bool):
+        return dict(unknown, why="the snapshot's entry for it is malformed")
+    head, examined = _text(entry.get("head"), 40), _text(entry.get("examined_head"), 40)
     reviews = [] if not ledger_problem else None   # None: not known (the ledger could not be read), which is not "none recorded"
     if head and reviews is not None:
         for reviewer in plan_ledger.REVIEWERS_NOW:
-            found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == head and e.get("reviewer") == reviewer]
+            found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == entry.get("head") and e.get("reviewer") == reviewer]
             if found:
-                reviews.append({"reviewer": reviewer, "verdict": found[-1].get("verdict"), "head": head})
-    examined = entry.get("examined_head")
+                reviews.append({"reviewer": reviewer, "verdict": _text(found[-1].get("verdict"), 20), "head": head})
     stale_head = bool(examined and head and examined != head)   # what was examined belongs to another head: it is not shown as this head's
-    view = {"pr": ref, "known": True, "state": entry.get("state"), "head": head, "mergeable": None if stale_head else entry.get("mergeable"),
-            "ci": None if stale_head else entry.get("ci"), "checks": None if stale_head else entry.get("checks"),
-            "examined_head": examined, "labels": entry.get("labels") or [], "gates": None if stale_head else entry.get("gates"), "reviews": reviews, "reviews_problem": ledger_problem,
-            "age_seconds": max(0, int(now - entry.get("at", now))), "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
-    if entry.get("why"):
-        view["why"] = entry["why"]
+    checks = None
+    if isinstance(entry.get("checks"), list) and not stale_head:
+        checks = [{"name": _text(c.get("name"), 60) or "?", "conclusion": _text(c.get("conclusion"), 30) or "?"} for c in entry["checks"][:30] if isinstance(c, dict)]
+    gates = entry.get("gates") if isinstance(entry.get("gates"), dict) and not stale_head else None
+    if gates is not None:
+        gates = {"ready": gates.get("ready") is True, "missing": [_plain(m, 160) for m in (gates.get("missing") if isinstance(gates.get("missing"), list) else [])[:12] if isinstance(m, str)]}
+        if isinstance(entry["gates"].get("error"), str):
+            gates = {"error": _plain(entry["gates"]["error"], 120)}
+    at = entry.get("at", now)
+    view = {"pr": ref, "known": True, "state": _text(entry.get("state"), 20), "head": head, "mergeable": None if stale_head else _text(entry.get("mergeable"), 20),
+            "ci": None if stale_head else _text(entry.get("ci"), 20), "checks": checks, "examined_head": examined,
+            "labels": [_plain(l, 60) for l in (entry.get("labels") if isinstance(entry.get("labels"), list) else [])[:20] if isinstance(l, str) and l.strip()],
+            "gates": gates, "reviews": reviews, "reviews_problem": _text(ledger_problem, 100) if ledger_problem else None,
+            "age_seconds": max(0, int(now - at)), "snapshot_age_seconds": max(0, int(now - body["written_at"]))}
+    if isinstance(entry.get("why"), str):
+        view["why"] = _plain(entry["why"], 100)
     return view
 
 
