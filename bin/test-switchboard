@@ -20944,6 +20944,14 @@ class TestPlanCheckRules(unittest.TestCase):
                     self.assertIn(phrase, text.lower())
                 self.assertRegex(text, r"never (?:prefers|human-days)")
 
+    def test_the_opt_in_line_is_bounded_read_with_bold_keys_and_applies_from_format_2_up(self):
+        self.assertIn("missing-size", self.codes("plan-format: 3\n" + GOOD_PLAN))
+        self.assertEqual(self.codes("plan-format: 2\n**size:** S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("**plan-format:** 2\nsize: S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: " + "9" * 5000 + "\n" + GOOD_PLAN), [], "a huge number is not read, and does not crash the checker")
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: S, 1 week\n" + GOOD_PLAN))
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: M, 2 wk\n" + GOOD_PLAN))
+
     def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
         for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
                           ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):

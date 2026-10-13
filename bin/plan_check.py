@@ -37,8 +37,8 @@ HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+.*plan\s*\(scenarios\)", re.IGNORECAS
 FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 # Size (the owner's rule): a plan states its SIZE as a T-shirt in AGENT time, never in human-days. Checked only for a plan that opts in with a
 # `plan-format: 2` line, so a plan written before the rule does not turn red; a plan that opts in must carry a `size:` line.
-PLAN_FORMAT_RE = re.compile(r"^[\s#>*-]*plan-format:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE)
-SIZE_RE = re.compile(r"^[\s#>*-]*size:\s*(\S.*)$", re.IGNORECASE | re.MULTILINE)
+PLAN_FORMAT_RE = re.compile(r"^[ \t#>*-]*plan-format:\*{0,2}[ \t]*([0-9]{1,4})[ \t]*$", re.IGNORECASE | re.MULTILINE)
+SIZE_RE = re.compile(r"^[ \t#>*-]*size:\*{0,2}[ \t]*(\S.*)$", re.IGNORECASE | re.MULTILINE)
 SIZE_WORD_RE = re.compile(r"^(S|M|L|XL)\b", re.IGNORECASE)
 SIZE_DAYS_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+)?\s*(?:days?|d|weeks?|wk)\b|\b(?:a|one|two|three|several|few)\s+(?:days?|weeks?)\b", re.IGNORECASE)
 SIZE_HUMAN_RE = re.compile(r"\b(?:human|person|man|engineer)[- ](?:days?|weeks?|hours?)\b", re.IGNORECASE)
