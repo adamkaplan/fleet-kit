@@ -9452,8 +9452,10 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 last_allow = max(i for i, e in enumerate(effects) if e == "allow")
                 self.assertNotIn("allow", effects[effects.index("deny"):] if "deny" in effects else [])
                 self.assertEqual(effects[last_allow + 1:], ["deny"] * (len(effects) - last_allow - 1))
-                for guard in ("timeout * fleet-switchboard gates *enforce*", "timeout * fleet-switchboard gates on*", "timeout * fleet-switchboard waive *G6*"):
-                    self.assertIn(guard, [r["resource"] for r in rules])
+                resources = [r["resource"] for r in rules]
+                for guard in ("fleet-switchboard gates *enforce*", "fleet-switchboard gates on*", "fleet-switchboard waive *G6*"):
+                    # the timeout form is its own line, or one `*`-led line covers the bare and the timeout forms (the Chief of Staff's)
+                    self.assertTrue("timeout * " + guard in resources or "*" + guard in resources, guard)
 
     def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
         for path in self.PATHS:
@@ -9490,7 +9492,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
 
     def test_the_job_runs_and_what_is_outside_it_is_denied(self):
         _, rules = self.rules()
-        for command in ("fleet-switchboard decisions list --tier all", "timeout 90 fleet-switchboard decisions list --tier all", "sleep 20",
+        for command in ("fleet-switchboard decisions list --tier all", "sleep 20",
                         "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
                         "gh pr merge 5 --squash", "gh issue close 5", "gh pr comment 5 --body ok", "az webapp show -n a -g g", "az group list",
                         "fleet-switchboard handoff --issue 5 --brief-file -", "fleet-switchboard launch v --agent orchestrator",
@@ -9510,8 +9512,32 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
                         "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
-                        "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
+                        "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x",
+                        "timeout 90 fleet-switchboard decisions list --tier all", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    READ_ONLY_ADDED = ("fleet-switchboard review measure --since 7", "fleet-switchboard review laws acme/api#5", "fleet-switchboard impact floor acme/api#5 --json",
+                       "fleet-switchboard impact hold --dry-run", "fleet-switchboard pr-explain acme/api#5 --check", "fleet-switchboard agents verify")
+
+    def test_the_review_and_impact_reads_are_allowed_and_each_is_read_only_and_the_writes_next_to_them_are_not(self):
+        """The cos list gains six read-only lines: review measure, review laws, impact floor, impact hold --dry-run, pr-explain and agents verify
+        (`gates *`, `plan *` and `status *` were already there). Each prints and writes nothing. The write subcommands of the same words stay denied."""
+        _, rules = self.rules()
+        for command in self.READ_ONLY_ADDED:
+            self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+        # no blanket `timeout ? fleet-switchboard *` any more: a write behind a timeout prefix is denied, like the bare one (the Chief of Staff needs no prefix)
+        for command in ("timeout 30 fleet-switchboard review record acme/api#5 --reviewer code --block f", "timeout 30 fleet-switchboard impact clear acme/api#5 --reason x",
+                        "timeout 30 fleet-switchboard verdict --all --pr acme/api#5", "timeout 5 fleet-switchboard send x y", "timeout 30 fleet-switchboard review laws acme/api#5"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+        for command in ("fleet-switchboard verdict --all --pr acme/api#5", "fleet-switchboard review record acme/api#5 --reviewer code --block f"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard review record acme/api#5 --reviewer code --block f"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard impact clear acme/api#5 --reason x"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard impact hold"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard agents install"), "deny")
+        for gate in ("fleet-switchboard gates mode acme/app enforce", "timeout 30 fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                     "timeout 5 fleet-switchboard waive acme/app#5 --gates G8 --reason x", "timeout 5 fleet-switchboard decisions batch --title x"):
+            self.assertEqual(self.evaluate(rules, "shell", gate), "deny", gate)   # the collapsed denies still catch both the bare and the timeout forms
 
     def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
         _, rules = self.parse(self.PATHS[1])
@@ -15727,6 +15753,7 @@ class FakeSweepHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.reads, self.single = {}, [], set(), [], []
+        self.closed_records = {}   # the closed or merged items the closed-state list read returns
         self.caps, self.fresh, self.live = [], [], {}   # live: a fresher copy of an item than `open` shows
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
@@ -15738,13 +15765,15 @@ class FakeSweepHub:
             return [c for c in self.comments if c["issue_url"].endswith("/%d" % number)][::-1], False
         if "/issues/comments" in path:
             return list(self.comments), False
+        if "state=closed" in path:
+            return list(self.closed_records.values()), False
         return list(self.open.values()), False
 
     def _read_one(self, repo, path, now, fresh=False):
         self.single.append((repo, path))
         self.fresh.append(fresh)
         number = int(path.rsplit("/", 1)[1])
-        data = dict(self.live.get(number, self.open.get(number, {})))
+        data = dict(self.live.get(number, self.open.get(number, self.closed_records.get(number, {}))))
         data["number"] = number
         data["state"] = "closed" if number in self.closed else "open"
         return data
@@ -16237,7 +16266,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap == sb.SWEEP_LIST_PAGES for cap in self.hub.caps))
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -17469,6 +17498,28 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        self.hub.closed_records = {
+            70: sweep_issue(70, "x", [captain, hold], pr=True),   # merged, still held: the finding
+            71: sweep_issue(71, "x", [], pr=True),                # merged, clean: nothing
+            72: sweep_issue(72, "x", [captain], pr=False),        # a closed ISSUE with the word: not a PR
+            73: sweep_issue(73, "x", [hold], pr=True)}            # closed, a hold label alone: a finding
+        self.hub.closed = {70, 71, 72, 73}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [("S9", "acme/api#70"), ("S9", "acme/api#73")])
+        self.assertIn("S9", sb.SWEEP_KINDS)
+
+    def test_s9_is_dropped_when_a_fresh_read_shows_the_label_gone(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        self.hub.closed_records = {70: sweep_issue(70, "x", [captain], pr=True)}
+        self.hub.closed = {70}
+        self.hub.live = {70: sweep_issue(70, "x", [], pr=True)}
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
     def test_s6a_a_pr_opened_within_15_minutes_gets_the_label_first(self):
         fresh, early, later = (sb.iso(self.world.clock.now() - m * 60) for m in (4, 20, 120))
@@ -30797,6 +30848,47 @@ def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, auth
         "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
     fields.update(more)
     return pr_view_json(state=state, **fields)
+
+
+class TestAPrLeavesTheListWhenItIsNotOpen(DecisionsBase):
+    """A row is derived from OPEN state: a merged or closed PR leaves at once whatever labels it carries, and a PR that was last seen open
+    and cannot be confirmed any more is not listed (its notice stays, so it returns when it can be read)."""
+
+    LABELS = [{"name": "osuser:merge-captain"}, {"name": "osuser:hold-impact"}]
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.world.engine.gh_runner = self.gh
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "platform", "", self.world.clock.now())
+
+    def rows(self):
+        return [d for d in self.listed() if d.get("number") == 7]
+
+    def test_a_merged_pr_that_still_carries_merge_captain_and_hold_impact_is_not_in_the_list(self):
+        (row,) = self.rows()
+        self.assertEqual((row["kind"], row["holds"]), ("captain", ["impact"]))
+        self.gh.answers[7] = (0, captain_pr(state="MERGED", labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(self.rows(), [], "gone in the same pass the merge is seen, labels or not")
+
+    def test_a_closed_pr_with_the_labels_is_not_listed_either(self):
+        self.gh.answers[7] = (0, captain_pr(state="CLOSED", labels=self.LABELS), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_pr_last_seen_open_that_cannot_be_confirmed_for_five_minutes_is_not_listed_and_returns(self):
+        self.assertEqual(len(self.rows()), 1)
+        self.gh.answers[7] = (1, "", "HTTP 502: Bad Gateway")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        (row,) = self.rows()
+        self.assertTrue(row["stale"], "inside the window it stays, marked stale")
+        self.world.tick(sb.PR_OPEN_CONFIRM_SECONDS)
+        self.assertEqual(self.rows(), [], "past it the row is withdrawn: nobody is shown a PR nothing can say is open")
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1, "the notice itself is kept")
+        self.gh.answers[7] = (0, captain_pr(labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(len(self.rows()), 1, "readable again: back")
 
 
 class TestCaptainPrs(DecisionsBase):

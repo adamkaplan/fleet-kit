@@ -4421,7 +4421,9 @@ The line is a comma list of `owner/repo#N` refs; a bare `#N` means the issue's o
 
 `fleet-switchboard decisions` and the panel draw a blocked item indented under what it waits for, with `[waits for <id>]`, and mark `[next]`; a cycle is drawn among the roots, marked `[cycle]`, and is never `next`. The panel shows the same notes (`next`, `cycle`, `waits for <id>`) and indents by depth within a repo's group; a decision that waits for one in another repo shows its depth and the id in its own group.
 
-**The sweep** (shadow, read-only: it writes nothing to GitHub, like the other kinds) adds two findings: **S7**, decisions that wait for each other (one finding per cycle, named by its first member), and **S8**, a decision that waits for an issue in a watched repo that is not an open decision and that a fresh read shows closed or missing.
+**The sweep** (shadow, read-only: it writes nothing to GitHub, like the other kinds) adds two findings: **S7**, decisions that wait for each other (one finding per cycle, named by its first member), and **S8**, a decision that waits for an issue in a watched repo that is not an open decision and that a fresh read shows closed or missing. A third, **S9**, flags a `merge-captain` or `hold-*` label left on a merged or closed PR (one bounded read of the repo's most recent closed items per refresh; shadow: nothing is removed).
+
+A PR row is derived from OPEN state. A merged or closed PR leaves the list in the pass that sees it, whatever labels it carries. A PR last seen open that cannot be confirmed any more (its `gh pr view` fails) for 5 minutes is not listed either; its notice is kept, so it returns when it can be read again.
 
 ### The daemon's reads of v2 (calls, memory and budget)
 
