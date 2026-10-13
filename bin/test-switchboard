@@ -4197,6 +4197,58 @@ class TestLaunch(Base):
             code = sb.main(["reattach", "--all-detached"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertEqual((code, out.getvalue().strip()), (0, "no agent is detached or dead"))
 
+    def test_all_detached_walks_a_non_empty_list_says_each_failure_and_continues_and_the_account_warning_reaches_the_command(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.add_agent("ops", fleet={"role": "coder", "repo": "acme-ops/service"})
+        for name in ("platform", "ops"):
+            self.world.v2.sessions[self.world.sessions[name]]["directory"] = str(self.work)
+        self.detach("platform")
+        self.detach("ops")
+        sb.write_pane_health(self.world.state, {"agents": {}, "missing": {}, "states": {
+            "platform": {"state": "detached", "pane": self.world.panes["platform"], "session": self.world.sessions["platform"]},
+            "ops": {"state": "detached", "pane": self.world.panes["ops"], "session": self.world.sessions["ops"]},
+            "ghost": {"state": "dead", "pane": "w1:p99", "session": "ses_gone"}}})
+        base = self.world.route
+
+        def wrong_login(argv, **kw):
+            if argv[0] == "gh":
+                return subprocess.CompletedProcess(argv, 0, "default-work\n", "")
+            return base(argv, **kw)
+        with captured() as (out, err):
+            code = sb.main(["reattach", "--all-detached"], runner=wrong_login, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 1)                                           # one failed (the ghost), so the exit says so
+        self.assertIn("ghost", err.getvalue())
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.reattached"]), 2, "the two repairable agents were both done")
+        self.assertEqual(len(self.world.herdr.closed), 2)
+
+    def test_replace_still_refuses_a_tab_with_a_second_pane(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        pane = self.world.panes["platform"]
+        self.world.v2.sessions[self.world.sessions["platform"]]["directory"] = str(self.work)
+        self.world.herdr.extra_panes = {self.world.herdr.tab_of(pane): ["a person's shell"]}
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("holds 2 panes", err.getvalue())
+        self.assertEqual(self.world.herdr.closed, [])
+        self.world.herdr.extra_panes = {}
+
+    def test_verify_account_failure_paths_say_a_fixed_line(self):
+        engine = self.engine
+        engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},
+                                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", ""), lambda: 1.0, {"PATH": "/bin"})
+        fleet = {"repo": "acme-ops/service"}
+        self.assertIn("could not be verified", sb.verify_account(engine, lambda a, **k: subprocess.CompletedProcess(a, 1, "", "x"), fleet))
+        self.assertIn("could not be verified", sb.verify_account(engine, lambda a, **k: subprocess.CompletedProcess(a, 0, "\n", ""), fleet))
+        def boom(a, **k):
+            raise OSError("secret-token-text")
+        line = sb.verify_account(engine, boom, fleet)
+        self.assertIn("could not be verified", line)
+        self.assertNotIn("secret", line)
+        self.assertIsNone(sb.verify_account(engine, boom, {"repo": "acme/unmapped"}))
+
     def test_the_account_is_verified_after_a_reattach_and_a_mismatch_is_said(self):
         engine = self.engine
         engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-ops/service": "acct-ops"}},

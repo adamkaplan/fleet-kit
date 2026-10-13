@@ -4359,10 +4359,6 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
                           % (session_id, fleet.get("name"), name))
     if not directory or not os.path.isabs(directory):
         raise LaunchError("session %s has no working directory to open the tab in" % session_id)
-    taken = engine.discover(engine.now()).agents.get(name)
-    released = []
-    if taken is not None:
-        released = release_stale_binding(engine, name, taken, session_id, replace=replace)   # refuses (LaunchError) a pane that is really running it
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     # Everything about who the agent is comes from the session's STORED fleet metadata, never from the caller: a reattached agent keeps its
     # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
@@ -4371,9 +4367,13 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:
-            env.update(accounts.token_env(fleet["repo"]))   # the repo's own account, as launch gives it
+            env.update(accounts.token_env(fleet["repo"]))   # fetched BEFORE anything is closed: a failed lookup must not leave the agent with no pane
         except AccountError as err:
             raise LaunchError(str(err)) from None
+    taken = engine.discover(engine.now()).agents.get(name)
+    released = []
+    if taken is not None:
+        released = release_stale_binding(engine, name, taken, session_id, replace=replace)   # refuses (LaunchError) a pane that is really running it
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
@@ -4713,7 +4713,7 @@ def verify_account(engine, runner, fleet):
         got = runner([engine.config["gh"], "api", "user", "--jq", ".login"], capture_output=True, text=True,
                      timeout=engine.config["call_timeout_seconds"], **({"env": env} if env is not None else {}))
     except Exception as err:
-        return "the gh account could not be verified: %s" % _one_line(str(err), 80)
+        return "the gh account for %s could not be verified (the lookup failed)" % repo
     login = (got.stdout or "").strip()
     if got.returncode != 0 or not login:
         return "the gh account for %s could not be verified (gh api user failed)" % repo
