@@ -4372,3 +4372,21 @@ A key in `config.json` that this tool does not read (at the top level or inside 
 ### `job`: long runs that say how they ended
 
 `fleet-switchboard job start <name> -- <command...>` runs a command detached (its own session, output to a log) and records it under `$FLEET_JOBS_DIR`, by default `fleet-jobs` in the shared temp dir; a wrapper writes the exit code to a file when the command ends. `job status <name>` prints one line told apart by evidence: **finished** (the exit file: its code and the result file), **alive** (the recorded process still runs and is the one that was started: the pid's start time is compared, so a reused pid is not mistaken for it) or **dead** (neither: killed, no exit code). It exits 0 for alive or finished with code 0, 1 otherwise. Starting a name that is still alive is refused; a finished or dead one is replaced. A job found dead that nobody has asked about (`job status` on it marks it collected) is reported ONCE to the starter's boss by the daemon (`job.dead:<name>:<started>`, found through the session the job was started from). The quiet-worker nudge and the coder definition and coordination skill tell a worker to use it for anything over a few minutes. The jobs dir is created private (0700, owned by you) and is neither written nor believed otherwise (a shared temp dir is where another user could plant a record); records and the `collected` marker are written whole-or-not-at-all, a start holds a per-name lock, and the daemon believes only a record owned by the daemon's user, with a name matching the pattern, whose session and starter name agree with a discovered agent. The starter is established the way every command does it (its own session, known to v2 as a fleet agent); a job started outside a fleet agent (no such session) is never reported, only status-able.
+
+### The order of decisions (`Waits for:`)
+
+A list oldest-first says what has waited longest, not what to do first. An issue's `## Decision required` section can say what it waits for, with ONE line inside that section (the same line anywhere else is prose):
+
+```
+## Decision required
+Pick the storage engine.
+Waits for: acme/api#2, #3
+```
+
+The line is a comma list of `owner/repo#N` refs; a bare `#N` means the issue's own repo. At most 10 are read, a repeat or an entry that is not a ref is skipped, and nothing is ever refused. The decision entry then carries an optional `waits_for` list (an issue that names nothing has no such field). Only what waits for an OPEN issue decision in the list is ordered: a ref to anything else (a work issue, a closed one) blocks nothing.
+
+**The order.** When at least one decision names what it waits for, the daemon adds optional fields to the issue decisions: `order` (their place), `depth` (0 for what can be done now, 1 under the decision it waits for, and so on; at most 4), `blocked_by` (the id of the first listed decision it waits for) and `mark`: `next` on the **oldest item that can be done now**, `cycle` on decisions that wait for each other. The list itself stays oldest first and no existing field changes; a reader that wants the arrangement sorts by `order`. A list in which nothing names a wait carries none of these fields and is drawn exactly as before.
+
+`fleet-switchboard decisions` and the panel draw a blocked item indented under what it waits for, with `[waits for <id>]`, and mark `[next]`; a cycle is drawn among the roots, marked `[cycle]`, and is never `next`. The panel shows the same notes (`next`, `cycle`, `waits for <id>`) and indents by depth within a repo's group; a decision that waits for one in another repo shows its depth and the id in its own group.
+
+**The sweep** (shadow, read-only: it writes nothing to GitHub, like the other kinds) adds two findings: **S7**, decisions that wait for each other (one finding per cycle, named by its first member), and **S8**, a decision that waits for an issue in a watched repo that is not an open decision and that a fresh read shows closed or missing.

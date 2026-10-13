@@ -15449,6 +15449,41 @@ class TestSweep(Base):
         self.sweep(decisions)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 1)
 
+    def test_s7_decisions_that_wait_for_each_other_are_one_finding_per_cycle(self):
+        one = dict(self.human(1), waits_for=["acme/api#2"])
+        two = dict(self.human(2), waits_for=["acme/api#1"])
+        three = dict(self.human(3), waits_for=["acme/api#1"])   # waits for a cycle member: not in the cycle
+        free = self.human(4)
+        self.sweep([one, two, three, free])
+        self.assertEqual([f for f in self.found() if f[0] == "S7"], [("S7", "acme/api#1")], "1 finding for the 1 cycle, named by its first member")
+
+    def test_s8_a_decision_that_waits_for_a_closed_issue_is_found_and_an_open_one_is_not(self):
+        self.hub.open = {78: sweep_issue(78, updated=self.at())}
+        self.hub.closed = {77}
+        waits = dict(self.human(10), waits_for=["acme/api#77", "acme/api#78", "acme/api#79"])
+        self.sweep([waits])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#77")], "77 is closed; 78 is open; 79 is not listed but a fresh read shows it open")
+        self.assertTrue(all(call[1].startswith("issues/") for call in self.hub.single), "only reads: the sweep writes nothing to GitHub")
+
+    def test_s8_a_target_that_is_not_there_is_found_and_a_truncated_or_unreadable_picture_is_not_judged(self):
+        original = self.hub._read_one
+        def gone(repo, path, now, fresh=False):
+            raise sb.GitHubUnavailable("gh api repos/acme/api/issues/88 failed: gh: Not Found (HTTP 404)")
+        self.hub._read_one = gone
+        self.sweep([dict(self.human(10), waits_for=["acme/api#88"])])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#88")], "missing counts like closed")
+        self.hub._read_one = original
+        state = sb.sweep_state(self.engine)
+        state.repos["acme/api"]["truncated"] = True
+        self.hub.closed = {89}   # it IS closed: only the truncated picture keeps the sweep from saying so
+        with mock.patch.object(sb, "sweep_refresh"):   # keep the picture as set: a refresh would read it afresh
+            self.sweep([dict(self.human(11), waits_for=["acme/api#89"])])
+        self.assertEqual([f for f in self.found() if f == ("S8", "acme/api#89")], [], "a truncated picture cannot say it is absent")
+
+    def test_s8_a_waited_for_issue_in_a_repo_that_is_not_watched_is_not_judged(self):
+        self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
+
     def test_s5_a_cos_decision_older_than_the_limit(self):
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         fresh = dict(self.human(41), tier="cos", since=sb.iso(self.world.clock.now() - 600))
@@ -32335,6 +32370,23 @@ class TestDecisionBaselineSeams(BaselineWorld):
                         [{"id": d["id"], "ask": d["ask"], "repo": d["repo"], "headline": d["headline"]}
                          for d in found["decisions"]])
 
+    def test_an_issue_that_says_what_it_waits_for_is_ordered_in_the_derived_list_and_one_that_does_not_is_untouched(self):
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        mine = "me:awaiting-user"
+        issue = lambda n, body: {"number": n, "title": "issue %d" % n, "state": "open", "labels": [{"name": mine}], "updated_at": "2027-01-15T07:00:00Z", "body": body}
+        hub.note_awaiting_issue(API, issue(30, "## Decision required\nPick one.\nWaits for: #31\n"))
+        hub.note_awaiting_issue(API, issue(31, "## Decision required\nPick one.\n"))
+        decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
+        by = {d["ask"]: d for d in decisions if d["kind"] == "issue"}
+        self.assertEqual(by[30]["waits_for"], ["acme/api#31"])
+        self.assertNotIn("waits_for", by[31])
+        self.assertEqual((by[31]["depth"], by[31]["mark"], by[30]["depth"], by[30]["blocked_by"]), (0, "next", 1, by[31]["id"]))
+        hub.note_awaiting_issue(API, issue(30, "## Decision required\nPick one.\n"))   # the line is edited out
+        hub.note_awaiting_issue(API, issue(31, "## Decision required\nPick one.\n"))
+        decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
+        self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
+
     def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
@@ -36711,6 +36763,169 @@ class TestJobFacts(unittest.TestCase):
         self.assertIn("job start <name> -- <command>", sb.NUDGE_TEXT % ("platform", "fleet-switchboard", "fleet-switchboard", "fleet-switchboard"))
         for rel in ("agents/opencode/coder.md", "skills/fleet-coordination/SKILL.md", "docs/switchboard.md"):
             self.assertIn("job status", (REPO / rel).read_text(), rel)
+
+
+class TestDecisionOrder(unittest.TestCase):
+    """Ask #67: the order of decisions (`Waits for:`), parsed, arranged, and drawn by the CLI. Synthetic names only."""
+
+    def entry(self, ident, number, waits=None, repo="acme/api", since="2027-01-01T00:00:00Z", kind="issue"):
+        found = {"id": ident, "kind": kind, "repo": repo, "ask": number, "agent": "coder", "since": since, "tier": "human", "title": "Item %d" % number,
+                 "headline": "Item %d" % number}
+        if waits:
+            found["waits_for"] = waits
+        return found
+
+    def render(self, decisions):
+        return sb.format_decisions({"stale": False, "decisions": decisions, "errors": []}, sb.parse_iso("2027-01-02T00:00:00Z")).split("\n")
+
+    def test_the_waits_for_line_is_read_only_inside_the_decision_required_section(self):
+        body = ("Waits for: acme/api#9\n## Decision required\nPick one.\nWaits for: acme/api#2, #3, not-a-ref, ACME/Web#7, #3\n"
+                "## Notes\nWaits for: acme/api#4\n")
+        self.assertEqual(sb.decision_core.parse_waits_for(body, "acme/api"), ["acme/api#2", "acme/api#3", "acme/web#7"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nno line\n", "acme/api"), [])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required (re-verified)\r\nWaits for: #5\r\n", "acme/api"), ["acme/api#5"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nWaits for: #5\n", None), [], "a bare number with no repo to mean is skipped")
+        many = "## Decision required\nWaits for: " + ", ".join("#%d" % n for n in range(1, 30))
+        self.assertEqual(len(sb.decision_core.parse_waits_for(many, "acme/api")), sb.decision_core.WAITS_FOR_MAX)
+        self.assertEqual(sb.decision_core.parse_waits_for(None, "acme/api"), [])
+
+    def test_an_entry_carries_waits_for_only_when_the_issue_names_one(self):
+        item = lambda n, waits: {"kind": "issue", "title": "t%d" % n, "ask": n, "agent": None, "since": 100.0, "seed": "issue:acme/api#%d" % n,
+                                 "bare": True, "repo": "acme/api", "tier": "human", "waits_for": waits}
+        entries = sb.decision_core.build_entries([item(1, ["acme/api#2"]), item(2, [])], ["d1", "d2"], "acme/api", lambda repo, number: None)
+        by = {e["ask"]: e for e in entries}
+        self.assertEqual(by[1]["waits_for"], ["acme/api#2"])
+        self.assertNotIn("waits_for", by[2])
+
+    def test_a_blocked_item_is_indented_under_what_it_waits_for_and_the_first_actionable_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2), self.entry("#3", 3, ["acme/api#1"]), self.entry("#4", 4)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#2 +waiting 1d +coder +Item 2  \[next\]$")
+        self.assertRegex(lines[1], r"^   #1 +waiting 1d +coder +Item 1  \[waits for #2\]$")
+        self.assertRegex(lines[2], r"^      #3 +waiting 1d +coder +Item 3  \[waits for #1\]$")
+        self.assertRegex(lines[3], r"^#4 +waiting 1d +coder +Item 4$")
+        self.assertEqual(decisions[1]["mark"], "next")
+        self.assertEqual([d.get("mark") for d in decisions if d["id"] != "#2"], [None, None, None])
+
+    def test_a_cycle_is_drawn_at_the_top_marked_and_never_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#1"]), self.entry("#3", 3)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#1 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[1], r"^#2 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[2], r"^#3 .*\[next\]$", "the first item that CAN be done is next, not a cycle member")
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2"]])
+
+    def test_a_self_wait_and_a_three_cycle_are_cycles_and_the_rest_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#3"]), self.entry("#3", 3, ["acme/api#1"]),
+                     self.entry("#4", 4, ["acme/api#4"]), self.entry("#5", 5, ["acme/api#6"]), self.entry("#6", 6, ["acme/api#5"]), self.entry("#7", 7)]
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2", "acme/api#3"], ["acme/api#4"], ["acme/api#5", "acme/api#6"]])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d.get("mark")) for d in sb.decision_core.arranged(decisions)],
+                         [("#1", "cycle"), ("#2", "cycle"), ("#3", "cycle"), ("#4", "cycle"), ("#5", "cycle"), ("#6", "cycle"), ("#7", "next")])
+
+    def test_a_wait_for_something_that_is_not_an_open_decision_blocks_nothing(self):
+        decisions = [self.entry("#1", 1, ["acme/api#99"]), self.entry("#2", 2)]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d["depth"], d.get("mark")) for d in sb.decision_core.arranged(decisions)], [("#1", 0, "next"), ("#2", 0, None)])
+
+    def test_a_list_in_which_nothing_waits_is_exactly_what_it_was(self):
+        decisions = [self.entry("#2", 2, since="2027-01-01T06:00:00Z"), self.entry("#1", 1)]
+        before = self.render([dict(d) for d in decisions])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(self.render(decisions), before)
+        self.assertTrue(all(set(d) == {"id", "kind", "repo", "ask", "agent", "since", "tier", "title", "headline"} for d in decisions), "no field was added")
+        self.assertNotIn("next", "\n".join(before))
+
+    def test_a_chain_deeper_than_the_cap_stays_at_the_cap_and_is_still_a_chain(self):
+        n = sb.decision_core.ORDER_DEPTH_MAX + 3
+        decisions = [self.entry("#%d" % i, i, ["acme/api#%d" % (i + 1)] if i < n else None) for i in range(1, n + 1)]
+        sb.decision_core.annotate_order(decisions)
+        depths = [d["depth"] for d in sb.decision_core.arranged(decisions)]
+        self.assertEqual(depths, [min(i, sb.decision_core.ORDER_DEPTH_MAX) for i in range(n)])
+        self.assertEqual(max(depths), sb.decision_core.ORDER_DEPTH_MAX)
+
+    def test_the_docs_describe_the_line_the_next_mark_and_the_two_sweep_findings(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text.split("### The order of decisions (`Waits for:`)", 1)[1]
+        for needle in ("Waits for:", "`next`", "`cycle`", "**S7**", "**S8**", "writes nothing to GitHub"):
+            self.assertIn(needle, section)
+
+    def test_a_report_is_never_a_target_so_nothing_waits_under_it(self):
+        decisions = [self.entry("r1", 5, kind="report"), self.entry("#6", 6, ["acme/api#5"])]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(decisions[1]["depth"], 0, "a report is not an issue decision: nothing waits under it")
+        self.assertEqual(decisions[0].get("mark"), None)
+
+
+ORDER_PANEL_HARNESS = r"""
+import * as d from "%(url)s";
+const nowMs = Date.parse("2027-01-02T00:00:00Z");
+const entry = (id, n, more = {}) => ({ id, kind: "issue", repo: "acme/api", ask: n, agent: "coder", since: "2027-01-01T0" + n + ":00:00Z", tier: "human", title: "Item " + n, headline: "Item " + n, ...more });
+const snap = (decisions) => ({ status: "ok", errors: [], decisions, ageMs: 0 });
+const plainList = [entry("#1", 1), entry("#2", 2)];
+const ordered = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 1, depth: 1, blocked_by: "#2" }), entry("#2", 2, { order: 0, depth: 0, mark: "next" }),
+                 entry("#3", 3, { order: 2, depth: 0 })];
+const cyc = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 0, depth: 0, mark: "cycle" }), entry("#2", 2, { waits_for: ["acme/api#1"], order: 1, depth: 0, mark: "cycle" })];
+const text = (list, v3) => d.styledText(d.styledRows(snap(list), nowMs, 34, d.HUMAN_VIEW, { v3, env: {} }), 34);
+console.log(JSON.stringify({
+  plain: d.viewLines(d.buildView(snap(ordered), nowMs)),
+  styled: text(ordered, true),
+  styledV2: text(ordered, false),
+  cycle: text(cyc, true),
+  noOrderPlain: d.viewLines(d.buildView(snap(plainList), nowMs)),
+  noOrderStyled: text(plainList, true),
+  notes: [d.orderNote({ mark: "next" }), d.orderNote({ mark: "cycle" }), d.orderNote({ blocked_by: "#2" }), d.orderNote({}), d.depthOf({ depth: 9 }), d.depthOf({ depth: "x" }), d.depthOf({})],
+  hostile: d.orderNote({ blocked_by: "#2\u001b[31m" }),
+}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPanelOrder(unittest.TestCase):
+    """Ask #67: the panel draws the order the daemon gave (optional fields), and a list without them exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "order-harness.mjs"
+            script.write_text(ORDER_PANEL_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+            done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        cls.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_plain_view_draws_the_order_nested_with_next_and_waits_for(self):
+        lines = self.r["plain"]
+        at = {name: i for i, name in enumerate(lines)}
+        heads = [l for l in lines if l.strip().startswith("#")]
+        self.assertEqual([h.strip().split(" ")[0] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
+        self.assertIn("#2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("#2")][0].split(" ")[1]), lines)
+        blocked = [h for h in heads if h.strip().startswith("#1")][0]
+        self.assertTrue(blocked.startswith("  #1 "), "indented under what it waits for")
+        self.assertTrue(blocked.endswith("\u00b7 waits for #2"))
+
+    def test_the_styled_panel_indents_the_blocked_item_and_marks_next_and_cycle(self):
+        styled = self.r["styled"]
+        item1 = [i for i, l in enumerate(styled) if l.startswith("  ") and "Item 1" in l]
+        self.assertTrue(item1, styled)
+        self.assertTrue(any("#2" in l and "next" in l for l in styled), styled)
+        self.assertTrue(any("#1" in l and "waits for #2" in l and l.startswith("  ") for l in styled), styled)
+        self.assertLess([i for i, l in enumerate(styled) if "Item 2" in l][0], item1[0], "the blocker is drawn first")
+        self.assertTrue(sum("cycle" in l for l in self.r["cycle"]) == 2 and not any("next" in l for l in self.r["cycle"]), self.r["cycle"])
+        self.assertTrue(all(len(l) <= 34 for l in styled + self.r["cycle"]), "nothing wider than the sidebar")
+
+    def test_a_list_without_the_fields_is_drawn_exactly_as_before(self):
+        for name in ("noOrderPlain", "noOrderStyled"):
+            joined = "\n".join(self.r[name])
+            self.assertNotIn("next", joined)
+            self.assertNotIn("waits for", joined)
+            self.assertFalse(any(l.startswith("  ") and "Item" in l for l in self.r[name]), name)
+
+    def test_the_helpers_cap_the_depth_and_strip_control_characters(self):
+        self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
+                         "the panel's depth cap is the core's")
+        self.assertNotIn("\u001b", self.r["hostile"])
 
 
 class TestAgentsVerify(unittest.TestCase):
