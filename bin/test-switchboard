@@ -11261,14 +11261,14 @@ class TestGhShimGateProbe(Base):
         return self.run_shim(*args, *extra, env=e)
 
     def test_a_merge_over_a_changes_requested_review_is_refused_naming_the_reviewer_in_any_repo(self):
-        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "rev-wake")])
+        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")])
         self.assertEqual(done.returncode, 10)
-        self.assertIn("blocking review(s): rev-wake: CHANGES_REQUESTED", done.stderr)
+        self.assertIn("blocking review(s): reviewer-a: CHANGES_REQUESTED", done.stderr)
         self.assertIn("--over-review", done.stderr)
         self.assertIsNone(seen, "the real gh never ran")
-        done, seen = self.merge("--admin", reviews=[self.review("CHANGES_REQUESTED", "rev-wake")])
+        done, seen = self.merge("--admin", reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")])
         self.assertEqual((done.returncode, seen), (10, None))                    # --admin changes nothing
-        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "rev-wake")], env={"FAKE_REPO": "other/repo"},
+        done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")], env={"FAKE_REPO": "other/repo"},
                                 args=("pr", "merge", "12", "-R", "other/repo", "--merge"))
         self.assertEqual(done.returncode, 10)                                    # a repo not listed under plan_gates is covered too
 
@@ -11290,7 +11290,7 @@ class TestGhShimGateProbe(Base):
         self.assertEqual([c for c in self.gate_calls() if c.startswith("review")], [])   # (the fake logs gates-check only)
 
     def test_over_review_with_a_reason_goes_ahead_is_stripped_and_logged_and_without_one_it_is_refused(self):
-        block = [self.review("CHANGES_REQUESTED", "rev-wake")]
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
         done, seen = self.merge("--over-review", "the owner accepted the risk in chat", reviews=block)
         self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
         self.assertNotIn("--over-review", " ".join(seen["argv"]))
@@ -11299,7 +11299,7 @@ class TestGhShimGateProbe(Base):
         (line,) = [l for l in self.spool() if l["event"] == "over_review"]
         self.assertIn("worker", line["detail"])
         self.assertIn("the owner accepted the risk in chat", line["detail"])
-        self.assertIn("rev-wake: CHANGES_REQUESTED", line["detail"])
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", line["detail"])
         self.assertEqual(line["pr"], "acme/app#12")
         done, seen = self.merge("--over-review=a reason of enough length", reviews=block)           # the = spelling
         self.assertEqual(done.returncode, 7)
@@ -11322,7 +11322,7 @@ class TestGhShimGateProbe(Base):
         self.assertIn("not checked", done.stderr)
 
     def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
-        block = [self.review("CHANGES_REQUESTED", "rev-wake")]
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
         done, seen = self.merge(reviews=block, args=("pr", "ready", "12", "-R", "acme/app"))
         self.assertEqual(done.returncode, 7)
         done, seen = self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
@@ -40325,7 +40325,7 @@ class TestV2Http(V2TransportBase):
 
 
 class TestDeliveryDuringABackoff(PR4Base):
-    """rev-wake's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
+    """reviewer-a's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
 
     def open_the_breaker(self):
         breaker = self.world.engine.v2.breaker
@@ -40358,7 +40358,7 @@ class TestDeliveryDuringABackoff(PR4Base):
             sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
             self.world.tick(5)
             self.world.engine.run_pass()
-        self.assertEqual(self.world.admissions("platform"), [], "the failure rev-wake found: held while the person read is skipped")
+        self.assertEqual(self.world.admissions("platform"), [], "the failure reviewer-a found: held while the person read is skipped")
 
 
 class TestV2Breaker(Base):
