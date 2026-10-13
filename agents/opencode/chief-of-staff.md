@@ -40,6 +40,12 @@ permissions:
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}
   - {action: shell, resource: "fleet-switchboard relaunch *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard review measure *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard review laws *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard impact floor *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard impact hold --dry-run*", effect: allow}
+  - {action: shell, resource: "fleet-switchboard pr-explain *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard agents verify*", effect: allow}
   - {action: shell, resource: "gh * view *", effect: allow}
   - {action: shell, resource: "gh * list *", effect: allow}
   - {action: shell, resource: "gh * status *", effect: allow}
@@ -98,19 +104,13 @@ permissions:
   - {action: shell, resource: "herdr tab focus *", effect: allow}
   - {action: subagent, resource: "*", effect: deny}
   - {action: task, resource: "*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard gates *enforce*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard gates *ENFORCE*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard gates on*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard waive *G6*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard waive *G8*", effect: deny}
-  - {action: shell, resource: "timeout * fleet-switchboard decisions batch*", effect: deny}
   - {action: shell, resource: "timeout * fleet-switchboard launch *", effect: deny}
-  - {action: shell, resource: "fleet-switchboard decisions batch*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates *enforce*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates *ENFORCE*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard gates on*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard waive *G6*", effect: deny}
-  - {action: shell, resource: "fleet-switchboard waive *G8*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard decisions batch*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard gates *enforce*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard gates *ENFORCE*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard gates on*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard waive *G6*", effect: deny}
+  - {action: shell, resource: "*fleet-switchboard waive *G8*", effect: deny}
   - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
   - {action: shell, resource: "gh repo edit*", effect: deny}
   - {action: shell, resource: "gh *--admin*", effect: deny}

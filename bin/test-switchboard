@@ -8912,8 +8912,10 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 last_allow = max(i for i, e in enumerate(effects) if e == "allow")
                 self.assertNotIn("allow", effects[effects.index("deny"):] if "deny" in effects else [])
                 self.assertEqual(effects[last_allow + 1:], ["deny"] * (len(effects) - last_allow - 1))
-                for guard in ("timeout * fleet-switchboard gates *enforce*", "timeout * fleet-switchboard gates on*", "timeout * fleet-switchboard waive *G6*"):
-                    self.assertIn(guard, [r["resource"] for r in rules])
+                resources = [r["resource"] for r in rules]
+                for guard in ("fleet-switchboard gates *enforce*", "fleet-switchboard gates on*", "fleet-switchboard waive *G6*"):
+                    # the timeout form is its own line, or one `*`-led line covers the bare and the timeout forms (the Chief of Staff's)
+                    self.assertTrue("timeout * " + guard in resources or "*" + guard in resources, guard)
 
     def test_the_first_rule_denies_everything_and_nothing_ever_asks(self):
         for path in self.PATHS:
@@ -8972,6 +8974,23 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    READ_ONLY_ADDED = ("fleet-switchboard review measure --since 7", "fleet-switchboard review laws acme/api#5", "fleet-switchboard impact floor acme/api#5 --json",
+                       "fleet-switchboard impact hold --dry-run", "fleet-switchboard pr-explain acme/api#5 --check", "fleet-switchboard agents verify")
+
+    def test_the_review_and_impact_reads_are_allowed_and_each_is_read_only_and_the_writes_next_to_them_are_not(self):
+        """The cos list gains six read-only lines: review measure, review laws, impact floor, impact hold --dry-run, pr-explain and agents verify
+        (`gates *`, `plan *` and `status *` were already there). Each prints and writes nothing. The write subcommands of the same words stay denied."""
+        _, rules = self.rules()
+        for command in self.READ_ONLY_ADDED + ("timeout 30 fleet-switchboard review laws acme/api#5",):
+            self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard review record acme/api#5 --reviewer code --block f"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard impact clear acme/api#5 --reason x"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard impact hold"), "deny")
+        self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard agents install"), "deny")
+        for gate in ("fleet-switchboard gates mode acme/app enforce", "timeout 30 fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
+                     "timeout 5 fleet-switchboard waive acme/app#5 --gates G8 --reason x", "timeout 5 fleet-switchboard decisions batch --title x"):
+            self.assertEqual(self.evaluate(rules, "shell", gate), "deny", gate)   # the collapsed denies still catch both the bare and the timeout forms
 
     def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
         _, rules = self.parse(self.PATHS[1])
