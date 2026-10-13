@@ -87,8 +87,6 @@ permissions:
   - {action: shell, resource: "sleep *", effect: allow}
   - {action: shell, resource: "pwd", effect: allow}
   - {action: shell, resource: "uptime", effect: allow}
-  - {action: shell, resource: "timeout ? fleet-switchboard *", effect: allow}
-  - {action: shell, resource: "timeout ?? fleet-switchboard *", effect: allow}
   - {action: shell, resource: "timeout * gh pr view *", effect: allow}
   - {action: shell, resource: "timeout * gh issue view *", effect: allow}
   - {action: shell, resource: "timeout * gh pr list *", effect: allow}
