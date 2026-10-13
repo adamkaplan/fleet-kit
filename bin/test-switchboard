@@ -39352,13 +39352,14 @@ class TestV2ClientBackpressure(Base):
         self.timeout = False
         before = len(self.calls)
         with self.assertRaises(sb.V2Error) as caught:
-            client.session_get("ses_a")
+            client.session_active()
         self.assertEqual(caught.exception.reason, "backoff")
         self.assertEqual(len(self.calls), before, "no process was started for a skipped read")
         client._call("session.synthetic", {"sessionID": "ses_a"}, {"id": "msg_1", "text": "wake"})
+        client.session_get("ses_a")   # discovery and the re-check before a write: a delivery cannot go without it
         client.inbox_list("ses_a")
         client.message_page("ses_a", 10, "synthetic")
-        self.assertEqual(len(self.calls), before + 3, "a write, the inbox and the delivery key read all went through")
+        self.assertEqual(len(self.calls), before + 4, "a write, the session read, the inbox and the delivery key read all went through")
         self.assertEqual(client.breaker.skipped, 1, "the one skipped read is counted once, in one place")
         with self.assertRaises(sb.V2Error):
             client.message_list("ses_a", limit=5)   # an ordinary transcript read is optional

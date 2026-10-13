@@ -815,7 +815,7 @@ class V2Error(Exception):
     """A v2 call that did not return usable JSON.
 
     reason: "http" (v2 answered with an HTTP error), "exit" (non-zero exit, no
-    HTTP status), "timeout", "bad_json", "unavailable" (could not run), "too_large" (a reply over the cap) or "backoff" (an optional
+    HTTP status), "timeout", "bad_json", "unavailable" (could not run), "too_large" (a reply over the cap), "refused" (a real run under the test suite) or "backoff" (an optional
     read skipped while the service is slow).
     """
 
@@ -890,7 +890,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "session.synthetic": ("POST", "/api/session/{sessionID}/synthetic", ("sessionID",), ()),
     "experimental.session.import": ("POST", "/api/experimental/session/import", (), ()),
 }
-V2_ESSENTIAL_READS = ("session.inbox.list", "session.permission.list", "session.form.list")   # a delivery or a blocked worker needs these
+V2_ESSENTIAL_READS = ("session.get", "session.inbox.list", "session.permission.list", "session.form.list")   # discovery and the re-check before a write (session.get), a delivery and a blocked worker need these
 V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
 V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
 V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
@@ -1149,6 +1149,7 @@ class V2Client:
         self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
         self.count_errors = 0   # accounting that failed; a call never fails for it
         self._link_written = 0.0
+        self._link_lock = threading.Lock()
         if http is None and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
             merged = dict(os.environ)
             merged.update(self.env)
@@ -1218,6 +1219,10 @@ class V2Client:
         """What `status` shows of the link, written by the daemon only, at most once a minute unless the breaker changed."""
         if self.state_dir is None:
             return
+        with self._link_lock:   # the daemon has threads: one writer at a time, and the once-a-minute check is part of it
+            self._write_link_locked(forced)
+
+    def _write_link_locked(self, forced):
         moment = self.clock()
         if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
             return
