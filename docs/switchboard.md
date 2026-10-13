@@ -1073,7 +1073,7 @@ a worker is a message in its transcript that is not a switchboard rider: a promp
 (yours, the fleet's, or the brief `launch` sent) or a message from its boss
 (`send`, a handoff). A GitHub notice, decoration, reminder, nudge or toast is not
 one. The worker has *reported* when its boss's transcript holds a `report:<worker>:*`
-key newer than its latest assigning input (the same `delivered_keys` read the
+or `send:<worker>:*` key (a `send` to its boss tells it as much as a `report`) newer than its latest assigning input (the same `delivered_keys` read the
 delivery rule uses, which now also returns when each key arrived). When a turn ends
 and the worker has not reported, the decision model is asked one question,
 `report_owed`: did this turn end with work done, blocked, failed or needing a
