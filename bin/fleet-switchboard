@@ -4402,6 +4402,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
 # that shows something else is DETACHED; a pane herdr no longer has is DEAD. Both wake the Chief of Staff, which can `reattach`.
 # ======================================================================
 
+PANE_SETTLE_SECONDS = 5      # the two looks before a close are this far apart: a pane that is still active between them is never closed
 PANE_READ_MAX = 8000         # characters of a pane's screen kept
 PANE_FORGET_SECONDS = 3 * 86400   # a dead agent nobody repaired is forgotten (and stops waking cos) after this
 PANE_HEALTH_FILE = "pane-health.json"
@@ -4453,6 +4454,14 @@ def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()
     return PANE_DETACHED, "pane %s shows %r, not %s's session %s" % (pane, info["title"][:60], name, session_id), info
 
 
+def pane_screen(engine, pane):
+    """A hash of the pane's visible screen, or None when it cannot be read (then there is no proof of quiet)."""
+    try:
+        return hashlib.sha256(engine.herdr.pane_read_visible(pane).encode("utf-8", "replace")).hexdigest()
+    except HerdrError:
+        return None
+
+
 def release_stale_binding(engine, name, taken, session_id, replace=False):
     """`taken` is the Observation herdr still lists under `name`. Returns what was released (lines), or raises LaunchError. A pane whose screen
     names the agent is LIVE: refused, no double attach. A pane herdr no longer has, or one that shows a fresh screen with no session of any fleet
@@ -4476,17 +4485,26 @@ def release_stale_binding(engine, name, taken, session_id, replace=False):
         raise LaunchError("pane %s is detached but herdr names no tab for it: nothing was closed" % taken.pane)
     # The close ends EVERY pane of the tab and rests on a read made a moment ago: so the tab must hold only this pane, it must not be working,
     # and the pane is judged AGAIN just before the close (a concurrent reattach or a person's typing changes it).
-    if str(info.get("status") or "").lower() == "working":
-        raise LaunchError("pane %s is working: it is not a stale screen, nothing was closed" % taken.pane)
+    if str(info.get("status") or "").lower() in ("working", "blocked"):
+        raise LaunchError("pane %s is %s: it is not a stale screen, nothing was closed" % (taken.pane, str(info.get("status")).lower()))
     try:
         count = engine.herdr.tab_get(tab).get("pane_count")
     except HerdrError as err:
         raise LaunchError("herdr cannot say what tab %s holds (%s): nothing was closed" % (tab, _one_line(str(err), 80))) from None
     if count != 1:
         raise LaunchError("tab %s holds %s panes, not only the stale one: nothing was closed" % (tab, count))
+    # PROOF BEFORE A CLOSE: two looks PANE_SETTLE_SECONDS apart must agree (same verdict, same tab, idle status, an UNCHANGED screen). One look is
+    # never enough, and `--replace` needs the same proof: a pane that is typing, drawing or working between the looks is alive and is not closed.
+    before = pane_screen(engine, taken.pane)
+    time.sleep(PANE_SETTLE_SECONDS)
     again, why_again, again_info = pane_state(engine, name, session_id, taken.pane, names, sessions)
+    after = pane_screen(engine, taken.pane)
     if again != (PANE_ATTACHED if replace and state == PANE_ATTACHED else PANE_DETACHED) or again_info.get("shows_another") or again_info.get("tab") != tab:
         raise LaunchError("pane %s changed while it was being judged (%s): nothing was closed" % (taken.pane, why_again))
+    if str(again_info.get("status") or "").lower() in ("working", "blocked"):
+        raise LaunchError("pane %s became %s between the two looks: nothing was closed" % (taken.pane, str(again_info.get("status")).lower()))
+    if before is None or after is None or before != after:
+        raise LaunchError("pane %s showed activity (or could not be read) between the two looks: no proof it is idle, nothing was closed" % taken.pane)
     with engine._external("herdr.tab.close", name, {"pane": taken.pane, "tab": tab, "why": "stale binding: %s" % why}):
         engine.herdr.tab_close(tab)
     return ["pane %s was a detached screen with no session of its own (%s): tab %s closed" % (taken.pane, why, tab)]
@@ -4650,6 +4668,34 @@ def cmd_reattach(args, runner, now, socket_call=None):
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     name = args.name
     discovery = engine.discover(engine.now())
+    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    if who:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.reattach_refused", name, {"why": _one_line(who, 160)})
+        raise LaunchError("refused: %s" % who)
+    try:
+        with agent_lock(state, name):
+            return _reattach_locked(args, runner, now, engine, state, name, discovery)
+    except ImpactStateBusy:
+        raise LaunchError("another reattach of %s is running: wait for it, then run `%s status`" % (name, PROG)) from None
+
+
+def reattach_caller_problem(engine, runner, now, discovery, name):
+    """None when the caller may reattach `name`: the operator at their own terminal, the Chief of Staff, or the agent's own boss. Else why not."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        return None
+    if kind[0] != "agent":
+        return "%s: only the operator, the Chief of Staff or the agent's own boss may reattach" % kind[1]
+    if len(kind) > 2 and kind[2] == "chief-of-staff":
+        return None
+    target = discovery.agents.get(name)
+    if target is not None and boss_name(discovery, target) == kind[1]:
+        return None
+    return "%s may not reattach %s: only the operator, the Chief of Staff, or %s's own boss may" % (kind[1], name, name)
+
+
+def _reattach_locked(args, runner, now, engine, state, name, discovery):
     known = read_pane_health(state)["agents"].get(name) or {}
     seen = discovery.agents.get(name)
     session_id = args.session or (seen.session_id if seen else None) or known.get("session")
@@ -14752,6 +14798,14 @@ class impact_state_lock:
             os.close(self.fd)
             self.fd = None
         return False
+
+
+class agent_lock(impact_state_lock):
+    """One flock per agent name: two concurrent reattaches of the same agent cannot both open or close a tab."""
+
+    def __init__(self, state_dir, name, seconds=10):
+        super().__init__(state_dir, seconds)
+        self.path = Path(state_dir) / ("reattach-%s.lock" % re.sub(r"[^a-z0-9_-]", "_", (name or "").lower()))
 
 
 def _impact_state_noted(engine, problem):
