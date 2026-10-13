@@ -3339,11 +3339,17 @@ LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lane
 
 def launch_agent_problem(config, runner, agent):
     """Why `agent` cannot be launched: the OpenCode service does not know it (an agent with no installed definition starts as the default Build
-    agent with the brief unsent). None when it is registered, or when the service cannot be asked (v2 then refuses it itself)."""
+    agent with the brief unsent), or knows it only as a subagent (a pane runs a primary agent). None when it is a registered primary agent, or when
+    the service cannot be asked (v2 then refuses it itself)."""
     state, found = agents_found(runner, config.get("opencode") or "opencode", AGENTS_VERIFY_TIMEOUT)
-    if state != "up" or agent in found:
+    if state != "up":
         return None
     known = ", ".join(sorted(n for n, (mode, _) in found.items() if mode == "primary")) or "none"
+    if agent in found:
+        if found[agent][0] in ("primary", "all"):   # `all` can run as a pane's agent too (OpenCode modes: primary, subagent, all)
+            return None
+        return ("--agent %r is registered as a %s, not a primary agent: a launched pane runs a primary agent, and a subagent is run by another agent's Task tool "
+                "(primary agents registered: %s)" % (agent, found[agent][0], known))
     return ("--agent %r is not registered with the OpenCode service, so it would start as the default agent and the brief would not be sent "
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
@@ -5085,7 +5091,8 @@ def decisions_from_github(engine, now):
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
-                      "parent": record.get("parent"), "closed": bool(record.get("closed"))})
+                      "parent": record.get("parent"), "closed": bool(record.get("closed")),
+                      "waits_for": record.get("waits_for") or []})
     return items, problems
 
 
@@ -6245,7 +6252,9 @@ def derive_decisions(engine, now):
     for source in (x for x in sources if x.entries):  # PR notices: information rather than decisions (never folded, never counted)
         found, problems = read_source(engine, source, now, errors)
         decisions.extend(found)
+    decision_core.fold_reports_into_prs(decisions)   # a report naming a `pr:` decision is that PR's question: one row, not two
     decision_core.order_decisions(decisions)
+    decision_core.annotate_order(decisions)   # optional order fields, only when some decision says what it waits for
     return decisions, errors
 
 
@@ -6776,20 +6785,24 @@ def format_decisions(report, now, view=None):
     if report["stale"]:
         return "Decisions unavailable: %s. Start it with `%s ensure`, or read the facts now with `%s decisions --fresh`." % (
             report["message"], PROG, PROG)
-    decisions = report["decisions"]
+    decisions = decision_core.arranged(report["decisions"])   # as listed, unless some decision says what it waits for (then: by order)
     human_only = view is None or view["tiers"] == ["human"]
     if not decisions:
         lines = ["No decisions are waiting on you." if human_only else "No decisions in this view."]
     else:
         agents = [d.get("agent") or "-" for d in decisions]
-        width_id, width_agent = max(len(d["id"]) for d in decisions), max(len(a) for a in agents)
+        indents = ["   " * min(d.get("depth") or 0, decision_core.ORDER_DEPTH_MAX) if isinstance(d.get("depth"), int) else "" for d in decisions]
+        width_id, width_agent = max(len(i) + len(d["id"]) for i, d in zip(indents, decisions)), max(len(a) for a in agents)
         lines = []
-        for decision, agent in zip(decisions, agents):
+        for decision, agent, indent in zip(decisions, agents, indents):
             since = parse_iso(decision.get("since"))
             tier = "" if human_only else "[%s]  " % decision.get("tier", "human")
-            lines.append("%s  waiting %s  %s%s  %s" % (decision["id"].ljust(width_id),
-                                                      format_age(now - since) if since is not None else "?",
-                                                      tier, agent.ljust(width_agent), decision["title"]))
+            note = {"next": "  [next]", "cycle": "  [cycle: they wait for each other]"}.get(decision.get("mark"), "")
+            if decision.get("blocked_by"):
+                note += "  [waits for %s]" % decision["blocked_by"]
+            lines.append("%s  waiting %s  %s%s  %s%s" % ((indent + decision["id"]).ljust(width_id),
+                                                        format_age(now - since) if since is not None else "?",
+                                                        tier, agent.ljust(width_agent), decision["title"], note))
         lines = [line.rstrip() for line in lines]
         if report.get("fresh"):  # --fresh says, for an open report, which send it looked at (or that there was none)
             lines = [line for pair in zip(lines, [("      " + d["considered"]) if d.get("considered") else None
@@ -6999,7 +7012,9 @@ SWEEP_FILE = "sweep.json"
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
-               "S5": "cos-tier decision aged (and not already in the owner's tier)"}
+               "S5": "cos-tier decision aged (and not already in the owner's tier)",
+               "S7": "decisions that wait for each other (a cycle): none of them can be done first",
+               "S8": "a decision waits for an issue that is closed or missing"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -7388,6 +7403,16 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
+    for group in decision_core.find_cycles(decisions):   # S7: one finding per cycle, named by its first member
+        found.add(("S7", group[0]))
+    listed = {decision_core.decision_ref(d) for d in decisions} - {None}
+    for d in decisions:   # S8: waits for an issue that is in a watched repo, is not an open decision and is not an open item there
+        for target in d.get("waits_for") or []:
+            repo, _, number = target.rpartition("#")
+            picture = state.repos.get(repo)
+            if (target not in listed and picture is not None and not picture.get("error") and not picture.get("truncated")
+                    and number.isdigit() and int(number) not in picture["items"]):
+                found.add(("S8", target))
     state.unattributed = unattributed
     return sorted(found)
 
@@ -7396,7 +7421,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     """Re-check one finding against a fresh read of its issue or PR (and, when comments raised it, a fresh read of its
     last comments), so a cached copy cannot raise it. True: still holds. False: no longer (or never did). None: could not
     be checked now (no budget, a failed or truncated read): it is neither raised nor audited this pass."""
-    if kind == "S5":
+    if kind in ("S5", "S7"):
         return True  # about the decision list derived this very pass
     hub = getattr(engine, "hub", None)
     repo, _, number = ref.rpartition("#")
@@ -7409,6 +7434,12 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
+    if kind == "S8":   # a decision waits for this issue: it still holds when the issue is closed, or is not there at all
+        try:
+            data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+        except GitHubUnavailable as err:
+            return True if NOT_FOUND_RE.search(str(err)) else None
+        return None if not isinstance(data, dict) or "state" not in data else data.get("state") == "closed"
     try:
         data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
     except GitHubUnavailable:
@@ -8779,6 +8810,43 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
+REMIND_LIST_MAX = 50   # reminders `remind --list` prints
+
+
+def remind_manage(args, engine, state, sender, moment):
+    """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
+    shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
+    if args.list_mine and args.cancel:
+        sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
+        return EXIT_USAGE
+    if args.name or args.when or args.text:
+        sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
+        return EXIT_USAGE
+    try:
+        mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    if args.list_mine:
+        mine.sort(key=lambda item: item["at"])
+        for item in mine[:REMIND_LIST_MAX]:
+            print("%s  %s  to=%s  issue=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item["text"], 120)))
+        if len(mine) > REMIND_LIST_MAX:
+            print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
+        if not mine:
+            sys.stderr.write("%s: no pending reminders for %s\n" % (PROG, sender))
+        return EXIT_OK
+    if args.cancel not in {item["id"] for item in mine}:
+        sys.stderr.write("%s: remind: no pending reminder %s of yours (see `%s remind --list`)\n" % (PROG, _one_line(args.cancel, 40), PROG))
+        return EXIT_USAGE
+    if not remove_reminders(state, {args.cancel}):   # delivered or cancelled between the read and the removal
+        sys.stderr.write("%s: remind: reminder %s is already gone\n" % (PROG, _one_line(args.cancel, 40)))
+        return EXIT_USAGE
+    engine.audit.append("cli", "reminder.cancel", sender, {"id": args.cancel})
+    print("cancelled %s" % args.cancel)
+    return EXIT_OK
+
+
 def cmd_remind(args, runner, now):
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
@@ -8790,6 +8858,11 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
+    if args.list_mine or args.cancel:
+        return remind_manage(args, engine, state, sender, moment)
+    if not args.name or not args.when or not args.text:
+        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
+        return EXIT_USAGE
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, sender)
     except IssueRefError as err:
@@ -8802,6 +8875,8 @@ def cmd_remind(args, runner, now):
                 sys.stderr.write("%s: --until-closed/--until-merged take OWNER/REPO#N, got %r\n" % (PROG, flag[:60]))
                 return EXIT_USAGE
             condition[key] = flag
+    if number is not None and repo and not condition and not args.keep_if_closed:
+        condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
@@ -10008,9 +10083,10 @@ class GitHubHub:
                 # a batch's rows come from the body this payload or listing already carries: no read of their own
                 rows = parse_decision_rows(issue["body"]) if "body" in issue else (known or {}).get("rows", [])
                 raised = signed_by_fleet(issue["body"]) if "body" in issue and rows else (known or {}).get("raised_by")
+                waits = decision_core.parse_waits_for(issue["body"], repo) if "body" in issue else (known or {}).get("waits_for", [])
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
                                       "parent": parent_of(issue), "tier": tier, "rows": rows,
-                                      "raised_by": raised if rows else None, "closed": closed}
+                                      "raised_by": raised if rows else None, "closed": closed, "waits_for": waits}
             else:
                 self.awaiting.pop(key, None)
 
@@ -10060,7 +10136,8 @@ class GitHubHub:
         with self.lock:
             records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
                         "parent": entry["parent"], "tier": entry["tier"], "rows": entry.get("rows", []),
-                        "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed"))}
+                        "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed")),
+                        "waits_for": entry.get("waits_for") or []}
                        for (repo, number), entry in sorted(self.awaiting.items())]
             errors = []
             for repo in sorted(self.watches):
@@ -13555,7 +13632,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
         if problem:
-            engine._note("impact.ledger_unreadable", "%s#%d" % (repo, number), {"why": problem, "fails": "toward hold"}) if engine.audit is not None else None
+            if engine.audit is not None:
+                engine._note("impact.ledger_unreadable", "%s#%d" % (repo, number), {"why": problem, "fails": "toward hold"})
             reasons = reasons + [problem]
         elif review:
             reasons = reasons + [IMPACT_REVIEW_REASON]
@@ -13656,6 +13734,10 @@ def write_impact_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
+class ImpactStateBusy(RuntimeError):
+    """The impact state lock could not be taken in time: nothing was done, try again."""
+
+
 class impact_state_lock:
     """ONE exclusive lock around everything that reads the impact state and acts on it: the daemon's `clear check -> label write -> applied record`
     and the owner's `clear record -> label removal` cannot interleave, so a clear is never lost and a cleared hold is never re-added.
@@ -13676,7 +13758,7 @@ class impact_state_lock:
                 if time.monotonic() >= deadline:
                     os.close(self.fd)
                     self.fd = None
-                    raise RuntimeError("the impact state is locked by another process (waited %d s)" % self.seconds) from None
+                    raise ImpactStateBusy("the impact state is locked by another process (waited %s s)" % self.seconds) from None
                 time.sleep(0.05)
 
     def __exit__(self, *exc):
@@ -13687,8 +13769,26 @@ class impact_state_lock:
 
 
 def _impact_state_noted(engine, problem):
-    if problem and engine.audit is not None:
-        engine._note("impact.state_unreadable", None, {"why": problem})
+    """A corrupt, oversized or non-object state file is QUARANTINED, never overwritten: it is renamed aside (`impact-hold.json.corrupt-<time>`) so
+    the clears in it can be recovered by hand, the pass starts from an empty state (fails toward hold) and the audit says so. Called under the lock."""
+    if not problem:
+        return
+    path = Path(engine.state_dir) / IMPACT_STATE_FILE
+    aside, failed = None, None
+    if path.exists():
+        aside = path.with_name("%s.corrupt-%d-%d" % (IMPACT_STATE_FILE, int(engine.now()), os.getpid()))
+        for n in range(1, 100):   # never replace an earlier quarantined copy: the clears in it are what the quarantine keeps
+            if not aside.exists():
+                break
+            aside = path.with_name("%s.corrupt-%d-%d-%d" % (IMPACT_STATE_FILE, int(engine.now()), os.getpid(), n))
+        try:
+            os.rename(str(path), str(aside))
+        except OSError as err:
+            aside, failed = None, "%s" % (err.strerror or err)
+    if engine.audit is not None:
+        engine._note("impact.state_unreadable", None, {"why": problem, "quarantined": aside.name if aside else None, "quarantine_failed": failed})
+    if failed:   # the corrupt file is still there: writing now would overwrite it, so this write waits and is retried
+        raise RuntimeError("the corrupt %s could not be set aside (%s): nothing was written" % (IMPACT_STATE_FILE, failed))
 
 
 def apply_impact_hold(engine, repo, number, report, record):
@@ -13731,6 +13831,8 @@ def impact_clear_core(engine, runner, repo, number, who, reason):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print."""
     pr = "%s#%d" % (repo, number)
+    if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
+        raise RuntimeError("no audit sink: an impact clear is refused rather than made unlogged")
     raw = read_pr_json(engine, repo, number)
     head = raw.get("headRefOid")
     if not isinstance(head, str) or not head:
@@ -13746,8 +13848,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason):
         state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
         change_issue_labels(engine, runner, repo, number, remove=remove)
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})
+        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})   # inside the lock
     return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head[:8], ", ".join(remove))]
 
 
@@ -13776,6 +13877,12 @@ def cmd_impact_clear(args, runner, now):
             print(line)
     except (NoticeError, IntentError) as err:
         sys.stderr.write("%s: impact clear: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_ERROR
+    except ImpactStateBusy as err:   # the lock wait ran out: one line, nothing half done
+        sys.stderr.write("%s: impact clear: %s; nothing was changed, try again in a moment\n" % (PROG, _one_line(str(err), 200)))
+        return EXIT_ERROR
+    except RuntimeError as err:      # no audit sink, or the corrupt state file could not be set aside: retrying does not help until it is fixed
+        sys.stderr.write("%s: impact clear: refused: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
         return EXIT_ERROR
     return EXIT_OK
 
@@ -13831,7 +13938,8 @@ def impact_would_hold_pass(engine, now):
         return
     seen = engine.__dict__.setdefault("impact_seen", {})
     reports = engine.__dict__.setdefault("impact_reports", {})
-    budget = cfg.get("calls_per_pass", IMPACT_PASS_CALLS)
+    hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
+    budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     for key, (_, records) in sorted(state.lists.items()):
         for record in records:
             if isinstance(record, dict) and isinstance(record.get("number"), int) and (key, record["number"]) in reports:
@@ -18129,9 +18237,13 @@ def build_parser():
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     remind = sub.add_parser("remind", help="A message to an agent that is due later")
-    remind.add_argument("name", help="The recipient's fleet name")
-    remind.add_argument("when", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
-    remind.add_argument("text", nargs="+", help="The reminder")
+    remind.add_argument("name", nargs="?", help="The recipient's fleet name")
+    remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
+    remind.add_argument("text", nargs="*", help="The reminder")
+    remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
+    remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
+                        "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     remind.add_argument("--until-closed", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this issue "
@@ -18230,7 +18342,11 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     parser = build_parser()
     try:
-        args = parser.parse_args(argv)
+        args, extra = parser.parse_known_args(argv)
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+            args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+        elif extra:
+            parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)

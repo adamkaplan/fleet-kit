@@ -4415,6 +4415,19 @@ class TestLaunch(Base):
         self.assertIn("agents verify", err)
         self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
 
+    def test_a_subagent_is_refused_too_and_named_as_one_with_nothing_created(self):
+        sessions = len(self.world.v2.sessions)
+        code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "reviewer-code": "subagent"}), "reviewer-code")
+        self.assertEqual(code, 1)
+        self.assertIn("--agent 'reviewer-code' is registered as a subagent, not a primary agent", err)
+        self.assertIn("Task tool", err)
+        self.assertIn("primary agents registered: coder", err)
+        self.assertEqual(len(self.world.v2.sessions), sessions, "no session was created")
+
+    def test_an_agent_registered_for_both_modes_launches(self):
+        code, out, err = self.cli_launch(self.listing_runner({"flex": "all", "coder": "primary"}), "flex", name="coder20")
+        self.assertEqual(code, 0, err)
+
     def test_a_registered_agent_launches_and_an_unreachable_service_does_not_block_it(self):
         for n, agents in enumerate(({"coder": "primary"}, None)):
             with self.subTest(agents=agents):
@@ -7707,6 +7720,93 @@ class TestRemindCLI(PR4Base):
         self.assertIn("when must be", err)
         self.assertNotIn("Traceback", err)
         self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_list_shows_only_the_callers_own_reminders_oldest_first_and_cancel_removes_only_those(self):
+        self.main("remind", "coder", "2h", "--from", "coder", "mine, later")
+        self.main("remind", "coder", "30m", "--from", "platform", "for me, sooner")
+        self.main("remind", "platform", "1h", "--from", "platform", "not mine")
+        code, out, err = self.main("remind", "--list", "--from", "coder")
+        self.assertEqual(code, 0, err)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("for me, sooner", lines[0])
+        self.assertIn("mine, later", lines[1])
+        self.assertNotIn("not mine", out)
+        mine = lines[0].split()[0]
+        other = next(i["id"] for i in sb.read_reminders(self.world.state) if i["text"] == "not mine")
+        for bad in (other, "nosuchid"):
+            with self.subTest(bad=bad):
+                code, _, err = self.main("remind", "--cancel", bad, "--from", "coder")
+                self.assertEqual(code, 2)
+                self.assertIn("no pending reminder", err)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 3)
+        code, out, err = self.main("remind", "--cancel", mine, "--from", "coder")
+        self.assertEqual((code, out.strip()), (0, "cancelled " + mine), err)
+        self.assertEqual(sorted(i["text"] for i in sb.read_reminders(self.world.state)), ["mine, later", "not mine"])
+        self.assertIn("reminder.cancel", [e["event"] for e in self.world.audit()])
+
+    def test_list_and_cancel_take_no_recipient_and_not_both_and_a_plain_remind_needs_its_three_parts(self):
+        for argv in (("remind", "--list", "platform"), ("remind", "--list", "--cancel", "x"), ("remind", "platform", "1h"), ("remind",)):
+            with self.subTest(argv=argv):
+                code, _, err = self.main(*argv, "--from", "coder")
+                self.assertEqual(code, 2, err)
+                self.assertIn("remind", err)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_a_reminder_about_an_issue_is_dropped_when_it_closes_unless_kept(self):
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--from", "coder", "about it")
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--keep-if-closed", "--from", "coder", "even so")
+        self.main("remind", "platform", "1h", "--from", "coder", "no issue")
+        by = {i["text"]: i for i in sb.read_reminders(self.world.state)}
+        self.assertEqual(by["about it"]["condition"], {"until_closed": "acme/api#41"})
+        self.assertNotIn("condition", by["even so"])
+        self.assertNotIn("condition", by["no issue"])
+
+    def test_list_is_capped_says_how_many_more_and_says_so_when_there_are_none(self):
+        code, out, err = self.main("remind", "--list", "--from", "coder")
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn("no pending reminders for coder", err)
+        for n in range(sb.REMIND_LIST_MAX + 3):
+            sb.add_reminder(self.world.state, "coder", EPOCH + 60 + n, EPOCH, "r%d" % n, None, "coder")
+        code, out, err = self.main("remind", "--list", "--from", "coder")
+        lines = out.strip().splitlines()
+        self.assertEqual((len(lines), lines[-1]), (sb.REMIND_LIST_MAX + 1, "(3 more not shown)"))
+
+    def test_an_explicit_condition_replaces_the_default_and_a_mistyped_option_is_refused_not_sent_as_text(self):
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--until-merged", "acme/api#42", "--from", "coder", "explicit")
+        (item,) = sb.read_reminders(self.world.state)
+        self.assertEqual(item["condition"], {"until_merged": "acme/api#42"})
+        for argv in (("remind", "platform", "1h", "--utnil-closed", "acme/api#1", "--from", "coder", "text"), ("remind", "--list", "--bogus", "--from", "coder")):
+            with self.subTest(argv=argv):
+                code, _, err = self.main(*argv)
+                self.assertEqual(code, 2)
+                self.assertIn("unrecognized arguments", err)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+
+    def test_words_after_an_option_are_part_of_the_text(self):
+        self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--from", "coder", "the", "text", "here")
+        self.assertEqual(sb.read_reminders(self.world.state)[0]["text"], "the text here")
+
+    def test_cancel_names_the_id_and_the_actor_in_the_audit_and_a_reminder_gone_meanwhile_is_not_reported_cancelled(self):
+        item = sb.add_reminder(self.world.state, "coder", EPOCH + 60, EPOCH, "x", None, "coder")
+        with mock.patch.object(sb, "remove_reminders", return_value=[]):
+            code, out, err = self.main("remind", "--cancel", item["id"], "--from", "coder")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("already gone", err)
+        code, out, err = self.main("remind", "--cancel", item["id"], "--from", "coder")
+        self.assertEqual(code, 0, err)
+        (event,) = [e for e in self.world.audit() if e["event"] == "reminder.cancel"]
+        self.assertEqual((event["actor"], event["subject"], event["detail"]["id"]), ("cli", "coder", item["id"]))
+
+    def test_a_reminder_armed_before_a_restart_fires_after_it(self):
+        # a regression guard: the persistence was already there, nothing had pinned it
+        code, _, err = self.main("remind", "platform", "10m", "--from", "coder", "still here")
+        self.assertEqual(code, 0, err)
+        restarted = self.world.new_engine()   # a new process: nothing but the state directory is shared
+        self.world.tick(600)
+        restarted.discover(self.world.clock.now())
+        facts = next(src for src in restarted.sources if isinstance(src, sb.ReminderFacts))()
+        self.assertEqual([f.summary for f in facts], ["still here"])
 
     def test_without_a_pane_it_says_so(self):
         code, _, err = self.main("remind", "platform", "1h", "later")
@@ -15749,6 +15849,41 @@ class TestSweep(Base):
         self.sweep(decisions)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 1)
 
+    def test_s7_decisions_that_wait_for_each_other_are_one_finding_per_cycle(self):
+        one = dict(self.human(1), waits_for=["acme/api#2"])
+        two = dict(self.human(2), waits_for=["acme/api#1"])
+        three = dict(self.human(3), waits_for=["acme/api#1"])   # waits for a cycle member: not in the cycle
+        free = self.human(4)
+        self.sweep([one, two, three, free])
+        self.assertEqual([f for f in self.found() if f[0] == "S7"], [("S7", "acme/api#1")], "1 finding for the 1 cycle, named by its first member")
+
+    def test_s8_a_decision_that_waits_for_a_closed_issue_is_found_and_an_open_one_is_not(self):
+        self.hub.open = {78: sweep_issue(78, updated=self.at())}
+        self.hub.closed = {77}
+        waits = dict(self.human(10), waits_for=["acme/api#77", "acme/api#78", "acme/api#79"])
+        self.sweep([waits])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#77")], "77 is closed; 78 is open; 79 is not listed but a fresh read shows it open")
+        self.assertTrue(all(call[1].startswith("issues/") for call in self.hub.single), "only reads: the sweep writes nothing to GitHub")
+
+    def test_s8_a_target_that_is_not_there_is_found_and_a_truncated_or_unreadable_picture_is_not_judged(self):
+        original = self.hub._read_one
+        def gone(repo, path, now, fresh=False):
+            raise sb.GitHubUnavailable("gh api repos/acme/api/issues/88 failed: gh: Not Found (HTTP 404)")
+        self.hub._read_one = gone
+        self.sweep([dict(self.human(10), waits_for=["acme/api#88"])])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [("S8", "acme/api#88")], "missing counts like closed")
+        self.hub._read_one = original
+        state = sb.sweep_state(self.engine)
+        state.repos["acme/api"]["truncated"] = True
+        self.hub.closed = {89}   # it IS closed: only the truncated picture keeps the sweep from saying so
+        with mock.patch.object(sb, "sweep_refresh"):   # keep the picture as set: a refresh would read it afresh
+            self.sweep([dict(self.human(11), waits_for=["acme/api#89"])])
+        self.assertEqual([f for f in self.found() if f == ("S8", "acme/api#89")], [], "a truncated picture cannot say it is absent")
+
+    def test_s8_a_waited_for_issue_in_a_repo_that_is_not_watched_is_not_judged(self):
+        self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
+        self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
+
     def test_s5_a_cos_decision_older_than_the_limit(self):
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         fresh = dict(self.human(41), tier="cos", since=sb.iso(self.world.clock.now() - 600))
@@ -20082,28 +20217,29 @@ class TestImpactHold(LedgerBase):
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
         self.assertEqual(len(self.label_writes()), 1)
 
-    def test_an_owner_clear_and_the_daemons_write_cannot_interleave_a_clear_is_never_lost(self):
-        import threading
-        started, order = threading.Event(), []
-        base = self.route
-
-        def slow(argv, **kw):
-            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/labels"):
-                started.set()
-                time.sleep(0.4)                       # the daemon is mid-write when the owner's clear arrives
-                order.append("add")
-            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
-                order.append("remove")
-            return base(argv, **kw)
-        self.route = slow
-        daemon = threading.Thread(target=self.passes)
-        daemon.start()
-        self.assertTrue(started.wait(5))
+    def clear_engine(self):
         engine = self.world.new_engine("cli")
         engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
-        sb.impact_clear_core(engine, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
-        daemon.join(5)
-        self.assertEqual(order, ["add", "remove", "remove"], "the clear waited for the write and then removed what it added")
+        return engine
+
+    def test_an_owner_clear_cannot_interleave_with_the_daemons_write_and_is_never_lost(self):
+        refused = []
+        base = self.route
+
+        def watching(argv, **kw):
+            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/labels"):
+                with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):     # the owner's clear arrives while the daemon holds the lock
+                    try:
+                        sb.impact_clear_core(self.clear_engine(), self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+                    except sb.ImpactStateBusy as err:
+                        refused.append(str(err))
+            return base(argv, **kw)
+        self.route = watching
+        self.passes()
+        self.assertEqual(len(refused), 1)
+        self.assertIn("locked", refused[0])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "the interleaved clear recorded nothing: it cannot be half done")
+        sb.impact_clear_core(self.clear_engine(), self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")   # lock free now
         state, problem = sb.read_impact_state(self.world.state)
         self.assertIsNone(problem)
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
@@ -20114,12 +20250,49 @@ class TestImpactHold(LedgerBase):
 
     def test_a_write_that_cannot_take_the_lock_is_retried_later_never_done_unlocked(self):
         with sb.impact_state_lock(self.world.state):
-            with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0.2):
+            with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
                 self.passes()
         self.assertEqual(self.writes, [])
         self.assertTrue([e for e in self.events("impact.error") if "locked" in e["detail"]["error"]])
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
         self.assertEqual(len(self.label_writes()), 1)
+
+    def test_the_clear_command_says_one_line_when_the_lock_is_held_and_changes_nothing(self):
+        self.passes()
+        before = list(self.writes)
+        with sb.impact_state_lock(self.world.state), mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
+            code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")
+        self.assertEqual(code, 1)
+        self.assertIn("locked by another process", err)
+        self.assertIn("try again", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual((self.writes, sb.read_impact_state(self.world.state)[0]["clears"]), (before, {}))
+
+    def test_a_clear_is_logged_inside_the_lock_and_refused_with_no_audit_sink(self):
+        self.passes()
+        engine = self.clear_engine()
+        seen = []
+        real = engine.audit.append
+
+        def checking(*a, **k):
+            if a[1] == "gate.hold_cleared":
+                with mock.patch.object(sb, "IMPACT_LOCK_SECONDS", 0):
+                    try:
+                        with sb.impact_state_lock(self.world.state):
+                            seen.append("lock was free")
+                    except RuntimeError:
+                        seen.append("lock held")
+            return real(*a, **k)
+        engine.audit.append = checking
+        sb.impact_clear_core(engine, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+        self.assertEqual(seen, ["lock held"])
+        silent = self.clear_engine()
+        silent.audit = None
+        writes = list(self.writes)
+        with self.assertRaises(RuntimeError) as caught:
+            sb.impact_clear_core(silent, self.route, "acme/app", 9, "the owner", "a false hold: the file is a fixture")
+        self.assertIn("no audit sink", str(caught.exception))
+        self.assertEqual(self.writes, writes, "refused before anything changed")
 
     def test_a_ledger_that_cannot_be_read_fails_toward_hold_and_says_so(self):
         self.floor_pr(path="src/app.py")                       # a clean floor: only the unknown rating can hold it
@@ -20149,7 +20322,7 @@ class TestImpactHold(LedgerBase):
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=9000)
         self.assertEqual(len(self.label_writes()), 2, "a new head is judged again, and the unknown rating holds it")
 
-    def test_a_corrupt_oversized_or_non_object_state_file_is_reported_not_read_as_empty(self):
+    def test_a_corrupt_oversized_or_non_object_state_file_is_reported_and_quarantined_never_overwritten(self):
         path = self.world.state / sb.IMPACT_STATE_FILE
         self.assertEqual(sb.read_impact_state(self.world.state)[1], None)                  # missing is fine
         for text, word in (("{not json", "not valid JSON"), ("[1, 2]", "not an object"), ("x" * (sb.IMPACT_STATE_MAX_BYTES + 5), "over")):
@@ -20157,10 +20330,72 @@ class TestImpactHold(LedgerBase):
             state, problem = sb.read_impact_state(self.world.state)
             self.assertEqual(state, {"clears": {}, "applied": {}})
             self.assertIn(word, problem)
-        path.write_text("{not json")
-        self.passes()                                          # fails toward hold, and the problem is audited
+        path.write_text("{not json, with another PR's clear in it")
+        self.passes()                                          # fails toward hold, the bad file is set aside, and the problem is audited
         self.assertEqual(len(self.label_writes()), 1)
-        self.assertTrue(self.events("impact.state_unreadable"))
+        (event,) = self.events("impact.state_unreadable")
+        aside = self.world.state / event["detail"]["quarantined"]
+        self.assertTrue(aside.name.startswith(sb.IMPACT_STATE_FILE + ".corrupt-"))
+        self.assertEqual(aside.read_text(), "{not json, with another PR's clear in it", "the original is kept, not overwritten")
+        state, problem = sb.read_impact_state(self.world.state)
+        self.assertIsNone(problem)
+        self.assertIn("acme/app#9", state["applied"], "and a fresh, valid state file was written")
+
+    def test_a_second_corruption_never_replaces_an_earlier_quarantined_copy_and_a_failed_rename_writes_nothing(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        asides = []
+        for text in ("{first bad", "{second bad"):
+            path.write_text(text)
+            engine = self.clear_engine()
+            with sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(engine, "bad")
+            asides = sorted(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))
+        self.assertEqual(sorted(a.read_text() for a in asides), ["{first bad", "{second bad"], "both kept, same second or not")
+        path.write_text("{third bad")
+        with mock.patch.object(os, "rename", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(RuntimeError) as caught, sb.impact_state_lock(self.world.state):
+                sb._impact_state_noted(self.clear_engine(), "bad")
+        self.assertIn("could not be set aside", str(caught.exception))
+        self.assertEqual(path.read_text(), "{third bad", "the corrupt file is untouched when it cannot be set aside")
+        (event,) = [e for e in self.events("impact.state_unreadable") if e["detail"].get("quarantine_failed")]
+        self.assertIn("Permission denied", event["detail"]["quarantine_failed"])
+
+    def test_every_kind_of_bad_state_file_goes_through_a_pass_and_a_bad_budget_is_refused(self):
+        path = self.world.state / sb.IMPACT_STATE_FILE
+        for text in ("[1, 2]", "x" * (sb.IMPACT_STATE_MAX_BYTES + 5)):
+            path.write_text(text)
+            self.passes()
+            self.assertEqual(len(list(self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"))) >= 1, True)
+            for aside in self.world.state.glob(sb.IMPACT_STATE_FILE + ".corrupt-*"):
+                aside.unlink()
+            path.unlink(missing_ok=True)
+            del self.engine_cached
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in (-1, True, "3", 1.5):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, impact_hold={"enabled": True, "calls_per_pass": bad}))
+
+    def test_a_missing_ledger_file_is_no_hold_not_unreadable(self):
+        """A regression guard: the read of a missing ledger is an empty ledger, so a clean floor is never held by the unknown-rating rule."""
+        self.floor_pr(path="src/app.py")
+        (self.world.state / "plan-ledger.jsonl").unlink(missing_ok=True)
+        (self.world.state / "plan-ledger.head").unlink(missing_ok=True)
+        self.assertEqual(sb.impact_review_hold(self.world.state, self.PR, LEDGER_HEAD), (False, None))
+        self.passes()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events("impact.ledger_unreadable"), [])
+
+    def test_impact_hold_calls_per_pass_is_accepted_and_bounds_the_pass(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        sb.validate_config(dict(base, impact_hold={"enabled": True, "calls_per_pass": 3}))
+        self.hold_config = {"enabled": True, "calls_per_pass": 0}
+        self.reconfigure()
+        self.passes()
+        self.assertEqual(self.writes, [], "a budget of 0 reads and writes nothing")
+        self.hold_config = {"enabled": True, "calls_per_pass": 30}
+        self.reconfigure()
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(len(self.label_writes()), 1)
 
     def test_control_characters_in_the_clear_reason_never_reach_the_record_or_the_log(self):
         self.passes()
@@ -20168,7 +20403,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 0, err)
         recorded = sb.read_impact_state(self.world.state)[0]["clears"]["acme/app#9"]["reason"]
         self.assertEqual(recorded, "a false hold [31m: the file is a fixture")
-        self.assertFalse(re.search(r"[\x00-\x1f\x7f]", json.dumps(self.events("gate.hold_cleared")[0]["detail"]["reason"]).replace("\\u001b", "")) and False)
+        self.assertEqual(self.events("gate.hold_cleared")[0]["detail"]["reason"], "a false hold [31m: the file is a fixture")
         self.assertNotIn("\x1b", self.events("gate.hold_cleared")[0]["detail"]["reason"])
 
     def test_the_hold_config_is_validated_and_the_label_is_in_the_held_set(self):
@@ -21091,6 +21326,48 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertEqual(self.codes(GOOD_PLAN, "(1) one; (2) two; (3) three").count("uncovered-clause"), 1)
         self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
         self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
+
+    def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
+        self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
+        self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: 2\nsize: S\n" + GOOD_PLAN), [], "a light plan may carry just `size: S`")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + GOOD_PLAN))
+        for valid in ("S", "M: a few hours, one file and a test", "L: about a day, three areas", "XL: several days, five areas and a migration", "xl, 3 days"):
+            with self.subTest(valid=valid):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (valid, GOOD_PLAN)), [])
+
+    def test_the_skill_and_the_template_state_the_size_rule_and_the_opt_in(self):
+        for path in (REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"):
+            text = path.read_text()
+            with self.subTest(path=path.name):
+                for phrase in ("t-shirt", "agent time", "plan-format: 2", "size: s"):
+                    self.assertIn(phrase, text.lower())
+                self.assertRegex(text, r"never (?:prefers|human-days)")
+
+    def test_the_opt_in_line_is_bounded_read_with_bold_keys_and_applies_from_format_2_up(self):
+        self.assertIn("missing-size", self.codes("plan-format: 3\n" + GOOD_PLAN))
+        self.assertEqual(self.codes("plan-format: 2\n**size:** S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("**plan-format:** 2\nsize: S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: " + "9" * 5000 + "\n" + GOOD_PLAN), [], "a huge number is not read, and does not crash the checker")
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: S, 1 week\n" + GOOD_PLAN))
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: M, 2 wk\n" + GOOD_PLAN))
+
+    def test_prose_that_starts_with_size_does_not_hide_the_real_line_and_a_code_fence_is_not_the_plan(self):
+        prose = "Size: one PR, a few files\n"
+        self.assertEqual(self.codes("plan-format: 2\n" + prose + "size: M\n" + GOOD_PLAN), [], "the repro: prose before the real line")
+        self.assertEqual(self.codes("plan-format: 2\nsize: M: a few hours\n" + prose + GOOD_PLAN), [])
+        self.assertIn("bad-size", self.codes("plan-format: 2\n" + prose + GOOD_PLAN), "only prose: the defect shows")
+        fenced = "```text\nplan-format: 2\nsize: huge\n```\n"
+        self.assertEqual(self.codes(fenced + GOOD_PLAN), [], "an example in a fence does not opt a plan in")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + fenced + GOOD_PLAN), "an example size in a fence is not the plan's size")
+        self.assertEqual(self.codes("plan-format: 2\n~~~\nsize: huge\n~~~\nsize: S\n" + GOOD_PLAN), [])
+
+    def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
+        for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
+                          ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (bad, GOOD_PLAN)), [code])
+        self.assertEqual(self.codes("size: M, 3 days\n" + GOOD_PLAN), [], "without the opt-in line the size is not read at all")
 
     def test_an_unchanged_scenario_is_needed_unless_the_plan_says_why_not(self):
         scen = GOOD_PLAN[:GOOD_PLAN.index("  - id: U1")] + "```\n"
@@ -30282,6 +30559,52 @@ class TestCaptainPrs(DecisionsBase):
         human = sb.decisions_view({"role": "human"}, {})
         self.assertEqual(sb.select_decisions(self.listed(), human), [])
 
+    def reports(self):
+        return [d for d in self.listed() if d.get("kind") == "report"]
+
+    def test_a_report_on_an_issue_that_names_the_pr_as_owner_repo_n_is_folded_into_the_pr_row(self):
+        self.ask_the_boss("Merge acme/api#7 now, or wait for the second review?", issue=2)
+        self.assertEqual(self.reports(), [], "no row of its own")
+        entry = self.only()
+        self.assertEqual((entry["kind"], entry["reported_by"]), ("captain", ["coder"]))
+        self.assertEqual(len(entry["reported_lines"]), 1)
+        self.assertTrue(entry["reported_lines"][0].startswith("coder: "))
+        self.assertIn("second review", entry["reported_lines"][0])
+
+    def test_a_report_that_names_the_pr_by_its_url_is_folded_too(self):
+        self.ask_the_boss("Is https://github.com/acme/api/pull/7 ready to merge?", issue=2)
+        self.assertEqual(self.reports(), [])
+        self.assertEqual(self.only()["reported_by"], ["coder"])
+
+    def test_the_report_row_is_gone_in_whichever_tier_the_pr_row_is_in(self):
+        self.ask_the_boss("Merge acme/api#7?", issue=2)
+        before = self.only()
+        self.assertEqual(before["tier"], "cos")
+        escalated = dict(before)
+        escalated["tier"] = "human"
+        folded = [escalated, {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder",
+                              "since": before["since"], "title": "question: Merge acme/api#7?"}]
+        sb.decision_core.fold_reports_into_prs(folded)
+        self.assertEqual([d["id"] for d in folded], [before["id"]], "the report row leaves with the PR row escalated")
+
+    def test_only_a_report_that_names_exactly_one_listed_pr_folds(self):
+        listed = lambda *n: [{"id": "pr:api#%d" % x, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": x, "since": "2027-01-01T00:00:00Z"} for x in n]
+        report = lambda text, i: {"id": "r%d" % i, "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder", "since": "2027-01-01T00:00:00Z", "title": text}
+        cases = [("names no PR", "which engine?"), ("two PRs", "acme/api#7 or acme/api#8?"), ("a bare number", "is #7 ready?"),
+                 ("a PR that is not listed", "acme/api#99 and the URL https://github.com/acme/api/pull/98"), ("another repo's PR 7", "acme/web#7 ready?")]
+        decisions = listed(7, 8) + [report(text, i) for i, (_, text) in enumerate(cases)]
+        sb.decision_core.fold_reports_into_prs(decisions)
+        self.assertEqual([d["id"] for d in decisions if d["kind"] == "report"], ["r%d" % i for i in range(5)], "all five stay")
+        self.assertTrue(all("reported_by" not in d for d in decisions if d["kind"] == "captain"))
+        both = listed(7) + [report("acme/api#7 and also https://github.com/acme/api/pull/7", 9)]
+        sb.decision_core.fold_reports_into_prs(both)
+        self.assertEqual([d["kind"] for d in both], ["captain"], "the same PR named twice is one PR")
+        self.assertEqual(sb.decision_core.named_prs("see HTTPS://GITHUB.COM/Acme/Api/pull/7 and Acme/Api#8"), {("acme/api", 7), ("acme/api", 8)})
+
+    def test_a_list_with_no_captain_pr_is_untouched(self):
+        decisions = [{"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 2, "agent": "coder", "since": "x", "title": "acme/api#7?"}]
+        self.assertEqual(sb.decision_core.fold_reports_into_prs(list(decisions)), decisions)
+
     def test_the_author_reviewing_their_own_pr_is_ignored(self):
         self.answer(captain_pr(reviews=[("coder-bot", "APPROVED", HEAD_A)]))
         self.assertEqual(self.only()["kind"], "notice")
@@ -32634,6 +32957,23 @@ class TestDecisionBaselineSeams(BaselineWorld):
         baseline_golden(self, "seams-headline-known-issue-title",
                         [{"id": d["id"], "ask": d["ask"], "repo": d["repo"], "headline": d["headline"]}
                          for d in found["decisions"]])
+
+    def test_an_issue_that_says_what_it_waits_for_is_ordered_in_the_derived_list_and_one_that_does_not_is_untouched(self):
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        mine = "me:awaiting-user"
+        issue = lambda n, body: {"number": n, "title": "issue %d" % n, "state": "open", "labels": [{"name": mine}], "updated_at": "2027-01-15T07:00:00Z", "body": body}
+        hub.note_awaiting_issue(API, issue(30, "## Decision required\nPick one.\nWaits for: #31\n"))
+        hub.note_awaiting_issue(API, issue(31, "## Decision required\nPick one.\n"))
+        decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
+        by = {d["ask"]: d for d in decisions if d["kind"] == "issue"}
+        self.assertEqual(by[30]["waits_for"], ["acme/api#31"])
+        self.assertNotIn("waits_for", by[31])
+        self.assertEqual((by[31]["depth"], by[31]["mark"], by[30]["depth"], by[30]["blocked_by"]), (0, "next", 1, by[31]["id"]))
+        hub.note_awaiting_issue(API, issue(30, "## Decision required\nPick one.\n"))   # the line is edited out
+        hub.note_awaiting_issue(API, issue(31, "## Decision required\nPick one.\n"))
+        decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
+        self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
 
     def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
@@ -37011,6 +37351,169 @@ class TestJobFacts(unittest.TestCase):
         self.assertIn("job start <name> -- <command>", sb.NUDGE_TEXT % ("platform", "fleet-switchboard", "fleet-switchboard", "fleet-switchboard"))
         for rel in ("agents/opencode/coder.md", "skills/fleet-coordination/SKILL.md", "docs/switchboard.md"):
             self.assertIn("job status", (REPO / rel).read_text(), rel)
+
+
+class TestDecisionOrder(unittest.TestCase):
+    """Ask #67: the order of decisions (`Waits for:`), parsed, arranged, and drawn by the CLI. Synthetic names only."""
+
+    def entry(self, ident, number, waits=None, repo="acme/api", since="2027-01-01T00:00:00Z", kind="issue"):
+        found = {"id": ident, "kind": kind, "repo": repo, "ask": number, "agent": "coder", "since": since, "tier": "human", "title": "Item %d" % number,
+                 "headline": "Item %d" % number}
+        if waits:
+            found["waits_for"] = waits
+        return found
+
+    def render(self, decisions):
+        return sb.format_decisions({"stale": False, "decisions": decisions, "errors": []}, sb.parse_iso("2027-01-02T00:00:00Z")).split("\n")
+
+    def test_the_waits_for_line_is_read_only_inside_the_decision_required_section(self):
+        body = ("Waits for: acme/api#9\n## Decision required\nPick one.\nWaits for: acme/api#2, #3, not-a-ref, ACME/Web#7, #3\n"
+                "## Notes\nWaits for: acme/api#4\n")
+        self.assertEqual(sb.decision_core.parse_waits_for(body, "acme/api"), ["acme/api#2", "acme/api#3", "acme/web#7"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nno line\n", "acme/api"), [])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required (re-verified)\r\nWaits for: #5\r\n", "acme/api"), ["acme/api#5"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nWaits for: #5\n", None), [], "a bare number with no repo to mean is skipped")
+        many = "## Decision required\nWaits for: " + ", ".join("#%d" % n for n in range(1, 30))
+        self.assertEqual(len(sb.decision_core.parse_waits_for(many, "acme/api")), sb.decision_core.WAITS_FOR_MAX)
+        self.assertEqual(sb.decision_core.parse_waits_for(None, "acme/api"), [])
+
+    def test_an_entry_carries_waits_for_only_when_the_issue_names_one(self):
+        item = lambda n, waits: {"kind": "issue", "title": "t%d" % n, "ask": n, "agent": None, "since": 100.0, "seed": "issue:acme/api#%d" % n,
+                                 "bare": True, "repo": "acme/api", "tier": "human", "waits_for": waits}
+        entries = sb.decision_core.build_entries([item(1, ["acme/api#2"]), item(2, [])], ["d1", "d2"], "acme/api", lambda repo, number: None)
+        by = {e["ask"]: e for e in entries}
+        self.assertEqual(by[1]["waits_for"], ["acme/api#2"])
+        self.assertNotIn("waits_for", by[2])
+
+    def test_a_blocked_item_is_indented_under_what_it_waits_for_and_the_first_actionable_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2), self.entry("#3", 3, ["acme/api#1"]), self.entry("#4", 4)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#2 +waiting 1d +coder +Item 2  \[next\]$")
+        self.assertRegex(lines[1], r"^   #1 +waiting 1d +coder +Item 1  \[waits for #2\]$")
+        self.assertRegex(lines[2], r"^      #3 +waiting 1d +coder +Item 3  \[waits for #1\]$")
+        self.assertRegex(lines[3], r"^#4 +waiting 1d +coder +Item 4$")
+        self.assertEqual(decisions[1]["mark"], "next")
+        self.assertEqual([d.get("mark") for d in decisions if d["id"] != "#2"], [None, None, None])
+
+    def test_a_cycle_is_drawn_at_the_top_marked_and_never_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#1"]), self.entry("#3", 3)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#1 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[1], r"^#2 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[2], r"^#3 .*\[next\]$", "the first item that CAN be done is next, not a cycle member")
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2"]])
+
+    def test_a_self_wait_and_a_three_cycle_are_cycles_and_the_rest_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#3"]), self.entry("#3", 3, ["acme/api#1"]),
+                     self.entry("#4", 4, ["acme/api#4"]), self.entry("#5", 5, ["acme/api#6"]), self.entry("#6", 6, ["acme/api#5"]), self.entry("#7", 7)]
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2", "acme/api#3"], ["acme/api#4"], ["acme/api#5", "acme/api#6"]])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d.get("mark")) for d in sb.decision_core.arranged(decisions)],
+                         [("#1", "cycle"), ("#2", "cycle"), ("#3", "cycle"), ("#4", "cycle"), ("#5", "cycle"), ("#6", "cycle"), ("#7", "next")])
+
+    def test_a_wait_for_something_that_is_not_an_open_decision_blocks_nothing(self):
+        decisions = [self.entry("#1", 1, ["acme/api#99"]), self.entry("#2", 2)]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d["depth"], d.get("mark")) for d in sb.decision_core.arranged(decisions)], [("#1", 0, "next"), ("#2", 0, None)])
+
+    def test_a_list_in_which_nothing_waits_is_exactly_what_it_was(self):
+        decisions = [self.entry("#2", 2, since="2027-01-01T06:00:00Z"), self.entry("#1", 1)]
+        before = self.render([dict(d) for d in decisions])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(self.render(decisions), before)
+        self.assertTrue(all(set(d) == {"id", "kind", "repo", "ask", "agent", "since", "tier", "title", "headline"} for d in decisions), "no field was added")
+        self.assertNotIn("next", "\n".join(before))
+
+    def test_a_chain_deeper_than_the_cap_stays_at_the_cap_and_is_still_a_chain(self):
+        n = sb.decision_core.ORDER_DEPTH_MAX + 3
+        decisions = [self.entry("#%d" % i, i, ["acme/api#%d" % (i + 1)] if i < n else None) for i in range(1, n + 1)]
+        sb.decision_core.annotate_order(decisions)
+        depths = [d["depth"] for d in sb.decision_core.arranged(decisions)]
+        self.assertEqual(depths, [min(i, sb.decision_core.ORDER_DEPTH_MAX) for i in range(n)])
+        self.assertEqual(max(depths), sb.decision_core.ORDER_DEPTH_MAX)
+
+    def test_the_docs_describe_the_line_the_next_mark_and_the_two_sweep_findings(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text.split("### The order of decisions (`Waits for:`)", 1)[1]
+        for needle in ("Waits for:", "`next`", "`cycle`", "**S7**", "**S8**", "writes nothing to GitHub"):
+            self.assertIn(needle, section)
+
+    def test_a_report_is_never_a_target_so_nothing_waits_under_it(self):
+        decisions = [self.entry("r1", 5, kind="report"), self.entry("#6", 6, ["acme/api#5"])]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(decisions[1]["depth"], 0, "a report is not an issue decision: nothing waits under it")
+        self.assertEqual(decisions[0].get("mark"), None)
+
+
+ORDER_PANEL_HARNESS = r"""
+import * as d from "%(url)s";
+const nowMs = Date.parse("2027-01-02T00:00:00Z");
+const entry = (id, n, more = {}) => ({ id, kind: "issue", repo: "acme/api", ask: n, agent: "coder", since: "2027-01-01T0" + n + ":00:00Z", tier: "human", title: "Item " + n, headline: "Item " + n, ...more });
+const snap = (decisions) => ({ status: "ok", errors: [], decisions, ageMs: 0 });
+const plainList = [entry("#1", 1), entry("#2", 2)];
+const ordered = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 1, depth: 1, blocked_by: "#2" }), entry("#2", 2, { order: 0, depth: 0, mark: "next" }),
+                 entry("#3", 3, { order: 2, depth: 0 })];
+const cyc = [entry("#1", 1, { waits_for: ["acme/api#2"], order: 0, depth: 0, mark: "cycle" }), entry("#2", 2, { waits_for: ["acme/api#1"], order: 1, depth: 0, mark: "cycle" })];
+const text = (list, v3) => d.styledText(d.styledRows(snap(list), nowMs, 34, d.HUMAN_VIEW, { v3, env: {} }), 34);
+console.log(JSON.stringify({
+  plain: d.viewLines(d.buildView(snap(ordered), nowMs)),
+  styled: text(ordered, true),
+  styledV2: text(ordered, false),
+  cycle: text(cyc, true),
+  noOrderPlain: d.viewLines(d.buildView(snap(plainList), nowMs)),
+  noOrderStyled: text(plainList, true),
+  notes: [d.orderNote({ mark: "next" }), d.orderNote({ mark: "cycle" }), d.orderNote({ blocked_by: "#2" }), d.orderNote({}), d.depthOf({ depth: 9 }), d.depthOf({ depth: "x" }), d.depthOf({})],
+  hostile: d.orderNote({ blocked_by: "#2\u001b[31m" }),
+}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed: the decisions plugin tests need it (skipped, not passed)")
+class TestDecisionsPanelOrder(unittest.TestCase):
+    """Ask #67: the panel draws the order the daemon gave (optional fields), and a list without them exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "order-harness.mjs"
+            script.write_text(ORDER_PANEL_HARNESS % {"url": (DECISIONS_PLUGIN / "decisions.mjs").resolve().as_uri()})
+            done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        cls.r = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_plain_view_draws_the_order_nested_with_next_and_waits_for(self):
+        lines = self.r["plain"]
+        at = {name: i for i, name in enumerate(lines)}
+        heads = [l for l in lines if l.strip().startswith("#")]
+        self.assertEqual([h.strip().split(" ")[0] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
+        self.assertIn("#2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("#2")][0].split(" ")[1]), lines)
+        blocked = [h for h in heads if h.strip().startswith("#1")][0]
+        self.assertTrue(blocked.startswith("  #1 "), "indented under what it waits for")
+        self.assertTrue(blocked.endswith("\u00b7 waits for #2"))
+
+    def test_the_styled_panel_indents_the_blocked_item_and_marks_next_and_cycle(self):
+        styled = self.r["styled"]
+        item1 = [i for i, l in enumerate(styled) if l.startswith("  ") and "Item 1" in l]
+        self.assertTrue(item1, styled)
+        self.assertTrue(any("#2" in l and "next" in l for l in styled), styled)
+        self.assertTrue(any("#1" in l and "waits for #2" in l and l.startswith("  ") for l in styled), styled)
+        self.assertLess([i for i, l in enumerate(styled) if "Item 2" in l][0], item1[0], "the blocker is drawn first")
+        self.assertTrue(sum("cycle" in l for l in self.r["cycle"]) == 2 and not any("next" in l for l in self.r["cycle"]), self.r["cycle"])
+        self.assertTrue(all(len(l) <= 34 for l in styled + self.r["cycle"]), "nothing wider than the sidebar")
+
+    def test_a_list_without_the_fields_is_drawn_exactly_as_before(self):
+        for name in ("noOrderPlain", "noOrderStyled"):
+            joined = "\n".join(self.r[name])
+            self.assertNotIn("next", joined)
+            self.assertNotIn("waits for", joined)
+            self.assertFalse(any(l.startswith("  ") and "Item" in l for l in self.r[name]), name)
+
+    def test_the_helpers_cap_the_depth_and_strip_control_characters(self):
+        self.assertEqual(self.r["notes"], [" \u00b7 next", " \u00b7 cycle", " \u00b7 waits for #2", "", sb.decision_core.ORDER_DEPTH_MAX, 0, 0],
+                         "the panel's depth cap is the core's")
+        self.assertNotIn("\u001b", self.r["hostile"])
 
 
 class TestAgentsVerify(unittest.TestCase):
