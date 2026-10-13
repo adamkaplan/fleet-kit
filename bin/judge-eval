@@ -191,7 +191,7 @@ def build_context(v2, session, at_ms, turns):
 def cmd_fetch_context(args):
     refuse_inside_repo(args.out, "the context file")
     config = sb.load_config()
-    v2 = sb.V2Client(config["opencode"], config["opencode_env"], subprocess.run, 30)
+    v2 = sb.V2Client(config["opencode"], config["opencode_env"], subprocess.run, 30, transport=config["v2_transport"])
     rows = read_jsonl(args.rows)
     found, failed = {}, 0
     for row in rows:
