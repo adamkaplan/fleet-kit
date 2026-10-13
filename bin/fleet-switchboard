@@ -41,6 +41,9 @@ Rules this file keeps from the start:
 Python 3.9+, standard library only.
 """
 import argparse
+import base64
+import http.client
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
@@ -804,7 +807,8 @@ class V2Error(Exception):
     """A v2 call that did not return usable JSON.
 
     reason: "http" (v2 answered with an HTTP error), "exit" (non-zero exit, no
-    HTTP status), "timeout", "bad_json" or "unavailable" (could not run).
+    HTTP status), "timeout", "bad_json", "unavailable" (could not run), "too_large" (a reply over the cap) or "backoff" (an optional
+    read skipped while the service is slow).
     """
 
     def __init__(self, reason, status=None, detail=None):
@@ -829,19 +833,360 @@ def valid_description(text):
         and "\n" not in text and "\r" not in text
 
 
+# ---------------------------------------------------------------- the v2 transport: HTTP to the background service, and backpressure
+#
+# `opencode api <op>` starts a whole process per call (0.13 to 1.5 s measured, against 5 to 17 ms for the same call over HTTP, with identical
+# JSON). The background service writes its address and password to `<state>/opencode/service.json` (mode 0600); the daemon talks to it directly
+# over loopback, keeps one connection alive for reads, and falls back to the CLI on ANY trouble with the HTTP route (the CLI also starts a
+# stopped service, so the fallback is also the recovery). Writes use a fresh connection and are never replayed after they may have been
+# received. The password is sent only to a loopback address and is never logged, audited, printed or put in an error.
+# The operation table was read from the service's own /openapi.json (OpenCode 2.0.24); an operation not in it, or a path parameter it does not
+# know, goes through the CLI. FLEET_SWITCHBOARD_V2_CLI=1 turns the HTTP route off.
+#
+# Backpressure: V2Breaker watches the latency of every call. When calls are slow (p95 over V2_SLOW_SECONDS) or time out in a row it opens for an
+# exponentially growing time (V2_BACKOFF_BASE .. V2_BACKOFF_MAX): OPTIONAL reads are skipped (V2Error "backoff": the callers already hold on a
+# V2Error) while writes and the reads a delivery or a blocked worker needs go on; it resumes gradually (one probe at a time, V2_RECOVER_OK good
+# probes to close). Fail mode: OPEN for essential calls on purpose (a wake must not be lost to a slow service), closed for optional reads.
+
+V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters, query parameters)
+    "server.info": ("GET", "/api/info", (), ()),
+    "session.active": ("GET", "/api/session/active", (), ()),
+    "session.create": ("POST", "/api/session", (), ()),
+    "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
+    "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
+    "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
+    "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
+    "session.inbox.update": ("PATCH", "/api/session/{sessionID}/inbox/{inboxID}", ("sessionID", "inboxID"), ()),
+    "session.interrupt": ("POST", "/api/session/{sessionID}/interrupt", ("sessionID",), ("resume",)),
+    "session.permission.list": ("GET", "/api/session/{sessionID}/permission", ("sessionID",), ()),
+    "session.permission.reply": ("POST", "/api/session/{sessionID}/permission/{requestID}/reply", ("sessionID", "requestID"), ()),
+    "session.form.list": ("GET", "/api/session/{sessionID}/form", ("sessionID",), ()),
+    "session.form.reply": ("POST", "/api/session/{sessionID}/form/{formID}/reply", ("sessionID", "formID"), ()),
+    "session.prompt": ("POST", "/api/session/{sessionID}/prompt", ("sessionID",), ()),
+    "session.synthetic": ("POST", "/api/session/{sessionID}/synthetic", ("sessionID",), ()),
+    "experimental.session.import": ("POST", "/api/experimental/session/import", (), ()),
+}
+V2_ESSENTIAL_READS = ("session.inbox.list", "session.permission.list", "session.form.list")   # a delivery or a blocked worker needs these
+V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
+V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
+V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
+V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
+V2_SLOW_MIN_SAMPLES = 8
+V2_SLOW_WINDOW = 20
+V2_TIMEOUT_STREAK = 3             # timeouts in a row that open it
+V2_BACKOFF_BASE = 10.0
+V2_BACKOFF_MAX = 300.0
+V2_RECOVER_OK = 3                 # good probes in a row that close it
+V2_LINK_STATUS_FILE = "v2-link.json"
+V2_LINK_WRITE_SECONDS = 60
+
+
+class V2Unreachable(Exception):
+    """The HTTP route cannot serve this call (no service file, a stale one, refused, a bad password twice): the caller uses the CLI."""
+
+
+def v2_service_file(env):
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "opencode" / "service.json"
+
+
+class V2Http:
+    """One keep-alive connection for reads to the OpenCode service; see the section comment."""
+
+    def __init__(self, service_file, timeout, alive=None):
+        self.file = Path(service_file)
+        self.timeout = timeout
+        self.alive = alive or self._pid_alive
+        self._info = None        # (host, port, authorization) once read; never logged
+        self._conn = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _pid_alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True   # not ours to signal, so it exists
+        return True
+
+    def _load(self):
+        try:
+            with open(str(self.file), "rb") as handle:
+                raw = handle.read(V2_SERVICE_FILE_MAX + 1)
+            if len(raw) > V2_SERVICE_FILE_MAX:
+                raise ValueError("too large")
+            found = json.loads(raw.decode("utf-8"))
+            url = urllib.parse.urlsplit(found["url"])
+            password, pid = found["password"], found.get("pid")
+            if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1") or not url.port:
+                raise ValueError("not a loopback http address")   # the password goes nowhere else
+            if not isinstance(password, str) or not 0 < len(password) <= 512 or re.search(r"[\x00-\x1f\x7f]", password):
+                raise ValueError("no usable password")
+            host, port = url.hostname, url.port
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise V2Unreachable("no usable service file") from None
+        if isinstance(pid, int) and not self.alive(pid):
+            raise V2Unreachable("the service file names a process that is gone")
+        token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
+        self._info = (host, port, "Basic " + token)
+
+    def close(self):
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def request(self, method, target, body=None):
+        """(status, text). Raises V2Unreachable (use the CLI) or V2Error (timeout, too large, or a write whose fate is unknown)."""
+        with self._lock:
+            for attempt in (0, 1):
+                if self._info is None:
+                    self._load()
+                try:
+                    return self._once(method, target, body)
+                except _V2Unauthorized:
+                    self._info = None   # the service restarted with a new password: read the file again, once
+                    self.close()
+                    if attempt:
+                        raise V2Unreachable("the service refused the password twice") from None
+                except V2Error:
+                    raise
+                except (OSError, http.client.HTTPException) as err:
+                    self.close()
+                    if isinstance(err, socket.timeout):
+                        raise V2Error("timeout", None, "no answer within %ss" % self.timeout) from None
+                    if method != "GET" and getattr(err, "sent", True):
+                        raise V2Error("unavailable", None, "the service dropped a %s (it may or may not have been received)" % method) from None
+                    self._info = None   # it may have moved: read the file again, once
+                    if attempt:
+                        raise V2Unreachable("the service does not answer") from None
+        raise V2Unreachable("the service does not answer")
+
+    def _once(self, method, target, body):
+        host, port, auth = self._info
+        reuse = method == "GET" and self._conn is not None
+        conn = self._conn if reuse else http.client.HTTPConnection(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
+        headers = {"Authorization": auth, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        sent = False
+        try:
+            conn.connect() if conn.sock is None else None
+            sent = True   # from here on a write may have reached the service
+            conn.request(method, target, body=data, headers=headers)
+            response = conn.getresponse()
+            raw = response.read(V2_HTTP_MAX_BODY + 1)
+        except (OSError, http.client.HTTPException) as err:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            if conn is self._conn:
+                self._conn = None
+            err.sent = sent
+            raise
+        if len(raw) > V2_HTTP_MAX_BODY:
+            conn.close()
+            self._conn = None
+            raise V2Error("too_large", None, "a reply over %d bytes was refused" % V2_HTTP_MAX_BODY)
+        if response.status == 401:
+            conn.close()
+            self._conn = None
+            raise _V2Unauthorized()
+        if method == "GET" and not response.will_close:
+            self._conn = conn
+        else:
+            conn.close()
+            if conn is self._conn:
+                self._conn = None
+        return response.status, raw.decode("utf-8", "replace")
+
+
+class _V2Unauthorized(Exception):
+    pass
+
+
+class V2Breaker:
+    """Latency-driven backoff for the calls to the service (see the section comment). `record(seconds, timed_out)` returns an event or None:
+    {"event": "v2.backoff", "episode", "reason", "seconds"} when it opens, {"event": "v2.resume", "episode"} when it closes."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.samples = []
+        self.timeouts = 0
+        self.state = "closed"      # closed | open (waiting) | probing
+        self.until = 0.0
+        self.level = 0
+        self.good = 0
+        self.episode = 0
+        self.skipped = 0
+        self.probe_out = False
+
+    def p95(self):
+        if not self.samples:
+            return None
+        ordered = sorted(self.samples)
+        return ordered[min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)]
+
+    def allows(self, essential):
+        """Whether this call may go now. Essential calls always may; an optional one waits out the backoff, then one probe at a time."""
+        if essential or self.state == "closed":
+            return True
+        if self.state == "open" and self.clock() >= self.until and not self.probe_out:
+            self.state, self.probe_out = "probing", True
+            return True
+        if self.state == "probing" and not self.probe_out:
+            self.probe_out = True
+            return True
+        self.skipped += 1
+        return False
+
+    def record(self, seconds, timed_out):
+        slow = timed_out or seconds > V2_SLOW_SECONDS
+        if self.state == "probing" and self.probe_out:
+            self.probe_out = False
+            if slow:
+                self.level += 1
+                self.state, self.good, self.until = "open", 0, self.clock() + self._wait()
+                return {"event": "v2.backoff", "episode": self.episode, "reason": "a probe was slow or timed out", "seconds": int(self._wait())}
+            self.good += 1
+            if self.good >= V2_RECOVER_OK:
+                self.state, self.level, self.good, self.samples, self.timeouts = "closed", 0, 0, [], 0
+                return {"event": "v2.resume", "episode": self.episode}
+            return None
+        self.samples = (self.samples + [seconds])[-V2_SLOW_WINDOW:]
+        self.timeouts = self.timeouts + 1 if timed_out else 0
+        if self.state != "closed":
+            return None   # an essential call during a backoff: it is recorded, it changes nothing
+        reason = None
+        if self.timeouts >= V2_TIMEOUT_STREAK:
+            reason = "%d calls in a row timed out" % self.timeouts
+        elif len(self.samples) >= V2_SLOW_MIN_SAMPLES and self.p95() > V2_SLOW_SECONDS:
+            reason = "p95 latency %.1f s is over %g s" % (self.p95(), V2_SLOW_SECONDS)
+        if reason is None:
+            return None
+        self.episode += 1
+        self.level, self.good, self.state = 0, 0, "open"
+        self.until = self.clock() + self._wait()
+        return {"event": "v2.backoff", "episode": self.episode, "reason": reason, "seconds": int(self._wait())}
+
+    def _wait(self):
+        return min(V2_BACKOFF_MAX, V2_BACKOFF_BASE * (2 ** self.level))
+
+
 class V2Client:
-    """The one client for OpenCode v2. Every call is `<binary> api <operation>`."""
+    """The one client for OpenCode v2. A call goes over HTTP to the background service when it can (see the transport section above), else
+    through `<binary> api <operation>`; every call is timed by the breaker."""
 
     DELIVERIES = ("queue", "steer")
     ORDERS = ("desc", "asc")
 
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20):
+    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, http=None, clock=time.monotonic):
         self.binary = binary
         self.env = dict(env or {})
         self.runner = runner
         self.timeout = timeout
+        self.clock = clock
+        self.breaker = V2Breaker(clock)
+        self.on_event = None      # callable(name, detail): the engine's audit of `v2.backoff` and `v2.resume`
+        self.state_dir = None     # set for the daemon: where `v2-link.json` (what `status` shows) is written
+        self.counts = {"http": 0, "cli": 0, "fallback": 0, "skipped": 0}
+        self._link_written = 0.0
+        if http is None and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
+            merged = dict(os.environ)
+            merged.update(self.env)
+            http = V2Http(v2_service_file(merged), timeout)   # a real run only: a fake runner stands for the CLI
+        self.http = http
+
+    def _is_essential(self, operation, params):
+        spec = V2_HTTP_OPERATIONS.get(operation)
+        if spec is None or spec[0] != "GET" or operation in V2_ESSENTIAL_READS:
+            return True
+        return operation == "session.message.list" and (params or {}).get("type") == "synthetic"   # the delivery rule's key read
 
     def _call(self, operation, params=None, data=None, envelope=False):
+        if not self.breaker.allows(self._is_essential(operation, params)):
+            self.counts["skipped"] += 1
+            raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
+        started = self.clock()
+        timed_out = False
+        try:
+            text = self._transport(operation, params, data)
+        except V2Error as err:
+            timed_out = err.reason == "timeout"
+            self._record(self.clock() - started, timed_out)
+            raise
+        self._record(self.clock() - started, False)
+        return self._decode(operation, text, envelope)
+
+    def _record(self, seconds, timed_out):
+        event = self.breaker.record(seconds, timed_out)
+        if event is not None and self.on_event is not None:
+            try:
+                self.on_event(event["event"], {k: v for k, v in event.items() if k != "event"})
+            except Exception:   # an audit trouble never fails a call
+                pass
+        self._write_link(event is not None)
+
+    def _write_link(self, forced=False):
+        """What `status` shows of the link, written by the daemon only, at most once a minute unless the breaker changed."""
+        if self.state_dir is None:
+            return
+        moment = time.time()
+        if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
+            return
+        self._link_written = moment
+        body = {"at": int(moment), "transport": "http" if self.http is not None else "cli", "calls": dict(self.counts),
+                "breaker": self.breaker.state, "episodes": self.breaker.episode,
+                "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
+        try:
+            target = Path(self.state_dir) / V2_LINK_STATUS_FILE
+            temp = target.with_name("%s.%d.tmp" % (V2_LINK_STATUS_FILE, os.getpid()))
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(body, sort_keys=True))
+            os.replace(str(temp), str(target))
+        except OSError:
+            pass   # a status line is best effort
+
+    def _transport(self, operation, params, data):
+        """The reply text of one call: over HTTP when the service answers, else through the CLI (which also starts a stopped service)."""
+        spec = V2_HTTP_OPERATIONS.get(operation)
+        if self.http is not None and spec is not None:
+            target = self._target(spec, params)
+            if target is not None:
+                try:
+                    status, text = self.http.request(spec[0], target, data)
+                except V2Unreachable:
+                    self.counts["fallback"] += 1
+                else:
+                    self.counts["http"] += 1
+                    if status >= 400:
+                        raise V2Error("http", status, _one_line(text) or "HTTP %d" % status)
+                    return text
+        self.counts["cli"] += 1
+        return self._cli(operation, params, data)
+
+    @staticmethod
+    def _target(spec, params):
+        """The request path and query of one call, or None when a parameter is one the table does not know (then the CLI decides)."""
+        method, template, path_names, query_names = spec
+        given = {name: value for name, value in (params or {}).items() if value is not None}
+        if set(given) - set(path_names) - set(query_names) or any(name not in given for name in path_names):
+            return None
+        path = template
+        for name in path_names:
+            path = path.replace("{%s}" % name, urllib.parse.quote(str(given[name]), safe=""))
+        query = [(name, str(given[name])) for name in query_names if name in given]
+        return path + ("?" + urllib.parse.urlencode(query) if query else "")
+
+    def _cli(self, operation, params, data):
         argv = [self.binary, "api", operation]
         for name, value in (params or {}).items():
             if value is not None:
@@ -873,7 +1218,11 @@ class V2Client:
                 # v2 put the error body on stdout and `HTTP <code> <reason>` on stderr.
                 raise V2Error("http", int(match.group(1)), _one_line(stdout) or _one_line(stderr))
             raise V2Error("exit", None, _one_line(stderr) or _one_line(stdout) or "exit %d" % result.returncode)
-        if not stdout.strip():
+        return stdout
+
+    @staticmethod
+    def _decode(operation, stdout, envelope):
+        if not (stdout or "").strip():
             return None
         try:
             body = json.loads(stdout)
@@ -882,6 +1231,11 @@ class V2Client:
         if isinstance(body, dict) and "data" in body:
             return body if envelope else body["data"]  # PR 8: paging needs the cursor beside the data
         return body
+
+    @staticmethod
+    def _limit(limit):
+        """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
+        return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
 
     def server_info(self):
         return self._call("server.info")
@@ -905,7 +1259,7 @@ class V2Client:
         if order is not None and order not in self.ORDERS:
             raise ValueError("order must be one of %s" % ", ".join(self.ORDERS))
         return self._call("session.message.list", {
-            "sessionID": session_id, "limit": limit, "order": order, "type": type, "cursor": cursor})
+            "sessionID": session_id, "limit": self._limit(limit), "order": order, "type": type, "cursor": cursor})
 
     def message_page(self, session_id, limit=None, type=None, cursor=None):
         """PR 8: one page of `session.message.list` with its cursor: (messages, cursor).
@@ -917,7 +1271,7 @@ class V2Client:
         if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_LIMIT):
             raise ValueError("cursor must be v2's opaque token (a non-empty string), got %r" % (cursor,))
         body = self._call("session.message.list", {
-            "sessionID": session_id, "limit": limit, "type": type, "cursor": cursor}, envelope=True)
+            "sessionID": session_id, "limit": self._limit(limit), "type": type, "cursor": cursor}, envelope=True)
         if isinstance(body, dict):
             found = body.get("cursor")
             return (body["data"] if isinstance(body.get("data"), list) else []), \
@@ -1793,6 +2147,8 @@ class Switchboard:
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
+            v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
@@ -10296,6 +10652,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
         report["stopped_news"] = stopped_news_summary(state, now())
@@ -10481,6 +10838,7 @@ def format_status(report):
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
+    lines.extend("      " + report["v2_link"] for _ in [0] if report.get("v2_link"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
@@ -10604,6 +10962,8 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"])
+    if actor == "daemon":
+        v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
     engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
@@ -14208,6 +14568,22 @@ def ci_record_status_line(state_dir, now_ts):
     return "ci-record: last pass %s (%s ago), recorded %d since the daemon started%s" % (
         iso(at), "%d s" % ago if ago < 120 else "%d min" % (ago // 60), recorded,
         "; last record " + iso(last) if isinstance(last, (int, float)) else "")
+
+
+def v2_link_status_line(state_dir, now_ts):
+    """The `status` line for the daemon's link to the OpenCode service, or None when the daemon has not written one."""
+    try:
+        raw = json.loads((Path(state_dir) / V2_LINK_STATUS_FILE).read_text())
+        at, calls = float(raw["at"]), raw["calls"]
+        transport, breaker = str(raw["transport"])[:8], str(raw["breaker"])[:8]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ago = max(0, int(now_ts - at))
+    p95 = raw.get("p95_ms")
+    return "v2-link: %s (%s ago): %s calls over HTTP, %s through the CLI (%s fell back); breaker %s%s%s" % (
+        transport, "%d s" % ago if ago < 120 else "%d min" % (ago // 60), calls.get("http"), calls.get("cli"), calls.get("fallback"),
+        "CLOSED" if breaker == "closed" else "OPEN: optional reads are being skipped (v2.backoff)" if breaker != "closed" else breaker,
+        "; p95 %d ms" % p95 if isinstance(p95, int) else "", "; %s episode(s) so far" % raw.get("episodes") if raw.get("episodes") else "")
 
 
 def cmd_gates_preflight(args, runner, now):
