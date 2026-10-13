@@ -2273,9 +2273,10 @@ class SentLedger:
         if self.path is None:
             return {}, {}
         try:
-            if self.path.stat().st_size > SENT_FILE_MAX:
+            with open(str(self.path)) as handle:
+                text = handle.read(SENT_FILE_MAX + 1)   # never more than the cap: the file can grow between a stat and a read
+            if len(text) > SENT_FILE_MAX:
                 raise V2Error("ledger_corrupt", None, "sent-keys.json is larger than any ledger the daemon writes: nothing is sent until it is moved aside")
-            text = self.path.read_text()
         except FileNotFoundError:
             return {}, {}
         except OSError as err:
@@ -2301,9 +2302,9 @@ class SentLedger:
 
     def update(self, change):
         """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically. A ledger that cannot be
-        locked, read or written raises (V2Error): the caller does not send."""
+        locked, read or written raises (V2Error): the caller does not send. With no state directory there is nowhere to keep it: that fails closed too."""
         if self.path is None:
-            return
+            raise V2Error("ledger_unwritable", None, "v2_light needs a state directory for sent-keys.json: nothing is sent without one")
         try:
             fd = os.open(str(self.lock), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "a") as guard:
@@ -2326,9 +2327,18 @@ class SentLedger:
             raise V2Error("ledger_unwritable", None, "sent-keys.json cannot be written (%s): nothing is sent until it can be" % err)
 
     def reserve(self, session_id, keys, created):
+        """Reserve `keys` unless one is already in the ledger (sent or of unknown fate): True when reserved, False when another sender
+        (the daemon, a CLI `send`) already has it. One locked step, so two senders never both write the same key."""
+        taken = []
+
         def change(sessions, unknown):
+            have = set(sessions.get(session_id, {})) | set(unknown.get(session_id, {}))
+            if have & set(keys):
+                taken.append(True)
+                return
             unknown.setdefault(session_id, {}).update({key: created for key in keys})
         self.update(change)
+        return not taken
 
     def confirm(self, session_id, keys, created):
         def change(sessions, unknown):
@@ -2857,16 +2867,19 @@ class Switchboard:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
                               "already has is unknown" % (READ_LIMIT, recipient, iso(since)))
-        if self.light and pending:
-            # v2_light: nothing reads a person's prompt in the background, but a recipient with something pending is about to be written to:
-            # the engagement gate gets its one small read now (never on a timer), so a note is still a note and a wake still a wake.
+        plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        if self.light and plan is not None and plan.action in ("note", "wake"):
+            # v2_light: nothing reads a person's prompt in the background. A delivery is about to happen (the batch is ripe and nothing
+            # holds it): only now does the engagement gate get its one small read, so a note is still a note and a wake still a wake.
+            # A plan that waits or holds reads nothing.
             try:
                 observation.last_human_prompt = self.last_human_prompt(
                     observation.session_id, now, inbox=(observation.fleet or {}).get("role") == "chief-of-staff", info={}, fresh=True)
             except V2Error as err:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read %s's transcript: %s" % (recipient, err))
-        return decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+            plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        return plan
 
     # -- deliver
 
@@ -2928,8 +2941,8 @@ class Switchboard:
                 reply = self.v2.interrupt(observation.session_id, False)
                 result["interrupted"] = reply.get("interrupted") if isinstance(reply, dict) else None
             detail["interrupted"] = True
-        if self.light:
-            self.sent.reserve(observation.session_id, keys, self.now())   # before the write: a crash after it leaves the fate unknown, never "not sent"
+        if self.light and not self.sent.reserve(observation.session_id, keys, self.now()):   # before the write: a crash after it leaves the fate unknown, never "not sent"
+            return {"sent": False, "action": "delivered", "reason": "another sender already holds these keys in the sent-keys ledger"}
         try:
             with self._external("v2.synthetic", plan.recipient, detail) as result:
                 record = self.v2.synthetic(observation.session_id, text,

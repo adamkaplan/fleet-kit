@@ -37756,6 +37756,44 @@ class TestV2Light(Base):
         world.tick(5)
         self.assertEqual([s["keys"] for s in world.engine.run_pass()["sent"]], [["lab.fact:1"]])
 
+    def test_a_key_another_sender_holds_is_not_sent_again(self):
+        world = self.world(agents=("platform",))
+        sid = world.sessions["platform"]
+        self.assertTrue(sb.SentLedger(world.state).reserve(sid, ["lab.fact:1"], 1.0))
+        self.assertFalse(sb.SentLedger(world.state).reserve(sid, ["lab.fact:1"], 2.0), "the second sender is refused")
+        world.fact("platform", "lab.fact:1")
+        world.tick(90)
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+        self.assertEqual(len(world.admissions("platform")), 0)
+
+    def test_a_ripe_delivery_reads_the_prompt_once_and_a_waiting_or_held_plan_reads_nothing(self):
+        world = self.world(agents=("platform",))
+        world.fact("platform", "lab.fact:1")
+        world.tick(5)   # inside the batch window: a plan that waits
+        mark = len(world.v2.calls)
+        report = world.engine.run_pass()
+        self.assertEqual(report["waiting"], ["platform"])
+        self.assertEqual(self.ops(world, mark).get("session.message.list", 0), 0, "waiting: no read")
+        world.tick(90)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        reads = self.ops(world, mark).get("session.message.list", 0)
+        self.assertTrue(1 <= reads <= 2, "ripe: the read that decides note or wake, and the one before the write (%d)" % reads)
+
+    def test_a_stop_a_summary_and_a_lapsed_note_read_nothing_and_say_nothing(self):
+        world = self.world(agents=("platform",))
+        engine, sid = world.engine, world.sessions["platform"]
+        world.v2._message(world.v2.sessions[sid], "assistant", "all done", None, world.clock.now())
+        source = sb.WorkerFacts()
+        source.bind(engine)
+        observation = sb.Observation("platform", sid, world.panes["platform"], "idle", {"name": "platform", "reports_to": "boss"},
+                                     idle_at=world.clock.now() - 10, outcome="ok")
+        mark = list(world.v2.calls)
+        self.assertEqual(source.last_reply(sid, 1), "", "no summary is read")
+        self.assertIsNone(sb.triage_stop(engine, source, observation, "boss", 1, ""), "a stop is only its idle rider")
+        self.assertEqual(engine.convert_lapsed_notes(observation, world.clock.now()), [])
+        self.assertEqual(world.v2.calls, mark, "none of the three made a call")
+
     def test_an_oversized_or_unreadable_ledger_stops_the_sends_and_is_kept(self):
         world = self.world(agents=("platform",))
         path = world.state / sb.SENT_KEYS_FILE
