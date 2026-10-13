@@ -2313,7 +2313,7 @@ class EventFeed:
         self.seen = {}                # session id -> what the events said
         self.connected = False
         self.needs_resync = True      # a fresh feed has seen nothing: the first open re-syncs once
-        self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0}
+        self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0, "read_errors": 0}
         self.down_reason = None
 
     # -- the reader thread (reads, filters, remembers; no v2 call, no write)
@@ -2402,7 +2402,7 @@ class EventFeed:
     def status(self):
         with self.lock:
             return {"connected": self.connected, "events": self.counts["events"], "connects": self.counts["connects"], "resyncs": self.counts["resyncs"],
-                    "missed": self.counts["missed"], "errors": self.counts["errors"], "sessions": len(self.seen), "down": self.down_reason}
+                    "missed": self.counts["missed"], "errors": self.counts["errors"], "read_errors": self.counts["read_errors"], "sessions": len(self.seen), "down": self.down_reason}
 
     def tick(self, engine, sessions):
         """The pass thread's part, after a pass: ONE bounded read per session after a (re)connect (`event.resync`; at most FEED_RESYNC_PER_PASS per
@@ -2415,6 +2415,7 @@ class EventFeed:
                 return
             if self.needs_resync:
                 pending = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RESYNC_MIN_SECONDS]
+                pending.sort(key=lambda s: -1.0 if self.seen.get(s) is None or self.seen[s]["read"] is None else self.seen[s]["read"])   # the longest unread first: a failing few cannot starve the rest
                 chosen = pending[:FEED_RESYNC_PER_PASS]
                 if len(pending) <= FEED_RESYNC_PER_PASS:
                     self.needs_resync = False
@@ -2438,6 +2439,11 @@ class EventFeed:
         try:
             page = engine.v2.message_list(session, limit=FEED_PAGE, type="assistant")
         except V2Error:
+            with self.lock:
+                self.counts["read_errors"] += 1
+                entry = self.seen.setdefault(session, {"assistant": None, "idle_ms": None, "read": None, "event_at": None})
+                if entry["read"] is None:
+                    entry["read"] = now - FEED_RESYNC_MIN_SECONDS   # tried: the next re-sync tries the others first, this one again after the interval
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
         with self.lock:
@@ -2458,6 +2464,15 @@ class EventFeed:
                 self.audit.append(self.actor, name, "v2", detail)
             except OSError:
                 pass
+
+
+def start_event_feed(engine, config, now):
+    """#290: the service's pushed news, where the HTTP route exists and `v2_events` is "auto". Returns the feed, or None (the old reads only)."""
+    if config["v2_events"] != "auto" or getattr(engine.v2, "http", None) is None:
+        return None
+    engine.feed = EventFeed(engine.v2.http, engine.audit, now)
+    engine.feed.start()
+    return engine.feed
 
 
 def feed_tick(engine):
@@ -11616,9 +11631,7 @@ def cmd_run(args, runner, now, wait):
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
     hub = attach_github(engine, config, state, runner, now)
-    if config["v2_events"] == "auto" and getattr(engine.v2, "http", None) is not None:   # #290: the service's pushed news, where the HTTP route exists
-        engine.feed = EventFeed(engine.v2.http, engine.audit, now)
-        engine.feed.start()
+    start_event_feed(engine, config, now)
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
     if judge_server is not None:
         engine.judge_warm = make_judge_warmer(config, runner, now)

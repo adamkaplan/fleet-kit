@@ -39588,6 +39588,54 @@ class TestEventFeedRun(V2TransportBase):
         self.assertNotIn("wrong", everything)
 
 
+class TestEventFeedStreamEdges(V2TransportBase):
+    """V2Http.stream_lines: the limits and error paths the feed relies on."""
+
+    def test_a_non_200_answer_is_an_error_and_no_gap_is_marked(self):
+        self.service.stream_status = 500
+        feed = sb.EventFeed(self.route(5), None, sleep=lambda s: feed.stop())
+        feed.needs_resync = False
+        feed.run()
+        self.assertEqual((feed.status()["errors"], feed.status()["connects"], feed.needs_resync), (1, 0, False))
+
+    def test_an_oversized_line_is_refused_and_counted(self):
+        self.service.stream = ["data: " + "x" * 5000]
+        with mock.patch.object(sb, "V2_STREAM_LINE_MAX", 1000):
+            feed = sb.EventFeed(self.route(5), None, sleep=lambda s: feed.stop())
+            feed.run()
+        self.assertEqual(feed.status()["errors"], 1)
+
+    def test_a_quiet_stretch_ends_the_connection_and_the_feed_reconnects_never_reading_on_after_the_timeout(self):
+        self.service.stream = [feed_line("session.step.ended", assistantMessageID="msg_a"), None, feed_line("session.step.ended", assistantMessageID="msg_never")]
+        sleeps, feed = [], None
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 2:
+                feed.stop()
+        feed = sb.EventFeed(self.route(5), None, sleep=sleep)
+        feed.needs_resync = False
+        feed.run()
+        self.assertEqual(feed.status()["connects"], 2, "ended, then reconnected")
+        self.assertEqual(feed.seen["ses_w"]["assistant"], "msg_a", "the line after the timeout was never read on that connection")
+
+    def test_a_refused_password_is_unreachable_and_counted_not_a_crash(self):
+        self.service.password = "rotated-and-stale"
+        feed = sb.EventFeed(self.route(5), None, sleep=lambda s: feed.stop())
+        feed.run()
+        self.assertEqual((feed.status()["errors"], feed.status()["down"]), (1, "V2Unreachable"))
+
+    def test_the_wiring_creates_the_feed_only_for_auto_with_an_http_route(self):
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(http=object()), audit=None)
+        with mock.patch.object(sb.EventFeed, "start"):
+            self.assertIsNotNone(sb.start_event_feed(engine, {"v2_events": "auto"}, time.time))
+            self.assertIsNone(sb.start_event_feed(types.SimpleNamespace(v2=types.SimpleNamespace(http=object()), audit=None), {"v2_events": "off"}, time.time))
+            self.assertIsNone(sb.start_event_feed(types.SimpleNamespace(v2=types.SimpleNamespace(http=None), audit=None), {"v2_events": "auto"}, time.time), "no HTTP route: no feed")
+        self.assertIsNone(sb.start_event_feed(types.SimpleNamespace(v2=types.SimpleNamespace(), audit=None), {"v2_events": "auto"}, time.time))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_events": "bogus"})
+
+
 class TestEventFeedReads(unittest.TestCase):
     class Stub:
         def __init__(self, pages=None, fail=False):
@@ -39650,6 +39698,27 @@ class TestEventFeedReads(unittest.TestCase):
             now[0] += 5
             feed.tick(engine, sessions)
         self.assertEqual(len(engine.v2.calls), len(sessions), "no session is read again within the minimum interval, however often the stream reconnects")
+
+    def test_a_failing_few_cannot_starve_the_rest_and_failures_are_counted(self):
+        now = [1000.0]
+
+        class Flaky:
+            def __init__(f):
+                f.calls = []
+
+            def message_list(f, session, **k):
+                f.calls.append(session)
+                if session in ("s0", "s1", "s2", "s3"):
+                    raise sb.V2Error("backoff", None, "skipped")
+                return []
+        feed = self.feed(now)
+        feed.needs_resync = True
+        engine = types.SimpleNamespace(v2=Flaky())
+        sessions = ["s%d" % n for n in range(8)]
+        feed.tick(engine, sessions)
+        feed.tick(engine, sessions)
+        self.assertTrue(set(sessions[4:]) <= set(engine.v2.calls), "the sessions after the failing four were reached on the second pass")
+        self.assertEqual(feed.status()["read_errors"], 4)
 
     def test_a_feed_that_is_not_connected_reads_nothing_the_old_reads_are_all_there_is(self):
         feed = sb.EventFeed(None, None, lambda: 1000.0)
