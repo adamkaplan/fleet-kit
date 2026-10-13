@@ -44,6 +44,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
+import collections
 import fcntl
 import getpass
 import hashlib
@@ -294,6 +295,10 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
+    "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
+    "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
+    "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
@@ -427,6 +432,9 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
+        if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
+            raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
@@ -820,7 +828,8 @@ def _one_line(text, limit=300):
 
 
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
-MAX_READ_PAGES = 5   # pages of READ_LIMIT messages `delivered_keys` reads before it holds
+MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
+SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
 DESCRIPTION_MAX = 200  # characters of the one line v2's TUI shows for a synthetic message (PR 13)
 
 
@@ -1781,6 +1790,144 @@ class KeyTimes(set):
                 self.at[key] = created
 
 
+STATUS_REREAD_GAP = 5   # seconds: an agent whose state flaps is read again at most this often
+COMPACTION_TTL_MAX = 30   # seconds a compaction list is remembered (an orders fact for a compacted agent waits at most this long)
+
+
+class V2Reads:
+    """What the daemon remembers of its reads of v2, and how much it may read.
+
+    Every v2 read is an `opencode api` process, and a session's record, its inbox and its transcript almost never change between two passes (a
+    pass every few seconds), so a pass that read each agent afresh cost tens of calls and, with many agents, took the service down. Now:
+
+      - a session's record (`session.get`) is remembered for `v2_cache_seconds`, and re-read at once when herdr says the agent's state changed;
+      - the newest human prompt is read as ONE small `message.list` (type user, PROMPT_READ messages), and only when the session's `time.updated`
+        moved, never a 200-message page;
+      - a session's inbox, and its compaction list, are remembered for `v2_cache_seconds` and 5 times that;
+      - background reads (cache fills) are capped per pass and per minute: past the cap what is remembered is kept (a read nobody has made yet is
+        still made), and the stalest agent is read first the next pass (`stale_first`), so every agent is refreshed in turn.
+
+    A read just BEFORE A WRITE is never served from here (`fresh=True`): invariant 4 holds. `v2_cache_seconds` 0 remembers nothing."""
+
+    PROMPT_READ = 10
+    PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
+
+    def human_prompts_newest(self, session_id):
+        """The person's prompts (user messages without `metadata.fleet`), newest first, from at most two small reads: the newest PROMPT_READ user
+        messages, and only if they are ALL the fleet's (a person's prompt may sit behind them) the newest PROMPT_READ_WIDE. A prompt buried
+        under more fleet messages than that is not seen: the person is then not counted as engaged by this read, and a write is re-checked anyway."""
+        for limit in (self.PROMPT_READ, self.PROMPT_READ_WIDE):
+            page = self.engine.v2.message_list(session_id, limit=limit, type="user")
+            page = page if isinstance(page, list) else []
+            found = [m for m in page if isinstance(m, dict) and _fleet_meta(m) is None]
+            if found or len(page) < limit:
+                return found
+        return []
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.sessions, self.prompts, self.inboxes, self.compactions = {}, {}, {}, {}   # session id -> remembered answer; memory only
+        self.pass_fills, self.deferred, self.minute = 0, 0, collections.deque()
+
+    def begin_pass(self):
+        self.pass_fills, self.deferred = 0, 0
+
+    def ttl(self):
+        return self.engine.config["v2_cache_seconds"]
+
+    def may_fill(self, now):
+        """True while this pass and this minute have background reads left."""
+        while self.minute and self.minute[0] < now - 60:
+            self.minute.popleft()
+        return (self.pass_fills < self.engine.config["v2_reads_per_pass"]
+                and len(self.minute) < self.engine.config["v2_reads_per_minute"])
+
+    def filled(self, now):
+        self.pass_fills += 1
+        self.minute.append(now)
+
+    def stale_first(self, session_id):
+        """Sort key: the agent whose record is oldest (or never read) comes first."""
+        entry = self.sessions.get(session_id)
+        return entry[1] if entry else float("-inf")
+
+    def forget(self, session_id):
+        """A write to this session (a note, a wake, a conversion, a brief) changed what is remembered about it. The delivered-keys memory is kept
+        ON PURPOSE: delivered_keys probes the newest synthetic message before it trusts what it remembers, so a write shows there."""
+        self.sessions.pop(session_id, None)
+        self.inboxes.pop(session_id, None)
+        self.prompts.pop(session_id, None)
+        self.compactions.pop(session_id, None)
+
+    def session_info(self, session_id, status, now, fresh=False):
+        """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
+        entry, ttl = self.sessions.get(session_id), self.ttl()
+        if entry is not None and not fresh and ttl > 0:
+            info, at, was = entry
+            if was == status:
+                if now - at < ttl:
+                    return info
+                if not self.may_fill(now):
+                    self.deferred += 1
+                    return info
+            elif now - at < STATUS_REREAD_GAP or not self.may_fill(now):
+                # herdr says the state changed, but this agent was read a moment ago (a flapping agent is read at most once per gap) or the
+                # budget is spent: keep what is remembered and try again at the next pass; a read before a write is fresh whatever this says
+                self.deferred += 1
+                return info
+        info = self.engine.v2.session_get(session_id) or {}
+        if ttl > 0:
+            self.sessions[session_id] = (info, now, status)
+            if not fresh:
+                self.filled(now)
+        return info
+
+    def human_prompt(self, session_id, info, now, fresh=False):
+        """When the newest prompt a PERSON typed was created (a user message without `metadata.fleet`), or None. Read again only when the session's
+        `time.updated` moved."""
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        updated, entry = times.get("updated"), self.prompts.get(session_id)
+        if entry is not None and not fresh and updated is not None and entry[0] == updated:
+            return entry[1]
+        if entry is not None and not fresh and not self.may_fill(now):
+            self.deferred += 1
+            return entry[1]
+        newest = self.human_prompts_newest(session_id)
+        found = _created(newest[0]) if newest else None
+        if self.ttl() > 0 and updated is not None:
+            self.prompts[session_id] = (updated, found)
+            if not fresh:
+                self.filled(now)
+        return found
+
+    def inbox(self, session_id, now, fresh=False):
+        """`session.inbox.list`, remembered (and read again when the daemon itself wrote to the session)."""
+        entry, ttl = self.inboxes.get(session_id), self.ttl()
+        if entry is not None and not fresh and ttl > 0:
+            if now - entry[1] < ttl:
+                return entry[0]
+            if not self.may_fill(now):
+                self.deferred += 1
+                return entry[0]
+        inbox = self.engine.v2.inbox_list(session_id)
+        if ttl > 0:
+            self.inboxes[session_id] = (inbox, now)
+            if not fresh:
+                self.filled(now)
+        return inbox
+
+    def compaction_page(self, session_id, limit, now):
+        """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
+        that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
+        entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
+        if entry is not None and ttl > 0 and now - entry[1] < ttl:
+            return entry[0]
+        page = self.engine.v2.message_list(session_id, limit, type="compaction")
+        if ttl > 0:
+            self.compactions[session_id] = (page, now)
+        return page
+
+
 class Switchboard:
     """observe -> derive -> decide -> deliver, for every fleet agent.
 
@@ -1811,6 +1958,8 @@ class Switchboard:
         self.executable = config["opencode_executable"] or config["opencode"]
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
+        self.reads = V2Reads(self)
+        self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
@@ -1841,33 +1990,29 @@ class Switchboard:
         page = self.v2.message_list(session_id, limit=READ_LIMIT)  # newest first (S5)
         return page if isinstance(page, list) else []
 
-    def last_human_prompt(self, session_id, now, inbox=False):
+    def last_human_prompt(self, session_id, now, inbox=False, info=None, fresh=False):
         """Your newest prompt in the engagement window: type `user` without `metadata.fleet`.
-        `inbox` (a Chief of Staff, PR 8) also counts one still waiting in v2's inbox."""
+        `inbox` (a Chief of Staff, PR 8) also counts one still waiting in v2's inbox. The transcript is not paged: the newest human prompt is one
+        small read, made again only when the session changed (V2Reads.human_prompt)."""
         start = now - self.engaged_seconds
         if inbox:
             waiting = inbox_human_prompts(self, session_id)
             if waiting and (_created(waiting[0]) or 0) >= start:
                 return _created(waiting[0])
-        for message in self._messages(session_id):
-            created = _created(message)
-            if created is not None and created < start:
-                break  # older than the window: stop reading
-            if message.get("type") == "user" and _fleet_meta(message) is None:
-                return created
-        return None
+        created = self.reads.human_prompt(session_id, info or {}, now, fresh)
+        return created if created is not None and created >= start else None
 
     NOT_FLEET_SECONDS = 120  # how long "this session is no fleet agent" is believed
 
-    def _observe_entry(self, entry, now):
-        """An Observation for one herdr agent, or None when it is not a fleet agent."""
+    def _observe_entry(self, entry, now, fresh=False):
+        """An Observation for one herdr agent, or None when it is not a fleet agent. `fresh` reads v2 again whatever is remembered (before a write)."""
         session_id = agent_session(entry)
         if session_id is None:
             return None
         if self._not_fleet.get(session_id, 0) > now:
             return None  # asked recently and it was not one: herdr lists every pane of every workspace
         try:
-            info = self.v2.session_get(session_id) or {}
+            info = self.reads.session_info(session_id, entry.get("agent_status"), now, fresh)
         except V2Error as err:
             if err.reason == "http" and err.status == 404:
                 self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS  # a pane of someone else's OpenCode
@@ -1887,7 +2032,7 @@ class Switchboard:
             return observation
         try:
             observation.last_human_prompt = self.last_human_prompt(
-                session_id, now, inbox=fleet.get("role") == "chief-of-staff")
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
         except V2Error as err:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
@@ -1922,9 +2067,7 @@ class Switchboard:
                 found.problems.append("herdr unreachable: %s" % err)
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
+        for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
             try:
                 observation = self._observe_entry(entry, now)
             except V2Error as err:
@@ -1948,7 +2091,7 @@ class Switchboard:
             return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
         entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
         try:
-            fresh = self._observe_entry(entry, now)
+            fresh = self._observe_entry(entry, now, fresh=True)   # a read before a write is never from memory (invariant 4)
         except V2Error as err:
             return None, "v2 unreachable: %s" % err
         if fresh is None or fresh.name != previous.name:
@@ -2009,10 +2152,23 @@ class Switchboard:
         first, plus its v2 inbox. Returns (keys, complete); not complete means
         the read ended before reaching `since`, so a key could be missed."""
         keys, complete = KeyTimes(), False
+        # A recipient with something pending is asked about every pass: ONE small read (its newest synthetic message) says whether anything it
+        # carries changed; if not, the keys found last time (which reached back to `since`) still hold, and the pages are not read again.
+        remembered = self._delivered.get(session_id) if self.config["v2_cache_seconds"] > 0 else None
+        newest = self.v2.message_list(session_id, limit=1, type="synthetic") if self.config["v2_cache_seconds"] > 0 else None   # BEFORE the pages: a message that lands during the read changes it
+        newest_id = newest[0].get("id") if isinstance(newest, list) and newest and isinstance(newest[0], dict) else None
+        if remembered is not None and remembered[0] == newest_id and remembered[1] <= since:
+            keys, complete = KeyTimes(), True
+            keys.update(remembered[2])
+            keys.at = dict(remembered[2].at)
+            inbox = self.v2.inbox_list(session_id)   # never from memory: a note another process wrote counts as delivered
+            for item in inbox if isinstance(inbox, list) else []:
+                keys.add_all(_fleet_keys(item), _created(item))
+            return keys, complete
         # Only synthetic messages carry keys; asking for just those keeps the read
         # short on a chatty recipient, which a 24 h worker look-back needs (PR 4).
         # PR 8: more than READ_LIMIT of them are read page by page, up to MAX_READ_PAGES.
-        for page, more in self.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+        for page, more in self.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
             reached = False
             for message in page:
                 created = _created(message)
@@ -2020,10 +2176,17 @@ class Switchboard:
                     reached = True
                     break
                 keys.add_all(_fleet_keys(message), created)
-            if reached or len(page) < READ_LIMIT or more is False:
+            if reached or len(page) < SYNTHETIC_PAGE or more is False:
                 complete = True
             if complete:
                 break
+        if complete and self.config["v2_cache_seconds"] > 0:
+            if len(self._delivered) > 200:
+                self._delivered.pop(next(iter(self._delivered)))   # the oldest goes (dicts keep insertion order), not every recipient at once
+            remembered_keys = KeyTimes()
+            remembered_keys.update(keys)
+            remembered_keys.at = dict(keys.at)
+            self._delivered[session_id] = (newest_id, since, remembered_keys)   # memory only: the messages' keys, before the inbox's are added
         inbox = self.v2.inbox_list(session_id)
         for item in inbox if isinstance(inbox, list) else []:
             keys.add_all(_fleet_keys(item), _created(item))
@@ -2145,6 +2308,7 @@ class Switchboard:
                 raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
                                      % message_id)
             result["id"] = record.get("id") if isinstance(record, dict) else None
+        self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
@@ -2158,11 +2322,14 @@ class Switchboard:
             return []
         if observation.engaged(now, self.engaged_seconds):
             return []
-        inbox = self.v2.inbox_list(observation.session_id)
-        notes = [item for item in (inbox if isinstance(inbox, list) else [])
-                 if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
-                 and item.get("delivery") == "steer" and item.get("resume") is not True
-                 and not _is_orders_note(item)]  # PR 17: an unread orders note never becomes a wake
+        def lapsed(inbox):
+            return [item for item in (inbox if isinstance(inbox, list) else [])
+                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
+                    and item.get("delivery") == "steer" and item.get("resume") is not True
+                    and not _is_orders_note(item)]  # PR 17: an unread orders note never becomes a wake
+        notes = lapsed(self.reads.inbox(observation.session_id, now))
+        if notes:   # what is remembered says a note waits: read it afresh before acting on it (a write follows)
+            notes = lapsed(self.reads.inbox(observation.session_id, now, fresh=True))
         converted = []
         for item in notes:
             if not fault("no-recheck"):
@@ -2181,6 +2348,7 @@ class Switchboard:
                         "delivery": delivery, "keys": _fleet_keys(item), "why": "note outlived engagement"}) as result:
                     record = self.v2.inbox_update(observation.session_id, item.get("id"), delivery)
                     result["delivery"] = record.get("delivery") if isinstance(record, dict) else None
+            self.reads.forget(observation.session_id)
             converted.append(item.get("id"))
         return converted
 
@@ -2198,6 +2366,7 @@ class Switchboard:
         report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
                   "badges": [], "toasts": []}
         self.pass_toasts = {}
+        self.reads.begin_pass()
         discovery = self.discover(now)
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -2243,6 +2412,8 @@ class Switchboard:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
         finish_pass(self, discovery, report)
+        if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
+            self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
         return report
 
     # -- render: the sidebar badge and the toast
@@ -2252,7 +2423,8 @@ class Switchboard:
         the facts in switchboard notes that wait in v2's inbox for a turn to
         carry them, plus the facts held for the agent. A note a turn has
         carried is read; a wake starts its own turn, so it is never unread."""
-        inbox = self.v2.inbox_list(observation.session_id)
+        # An agent with something pending (a held plan) is never served from memory: a send or a note for it is noticed at the next pass.
+        inbox = self.reads.inbox(observation.session_id, self.now(), fresh=observation.name in held)
         waiting = [item for item in (inbox if isinstance(inbox, list) else [])
                    if isinstance(item, dict) and (_fleet_meta(item) or {}).get("from") == "switchboard"
                    and item.get("delivery") == "steer" and item.get("resume") is not True]
@@ -3403,19 +3575,18 @@ def send_brief(engine, name, session_id, brief):
     later run finds out it was sent."""
     with engine._external("v2.session.prompt", name, {"session": session_id, "brief_chars": len(brief)}):
         engine.v2.prompt(session_id, brief, {"fleet": {"from": "switchboard", "brief": True}})
+    engine.reads.forget(session_id)   # a write: what was remembered of this session is old
 
 
-BRIEF_SCAN_PAGES = 25  # pages of READ_LIMIT messages; a session this long is not one that never got its brief
+BRIEF_SCAN_USER = 10  # the oldest user messages read for the brief; a session with more than that many is not one that never got its brief
 
 
 def brief_in_transcript(engine, session_id):
     """Whether the session's transcript holds a message whose metadata says it is the brief. A listing too long to
     read to its end is taken to hold one: a duplicate brief in a long conversation does more harm than none."""
-    more = None
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, max_pages=BRIEF_SCAN_PAGES):
-        if any((_fleet_meta(message) or {}).get("brief") for message in page):
-            return True
-    return bool(more)
+    page = engine.v2.message_list(session_id, limit=BRIEF_SCAN_USER, order="asc", type="user")   # the brief is among a session's first prompts: one small read
+    page = page if isinstance(page, list) else []
+    return any((_fleet_meta(message) or {}).get("brief") for message in page) or len(page) >= BRIEF_SCAN_USER
 
 
 VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to pick its Decisions view
@@ -3600,7 +3771,7 @@ def inbox_human_prompts(engine, session_id):
 
 def newest_prompts(engine, session_id):
     """Your prompts to a Chief of Staff, newest first: the inbox's (not yet consumed), then the transcript's."""
-    return inbox_human_prompts(engine, session_id) + human_prompts(engine._messages(session_id))
+    return inbox_human_prompts(engine, session_id) + engine.reads.human_prompts_newest(session_id)   # small reads of the newest user messages, not a 200-message page
 
 
 def acting(engine):
@@ -4267,15 +4438,18 @@ def assigning_input(engine, observation, boss):
     Assigning: a prompt (yours, the fleet's task, or the brief `launch` sent), or a message from its boss
     (`send`, a handoff). Not assigning: a GitHub notice, a decoration, a reminder, a nudge, a toast, a
     report from one of its own workers. Newest first, within READ_LIMIT messages."""
-    for message in engine._messages(observation.session_id):
-        if not isinstance(message, dict):
-            continue
-        if message.get("type") == "user" or (
-                message.get("type") == "synthetic"
-                and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(message))):
-            created = _created(message)
-            return (message.get("id"), created) if message.get("id") and created is not None else None
-    return None
+    # Two small typed reads instead of a 200-message page of everything: the newest user message, and the newest of the last few synthetic ones
+    # that is a `send` from the boss. The newer of the two assigned it.
+    users = engine.v2.message_list(observation.session_id, limit=1, type="user")
+    synthetic = engine.v2.message_list(observation.session_id, limit=SYNTHETIC_PAGE, type="synthetic")
+    candidates = [m for m in (users if isinstance(users, list) else []) if isinstance(m, dict)]
+    candidates += [m for m in (synthetic if isinstance(synthetic, list) else []) if isinstance(m, dict)
+                   and any(key.startswith("send:%s:" % boss) for key in _fleet_keys(m))][:1]
+    candidates = [m for m in candidates if m.get("id") and _created(m) is not None]
+    if not candidates:
+        return None
+    newest = max(candidates, key=_created)
+    return newest.get("id"), _created(newest)
 
 
 def report_jev(engine, settings):
@@ -4906,7 +5080,7 @@ def transcript_lines(engine, session_id, since):
     if cached is not None and cached[0] == newest_id and cached[1] <= since:
         return [line for line in cached[2] if line[0] >= since]  # nothing new since the last full read
     found, complete = [], False
-    for page, more in engine.v2.message_pages(session_id, READ_LIMIT, "synthetic", MAX_READ_PAGES):
+    for page, more in engine.v2.message_pages(session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
         for message in page:
             created = _created(message) if isinstance(message, dict) else None
             if created is None:
@@ -19712,7 +19886,7 @@ class OrdersFacts:
             try:
                 orders = engine.charter_orders(observation, charter)
                 compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
-                    engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+                    engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
             except (IntentError, V2Error) as err:  # one agent's trouble never hides the others; nothing is guessed
                 engine._note("orders.unreadable", observation.name, {"charter": charter,
                                                                       "error": _one_line(str(err), 200)})
@@ -19734,7 +19908,7 @@ class OrdersFacts:
         try:
             found = read_cos_orders(engine.config)
             compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
-                engine.v2.message_list(observation.session_id, COMPACTIONS_READ, type="compaction"))
+                engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
         except (CosOrdersError, V2Error) as err:  # nothing is guessed; a file too large is refused, not cut
             engine._note("orders.unreadable", observation.name, {"cos": True, "error": _one_line(str(err), 200)})
             return None
