@@ -15183,6 +15183,7 @@ class FakeSweepHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.reads, self.single = {}, [], set(), [], []
+        self.closed_records = {}   # the closed or merged items the closed-state list read returns
         self.caps, self.fresh, self.live = [], [], {}   # live: a fresher copy of an item than `open` shows
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
@@ -15194,13 +15195,15 @@ class FakeSweepHub:
             return [c for c in self.comments if c["issue_url"].endswith("/%d" % number)][::-1], False
         if "/issues/comments" in path:
             return list(self.comments), False
+        if "state=closed" in path:
+            return list(self.closed_records.values()), False
         return list(self.open.values()), False
 
     def _read_one(self, repo, path, now, fresh=False):
         self.single.append((repo, path))
         self.fresh.append(fresh)
         number = int(path.rsplit("/", 1)[1])
-        data = dict(self.live.get(number, self.open.get(number, {})))
+        data = dict(self.live.get(number, self.open.get(number, self.closed_records.get(number, {}))))
         data["number"] = number
         data["state"] = "closed" if number in self.closed else "open"
         return data
@@ -15693,7 +15696,7 @@ class TestSweep(Base):
             checked = set(self.engine.sweep.checked)
         self.assertEqual(seen, set(repos))                       # every repo was reached across passes
         self.assertEqual(len(checked), 20)                       # and every decision's issue was checked
-        self.assertTrue(all(cap == sb.SWEEP_LIST_PAGES for cap in self.hub.caps))
+        self.assertTrue(all(cap in (sb.SWEEP_LIST_PAGES, 1) for cap in self.hub.caps), "the lists are capped; the closed-PR list (S9) is one page")
         quiet = self.calls()
         self.sweep(decisions)                                    # nothing is stale yet: the cache answers
         self.assertEqual(self.calls(), quiet)
@@ -16925,6 +16928,28 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        self.hub.closed_records = {
+            70: sweep_issue(70, "x", [captain, hold], pr=True),   # merged, still held: the finding
+            71: sweep_issue(71, "x", [], pr=True),                # merged, clean: nothing
+            72: sweep_issue(72, "x", [captain], pr=False),        # a closed ISSUE with the word: not a PR
+            73: sweep_issue(73, "x", [hold], pr=True)}            # closed, a hold label alone: a finding
+        self.hub.closed = {70, 71, 72, 73}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [("S9", "acme/api#70"), ("S9", "acme/api#73")])
+        self.assertIn("S9", sb.SWEEP_KINDS)
+
+    def test_s9_is_dropped_when_a_fresh_read_shows_the_label_gone(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        self.hub.closed_records = {70: sweep_issue(70, "x", [captain], pr=True)}
+        self.hub.closed = {70}
+        self.hub.live = {70: sweep_issue(70, "x", [], pr=True)}
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
     def test_s6a_a_pr_opened_within_15_minutes_gets_the_label_first(self):
         fresh, early, later = (sb.iso(self.world.clock.now() - m * 60) for m in (4, 20, 120))
@@ -30253,6 +30278,47 @@ def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, auth
         "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
     fields.update(more)
     return pr_view_json(state=state, **fields)
+
+
+class TestAPrLeavesTheListWhenItIsNotOpen(DecisionsBase):
+    """A row is derived from OPEN state: a merged or closed PR leaves at once whatever labels it carries, and a PR that was last seen open
+    and cannot be confirmed any more is not listed (its notice stays, so it returns when it can be read)."""
+
+    LABELS = [{"name": "osuser:merge-captain"}, {"name": "osuser:hold-impact"}]
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.world.engine.gh_runner = self.gh
+        sb.record_pr_notice(self.world.state, "acme/api", 7, "platform", "", self.world.clock.now())
+
+    def rows(self):
+        return [d for d in self.listed() if d.get("number") == 7]
+
+    def test_a_merged_pr_that_still_carries_merge_captain_and_hold_impact_is_not_in_the_list(self):
+        (row,) = self.rows()
+        self.assertEqual((row["kind"], row["holds"]), ("captain", ["impact"]))
+        self.gh.answers[7] = (0, captain_pr(state="MERGED", labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(self.rows(), [], "gone in the same pass the merge is seen, labels or not")
+
+    def test_a_closed_pr_with_the_labels_is_not_listed_either(self):
+        self.gh.answers[7] = (0, captain_pr(state="CLOSED", labels=self.LABELS), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_pr_last_seen_open_that_cannot_be_confirmed_for_five_minutes_is_not_listed_and_returns(self):
+        self.assertEqual(len(self.rows()), 1)
+        self.gh.answers[7] = (1, "", "HTTP 502: Bad Gateway")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        (row,) = self.rows()
+        self.assertTrue(row["stale"], "inside the window it stays, marked stale")
+        self.world.tick(sb.PR_OPEN_CONFIRM_SECONDS)
+        self.assertEqual(self.rows(), [], "past it the row is withdrawn: nobody is shown a PR nothing can say is open")
+        self.assertEqual(len(sb.read_pr_notices(self.world.state)), 1, "the notice itself is kept")
+        self.gh.answers[7] = (0, captain_pr(labels=self.LABELS, reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.assertEqual(len(self.rows()), 1, "readable again: back")
 
 
 class TestCaptainPrs(DecisionsBase):
