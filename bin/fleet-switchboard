@@ -831,6 +831,7 @@ def valid_description(text):
 
 
 V2_CALLS_KEEP_SECONDS = 600   # how long a call is remembered, for the calls-per-minute figures
+V2_CALLS_KEEP_MAX = 50000     # and how many at most (a runaway cannot grow the list without bound)
 UNDER_TEST_ENV = "FLEET_SWITCHBOARD_UNDER_TEST"   # set by the test suite: the real opencode is then never run
 ALLOW_REAL_V2_ENV = "FLEET_SWITCHBOARD_ALLOW_REAL_V2"   # =1: a test that really means to talk to a service says so
 
@@ -856,20 +857,31 @@ class V2Client:
         self.runner = runner
         self.timeout = timeout
         self.clock = clock
-        self.calls = collections.deque()   # (time, operation) of the last V2_CALLS_KEEP_SECONDS: what `status` reports as calls per minute
+        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
+        self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
+        self.count_errors = 0   # accounting that failed; a call never fails for it
+
+    def count_call(self, operation):
+        """Remember one call. NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
+        try:
+            now = self.clock()
+            with self.calls_lock:
+                self.calls.append((now, operation))
+                while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
+                    self.calls.popleft()
+        except Exception:
+            self.count_errors += 1
 
     def calls_by_operation(self, window=60.0, now=None):
         """{operation: calls} over the last `window` seconds (this process's own calls)."""
         now = self.clock() if now is None else now
-        found = collections.Counter(op for at, op in self.calls if at >= now - window)
-        return dict(found)
+        with self.calls_lock:
+            remembered = list(self.calls)
+        return dict(collections.Counter(op for at, op in remembered if at >= now - window))
 
     def _call(self, operation, params=None, data=None, envelope=False):
         refuse_real_opencode_under_test(self.runner, self.binary)
-        now = self.clock()
-        self.calls.append((now, operation))
-        while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
-            self.calls.popleft()
+        self.count_call(operation)
         argv = [self.binary, "api", operation]
         for name, value in (params or {}).items():
             if value is not None:
@@ -6395,7 +6407,9 @@ def record_v2_calls(engine):
             return
         path = Path(engine.state_dir) / V2_CALLS_FILE
         temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
-        temp.write_text(json.dumps(summary, sort_keys=True) + "\n")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(summary, sort_keys=True) + "\n")
         os.rename(str(temp), str(path))
     except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
         if temp is not None:

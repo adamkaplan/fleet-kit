@@ -14,6 +14,7 @@ is non-zero on failure.
 """
 import ast
 import base64
+import collections
 import contextlib
 import errno
 import copy
@@ -37102,6 +37103,69 @@ class TestV2CallAccounting(Base):
         v2.message_list("ses_example1", limit=5)
         self.assertEqual(v2.calls_by_operation(60.0), {"session.message.list": 1})
         self.assertEqual(v2.calls_by_operation(300.0), {"session.get": 3, "session.inbox.list": 1, "session.message.list": 1})
+
+    def test_many_threads_calling_at_once_never_raise_and_every_call_is_counted(self):
+        v2 = self.client(self.ok, time.time)
+        errors, per_thread, threads = [], 1500, 8
+        def work():
+            try:
+                for n in range(per_thread):
+                    v2.session_get("ses_example1")
+                    if n % 5 == 0:
+                        v2.calls_by_operation(60.0)   # a reader at the same time
+            except BaseException as err:   # pragma: no cover - the failure this test exists to catch
+                errors.append(err)
+        pool = [threading.Thread(target=work) for _ in range(threads)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(v2.calls_by_operation(60.0), {"session.get": per_thread * threads})
+        self.assertEqual(v2.count_errors, 0)
+
+    def test_the_trim_the_append_and_the_read_all_run_under_the_lock(self):
+        class Recording:
+            held, entered = False, 0
+            def __enter__(self):
+                Recording.held, Recording.entered = True, Recording.entered + 1
+            def __exit__(self, *exc):
+                Recording.held = False
+        v2 = self.client(self.ok, lambda: 1.0)
+        v2.calls_lock = Recording()
+        seen = []
+        class Watched(collections.deque):
+            def append(self, item):
+                seen.append(Recording.held)
+                super().append(item)
+            def popleft(self):
+                seen.append(Recording.held)
+                return super().popleft()
+            def __iter__(self):
+                seen.append(Recording.held)
+                return super().__iter__()
+        watched = Watched(maxlen=sb.V2_CALLS_KEEP_MAX)
+        v2.calls = watched
+        v2.session_get("a")
+        v2.clock = lambda: 1.0 + sb.V2_CALLS_KEEP_SECONDS + 1   # the first call is now old: the next call trims it
+        v2.session_get("b")
+        v2.calls_by_operation(60.0)
+        self.assertGreaterEqual(len(seen), 4, "an append, an append, a trim and a read happened")
+        self.assertTrue(all(seen), "each of them under the lock: %r" % seen)
+
+    def test_the_list_is_bounded_and_a_call_never_fails_because_accounting_did(self):
+        v2 = self.client(self.ok, lambda: 1.0)
+        self.assertEqual(v2.calls.maxlen, sb.V2_CALLS_KEEP_MAX)
+        broken = self.client(self.ok, mock.Mock(side_effect=RuntimeError("clock broke")))
+        self.assertEqual(broken.session_get("x"), [], "the call went through")
+        self.assertEqual(broken.count_errors, 1, "and the accounting failure was counted")
+
+    def test_the_record_file_is_private(self):
+        world = World(self, agents=("platform",))
+        world.engine.v2 = self.client(self.ok, world.clock.now)
+        world.engine.v2.session_get("x")
+        sb.record_v2_calls(world.engine)
+        self.assertEqual(stat.S_IMODE((world.state / sb.V2_CALLS_FILE).stat().st_mode), 0o600)
 
     def test_only_the_last_ten_minutes_are_remembered(self):
         now = [0.0]
