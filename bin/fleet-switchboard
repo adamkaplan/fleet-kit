@@ -4305,10 +4305,10 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
         return None
     assigned_id, assigned_at = assigned
     keys, complete = engine.delivered_keys(boss_view.session_id, assigned_at - SINCE_SLACK)
-    prefix = "%s:%s:" % (REPORT, observation.name)
+    prefixes = ("%s:%s:" % (REPORT, observation.name), "send:%s:" % observation.name)   # a `send` to its boss tells it as much as a `report`
     if not fault("ignore-reports") and any(
-            key.startswith(prefix) and (keys.at.get(key) is None or keys.at[key] >= assigned_at) for key in keys):
-        return None  # it reported since it was last given work: this stop is only a rider
+            key.startswith(prefixes) and (keys.at.get(key) is None or keys.at[key] >= assigned_at) for key in keys):
+        return None  # it reported or wrote to its boss since it was last given work: this stop is only a rider
     if not complete:
         return None  # the read did not reach back far enough to say it did not report
     nudge_key = "%s:%s:%s" % (NUDGE, observation.session_id, assigned_id)

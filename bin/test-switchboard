@@ -17075,6 +17075,18 @@ class TestUnreportedStop(ReportBase):
         self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])
         self.assertEqual(self.triage_events(), [])
 
+    def test_a_send_to_the_boss_counts_as_telling_it(self):
+        self.stop("OWED-ME")
+        self.world.tick(1)
+        self.world.new_engine("cli").send("coder", "platform", "done, see the PR")
+        self.world.tick(5)
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)], "report then stop: no nudge")
+        self.assertEqual(self.triage_events(), [])
+
+    def test_a_stop_with_no_report_and_no_send_still_nudges(self):
+        self.stop("OWED-ME: the migration is finished")
+        self.assertIn("nudge", [f.kind for f in self.facts()])
+
     def test_a_stop_with_no_report_and_a_jev_answer_of_owed_nudges_the_worker_once(self):
         self.stop("OWED-ME: the migration is finished")
         found = self.facts()
