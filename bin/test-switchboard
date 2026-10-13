@@ -20927,6 +20927,30 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
         self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
 
+    def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
+        self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
+        self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: 2\nsize: S\n" + GOOD_PLAN), [], "a light plan may carry just `size: S`")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + GOOD_PLAN))
+        for valid in ("S", "M: a few hours, one file and a test", "L: about a day, three areas", "XL: several days, five areas and a migration", "xl, 3 days"):
+            with self.subTest(valid=valid):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (valid, GOOD_PLAN)), [])
+
+    def test_the_skill_and_the_template_state_the_size_rule_and_the_opt_in(self):
+        for path in (REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"):
+            text = path.read_text()
+            with self.subTest(path=path.name):
+                for phrase in ("t-shirt", "agent time", "plan-format: 2", "size: s"):
+                    self.assertIn(phrase, text.lower())
+                self.assertRegex(text, r"never (?:prefers|human-days)")
+
+    def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
+        for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
+                          ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (bad, GOOD_PLAN)), [code])
+        self.assertEqual(self.codes("size: M, 3 days\n" + GOOD_PLAN), [], "without the opt-in line the size is not read at all")
+
     def test_an_unchanged_scenario_is_needed_unless_the_plan_says_why_not(self):
         scen = GOOD_PLAN[:GOOD_PLAN.index("  - id: U1")] + "```\n"
         self.assertIn("no-unchanged-scenario", self.codes(scen))

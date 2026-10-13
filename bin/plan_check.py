@@ -35,6 +35,14 @@ ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+.*plan\s*\(scenarios\)", re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+# Size (the owner's rule): a plan states its SIZE as a T-shirt in AGENT time, never in human-days. Checked only for a plan that opts in with a
+# `plan-format: 2` line, so a plan written before the rule does not turn red; a plan that opts in must carry a `size:` line.
+PLAN_FORMAT_RE = re.compile(r"^[\s#>*-]*plan-format:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE)
+SIZE_RE = re.compile(r"^[\s#>*-]*size:\s*(\S.*)$", re.IGNORECASE | re.MULTILINE)
+SIZE_WORD_RE = re.compile(r"^(S|M|L|XL)\b", re.IGNORECASE)
+SIZE_DAYS_RE = re.compile(r"\b[0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+)?\s*(?:days?|d|weeks?|wk)\b|\b(?:a|one|two|three|several|few)\s+(?:days?|weeks?)\b", re.IGNORECASE)
+SIZE_HUMAN_RE = re.compile(r"\b(?:human|person|man|engineer)[- ](?:days?|weeks?|hours?)\b", re.IGNORECASE)
+SIZE_FORMAT_FROM = 2        # the `plan-format:` number from which a size is required
 UNCHANGED_NONE_RE = re.compile(r"^[\s#>*-]*unchanged:\s*none\s+because\s+(\S.*)$", re.IGNORECASE | re.MULTILINE)
 
 # A pass rule that says nothing. Compared after lower-casing and dropping punctuation.
@@ -583,6 +591,29 @@ def unchanged_reason_ok(reason):
     return len(reason) >= MIN_UNCHANGED_REASON and len(real) >= 3
 
 
+def size_problem(text):
+    """None, or (code, message) for the size line of a plan that opted in (`plan-format: 2` or more). The size is S (under 1 hour of agent time), M
+    (a few hours), L (about a day) or XL (several days), each with what makes it that size; a size given in days is refused for work under L, and
+    human-days are refused always (the fleet's calibration is agent time)."""
+    opted = PLAN_FORMAT_RE.search(text or "")
+    if not opted or int(opted.group(1)) < SIZE_FORMAT_FROM:
+        return None
+    found = SIZE_RE.search(text or "")
+    if not found:
+        return ("missing-size", "the plan has no `size:` line (S under 1 hour, M a few hours, L about a day, XL several days, in AGENT time, "
+                "with what makes it that size; a light plan may carry just `size: S`)")
+    value = found.group(1).strip()
+    word = SIZE_WORD_RE.match(value)
+    if not word:
+        return ("bad-size", "`size:` must start with S, M, L or XL (agent time: S under 1 hour, M a few hours, L about a day, XL several days), got %r" % value[:60])
+    if SIZE_HUMAN_RE.search(value):
+        return ("size-in-days", "the size is given in human time (%r): size is in AGENT time, a T-shirt with what makes it that size" % value[:60])
+    if word.group(1).upper() in ("S", "M") and SIZE_DAYS_RE.search(value):
+        return ("size-in-days", "a size of %s is under a day of agent time, but %r gives days: say what makes it %s, or size it L or XL"
+                % (word.group(1).upper(), value[:60], word.group(1).upper()))
+    return None
+
+
 def validate(scenarios, clauses, text=""):
     """(defects, warnings): each a dict {"id", "code", "message"}; `id` is the scenario id, or "-" for the plan.
 
@@ -672,6 +703,9 @@ def validate(scenarios, clauses, text=""):
         warnings.append({"id": "-", "code": "no-constraint-list",
                          "message": "scenarios cover PC-%s but the plan declares no constraint list (`PC-<n>: ...` lines): "
                                     "PC-n is a plan constraint, so what it covers cannot be checked" % ", PC-".join(str(n) for n in sorted(covered_pc))})
+    size = size_problem(text)
+    if size:
+        bad("-", size[0], size[1])
     sliced = {}
     for scenario in scenarios:
         if _normal(scenario.get("slice", "")):
