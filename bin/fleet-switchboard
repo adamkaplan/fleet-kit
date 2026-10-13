@@ -988,6 +988,8 @@ class V2Http:
                 conn.request("GET", path, headers={"Authorization": auth, "Accept": "text/event-stream"})
                 response = conn.getresponse()
             except (OSError, http.client.HTTPException):
+                with self._lock:
+                    self._info = None   # it may have moved (a restart on a new port): read the file again at the next connect, as `request` does
                 raise V2Unreachable("the service does not answer") from None
             if response.status == 401:
                 with self._lock:
@@ -2365,7 +2367,7 @@ class EventFeed:
                 self.consume(self.stream.stream_lines("/api/event"))
                 if self.now() - started >= FEED_STABLE_SECONDS:
                     backoff = 1   # it lived: a long connection that ended is not a flapping one
-            except (V2Unreachable, V2Error, OSError, http.client.HTTPException) as err:
+            except Exception as err:   # anything at all: one bad connection is a counted error, never a dead reader thread
                 with self.lock:
                     self.connected = False
                     self.down_reason = type(err).__name__
@@ -2420,7 +2422,8 @@ class EventFeed:
                 entry["assistant"] = message   # the id only: an event's text is never kept
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
                 created = event.get("created")
-                entry["idle_ms"] = int(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else int(self.now() * 1000)
+                finite = isinstance(created, (int, float)) and not isinstance(created, bool) and math.isfinite(created)   # NaN and Infinity are valid JSON to Python: int() of them raises
+                entry["idle_ms"] = int(created) if finite else int(self.now() * 1000)
 
     # -- what the pass thread asks
 

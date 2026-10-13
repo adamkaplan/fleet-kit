@@ -39675,6 +39675,28 @@ class TestEventFeedRun(V2TransportBase):
 class TestEventFeedStreamEdges(V2TransportBase):
     """V2Http.stream_lines: the limits and error paths the feed relies on."""
 
+    def test_a_service_file_that_moved_is_read_again_after_a_refused_connection(self):
+        route = self.route(5)
+        self.service.up = False
+        with self.assertRaises(sb.V2Unreachable):
+            list(route.stream_lines("/api/event"))
+        self.assertIsNone(route._info, "the address may have changed: the file is read again")
+        self.service.up = True
+        self.assertIs(next(route.stream_lines("/api/event")), sb.STREAM_OPENED)
+
+    def test_a_non_finite_time_or_any_surprise_never_kills_the_reader_thread(self):
+        feed = sb.EventFeed(None)
+        for created in ("NaN", "Infinity", "-Infinity"):
+            feed.handle('data: {"type": "session.execution.succeeded", "created": %s, "data": {"sessionID": "ses_w"}}' % created)
+            self.assertIsInstance(feed.seen["ses_w"]["idle_ms"], int)
+        class Boom:
+            def stream_lines(self, path):
+                raise RuntimeError("anything")
+        sleeps = []
+        crashing = sb.EventFeed(Boom(), None, sleep=lambda s: (sleeps.append(s), crashing.stop()))
+        crashing.run()
+        self.assertEqual((crashing.status()["errors"], crashing.status()["down"]), (1, "RuntimeError"), "counted, and the loop goes on instead of dying")
+
     def test_a_non_200_answer_is_an_error_and_no_gap_is_marked(self):
         self.service.stream_status = 500
         feed = sb.EventFeed(self.route(5), None, sleep=lambda s: feed.stop())
