@@ -4458,7 +4458,7 @@ def pane_screen(engine, pane):
     """A hash of the pane's visible screen, or None when it cannot be read (then there is no proof of quiet)."""
     try:
         return hashlib.sha256(engine.herdr.pane_read_visible(pane).encode("utf-8", "replace")).hexdigest()
-    except HerdrError:
+    except Exception:   # any failure to read is "no proof it is idle": nothing is closed
         return None
 
 
@@ -4668,7 +4668,7 @@ def cmd_reattach(args, runner, now, socket_call=None):
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     name = args.name
     discovery = engine.discover(engine.now())
-    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    who = reattach_caller_problem(engine, runner, now, discovery, name, getattr(args, "session", None))
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.reattach_refused", name, {"why": _one_line(who, 160)})
@@ -4680,7 +4680,7 @@ def cmd_reattach(args, runner, now, socket_call=None):
         raise LaunchError("another reattach of %s is running: wait for it, then run `%s status`" % (name, PROG)) from None
 
 
-def reattach_caller_problem(engine, runner, now, discovery, name):
+def reattach_caller_problem(engine, runner, now, discovery, name, session=None):
     """None when the caller may reattach `name`: the operator at their own terminal, the Chief of Staff, or the agent's own boss. Else why not."""
     kind = gates_caller_kind(runner, now)
     if kind[0] == "person":
@@ -4692,6 +4692,15 @@ def reattach_caller_problem(engine, runner, now, discovery, name):
     target = discovery.agents.get(name)
     if target is not None and boss_name(discovery, target) == kind[1]:
         return None
+    if target is None:   # a dead agent is not discovered: its boss is in the session's STORED metadata
+        try:
+            known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
+            stored = _fleet_meta(engine.v2.session_get(session or known.get("session"))) or {} if (session or known.get("session")) else {}
+            boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
+        except Exception:
+            boss = None
+        if boss is not None and boss == kind[1]:
+            return None
     return "%s may not reattach %s: only the operator, the Chief of Staff, or %s's own boss may" % (kind[1], name, name)
 
 
@@ -12115,7 +12124,17 @@ def cmd_launch(args, runner, now, socket_call=None):
             stored = ((engine.v2.session_get(args.resume).get("metadata") or {}).get("fleet") or {}).get("repo")
             if stored and given != stored:
                 raise LaunchError("--repo %s differs from the session's stored repo %s: a resume keeps what the session says, never the caller's" % (given, stored))
-        done = resume_agent(engine, args.name, args.resume, workspace)
+        # the same authorisation and one-at-a-time lock as `reattach`: this path can close a stale tab too
+        who = reattach_caller_problem(engine, runner, now, engine.discover(engine.now()), args.name, args.resume)
+        if who:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.reattach_refused", args.name, {"why": _one_line(who, 160), "via": "launch --resume"})
+            raise LaunchError("refused: %s" % who)
+        try:
+            with agent_lock(state, args.name):
+                done = resume_agent(engine, args.name, args.resume, workspace)
+        except ImpactStateBusy:
+            raise LaunchError("another reattach of %s is running: wait for it" % args.name) from None
         print(json.dumps(done, sort_keys=True))
         return EXIT_OK
     if not args.agent or not args.dir:
@@ -14800,11 +14819,14 @@ class impact_state_lock:
         return False
 
 
+AGENT_LOCK_SECONDS = 10   # how long a second reattach of the same agent waits for the first (keep it above PANE_SETTLE_SECONDS)
+
+
 class agent_lock(impact_state_lock):
     """One flock per agent name: two concurrent reattaches of the same agent cannot both open or close a tab."""
 
-    def __init__(self, state_dir, name, seconds=10):
-        super().__init__(state_dir, seconds)
+    def __init__(self, state_dir, name, seconds=None):
+        super().__init__(state_dir, AGENT_LOCK_SECONDS if seconds is None else seconds)
         self.path = Path(state_dir) / ("reattach-%s.lock" % re.sub(r"[^a-z0-9_-]", "_", (name or "").lower()))
 
 

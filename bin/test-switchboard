@@ -3924,9 +3924,13 @@ class TestLaunch(Base):
         patch = mock.patch.object(sb, "PANE_SETTLE_SECONDS", 0)       # the two looks before a close are instant in tests
         patch.start()
         self.addCleanup(patch.stop)
-        term = mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None)   # a test shell is the operator's terminal unless a test says otherwise
+        self.terminal_problem = None                                  # None: the test shell is the operator's own terminal; a test sets a string to say it is not
+        term = mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem)
         term.start()
         self.addCleanup(term.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)            # restores HERDR_PANE_ID and the workspace even when an assertion fails
+        env.start()
+        self.addCleanup(env.stop)
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
@@ -4282,10 +4286,12 @@ class TestLaunch(Base):
             code, err = run()
         self.assertNotEqual(code, 0)
         self.assertIn("showed activity", err)
+        self.assertEqual(herdr.closed, [])
         herdr.panes[pane]["screen"] = "  Build\n"
         herdr.panes[pane]["status"] = "blocked"
         code, err = run()
         self.assertIn("is blocked", err)
+        self.assertEqual(herdr.closed, [])
         herdr.panes[pane]["status"] = None
         herdr.panes[pane]["read_fails"] = True
         code, err = run("--replace")
@@ -4317,6 +4323,25 @@ class TestLaunch(Base):
         os.environ.pop("HERDR_PANE_ID", None)
         refused = [e for e in self.world.audit() if e["event"] == "fleetpane.reattach_refused"]
         self.assertEqual(len(refused), 1)
+        self.assertEqual((refused[0]["subject"], refused[0]["detail"]["why"].startswith("stranger may not reattach platform")), ("platform", True))
+        # no pane id and away from the owner's terminal: refused too; and an orchestrator who is NOT its boss
+        self.terminal_problem = "stdin is not a terminal"
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.world.panes["platform"] = self.engine.discover(self.world.clock.now()).agents["platform"].pane
+        pane2 = self.detach()
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.world.herdr.closed.count(pane2), 0)
+        self.world.add_agent("other-orch", fleet={"role": "orchestrator"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["other-orch"]
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("may not reattach platform", err.getvalue())
+        self.assertIn(pane2, self.world.herdr.panes)
+        self.terminal_problem = None
+        os.environ.pop("HERDR_PANE_ID", None)
         self.world.panes["platform"] = self.engine.discover(self.world.clock.now()).agents["platform"].pane   # the pane the cos reattach opened
         pane = self.detach()                                                # a boss of the agent may
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
@@ -4325,19 +4350,49 @@ class TestLaunch(Base):
         os.environ.pop("HERDR_PANE_ID", None)
         self.assertEqual(code, 0, err.getvalue())
 
-    def test_two_concurrent_reattaches_of_one_agent_open_one_tab_and_the_second_is_told(self):
+    def test_two_concurrent_reattaches_of_one_agent_open_one_tab_the_second_is_told_and_another_agent_is_not_blocked(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.detach()
         before = len(self.world.herdr.socket_calls)
-        with sb.agent_lock(self.world.state, "platform"):                 # a first reattach is running
-            with mock.patch.object(sb.agent_lock, "__init__", lambda self_, d, n, seconds=0: sb.impact_state_lock.__init__(self_, d, 0) or setattr(self_, "path", Path(d) / "reattach-platform.lock")):
-                with captured() as (out, err):
-                    code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        with sb.agent_lock(self.world.state, "platform"), mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0):   # a first reattach is running
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertIn("another reattach of platform is running", err.getvalue())
+            with captured() as (out, err):                                  # the same lock guards `launch --resume`
+                code = sb.main(["launch", "platform", "--resume", self.world.sessions["platform"]], runner=self.world.route,
+                               now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertNotEqual(code, 0)
+            self.assertEqual((len(self.world.herdr.socket_calls), self.world.herdr.closed), (before, []))
+            self.world.add_agent("ops")                                      # another agent's lock is a different file
+            self.world.v2.sessions[self.world.sessions["ops"]]["directory"] = str(self.work)
+            self.detach("ops")
+            with captured() as (out, err):
+                code = sb.main(["reattach", "ops"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+
+    def test_launch_resume_by_a_stranger_closes_nothing_and_the_boss_of_a_dead_agent_may_reattach_it(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.add_agent("boss", fleet={"role": "coder"})
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        self.world.v2.sessions[self.world.sessions["platform"]]["metadata"]["fleet"]["reports_to"] = "boss"
+        pane = self.detach()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
+        with captured() as (out, err):
+            code = sb.main(["launch", "platform", "--resume", self.world.sessions["platform"]], runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertNotEqual(code, 0)
-        self.assertIn("another reattach of platform is running", err.getvalue())
-        self.assertEqual(len(self.world.herdr.socket_calls), before, "no tab was opened")
-        with captured() as (out, err):                                      # once the lock is free the same command runs
+        self.assertEqual((self.world.herdr.closed, pane in self.world.herdr.panes), ([], True))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.reattach_refused" and e["detail"].get("via") == "launch --resume"])
+        self.health()                                                      # the daemon remembers it, then its pane dies
+        del self.world.herdr.panes[pane]
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        with captured() as (out, err):
             code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
 
