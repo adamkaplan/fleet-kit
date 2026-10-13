@@ -1002,17 +1002,22 @@ class V2Http:
         raise V2Unreachable("the service does not answer")
 
     @staticmethod
+    def _budget(conn, deadline):
+        """Give the socket only the time the call has left (connect, send, status line, headers and body all share ONE deadline); none left is a timeout."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("the call did not finish within its total time")
+        sock = getattr(conn, "sock", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(left)
+
+    @staticmethod
     def _read_body(response, conn, deadline):
         """The whole reply body, at most V2_HTTP_MAX_BODY + 1 bytes, within a TOTAL deadline: each socket operation has its own timeout, so a service
         that answers a byte at a time could otherwise hold the one client far longer than `timeout`."""
         chunks, size = [], 0
         while size <= V2_HTTP_MAX_BODY:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise socket.timeout("the reply did not finish within the call's total time")
-            sock = getattr(conn, "sock", None)
-            if sock is not None and hasattr(sock, "settimeout"):
-                sock.settimeout(left)
+            V2Http._budget(conn, deadline)
             chunk = response.read(min(65536, V2_HTTP_MAX_BODY + 1 - size))
             if not chunk:
                 break
@@ -1035,7 +1040,9 @@ class V2Http:
             if conn.sock is None:
                 conn.connect()
             sent = True   # from here on a write may have reached the service
+            self._budget(conn, deadline)
             conn.request(method, target, body=data, headers=headers)
+            self._budget(conn, deadline)
             response = conn.getresponse()
             raw = self._read_body(response, conn, deadline)
         except (OSError, http.client.HTTPException) as err:

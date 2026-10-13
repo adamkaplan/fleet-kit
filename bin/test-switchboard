@@ -39128,6 +39128,13 @@ class TestV2Http(V2TransportBase):
             with self.assertRaises(socket.timeout):
                 sb.V2Http._read_body(trickle, types.SimpleNamespace(sock=None), now[0] + 5.0)
         self.assertEqual(trickle.reads, 3, "stopped at the total deadline (5 s), not after the whole reply")
+        sock = types.SimpleNamespace(timeouts=[], settimeout=lambda seconds: sock.timeouts.append(round(seconds, 1)))
+        conn = types.SimpleNamespace(sock=sock)
+        with mock.patch.object(sb.time, "monotonic", lambda: 100.0):
+            sb.V2Http._budget(conn, 103.0)
+            with self.assertRaises(socket.timeout):
+                sb.V2Http._budget(conn, 100.0)
+        self.assertEqual(sock.timeouts, [3.0], "the socket gets what is left of the total time: connect, send, headers and body share it")
         done = type("Done", (), {"read": lambda self, amount=None, _b=[b"abc", b""]: _b.pop(0)})()
         self.assertEqual(sb.V2Http._read_body(done, types.SimpleNamespace(sock=None), time.monotonic() + 5), b"abc")
 
