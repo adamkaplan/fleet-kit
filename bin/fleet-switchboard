@@ -5989,6 +5989,7 @@ PR_NOTICES = "pr-notices.json"
 PR_NOTICES_LOCK = "pr-notices.lock"
 PR_FACTS_TTL = 60                 # seconds a PR's facts (or a failed read) are kept before `gh pr view` runs again
 PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' PRs; the rest wait for the next pass
+PR_OPEN_CONFIRM_SECONDS = 300     # a PR last SEEN open longer ago than this, and not readable now, is not listed (its notice is kept; it returns when it can be read)
 PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
 PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
 PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels"
@@ -6431,14 +6432,16 @@ def notice_facts(engine, repo, number, now, budget=None):
     held = engine.notice_facts.get(key)
     if held is not None and now - held["at"] < PR_FACTS_TTL:
         return held
+    confirmed = held.get("confirmed") if held else None   # when a read last showed it OPEN
     if budget is not None and budget[0] <= 0:
-        return {"at": 0, "facts": held["facts"] if held else None, "stale": True, "skipped": True,
+        return {"at": 0, "facts": held["facts"] if held else None, "stale": True, "skipped": True, "confirmed": confirmed,
                 "error": "not read this pass: the notice reads' time budget is spent"}
     started = engine.now()
     try:
-        held = {"at": now, "facts": read_pr_facts(engine, repo, number), "stale": False, "error": None}
+        facts = read_pr_facts(engine, repo, number)
+        held = {"at": now, "facts": facts, "stale": False, "error": None, "confirmed": now if facts.get("state") == "open" else confirmed}
     except NoticeError as err:
-        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200),
+        held = {"at": now, "facts": held["facts"] if held else None, "stale": True, "error": _one_line(str(err), 200), "confirmed": confirmed,
                 "not_found": isinstance(err, NoticeNotFound)}  # gh ANSWERED that there is no such PR: it worked
     if budget is not None:
         budget[0] -= max(0, engine.now() - started)
@@ -6507,6 +6510,8 @@ def decisions_from_notices(engine, now):
             if since is not None:
                 engine.notice_effects["unreadable"][key] = None
                 engine.notice_effects["observed"][key] = None
+        if held["stale"] and held.get("confirmed") is not None and now - held["confirmed"] > PR_OPEN_CONFIRM_SECONDS:
+            continue   # it was last seen open a while ago and cannot be confirmed now: a row derived from OPEN state is not listed (the notice stays)
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold)
@@ -7585,7 +7590,8 @@ SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
                "S5": "cos-tier decision aged (and not already in the owner's tier)",
                "S7": "decisions that wait for each other (a cycle): none of them can be done first",
-               "S8": "a decision waits for an issue that is closed or missing"}
+               "S8": "a decision waits for an issue that is closed or missing",
+               "S9": "a merge or hold label left on a merged or closed PR"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -7792,6 +7798,14 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [],
                          "latest_strong": False, "latest_refs": []}
+    closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
+    recent, cut = hub.read_pages("repos/%s/issues?state=closed&sort=updated&direction=desc&per_page=50" % repo, cap=1)
+    budget[0] -= sweep_pages_used(recent, cut)
+    for record in recent:
+        number = _number(record)
+        names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
+        if number is not None and _is_pr(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+            closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
     budget[0] -= sweep_pages_used(comments, cut)
@@ -7802,7 +7816,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
             items[number]["comments"].append(sweep_says_waiting(regex, comment.get("body")))
             fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo])  # the last one wins
             items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
-    return {"at": now, "items": items, "truncated": truncated, "error": None}
+    return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds}
 
 
 def sweep_refresh(engine, state, repos, now, cfg, regex, budget):
@@ -7974,6 +7988,9 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
+    for repo, picture in state.repos.items():   # S9: a merge or hold label left on a merged or closed PR (read-only: nothing is removed)
+        for number in sorted(picture.get("closed_holds") or {}):
+            found.add(("S9", ref_text(repo, number)))
     for group in decision_core.find_cycles(decisions):   # S7: one finding per cycle, named by its first member
         found.add(("S7", group[0]))
     listed = {decision_core.decision_ref(d) for d in decisions} - {None}
@@ -8005,6 +8022,15 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
+    if kind == "S9":   # still a PR, no longer open, and still carrying a merge or hold label
+        try:
+            data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
+        except GitHubUnavailable:
+            return None
+        if not isinstance(data, dict) or "state" not in data:
+            return None
+        names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
+        return _is_pr(data) and data.get("state") != "open" and bool(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     if kind == "S8":   # a decision waits for this issue: it still holds when the issue is closed, or is not there at all
         try:
             data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
