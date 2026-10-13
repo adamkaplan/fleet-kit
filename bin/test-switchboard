@@ -211,7 +211,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90,
+            "owner_logins": [], "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto",
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -38896,6 +38896,355 @@ class TestPlanReviewCore(unittest.TestCase):
         for needle in ("acme/app#7", "O3", "L3", "no rollback", "rejected: out of scope"):
             self.assertIn(needle, text)
         self.assertIn("(none recorded)", plan_review.escalation_message("x#1", {"id": "O1", "lane": "L1"}, None))
+
+
+# ---- the event stream and the event feed (#290 slice 2; HELD for the owner: the credential)
+
+def feed_line(kind, session="ses_w", created=None, **data):
+    body = {"id": "evt_%s" % kind, "type": kind, "data": dict({"sessionID": session}, **data)}
+    if created is not None:
+        body["created"] = created
+    return "data: " + json.dumps(body)
+
+
+class EventServiceScript:
+    """The OpenCode service's event endpoint, in memory: no socket, thread or sleep. `connect` is the connection factory a test gives V2Stream.
+    Knobs: `up`, `status`, `password`, `lines` (what it streams; a None is a read timeout, after which a real response cannot be read on)."""
+
+    def __init__(self, password="pw-secret-1"):
+        self.password, self.up, self.status, self.lines, self.requests = password, True, 200, [], []
+
+    def connect(self, host, port, timeout=None):
+        return EventServiceConnection(self, timeout)
+
+    def write_service_file(self, path, url="http://127.0.0.1:49374", pid=None, mode=0o600):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps({"id": "x", "version": "2.0.24", "url": url, "pid": pid or os.getpid(), "password": self.password}))
+        os.chmod(str(path), mode)
+
+
+class EventServiceResponse:
+    def __init__(self, status, lines):
+        self.status, self.lines, self.timed_out = status, lines, False
+
+    def readline(self, limit=-1):
+        if self.timed_out:
+            raise OSError("cannot read from timed out object")   # what a real response does after a socket timeout
+        if not self.lines:
+            return b""
+        line = self.lines.pop(0)
+        if line is None:
+            self.timed_out = True
+            raise socket.timeout("timed out")
+        raw = (line + "\n").encode()
+        return raw[:limit] if limit and limit > 0 else raw
+
+
+class EventServiceConnection:
+    def __init__(self, service, timeout):
+        self.service, self.timeout, self.pending = service, timeout, None
+
+    def connect(self):
+        if not self.service.up:
+            raise ConnectionRefusedError(61, "Connection refused")
+
+    def request(self, method, target, body=None, headers=None):
+        self.pending = (method, target, (headers or {}).get("Authorization"))
+        self.service.requests.append(self.pending)
+
+    def getresponse(self):
+        token = "Basic " + base64.b64encode(("opencode:" + self.service.password).encode()).decode()
+        if self.pending[2] != token:
+            return EventServiceResponse(401, [])
+        return EventServiceResponse(self.service.status, list(self.service.lines))
+
+    def close(self):
+        pass
+
+
+class TestEventStream(Base):
+    def setUp(self):
+        super().setUp()
+        self.service = EventServiceScript()
+        self.file = self.home / "opencode" / "service.json"
+        self.service.write_service_file(self.file)
+
+    def route(self, alive=None):
+        return sb.V2Stream(self.file, alive=alive or (lambda pid: True), connect=self.service.connect)
+
+    def test_the_stream_says_it_opened_then_yields_its_lines_and_a_quiet_stretch_ends_it_like_a_close(self):
+        self.service.lines = [feed_line("session.execution.succeeded", created=1), None, feed_line("never", created=2)]
+        got = list(self.route().stream_lines())
+        self.assertIs(got[0], sb.STREAM_OPENED)
+        self.assertEqual([json.loads(g[5:])["type"] for g in got[1:]], ["session.execution.succeeded"],
+                         "a read timeout ends the connection: a response is never read on after one")
+        self.assertEqual([(m, t) for m, t, _ in self.service.requests], [("GET", "/api/event")], "one GET, nothing else")
+
+    def test_a_bad_service_file_is_unreachable_and_the_service_is_not_contacted(self):
+        cases = (("none", lambda: self.file.unlink()), ("stale pid", lambda: self.service.write_service_file(self.file, pid=99999999)),
+                 ("remote", lambda: self.service.write_service_file(self.file, url="http://203.0.113.9:80")),
+                 ("a name, not a literal address", lambda: self.service.write_service_file(self.file, url="http://localhost:49374")),
+                 ("world readable", lambda: self.service.write_service_file(self.file, mode=0o644)),
+                 ("garbage", lambda: (self.file.write_text("{not json"), os.chmod(str(self.file), 0o600))),
+                 ("huge", lambda: (self.file.write_text(" " * 10000), os.chmod(str(self.file), 0o600))),
+                 ("huge but valid up front", lambda: (self.file.write_text(json.dumps({"url": "http://127.0.0.1:1", "password": self.service.password}) + " " * 10000), os.chmod(str(self.file), 0o600))))
+        for name, writer in cases:
+            with self.subTest(name=name):
+                self.file.exists() and self.file.unlink()
+                self.service.write_service_file(self.file)
+                writer()
+                before = len(self.service.requests)
+                with self.assertRaises(sb.V2Unreachable):
+                    list(self.route(alive=lambda pid: pid != 99999999).stream_lines())
+                self.assertEqual(len(self.service.requests), before)
+        for good in ("http://127.0.0.1:49374", "http://[::1]:49374"):
+            with self.subTest(good=good):
+                self.service.write_service_file(self.file, url=good)
+                self.assertIs(next(self.route().stream_lines()), sb.STREAM_OPENED)
+
+    def test_a_refused_password_a_bad_status_a_refused_connection_and_an_oversized_line(self):
+        route = self.route()
+        self.service.password = "rotated"
+        with self.assertRaises(sb.V2Unreachable):
+            list(route.stream_lines())
+        self.service.password = "pw-secret-1"
+        self.service.status = 500
+        with self.assertRaises(sb.V2Error):
+            list(self.route().stream_lines())
+        self.service.status = 200
+        self.service.up = False
+        with self.assertRaises(sb.V2Unreachable):
+            list(self.route().stream_lines())
+        self.service.up = True
+        self.service.lines = ["data: " + "x" * 5000]
+        with mock.patch.object(sb, "V2_STREAM_LINE_MAX", 1000):
+            with self.assertRaises(sb.V2Error):
+                list(self.route().stream_lines())
+
+    def test_the_credential_is_read_only_for_the_stream_and_a_fake_run_or_the_off_key_never_reads_it(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["v2_events"], "auto")
+        self.assertEqual(sb.validate_config(dict(base, v2_events="off"))["v2_events"], "off")
+        for bad in ("stream", "", None, 1, True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, v2_events=bad))
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        self.assertEqual(source.count("v2_service_file("), 2, "defined once, used once (cmd_run's gate)")
+        self.assertIn('config["v2_events"] == "auto" and runner is subprocess.run', source)
+
+
+class TestEventFeedLines(unittest.TestCase):
+    def test_only_the_wanted_events_are_kept_and_no_text_is_ever_kept(self):
+        feed = sb.EventFeed(None)
+        for line in ("event: x", "data: not json", "data: []", feed_line("session.tool.success", assistantMessageID="msg_t", content="x" * 5000),
+                     feed_line("session.text.ended", assistantMessageID="msg_a", ordinal=0, text="SECRET-TEXT"),
+                     feed_line("session.execution.succeeded", created=5000)):
+            feed.handle(line)
+        self.assertEqual(feed.status()["events"], 2, "the tool output and the junk were not kept")
+        self.assertEqual(feed.seen["ses_w"], {"assistant": "msg_a", "idle_ms": 5000, "read": None, "event_at": feed.seen["ses_w"]["event_at"]})
+        self.assertNotIn("SECRET-TEXT", repr(feed.seen), "an event's text can be partial or stale: it is never kept")
+
+    def test_the_step_ended_and_failed_and_interrupted_branches_and_a_line_without_a_session(self):
+        feed = sb.EventFeed(None)
+        feed.handle(feed_line("session.step.ended", assistantMessageID="msg_s"))
+        self.assertEqual(feed.seen["ses_w"]["assistant"], "msg_s")
+        for kind in ("session.execution.failed", "session.execution.interrupted"):
+            feed.handle(feed_line(kind, created=7000))
+            self.assertEqual(feed.seen["ses_w"]["idle_ms"], 7000)
+        feed.handle('data: {"type": "session.text.ended", "data": {"text": "t"}}')
+        self.assertEqual(feed.status()["sessions"], 1)
+
+    def test_the_sessions_kept_are_bounded(self):
+        feed = sb.EventFeed(None)
+        with mock.patch.object(sb, "FEED_SESSIONS_MAX", 3):
+            for n in range(10):
+                feed.handle(feed_line("session.execution.succeeded", session="ses_%d" % n, created=1))
+        self.assertEqual(feed.status()["sessions"], 3)
+
+    def test_a_session_is_touched_when_an_event_named_it_after_it_was_last_read(self):
+        feed = sb.EventFeed(None, now=lambda: 100.0)
+        self.assertTrue(feed.touched_since_read("ses_w"), "never read")
+        feed.seen["ses_w"] = {"assistant": None, "idle_ms": None, "read": 100.0, "event_at": None}
+        self.assertFalse(feed.touched_since_read("ses_w"))
+        feed.now = lambda: 101.0
+        feed.handle(feed_line("session.step.ended", assistantMessageID="msg_s"))
+        self.assertTrue(feed.touched_since_read("ses_w"))
+
+
+class TestEventFeedRun(Base):
+    def setUp(self):
+        super().setUp()
+        self.service = EventServiceScript()
+        self.file = self.home / "opencode" / "service.json"
+        self.service.write_service_file(self.file)
+
+    def route(self):
+        return sb.V2Stream(self.file, alive=lambda pid: True, connect=self.service.connect)
+
+    def test_the_feed_marks_a_gap_on_every_opened_connection_and_reconnects_with_growing_waits(self):
+        sleeps, feed = [], None
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 4:
+                feed.stop()
+        feed = sb.EventFeed(self.route(), None, sleep=sleep)
+        self.service.lines = [feed_line("session.step.ended", assistantMessageID="msg_a"), feed_line("session.execution.succeeded", created=7)]
+        feed.needs_resync = False
+        feed.run()
+        self.assertEqual(sleeps, [1, 2, 4, 8], "a stream that ends is a gap: reconnect, waiting longer each time")
+        self.assertEqual(feed.status()["connects"], 4)
+        self.assertTrue(feed.needs_resync)
+
+    def test_a_connection_that_lived_starts_the_wait_over_and_the_wait_is_capped(self):
+        clock, sleeps, feed = [0.0], [], None
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += sb.FEED_STABLE_SECONDS + 1 if len(sleeps) == 3 else 0.1
+            if len(sleeps) == 5:
+                feed.stop()
+        feed = sb.EventFeed(self.route(), None, now=lambda: clock[0], sleep=sleep)
+        self.service.lines = []
+        feed.run()
+        self.assertEqual(sleeps[:2], [1, 2])
+        with mock.patch.object(sb, "FEED_BACKOFF_MAX", 2):
+            capped, feed2 = [], None
+
+            def sleep2(seconds):
+                capped.append(seconds)
+                if len(capped) == 4:
+                    feed2.stop()
+            feed2 = sb.EventFeed(self.route(), None, sleep=sleep2)
+            feed2.run()
+        self.assertEqual(capped, [1, 2, 2, 2])
+
+    def test_a_service_that_stays_down_costs_nothing_no_gap_no_resync_no_read_no_audit_line(self):
+        world = World(self, agents=("platform", "coder"))
+        engine = world.new_engine()
+        self.service.up = False
+        waits = []
+        engine.feed = feed = sb.EventFeed(self.route(), engine.audit, world.clock.now, sleep=lambda s: (waits.append(s), len(waits) >= 5 and feed.stop()))
+        feed.run()
+        engine.discover(world.clock.now())
+        before = len(world.v2.calls)
+        for _ in range(3):
+            sb.feed_tick(engine)
+        self.assertEqual((feed.status()["connects"], feed.status()["errors"]), (0, 5))
+        self.assertEqual(len(world.v2.calls), before, "no read at all while the service is down")
+        self.assertEqual([e for e in world.audit() if e["event"] in ("event.resync", "event.missed")], [])
+
+    def test_the_password_is_in_no_feed_state_no_audit_line_and_no_status_file(self):
+        world = World(self, agents=("platform", "coder"))
+        engine = world.new_engine()
+        engine.feed = feed = sb.EventFeed(self.route(), engine.audit, world.clock.now, sleep=lambda s: feed.stop())
+        self.service.password = "wrong"
+        feed.run()
+        self.service.password = "pw-secret-1"
+        self.service.write_service_file(self.file)
+        feed.stop_event.clear()
+        feed.sleep = lambda s: feed.stop()
+        self.service.lines = [feed_line("session.step.ended", assistantMessageID="msg_a")]
+        feed.run()
+        engine.discover(world.clock.now())
+        feed.connected = True
+        sb.feed_tick(engine)
+        sb.record_v2_calls(engine)
+        everything = json.dumps(feed.status()) + (world.state / "audit.jsonl").read_text() + (world.state / sb.V2_CALLS_FILE).read_text()
+        self.assertIn("event.resync", everything)
+        self.assertNotIn(self.service.password, everything)
+        self.assertNotIn("Basic ", everything)
+        self.assertNotIn("wrong", everything)
+
+
+class TestEventFeedReads(unittest.TestCase):
+    class Stub:
+        def __init__(self, pages=None, fail=False):
+            self.calls, self.pages, self.fail = [], pages or [[]], fail
+
+        def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+            self.calls.append((session, limit, type))
+            if self.fail:
+                raise sb.V2Error("backoff", None, "skipped")
+            return self.pages[0]
+
+    def feed(self, now, audits=None):
+        audit = types.SimpleNamespace(append=lambda actor, name, subject, detail: audits.append((name, detail))) if audits is not None else None
+        feed = sb.EventFeed(None, audit, lambda: now[0])
+        feed.connected, feed.needs_resync = True, False
+        return feed
+
+    def test_an_assistant_message_no_event_announced_is_found_by_one_bounded_read_and_said_to_be_missed(self):
+        now, audits = [1000.0], []
+        feed = self.feed(now, audits)
+        feed.handle(feed_line("session.step.ended", session="ses_a", assistantMessageID="msg_old"))
+        engine = types.SimpleNamespace(v2=self.Stub([[{"id": "msg_new"}]]))
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual(engine.v2.calls, [("ses_a", sb.FEED_PAGE, "assistant")], "one bounded read, newest assistant message only")
+        self.assertEqual(audits, [("event.missed", {"session": "ses_a", "last_seen": "msg_old", "found": "msg_new"})])
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual(len(engine.v2.calls), 1, "within the interval: no read")
+        now[0] += sb.FEED_RECONCILE_SECONDS + 1
+        feed.tick(engine, ["ses_a"])
+        self.assertEqual((len(engine.v2.calls), len(audits)), (2, 1), "read again after the interval; nothing new, so nothing missed")
+        self.assertEqual(feed.status()["missed"], 1)
+
+    def test_the_reconciliation_is_spread_and_a_read_that_fails_is_tried_again(self):
+        feed = self.feed([1000.0])
+        engine = types.SimpleNamespace(v2=self.Stub(fail=True))
+        sessions = ["s%d" % n for n in range(10)]
+        feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), sb.FEED_RECONCILES_PER_PASS, "at most this many per pass")
+        engine.v2.fail = False
+        feed.tick(engine, sessions)
+        feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), 3 * sb.FEED_RECONCILES_PER_PASS, "the failed ones came round again")
+
+    def test_a_resync_is_spread_over_passes_and_a_flapping_stream_cannot_cause_a_read_storm(self):
+        now, audits = [1000.0], []
+        feed = self.feed(now, audits)
+        feed.needs_resync = True
+        engine = types.SimpleNamespace(v2=self.Stub())
+        sessions = ["s%d" % n for n in range(10)]
+        feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), sb.FEED_RESYNC_PER_PASS, "a burst is never made: the first pass reads a few")
+        self.assertTrue(feed.needs_resync, "the rest wait for the next passes")
+        for _ in range(2):
+            feed.tick(engine, sessions)
+        self.assertEqual(sorted(c[0] for c in engine.v2.calls), sorted(sessions), "every session was read once, spread over three passes")
+        self.assertFalse(feed.needs_resync)
+        self.assertEqual([n for n, _ in audits].count("event.resync"), 3)
+        for _ in range(5):   # the stream flaps: a new gap each time, within the minimum interval
+            feed.needs_resync = True
+            now[0] += 5
+            feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), len(sessions), "no session is read again within the minimum interval, however often the stream reconnects")
+
+    def test_a_feed_that_is_not_connected_reads_nothing_the_old_reads_are_all_there_is(self):
+        feed = sb.EventFeed(None, None, lambda: 1000.0)
+        feed.needs_resync = True
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(message_list=lambda *a, **k: self.fail("a read while the stream is down")))
+        feed.tick(engine, ["ses_a"])
+
+    def test_a_feed_that_breaks_never_fails_the_pass_and_is_said_once(self):
+        notes = []
+        feed = sb.EventFeed(None)
+        feed.tick = mock.Mock(side_effect=RuntimeError("boom"))
+        engine = types.SimpleNamespace(feed=feed, discovery=None, _note=lambda *a: notes.append(a))
+        sb.feed_tick(engine)
+        self.assertEqual(notes[0][0], "event.feed.error")
+        sb.feed_tick(types.SimpleNamespace())   # no feed at all: nothing
+
+    def test_the_status_line_says_the_stream_is_up_or_that_the_old_reads_are_in_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = types.SimpleNamespace(state_dir=tmp, now=lambda: 1000.0, v2=types.SimpleNamespace(calls_by_operation=lambda *a, **k: {}))
+            engine.feed = sb.EventFeed(None)
+            engine.feed.connected = True
+            sb.record_v2_calls(engine)
+            self.assertIn("events: stream", sb.v2_calls_status(tmp, 1000.0))
+            engine.feed.connected = False
+            sb.record_v2_calls(engine)
+            self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
 
 
 def main(argv):
