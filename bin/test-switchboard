@@ -38178,7 +38178,7 @@ class TestAgentsVerify(unittest.TestCase):
             with self.subTest(defaults=len(defaults)):
                 code, out, err = self.run_verify(self.listing(**{"coder": ("primary", list(defaults))}))
                 self.assertEqual(code, 1)
-                self.assertRegex(out, r"FAIL  coder: \d+ of its \d+ rules are not registered as written")
+                self.assertRegex(out, r"FAIL  coder: \d+ of its \d+ rules \(from .*coder.md\) are not registered as written")
 
     def test_a_missing_rule_and_a_rule_with_another_effect_fail_and_a_missing_agent_too(self):
         coder = sb.agent_definition_rules("coder")
@@ -38186,14 +38186,33 @@ class TestAgentsVerify(unittest.TestCase):
                                   "orchestrator": ("primary", self.rows_of("orchestrator", flip=[sb.agent_definition_rules("orchestrator")[0]]) + self.DEFAULTS_5)})
         code, out, err = self.run_verify(listing.replace('"id": "reviewer-impact"', '"id": "someone-else"'))
         self.assertEqual(code, 1)
-        self.assertIn("coder: 1 of its %d rules are not registered as written" % len(coder), out)
-        self.assertIn("orchestrator: 1 of its", out)
+        self.assertRegex(out, r"coder: 1 of its %d rules \(from .*coder.md\) are not registered as written" % len(coder))
+        self.assertRegex(out, r"orchestrator: 1 of its \d+ rules \(from .*orchestrator.md\)")
         self.assertIn("reviewer-impact: not registered", out)
 
     def test_the_order_of_the_registered_rules_does_not_matter(self):
         rows = list(reversed(self.rows_of("coder") + self.DEFAULTS_5))
         code, out, err = self.run_verify(self.listing(**{"coder": ("primary", rows)}))
         self.assertEqual((code, err), (0, ""))
+
+    def test_every_shipped_definition_is_read_whole_no_line_of_its_permission_block_is_skipped(self):
+        for name in sb.EXPECTED_AGENTS:
+            rules, unread, path = sb.agent_definition(name)
+            self.assertEqual(unread, 0, "%s: %d lines of its permission block are not in a form the check reads" % (name, unread))
+            self.assertTrue(rules, name)
+
+    def test_a_line_the_check_cannot_read_and_a_definition_that_is_not_there_are_said_not_passed(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "opencode"
+            folder.mkdir()
+            (folder / "coder.md").write_text("---\nname: coder\nmode: primary\npermission:\n  edit: allow\n  bash:\n    git *: allow\n---\nbody\n")
+            found = {"coder": ("primary", {("edit", "*", "allow")})}
+            self.assertRegex("\n".join(sb.agents_problems(found, {"coder": "primary"}, root)), r"coder: 2 lines of the permission block in .*coder.md are not in a form")
+            unchecked = []
+            self.assertEqual(sb.agents_problems(found, {"coder": "primary"}, root + "/none", unchecked), [])
+            self.assertEqual(unchecked, ["coder"], "the rules were not compared: said, not passed")
+            self.assertEqual(sb.agents_problems({"coder": ("subagent", set())}, {"coder": "primary"}, root + "/none"), [
+                "coder: registered as subagent, expected primary (its front matter probably failed to parse: quote any description with a colon)"], "the mode is still checked")
 
     def test_the_definitions_are_read_as_the_service_registers_them(self):
         """A permission map entry `edit: allow` is action edit, resource `*`; `bash` is action `shell`. A list entry keeps its action, resource and effect."""

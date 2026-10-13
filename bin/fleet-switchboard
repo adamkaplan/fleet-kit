@@ -15969,9 +15969,10 @@ _RULE_LINE = re.compile(r'^\s*-\s*\{action:\s*(.+?),\s*resource:\s*(".*"),\s*eff
 _MAP_LINE = re.compile(r'^  ([A-Za-z_][A-Za-z0-9_]*):\s*(allow|deny|ask)\s*(?:#.*)?$')
 
 
-def agent_definition_rules(name, root=None):
-    """The rules the kit's definition of agent `name` declares, as a sorted list of (action, resource, effect), or None when the
-    definition cannot be found (an install without the kit's agents directory: the rules are then not checked)."""
+def agent_definition(name, root=None):
+    """(rules, unread, path) of the kit's definition of agent `name`: its declared rules as a sorted list of (action, resource, effect), the
+    lines of its permission block that the parser could not read (so they could not be checked), and the file used; None when the
+    definition cannot be found (an install without the kit's agents directory)."""
     base = Path(root) if root is not None else Path(os.path.realpath(__file__)).parent.parent / "agents"
     for folder in AGENT_DEFINITION_DIRS:
         path = base / folder / (name + ".md")
@@ -15980,7 +15981,7 @@ def agent_definition_rules(name, root=None):
         except OSError:
             continue
         front = text.split("\n---\n", 1)[0].splitlines()[1:]   # without the opening ---
-        rules, section = set(), None
+        rules, unread, section = set(), 0, None
         for line in front:
             if line.startswith("permissions:"):
                 section = "list"
@@ -15988,17 +15989,23 @@ def agent_definition_rules(name, root=None):
                 section = "map"
             elif line and not line.startswith((" ", "#")):
                 section = None
-            elif section == "list":
-                match = _RULE_LINE.match(line)
-                if match:
+            elif section and line.strip() and not line.lstrip().startswith("#"):
+                match = _RULE_LINE.match(line) if section == "list" else _MAP_LINE.match(line)
+                if match is None:
+                    unread += 1
+                elif section == "list":
                     action = json.loads(match.group(1)) if match.group(1).startswith('"') else match.group(1)
                     rules.add((action, json.loads(match.group(2)), match.group(3)))
-            elif section == "map":
-                match = _MAP_LINE.match(line)
-                if match:
+                else:
                     rules.add(("shell" if match.group(1) == "bash" else match.group(1), "*", match.group(2)))
-        return sorted(rules)
+        return sorted(rules), unread, str(path)
     return None
+
+
+def agent_definition_rules(name, root=None):
+    """The declared rules of the definition (see `agent_definition`), or None when it cannot be found."""
+    found = agent_definition(name, root)
+    return None if found is None else found[0]
 
 
 def agents_found(runner, opencode, timeout):
@@ -16022,8 +16029,9 @@ def agents_found(runner, opencode, timeout):
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
-def agents_problems(found, expected=None, root=None):
-    """One line per agent of ours that is missing, in the wrong mode or short of a rule its definition declares."""
+def agents_problems(found, expected=None, root=None, unchecked=None):
+    """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
+    the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
     problems = []
     for name, mode in sorted((expected or EXPECTED_AGENTS).items()):
         if name not in found:
@@ -16033,13 +16041,18 @@ def agents_problems(found, expected=None, root=None):
         if got_mode != mode:
             problems.append("%s: registered as %s, expected %s (its front matter probably failed to parse: quote any description with a colon)" % (name, got_mode, mode))
             continue
-        declared = agent_definition_rules(name, root)
-        if declared is None:
-            continue   # no definition to compare with: the mode was checked
+        definition = agent_definition(name, root)
+        if definition is None:
+            if unchecked is not None:
+                unchecked.append(name)   # no definition to compare with: the mode was checked, the rules were not
+            continue
+        declared, unread, path = definition
+        if unread:
+            problems.append("%s: %d lines of the permission block in %s are not in a form this check reads, so they were not verified" % (name, unread, path))
         missing = [rule for rule in declared if rule not in registered]
         if missing:
-            problems.append("%s: %d of its %d rules are not registered as written, for example %s %s %s (its permission block did not load as written)"
-                            % (name, len(missing), len(declared), missing[0][0], missing[0][1], missing[0][2]))
+            problems.append("%s: %d of its %d rules (from %s) are not registered as written, for example %s %s %s (its permission block did not load as written)"
+                            % (name, len(missing), len(declared), path, missing[0][0], missing[0][1], missing[0][2]))
     return problems
 
 
@@ -16052,13 +16065,18 @@ def cmd_agents(args, runner, now):
     if state == "bad":
         sys.stderr.write("%s: agents verify: %s\n" % (PROG, payload))
         return EXIT_ERROR
-    problems = agents_problems(payload)
+    unchecked = []
+    problems = agents_problems(payload, unchecked=unchecked)
     if problems:
         for line in problems:
             print("FAIL  " + line)
-        print("agents: %d of %d agents are not registered as written" % (len(problems), len(EXPECTED_AGENTS)))
+        print("agents: %d problems among %d agents" % (len(problems), len(EXPECTED_AGENTS)))
         return EXIT_ERROR
-    print("agents: PASS (%d of %d registered with the expected mode and every rule their definitions declare)" % (len(EXPECTED_AGENTS), len(EXPECTED_AGENTS)))
+    if unchecked:
+        print("agents: PASS on mode only for %d of %d (%s): their definitions were not found beside this binary, so their rules were not compared"
+              % (len(unchecked), len(EXPECTED_AGENTS), ", ".join(unchecked)))
+        return EXIT_ERROR if args.strict else EXIT_OK
+    print("agents: PASS (%d of %d registered with the expected mode and every rule their definitions declare; rules loaded, not proof they take effect: the last match wins)" % (len(EXPECTED_AGENTS), len(EXPECTED_AGENTS)))
     return EXIT_OK
 
 
