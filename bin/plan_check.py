@@ -591,18 +591,35 @@ def unchanged_reason_ok(reason):
     return len(reason) >= MIN_UNCHANGED_REASON and len(real) >= 3
 
 
+def _outside_fences(text):
+    """`text` with every fenced block (``` or ~~~, closed or not) removed: an example in a code fence is not the plan's own line."""
+    kept, fence = [], None
+    for line in (text or "").splitlines():
+        opened = FENCE_RE.match(line)
+        if fence is None and opened:
+            fence = opened.group(1)
+        elif fence is not None and opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence) and not opened.group(2).strip():
+            fence = None
+        elif fence is None:
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def size_problem(text):
     """None, or (code, message) for the size line of a plan that opted in (`plan-format: 2` or more). The size is S (under 1 hour of agent time), M
     (a few hours), L (about a day) or XL (several days), each with what makes it that size; a size given in days is refused for work under L, and
     human-days are refused always (the fleet's calibration is agent time)."""
-    opted = PLAN_FORMAT_RE.search(text or "")
+    text = _outside_fences(text)   # a `plan-format:` or `size:` inside a code fence is an example, not the plan's line
+    opted = PLAN_FORMAT_RE.search(text)
     if not opted or int(opted.group(1)) < SIZE_FORMAT_FROM:
         return None
-    found = SIZE_RE.search(text or "")
-    if not found:
+    lines = SIZE_RE.findall(text)
+    # prose can start a line with "Size: one PR ..."; the plan's own line is the first one that starts with a size, else (so the defect is shown) the first
+    found = next((m for m in lines if SIZE_WORD_RE.match(m.strip())), lines[0] if lines else None)
+    if found is None:
         return ("missing-size", "the plan has no `size:` line (S under 1 hour, M a few hours, L about a day, XL several days, in AGENT time, "
                 "with what makes it that size; a light plan may carry just `size: S`)")
-    value = found.group(1).strip()
+    value = found.strip()
     word = SIZE_WORD_RE.match(value)
     if not word:
         return ("bad-size", "`size:` must start with S, M, L or XL (agent time: S under 1 hour, M a few hours, L about a day, XL several days), got %r" % value[:60])

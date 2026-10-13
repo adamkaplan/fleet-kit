@@ -20952,6 +20952,16 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: S, 1 week\n" + GOOD_PLAN))
         self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: M, 2 wk\n" + GOOD_PLAN))
 
+    def test_prose_that_starts_with_size_does_not_hide_the_real_line_and_a_code_fence_is_not_the_plan(self):
+        prose = "Size: one PR, a few files\n"
+        self.assertEqual(self.codes("plan-format: 2\n" + prose + "size: M\n" + GOOD_PLAN), [], "the repro: prose before the real line")
+        self.assertEqual(self.codes("plan-format: 2\nsize: M: a few hours\n" + prose + GOOD_PLAN), [])
+        self.assertIn("bad-size", self.codes("plan-format: 2\n" + prose + GOOD_PLAN), "only prose: the defect shows")
+        fenced = "```text\nplan-format: 2\nsize: huge\n```\n"
+        self.assertEqual(self.codes(fenced + GOOD_PLAN), [], "an example in a fence does not opt a plan in")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + fenced + GOOD_PLAN), "an example size in a fence is not the plan's size")
+        self.assertEqual(self.codes("plan-format: 2\n~~~\nsize: huge\n~~~\nsize: S\n" + GOOD_PLAN), [])
+
     def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
         for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
                           ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):
