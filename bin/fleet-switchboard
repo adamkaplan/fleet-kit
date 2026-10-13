@@ -3649,8 +3649,11 @@ def release_stale_binding(engine, name, taken, session_id):
 def read_pane_health(state_dir):
     """{"agents": {name: {...}}, "states": {name: {...}}, "missing": {name: n}}; an unreadable file is an empty one."""
     try:
-        raw = json.loads((Path(state_dir) / PANE_HEALTH_FILE).read_text())
-    except (OSError, ValueError):
+        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
+            raw = json.loads(handle.read(1000001).decode("utf-8")) if True else {}
+        if isinstance(raw, dict) and len(json.dumps(raw)) > 1000000:
+            raw = {}
+    except (OSError, ValueError, UnicodeError):
         raw = {}
     raw = raw if isinstance(raw, dict) else {}
     return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("agents", "states", "missing")}
@@ -3833,8 +3836,10 @@ def cmd_reattach(args, runner, now, socket_call=None):
     data["missing"].pop(name, None)
     try:
         write_pane_health(state, data)
-    except OSError:
-        pass
+    except OSError as err:   # the reattach itself succeeded (exit 0): the next daemon pass rewrites the file; say so
+        sys.stderr.write("%s: reattached, but pane-health.json was not updated (%s): the next daemon pass will\n" % (PROG, _one_line(str(err), 100)))
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.error", name, {"error": "pane-health.json not written: %s" % _one_line(str(err), 100)})
     done = dict(done, charter=note or None)
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK

@@ -4197,6 +4197,7 @@ class TestLaunch(Base):
             with captured() as (out, err):
                 code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
         self.assertNotEqual(code, 0)
+        self.assertIn("changed while it was being judged", err.getvalue())
         self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
         herdr.panes[pane]["title"] = "OpenCode"
         base = self.world.route
@@ -4216,6 +4217,28 @@ class TestLaunch(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("belongs to", err.getvalue())
         self.assertEqual(herdr.closed, [])
+
+    def test_a_state_file_that_cannot_be_written_is_reported_by_the_pass_and_by_reattach_and_a_pane_with_no_tab_is_refused(self):
+        self.engine.state_dir = self.world.state
+        self.engine.discover(self.world.clock.now())
+        with mock.patch.object(sb, "write_pane_health", side_effect=OSError(28, "No space left")):
+            sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error"])
+        self.detach()
+        taken = self.engine.discover(self.world.clock.now()).agents["platform"]
+        with mock.patch.object(sb, "pane_state", return_value=(sb.PANE_DETACHED, "x", {"tab": None})):
+            with self.assertRaises(sb.LaunchError) as caught:
+                sb.release_stale_binding(self.engine, "platform", taken, taken.session_id)
+        self.assertIn("names no tab", str(caught.exception))
+
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.detach()
+        with mock.patch.object(sb, "write_pane_health", side_effect=OSError(28, "No space left")):
+            with captured() as (out, err):
+                code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("pane-health.json was not updated", err.getvalue())
 
     def test_a_pass_checks_at_most_the_budget_of_panes(self):
         for n in range(sb.PANE_CHECKS_PER_PASS + 5):
