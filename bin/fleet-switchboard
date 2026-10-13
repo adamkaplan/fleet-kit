@@ -904,8 +904,9 @@ V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
 V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
 V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
 V2_STREAM_LINE_MAX = 1024 * 1024  # one event line of the stream; a larger one is refused
-V2_STREAM_IDLE_SECONDS = 300      # a stream that said nothing for this long is dropped and opened again (cheap: the re-sync is rate limited)
+V2_STREAM_IDLE_SECONDS = 1800     # a stream that said nothing for this long is dropped and opened again (the service sends no keep-alive); that reopen is NOT a gap
 STREAM_OPENED = object()          # what stream_lines yields once the service answered
+STREAM_IDLE = object()            # what it yields when it ends because the stream was quiet for the whole idle time (the next open is not a gap)
 V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
 V2_SLOW_MIN_SAMPLES = 8
 V2_SLOW_WINDOW = 20
@@ -1004,6 +1005,9 @@ class V2Http:
             while True:
                 try:
                     raw = response.readline(V2_STREAM_LINE_MAX + 1)
+                except socket.timeout:
+                    yield STREAM_IDLE   # quiet for the whole idle time: ours to end, not the service's; the caller may reopen without marking a gap
+                    return
                 except (OSError, http.client.HTTPException):
                     return   # a read timeout included: a response is not read on after a timeout (the socket refuses), so it ends and the caller reconnects
                 if not raw:
@@ -2468,6 +2472,7 @@ FEED_RESYNC_MIN_SECONDS = 120    # a session read this recently is not read agai
 FEED_SESSIONS_MAX = 500
 FEED_BACKOFF_MAX = 60
 FEED_STABLE_SECONDS = 30         # a connection that lasted this long starts the reconnect wait over
+FEED_ID_MAX = 128                # an id longer than this is not kept (ids are short; a line may be 1 MB)
 
 
 class EventFeed:
@@ -2482,6 +2487,8 @@ class EventFeed:
         self.seen = {}                # session id -> what the events said
         self.connected = False
         self.needs_resync = True      # a fresh feed has seen nothing: the first open re-syncs once
+        self.consumers = set()        # who needs the feed's reads: with none, the feed only OBSERVES (it costs a connection and no v2 call)
+        self.quiet_end = False        # the last connection ended because the stream was quiet: the next open is not a gap
         self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0, "read_errors": 0}
         self.down_reason = None
 
@@ -2515,7 +2522,8 @@ class EventFeed:
 
     def consume(self, lines):
         """Read every line of one connection. The gap is marked when the service ANSWERED (STREAM_OPENED), never before: a service that is down
-        opens nothing and costs nothing. A connection that ended is a gap too: the next open re-syncs."""
+        opens nothing and costs nothing; and never after our own idle reopen (STREAM_IDLE: nothing was lost to a drop, only a quiet stream was
+        reopened). A connection that ended for any other reason is a gap: the next open re-syncs."""
         try:
             for line in lines:
                 if self.stop_event.is_set():
@@ -2524,12 +2532,20 @@ class EventFeed:
                     with self.lock:
                         self.connected, self.down_reason = True, None
                         self.counts["connects"] += 1
-                        self.needs_resync = True   # events between two connections are missed by contract
+                        if not self.quiet_end:
+                            self.needs_resync = True   # events between two connections are missed by contract
+                        self.quiet_end = False
+                elif line is STREAM_IDLE:
+                    with self.lock:
+                        self.quiet_end = True
                 else:
                     self.handle(line)
         finally:
             with self.lock:
                 self.connected = False
+            close = getattr(lines, "close", None)
+            if close is not None:
+                close()   # a generator stopped early is closed now, not when it is collected: its connection goes with it
 
     def handle(self, line):
         if not line.startswith("data:"):
@@ -2542,7 +2558,7 @@ class EventFeed:
         if kind not in FEED_TYPES:
             return
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        session = data.get("sessionID") if isinstance(data.get("sessionID"), str) else None
+        session = data.get("sessionID") if isinstance(data.get("sessionID"), str) and len(data["sessionID"]) <= FEED_ID_MAX else None
         with self.lock:
             self.counts["events"] += 1
             if session is None:
@@ -2553,7 +2569,7 @@ class EventFeed:
                     self.seen.pop(next(iter(self.seen)))
                 entry = self.seen[session] = {"assistant": None, "idle_ms": None, "read": None, "event_at": None}
             entry["event_at"] = self.now()
-            message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) else None
+            message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
             if message and kind in ("session.text.ended", "session.step.ended"):
                 entry["assistant"] = message   # the id only: an event's text is never kept
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
@@ -2562,6 +2578,11 @@ class EventFeed:
                 entry["idle_ms"] = int(created) if finite else int(self.now() * 1000)
 
     # -- what the pass thread asks
+
+    def need(self, name):
+        """A reader that wants the feed's help registers here; until one does the feed reads nothing (it only observes)."""
+        with self.lock:
+            self.consumers.add(name)
 
     def touched_since_read(self, session_id):
         """True when an event named this session after the daemon last read it (or it was never read): a reader that wants only what is new may read."""
@@ -2581,11 +2602,11 @@ class EventFeed:
         service is slow) is simply tried again at the next pass. While the stream is down nothing is read here: the old reads are all there is."""
         now = self.now()
         with self.lock:
-            if not self.connected:
-                return
+            if not self.connected or not self.consumers:
+                return   # down, or nobody uses what a read would find: no read
             if self.needs_resync:
                 pending = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RESYNC_MIN_SECONDS]
-                pending.sort(key=lambda s: -1.0 if self.seen.get(s) is None or self.seen[s]["read"] is None else self.seen[s]["read"])   # the longest unread first: a failing few cannot starve the rest
+                pending.sort(key=lambda s: -1.0 if self.seen.get(s) is None else max(self.seen[s]["read"] or -1.0, self.seen[s].get("tried") or -1.0))   # the longest unread first: a failing few cannot starve the rest
                 chosen = pending[:FEED_RESYNC_PER_PASS]
                 if len(pending) <= FEED_RESYNC_PER_PASS:
                     self.needs_resync = False
@@ -2598,9 +2619,10 @@ class EventFeed:
                 if not more:
                     self.counts["resyncs"] += 1
             self._audit("event.resync", {"sessions": done, "more": more, "reason": "start or reconnect: events while disconnected are missed by contract"})
-            return
         with self.lock:
-            due = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RECONCILE_SECONDS]
+            backlog = self.needs_resync   # a resync backlog reads the never-read ones itself, in its own order and cap
+            due = [s for s in sessions if (not backlog and (self.seen.get(s) is None or self.seen[s]["read"] is None))
+                   or (self.seen.get(s) is not None and self.seen[s]["read"] is not None and now - self.seen[s]["read"] >= FEED_RECONCILE_SECONDS)]
         for session in due[:FEED_RECONCILES_PER_PASS]:
             self._read(engine, session, now, announced=True)
 
@@ -2612,14 +2634,13 @@ class EventFeed:
             with self.lock:
                 self.counts["read_errors"] += 1
                 entry = self.seen.setdefault(session, {"assistant": None, "idle_ms": None, "read": None, "event_at": None})
-                if entry["read"] is None:
-                    entry["read"] = now - FEED_RESYNC_MIN_SECONDS   # tried: the next re-sync tries the others first, this one again after the interval
+                entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
         with self.lock:
             entry = self.seen.setdefault(session, {"assistant": None, "idle_ms": None, "read": None, "event_at": None})
             known, entry["read"] = entry["assistant"], now
-            missed = announced and isinstance(newest, str) and known != newest
+            missed = announced and known is not None and isinstance(newest, str) and known != newest   # a session no event ever named has nothing to have missed
             if isinstance(newest, str) and known != newest:
                 entry["assistant"] = newest   # what the events did not say is learned here
             if missed:
