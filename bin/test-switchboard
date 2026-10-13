@@ -37707,6 +37707,9 @@ class TestV2Light(Base):
         world = self.world(agents=("platform",))
         self.assertEqual(sb.SentLedger(world.state).keys, {})
         path = world.state / sb.SENT_KEYS_FILE
+        path.write_text('{"sessions": {"ses_example": {"k": "not a time"}}}')
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
         path.write_text("not json")
         with self.assertRaises(sb.V2Error):
             sb.SentLedger(world.state).known("ses_example", 0)
@@ -37748,9 +37751,39 @@ class TestV2Light(Base):
         world.tick(5)
         self.assertEqual([s["keys"] for s in world.engine.run_pass()["sent"]], [["lab.fact:1"]])
 
-    def test_a_timeout_or_unreadable_reply_keeps_the_reservation_and_is_not_sent_again(self):
-        for error in (sb.V2Error("timeout", None, "no answer"), sb.V2Error("bad_json", None, "garbage")):
+    def test_an_oversized_or_unreadable_ledger_stops_the_sends_and_is_kept(self):
+        world = self.world(agents=("platform",))
+        path = world.state / sb.SENT_KEYS_FILE
+        path.write_text(" " * (sb.SENT_FILE_MAX + 1))
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).reserve("ses_example", ["k"], 1.0)
+        self.assertEqual(len(path.read_text()), sb.SENT_FILE_MAX + 1, "kept as it was")
+        path.unlink()
+        path.mkdir()   # a directory where the file goes: not missing, not readable
+        with self.assertRaises(sb.V2Error):
+            sb.SentLedger(world.state).known("ses_example", 0)
+
+    def test_a_call_that_never_ran_is_released_and_unknown_reservations_are_never_trimmed(self):
+        for error in (sb.V2Error("unavailable", None, "cannot run"), sb.V2Error("refused", None, "no")):
             with self.subTest(reason=error.reason):
+                world = self.world(agents=("platform",))
+                world.fact("platform", "lab.fact:1")
+                world.tick(90)
+                self.refuse_with(world, error)
+                world.engine.run_pass()
+                self.assertEqual(sb.SentLedger(world.state).unknown_count(), 0, "released")
+        ledger = sb.SentLedger(world.state)
+        ledger.reserve("ses_example", ["old"], 1.0)
+        for n in range(sb.SENT_PER_SESSION + 20):
+            ledger.confirm("ses_example", ["k%d" % n], float(10 + n))
+        self.assertIn("old", ledger.known("ses_example", 0), "an unknown-fate reservation outlives the trim")
+
+    def test_a_timeout_or_unreadable_reply_keeps_the_reservation_and_is_not_sent_again(self):
+        for error in (sb.V2Error("timeout", None, "no answer"), sb.V2Error("bad_json", None, "garbage"), sb.V2Error("http", 500, "boom"),
+                      sb.V2Error("http", 504, "gateway"), sb.V2Error("http", 408, "slow")):
+            with self.subTest(reason=error.reason, status=error.status):
                 world = self.world(agents=("platform",))
                 world.fact("platform", "lab.fact:1")
                 world.tick(90)

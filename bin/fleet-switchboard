@@ -1820,7 +1820,7 @@ V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before 
                 "stopped/finished summary and stop classification", "landed-checks that page messages (a sent-key ledger answers instead)",
                 "report-answered checks", "brief scan")
 SENT_KEYS_FILE = "sent-keys.json"
-SENT_PER_SESSION, SENT_SESSIONS = 400, 200
+SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds
 SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one   # the ledger's bounds: the newest keys of the newest sessions
 
 
@@ -1852,10 +1852,15 @@ class SentLedger:
             raise V2Error("ledger_unreadable", None, "sent-keys.json cannot be read (%s): nothing is sent until it can be" % err)
         try:
             body = json.loads(text)
-            sessions = {sid: {str(k): v for k, v in entries.items() if isinstance(v, (int, float))}
-                        for sid, entries in (body.get("sessions") or {}).items()}
-            unknown = {sid: {str(k): v for k, v in entries.items() if isinstance(v, (int, float))}
-                       for sid, entries in (body.get("unknown") or {}).items()}
+            tables = []
+            for name in ("sessions", "unknown"):
+                table = {}
+                for sid, entries in (body.get(name) or {}).items():
+                    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in entries.values()):
+                        raise ValueError("a key without a time")
+                    table[sid] = {str(k): v for k, v in entries.items()}
+                tables.append(table)
+            sessions, unknown = tables
         except (ValueError, AttributeError, TypeError):
             raise V2Error("ledger_corrupt", None, "sent-keys.json is not a ledger: nothing is sent until it is moved aside (it is never read as empty)")
         return sessions, unknown
@@ -1875,7 +1880,7 @@ class SentLedger:
                 fcntl.flock(guard, fcntl.LOCK_EX)
                 sessions, unknown = self.load()
                 change(sessions, unknown)
-                for table in (sessions, unknown):
+                for table in (sessions,):   # an unknown-fate reservation is never trimmed away: it is what says "do not send again"
                     for mine in table.values():
                         if len(mine) > SENT_PER_SESSION:
                             for key, _ in sorted(mine.items(), key=lambda kv: kv[1])[:len(mine) - SENT_PER_SESSION]:
@@ -1933,6 +1938,11 @@ class SentLedger:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.rename(str(temp), str(self.path))
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)   # the rename itself must survive a power loss
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except Exception as err:
             if temp is not None:
                 try:
@@ -2505,11 +2515,12 @@ class Switchboard:
                 raise
             if err.reason == "http" and err.status == 409:
                 pass   # v2 already holds this message (its id is derived from the keys): it IS delivered
-            elif (err.reason == "http" and err.status is not None) or err.reason in ("unavailable", "refused"):
-                self.sent.release(observation.session_id, keys)   # a definite refusal, or the call never ran: the write did not land
+            elif (err.reason == "http" and isinstance(err.status, int) and 400 <= err.status < 500 and err.status != 408) \
+                    or err.reason in ("unavailable", "refused"):
+                self.sent.release(observation.session_id, keys)   # a definite refusal (a 4xx other than 408/409: not admitted), or the call never ran: the write did not land
                 raise
             else:
-                raise   # timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
+                raise   # a 5xx, 408, timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
