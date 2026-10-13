@@ -11203,9 +11203,9 @@ class TestGhShimGateProbe(Base):
         self.sb = self.home / "fakesb"
         self.sb.write_text("#!/bin/sh\n"
                            "if [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; else echo worker; fi; exit 0; fi\n"
-                           "if [ \"$1\" = review ] && [ \"$2\" = blockers ]; then\n  [ -n \"$FAKE_BLOCKERS_EXIT\" ] && exit $FAKE_BLOCKERS_EXIT\n  [ -n \"$FAKE_BLOCKERS\" ] && echo \"$FAKE_BLOCKERS\"; exit 0; fi\n"
+                           "if [ \"$1\" = review ] && [ \"$2\" = blockers ]; then\n  echo \"$@\" >> %r\n  [ -n \"$FAKE_BLOCKERS_EXIT\" ] && exit $FAKE_BLOCKERS_EXIT\n  [ -n \"$FAKE_BLOCKERS\" ] && echo \"$FAKE_BLOCKERS\"; exit 0; fi\n"
                            "if [ \"$1\" = gates-check ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
-                           "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  if [ -n \"$FAKE_GATE_JSON\" ]; then echo \"$FAKE_GATE_JSON\"; else echo '{\"verdict\": \"x\"}'; fi; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % str(self.calls_log))
+                           "  [ -n \"$FAKE_GATE_SLEEP\" ] && sleep $FAKE_GATE_SLEEP\n  if [ -n \"$FAKE_GATE_JSON\" ]; then echo \"$FAKE_GATE_JSON\"; else echo '{\"verdict\": \"x\"}'; fi; exit ${FAKE_GATE_EXIT:-0}\nfi\nexit 2\n" % (str(self.calls_log) + ".review", str(self.calls_log)))
         self.sb.chmod(0o755)
         subprocess.run([str(self.sb), "whoami", "--json"], capture_output=True, timeout=60)   # the first start of a new file is the slow one
         self.state = self.home / "state"
@@ -11287,7 +11287,8 @@ class TestGhShimGateProbe(Base):
         done, seen = self.merge(env={"FAKE_BLOCKERS": "security recorded request-changes (2 blocking finding(s)) at aaaaaaaa"})
         self.assertEqual(done.returncode, 10)
         self.assertIn("security recorded request-changes", done.stderr)
-        self.assertEqual([c for c in self.gate_calls() if c.startswith("review")], [])   # (the fake logs gates-check only)
+        asked = (self.calls_log.parent / (self.calls_log.name + ".review")).read_text().split()
+        self.assertEqual(asked, ["review", "blockers", "acme/app#12", "--head", self.HEAD])      # the shim binds the question to the head it read
 
     def test_over_review_with_a_reason_goes_ahead_is_stripped_and_logged_and_without_one_it_is_refused(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
@@ -11320,6 +11321,22 @@ class TestGhShimGateProbe(Base):
         done, seen = self.merge(env={"FAKE_REVIEWS": "not json"})
         self.assertEqual(done.returncode, 7)
         self.assertIn("not checked", done.stderr)
+
+    def test_an_override_whose_log_cannot_be_written_is_refused_and_a_pr_number_after_the_flag_is_not_its_reason(self):
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        done, seen = self.merge("--over-review", "a fine long reason here", reviews=block, env={"FLEET_SWITCHBOARD_STATE": str(self.home / "no-such-state")})
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("could not be logged", done.stderr)
+        done, seen = self.merge(reviews=block, args=("pr", "merge", "--over-review", "12", "-R", "acme/app", "--merge"))   # `12` is the PR
+        self.assertEqual(done.returncode, 10)
+        self.assertIn("at least 10 characters", done.stderr)
+        done, seen = self.merge("--over-review", "x" * 300, reviews=block)       # a long reason: the head and the overridden review still fit the line
+        self.assertEqual(done.returncode, 7)
+        line = [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"]
+        self.assertIn(self.HEAD[:12], line)
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", line)
+        done, seen = self.merge("--over-review", "a reason\x1b[31m with escapes", reviews=block)
+        self.assertNotIn("\x1b", [l for l in self.spool() if l["event"] == "over_review"][-1]["detail"])
 
     def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
@@ -39535,6 +39552,40 @@ class TestReviewerSubagents(LedgerBase):
         got = sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
         self.assertEqual((got["recorded"], got["missing"]), ({"code": "approve"}, ["architecture", "security", "impact", "test"]))
 
+    def blockers(self, *more, head=None):
+        with captured() as (out, err):
+            code = sb.main(["review", "blockers", self.PR] + (["--head", head] if head else []) + list(more), runner=self.route,
+                           now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_review_blockers_lists_only_the_reviewers_whose_latest_record_at_the_head_is_request_changes(self):
+        self.record("coder", "code", "request-changes", "--blocks", "2")
+        self.record("coder", "security", "request-changes", "--blocks", "1")
+        self.record("coder", "security", "approve")                          # supersedes its own earlier block
+        self.record("coder", "test", "request-changes", "--blocks", "1", "--head", LEDGER_HEAD)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "architecture",
+                                                       "verdict": "request-changes", "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 1)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#99", "head": LEDGER_HEAD, "reviewer": "impact",
+                                                       "verdict": "request-changes", "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 2)
+        code, out, err = self.blockers()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), ["code recorded request-changes (2 blocking finding(s)) at " + LEDGER_HEAD[:8],
+                                            "test recorded request-changes (1 blocking finding(s)) at " + LEDGER_HEAD[:8]])
+        code, out, err = self.blockers(head=LEDGER_NEW_HEAD)                  # another head: only what was recorded for THAT head
+        self.assertEqual(out.splitlines(), ["architecture recorded request-changes (1 blocking finding(s)) at " + LEDGER_NEW_HEAD[:8]])
+
+    def test_review_blockers_prints_nothing_for_a_clean_pr_and_refuses_an_untrustworthy_ledger_and_writes_nothing(self):
+        code, out, err = self.blockers()
+        self.assertEqual((code, out), (0, ""))
+        self.record("coder", "code", "request-changes", "--blocks", "1")
+        before = (self.world.state / "plan-ledger.jsonl").read_text()
+        (self.world.state / "plan-ledger.jsonl").write_text(before.replace("request-changes", "approve-ish"))   # tampered: the chain breaks
+        code, out, err = self.blockers()
+        self.assertEqual(code, 2)
+        self.assertIn("ledger is not trustworthy", err)
+        (self.world.state / "plan-ledger.jsonl").write_text(before)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 1, "reading wrote nothing")
+
     # -- the coder session records what a reviewer returned
 
     def block_text(self, verdict="request-changes", head=None, extra="", findings=("R-CODE-3 | block | src/q.py:4 | a write can be torn | use a temp file",
@@ -40325,7 +40376,7 @@ class TestV2Http(V2TransportBase):
 
 
 class TestDeliveryDuringABackoff(PR4Base):
-    """reviewer-a's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
+    """rev-wake's Medium: while the breaker is open a wake must still be delivered (the person-is-typing read every observation makes is essential)."""
 
     def open_the_breaker(self):
         breaker = self.world.engine.v2.breaker
@@ -40358,7 +40409,7 @@ class TestDeliveryDuringABackoff(PR4Base):
             sb.add_reminder(self.world.state, "platform", self.world.clock.now() + 1, self.world.clock.now(), "look at the build")
             self.world.tick(5)
             self.world.engine.run_pass()
-        self.assertEqual(self.world.admissions("platform"), [], "the failure reviewer-a found: held while the person read is skipped")
+        self.assertEqual(self.world.admissions("platform"), [], "the failure rev-wake found: held while the person read is skipped")
 
 
 class TestV2Breaker(Base):

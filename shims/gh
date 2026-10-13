@@ -385,8 +385,10 @@ def gate_spool(event, repo, number, check, detail):
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as out:
                 out.write(line + "\n")
+            return True   # written
     except OSError:
         pass
+    return False
 
 
 OVER_REVIEW_FLAG = "--over-review"
@@ -402,8 +404,10 @@ def take_over_review(args):
         arg = args[i]
         if arg == OVER_REVIEW_FLAG:
             found = True
-            if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                reason, i = args[i + 1], i + 2
+            nxt = args[i + 1] if i + 1 < len(args) else ""
+            # the next word is the reason, unless it is a flag, a bare PR number or a PR URL (then it is the PR and the reason is missing)
+            if nxt and not nxt.startswith("-") and not nxt.isdigit() and not PR_URL_RE.match(nxt):
+                reason, i = nxt, i + 2
             else:
                 i += 1
             continue
@@ -433,7 +437,9 @@ def review_probe(args, found, reason, lookup, gh):
     superseded by that reviewer's later approval) or the switchboard holds a blocking `review record` at the PR's CURRENT head, naming them.
     `--over-review <reason>` (at least 10 characters) goes ahead on purpose and is spooled for the audit (who, PR, head, reason). FAIL MODE: a read
     that cannot be made (reviews API, switchboard) lets the merge through with one visible warning line: a flake never blocks, and is never silent.
-    Returns the refusal text, or None."""
+    A GUARDRAIL against accidents, not a boundary: the real gh, an unrecognised flag shape (fail open) or `--over-review` with any reason bypasses it;
+    the boundary is GitHub's branch protection / required reviews. The check reads the PR's head and the merge then runs unbound, so a push in
+    between can land an unchecked head (a short, documented window; the enforcing gates bind `--match-head-commit` themselves). Returns the refusal text, or None."""
     try:
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
             return None
@@ -473,7 +479,11 @@ def review_probe(args, found, reason, lookup, gh):
         names = "; ".join(blockers[:5])
         if found and len(reason) >= 10:
             who = lookup.identity().get("name") or "agent"
-            gate_spool("over_review", repo, number, "merge", "by %s at %s: %s | over: %s" % (who, head[:12], reason, names))
+            shown = gate_clean(reason)[:100]   # the reason alone is clipped, so the head and the overridden reviews always fit the logged line
+            logged = gate_spool("over_review", repo, number, "merge", "by %s at %s | over: %s | reason: %s" % (who, head[:12], names[:60], shown))
+            if not logged:   # an override nobody can audit is not made
+                return "gh: merge of %s#%d refused: blocking review(s): %s. The --over-review could not be logged (no writable switchboard state), so it was not made" % (
+                    repo, number, names)
             sys.stderr.write("gh: merging %s#%d over a blocking review on purpose (%s); logged\n" % (repo, number, names))
             return None
         why = ("--over-review needs a reason of at least 10 characters" if found else
@@ -584,12 +594,12 @@ def main(args):
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
         return 127
     plan = None
+    args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     lookup = Lookup()   # one identity lookup, one deadline, for the name and the account together
     try:
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
         plan = None  # never let signing stop the command
-    args, over_found, over_reason = take_over_review(args)
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
     if refusal is not None:
         sys.stderr.write(refusal + "\n")
