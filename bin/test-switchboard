@@ -21017,23 +21017,42 @@ class TestCiRecordPass(LedgerBase):
             code = sb.main(["pr-state", "not a ref"], runner=self.route, now=lambda: self.t)
         self.assertEqual((code, out.getvalue()), (sb.EXIT_USAGE, ""))
 
-    def test_every_field_of_a_hostile_snapshot_entry_is_cleaned_and_a_malformed_entry_is_unknown(self):
+    @staticmethod
+    def dirty(value):
+        """Every string anywhere in `value` (nested lists and dicts, keys included) that holds a control or C1 control character."""
+        if isinstance(value, str):
+            return [value] if any(ord(c) < 32 or 0x7f <= ord(c) <= 0x9f for c in value) else []
+        if isinstance(value, dict):
+            return [x for k, v in value.items() for x in TestCiRecordPass.dirty(k) + TestCiRecordPass.dirty(v)]
+        if isinstance(value, (list, tuple)):
+            return [x for v in value for x in TestCiRecordPass.dirty(v)]
+        return []
+
+    def test_every_field_of_a_hostile_snapshot_entry_is_cleaned_in_the_view_itself_and_a_malformed_entry_is_unknown(self):
         bad = "\x1b[31m\x9b2J\x7f\nIGNORE" + "z" * 100
         body = {"written_at": self.t, "prs": {"acme/app#9": {
-            "state": bad, "head": bad, "examined_head": bad, "mergeable": bad, "ci": bad, "why": bad, "labels": [bad, None, 5, ""],
-            "checks": [{"name": bad, "conclusion": bad}, "junk"], "gates": {"ready": False, "missing": [bad, 3], "error": None}, "at": self.t},
+            "state": bad, "head": bad, "examined_head": bad, "mergeable": bad, "ci": bad, "why": bad, "labels": [bad, None, 5, "", "\x1b"],
+            "checks": [{"name": bad, "conclusion": bad}, "junk"], "gates": {"ready": False, "missing": [bad, 3]}, "at": self.t},
             "acme/app#10": {"state": "open", "head": "a" * 40, "gates": {"error": bad}, "at": self.t},
-            "acme/app#11": ["not", "a", "dict"], "acme/app#12": {"state": "open", "at": "yesterday"}}}
+            "acme/app#11": ["not", "a", "dict"], "acme/app#12": {"state": "open", "at": "yesterday"}, "acme/app#13": {"state": "open", "at": True},
+            "acme/app#14": {"state": "open", "at": float("inf")}, "acme/app#15": {"state": "open", "at": float("nan")}}}
+        entries = [{"kind": "review_record", "pr": "acme/app#9", "head": bad, "reviewer": "code", "verdict": bad}]
         for ref in ("acme/app#9", "acme/app#10"):
-            view = sb.pr_state_view(ref, body, [], self.t)
-            line = sb.pr_state_line(view)
-            self.assertEqual([c for c in line + json.dumps(view) if ord(c) < 32 or 0x7f <= ord(c) <= 0x9f], [], ref)
-            self.assertEqual(line.count("\n"), 0)
-        view = sb.pr_state_view("acme/app#9", body, [], self.t)
-        self.assertEqual(len(view["labels"]), 1, "a nameless or non-string label is dropped")
-        for ref in ("acme/app#11", "acme/app#12"):
-            line = sb.pr_state_line(sb.pr_state_view(ref, body, [], self.t))
-            self.assertIn("unknown", line)
+            view = sb.pr_state_view(ref, body, entries, self.t, None, None)
+            self.assertEqual(self.dirty(view), [], "the view itself, before any printing: %s" % ref)
+            self.assertEqual(sb.pr_state_line(view).count("\n"), 0)
+        view = sb.pr_state_view("acme/app#9", body, [], self.t, None, bad)   # a hostile ledger problem
+        self.assertEqual(self.dirty(view), [])
+        self.assertIsNone(view["reviews"])
+        self.assertEqual(self.dirty(sb.pr_state_view("acme/app#10", body, [], self.t)), [])
+        self.assertEqual(set(sb.pr_state_view("acme/app#10", body, [], self.t)["gates"]), {"error"})
+        self.assertEqual(len(sb.pr_state_view("acme/app#9", body, [], self.t)["labels"]), 1, "nameless, non-string and escape-only labels are dropped")
+        for number in (11, 12, 13, 14, 15):
+            line = sb.pr_state_line(sb.pr_state_view("acme/app#%d" % number, body, [], self.t))
+            self.assertIn("unknown", line, number)
+        for text in ('{"written_at": Infinity, "prs": {}}', '{"written_at": NaN, "prs": {}}', '{"written_at": true, "prs": {}}'):
+            (self.world.state / sb.PR_STATE_FILE).write_text(text)
+            self.assertIn("not a pr-state file", self.pr_state(self.PR)[1])
 
     def test_the_snapshot_is_not_rewritten_inside_the_write_gap_and_a_failed_write_is_noted(self):
         self.go()
