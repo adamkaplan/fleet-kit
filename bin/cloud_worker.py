@@ -61,7 +61,10 @@ def cloud_dir(state):
     path = Path(state) / CLOUD_DIR
     if not path.is_dir():
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(str(path), 0o700)
+    found = os.lstat(str(path))
+    if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
+        raise CloudError("the cloud directory is not the user's own")
+    os.chmod(str(path), 0o700)
     return path
 
 
@@ -452,8 +455,9 @@ def cmd_send(args, runner, now, record):
 
 
 def message_line(message):
-    role = str(message.get("type") or message.get("role") or "?")
-    return "%s: %s" % (role, re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", H["_message_text"](message)).strip())
+    role = str(message.get("type") or message.get("role") or "?")[:20]
+    line = "%s: %s" % (role, H["_message_text"](message))
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", line).strip()   # a pod's text never reaches the terminal as an escape sequence
 
 
 def cmd_read(args, runner, now):

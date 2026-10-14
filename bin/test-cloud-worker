@@ -250,6 +250,10 @@ class TestCloudWorkerEndpoint(Base):
         self.assertEqual(caught.exception.reason, "unavailable")
         self.assertIn("no local fallback", str(caught.exception))
 
+    def test_a_pods_escape_sequences_are_not_printed(self):
+        line = sb.cloud().message_line({"type": "as\x1b[31m", "text": "a\x9b2Jb\x07"})
+        self.assertNotRegex(line, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
     def test_endpoint_rules(self):
         problem = sb.cloud().endpoint_problem
         self.assertIsNone(problem("https://worker-coder7.example.internal:4096"))
