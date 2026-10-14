@@ -18005,23 +18005,40 @@ class TestIdentityCheck(ReportBase):
 
     def test_a_failed_account_lookup_refuses_every_write_and_lets_every_read_through(self):
         users = {"acme-ops/service": "acct-ops"}
-        for label, kwargs in (("the identity lookup times out", dict(wedge=True, seconds=0.3)),
-                              ("the token lookup fails", dict(token_for={}))):
+        for label, tokens, extra in (("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.3)),
+                                     ("the token lookup fails", {}, {})):
             for args in self.WRITES:
                 with self.subTest(label, write=args):
-                    done, seen = self.run_gh_shim("acme-ops/service", users, kwargs.pop("token_for", {"acct-ops": "tok-ops"}) if False else
-                                                  kwargs.get("token_for", {"acct-ops": "tok-ops"}), args=args,
-                                                  **{k: v for k, v in kwargs.items() if k != "token_for"})
+                    done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=args, **extra)
                     self.assertNotEqual(done.returncode, 0)
                     self.assertIn("account lookup failed, retry", done.stderr)
-                    self.assertIsNone(seen, "the real gh never ran: no write went out with the inherited token")
+                    self.assertTrue(seen is None or seen["argv"][:2] == ["repo", "view"],      # the gate probe's own read may run; the write never does
+                                    "no write went out with the inherited token: %r" % (seen,))
             for args in self.READS:
                 with self.subTest(label, read=args):
-                    done, seen = self.run_gh_shim("acme-ops/service", users, kwargs.get("token_for", {"acct-ops": "tok-ops"}), args=args,
-                                                  **{k: v for k, v in kwargs.items() if k != "token_for"})
+                    done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=args, **extra)
                     self.assertEqual(done.returncode, 0, done.stderr)
                     self.assertEqual(seen["token"], "inherited-personal-token")        # a read may keep falling through
                     self.assertNotIn("account lookup failed", done.stderr)
+
+    MORE_WRITES = (("pr", "-R", "acme-ops/service", "merge", "5"), ("issue", "--repo", "acme-ops/service", "comment", "2", "--body", "x"),
+                   ("workflow", "run", "ci.yml"), ("run", "rerun", "7"), ("secret", "set", "X"), ("gist", "create", "f"), ("pr", "checkout", "5"),
+                   ("api", "repos/a/b/issues", "-fa=b"), ("api", "repos/a/b/issues", "--field=a=b"), ("some-alias", "go"))
+    MORE_READS = (("pr", "view", "-R", "acme-ops/service", "5"), ("run", "view", "7"), ("api", "repos/a/b/issues", "--jq", ".[0]"), ("--version",))
+
+    def test_a_write_the_shim_does_not_list_or_a_flag_before_the_verb_is_still_a_write_and_unknown_is_not_a_read(self):
+        shim = self.shim()
+        for args in self.MORE_WRITES:
+            self.assertTrue(shim.is_write(list(args)), args)
+        for args in self.MORE_READS + self.READS:
+            self.assertFalse(shim.is_write(list(args)), args)
+        users = {"acme-ops/service": "acct-ops"}
+        for args in self.MORE_WRITES[:7]:
+            with self.subTest(write=args):
+                done, seen = self.run_gh_shim("acme-ops/service", users, {}, args=args)     # the token lookup fails
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("account lookup failed, retry", done.stderr)
+                self.assertTrue(seen is None or seen["argv"][:2] == ["repo", "view"], seen)
 
     def test_a_lookup_that_answers_leaves_writes_unchanged_and_the_retry_rescues_a_blip(self):
         users = {"acme-ops/service": "acct-ops"}
@@ -18035,21 +18052,23 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.run_gh_shim("acme/api", users, {"acct-ops": "tok-ops"}, args=("pr", "merge", "5"))   # no mapping: not a failure
         self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"))
         shim = self.shim()
-        calls = []
-        real = shim.account_env
+        calls, execs = [], []
 
         def blip(gh, lookup=None, strict=False):
             calls.append(strict)
-            if len(calls) == 1:
+            if strict and calls.count(True) == 1:      # the first STRICT lookup fails; the gate probe's non-strict one does not count
                 raise shim.AccountLookupFailed("identity")
-            return {"GH_TOKEN": "tok-ops"}
-        shim.account_env = blip
-        shim.real_gh = lambda: "/bin/true"
-        shim.os.execve = lambda *a: (_ for _ in ()).throw(SystemExit(0))
-        with self.assertRaises(SystemExit):
-            shim.main(["pr", "merge", "5"])
-        self.assertEqual(calls, [True, True], "retried once, and the retry went through")
-        shim.account_env = real
+            return dict(os.environ, GH_TOKEN="tok-ops")
+
+        def fake_execve(path, argv, env):
+            execs.append(env.get("GH_TOKEN"))
+            raise SystemExit(0)
+
+        with mock.patch.object(shim, "account_env", blip), mock.patch.object(shim, "real_gh", lambda: "/bin/true"), mock.patch.object(shim.os, "execve", fake_execve):
+            with self.assertRaises(SystemExit):
+                shim.main(["pr", "merge", "5"])
+        self.assertEqual([c for c in calls if c], [True, True], "the strict lookup was tried, retried once, and the retry went through")
+        self.assertEqual(execs, ["tok-ops"], "the retried account reaches the real gh")
 
     def test_name_and_repo_come_from_one_whoami_call_and_a_signed_gh_call_replaces_the_token_too(self):
         users = {"acme-ops/service": "acct-ops"}

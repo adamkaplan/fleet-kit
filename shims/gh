@@ -135,23 +135,33 @@ class AccountLookupFailed(Exception):
     """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
 
 
-WRITE_VERBS = {
-    "pr": {"merge", "ready", "comment", "edit", "close", "reopen", "review", "create", "update-branch", "lock", "unlock"},
-    "issue": {"comment", "edit", "close", "reopen", "create", "delete", "transfer", "pin", "unpin", "lock", "unlock", "develop"},
-    "label": {"create", "edit", "delete", "clone"},
-    "release": {"create", "edit", "delete", "upload", "delete-asset"},
-    "repo": {"create", "edit", "delete", "fork", "rename", "archive", "unarchive"},
-}
+READ_SUBCOMMANDS = {"view", "list", "status", "diff", "checks", "download", "watch", "get", "clone", "ls", "show", "tree", "search", "contents"}
+READ_GROUPS = {"search", "status", "browse", "completion", "help", "version", "auth", "config", "alias", "extension", "ext", "attestation", "agent-task"}
+
+
+def command_words(args):
+    """The positional words of a gh command, skipping flags and the value of `-R`/`--repo` (a flag before the verb, as in `gh pr -R o/r merge 5`, must
+    not hide the verb)."""
+    words, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in ("-R", "--repo"):
+            skip = True
+        elif not a.startswith("-"):
+            words.append(a)
+    return words
 
 
 def is_write(args):
-    """True when the gh command changes something on GitHub: a write verb of pr, issue, label, release or repo, or `gh api` with a method other
-    than GET (`-X`/`--method`, or fields, which make gh api a POST). Reads are everything else."""
+    """True unless the gh command is KNOWN to only read: a read group (auth, config, search, status, ...), a read sub-command (view, list, status, diff,
+    checks, download, watch, ...), or `gh api` with no method other than GET and no fields. Anything else, including a verb this does not list
+    (`workflow run`, `run rerun`, `secret set`, `gist`, `pr checkout`, an alias), counts as a WRITE: the shim fails closed on what it cannot tell."""
     try:
-        words = [a for a in args if not a.startswith("-")]
-        if len(args) >= 2 and args[0] in WRITE_VERBS and args[1] in WRITE_VERBS[args[0]]:
-            return True
-        if args and args[0] == "api":
+        words = command_words(args)
+        if not words:
+            return False   # `gh --version`, `gh --help`
+        if words[0] == "api":
             method = None
             for i, a in enumerate(args):
                 if a in ("-X", "--method") and i + 1 < len(args):
@@ -162,8 +172,11 @@ def is_write(args):
                     method = a[2:].upper()
             if method is not None:
                 return method != "GET"
-            return any(a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=")) for a in args)
-        return False
+            return any(a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=", "-f", "-F"))
+                       for a in args[1:] if a.startswith("-") and not a.startswith("--jq") and not a.startswith("--paginate") and not a.startswith("--slurp"))
+        if words[0] in READ_GROUPS:
+            return False
+        return not (len(words) >= 2 and words[1] in READ_SUBCOMMANDS)
     except Exception:
         return True   # cannot tell: treat as a write, the safe side
 
