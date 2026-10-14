@@ -10669,8 +10669,11 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 for command in self.AZ_READS + ("gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply",
                                                 "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api"):
                     self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
-                for command in self.TIMEOUT_WRITES:
+                for command in self.TIMEOUT_WRITES + ("fleet-switchboard disk prune --docker /bin/sh", "fleet-switchboard disk --docker /tmp/x report",
+                                                      "fleet-switchboard disk reap-docker --apply --docker /tmp/x/docker", "fleet-switchboard disk report --docker=/bin/sh"):
                     self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                for command in ("fleet-switchboard disk prune", "fleet-switchboard disk prune --dry-run", "fleet-switchboard disk report"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
                 for command in self.AZ_SECRETS + self.AZ_MORE_SECRETS:
                     self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
                     self.assertEqual(self.evaluate(rules, "shell", "timeout 30 " + command), "deny", "timeout 30 " + command)
@@ -18470,7 +18473,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
     def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
-                    wedge=False, seconds=None, extra_env=None):
+                    wedge=False, seconds=None, extra_env=None, own=None):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -18493,9 +18496,9 @@ class TestIdentityCheck(ReportBase):
         else:
             (bindir / "sb").write_text(
                 "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then [ %d -ne 0 ] && exit %d; "
-                "echo '{\"name\": \"api\", \"repo\": %s}'; exit 0; fi\n"
+                "echo '{\"name\": \"api\", \"repo\": %s%s}'; exit 0; fi\n"
                 "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n"
-                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null"))
+                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null", "" if own is None else ", \"own\": %s" % ("true" if own else "false")))
         (bindir / "sb").chmod(0o755)
         config = home / "xdg-config" / "fleet-switchboard"
         config.mkdir(parents=True, exist_ok=True)
@@ -18553,6 +18556,34 @@ class TestIdentityCheck(ReportBase):
         self.assertIsNone(seen)
         done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "list", "-R", "other-org/svc"))
         self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "a read still falls through")
+
+    def test_the_chief_of_staff_whose_whoami_gives_only_the_default_intent_repo_still_acts_as_the_account_of_the_repo_a_command_names(self):
+        """The real shape: cos has no repo of its own, and `whoami --json` falls back to the config's `intent_repo` (own: false). Before, the shim
+        used that default repo's account for everything, so the named-repo branch never ran for cos."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "acme-ops/svc"), "tok-ops"),
+                               (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"),                                   # nothing named: the default repo's account, as before
+                               (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"),               # a merge never switches: the default's account
+                               (("repo", "view", "acme/api"), "tok-ops")):                        # nor does anything but issue and pr
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], expected)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("issue", "view", "5", "-R", "acme/api"), own=True)
+        self.assertEqual(seen["token"], "tok-ops", "a caller whose repo IS its own keeps its account")
+
+    def test_whoami_json_says_whether_the_repo_is_the_callers_own_or_only_the_default(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme-ops/default"})
+        self.world.add_agent("boss", fleet={"role": "chief-of-staff"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "boss", "repo": "acme-ops/default", "own": False}), err)
+        self.world.add_agent("worker", fleet={"role": "coder", "repo": "acme/api"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True}), err)
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
         users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}
@@ -18710,7 +18741,7 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service"}))
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
@@ -41273,6 +41304,42 @@ class TestDockerReaper(Base):
         self.assertEqual(docker.calls, [])
         stamp = json.loads((self.world.state / sb.DOCKER_REAP_FILE).read_text())["at"]
         self.assertEqual(stamp + sb.DOCKER_REAP_INTERVAL, self.NOW + sb.DOCKER_REAP_RETRY)
+
+    def test_the_docker_option_runs_only_a_docker_binary_it_can_trust_in_every_disk_command(self):
+        for target in ("/bin/sh", "/bin/ls", "/usr/bin/env"):
+            for argv in (["disk", "prune", "--dry-run", "--docker", target], ["disk", "reap-docker", "--docker", target]):
+                with self.subTest(argv=argv):
+                    err = io.StringIO()
+                    with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()) as out, \
+                            mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable that is not docker")):
+                        code = sb.main(argv, runner=FakePruneDocker(), now=self.world.clock.now)
+                    self.assertIn("refused", err.getvalue() + out.getvalue())
+        good = self.home / "docker"
+        good.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(good), 0o755)
+        good = str(good)
+        self.assertEqual(sb._docker_problem(good), (good, None))
+        link = self.home / "docker-link"
+        other = self.home / "tool"
+        other.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(other), 0o755)
+        bad_link = self.home / "sub" / "docker"
+        bad_link.parent.mkdir()
+        os.symlink(str(other), str(bad_link))
+        self.assertIn("not a docker binary", sb._docker_problem(str(bad_link))[1])        # a link named docker that points at another tool
+        loose = self.home / "loose" / "docker"
+        loose.parent.mkdir()
+        loose.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(loose), 0o775)
+        self.assertIn("writable by group or other", sb._docker_problem(str(loose))[1])
+        plain = loose.parent / "plain" / "docker"
+        plain.parent.mkdir()
+        plain.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(plain), 0o644)
+        self.assertIn("not an executable file", sb._docker_problem(str(plain))[1])
+        self.assertIn("not installed", sb._docker_problem("/nonexistent/docker")[1])
+        self.assertIn("not a usable", sb._docker_problem("--help")[1])
+        self.assertIn("not a docker binary", sb._docker_problem("/bin/sh")[1])
 
     def test_without_docker_it_refuses_and_runs_nothing(self):
         docker = self.world_docker()

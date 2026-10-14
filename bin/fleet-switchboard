@@ -2266,10 +2266,43 @@ def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
     return result
 
 
+def _docker_problem(name):
+    """(path, None) for a docker binary the disk tools may run, else (None, one line saying why not). The tools take `--docker` from a person, so the
+    value is NOT trusted to be a docker: its basename (and a symlink's real basename) must be exactly `docker`, it must be a regular executable file,
+    and neither it nor its directory may be writable by group or other; a bare name is resolved from PATH. Anything else is refused."""
+    if not isinstance(name, str) or not name or "\x00" in name or name.startswith("-"):
+        return None, "is not a usable executable name"
+    path = name if os.sep in name else shutil.which(name)
+    if path is None or not os.path.exists(path):
+        return None, "not installed or not on PATH"
+    if not os.path.isabs(path):
+        return None, "must be an absolute path (or a bare name on PATH)"
+    if os.path.basename(path) != "docker" or os.path.basename(os.path.realpath(path)) != "docker":
+        return None, "is not a docker binary: its name (and the name a link points to) must be exactly `docker`"
+    try:
+        real = os.path.realpath(path)
+        info = os.stat(real)
+        if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+            return None, "is not an executable file"
+        if info.st_uid not in (0, os.getuid()):
+            return None, "belongs to another user: not trusted"
+        if info.st_mode & 0o022 or os.stat(os.path.dirname(real)).st_mode & 0o022 and not os.stat(os.path.dirname(real)).st_mode & 0o1000:
+            return None, "is writable by group or other (or sits in a directory they can change): not trusted"
+    except OSError:
+        return None, "cannot be read"
+    return path, None
+
+
 def _docker_executable(name):
-    if os.sep in name:
-        return name if os.access(name, os.X_OK) else None
-    return shutil.which(name)
+    return _docker_problem(name)[0]
+
+
+def _docker_message(name):
+    """The one refusal line for a `--docker` value that is not a usable docker."""
+    why = _docker_problem(name)[1] or "not usable"
+    if why.startswith("not installed"):
+        return "docker is not installed or not on PATH (%s)" % _plain(name, 160)
+    return "refused: %s %s" % (_plain(name, 120), why)
 
 
 class DockerReapFacts:
@@ -6866,8 +6899,10 @@ def cmd_whoami(args, runner, now):
     if getattr(args, "json", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
         repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
-        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
-                         sort_keys=True))
+        own = repo or _fleet_repo(fleet, config)
+        # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
+        # its own to keep, so the gh shim may use the account of the repo a command names
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -18714,7 +18749,7 @@ def cmd_disk_reap_docker(args, runner, now):
     """`disk reap-docker [--apply]`: list (the default) or remove the expired labelled docker objects."""
     docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk reap-docker: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk reap-docker: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     apply = bool(args.apply)
     if apply and not load_config().get("docker_reaper", True):
@@ -18738,9 +18773,9 @@ cmd_disk_reap_docker.direct = True
 
 def cmd_disk_prune(args, runner, now):
     """`disk prune [--dry-run]`."""
-    docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
+    docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk prune: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
@@ -18849,7 +18884,8 @@ def disk_report(args, runner, now, out=print):
     lines.append("docker")
     docker = _docker_executable(args.docker)
     if docker is None:
-        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+        why = _docker_problem(args.docker)[1]
+        lines.append("  docker: %s (%s)" % (why if why.startswith("not installed") else "refused: " + why, _plain(args.docker, 100)))
     else:
         try:
             done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)

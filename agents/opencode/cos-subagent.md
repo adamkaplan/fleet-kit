@@ -111,6 +111,7 @@ permissions:
   - {action: shell, resource: "fleet-switchboard waive *G6*", effect: deny}
   - {action: shell, resource: "fleet-switchboard waive *G8*", effect: deny}
   - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard disk *--docker*", effect: deny}
   - {action: shell, resource: "gh repo edit*", effect: deny}
   - {action: shell, resource: "gh *--admin*", effect: deny}
   - {action: shell, resource: "gh *--auto*", effect: deny}

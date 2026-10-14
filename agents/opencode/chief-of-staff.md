@@ -28,7 +28,6 @@ permissions:
   - {action: shell, resource: "fleet-switchboard status *", effect: allow}
   - {action: shell, resource: "fleet-switchboard pending *", effect: allow}
   - {action: shell, resource: "fleet-switchboard whoami *", effect: allow}
-  - {action: shell, resource: "fleet-switchboard version *", effect: allow}
   - {action: shell, resource: "fleet-switchboard notice *", effect: allow}
   - {action: shell, resource: "fleet-switchboard decisions *", effect: allow}
   - {action: shell, resource: "fleet-switchboard orders *", effect: allow}
@@ -112,6 +111,7 @@ permissions:
   - {action: shell, resource: "*fleet-switchboard waive *G6*", effect: deny}
   - {action: shell, resource: "*fleet-switchboard waive *G8*", effect: deny}
   - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard disk *--docker*", effect: deny}
   - {action: shell, resource: "gh repo edit*", effect: deny}
   - {action: shell, resource: "gh *--admin*", effect: deny}
   - {action: shell, resource: "gh *--auto*", effect: deny}

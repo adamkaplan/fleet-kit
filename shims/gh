@@ -121,7 +121,8 @@ class Lookup:
         if isinstance(data, dict):
             name, repo = data.get("name"), data.get("repo")
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
-                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None}
+                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
+                           "own": data.get("own") is not False}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
             return self._ident
         plain = self.run([binary, "whoami"])   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
@@ -242,9 +243,12 @@ def account_env(gh, lookup=None, strict=False, args=None):
         if not users or not switchboard_binary():
             return None
         lookup = lookup or Lookup()
-        repo = lookup.identity().get("repo")
-        if not repo and not lookup.failed:
-            repo = explicit_repo(args or [])   # a caller with no repo of its own (the Chief of Staff) acts as the account of the repo the command names
+        ident = lookup.identity()
+        repo = ident.get("repo")
+        if (not repo or ident.get("own") is False) and not lookup.failed:
+            # a caller with no repo of its own (the Chief of Staff: whoami gives only the default `intent_repo`, own false) acts as the account of the
+            # repo the command names; with nothing named it keeps the default repo's account as before
+            repo = explicit_repo(args or []) or repo
         if not repo:
             if strict and lookup.failed:
                 raise AccountLookupFailed("identity")
