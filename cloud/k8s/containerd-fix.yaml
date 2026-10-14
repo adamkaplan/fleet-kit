@@ -14,36 +14,46 @@ metadata:
 data:
   fix.sh: |
     #!/bin/sh
+    # Test hooks: CFG (config path), HOST (command prefix that runs on the node), LABEL_CMD,
+    # ONCE=1 (one pass, then exit), MAX_BAD (invalid-config tries before exiting non-zero).
     set -eu
-    CFG=/host/etc/containerd/config.toml
+    CFG=${CFG:-/host/etc/containerd/config.toml}
+    HOST=${HOST:-nsenter -t 1 -m -u -i -n -p --}
+    LABEL_CMD=${LABEL_CMD:-kubectl label node $NODE_NAME sysbox-runtime=running --overwrite}
     NEW="io.containerd.cri.v1.runtime"
     OLD="io.containerd.grpc.v1.cri"
-    host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
-    label() { kubectl label node "$NODE_NAME" "sysbox-runtime=running" --overwrite >/dev/null; }
+    bad=0
 
     while true; do
       if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
-        echo "waiting for the Sysbox installer to register sysbox-runc"; sleep 15; continue
+        echo "waiting for the Sysbox installer to register sysbox-runc"
+        [ "${ONCE:-0}" = 1 ] && exit 3
+        sleep 15; continue
       fi
       if grep -Eq "^\[plugins\.[\"']$NEW[\"']\.containerd\.runtimes\.sysbox-runc\]" "$CFG" \
          && ! grep -Eq "^\[plugins\.[\"']$OLD[\"']\.containerd\.runtimes\.sysbox-runc" "$CFG"; then
-        echo "sysbox-runc already under $NEW: nothing to do"; label
+        echo "sysbox-runc already under $NEW: nothing to do"; $LABEL_CMD >/dev/null
       else
-        cp -n "$CFG" "$CFG.sysbox-fix.bak" || true
+        cp "$CFG" "$CFG.sysbox-fix.bak"
         cp "$CFG" "$CFG.tmp"
         # rename the plugin key on sysbox-runc table headers only
         sed -i -E "s#^\[plugins\.[\"']$OLD[\"']\.containerd\.runtimes\.sysbox-runc#[plugins.'$NEW'.containerd.runtimes.sysbox-runc#" "$CFG.tmp"
-        mv "$CFG.tmp" "$CFG"
-        if host containerd config dump >/dev/null 2>&1 \
-           && host containerd config dump | grep -q 'runtimes.sysbox-runc'; then
+        mv "$CFG.tmp" "$CFG"; sync
+        if $HOST containerd config dump >/dev/null 2>&1 \
+           && $HOST containerd config dump | grep -q 'runtimes.sysbox-runc'; then
           echo "config valid: restarting containerd"
-          host systemctl restart containerd
-          label
+          $HOST systemctl restart containerd
+          $LABEL_CMD >/dev/null
         else
-          echo "config invalid: restoring backup" >&2
-          cp "$CFG.sysbox-fix.bak" "$CFG"; sleep 60; continue
+          bad=$((bad + 1))
+          echo "config invalid (try $bad): restoring backup" >&2
+          cp "$CFG.sysbox-fix.bak" "$CFG"
+          [ "$bad" -ge "${MAX_BAD:-5}" ] && { echo "giving up: pod exits non-zero" >&2; exit 1; }
+          [ "${ONCE:-0}" = 1 ] && exit 1
+          sleep 60; continue
         fi
       fi
+      [ "${ONCE:-0}" = 1 ] && exit 0
       sleep 300
     done
 ---

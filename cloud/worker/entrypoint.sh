@@ -3,6 +3,6 @@
 # Outside Sysbox (no nested support) the worker still starts, without Docker.
 set -eu
 if [ "${WORKER_DOCKER:-1}" = "1" ]; then
-  sudo /usr/local/bin/start-dockerd || echo "worker: nested Docker unavailable" >&2
+  sudo /usr/local/bin/start-dockerd || echo "worker: nested Docker unavailable (see /var/log/dockerd.log)" >&2
 fi
 exec "$@"

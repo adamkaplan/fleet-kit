@@ -19,7 +19,9 @@ scan_dir() {
   local dir=$1 hits=0 name re out
   while IFS= read -r line; do
     name=${line%%@@*}; re=${line#*@@}
-    out=$(grep -rIlE --exclude-dir=proc --exclude-dir=sys -e "$re" "$dir" 2>/dev/null || true)
+    rc=0; out=$(grep -rIlE --exclude-dir=proc --exclude-dir=sys -e "$re" "$dir" 2>/dev/null) || rc=$?
+    # 0 = hits, 1 = none; anything else means files were not read: an error, never a pass
+    [ "$rc" -le 1 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
     if [ -n "$out" ]; then
       while IFS= read -r f; do echo "${f#"$dir"/}: $name"; hits=$((hits + 1)); done <<<"$out"
     fi
@@ -46,7 +48,8 @@ cp "$work/img"/blobs/sha256/* "$work/files/" 2>/dev/null || true
 n=0
 while IFS= read -r layer; do
   n=$((n + 1)); mkdir "$work/files/layer$n"
-  tar -xf "$work/img/$layer" -C "$work/files/layer$n" --exclude='dev/*' 2>/dev/null || true
-done < <(find "$work/img" -name 'layer.tar' -o -type f -path '*/blobs/sha256/*' | sed "s#^$work/img/##" \
-          | while IFS= read -r p; do tar -tf "$work/img/$p" >/dev/null 2>&1 && echo "$p"; done)
+  tar -xf "$work/img/$layer" -C "$work/files/layer$n" --exclude='dev/*' 2>/dev/null \
+    || { echo "scan-secrets: cannot extract layer $layer: not scanned" >&2; exit 2; }
+done < <(python3 -c 'import json,sys; [print(l) for e in json.load(open(sys.argv[1])) for l in e["Layers"]]' "$work/img/manifest.json")
+[ "$n" -gt 0 ] || { echo "scan-secrets: no layers found in the image: not scanned" >&2; exit 2; }
 if scan_dir "$work/files"; then echo "scan-secrets: 0 hits"; else echo "scan-secrets: hits found" >&2; exit 1; fi
