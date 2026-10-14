@@ -38704,6 +38704,60 @@ class TestV2ReadVolume(Base):
         before = sum(self.ops(uncached).values())
         self.assertGreater(before, 5 * total, "without the memory the same passes read about %d times: %s" % (before, self.ops(uncached)))
 
+    def test_twenty_agents_are_refreshed_by_one_session_list_not_twenty_session_gets(self):
+        world = self.world()
+        self.passes(world, 40)                      # 200 s: the 120 s memory expires once
+        ops = self.ops(world)
+        self.assertEqual(ops.get("session.get", 0), 0, ops)
+        self.assertLessEqual(ops.get("session.list", 0), 4, ops)
+        self.assertGreaterEqual(ops.get("session.list", 0), 2, "the list is read again, not only once")
+        self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20)
+
+    def test_a_session_whose_time_moved_shows_its_new_time_after_the_next_list(self):
+        world = self.world()
+        self.passes(world, 2)
+        sid = world.sessions["agent4"]
+        before = world.engine.reads.sessions[sid][0]["time"]["updated"]
+        world.v2.sessions[sid]["messages"].append({"id": "msg_new", "type": "assistant", "time": {"created": world.clock.ms(world.clock.now()) + 5000}, "text": "x"})
+        world.tick(130)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        self.assertGreaterEqual(world.engine.reads.sessions[sid][0]["time"]["updated"], before + 1)
+        self.assertEqual(self.ops(world, mark).get("session.get", 0), 0)
+
+    def test_a_session_the_list_page_does_not_hold_is_read_alone(self):
+        world = self.world()
+        world.engine.reads.LIST_PAGE = 5
+        world.v2.list_page_cap = 5
+        self.passes(world, 2)
+        ops = self.ops(world)
+        self.assertGreaterEqual(ops.get("session.get", 0), 15, "the 15 sessions past the page are read one by one: %s" % ops)
+        self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20)
+
+    def test_a_failed_list_falls_back_to_the_session_reads_and_is_not_retried_at_once(self):
+        world = self.world()
+        real, tries = world.engine.v2.session_list_page, []
+        world.engine.v2.session_list_page = lambda *a, **k: tries.append(1) or (_ for _ in ()).throw(sb.V2Error("timeout", None, "slow"))
+        try:
+            self.passes(world, 6)
+        finally:
+            world.engine.v2.session_list_page = real
+        self.assertEqual(self.ops(world).get("session.get", 0), 20, "every agent is still read, once")
+        self.assertEqual(len(tries), 1, "one attempt, and none again within half the memory")
+
+    def test_a_read_before_a_write_is_never_from_the_list(self):
+        world = self.world()
+        self.passes(world, 2)
+        mark = len(world.v2.calls)
+        world.engine.reads.session_info(world.sessions["agent1"], "idle", world.clock.now(), fresh=True)
+        ops = self.ops(world, mark)
+        self.assertEqual((ops.get("session.get"), ops.get("session.list")), (1, None))
+
+    def test_under_light_mode_no_list_is_read(self):
+        world = self.world(v2_light=True)
+        self.passes(world, 3)
+        self.assertEqual(self.ops(world).get("session.list", 0), 0)
+
     def test_once_warm_a_pass_of_idle_agents_reads_almost_nothing(self):
         world = self.world()
         self.passes(world, 2)
@@ -38723,6 +38777,8 @@ class TestV2ReadVolume(Base):
 
     def test_a_cache_fill_budget_per_pass_shares_the_reads_out_in_turn(self):
         world = self.world(v2_cache_seconds=30, v2_reads_per_pass=3, v2_reads_per_minute=1000)
+        world.engine.reads.LIST_PAGE = 1             # the list holds one session: the rest are read alone, which is what the budget shares out
+        world.v2.list_page_cap = 1
         self.passes(world, 1)                       # the first read of every agent is always made
         world.tick(40)                              # all 20 records are now old
         mark = len(world.v2.calls)
@@ -38734,7 +38790,7 @@ class TestV2ReadVolume(Base):
             mark = len(world.v2.calls)
             world.engine.run_pass()
             seen |= {self.params(call)["sessionID"] for call in world.v2.calls[mark:] if len(call) > 2 and call[2] == "session.get"}
-        self.assertEqual(len(seen), 20, "every agent is refreshed within a few passes: the stalest goes first")
+        self.assertEqual(len(seen), 19, "every agent but the one the list holds is refreshed within a few passes: the stalest goes first")
 
     def test_a_per_minute_cap_keeps_what_is_remembered_and_the_stale_record_is_still_used(self):
         world = self.world(v2_cache_seconds=30, v2_reads_per_pass=100, v2_reads_per_minute=5)
