@@ -175,6 +175,10 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         out.write("heavy: %s: command not found\n" % command[0])
         return EXIT_NOT_FOUND
     name = name or holder_name(environ)
+    mode = should_take_slot(environ)   # "off": FLEET_HEAVY=off or CI, run it as it is; "inside": already in a slot (a nested heavy), no second one
+    if mode == "inside":
+        out.write("heavy: already inside a slot: running without a second one\n")
+    unslotted = None if mode == "taken" and state_dir is not None else ("" if mode == "off" else "no slot directory" if mode == "taken" else "inside")
     started = clock()
     try:
         every = float(environ.get("FLEET_HEAVY_REPORT_SECONDS") or WAIT_REPORT_SECONDS)   # 30 s; a test shortens it
@@ -195,8 +199,13 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     old = {number: signal.signal(number, on_signal) for number in FORWARDED}
     fd = None
     try:
-        while True:
-            fd, index = _take(state_dir, slots)
+        while unslotted is None:
+            try:
+                fd, index = _take(state_dir, slots)
+            except OSError as err:   # a missing, unwritable or locked-out directory never stops the command: one line, and it runs without a slot
+                out.write("heavy: no slot (%s): running without one\n" % (err.strerror or err))
+                unslotted = "unusable"
+                break
             if fd is not None:
                 break
             if got["signal"] is not None:
@@ -212,17 +221,19 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 out.flush()
                 next_report = now + every
             sleep(POLL_SECONDS)
-        _record(fd, name, os.getpid(), command[0], clock())   # at once, so a killed holder's old record is never shown for this one
-        os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
         env = dict(environ)
-        env[SLOT_ENV] = str(index)
-        argv = command_prefix(which) + list(command)
+        if fd is not None:
+            _record(fd, name, os.getpid(), command[0], clock())   # at once, so a killed holder's old record is never shown for this one
+            os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
+            env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
+        argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
         try:
-            child["p"] = subprocess.Popen(argv, env=env, pass_fds=(fd,))
+            child["p"] = subprocess.Popen(argv, env=env, pass_fds=(fd,) if fd is not None else ())
         except OSError as err:
             out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
             return EXIT_NOT_FOUND
-        _record(fd, name, child["p"].pid, command[0], clock())
+        if fd is not None:
+            _record(fd, name, child["p"].pid, command[0], clock())
         if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
             try:
                 child["p"].send_signal(got["signal"])
