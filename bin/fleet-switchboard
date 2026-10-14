@@ -9443,8 +9443,8 @@ def record_github_calls(engine):
             for at, account, _, _ in accounts.calls:
                 if cursor is None or at > cursor:
                     fresh[account] = fresh.get(account, 0) + 1
-        engine.agent_calls_cursor = engine.now()
-        agent_calls.fold(str(engine.state_dir), engine.now(), fresh)
+        if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
+            engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
