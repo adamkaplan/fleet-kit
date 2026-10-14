@@ -11473,7 +11473,10 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertEqual(parser.commands, frozenset(choices))
         for action in sorted(set(choices) - {"version"}):
             with self.subTest(action=action):
-                self.assertTrue(callable(sb.resolve_command(action, parser.commands)), "%s has no cmd_ function" % action)
+                handler = sb.resolve_command(action, parser.commands)
+                self.assertTrue(callable(handler), "%s has no cmd_ function" % action)
+                required = [n for n, p in inspect.signature(handler).parameters.items() if p.default is p.empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+                self.assertTrue(set(required) <= set(sb.COMMAND_ARGUMENTS), "%s asks for %s, which a command is never given" % (action, sorted(set(required) - set(sb.COMMAND_ARGUMENTS))))
 
     def run_dispatch(self, action, **namespace):
         """dispatch() for `action` with every function replaced by a recorder that keeps the real signature: (return value, calls, ensure calls)."""
@@ -11529,7 +11532,14 @@ class TestSelfRegisteringCli(unittest.TestCase):
         registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
         declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
         registered = TestSelfRegisteringCli.commands()[0].commands
-        for node in ast.parse(SWITCHBOARD.read_text()).body:
+        tree = ast.parse(SWITCHBOARD.read_text())
+        plain = {id(node) for node in tree.body}
+        for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
+            if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
+                                                    and x.value.id.startswith("cmd_") for x in node.targets):
+                if id(node) not in plain or not (isinstance(node.value, ast.Constant) and node.value.value is True):
+                    raise AssertionError("line %d declares a command's dispatch group in a form the guard cannot read: write `cmd_x.<group> = True` at module level" % node.lineno)
+        for node in tree.body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute) \
                     and isinstance(node.targets[0].value, ast.Name) and node.targets[0].attr in declared \
                     and isinstance(node.value, ast.Constant) and node.value.value is True and node.targets[0].value.id.startswith("cmd_"):
