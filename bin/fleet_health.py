@@ -433,7 +433,63 @@ def _resolve_charters(ctx, state, now, budget):
     return out, problems
 
 
-def _refresh_asks(ctx, state, now):
+def _parent_of(ctx, state, budget, repo, number, now, problems):
+    """(parent number or None, resolved): a parent never changes, so one read per number is kept for good (a failure is retried after RETRY_SECONDS).
+    Unresolved when it cannot be read or the account's budget is spent or paused: nothing is guessed."""
+    parents, failed, key = state.setdefault("parents", {}), state.setdefault("parents_failed", {}), "%s#%d" % (repo, number)
+    if key in parents:
+        return (parents[key] or None), True
+    if now - failed.get(key, -1e9) < RETRY_SECONDS or getattr(ctx, "read_parent", None) is None:
+        return None, False
+    if budget.paused(repo, problems) or budget.left(budget.account(repo)) < 1:
+        return None, False
+    try:
+        parent = budget.metered(repo, 1, lambda: ctx.read_parent(repo, number))
+    except Exception:
+        failed[key] = now
+        while len(failed) > PARENTS_KEEP:
+            failed.pop(next(iter(failed)))
+        return None, False
+    parents[key] = parent or 0
+    while len(parents) > PARENTS_KEEP:
+        parents.pop(next(iter(parents)))   # the oldest: it is only read again
+    return parent, True
+
+
+def expand_rows(ctx, state, budget, rows, asks_by_name, now, problems):
+    """Attribute each movement to the asks on the parent chain of the issues it refers to: a work item whose parent is an ask moves that ask (up to
+    PARENT_LEVELS levels). Returns (rows with the chain's numbers added, the count of movements whose reference could not be resolved)."""
+    known = {(a["repo"], a["number"]) for lst in asks_by_name.values() for a in lst}
+    is_ask = lambda repo, n: any(_same_repo(r, repo) and k == n for r, k in known)
+    window = now - max(ctx.cfg.get("stalled_hours", 2.0), ctx.cfg.get("backlog_hours", 4.0)) * 3600   # older movements cannot change a figure
+    out, unattributed = [], 0
+    for row in rows:
+        refs = row.get("refs") if isinstance(row.get("refs"), list) else []
+        if not refs or row["at"] < window or not row.get("repo"):
+            out.append(row)
+            continue
+        extra, stuck = [], False
+        for ref in refs[:MOVES_NUMBERS_MAX]:
+            if not isinstance(ref, int) or is_ask(row["repo"], ref):
+                continue
+            cur = ref
+            for _ in range(PARENT_LEVELS):
+                parent, resolved = _parent_of(ctx, state, budget, row["repo"], cur, now, problems)
+                if not resolved:
+                    stuck = True
+                    break
+                if not parent:
+                    break
+                extra.append(parent)
+                cur = parent
+                if is_ask(row["repo"], cur):
+                    break
+        unattributed += 1 if stuck else 0
+        out.append(dict(row, numbers=list(row["numbers"]) + [n for n in extra if n not in row["numbers"]]) if extra else row)
+    return out, unattributed
+
+
+def _refresh_asks(ctx, state, now, rows=()):
     """Re-read each asks list at most hourly, the oldest first, within each account's read budget; a failed read keeps the cached list and is told."""
     cache, problems = state.setdefault("asks", {}), []
     budget = _Budget(ctx, state, now)
@@ -460,20 +516,23 @@ def _refresh_asks(ctx, state, now):
         cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
+    asks_by_name = {n: (cache.get(n) or {}).get("list") or [] for n in ctx.orchestrators}
+    rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, now, problems)
+    state["unattributed"] = unattributed
     state["reads"] = budget.to_state()
-    return problems
+    return problems, rows
 
 
 def tick(ctx):
     """One pass. Returns the list of (orchestrator, wake text) sent. Never raises for a source it cannot read."""
     now, state = ctx.now, _read_state(ctx.state_dir)
     before_state = json.loads(json.dumps(state))
-    problems = _refresh_asks(ctx, state, now)
     rows = read_moves(ctx.state_dir, now - 24 * 3600)
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
+    rows += audited or []
+    problems, rows = _refresh_asks(ctx, state, now, rows)
     if audited is None:
         problems.append("movement: the audit log cannot be read")
-    rows += audited or []
     waiting = decisions_waiting(ctx.state_dir)
     if waiting is None:
         problems.append("decisions: decisions.json cannot be read")
@@ -532,6 +591,8 @@ def status_lines(state_dir, now):
         out.append("  %-12s asks %s, stalled %s (oldest %s h), moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f["oldest_stall_hours"]), num(f["moved_1h"]),
             f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+    if state.get("unattributed"):
+        out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):
         out.append("  unreadable: %s" % "; ".join(state["problems"][:3]))
     return out

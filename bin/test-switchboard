@@ -47865,6 +47865,106 @@ class TestLoadAlert(Base):
                                     "acme/widget", 5, sb.closing_numbers)[0]
         self.assertEqual((row["numbers"], row["refs"]), ([4303, 4022, 3115], [4022, 3115]))
 
+    def chain_world(self, parents, asks_numbers=(100,), **extra):
+        """A pass whose asks are `asks_numbers` of repo r, with `parents` {number: parent or None} as the issue parents on GitHub."""
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        self.asks = {1: list(asks_numbers)}
+        def tick(at, rows=(), **kw):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            def read_asks(charter, repo):
+                return [{"repo": "r", "number": n} for n in self.asks[charter]]
+            ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def move_row(self, at, refs, number=900):
+        return {"at": at, "repo": "r", "numbers": [number] + list(refs), "refs": list(refs), "kind": "push"}
+
+    def test_a_pull_request_naming_a_work_item_moves_the_ask_above_it(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200])])
+        got = self.latest()["o"]
+        self.assertEqual((got["stalled"], got["moved_1h"], reads), (0, 1, [200]))        # the ask 100 moved through its work item 200; one parent read
+
+    def test_a_chain_of_three_levels_reaches_the_ask_and_a_fourth_is_never_read(self):
+        tick, reads = self.chain_world({203: 202, 202: 201, 201: 100, 100: 50})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [203])])
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [203, 202, 201]))   # 3 reads reach the ask at the top; no read for the ask's own parent
+        tick2, reads2 = self.chain_world({205: 204, 204: 203, 203: 202, 202: 100}, asks_numbers=(100,))
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick2(self.T0)
+        tick2(late, [self.move_row(late - 60, [205])])
+        self.assertEqual((self.latest()["o"]["stalled"], reads2), (1, [205, 204, 203]))   # the ask is 4 levels up: not reached, and no 4th read
+
+    def test_a_resolved_parent_is_never_read_again(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200])])
+        tick(late + 600, [self.move_row(late + 300, [200])])
+        tick(late + 3 * 3600, [self.move_row(late + 3 * 3600 - 30, [200])])
+        self.assertEqual(reads, [200])
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["parents"], {"r#200": 100})
+
+    def test_an_unreadable_parent_is_not_guessed_and_status_counts_the_unattributed(self):
+        tick, reads = self.chain_world({})                 # every parent read fails
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300]), self.move_row(late - 30, [301], number=901)])
+        got = self.latest()["o"]
+        self.assertEqual((got["stalled"], got["moved_1h"]), (1, 0))                      # the ask did not get the credit
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertEqual([l.strip() for l in lines if "not attributed" in l], ["2 movement(s) not attributed (a referenced issue's parent could not be read)"])
+        tick(late + 60, [])
+        self.assertEqual(len(reads), 2)                                                  # a failed read waits RETRY_SECONDS
+
+    def test_parent_reads_use_the_account_budget_and_a_spent_budget_leaves_them_unattributed(self):
+        tick, reads = self.chain_world({n: 100 for n in range(200, 240)})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60 + n % 3, [200 + n], number=900 + n) for n in range(40)], cfg={"read_budget": 5})
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertLessEqual(len(state["reads"]), 5)                                      # the same count as the asks and charters reads
+        self.assertLess(len(reads), 5)
+        self.assertGreater(state["unattributed"], 0)
+
+    def test_parent_reads_answered_304_are_free(self):
+        tick, reads = self.chain_world({n: 100 for n in range(200, 210)}, begin_read=lambda: 0, read_cost=lambda token, repo: 0)
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200 + n], number=900 + n) for n in range(10)], cfg={"read_budget": 2})
+        self.assertEqual(len(reads), 10)
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["reads"], [])
+
+    def test_the_daemon_reads_a_parent_from_the_issue_and_ignores_another_repository(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        paths = []
+        def _api(path, repo):
+            paths.append(path)
+            return {"parent_issue_url": "https://api.github.com/repos/acme/widget/issues/100"} if path.endswith("/issues/200") else (
+                {"parent_issue_url": "https://api.github.com/repos/other/place/issues/7"} if path.endswith("/issues/201") else [])
+        intents = types.SimpleNamespace(repo="acme/widget", _api=_api, open_asks=lambda c, r: [types.SimpleNamespace(repo="acme/widget", number=100)])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        discovery = types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"})})
+        sb.load_tick(engine, discovery)
+        self.health.append_moves(str(self.state_dir), [{"at": self.T0, "repo": "acme/widget", "numbers": [900, 200, 201], "refs": [200, 201], "kind": "push"}])
+        sb.load_tick(engine, discovery)
+        parents = json.loads((self.state_dir / "load.json").read_text())["parents"]
+        self.assertEqual(parents, {"acme/widget#200": 100, "acme/widget#201": 0})          # a parent in another repository is no parent here
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
