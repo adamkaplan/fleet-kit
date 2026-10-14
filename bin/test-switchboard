@@ -214,7 +214,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "disk_guard": None,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "disk_guard": None, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -2388,7 +2388,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -8562,7 +8562,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -39065,6 +39065,217 @@ class TestAuditRotation(unittest.TestCase):
         entry = json.loads(self.path.read_text().splitlines()[-1])
         self.assertEqual(entry["event"], "audit.rotated")
         self.assertEqual((entry["detail"]["pruned"], entry["detail"]["archive"].startswith("audit-")), (["audit-2020-01-01.jsonl.gz"], True))
+
+
+
+class FakeDocker:
+    """A scripted docker: objects with labels, a record of every argv, and the removals. Filters are NOT applied (the reaper must not rely on them)."""
+
+    def __init__(self, containers=(), networks=(), volumes=(), running_mounts=()):
+        self.containers, self.networks, self.volumes, self.running_mounts = list(containers), list(networks), list(volumes), list(running_mounts)
+        self.calls, self.fail = [], set()
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv[1:]))
+        a = list(argv[1:])
+        if a[:1] == ["ps"] and "status=running" in a:
+            return subprocess.CompletedProcess(argv, 0, "\n".join(self.running_mounts), "")
+        if a[:1] == ["ps"]:
+            return subprocess.CompletedProcess(argv, 0, "\n".join("%s|%s|%s|%s" % row for row in self.containers), "")
+        if a[:2] == ["network", "ls"]:
+            return subprocess.CompletedProcess(argv, 0, "\n".join("%s|-|%s|%s" % (r[0], r[2], r[3]) for r in self.networks), "")
+        if a[:2] == ["volume", "ls"]:
+            return subprocess.CompletedProcess(argv, 0, "\n".join("%s|-|%s|%s" % (r[0], r[2], r[3]) for r in self.volumes), "")
+        if a[0] in ("rm", "network", "volume") and ("rm" in a):
+            if a[-1] in self.fail:
+                return subprocess.CompletedProcess(argv, 1, "", "in use")
+            return subprocess.CompletedProcess(argv, 0, a[-1], "")
+        raise AssertionError("unexpected docker call %r" % a)
+
+    def removals(self):
+        return [c for c in self.calls if "rm" in c]
+
+
+class TestDockerReaper(Base):
+    """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
+
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.docker_path = self.home / "docker"
+        self.docker_path.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(self.docker_path), 0o755)
+
+    def world_docker(self):
+        old, live = self.NOW - 100, self.NOW + 100
+        return FakeDocker(
+            containers=[("c_old", "exited", old, "agent-a"), ("c_live", "running", live, "agent-a"), ("c_none", "running", "", "")],
+            networks=[("n_old", "", old, "agent-a"), ("n_live", "", live, "agent-b"), ("n_nolabel", "", "", "")],
+            volumes=[("v_old", "", old, "agent-a"), ("v_mounted", "", old, "agent-a"), ("v_none", "", "", "")],
+            running_mounts=["v_mounted,other"])
+
+    def run_cli(self, docker, *argv):
+        with captured() as (out, err):
+            code = sb.main(["disk", "reap-docker", "--docker", str(self.docker_path), *argv], runner=docker, now=lambda: self.NOW)
+        return code, out.getvalue(), err.getvalue()
+
+    def audits(self):
+        return [e for e in self.world.audit() if e["event"] == "docker.reaped"]
+
+    def test_s4_only_the_expired_labelled_objects_are_removed(self):
+        docker = self.world_docker()
+        code, out, err = self.run_cli(docker, "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(docker.removals(), [["rm", "-f", "c_old"], ["network", "rm", "n_old"], ["volume", "rm", "v_old"]])
+        self.assertIn("kept volume v_mounted: a running container mounts it", out)
+        for argv in docker.removals():
+            self.assertNotIn("-v", argv)
+            self.assertNotIn("prune", argv)
+
+    def test_s11_a_dry_run_removes_nothing_and_an_applied_run_audits_each_removal(self):
+        docker = self.world_docker()
+        code, out, err = self.run_cli(docker)
+        self.assertEqual((code, docker.removals(), self.audits()), (0, [], []))
+        self.assertIn("dry run", out)
+        self.assertIn("container c_old", out)
+        self.run_cli(docker, "--apply")
+        entries = self.audits()
+        self.assertEqual([(e["detail"]["kind"], e["subject"]) for e in entries], [("container", "c_old"), ("network", "n_old"), ("volume", "v_old")])
+        self.assertEqual(entries[0]["detail"]["owner"], "agent-a")
+
+    def test_s11_the_kill_switch_removes_nothing_even_with_apply(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "docker_reaper": False})
+        docker = self.world_docker()
+        code, out, err = self.run_cli(docker, "--apply")
+        self.assertEqual((code, docker.calls), (sb.EXIT_USAGE, []))
+        self.assertIn("docker_reaper is false", err)
+
+    def test_s12_no_sudo_in_any_command(self):
+        docker = self.world_docker()
+        self.run_cli(docker, "--apply")
+        self.run_cli(docker)
+        self.assertEqual([c for c in docker.calls if any("sudo" in part for part in c)], [])
+
+    def test_u1_a_machine_with_nothing_eligible_loses_nothing(self):
+        docker = FakeDocker()
+        code, out, err = self.run_cli(docker, "--apply")
+        self.assertEqual((code, docker.removals()), (0, []))
+        self.assertIn("removed: 0", out)
+
+    def test_a_label_that_is_not_an_epoch_and_an_unlabelled_object_are_never_removed(self):
+        docker = FakeDocker(containers=[("c1", "exited", "soon", "agent-a"), ("c2", "exited", "-5", "agent-a"), ("c3", "exited", self.NOW - 1, ""),
+                                        ("c4", "exited", "1" * 20, "agent-a")])
+        self.run_cli(docker, "--apply")
+        self.assertEqual(docker.removals(), [])
+
+    def test_a_failed_listing_ends_the_run_before_anything_is_removed(self):
+        docker = self.world_docker()
+        real = docker.__call__
+
+        def runner(argv, **kwargs):
+            if argv[1:3] == ["volume", "ls"]:
+                return subprocess.CompletedProcess(argv, 1, "", "daemon not running")
+            return real(argv, **kwargs)
+        code, out, err = self.run_cli(runner, "--apply")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(docker.removals(), [])
+        self.assertIn("daemon not running", out)
+
+    def test_a_removal_that_fails_is_said_and_not_audited_and_the_rest_go_on(self):
+        docker = self.world_docker()
+        docker.fail.add("c_old")
+        code, out, err = self.run_cli(docker, "--apply")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual([e["subject"] for e in self.audits()], ["n_old", "v_old"])
+
+    def test_without_docker_it_refuses_and_runs_nothing(self):
+        docker = self.world_docker()
+        with captured() as (out, err):
+            code = sb.main(["disk", "reap-docker", "--docker", "/nonexistent/docker", "--apply"], runner=docker, now=lambda: self.NOW)
+        self.assertEqual((code, docker.calls), (sb.EXIT_USAGE, []))
+
+    def test_a_hostile_owner_label_reaches_the_terminal_as_plain_text(self):
+        docker = FakeDocker(containers=[("c1", "exited", self.NOW - 1, "\x1b[2Jevil\x9b31m")])
+        code, out, err = self.run_cli(docker)
+        self.assertEqual([c for c in out if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
+
+    def test_the_config_key_must_be_a_boolean(self):
+        for bad in ("yes", None, 1, {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "docker_reaper": bad})
+
+    # -- the daemon's daily run
+
+    def daily(self, runner, config=None):
+        engine = self.world.engine
+        engine.config = dict(engine.config, **(config or {}))
+        engine.docker_reap_runner = runner
+        source = [src for src in engine.sources if getattr(src, "__name__", "") == "docker_reap_facts"][0]
+        return engine, source
+
+    def test_the_daemon_reaps_once_a_day_on_a_thread_and_a_restart_does_not_repeat_it(self):
+        docker = self.world_docker()
+        engine, source = self.daily(docker)
+        engine.now = lambda: self.NOW
+        with mock.patch.object(sb, "_docker_executable", lambda name: "docker"):
+            self.assertEqual(source(), [])
+            source.thread.join(10)
+            self.assertEqual(len(docker.removals()), 3)
+            self.assertEqual(len(self.audits()), 3)
+            source(), (source.thread.join(10) if source.thread else None)
+            self.assertEqual(len(docker.removals()), 3, "not again within a day")
+            engine.now = lambda: self.NOW + sb.DOCKER_REAP_INTERVAL + 1
+            source()
+            source.thread.join(10)
+            self.assertGreater(len(docker.calls), 9, "a day later it lists again")
+
+    def test_an_engine_that_is_not_the_daemon_and_the_kill_switch_never_reap(self):
+        docker = self.world_docker()
+        engine, source = self.daily(None)
+        engine.now = lambda: self.NOW
+        source()
+        self.assertEqual(docker.calls, [])
+        engine, source = self.daily(docker, {"docker_reaper": False})
+        with mock.patch.object(sb, "_docker_executable", lambda name: "docker"):
+            source()
+        self.assertEqual(docker.calls, [])
+        self.assertIsNone(source.thread)
+
+
+class TestComposeTrap(Base):
+    """`tools/fleet-compose-trap.sh`: the compose project is brought down WITH its volumes once, on a normal exit and on an interrupt."""
+
+    def run_harness(self, how):
+        log = self.home / "docker.log"
+        fake = self.home / "bin"
+        fake.mkdir(exist_ok=True)
+        (fake / "docker").write_text("#!/bin/sh\necho \"$@\" >> %s\n" % log)
+        os.chmod(str(fake / "docker"), 0o755)
+        script = self.home / "harness.sh"
+        script.write_text("#!/usr/bin/env bash\n. %s\nfleet_compose_trap -p proj -f compose.test.yml\n%s\n" % (
+            REPO / "tools" / "fleet-compose-trap.sh", "exit 0" if how == "exit" else "sleep 30 &\nwait"))
+        env = dict(os.environ, PATH="%s:%s" % (fake, os.environ["PATH"]))
+        proc = subprocess.Popen(["bash", str(script)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if how != "exit":
+            time.sleep(1.0)
+            proc.send_signal(signal.SIGINT if how == "interrupt" else signal.SIGTERM)
+        proc.wait(timeout=20)
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_s5_a_normal_exit_runs_down_with_volumes_once(self):
+        self.assertEqual(self.run_harness("exit"), ["compose -p proj -f compose.test.yml down -v --remove-orphans"])
+
+    def test_s5_an_interrupt_and_a_termination_run_it_once_each(self):
+        for how in ("interrupt", "terminate"):
+            with self.subTest(how=how):
+                (self.home / "docker.log").unlink(missing_ok=True)
+                self.assertEqual(self.run_harness(how), ["compose -p proj -f compose.test.yml down -v --remove-orphans"])
+
+    def test_the_helper_never_uses_sudo(self):
+        self.assertNotIn("sudo", (REPO / "tools" / "fleet-compose-trap.sh").read_text().replace("Never uses sudo.", ""))
 
 
 class TestDiskGuard(Base):

@@ -4497,3 +4497,30 @@ The daemon makes ONE `disk_usage` of the volume holding the state directory per 
 </dict>
 </plist>
 ```
+
+### Docker: label convention and `disk reap-docker`
+
+A test stack or compose project an agent starts carries two labels: `fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` (when it should be gone: the run's start plus a generous limit). In a compose file:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    labels:
+      fleet.owner: "${FLEET_AGENT:-coder}"
+      fleet.expires: "${FLEET_EXPIRES}"   # export FLEET_EXPIRES=$(( $(date +%s) + 7200 ))
+volumes:
+  data:
+    labels:
+      fleet.owner: "${FLEET_AGENT:-coder}"
+      fleet.expires: "${FLEET_EXPIRES}"
+networks:
+  default:
+    labels:
+      fleet.owner: "${FLEET_AGENT:-coder}"
+      fleet.expires: "${FLEET_EXPIRES}"
+```
+
+First line of defence: a harness `source`s `tools/fleet-compose-trap.sh` and calls `fleet_compose_trap -p "$PROJECT" -f compose.test.yml`; on a normal exit, an interrupt or a termination it runs `docker compose ... down -v --remove-orphans` once.
+
+Second line: `fleet-switchboard disk reap-docker` lists (the default) and `disk reap-docker --apply` removes the containers (`docker rm -f`, never `-v`), networks and volumes that carry BOTH labels and whose `fleet.expires` has passed. It never touches an unlabelled object, one that has not expired, a label that is not an epoch, or a volume a running container mounts; no `system prune`, no sudo. Each removal is one `docker.reaped` audit line. The daemon applies it once a day (the time of the last run is kept in `docker-reap.json`; docker is run on a background thread, never in the pass) and says `docker.reap` in the audit; `"docker_reaper": false` in the config is the kill switch for both the daemon and `--apply`. With no docker it says so and does nothing.
