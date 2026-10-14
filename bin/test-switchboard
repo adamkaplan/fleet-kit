@@ -7927,9 +7927,10 @@ class TestHygiene(unittest.TestCase):
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
         top, jobs = workflow.split("\njobs:\n", 1)
         self.assertIn("\nconcurrency:\n", top, "the concurrency block is top-level (before jobs)")
-        self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}", top)
+        self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}", top)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
+        self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
         self.assertEqual(workflow.count("macos-latest"), 1, "one macOS job per run: a single matrix entry")
         self.assertIn("os: [ubuntu-latest, macos-latest]", jobs)
 
