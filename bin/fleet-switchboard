@@ -3953,7 +3953,8 @@ class Switchboard:
         outcome = self.send_fact(fact, discovery, now, waiting)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
             try:   # a final done report reclaims the worker's registered worktrees: removed when clean and pushed, else kept with the reason
-                lines = reclaim_for_agent(self, subprocess.run, sender, True, "done report", keep_cwd=True)
+                lines = reclaim_for_agent(self, subprocess.run, sender, False, "done report")   # a dry run: a worker often goes on in the same worktree, so only `retire` or `disk reclaim-worktrees --apply` removes
+                lines = [l.replace(": would remove (", ": reclaimable: clean and pushed, `retire` or `disk reclaim-worktrees --apply` removes it (") for l in lines]
                 if lines:
                     outcome = dict(outcome, worktrees=lines)
             except Exception as err:
@@ -5030,7 +5031,10 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         try:
             found = worktree_of_directory(subprocess.run, directory)
             if found is not None:
-                if register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now()):
+                done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
+                if isinstance(done, str):   # already claimed by another agent: never taken over
+                    engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
+                elif done is True:
                     if engine.audit is not None:
                         engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
                 else:   # it will not be reclaimed later: say so now
@@ -5757,10 +5761,14 @@ def read_worktrees(state_dir):
 
 
 def register_worktree(state_dir, path, agent, repo, branch, now):
-    """Record one worktree (atomic, 0600, under the state lock). Returns True when written."""
+    """Record one worktree (atomic, 0600, under the state lock). Returns True when written, False when it could not be, and the OWNER's name (a str)
+    when another agent already holds it: an existing entry's owner is never overwritten."""
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = read_worktrees(state_dir)
+            held = data.get(str(path))
+            if isinstance(held, dict) and held.get("agent") not in (None, agent):
+                return held.get("agent")   # a second claim never takes the owner over: the caller says so
             data[str(path)] = {"agent": agent, "repo": repo, "branch": branch, "created": int(now)}
             _write_small(state_dir, WORKTREES_FILE, data)
         return True
@@ -5888,7 +5896,10 @@ def cmd_disk_register_worktree(args, runner, now):
     found = worktree_of_directory(runner, path)
     if found is None:
         raise LaunchError("%s is not a linked git worktree (a main checkout or a plain directory is never registered)" % path)
-    if not register_worktree(state, found[0], args.agent, args.repo, found[1], now()):
+    done = register_worktree(state, found[0], args.agent, args.repo, found[1], now())
+    if isinstance(done, str):
+        raise LaunchError("refused: %s is already registered to %s; a second claim never takes it over" % (found[0], done))
+    if done is not True:
         raise LaunchError("the registry could not be written: nothing changed")
     if engine.audit is not None:
         engine.audit.append(engine.actor, "worktree.registered", args.agent, {"path": found[0], "branch": found[1], "by": "register-worktree"})
