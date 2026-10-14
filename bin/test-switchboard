@@ -4500,6 +4500,79 @@ class TestLaunch(Base):
     def kill(self, name):
         del self.world.herdr.panes[self.world.panes[name]]
 
+    def dead_worker(self, entry="absent"):
+        """A DEAD worker (its pane is gone) under a boss, with the given last-reports.json entry; a chief of staff to be woken."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.worker()
+        if entry != "absent":
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}) if entry is not None else "{not json")
+        self.health()
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
+
+    def test_dead_hint_s1_status_says_the_last_report_and_both_hints(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
+        self.assertIn("last report: working 3h ago", lines)   # a final done would have retired it already
+        self.assertIn("fleet-switchboard retire worker", lines)
+        self.assertIn("fleet-switchboard reattach worker", lines)
+
+    def test_dead_hint_s2_the_wake_says_no_report_since_launch_and_both_hints(self):
+        self.dead_worker()
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source()) if "worker is DEAD" in f.summary]
+        self.assertEqual(len(facts), 1)
+        for text in ("no report since launch", "fleet-switchboard retire worker", "fleet-switchboard reattach worker"):
+            self.assertIn(text, facts[0].summary)
+
+    def test_dead_hint_s3_the_newer_of_a_report_and_a_send_to_the_boss_is_shown(self):
+        now = self.world.clock.now()
+        sign = sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now - 300, "other": now - 10}}, now, "boss")
+        self.assertIn("last report: a message sent 5m ago", sign)
+        self.assertNotIn("working", sign)
+        self.assertIn("working 2h ago", sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now + 9999}}, now, "boss"))
+
+    def test_dead_hint_s4_detached_and_other_lines_do_not_change(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.detach()
+        self.health()
+        self.health(1)
+        lines = sb.pane_health_status_lines(self.world.state)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("platform DETACHED", lines[0])
+        self.assertEqual(lines[1], "        run `fleet-switchboard reattach <name>`")
+        self.assertNotIn("last report", "\n".join(lines))
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source())]
+        self.assertNotIn("last report", facts[0].summary)
+
+    def test_dead_hint_s5_both_cases_carry_both_hints_within_the_bound(self):
+        now = self.world.clock.now()
+        for entry in ({"state": "done", "at": now - 60}, None):
+            text = sb.dead_hint.hint("alpha", entry, now)
+            self.assertIn("fleet-switchboard retire alpha", text)
+            self.assertIn("fleet-switchboard reattach alpha", text)
+            self.assertLessEqual(len(text), 240)
+
+    def test_dead_hint_s6_a_corrupt_file_says_no_report_since_launch(self):
+        self.dead_worker(None)
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, self.world.clock.now()))
+        self.assertIn("no report since launch", lines)
+
+    def test_dead_hint_s7_nothing_is_written(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        before = {p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}
+        sb.pane_health_status_lines(self.world.state, now)
+        list(sb.PaneFacts.__call__(self.fact_source()))
+        self.assertEqual({p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}, before)
+
+    def test_dead_hint_s8_a_500_character_state_or_name_is_bounded(self):
+        now = self.world.clock.now()
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertLessEqual(len(text), 240)
+
     def test_retire_stops_dead_and_detached_reports_and_all_detached_skips_it_and_undo_brings_it_back(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
