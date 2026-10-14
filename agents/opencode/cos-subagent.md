@@ -49,6 +49,7 @@ permissions:
   - {action: shell, resource: "gh pr ready *", effect: allow}
   - {action: shell, resource: "gh pr edit *", effect: allow}
   - {action: shell, resource: "gh pr merge *", effect: allow}
+  - {action: shell, resource: "gh issue create *", effect: allow}
   - {action: shell, resource: "gh issue comment *", effect: allow}
   - {action: shell, resource: "gh issue close *", effect: allow}
   - {action: shell, resource: "gh issue reopen *", effect: allow}
@@ -79,10 +80,8 @@ permissions:
   - {action: shell, resource: "uptime", effect: allow}
   - {action: shell, resource: "timeout ? fleet-switchboard *", effect: allow}
   - {action: shell, resource: "timeout ?? fleet-switchboard *", effect: allow}
-  - {action: shell, resource: "timeout * gh pr view *", effect: allow}
-  - {action: shell, resource: "timeout * gh issue view *", effect: allow}
-  - {action: shell, resource: "timeout * gh pr list *", effect: allow}
-  - {action: shell, resource: "timeout * gh issue list *", effect: allow}
+  - {action: shell, resource: "timeout * gh * view *", effect: allow}
+  - {action: shell, resource: "timeout * gh * list *", effect: allow}
   - {action: shell, resource: "herdr * list*", effect: allow}
   - {action: shell, resource: "herdr * get*", effect: allow}
   - {action: shell, resource: "herdr * read*", effect: allow}

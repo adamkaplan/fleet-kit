@@ -181,7 +181,37 @@ def is_write(args):
         return True   # cannot tell: treat as a write, the safe side
 
 
-def account_env(gh, lookup=None, strict=False):
+EXPLICIT_REPO_GROUPS = {"issue", "pr"}
+URL_REPO_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/[0-9]+(?:[/?#].*)?$")
+
+
+def explicit_repo(args):
+    """The repo a `gh issue ...` or `gh pr ...` command NAMES (`-R`/`--repo`, or an issue or pull request URL), or None. Never for `merge`: a merge keeps
+    the caller's own rule. Only `issue` and `pr` commands: nothing else (`repo`, `secret`, `workflow`, `run`, `api`) picks an account by what it names."""
+    try:
+        words = command_words(args)
+        if len(words) < 2 or words[0] not in EXPLICIT_REPO_GROUPS or words[1] == "merge":
+            return None
+        found = None
+        for i, a in enumerate(args):
+            if a in ("-R", "--repo") and i + 1 < len(args):
+                found = args[i + 1]
+            elif a.startswith("--repo="):
+                found = a.split("=", 1)[1]
+            elif a.startswith("-R") and len(a) > 2 and not a.startswith("--"):
+                found = a[2:].lstrip("=")
+        if found is None:
+            for a in args:
+                m = URL_REPO_RE.match(a)
+                if m:
+                    found = m.group(1)
+                    break
+        return found if isinstance(found, str) and REPO_RE.match(found) else None
+    except Exception:
+        return None
+
+
+def account_env(gh, lookup=None, strict=False, args=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
@@ -195,6 +225,8 @@ def account_env(gh, lookup=None, strict=False):
             return None
         lookup = lookup or Lookup()
         repo = lookup.identity().get("repo")
+        if not repo and not lookup.failed:
+            repo = explicit_repo(args or [])   # a caller with no repo of its own (the Chief of Staff) acts as the account of the repo the command names
         if not repo:
             if strict and lookup.failed:
                 raise AccountLookupFailed("identity")
@@ -709,10 +741,10 @@ def main(args):
     if verdict is not None:
         args = verdict[1]
     try:
-        env = account_env(gh, lookup, strict=is_write(args))
+        env = account_env(gh, lookup, strict=is_write(args), args=args)
     except AccountLookupFailed:
         try:
-            env = account_env(gh, Lookup(write=True), strict=True)   # retry the lookup ONCE with a fresh deadline
+            env = account_env(gh, Lookup(write=True), strict=True, args=args)   # retry the lookup ONCE with a fresh deadline
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")
