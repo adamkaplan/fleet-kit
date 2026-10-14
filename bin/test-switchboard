@@ -40306,18 +40306,20 @@ class TestTempJanitor(Base):
 
     def test_records_that_cannot_be_read_in_full_mean_nothing_is_judged(self):
         victim = self.old("old-victim-file.txt")
-        (self.world.state / "reminders.json").write_text("{}")
-        os.chmod(str(self.world.state / "reminders.json"), 0)
-        try:
-            code, out, err = self.run_cli("--apply")
-        finally:
-            os.chmod(str(self.world.state / "reminders.json"), 0o600)
-        self.assertTrue(victim.exists())
-        self.assertIn("could not be read in full", out)
+        if os.getuid() != 0:   # root can read a file with mode 0
+            (self.world.state / "reminders.json").write_text("{}")
+            os.chmod(str(self.world.state / "reminders.json"), 0)
+            try:
+                code, out, err = self.run_cli("--apply")
+            finally:
+                os.chmod(str(self.world.state / "reminders.json"), 0o600)
+            self.assertTrue(victim.exists())
+            self.assertIn("could not be read in full", out)
         with mock.patch.object(self.jan, "STATE_TOTAL_BYTES", 5):
             (self.world.state / "reminders.json").write_text("x" * 50)
             code, out, err = self.run_cli("--apply")
         self.assertTrue(victim.exists())
+        self.assertIn("could not be read in full", out)
 
     def test_an_entry_that_changes_after_the_scan_is_kept(self):
         victim = self.old("touched-after-scan.txt")
@@ -40336,16 +40338,35 @@ class TestTempJanitor(Base):
     def test_an_audit_line_that_cannot_be_written_stops_the_removing(self):
         self.old("a-first.txt")
         self.old("b-second.txt")
-        with mock.patch.object(sb.AuditLog, "append", side_effect=OSError("disk full")):
-            code, out, err = self.run_cli("--apply")
-        self.assertIn("STOPPED: a-first.txt was removed but its audit line could not be written", out)
+        def failing(name, detail):
+            raise OSError("disk full")
+        lines, removed, kept = self.jan.run(self.temp, self.world.state, self.now, self.jan.settings({}), True, failing)
+        self.assertIn("STOPPED: a-first.txt was removed but its audit line could not be written (disk full)", " ".join(lines))
+        self.assertEqual(removed, 1)
         self.assertTrue((self.temp / "b-second.txt").exists())
 
     def test_a_directory_outside_the_system_temp_directory_is_refused(self):
-        outside = Path(os.path.expanduser("~")) / ".fleet-janitor-test-nonexistent-dir"
-        self.assertFalse(self.jan.safe_dir(outside)[0])
-        self.assertFalse(self.jan.safe_dir(Path(tempfile.gettempdir()))[0])
+        outside = REPO / "scenarios"   # a real directory the user owns, outside the system temp directory and not the home directory
+        ok, why = self.jan.safe_dir(outside)
+        self.assertFalse(ok)
+        self.assertIn("not under the system temp directory", why)
+        self.assertIn("is the system temp directory itself", self.jan.safe_dir(Path(tempfile.gettempdir()))[1])
         self.assertTrue(self.jan.safe_dir(self.temp)[0])
+        lines, removed, kept = self.jan.run(outside, self.world.state, self.now, self.jan.settings({}), True, lambda *a: None)
+        self.assertEqual((removed, lines[0][:8]), (0, "refused:"))
+
+    def test_an_entry_on_another_device_than_the_temp_directory_is_kept(self):
+        victim = self.old("mount-like.txt")
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **k):
+            info = real_lstat(path, *a, **k)
+            if str(path) == str(victim):
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, info.st_nlink, info.st_uid, info.st_gid, info.st_size, info.st_atime, info.st_mtime, info.st_ctime))
+            return info
+        with mock.patch.object(self.jan.os, "lstat", lstat):
+            row = self.jan.judge(str(victim), "", self.now, self.jan.settings({}))
+        self.assertEqual((row["action"], row["why"][:11]), ("keep", "is on anoth"))
 
     def test_a_bad_temp_janitor_key_is_refused_by_the_config_loader_and_is_not_an_unknown_key(self):
         bad = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"days": 0}}

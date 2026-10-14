@@ -192,6 +192,13 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic):
     if info.st_uid != uid:
         row["why"] = "owned by another user"
         return row
+    try:
+        if info.st_dev != os.lstat(os.path.dirname(path)).st_dev:
+            row["why"] = "is on another device than the temp directory (a mount point)"
+            return row
+    except OSError:
+        row["why"] = "its directory cannot be read"
+        return row
     keep = list(cfg.get("keep") or [])
     if any(fnmatch.fnmatchcase(name, g) or fnmatch.fnmatchcase(path, g) for g in keep):
         row["why"] = "matches a keep glob"
