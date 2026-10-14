@@ -12833,7 +12833,7 @@ class GitHubHub:
             else:
                 done = self.runner(argv, capture_output=True, text=True,
                                    timeout=timeout or self.config["call_timeout_seconds"], **extra)
-        except GhRateLimited as err:
+        except GhRateLimited as err:   # fail closed, on purpose: while the account is paused every hub read says "unavailable" (callers already hold on that); no hub read is `essential`
             raise GitHubUnavailable(str(err)) from None
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -13639,13 +13639,20 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     return engine, state, config
 
 
+def enable_conditional_reads(engine):
+    """The daemon's GitHub reads ask with `-i` and keep ETags (see `GhAccounts.read`). Nothing else turns it on."""
+    accounts = getattr(engine, "accounts", None)
+    if isinstance(accounts, GhAccounts):
+        accounts.conditional = True
+
+
 def cmd_run(args, runner, now, wait):
     if not args.once:   # the daemon: whoever started it, it is nobody's agent (see CALLER_ENV_NAMES)
         for name in CALLER_ENV_NAMES:
             os.environ.pop(name, None)
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
-    engine.accounts.conditional = True   # the daemon's reads keep ETags (a 304 is free); a one-shot command reads plainly
+    enable_conditional_reads(engine)   # the daemon's reads keep ETags (a 304 is free); a one-shot command reads plainly
     if args.once:
         with single_instance(state):
             report = engine.run_pass()
@@ -14453,7 +14460,7 @@ class GhAccounts:
 
     def _pause(self, account, until, status):
         with self.lock:
-            self.paused[account] = until
+            self.paused[account] = max(until, self.paused.get(account, 0))   # a later, shorter answer never shortens a pause
             first = account not in self.limited_once
             self.limited_once.add(account)
         if first:
@@ -14467,9 +14474,9 @@ class GhAccounts:
         if not limited:
             return None
         until = None
-        if retry is not None and retry.isdigit():
+        if retry is not None and re.fullmatch(r"[0-9]{1,10}", retry):
             until = now + int(retry)
-        elif remaining == "0" and reset is not None and reset.isdigit():
+        elif remaining == "0" and reset is not None and re.fullmatch(r"[0-9]{1,12}", reset):
             until = float(reset)
         if until is None:
             until = now + GH_LIMIT_DEFAULT_PAUSE

@@ -9885,6 +9885,90 @@ class TestGithubReadGate(IntentCase):
         with self.assertRaises(sb.GhRateLimited):
             accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5)
 
+    def test_the_pass_leaves_the_record_status_reads_and_status_prints_the_lines(self):
+        engine = self.world.engine
+        engine.accounts = self.accounts
+        self.reader.issue(2)
+        sb.record_github_calls(engine)
+        lines = sb.github_calls_status(self.world.state, self.world.clock.now())
+        self.assertRegex(lines[0], r"^github calls/min by account: default 1 \(issues/# 1\)")
+        self.tick(300)
+        self.assertIn("the daemon is not passing", sb.github_calls_status(self.world.state, self.world.clock.now())[0])
+        report = {"github_calls": lines, "agents": {"ok": True, "list": []}}
+        self.assertIn("github calls/min by account", "\n".join(l for l in ["      " + t for t in report["github_calls"]]))
+
+    def test_the_hub_read_of_a_paused_account_is_unavailable_and_starts_no_process(self):
+        now = self.world.clock.now
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return self.limited(now())
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})
+        accounts.conditional = True
+        hub = sb.GitHubHub(self.world.config, self.world.state, self.audit, runner, None, now)
+        hub.accounts = accounts
+        with self.assertRaises(sb.GitHubUnavailable):
+            hub.gh_api("repos/%s/issues/1" % FAKE_REPO, paginate=False)
+        with self.assertRaises(sb.GitHubUnavailable) as caught:
+            hub.gh_api("repos/%s/issues/2" % FAKE_REPO, paginate=False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("rate limited until", str(caught.exception))
+        self.assertEqual(accounts.call_summary(now())["last_minute"]["default"], {"issues/#": 1}, "a hub read is counted")
+
+    def test_the_daemon_turns_conditional_reads_on_and_nothing_else_does(self):
+        engine = types.SimpleNamespace(accounts=self.accounts)
+        self.accounts.conditional = False
+        sb.enable_conditional_reads(engine)
+        self.assertTrue(self.accounts.conditional)
+        sb.enable_conditional_reads(types.SimpleNamespace())   # no accounts: nothing happens
+
+    def test_a_long_moving_or_oversized_answer_is_not_remembered_and_the_memory_is_bounded(self):
+        now = self.world.clock.now
+        body = {"v": "x"}
+
+        def runner(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, 'HTTP/2.0 200 OK\r\nEtag: W/"t"\r\n\r\n' + json.dumps(body), "")
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})
+        accounts.conditional = True
+        accounts.read(runner, "repos/%s/issues/comments?since=2027-01-01" % FAKE_REPO, FAKE_REPO, 5)
+        self.assertEqual(len(accounts.etags), 0, "a since= window never repeats")
+        body["v"] = "y" * (sb.GH_ETAG_BODY_MAX + 10)
+        accounts.read(runner, "repos/%s/issues/1" % FAKE_REPO, FAKE_REPO, 5)
+        self.assertEqual(len(accounts.etags), 0, "an oversized answer is not kept")
+        body["v"] = "z"
+        for number in range(sb.GH_ETAG_MAX + 5):
+            accounts.read(runner, "repos/%s/issues/%d" % (FAKE_REPO, number), FAKE_REPO, 5)
+        self.assertEqual(len(accounts.etags), sb.GH_ETAG_MAX)
+        body["v"] = "q" * (sb.GH_ETAG_BODY_MAX - 100)
+        for number in range(1000, 1000 + 60):
+            accounts.read(runner, "repos/%s/issues/%d" % (FAKE_REPO, number), FAKE_REPO, 5)
+        self.assertLessEqual(sum(len(v[1]) for v in accounts.etags.values()), sb.GH_ETAG_BYTES_MAX)
+
+    def test_a_304_with_nothing_remembered_is_an_ordinary_failure_and_a_paginated_read_is_never_conditional(self):
+        now = self.world.clock.now
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 304 Not Modified\r\n\r\n", "gh: HTTP 304")
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})
+        accounts.conditional = True
+        done = accounts.read(runner, "repos/%s/issues/1" % FAKE_REPO, FAKE_REPO, 5)
+        self.assertEqual(done.returncode, 1)
+        accounts.read(runner, "repos/%s/issues" % FAKE_REPO, FAKE_REPO, 5, paginate=True)
+        self.assertEqual(seen[1], [FAKE_GH, "api", "--paginate", "repos/%s/issues" % FAKE_REPO])
+
+    def test_an_essential_read_that_hits_the_limit_never_shortens_a_longer_pause(self):
+        accounts = self.accounts
+        accounts._pause("default", self.world.clock.now() + 1000, 403)
+        accounts._pause("default", self.world.clock.now() + 100, 403)
+        self.assertEqual(accounts.paused["default"], self.world.clock.now() + 1000)
+
+    def test_a_header_with_unicode_digits_is_no_reset(self):
+        now = self.world.clock.now()
+        self.assertEqual(sb.GhAccounts._limit_reset(429, {"retry-after": "\u00b2"}, "", now), now + sb.GH_LIMIT_DEFAULT_PAUSE)
+
     def test_only_the_daemon_turns_conditional_reads_on(self):
         self.assertFalse(sb.GhAccounts({"gh": FAKE_GH}, None, time.time, environ={}).conditional)
 
