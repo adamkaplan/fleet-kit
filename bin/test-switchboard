@@ -39953,7 +39953,7 @@ class TestDiskReport(Base):
 
     def runner(self, docker_text="TYPE TOTAL SIZE\nImages 3 1.2GB\n", docker_code=0):
         def run(argv, **kwargs):
-            if argv[0] == str(self.docker_path):
+            if argv[0] == str(self.docker_path) or os.path.basename(argv[0]) == "docker":   # ANY docker, by name or by path
                 self.calls.append(list(argv[1:]))
                 return subprocess.CompletedProcess(argv, docker_code, docker_text, "daemon down" if docker_code else "")
             if argv[0] == "ps":
@@ -39992,6 +39992,8 @@ class TestDiskReport(Base):
         with captured():
             sb.main(["status"], runner=self.runner(), now=self.world.clock.now)
         self.assertEqual(self.calls, [], "the status pass asked docker")
+        self.runner()(["docker", "ps"])   # the guard can fail: a call by bare name is recorded
+        self.assertEqual(self.calls, [["ps"]])
 
     def test_s2_a_missing_docker_is_said_and_the_other_sections_still_print(self):
         code, out, err = self.report("report", docker="/nonexistent/docker")
