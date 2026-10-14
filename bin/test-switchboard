@@ -4849,6 +4849,55 @@ class TestLaunch(Base):
         self.assertEqual((status, root.exists()), ("kept", True))
         self.assertIn("herdr cannot say", line)
 
+    def test_an_automatic_retire_through_the_health_pass_removes_a_clean_pushed_worktree_keeps_a_dirty_one_and_stops_with_the_kill_switch(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        self.world.v2.sessions[self.world.sessions["worker"]]["directory"] = str(self.work)
+        self.health()
+        clean, dirty = self.add_worktree("w-auto-clean"), self.add_worktree("w-auto-dirty", dirty=True)
+        for wt in (clean, dirty):
+            sb.register_worktree(self.world.state, str(wt), "worker", None, wt.name, 1)
+        sb.record_last_report(self.world.state, "worker", "done", self.world.clock.now())
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_retired(self.world.state)["worker"]["auto"], True)
+        self.assertFalse(clean.exists(), "the automatic retire reclaims a clean, pushed worktree")
+        self.assertTrue(dirty.exists())
+        self.assertEqual([Path(p).name for p in self.registered()], ["w-auto-dirty"])
+
+    def test_the_kill_switch_stops_an_automatic_retire_from_removing_a_worktree(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.world.config["worktree_reclaim"] = self.engine.config["worktree_reclaim"] = {"enabled": False}
+        self.make_repo()
+        self.worker()
+        self.world.v2.sessions[self.world.sessions["worker"]]["directory"] = str(self.work)
+        self.health()
+        clean = self.add_worktree("w-auto-off")
+        sb.register_worktree(self.world.state, str(clean), "worker", None, "w-auto-off", 1)
+        sb.record_last_report(self.world.state, "worker", "done", self.world.clock.now())
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertTrue(clean.exists())
+
+    def test_more_panes_than_the_look_cap_or_a_failing_pane_read_keeps_the_worktree(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        wt = self.add_worktree("w-cap")
+        engine = self.world.new_engine("cli")
+        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p%d" % n} for n in range(sb.WORKTREE_PANE_LOOKS + 1)]), \
+                mock.patch.object(sb.HerdrClient, "pane_get", return_value={"cwd": "/tmp"}):
+            self.assertIn("more than", sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p1"}]), \
+                mock.patch.object(sb.HerdrClient, "pane_get", side_effect=sb.HerdrError("exit", "gone")):
+            self.assertIn("herdr cannot say", sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p1"}]), \
+                mock.patch.object(sb.HerdrClient, "pane_get", return_value={"cwd": None}):
+            self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
