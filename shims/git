@@ -4,15 +4,16 @@
 Git's global credential helper is whatever the machine set (often one stored github.com login), so `git push` from an agent's shell went out as that
 login and GitHub answered 403 for a repository another account owns. The fleet's `gh` shim already picks the right GitHub account for the caller's
 repository, from its session (the `gh_users` map). This shim is put first on an agent's PATH by the `fleet-hooks` plugin's shell hook, next to `gh`, so an agent
-keeps typing plain `git push` and the credential comes from `gh auth git-credential` (the shim: which fails closed when the account lookup fails).
+keeps typing plain `git push` and the credential comes from `gh auth git-credential` (the shim: which fails closed when the account lookup fails or no account is mapped for the caller's repository).
 
-For the NETWORK verbs only (push, fetch, pull, clone, ls-remote, `remote update`) it puts, BEFORE the verb and after any global options,
+When `gh_users` is configured (and FLEET_GIT_SHIM is not `off`), for the NETWORK verbs only (push, fetch, pull, clone, ls-remote, `remote update|show|prune`) it puts, BEFORE the verb and after any global options,
     -c credential.https://github.com.helper=                          (empty: reset the helper list for this host)
     -c 'credential.https://github.com.helper=!gh auth git-credential'  (the fleet's gh)
 Everything else, and anything it does not understand, runs the real git with the arguments, standard input and exit status unchanged: this must
 never block a command. A caller that passes its own `-c credential.*` (or `--config-env=credential.*`) is left alone. No token is read, printed or
 put in an argument here: the helper does that, in git's own process. The real git is found by skipping this shim's own directory (never itself).
 """
+import json
 import os
 import sys
 
@@ -20,6 +21,20 @@ NETWORK_VERBS = {"push", "fetch", "pull", "clone", "ls-remote"}
 VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
 RESET_HELPER = "credential.https://github.com.helper="
 FLEET_HELPER = "credential.https://github.com.helper=!gh auth git-credential"
+
+
+def routing_wanted():
+    """Route only when per-repository accounts are in use (`gh_users` of the switchboard's config is not empty) and FLEET_GIT_SHIM is not `off`: a fleet with one
+    account, or none, keeps git's own credentials exactly as they were."""
+    if os.environ.get("FLEET_GIT_SHIM", "").strip().lower() == "off":
+        return False
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            users = json.load(handle).get("gh_users")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(users, dict) and bool(users)
 
 
 def real_git():
@@ -68,7 +83,7 @@ def is_network(args, verb_at):
         return True
     if verb == "remote":
         rest = [a for a in args[verb_at + 1:] if not a.startswith("-")]
-        return bool(rest) and rest[0] == "update"
+        return bool(rest) and rest[0] in ("update", "show", "prune")
     return False
 
 
@@ -76,7 +91,7 @@ def routed(args):
     """The arguments to give the real git."""
     try:
         verb_at, settings = parse(args)
-        if verb_at is None or not is_network(args, verb_at):
+        if verb_at is None or not is_network(args, verb_at) or not routing_wanted():
             return args
         if any(s.split("=", 1)[0].strip().lower().startswith("credential.") for s in settings):
             return args   # the caller chose its own credential configuration (any credential.* key opts out, for any host)

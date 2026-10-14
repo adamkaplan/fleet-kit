@@ -276,7 +276,7 @@ Close code-only work once the source delivery is accepted. Keep linked runtime
 work open until its own acceptance. Notify the orchestrator on completion or
 handoff, on the issue — the GitHub record has to survive a lost message.
 
-**Pushing.** git push works as the repository's account (fetch, pull and clone too): the fleet's `git` shim, first on your shell's PATH next to `gh`, routes the credential through the `gh` shim, which picks the account for your session's repository. Use plain `git push`: no manual -c credential route is needed, and if the account lookup fails the push fails rather than going out as another login, when the shim is first on your PATH (say so in your report and retry; do not try the stored login). It is a guardrail, not a boundary: the account's own permissions are the boundary.
+**Pushing.** git push works as the repository's account (fetch, pull and clone too): the fleet's `git` shim, first on your shell's PATH next to `gh`, routes the credential through the `gh` shim, which picks the account for your session's repository. Use plain `git push`: no manual -c credential route is needed, and if the account lookup fails, or no account is mapped for your repository in `gh_users`, the push fails with one clear line rather than going out as another login, when the shim is first on your PATH (with no `gh_users` at all, git keeps its own credentials, and `FLEET_GIT_SHIM=off` turns the routing off) (say so in your report and retry; do not try the stored login). It is a guardrail, not a boundary: the account's own permissions are the boundary.
 
 ## Evidence
 

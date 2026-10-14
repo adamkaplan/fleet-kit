@@ -131,6 +131,10 @@ class Lookup:
         return self._ident
 
 
+class NoAccountMapped(Exception):
+    """git's credential helper was asked, `gh_users` is set, and this caller has no repository or no account mapped for it: git must not authenticate as a guess."""
+
+
 class AccountLookupFailed(Exception):
     """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
 
@@ -183,7 +187,14 @@ def is_write(args):
         return True   # cannot tell: treat as a write, the safe side
 
 
-def account_env(gh, lookup=None, strict=False):
+def is_git_credential(args):
+    try:
+        return command_words(args)[:2] == ["auth", "git-credential"]
+    except Exception:
+        return False
+
+
+def account_env(gh, lookup=None, strict=False, credential=False):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
@@ -193,16 +204,24 @@ def account_env(gh, lookup=None, strict=False):
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
             return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
-        if not users or not switchboard_binary():
+        if not users:
+            return None   # no per-repository accounts are configured: nothing to bind to, whatever the caller is
+        if not switchboard_binary():
+            if credential:
+                raise NoAccountMapped("this shell (no switchboard to say which repository it is)")
             return None
         lookup = lookup or Lookup()
         repo = lookup.identity().get("repo")
         if not repo:
             if strict and lookup.failed:
                 raise AccountLookupFailed("identity")
+            if credential:
+                raise NoAccountMapped("this shell (it has no repository identity)")
             return None
         account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
         if not isinstance(account, str) or not account:
+            if credential:
+                raise NoAccountMapped("repository %s" % repo)
             return None
         clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
         got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
@@ -210,10 +229,14 @@ def account_env(gh, lookup=None, strict=False):
         if not token and strict:
             raise AccountLookupFailed("token")
         return dict(os.environ, GH_TOKEN=token) if token else None
-    except AccountLookupFailed:
+    except (AccountLookupFailed, NoAccountMapped):
         raise
     except Exception:
         return None
+
+
+def _clean_reason(text):
+    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:120]
 
 
 def my_name(lookup=None):
@@ -710,11 +733,18 @@ def main(args):
         return 10
     if verdict is not None:
         args = verdict[1]
+    credential = is_git_credential(args)
     try:
-        env = account_env(gh, lookup, strict=is_write(args))
+        env = account_env(gh, lookup, strict=is_write(args), credential=credential)
+    except NoAccountMapped as err:
+        sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+        return 1
     except AccountLookupFailed:
         try:
-            env = account_env(gh, Lookup(write=True), strict=True)   # retry the lookup ONCE with a fresh deadline
+            env = account_env(gh, Lookup(write=True), strict=True, credential=credential)   # retry the lookup ONCE with a fresh deadline
+        except NoAccountMapped as err:
+            sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+            return 1
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")

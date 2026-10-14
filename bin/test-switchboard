@@ -11875,9 +11875,15 @@ class TestGitShim(Base):
                         "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN')}, open(%r,'w'))\n"
                         "print('real git out'); sys.exit(int(os.environ.get('FAKE_GIT_EXIT','0')))\n" % (str(self.starts), str(self.log)))
         fake.chmod(0o755)
+        self.write_users({"acme/*": "acct-acme"})
+
+    def write_users(self, users):
+        config = self.home / "xdg-config" / "fleet-switchboard"
+        config.mkdir(parents=True, exist_ok=True)
+        (config / "config.json").write_text(json.dumps({"gh_users": users} if users is not None else {}))
 
     def run_git(self, *args, stdin="", env=None, path=None):
-        environ = {"PATH": path or "%s:%s:%s" % (GIT_SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home)}
+        environ = {"PATH": path or "%s:%s:%s" % (GIT_SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "xdg-config")}
         environ.update(env or {})
         for p in (self.log, self.starts):
             if p.exists():
@@ -11952,6 +11958,23 @@ class TestGitShim(Base):
         done, seen = self.run_git("status", path="%s:%s" % (GIT_SHIM.parent, broken))
         self.assertEqual((done.returncode, seen), (126, None))
         self.assertIn("git: cannot run", done.stderr)
+
+    def test_it_routes_only_when_accounts_are_mapped_and_not_switched_off(self):
+        for label, setup, env in (("no gh_users at all", lambda: self.write_users(None), {}), ("an empty map", lambda: self.write_users({}), {}),
+                                  ("switched off", lambda: self.write_users({"acme/*": "a"}), {"FLEET_GIT_SHIM": "off"}),
+                                  ("an unreadable config", lambda: (self.home / "xdg-config" / "fleet-switchboard" / "config.json").write_text("{bad"), {})):
+            with self.subTest(label):
+                setup()
+                done, seen = self.run_git("push", "origin", env=env)
+                self.assertEqual(seen["argv"], ["push", "origin"], "git keeps its own credentials")
+        self.write_users({"acme/*": "a"})
+        done, seen = self.run_git("push", "origin")
+        self.assertEqual(seen["argv"], self.routed(verb="push", rest=["origin"]))
+        for sub in ("show", "prune", "update"):
+            done, seen = self.run_git("remote", sub, "origin")
+            self.assertEqual(seen["argv"], self.routed(verb="remote", rest=[sub, "origin"]), sub)
+        done, seen = self.run_git("remote", "add", "o", "u")
+        self.assertEqual(seen["argv"], ["remote", "add", "o", "u"])
 
     def test_the_shim_reads_no_token_and_prints_nothing_of_its_own(self):
         done, seen = self.run_git("push", env={"GH_TOKEN": "tok-secret"})
@@ -18259,6 +18282,28 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "auth status is still a read")
         self.assertTrue(self.shim().is_write(["auth", "git-credential", "get"]))
         self.assertFalse(self.shim().is_write(["auth", "status"]))
+
+    def test_git_credential_for_a_repository_with_no_mapped_account_or_no_identity_is_refused_never_the_inherited_token(self):
+        users = {"acme-ops/service": "acct-ops"}
+        cred = ("auth", "git-credential", "get")
+        for label, repo, extra in (("an unmapped repository", "acme-other/thing", {}), ("no repository identity", None, {})):
+            with self.subTest(label):
+                done, seen = self.run_gh_shim(repo, users, {"acct-ops": "tok-ops"}, args=cred, **extra)
+                self.assertEqual(done.returncode, 1)
+                self.assertIn("no GitHub account is mapped for", done.stderr)
+                self.assertIn("git cannot authenticate as a guess", done.stderr)
+                self.assertIsNone(seen, "the real gh (and so the inherited token) never ran")
+                self.assertNotIn("inherited-personal-token", done.stdout + done.stderr)
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=cred, extra_env={"FLEET_SWITCHBOARD_BIN": ""})
+        self.assertEqual(done.returncode, 1, "no switchboard to name the repository")
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=cred)
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a mapped repository still works")
+        done, seen = self.run_gh_shim("acme-other/thing", None, {}, args=cred)
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "with no gh_users at all nothing is bound: unchanged")
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=("issue", "list"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "other gh commands keep the rule of #270: a read falls through")
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=("issue", "comment", "2", "--body", "x"))
+        self.assertEqual(done.returncode, 0, "an unmapped repository is not a failure for a gh write (#270)")
 
     def test_a_write_the_shim_does_not_list_or_a_flag_before_the_verb_is_still_a_write_and_unknown_is_not_a_read(self):
         shim = self.shim()
