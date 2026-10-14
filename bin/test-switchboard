@@ -10744,7 +10744,8 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "decisions": ("cmd_decisions", ("args", "runner", "now")), "comment": ("cmd_comment", ("args", "runner", "now")), "whoami": ("cmd_whoami", ("args", "runner", "now")),
         "pending": ("cmd_pending", ("args", "runner", "now")), "remind": ("cmd_remind", ("args", "runner", "now")), "intent": ("cmd_intent", ("args", "runner", "now")),
         "intents": ("cmd_intents", ("args", "runner", "now")), "import-v1": ("cmd_import_v1", ("args", "runner", "now")), "orders": ("cmd_orders", ("args", "runner", "now")),
-        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call"))}
+        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
+        "triage": ("cmd_triage", ("args", "runner", "now"))}
     OLD_ENSURE_ON_USE = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent", "bootstrap")
     OLD_DIRECT = ("status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool")
     OLD_LEDGER = ("prove", "verdict", "waive", "gates", "gates-check")
@@ -18937,6 +18938,151 @@ class TestCaptainSweepFindings(TestSweep):
         start, end = text.index("def sweep_read_repo"), text.index("class SweepFacts")
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "add-label", "POST", "PATCH", "DELETE"):
             self.assertNotIn(forbidden, text[start:end], forbidden)
+
+
+class TestTriageDigest(Base):
+    """#349: the stale digest: one per pass, a backoff, changes, parked, 'seen, leave', the cost figure. It reuses the triage
+    harness's setup without inheriting (and so re-running) its tests."""
+    DAY = 86400
+    COS, USER = TestTriage.COS, TestTriage.USER
+
+    def setUp(self):
+        Base.setUp(self)
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.prs, self.pr_calls = {}, []
+        self.engine.gh_runner = self.pr_runner
+        self.engine.config["awaiting_label"], self.engine.config["awaiting_cos_label"] = self.USER, self.COS
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"])
+        self.engine.discover(self.world.clock.now())
+        self.hub.open["acme/api"] = {}
+
+    pr_runner = TestTriage.pr_runner
+    add = TestTriage.add
+    bound = TestTriage.bound
+
+    def passes(self, days, step=1, **cfg):
+        """Run one pass every `step` days for `days` days (a first pass at day 0); return [(day, [(rule, ref)])] of the digests sent."""
+        self.engine.config["triage"].update(enabled=True, **cfg)
+        sent, real = [], sb.triage_queue_fact
+        def spy(state, due, *a, **k):
+            sent.append((day, list(due)))
+            return real(state, due, *a, **k)
+        with mock.patch.object(sb, "triage_queue_fact", spy):
+            for day in range(0, days + 1, step):
+                if day:
+                    self.world.tick(step * self.DAY)
+                self.world.tick(1)
+                sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        return sent
+
+    def refs(self, digest):
+        return sorted({ref for _, ref in digest[1]})
+
+    def test_s1_twelve_items_are_one_digest_and_an_empty_pass_sends_nothing_s8(self):
+        for n in range(100, 112):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        sent = self.passes(0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(self.refs(sent[0])), 12)
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 1)
+        self.hub.open["acme/api"] = {}
+        self.engine.triage.units.clear()
+        self.assertEqual(self.passes(0), [])                       # S8: nothing stale, nothing sent
+
+    def test_s2_an_unchanged_item_surfaces_after_1_then_3_then_7_days_then_weekly(self):
+        self.add(140, created=30, updated=20, labels=["kind"])   # past every SLA from the first pass, so no new finding appears later
+        sent = self.passes(26)
+        self.assertEqual([d for d, _ in sent], [0, 1, 4, 11, 18, 25])   # the fixed re-alarm would show 27
+
+    def test_s3_a_changed_item_surfaces_at_once_and_its_backoff_restarts(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        self.passes(1)                                             # shown on day 0 and day 1: next step is 3 days
+        self.world.tick(3600)
+        self.add(140, created=3, updated=0.01, labels=["kind"])     # a new comment: it was updated just now
+        self.engine.triage.units.clear()
+        self.assertEqual(len(self.passes(0)), 1)                   # surfaced at once
+        self.assertEqual([d for d, _ in self.passes(2)], [1])      # and the next step is 1 day, not 3 or 7
+
+    def test_s4_parked_with_a_future_date_is_skipped_a_past_date_and_an_invalid_one_surface_and_the_invalid_is_flagged_once(self):
+        now = self.world.clock.now()
+        day = lambda d: sb.iso(now + d * self.DAY)[:10]
+        self.add(150, created=5, updated=4, labels=["osuser:parked"], body="Parked until: %s" % day(30))
+        self.add(151, created=5, updated=4, labels=["osuser:parked"], body="Parked until: %s" % day(-5))
+        self.add(152, created=5, updated=4, labels=["osuser:parked"], body="parked, see later")
+        sent = self.passes(1)
+        self.assertEqual(self.refs(sent[0]), ["acme/api#151", "acme/api#152"])   # the future park never surfaces; a bad date is not a park
+        facts = [t for k, (t, _) in self.engine.triage.facts.items() if "summary" not in k]
+        flags = [t for t in facts if "without a valid" in t and "api#152" in t]
+        self.assertEqual(len(flags), 1)                            # flagged once
+        later = [self.refs(d) for d in sent[1:]]
+        self.assertNotIn(["acme/api#150"], later)
+        audit = [e for e in self.world.audit() if e["event"] == "triage.parked_invalid"]
+        self.assertEqual([e["detail"]["ref"] for e in audit], ["acme/api#152"])
+
+    def test_s11_a_bad_parked_date_is_listed_in_the_first_digest_flagged_once_and_a_muted_item_stays_hidden(self):
+        self.add(170, created=5, updated=4, labels=["osuser:parked"], body="Parked until: someday")
+        self.add(171, created=3, updated=0.2, labels=["kind"])
+        sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "acme/api#171", self.world.clock.now())
+        sent = self.passes(2)
+        self.assertEqual(self.refs(sent[0]), ["acme/api#170"])                 # listed at once, the muted item never
+        self.assertNotIn("acme/api#171", [r for d in sent for r in self.refs(d)])
+        flags = [t for k, (t, _) in self.engine.triage.facts.items() if "without a valid" in t]
+        self.assertEqual(len(flags), 1)                                         # 1 flag line in 3 passes
+
+    def test_s10_nothing_on_day_two_and_the_item_on_day_four(self):
+        self.add(140, created=30, updated=20, labels=["kind"])
+        sent = self.passes(4)
+        self.assertEqual([d for d, _ in sent], [0, 1, 4])                       # day 2 (and 3) are quiet
+
+    def test_s12_the_cost_figure_counts_characters_and_estimates_tokens_at_a_quarter(self):
+        now = self.world.clock.now()
+        for size in (200, 400, 600):
+            sb.triage_digest.cost_record(str(self.world.state), now, "x" * size)
+        cost = sb.triage_digest.cost_read(str(self.world.state))
+        self.assertEqual(cost["days"][sb.triage_digest.day_of(now)], {"messages": 3, "chars": 1200})
+        line = sb.triage_digest.cost_lines(cost, sb.triage_digest.day_of(now))[-1]
+        self.assertIn("1200 chars, ~300 tokens", line)
+
+    def test_s5_seen_leave_mutes_until_a_change(self):
+        self.add(160, created=3, updated=0.2, labels=["kind"])
+        self.assertEqual(sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "acme/api#160", self.world.clock.now())[0], 0)
+        self.assertEqual(self.passes(14, step=1), [])               # 0 appearances over 14 days
+        self.world.tick(60)
+        self.add(160, created=3, updated=0.0001, labels=["kind"])    # a change after the mute
+        self.engine.triage.units.clear()
+        self.assertEqual(len(self.passes(0)), 1)                   # 1 appearance after the change
+        self.assertEqual(sb.triage_digest.mute_command(str(self.world.state), "muted", None, 0)[1].count("api#160"), 1)
+        self.assertEqual(sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "not a ref", 0)[0], 2)
+
+    def test_s6_status_shows_characters_and_tokens_for_seven_days_and_not_recorded_before_the_first(self):
+        now = self.world.clock.now()
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        self.passes(0)
+        seeded = {"v": 1, "since": sb.triage_digest.day_of(now - 6 * self.DAY),
+                  "days": {sb.triage_digest.day_of(now - 3 * self.DAY): {"messages": 1, "chars": 400}}}
+        (self.world.state / sb.triage_digest.COST_FILE).write_text(json.dumps(seeded))
+        lines = "\n".join(sb.triage_status_lines(sb.triage_summary(self.world.state)))
+        cost = [l for l in lines.splitlines() if " cost " in l]
+        self.assertEqual(len(cost), 7)
+        self.assertTrue(any("400 chars, ~100 tokens (chars/4)" in l for l in cost))
+        self.assertTrue(all(("chars" in l) or ("not recorded" in l) for l in cost))
+        self.assertEqual(sb.triage_status_lines({"counts": {}, "cost": None})[-1].strip(), "triage     cost per day: not recorded (nothing delivered yet)")
+
+    def test_s7_a_corrupt_memory_file_surfaces_everything_once_and_is_rebuilt(self):
+        for n in (140, 141, 142):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        (self.world.state / sb.triage_digest.SEEN_FILE).write_text("{not json")
+        sent = self.passes(0)
+        self.assertEqual(len(self.refs(sent[0])), 3)
+        self.assertEqual(len(json.loads((self.world.state / sb.triage_digest.SEEN_FILE).read_text())["items"]), 3)
+
+    def test_backoff_false_restores_the_fixed_realarm(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        self.assertEqual([d for d, _ in self.passes(3, backoff=False)], [0, 1, 2, 3])   # the fixed 24-hour re-alarm is back
 
 
 class TestCaptainTriage(TestTriage):
