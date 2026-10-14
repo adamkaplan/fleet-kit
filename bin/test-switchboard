@@ -18475,6 +18475,73 @@ class TestTriage(Base):
                          ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
         self.assertFalse(row["detail"]["applied"])
 
+    def ledger(self, *rows):
+        """Write a real hash-chained plan ledger into the state dir (proof / verdict rows for acme/api#200)."""
+        for kind, scenario, result in rows:
+            sb.plan_ledger.append_entry(self.world.state, {"kind": kind, "pr": "acme/api#200", "scenario": scenario, "result": result,
+                                                           "evaluator": "tester", "plan_hash": "sha256:x", "head": "a" * 40, "by": "someone"}, self.world.clock.now())
+
+    def test_t12_s1_an_open_sub_issue_suppresses_it(self):
+        self.charter()
+        self.add(300, created=60, labels=["kind"], assignees=["bot"])
+        self.hub.open["acme/api"][300]["sub_issues_summary"] = {"total": 2, "completed": 1}
+        self.merged_pr(200, "Part of #300.")
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+        self.assertEqual(self.only("T1"), [])                               # still not reported as unowned: its PR merged
+
+    def test_t12_s2_its_own_text_saying_work_is_left_suppresses_it_and_quotes_do_not(self):
+        self.charter()
+        self.add(301, created=60, labels=["kind"], assignees=["bot"], body="Done when:\n- [x] code\n- [ ] the three day live proof")
+        self.add(302, created=60, labels=["kind"], assignees=["bot"], body="The cost figure: pending live proof over three days.")
+        self.add(303, created=60, labels=["kind"], assignees=["bot"], body="Notes\n> - [ ] quoted, not ours\n```\n- [ ] in code\n```")
+        self.merged_pr(200, "Part of #301. Part of #302. Part of #303.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#303"])               # only the quoted and fenced one: nothing is really left
+
+    def test_t12_s3_a_proof_with_no_passing_verdict_in_the_ledger_suppresses_it_until_the_verdict(self):
+        self.charter()
+        self.add(304, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(200, "Part of #304.")
+        self.ledger(("proof", "S9", "pass"))
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), [])                              # proved, not judged
+        self.ledger(("verdict", "S9", "pass"))
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#304"])               # judged: done
+
+    def test_t12_s4_all_merged_and_nothing_pending_fires_with_the_usual_evidence(self):
+        self.charter()
+        self.add(305, created=60, labels=["kind"], assignees=["bot"], body="Done when:\n- [x] everything")
+        self.merged_pr(200, "Part of #305.")
+        self.ledger(("proof", "S1", "pass"), ("verdict", "S1", "pass"))
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#305"])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T12"][0]
+        self.assertEqual((row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]), (200, "https://github.com/acme/api/pull/200"))
+
+    def test_t12_s5_a_tampered_ledger_is_unknown_and_gives_no_finding(self):
+        self.charter()
+        self.add(306, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(200, "Part of #306.")
+        self.ledger(("proof", "S1", "pass"), ("verdict", "S1", "pass"))
+        path = self.world.state / sb.plan_ledger.LEDGER_FILE
+        path.write_text(path.read_text().replace('"pass"', '"fail"', 1))   # an edit breaks the chain
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+
+    def test_t12_s6_no_extra_github_read_is_made_for_the_pending_check(self):
+        self.charter()
+        self.add(307, created=60, labels=["kind"], assignees=["bot"], body="- [ ] left")
+        self.merged_pr(200, "Part of #307.")
+        self.go(passes=1)
+        before = len(self.hub.calls)
+        self.engine.triage.confirmed.clear()
+        self.go(passes=1)
+        reads = [c for c in self.hub.calls[before:] if "/issues/307" in c or "sub_issues" in c or "/comments" in c and "since" not in c]
+        self.assertEqual(reads, [])
+
     def test_t12_never_fires_for_a_charter_or_an_ask_named_by_part_of_but_does_for_a_work_item(self):
         self.charter()                                                     # #1 is the charter, #2 an ask under it
         self.add(3, created=20, updated=0.1, parent=2, labels=["kind"], body="Next: go")   # a work item under the ask

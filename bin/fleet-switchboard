@@ -10899,6 +10899,7 @@ def triage_norm(issue):
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
             "owner_body": triage_names_owner(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
+            "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
                                    "body": body})}
 
@@ -10912,6 +10913,23 @@ def triage_comment_facts(records):
         if at is not None:
             found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
+
+
+def triage_pending_proofs(engine, links, items, repo):
+    """#410: the open issues of `links` whose linked merged PR still has a proof the ledger has not seen pass. The ledger is one local file, read only
+    when a T12 candidate exists; an unreadable or tampered one makes every candidate unknown (suppressed this pass), never a finding."""
+    candidates = {n: l for n, l in links.items() if n in items}
+    if not candidates:
+        return set()
+    if engine.state_dir is None:
+        return set()   # no state directory: no ledger exists
+    try:
+        entries, problem = plan_ledger.read_ledger(engine.state_dir)
+    except Exception:
+        return set(candidates)
+    if problem:
+        return set(candidates)
+    return load_triage_plan_open().pending_issues(candidates, entries, repo)
 
 
 def triage_context(engine, repo, items, discovery):
@@ -10961,7 +10979,7 @@ def triage_charter_descendants(items, charters):
     return below, unresolved
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None):
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -10998,8 +11016,9 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
             found.pop("T1", None)
             found.pop("T11", None)
-            found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
-            ours = ours or link["by"] in ours_logins
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ())):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+                found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
+                ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
         # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
@@ -11095,6 +11114,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                     by_number.setdefault(n, []).append(c)
         merged_unit = state.units.get((repo, "merged"))   # #384: not read yet (or no unit): no T12, never a guess
         links = load_triage_plan_open().merged_links(merged_unit["data"], repo) if merged_unit is not None else {}
+        pending = triage_pending_proofs(engine, links, items, repo)
         sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
         if comments_unit is None:
             unchecked.setdefault(repo, []).append("comments")
@@ -11103,7 +11123,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip, merged=links)
+                                       captain_skip=captain_skip, merged=links, pending=pending)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
