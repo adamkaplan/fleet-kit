@@ -41808,16 +41808,23 @@ class TestCpuGuard(Base):
         module = self.home / "heavy_slots.py"
         with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(self.home / "absent.py")):
             self.assertIsNone(self.cg.slots_text({}, self.world.state), "no heavy module yet: no slots text")
-        for label, body, want in (("a good module", "def slots(config):\n    return 3\ndef holders(state_dir):\n    return ['a', 'b']\n", "heavy slots 2/3"),
-                                  ("a raising module", "def slots(config):\n    raise RuntimeError('x')\ndef holders(state_dir):\n    return []\n", None),
-                                  ("a module with bad types", "def slots(config):\n    return 'three'\ndef holders(state_dir):\n    return []\n", None),
-                                  ("a module that does not parse", "def slots(:\n", None)):
+        good = ("def settings(raw):\n    return (raw or {}).get('slots', 3)\n"
+                "def holders(state_dir, maximum):\n    return [{'slot': 1, 'name': 'coder-live', 'pid': 7, 'command': 'make test', 'since': 1000.0}, "
+                "{'slot': 2, 'name': 'coder\\x1b[2J', 'pid': 8, 'command': 'npm', 'since': 'soon'}]\n")
+        for label, body, want in (("a good module", good, "heavy slots 2/3 (coder-live make test 6m, coder??2J npm)"),
+                                  ("no holders", "def settings(raw):\n    return 3\ndef holders(state_dir, maximum):\n    return []\n", "heavy slots 0/3"),
+                                  ("a raising module", "def settings(raw):\n    raise RuntimeError('x')\ndef holders(state_dir, maximum):\n    return []\n", None),
+                                  ("bad types", "def settings(raw):\n    return 'three'\ndef holders(state_dir, maximum):\n    return []\n", None),
+                                  ("a module that does not parse", "def settings(:\n", None)):
             with self.subTest(label):
                 module.write_text(body)
                 with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
-                    text = self.cg.slots_text({}, self.world.state)
+                    text = self.cg.slots_text({}, self.world.state, now=1000.0 + 360)
                 self.assertEqual(text, want)
                 self.assertEqual(self.cg.status_line(cfg, read, text), plain + ("; " + want if want else ""))
+        module.write_text(good)
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertIn("heavy slots 2/5", self.cg.slots_text({"heavy": {"slots": 5}}, self.world.state, now=1500.0), "the module's own settings read the config's heavy section")
 
     def test_a_one_minute_spike_never_wakes_anyone_only_the_five_minute_average_does(self):
         self.load[0] = 10.0        # the five-minute average is fine
@@ -41900,7 +41907,7 @@ class TestCpuGuard(Base):
         (fact,) = self.facts()
         self.assertNotIn("top:", fact.summary)
         module = self.home / "heavy_slots.py"
-        module.write_text("def slots(config):\n    return 1000\ndef holders(state_dir):\n    return range(10 ** 9)\n")
+        module.write_text("def settings(raw):\n    return 1000\ndef holders(state_dir, maximum):\n    return range(10 ** 9)\n")
         with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
             self.assertEqual(self.cg.slots_text({}, self.world.state), "heavy slots 1001/1000", "the count is cut at one past the cap, never walked")
         module.write_text("import sys\nsys.exit(3)\n")

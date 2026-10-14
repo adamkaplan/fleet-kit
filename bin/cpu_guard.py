@@ -63,22 +63,43 @@ def reading():
     return load1, load5, max(cores, 1)
 
 
-def slots_text(config, state_dir):
-    """`heavy slots 2/3` from the optional `heavy_slots` module (bin/heavy_slots.py: `slots(config)` the number of slots, `holders(state_dir)` who holds
-    them), or None: no such module yet, or any trouble with it, adds nothing to the line."""
+def _holder_text(row, now):
+    """`name command 4m` for one holder, cleaned and short; None for a row that is not usable."""
+    if not isinstance(row, dict):
+        return None
+    clean = lambda v, n: re.sub(r"[^A-Za-z0-9_.+ -]", "?", str(v))[:n].strip()
+    name, command, since = clean(row.get("name", ""), 24), clean(row.get("command", ""), 24), row.get("since")
+    age = ""
+    if _number(since) and since > 0:
+        minutes = max(0, int((now - since) // 60))
+        age = " %dm" % minutes if minutes < 120 else " %dh" % (minutes // 60)
+    text = (name + " " + command).strip() + age
+    return text or None
+
+
+def slots_text(config, state_dir, now=None):
+    """`heavy slots 2/3 (coder-live make 4m, ...)` from the optional `heavy_slots` module of the `heavy` command (bin/heavy_slots.py, loaded by path):
+    `settings(config.get("heavy"))` is the number of slots and `holders(state_dir, max)` the rows `{slot, name, pid, command, since}` of the slots whose lock is
+    held NOW (the kernel's flock is the truth: no file to lie after a kill; no process is started). A missing module, or any trouble with it, adds nothing."""
     try:
         import importlib.util
+        import itertools
+        import time
         path = HEAVY_SLOTS_PATH
         if not os.path.isfile(path):
             return None
         spec = importlib.util.spec_from_file_location("heavy_slots", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        import itertools
-        total, held = module.slots(config), len(list(itertools.islice(module.holders(state_dir), 1001)))   # a runaway holders list is cut
+        total = module.settings((config or {}).get("heavy"))
+        if isinstance(total, dict):   # a settings dict carries the number as "slots" or "max"
+            total = total.get("slots", total.get("max"))
         if isinstance(total, bool) or not isinstance(total, int) or not 1 <= total <= 1000:
             return None
-        return "heavy slots %d/%d" % (held, total)
+        rows = list(itertools.islice(module.holders(state_dir, total), 1001))   # a runaway list is cut
+        stamp = time.time() if now is None else now
+        shown = [t for t in (_holder_text(r, stamp) for r in rows[:3]) if t]
+        return "heavy slots %d/%d%s" % (len(rows), total, " (%s%s)" % (", ".join(shown), ", ..." if len(rows) > 3 else "") if shown else "")
     except BaseException:   # a module that exits or raises must not take `status` or the daemon's pass with it
         return None
 
