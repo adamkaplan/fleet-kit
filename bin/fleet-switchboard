@@ -2294,6 +2294,8 @@ def _docker_problem(name):
         while True:
             at = os.stat(here)
             mode = at.st_mode
+            if at.st_uid not in (0, os.getuid()):
+                return None, "sits in a directory (%s) that others can change (another user owns it): not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
             if not mode & 0o1000:   # a sticky directory (/tmp) lets nobody replace another's file
                 # the file's own directory must be closed to group and other; an ancestor only to OTHER, or to a group when it is not root's (a root-owned
                 # group-writable /Applications or /usr/local, where a standard Docker install lives, is the operating system's own)
