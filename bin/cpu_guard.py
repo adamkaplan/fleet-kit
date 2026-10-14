@@ -6,6 +6,7 @@ two thirds of the guard (the default guard of 3 re-arms below 2), and it is kept
 guard ever starts is ONE bounded `ps` when an episode begins, to name the top categories of what is running."""
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -52,15 +53,39 @@ def settings(raw):
     return merged
 
 
+class Reading:
+    """What the system said: `load1`, `load5` (finite and not negative, or None), `cores` (a positive whole number, or None) and `problem` (None, or why
+    the load could not be read). The ratio is known only when both the load and the cores are."""
+
+    def __init__(self, load1=None, load5=None, cores=None, problem=None):
+        self.load1, self.load5, self.cores, self.problem = load1, load5, cores, problem
+
+    @property
+    def ratio_known(self):
+        return self.problem is None and self.load5 is not None and self.cores is not None
+
+
+def _good_load(value):
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def reading():
-    """(load over one minute, load over five minutes, cores), or None when the system will not say. A system call each: no process."""
+    """A Reading: one `os.getloadavg()` and one `os.cpu_count()`, system calls with no process. A load that cannot be read, or is not a finite number of at
+    least 0, is a problem (said, never guessed); a core count that is missing, 0 or negative leaves `cores` None (the ratio is then UNKNOWN, never taken as one core)."""
     try:
-        loads = os.getloadavg()
-        load1, load5 = float(loads[0]), float(loads[1])   # looked up at the call, so a test can replace it
-        cores = int(os.cpu_count() or 1)
-    except (OSError, AttributeError, ValueError, TypeError, IndexError):
-        return None
-    return load1, load5, max(cores, 1)
+        loads = os.getloadavg()   # looked up at the call, so a test can replace it
+        load1, load5 = _good_load(loads[0]), _good_load(loads[1])
+    except (OSError, AttributeError, ValueError, TypeError, IndexError) as err:
+        return Reading(problem="%s: %s" % (type(err).__name__, err) if str(err) else type(err).__name__)
+    if load1 is None or load5 is None:
+        return Reading(problem="the load average is not a finite number of at least 0")
+    try:
+        cores = os.cpu_count()
+        cores = int(cores) if cores is not None and int(cores) > 0 else None
+    except (OSError, ValueError, TypeError):
+        cores = None
+    return Reading(load1, load5, cores)
 
 
 def _holder_text(row, now):
@@ -105,14 +130,17 @@ def slots_text(config, state_dir, now=None):
 
 
 def status_line(cfg, read, slots=None):
-    """`load 86 on 14 cores (6.1x) [HIGH]`; None when the load could not be read."""
-    if read is None:
-        return None
-    load, _, cores = read
-    ratio = load / cores
-    line = "load %d on %d cores (%.1fx)" % (round(load), cores, ratio)   # the DISPLAYED load is the one-minute average; the alarm uses the five-minute one
-    if cfg is not None and ratio > cfg["high_ratio"]:
-        line += " [HIGH]"
+    """`load 86 on 14 cores (6.1x) [HIGH]`; `load 86, cores unknown` when the core count is not known (no ratio, no marker); `unreadable: <reason>` when the
+    load is not. The DISPLAYED load is the one-minute average; the alarm uses the five-minute one."""
+    if read.problem is not None:
+        return "unreadable: %s" % re.sub(r"[^A-Za-z0-9_.:, -]", "?", read.problem)[:80]
+    if read.cores is None:
+        line = "load %d, cores unknown" % round(read.load1)
+    else:
+        ratio = read.load1 / read.cores
+        line = "load %d on %d cores (%.1fx)" % (round(read.load1), read.cores, ratio)
+        if cfg is not None and ratio > cfg["high_ratio"]:
+            line += " [HIGH]"
     if slots:
         line += "; " + slots
     return line

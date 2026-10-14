@@ -41914,6 +41914,36 @@ class TestCpuGuard(Base):
         with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
             self.assertIsNone(self.cg.slots_text({}, self.world.state), "a module that exits takes nobody down")
 
+    def test_bad_inputs_are_said_and_never_guessed_a_missing_core_count_is_not_one_core(self):
+        cfg = self.cg.settings(None)
+        for label, cores, want in (("no core count", None, "load 20, cores unknown"), ("zero cores", 0, "load 20, cores unknown"), ("negative cores", -3, "load 20, cores unknown"),
+                                   ("a core count that is not a number", "many", "load 20, cores unknown")):
+            with self.subTest(label):
+                self.cores, self.load[0] = cores, 20.0
+                self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), want, "no ratio and no marker: never one core")
+                self.assertEqual(self.run_for(10), [], "a normal load on an unknown core count wakes nobody")
+                self.assertEqual(self.audits("cpu.high"), [])
+        self.cores = 14
+        for label, value, reason in (("nan", float("nan"), "not a finite number"), ("inf", float("inf"), "not a finite number"), ("negative", -1.0, "not a finite number")):
+            with self.subTest(label):
+                self.load[0] = value
+                line = self.cg.status_line(cfg, self.cg.reading())
+                self.assertEqual(line, "unreadable: the load average is not a finite number of at least 0")
+                self.assertEqual(self.run_for(10), [], "a bad load wakes nobody and raises nothing")
+        self.load[0] = 86.0
+        with mock.patch.object(os, "getloadavg", side_effect=OSError("no load average")):
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "unreadable: OSError: no load average")
+        with mock.patch.object(os, "getloadavg", return_value=()):
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "unreadable: IndexError: tuple index out of range")
+        self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "load 86 on 14 cores (6.1x) [HIGH]", "and a good reading is as before")
+
+    def test_status_says_when_the_load_or_the_cores_are_unknown_instead_of_leaving_the_line_out(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.load[0] = float("nan")
+        self.assertIn("cpu        unreadable: the load average is not a finite number", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+        self.load[0], self.cores = 20.0, None
+        self.assertIn("cpu        load 20, cores unknown", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
     def test_s7_the_config_key_is_validated(self):
         for ok in (None, False, {}, {"high_ratio": 4.5, "minutes": 10}, {"minutes": 1}):
             sb.validate_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, cpu_guard=ok), "t")
@@ -41929,7 +41959,7 @@ class TestCpuGuard(Base):
     def test_an_unreadable_load_says_nothing_and_a_failing_ps_still_wakes(self):
         with mock.patch.object(os, "getloadavg", side_effect=OSError("no")):
             self.assertEqual(self.run_for(7), [])
-            self.assertIsNone(self.cg.status_line(self.cg.settings(None), self.cg.reading()))
+            self.assertTrue(self.cg.status_line(self.cg.settings(None), self.cg.reading()).startswith("unreadable: OSError"))
         self.settle()
         self.engine.cpu_ps_runner = lambda argv, **kw: (_ for _ in ()).throw(OSError("no ps"))
         self.run_for(6)

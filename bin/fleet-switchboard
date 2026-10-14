@@ -2254,14 +2254,14 @@ class CpuFacts:
         if cfg is None:
             return []
         read = cg.reading()
-        if read is None:   # FAIL OPEN: a guard that cannot read the load tells nobody
+        if not read.ratio_known:   # FAIL OPEN: a load or a core count that cannot be read tells nobody (the status line says so), and never counts as one core
             return []
         discovery = getattr(engine, "discovery", None)
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
         if self.tracker is None:
             self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
             self.saved_episode = self.tracker.episode
-        load1, load5, cores = read
+        load1, load5, cores = read.load1, read.load5, read.cores
         ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
         event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
         if event == "begin":
