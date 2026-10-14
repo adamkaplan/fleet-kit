@@ -1,5 +1,5 @@
 # Cloud worker image.
-# for nested use under the Sysbox runtime. Runs as a non-root user. No secret is
+# Nested Docker needs the Sysbox runtime. Runs as a non-root user. No secret is
 # built in: the launcher supplies every credential at start (see cloud/README.md).
 FROM node:22-bookworm-slim AS node
 
