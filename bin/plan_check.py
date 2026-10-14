@@ -146,8 +146,8 @@ def _strip_comment(value):
         elif char in "'\"":
             if index == 0 or value[index - 1] in " \t":
                 quote = char
-        elif char == "#" and (index == 0 or value[index - 1] in " \t"):
-            return value[:index].rstrip()
+        elif char == "#" and (index == 0 or value[index - 1] in " \t") and (index + 1 == len(value) or value[index + 1] in " \t"):
+            return value[:index].rstrip()   # a comment is `#` then a space (or the end): `#348` and `issue #12` are text (#364)
     return value.rstrip()
 
 
@@ -385,6 +385,30 @@ def declared_clauses(text):
 
 def _words(text):
     return re.findall(r"[a-z0-9]+", re.sub(r"\([0-9]+\)", " ", str(text).lower()))
+
+
+def first_difference(declared, clauses, done_when):
+    """One sentence naming the FIRST declared clause that does not match the ask, with what was declared for it (#364). `clauses` is the ask's
+    numbered clause list (when it has more than one); otherwise the declared clauses must continue the ask's own words in order."""
+    if len(clauses) > 1:
+        for number, ask in enumerate(clauses, 1):
+            if number > len(declared):
+                return "DW-%d is missing: the ask has %r" % (number, " ".join(str(ask).split())[:100])
+            if _words(declared[number - 1]) != _words(ask):
+                return "DW-%d differs: declared %r, the ask has %r" % (number, declared[number - 1][:100], " ".join(str(ask).split())[:100])
+        if len(declared) > len(clauses):
+            return "DW-%d is declared but the ask has only %d clauses: %r" % (len(clauses) + 1, len(clauses), declared[len(clauses)][:100])
+        return None
+    ask, position = _words(done_when), 0
+    for number, text in enumerate(declared, 1):
+        words = _words(text)
+        if ask[position:position + len(words)] != words:
+            return "DW-%d does not continue the ask: declared %r, the ask has %r at that point" % (
+                number, text[:100], " ".join(ask[position:position + len(words)])[:100])
+        position += len(words)
+    if position != len(ask):
+        return "the declared clauses stop early: the ask goes on with %r" % " ".join(ask[position:])[:100]
+    return None
 
 
 def verify_declared(declared, done_when):
@@ -800,7 +824,7 @@ def check(text, done_when, plan_done_when=None):
             if len(declared) != len(clauses) or not verify_declared(declared, done_when):
                 extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the "
                               "ask: the ask has %d numbered clauses and the plan declares %d (a plan can never merge or drop "
-                              "clauses). The ask has: %r" % (len(clauses), len(declared), _normal(done_when)[:160])})
+                              "clauses). First difference: %s. The ask has: %r" % (len(clauses), len(declared), (first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
         elif not _words(done_when):
             extra.append({"id": "-", "code": "no-done-when", "message": "the plan declares clauses but the ask has no "
                           "Done-when to check them against"})
@@ -809,7 +833,7 @@ def check(text, done_when, plan_done_when=None):
         else:
             extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the ask: "
                           "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
-                          "numbers are ignored). The ask has: %r" % _normal(done_when)[:160]})
+                          "numbers are ignored). First difference: %s. The ask has: %r" % ((first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
     defects, warnings = validate(scenarios, clauses, text)
     defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
     if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
@@ -830,7 +854,7 @@ def check(text, done_when, plan_done_when=None):
 GROUP_LINES = 5   # defect lines shown per kind in the text output; --json has them all
 
 
-def render(result, source):
+def render(result, source, explaining=False):
     """The lines `plan check` prints: defects grouped by kind with counts, at most GROUP_LINES lines each."""
     lines = ["plan check: %s" % result["result"].upper(), "source: %s" % source,
              "scenarios: %d; Done-when clauses: %d" % (result["scenarios"], len(result["clauses"])),
@@ -843,8 +867,83 @@ def render(result, source):
         lines.append("defects: %s" % ", ".join("%s x%d" % (code, len(items)) for code, items in groups.items()))
     for code, items in groups.items():
         lines.append("%s x%d" % (code, len(items)))
-        lines.extend("  DEFECT %s: %s" % (d["id"], d["message"]) for d in items[:GROUP_LINES])
+        for d in items[:GROUP_LINES]:
+            lines.append("  DEFECT %s: %s" % (d["id"], d["message"]))
+            lines.extend(_why(code, "    ") if explaining else [])
         if len(items) > GROUP_LINES:
             lines.append("  ... and %d more (use --json for all)" % (len(items) - GROUP_LINES))
-    lines.extend("WARN: %s" % w["message"] for w in result["warnings"])
+    for w in result["warnings"]:
+        lines.append("WARN: %s" % w["message"])
+        lines.extend(_why(w["code"], "  ") if explaining else [])
+    return lines
+
+
+def _why(code, indent):
+    found = explain(code)
+    return [] if found is None else ["%sWHY %s: %s" % (indent, code, found[0]), "%sFIX %s" % (indent, found[1])]
+
+
+# ---------------------------------------------------------------- `plan check --explain` and `plan template` (#353)
+
+# Every defect and warning code the checker produces: (the rule, how to fix it). `missing-<key>` is one code per required key.
+EXPLAIN = {
+    "unknown-key": ("a scenario may only use the keys " + ", ".join(KNOWN), "delete the key, or fix its spelling"),
+    "missing-id": ("every scenario needs an `id`", "add `id: S<n>` (behaviour) or `U<n>` (unchanged behaviour)"),
+    "bad-id": ("an id is S<number> or U<number>, optionally followed by one lowercase letter", "rename it, for example `S3` or `U1`"),
+    "duplicate-id": ("ids are unique so a verdict binds to one scenario", "renumber one of them"),
+    "bad-covers": ("`covers` names exactly one clause (DW-<n>) or constraint (PC-<n>)", "write `covers: DW-1`"),
+    "covers-unknown-clause": ("a scenario cannot cover a Done-when clause the ask does not have", "use a DW number the ask has; if the ask is one sentence, declare its clauses in a `clauses:` block"),
+    "short-text": ("`text` must say the scenario: Given, when, then", "write the situation and the observable result in a sentence"),
+    "bad-proof": ("`proof` is one of " + "|".join(PROOFS), "pick the kind of proof"),
+    "bad-evaluator": ("`evaluator` is one of " + "|".join(EVALUATORS), "pick who records the proof"),
+    "evaluator-mismatch": ("the evaluator must be able to record the proof: test needs ci, screenshot needs reviewer or owner, live and measure need tester or owner", "change the evaluator or the proof"),
+    "bad-claim": ("`claim` is `pr` (default) or `epic`", "remove it or use one of the two"),
+    "vague-pass": ("`pass` must be an observable a stranger can decide: a status or exit code, a count or threshold, a quoted value, or a named comparison", "for example `exit status is 0`, `exactly 3 items`, `shows \"Ready\"`"),
+    "no-discriminator": ("`discriminates` names the specific wrong build that would FAIL this scenario", "write `a build that <does X> <observable wrong outcome>`"),
+    "uncovered-clause": ("every Done-when clause needs at least one S scenario covering it", "add an S scenario with `covers: DW-<n>` for that clause"),
+    "no-done-when": ("coverage is checked against the ask's Done-when, and none was found", "pass `--ask <owner/repo#N>` or `--done-when TEXT`"),
+    "no-unchanged-scenario": ("a plan states what must NOT change, with a U scenario", "add a `U1` scenario, or write `unchanged: none because <reason>` (a real reason)"),
+    "covers-unknown-constraint": ("a scenario may only cover a constraint the plan lists", "list `PC-<n>: ...` in the plan, or cover a different one"),
+    "uncovered-constraint": ("every listed constraint needs a scenario that covers it", "add a scenario with `covers: PC-<n>`"),
+    "missing-size": ("a plan-format 2 plan states its size in agent time", "add `size: S|M|L|XL` with what makes it that size"),
+    "bad-size": ("a size starts with S, M, L or XL", "write for example `size: S (one file, tests)`"),
+    "size-in-days": ("size is a T-shirt in AGENT time, never days of human work", "drop the days; say what makes it that size"),
+    "declared-clauses-mismatch": ("a `clauses:` block must reproduce the ask's Done-when, never merge or drop clauses", "copy the clauses from the ask, in order; the message shows the first one that differs"),
+    "done-when-differs": ("a plan that states its own Done-when must state the ask's", "copy the Done-when from the ask"),
+    "evaluator-alias": ("`adam` is an old spelling of `owner`", "write `owner`"),
+    "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),
+    "many-scenarios": ("a plan with many scenarios is hard to review", "split it into slices"),
+    "no-constraint-list": ("PC-n scenarios cannot be checked without a constraints list", "add `PC-<n>: ...` lines to the plan"),
+    "one-clause-many-parts": ("a one-sentence Done-when with many parts counts as one clause", "declare the clauses in a `clauses:` block"),
+}
+
+
+def explain(code):
+    """(rule, fix) for a defect or warning `code`, or None."""
+    if code.startswith("missing-") and code[len("missing-"):] in REQUIRED:
+        key = code[len("missing-"):]
+        return ("`%s` is required in every scenario" % key, "add `%s:` with a value" % key)
+    return EXPLAIN.get(code)
+
+
+TEMPLATE_CLAUSE_MAX = 300   # characters of one clause printed by `plan template`
+
+
+def template(clauses, source=None):
+    """The lines of a prefilled plan for an ask with `clauses` (the Done-when clause texts): format, size, the clauses and one scenario stub per
+    clause plus an unchanged one. Placeholders are written `<...>`; replace each before `plan check`."""
+    clauses = [" ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(c)).split())[:TEMPLATE_CLAUSE_MAX] for c in clauses]   # the ask is untrusted text printed to a terminal (R-SEC-4)
+    lines = ["## Plan (scenarios)", "", "plan-format: 2", "size: <S|M|L|XL> (<what makes it that size>)", "",
+             "Done-when (copied from %s):" % (source or "the ask")]
+    lines += ["(%d) %s" % (n, c) for n, c in enumerate(clauses, 1)]
+    lines += ["", "PC-1: <what must hold, and why>", "Out of scope: <what this does not do>", "Areas touched: <files and areas; any held-PR area?>",
+              "Risks and rollback: <what could go wrong; how it is undone>", "Tier S light, claim pr.", "", "```yaml", "scenarios:"]
+    for number, clause in enumerate(clauses, 1):
+        lines += ["  - id: S%d" % number, "    covers: DW-%d" % number,
+                  "    text: <Given ..., when ..., then ...: %s>" % clause[:60],
+                  "    proof: test", "    pass: <an observable: exit status is 0, exactly 3 items, shows \"Ready\">",
+                  "    discriminates: <a build that does X and so shows Y>", "    evaluator: ci"]
+    lines += ["  - id: U1", "    covers: PC-1", "    text: <Given ..., when ..., then behaviour that must not change is unchanged>",
+              "    proof: test", "    pass: <an observable: byte-identical to the stored fixture>",
+              "    discriminates: <a build that changes X makes Y differ>", "    evaluator: ci", "```"]
     return lines
