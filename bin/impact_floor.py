@@ -157,18 +157,21 @@ def decide(floor_hit, rated, unknown=None):
 
 
 def validate_hold_config(raw):
-    """Raise ValueError naming the key when `impact_hold` is not {enabled?, dry_run?, repos: {owner/repo: {enabled}}}.
+    """Raise ValueError naming the key when `impact_hold` is not {enabled?, dry_run?, calls_per_pass?, repos: {owner/repo: {enabled}}}.
     The hold is OFF unless `enabled` is true (the one line a person flips)."""
     if raw is None:
         return
     if not isinstance(raw, dict):
         raise ValueError("'impact_hold' must be an object")
-    unknown = sorted(set(raw) - {"enabled", "dry_run", "repos"})
+    unknown = sorted(set(raw) - {"enabled", "dry_run", "calls_per_pass", "repos"})
     if unknown:
         raise ValueError("'impact_hold' has key(s) this tool does not read: %s" % ", ".join(unknown))
     for key in ("enabled", "dry_run"):
         if key in raw and not isinstance(raw[key], bool):
             raise ValueError("'impact_hold.%s' must be true or false" % key)
+    calls = raw.get("calls_per_pass", 1)
+    if not isinstance(calls, int) or isinstance(calls, bool) or calls < 0:
+        raise ValueError("'impact_hold.calls_per_pass' must be a whole number, 0 or more")
     repos = raw.get("repos", {})
     if not isinstance(repos, dict):
         raise ValueError("'impact_hold.repos' must be an object keyed by owner/repo")

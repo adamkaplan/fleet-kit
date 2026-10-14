@@ -218,6 +218,7 @@ fleet-switchboard remind <your name> <when> --issue <n> "<what to do when woken>
 `<when>` is a delay (`20m`, `2h`) or an ISO time with a zone. The daemon delivers the
 reminder at that time as an ordinary wake, so you cost nothing while you idle. Never
 poll in a loop and never `sleep` to wait: a polling agent spends tokens to learn nothing.
+A reminder with `--issue` is dropped unsent once that issue is closed (`--keep-if-closed` delivers it anyway); `remind --list` shows yours and `remind --cancel <id>` removes one.
 
 Two reminders are made for you. `fleet-switchboard launch` reads the brief's
 `CHECKPOINT` (or `--checkpoint 30m --overdue 60m`): the worker is reminded at the
@@ -335,3 +336,7 @@ the order already answers. The Chief of Staff's own orders are one local file,
 `standing-orders.md` beside the switchboard config: only the owner edits it
 (`fleet-switchboard orders --cos` prints it), and it is told them at its start, after each
 compaction and when the file changes.
+
+**Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
+`fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
+report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.

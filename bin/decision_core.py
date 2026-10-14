@@ -413,6 +413,140 @@ def parse_decision_rows(body):
     return rows
 
 
+# ---------------------------------------------------------------- order: what a decision waits for
+
+WAITS_FOR_MAX = 10   # refs one decision may name
+_SECTION_HEADING = re.compile(r"^##[ \t]+decision required(?![A-Za-z0-9_])", re.I)
+_ANY_H2 = re.compile(r"^##(?!#)[ \t]")
+_WAITS_FOR_LINE = re.compile(r"^[ \t]*waits[ \t]+for[ \t]*:[ \t]*(.*?)[ \t]*$", re.I)
+_WAIT_REF = re.compile(r"^(?:([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+))?#([0-9]+)$")
+
+
+def parse_waits_for(body, repo=None):
+    """The issues a decision says it waits for: the `Waits for: owner/repo#N, #M` line INSIDE its `## Decision required` section (up to the
+    next `##` heading), as lower-case `owner/repo#N` refs in the order written, a bare `#M` meaning `repo` (the issue's own). Only that
+    section is read: the same line anywhere else in the body is prose. Lenient: an entry that is not a ref is skipped, a repeat is dropped,
+    and at most WAITS_FOR_MAX are kept (the daemon never refuses an issue). [] for a body with no such line."""
+    if not isinstance(body, str):
+        return []
+    inside, refs = False, []
+    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _SECTION_HEADING.match(line):
+            inside = True
+            continue
+        if inside and _ANY_H2.match(line):
+            inside = False
+        found = _WAITS_FOR_LINE.match(line) if inside else None
+        if not found:
+            continue
+        for part in found.group(1).split(","):
+            match = _WAIT_REF.match(part.strip())
+            if not match:
+                continue
+            owner_repo = (match.group(1) or repo or "").lower()
+            if not owner_repo:
+                continue
+            ref = "%s#%d" % (owner_repo, int(match.group(2)))
+            if ref not in refs:
+                refs.append(ref)
+    return refs[:WAITS_FOR_MAX]
+
+
+def decision_ref(entry):
+    """`owner/repo#N` (lower case) of an issue decision, or None for anything else (a report, a request, a notice)."""
+    if entry.get("kind") != "issue" or not entry.get("repo") or not isinstance(entry.get("ask"), int):
+        return None
+    return "%s#%d" % (str(entry["repo"]).lower(), entry["ask"])
+
+
+def waits_graph(decisions):
+    """({ref: entry}, {ref: [refs it waits for that are themselves open decisions]}): the edges inside the list. A ref that is not an open
+    decision is not an edge (it is something else, or closed, or missing: the sweep says which)."""
+    listed = {decision_ref(d): d for d in decisions if decision_ref(d)}
+    edges = {ref: [w for w in (d.get("waits_for") or []) if w in listed] for ref, d in listed.items()}
+    return listed, edges
+
+
+def find_cycles(decisions):
+    """The groups of decisions that wait for each other: [[ref, ...]] each sorted, the groups sorted. A decision that waits for itself is a group
+    of one. Decisions that only wait for a cycle are not in it."""
+    listed, edges = waits_graph(decisions)
+    reach = {}
+    for ref in listed:
+        seen, stack = set(), list(edges[ref])
+        while stack:
+            at = stack.pop()
+            if at in seen:
+                continue
+            seen.add(at)
+            stack.extend(edges.get(at, ()))
+        reach[ref] = seen
+    members = {ref for ref in listed if ref in reach[ref]}
+    groups, taken = [], set()
+    for ref in sorted(members):
+        if ref in taken:
+            continue
+        group = sorted(m for m in members if m in reach[ref] and ref in reach[m] or m == ref)
+        taken.update(group)
+        groups.append(group)
+    return groups
+
+
+ORDER_DEPTH_MAX = 4   # how deep a chain of waits is drawn; deeper ones sit at this depth
+
+
+def annotate_order(decisions):
+    """Say, on each issue decision, where it sits in the order of what to do. In place, and ONLY when some decision names what it waits for;
+    a list in which none does is returned untouched (no field is added, the order stays oldest first).
+
+    Added, all optional: `order` (its place, 0..), `depth` (0 for what can be done now, 1 under the decision it waits for, ...), `blocked_by`
+    (the display id of that decision: the first of its `waits_for` that is an open decision), `mark`: `next` on the first decision that can
+    be done now, `cycle` on decisions that wait for each other (they are drawn at the top and are never `next`). `waits_for` itself is
+    the field the entry already carries. The list's own order is not changed: a reader that wants the arrangement sorts by `order`."""
+    if not any(d.get("waits_for") for d in decisions):
+        return decisions
+    listed, edges = waits_graph(decisions)
+    cyclic = {ref for group in find_cycles(decisions) for ref in group}
+    parent = {ref: next((w for w in edges[ref] if w != ref), None) if ref not in cyclic else None for ref in listed}
+    children = {}
+    for ref, up in parent.items():
+        if up is not None:
+            children.setdefault(up, []).append(ref)
+    place, first = [], True
+    sequence = [d for d in decisions if decision_ref(d)]
+    position = {decision_ref(d): i for i, d in enumerate(sequence)}
+
+    def walk(ref, depth):
+        place.append((ref, depth))
+        for child in sorted(children.get(ref, ()), key=position.get):
+            walk(child, min(depth + 1, ORDER_DEPTH_MAX))
+    for d in sequence:
+        ref = decision_ref(d)
+        if parent[ref] is None:
+            walk(ref, 0)
+    for n, (ref, depth) in enumerate(place):
+        entry = listed[ref]
+        entry["order"], entry["depth"] = n, depth
+        up = parent[ref]
+        if up is not None:
+            entry["blocked_by"] = listed[up]["id"]
+        if ref in cyclic:
+            entry["mark"] = "cycle"
+        elif depth == 0 and first:
+            entry["mark"], first = "next", False
+    rest = [d for d in decisions if not decision_ref(d)]
+    for n, d in enumerate(rest, len(place)):   # a report, a request: after the issues, as they were
+        d["order"], d["depth"] = n, 0
+    return decisions
+
+
+def arranged(decisions):
+    """The decisions in the order to show them: by `order` when annotate_order gave one to every entry, else as they are (oldest first)."""
+    if decisions and all(isinstance(d.get("order"), int) for d in decisions):
+        return sorted(decisions, key=lambda d: d["order"])
+    return list(decisions)
+
+
 # ---------------------------------------------------------------- folding: items in, the decision list out
 
 
@@ -505,6 +639,8 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
             headline = batch_headline(item["title"], len(item["rows"]))
             if item.get("raised_by"):
                 extra["raised_by"] = item["raised_by"]
+        if item["kind"] == "issue" and item.get("waits_for"):
+            extra["waits_for"] = list(item["waits_for"])   # optional: only an issue that says what it waits for carries it
         if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
             extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
@@ -555,6 +691,44 @@ def captain_entry(notice, facts, escalated, evidence):
     if facts.get("holds"):   # why it is held, from its `hold-*` labels (#133): shown, never read from prose
         entry["holds"] = list(facts["holds"])
     return entry
+
+
+_PR_URL = re.compile(r"https?://github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)/pull/([0-9]+)", re.I)
+_PR_SHORT = re.compile(r"(?<![\w/.:-])([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)#([0-9]+)")
+
+
+def named_prs(text):
+    """The pull requests a text names: {(owner/repo lower, number)} from a GitHub pull URL or an `owner/repo#N` ref. A bare `#N` names nothing here
+    (without its repo it could be any PR or issue)."""
+    text = str(text or "")
+    found = {(m.group(1).lower(), int(m.group(2))) for m in _PR_URL.finditer(text)}
+    return found | {(m.group(1).lower(), int(m.group(2))) for m in _PR_SHORT.finditer(_PR_URL.sub(" ", text))}
+
+
+def fold_reports_into_prs(decisions):
+    """A report that names a `pr:` decision (kind `captain`) by its URL or `owner/repo#N` is that PR's question: it is folded into the PR's row
+    (which gains `reported_by` and `reported_lines`, as an issue decision does) and has no row of its own, in whichever tier either is in. In
+    place; returns `decisions`. A report that names no such PR, or names more than one, stays. Only the first
+    DECISION_REPORT_TITLE_MAX characters of a report are searched (what the entry keeps)."""
+    prs = {(str(d["repo"]).lower(), d["number"]): d for d in decisions
+           if d.get("kind") == "captain" and d.get("repo") and isinstance(d.get("number"), int)}
+    if not prs:
+        return decisions
+    folded, lines = set(), {}
+    for d in decisions:
+        if d.get("kind") != "report":
+            continue
+        hit = [prs[ref] for ref in named_prs(d.get("title")) if ref in prs]
+        if len(hit) != 1:
+            continue
+        pr = hit[0]
+        folded.add(id(d))
+        pr["reported_by"] = sorted(set(pr.get("reported_by") or []) | {d.get("agent") or "-"})
+        lines.setdefault(id(pr), list(pr.get("reported_lines") or [])).append("%s: %s" % (d.get("agent") or "-", line_of(d.get("title"), FOLDED_LINE_MAX)))
+        pr["reported_lines"] = lines[id(pr)][-FOLDED_LINES_KEPT:]
+    if folded:
+        decisions[:] = [d for d in decisions if id(d) not in folded]
+    return decisions
 
 
 def order_decisions(decisions):

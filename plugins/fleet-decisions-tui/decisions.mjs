@@ -221,6 +221,17 @@ export function idOf(d, ambiguous = () => false) {
   return d.id
 }
 
+// The order of what to do (optional fields the daemon adds only when some decision names what it waits for; a file without them draws exactly as before):
+// `order` (its place), `depth` (how far under what it waits for), `mark` (`next`: do this first; `cycle`: waits for another that waits for it), `blocked_by` (the id it waits for).
+export const depthOf = (d) => (Number.isInteger(d.depth) && d.depth > 0 ? Math.min(d.depth, 4) : 0)
+export const orderNote = (d) => (d.mark === "next" ? " \u00b7 next" : d.mark === "cycle" ? " \u00b7 cycle" : "") + (typeof d.blocked_by === "string" && d.blocked_by ? ` \u00b7 waits for ${stripControls(d.blocked_by)}` : "")
+// Within one group: by `order` when every entry has one, else oldest first (the stable sort of old).
+export const inOrder = (list, sinceOf) => {
+  const withIndex = list.map((d, i) => ({ d, i }))
+  const ordered = withIndex.length > 0 && withIndex.every(({ d }) => Number.isInteger(d.order))
+  return withIndex.sort((x, y) => (ordered ? x.d.order - y.d.order : sinceOf(x.d) - sinceOf(y.d)) || x.i - y.i).map(({ d }) => d)
+}
+
 // One decision: its first line `<id> <age>`, then the daemon's headline (the title, for an older file with none) wrapped to `width` and cut to HEADLINE_LINES lines, the last ending in an ellipsis if cut.
 export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const since = Date.parse(decision.since)
@@ -228,7 +239,7 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = stripControls(typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title)
-  const entry = { key: decision.id, head: oneLine(`${idOf(decision)} ${age}${via}`, width), lines: wrapText(text, width, HEADLINE_LINES) }
+  const entry = { key: decision.id, head: "  ".repeat(depthOf(decision)) + oneLine(`${idOf(decision)} ${age}${via}${orderNote(decision)}`, width - 2 * depthOf(decision)), lines: wrapText(text, width, HEADLINE_LINES) }
   // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
   if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
@@ -256,10 +267,7 @@ export function buildView(snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW)
     }
     return [...by.keys()].sort().map((repo) => ({
       repo,
-      entries: by.get(repo)
-        .map((d, i) => ({ d, i }))
-        .sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i)
-        .map(({ d }) => entryOf(d, nowMs, width)),
+      entries: inOrder(by.get(repo), sinceOf).map((d) => entryOf(d, nowMs, width)),
     }))
   }
   const groups = groupsOf(shown)
@@ -489,10 +497,11 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
     const entries = []
     order.forEach((repo, gi) => {
       { if (gi) out.push(blank()); out.push(row(stripControls(repo === "(no repo)" || known.ambiguous(repo) ? repo : shortRepo(repo)), v3 ? `b+${projectHue(repo)}` : "b")) }
-      const items = by.get(repo).map((d, i) => ({ d, i })).sort((x, y) => sinceOf(x.d) - sinceOf(y.d) || x.i - y.i).map(({ d }) => d)
+      const items = inOrder(by.get(repo), sinceOf)
       items.forEach((d, ei) => {
         const url = urlOf(d)
-        const put = (l) => out.push(url ? { ...l, url } : l)
+        const indent = "  ".repeat(depthOf(d))
+        const put = (l) => { const linked = url ? { ...l, url } : l; out.push(indent ? { ...linked, segs: [[indent, ""], ...linked.segs] } : linked) }
         const tidyWith = (t) => tidyRefs(stripControls(t), repo, known)
         const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
         const age = ageSeg(d)
@@ -503,13 +512,15 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
           // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
           const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
           const lead = v3 && !isNotice(d) ? [kindGlyph(d), "m"] : null  // one cell and a space: the headline wraps in what is left
-          wrapText(shownHeadline, lead ? width - 2 : width, HEADLINE_LINES).forEach((t, ti) => {
+          wrapText(shownHeadline, (lead ? width - 2 : width) - indent.length, HEADLINE_LINES).forEach((t, ti) => {
             put(lead && ti === 0 ? { segs: [[lead[0] + " ", lead[1]], [t, section.need ? "b" : ""]] } : lead ? { segs: [["  ", ""], [t, section.need ? "b" : ""]] } : row(t, section.need ? "b" : ""))
           })
           const rows = Array.isArray(d.rows) ? d.rows.filter((r) => r && typeof r.text === "string") : []
           for (const r of rows) for (const t of wrapText(tidyWith(r.text), width, ROW_LINES)) put(row(t, "m"))
           const left = [[oneLine(stripControls(idText + (Array.isArray(d.reported_by) && d.reported_by.length ? ` ${d.reported_by.join(",")}` : "")), width), "m"]]
           if (isNotice(d)) for (const [t, st] of stateOf(d)) if (textOf(left).length + 3 + t.length + 1 + age[0].length <= width) left.push([" \u00b7 ", "m"], [t, st])
+          const note = orderNote(d)   // `next`, `cycle`, `waits for <id>`: only when the daemon ordered the list
+          if (note) left.push([note, d.mark === "cycle" ? "w" : d.mark === "next" ? "s" : "m"])
           if (v3) {
             left[0][1] = "m+t"
             const long = secondsOf(d) >= AGE_ERROR_SECONDS
