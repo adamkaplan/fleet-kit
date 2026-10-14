@@ -10851,7 +10851,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({r for r, _ in due})
     if not due:   # only the once-only flag of an invalid park: still one message, and nothing else in it
-        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (held back this once, then judged as not parked): %s." % ", ".join(invalid)
+        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
     summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (

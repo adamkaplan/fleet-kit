@@ -18579,14 +18579,14 @@ class TestTriageDigest(Base):
         self.assertEqual(len(self.passes(0)), 1)                   # surfaced at once
         self.assertEqual([d for d, _ in self.passes(2)], [1])      # and the next step is 1 day, not 3 or 7
 
-    def test_s4_parked_with_a_future_date_is_skipped_a_past_date_surfaces_and_an_invalid_one_is_flagged_once(self):
+    def test_s4_parked_with_a_future_date_is_skipped_a_past_date_and_an_invalid_one_surface_and_the_invalid_is_flagged_once(self):
         now = self.world.clock.now()
         day = lambda d: sb.iso(now + d * self.DAY)[:10]
         self.add(150, created=5, updated=4, labels=["osuser:parked"], body="Parked until: %s" % day(30))
         self.add(151, created=5, updated=4, labels=["osuser:parked"], body="Parked until: %s" % day(-5))
         self.add(152, created=5, updated=4, labels=["osuser:parked"], body="parked, see later")
         sent = self.passes(1)
-        self.assertEqual(self.refs(sent[0]), ["acme/api#151"])      # 1 of 3 surfaces; the future park never does
+        self.assertEqual(self.refs(sent[0]), ["acme/api#151", "acme/api#152"])   # the future park never surfaces; a bad date is not a park
         facts = [t for k, (t, _) in self.engine.triage.facts.items() if "summary" not in k]
         flags = [t for t in facts if "without a valid" in t and "api#152" in t]
         self.assertEqual(len(flags), 1)                            # flagged once
@@ -18594,6 +18594,30 @@ class TestTriageDigest(Base):
         self.assertNotIn(["acme/api#150"], later)
         audit = [e for e in self.world.audit() if e["event"] == "triage.parked_invalid"]
         self.assertEqual([e["detail"]["ref"] for e in audit], ["acme/api#152"])
+
+    def test_s11_a_bad_parked_date_is_listed_in_the_first_digest_flagged_once_and_a_muted_item_stays_hidden(self):
+        self.add(170, created=5, updated=4, labels=["osuser:parked"], body="Parked until: someday")
+        self.add(171, created=3, updated=0.2, labels=["kind"])
+        sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "acme/api#171", self.world.clock.now())
+        sent = self.passes(2)
+        self.assertEqual(self.refs(sent[0]), ["acme/api#170"])                 # listed at once, the muted item never
+        self.assertNotIn("acme/api#171", [r for d in sent for r in self.refs(d)])
+        flags = [t for k, (t, _) in self.engine.triage.facts.items() if "without a valid" in t]
+        self.assertEqual(len(flags), 1)                                         # 1 flag line in 3 passes
+
+    def test_s10_nothing_on_day_two_and_the_item_on_day_four(self):
+        self.add(140, created=30, updated=20, labels=["kind"])
+        sent = self.passes(4)
+        self.assertEqual([d for d, _ in sent], [0, 1, 4])                       # day 2 (and 3) are quiet
+
+    def test_s12_the_cost_figure_counts_characters_and_estimates_tokens_at_a_quarter(self):
+        now = self.world.clock.now()
+        for size in (200, 400, 600):
+            sb.triage_digest.cost_record(str(self.world.state), now, "x" * size)
+        cost = sb.triage_digest.cost_read(str(self.world.state))
+        self.assertEqual(cost["days"][sb.triage_digest.day_of(now)], {"messages": 3, "chars": 1200})
+        line = sb.triage_digest.cost_lines(cost, sb.triage_digest.day_of(now))[-1]
+        self.assertIn("1200 chars, ~300 tokens", line)
 
     def test_s5_seen_leave_mutes_until_a_change(self):
         self.add(160, created=3, updated=0.2, labels=["kind"])

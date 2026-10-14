@@ -127,8 +127,7 @@ def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_se
                 continue   # parked until a date still ahead
             if until is None and any(str(l).endswith(":parked") for l in item["labels"]) and "PARKED " + ref not in seen:
                 if ref not in invalid:
-                    invalid.append(ref)
-                continue   # flagged once, and held back for this one digest; after it the item is judged as not parked
+                    invalid.append(ref)   # flagged once; the item itself is judged as not parked and listed like any other
         if not backoff:
             if now - alarmed.get((rule, ref), 0) >= realarm_seconds:
                 due.append((rule, ref))
