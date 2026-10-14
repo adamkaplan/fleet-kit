@@ -138,6 +138,23 @@ def load_plan_ledger():
     return module
 
 
+def load_report_fold():
+    """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
+    held = sys.modules.get("report_fold")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("report_fold", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["report_fold"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("report_fold", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -286,6 +303,26 @@ def load_work_sync():
 
 
 work_sync = load_work_sync()
+
+
+def load_triage_digest():
+    """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
+    held = sys.modules.get("triage_digest")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("triage_digest", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["triage_digest"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("triage_digest", None)
+        raise
+    return module
+
+
+triage_digest = load_triage_digest()
 
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
@@ -2643,6 +2680,7 @@ class Plan:
     def __init__(self, recipient, action, reason, pending, observation=None, ready_at=None):
         self.recipient, self.action, self.reason = recipient, action, reason
         self.pending, self.observation, self.ready_at = pending, observation, ready_at
+        self.folded = False   # #352: a report folded into the sender's earlier send: a note, never a second wake
 
     def to_json(self):
         return {"recipient": self.recipient, "action": self.action, "reason": self.reason,
@@ -3806,6 +3844,8 @@ class Switchboard:
             fresh, why = self.reobserve(observation, self.now())
             again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
                            self.engaged_seconds, why)
+            if plan.folded and again.action == "wake":
+                again.action = "note"   # #352: a folded report stays a note
             if again.action != plan.action and not (interrupt and again.action in ("note", "wake")):
                 detail = {"was": plan.action, "now": again.action, "reason": again.reason,
                           "keys": [fact.key for fact in plan.pending]}
@@ -4096,7 +4136,10 @@ class Switchboard:
                     repo=repo or issue_repo(issue))
         outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
-            record_last_send(self.state_dir, sender, recipient, now)   # beside `report`'s record: both count as being in touch with that boss
+            # Beside `report`'s record: both count as being in touch with that boss. #352: only a send that woke the boss is one a report folds
+            # into, and under v2_light nothing folds, so no issue is kept there.
+            record_last_send(self.state_dir, sender, recipient, now, repo=repo or issue_repo(issue),
+                             issue=issue if outcome.get("action") == "wake" and not self.light else None)
         return outcome
 
     def repos_in_play(self):
@@ -4105,10 +4148,13 @@ class Switchboard:
         discovery = getattr(self, "discovery", None)
         return watched_repos(self.config, discovered_fleets(discovery))
 
-    def send_fact(self, fact, discovery, now, carried=(), interrupt=False):
-        """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule."""
+    def send_fact(self, fact, discovery, now, carried=(), interrupt=False, folded=False):
+        """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule. `folded` (#352): a report that
+        follows the sender's own earlier send is delivered as a note: it never wakes the boss a second time."""
         recipient = fact.recipient
         plan = self.plan(recipient, [fact] + list(carried), discovery, now)
+        if folded and plan is not None and plan.action == "wake":
+            plan.action, plan.reason, plan.folded = "note", "folded into the sender's earlier message: no second wake", True
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
@@ -4159,9 +4205,14 @@ class Switchboard:
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
         waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
+        earlier = None
+        if self.state_dir is not None and not self.light:   # #352: read BEFORE this report is recorded. Never under v2_light: an unread note is not converted to a wake there, so a folded question could sit unread
+            earlier = load_report_fold().follows(_read_small(self.state_dir, LAST_REPORT_FILE).get(sender), boss, repo, number, now)
+        if earlier is not None:
+            fact.summary = load_report_fold().marked(fact.summary, earlier, now)
         if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
             self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
-        outcome = self.send_fact(fact, discovery, now, waiting)
+        outcome = self.send_fact(fact, discovery, now, waiting, folded=earlier is not None)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
             try:   # a final done report reclaims the worker's registered worktrees: removed when clean and pushed, else kept with the reason
                 lines = reclaim_for_agent(self, subprocess.run, sender, False, "done report")   # a dry run: a worker often goes on in the same worktree, so only `retire` or `disk reclaim-worktrees --apply` removes
@@ -5496,7 +5547,7 @@ def _prune_last_reports(data):
             data.pop(old, None)
 
 
-def record_last_send(state_dir, sender, recipient, now):
+def record_last_send(state_dir, sender, recipient, now, repo=None, issue=None):
     """Remember that `sender` last SENT something to `recipient` (`send_to: {recipient: epoch}`, beside the last report's `state` and `at`, which it never
     changes; at most 8 recipients kept): a worker that messages its boss is in touch, which the overdue-checkpoint check counts as reporting to THAT boss
     even where no transcript is read (v2_light). Best effort, under a lock; never raises into `send`."""
@@ -5509,6 +5560,7 @@ def record_last_send(state_dir, sender, recipient, now):
             for old in sorted(sends, key=sends.get)[:max(0, len(sends) - 8)]:
                 sends.pop(old, None)
             entry["send_to"] = sends
+            entry = load_report_fold().record(entry, recipient, repo, issue, now)   # #352: what a later report on this issue folds into
             data[sender] = entry
             _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)
@@ -5527,6 +5579,8 @@ def record_last_report(state_dir, sender, state, now):
             entry = {"state": state, "at": int(now)}
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
+            if isinstance((data.get(sender) or {}).get("send_on"), dict):
+                entry["send_on"] = data[sender]["send_on"]   # nor what a later report folds into (#352)
             data[sender] = entry
             _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)
@@ -10427,7 +10481,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -10503,7 +10557,7 @@ def validate_triage_config(config, source):
                           % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)), 'triage', unknown, list(TRIAGE_DEFAULTS))
     section = dict(TRIAGE_DEFAULTS, **raw)
     where = "%s: 'triage" % source
-    for key in ("enabled", "daily_summary"):
+    for key in ("enabled", "daily_summary", "backoff"):
         if not isinstance(section[key], bool):
             raise ConfigError("%s.%s' must be true or false, got %r" % (where, key, section[key]))
     for key in ("repos", "our_logins"):
@@ -10592,6 +10646,7 @@ class TriageState:
         self.logged, self.facts, self.current = set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
+        self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
 
 
 def triage_state(engine):
@@ -11012,11 +11067,13 @@ def triage_pass(engine, decisions, now, errors=()):
                      "oldest_unchecked_seconds": int(oldest), "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
                      "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
     triage_write(engine, state)
-    due_all = [(r, ref) for r, ref, _ in findings if now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
-    due = [pair for pair in due_all if pair[0] != "OO"]
-    flagged = [pair for pair in due_all if pair[0] == "OO"]
-    if cfg["enabled"] and due:   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
-        triage_queue_fact(state, due, now, cfg, len(flagged))
+    flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
+                                     [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+    if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
+        text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
+        triage_digest.cost_record(engine.state_dir, now, text)
+        triage_digest_commit(engine, state, due[:cfg["max_findings"]], invalid, now)
         for pair in flagged:
             state.alarmed[pair] = now
         for rule, _ in due:
@@ -11024,22 +11081,59 @@ def triage_pass(engine, decisions, now, errors=()):
     triage_daily_summary(engine, state, cfg, now, day, repos)
 
 
-def triage_queue_fact(state, due, now, cfg, other_owner=0):
+def triage_digest_items(state):
+    """"repo#N" -> the reduced issue the rules read, from the lists already held (no read)."""
+    index = {}
+    for (repo, unit), held in state.units.items():
+        if unit == "issues" and isinstance(held, dict) and isinstance(held.get("data"), list):
+            for record in held["data"]:
+                item = triage_norm(record) if isinstance(record, dict) else None
+                if item is not None:
+                    index["%s#%d" % (repo, item["number"])] = item
+    return index
+
+
+def triage_digest_due(engine, state, ours, candidates, cfg, now):
+    """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
+    if state.seen is None:
+        state.seen = triage_digest.load_seen(engine.state_dir)
+    triage_digest.prune(state.seen, candidates)
+    mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
+    return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
+                                cfg["realarm_hours"] * 3600, PARKED_MAX_DAYS)
+
+
+def triage_digest_commit(engine, state, shown, invalid, now):
+    triage_digest.commit(state.seen, triage_digest_items(state), shown, invalid, now)
+    for ref in invalid:
+        engine._note("triage.parked_invalid", ref, {"ref": ref, "why": "a parked label without one valid `Parked until: YYYY-MM-DD` line"})
+    triage_digest.write_seen(engine.state_dir, state.seen)
+
+
+def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
+    """Queue THE one digest of the pass and return its text (the cost figure counts it). Only the shown items are marked."""
     shown = due[:cfg["max_findings"]]
     digest = hashlib.sha256("|".join("%s:%s" % pair for pair in shown).encode()).hexdigest()[:10]
     key = "triage:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({r for r, _ in due})
+    if not due:   # only the once-only flag of an invalid park: still one message, and nothing else in it
+        summary = "triage: no stale item to show; parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+        state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
+        return summary
     summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
         len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
     if other_owner:
         summary += " Also %d other-owner flag(s): not ours, nothing to do." % other_owner
-    for pair in due:
+    if invalid:
+        summary += " Parked without a valid `Parked until: YYYY-MM-DD` line (treated as not parked): %s." % ", ".join(invalid)
+    for pair in shown:
         state.alarmed[pair] = now
     state.facts[key] = (summary, now)
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+    return summary
 
 
 def triage_daily_summary(engine, state, cfg, now, day, repos):
@@ -11060,6 +11154,7 @@ def triage_daily_summary(engine, state, cfg, now, day, repos):
     engine._note("triage.summary", None, {"text": text, "counts": counts, "enabled": cfg["enabled"], "at": iso(now)})
     if cfg["enabled"] and cfg["daily_summary"]:
         state.facts["triage.summary:%d" % int(now)] = (text, now)
+        triage_digest.cost_record(engine.state_dir, now, text)
 
 
 def triage_write(engine, state):
@@ -11076,7 +11171,10 @@ def triage_summary(state_dir):
         raw = json.loads((Path(state_dir) / TRIAGE_FILE).read_text())
     except (OSError, ValueError):
         return None
-    return raw if isinstance(raw, dict) and isinstance(raw.get("counts"), dict) else None
+    if not (isinstance(raw, dict) and isinstance(raw.get("counts"), dict)):
+        return None
+    raw["cost"] = triage_digest.cost_read(str(state_dir))   # #349: None means no figure was recorded
+    return raw
 
 
 def triage_status_lines(triage):
@@ -11103,6 +11201,9 @@ def triage_status_lines(triage):
                      "raised nor audited" % (triage["unchecked"], extra))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    if "cost" in triage:   # #349: what the digests cost the Chief of Staff to read, per day
+        lines.extend(triage_digest.cost_lines(triage["cost"], str(triage.get("at") or "")[:10]) if triage["cost"]
+                     else ["      triage     cost per day: not recorded (nothing delivered yet)"])
     return lines
 
 
@@ -25147,6 +25248,28 @@ def cmd_orders_cos(args):
     print()
     print(found["raw"].rstrip("\n"))
     return EXIT_OK
+
+
+def cmd_triage(args, runner, now):
+    """`triage seen-leave|unmute|muted`: the Chief of Staff's mute list for the stale digest (#349). One private file in the state
+    directory; nothing on GitHub. The daemon reads it each pass."""
+    code, text = triage_digest.mute_command(str(ensure_state_dir()), args.triage_action, getattr(args, "ref", None), now())
+    (sys.stdout if code == EXIT_OK else sys.stderr).write(("" if code == EXIT_OK else "%s: triage: " % PROG) + text + "\n")
+    return EXIT_OK if code == 0 else (EXIT_USAGE if code == 2 else EXIT_ERROR)
+
+
+cmd_triage.direct = True   # one small file: no daemon start, no GitHub
+
+
+def add_triage_parsers(sub):
+    triage = sub.add_parser("triage", help="Mute or unmute an item in the stale digest ('seen, leave'); writes nothing to GitHub",
+                            description="`triage seen-leave OWNER/REPO#N` keeps the item out of the Chief of Staff's stale digest until it "
+                                        "changes (a comment, a label, a state or a push). `triage unmute OWNER/REPO#N` undoes it; "
+                                        "`triage muted` lists them.")
+    actions = triage.add_subparsers(dest="triage_action", required=True)
+    for name in ("seen-leave", "unmute"):
+        actions.add_parser(name).add_argument("ref", metavar="OWNER/REPO#N")
+    actions.add_parser("muted")
 
 
 def add_decision_parsers(sub):
