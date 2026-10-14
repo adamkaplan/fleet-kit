@@ -8892,6 +8892,27 @@ class TestCheckpointReminders(SelfWakeBase):
         self.wait(3600)
         self.assertEqual([t for t in self.texts("other") if "overdue checkpoint" in t], [])
 
+    def test_a_plain_send_to_the_boss_counts_even_where_no_transcript_is_read(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").send("coder", "platform", "quick question", None, None)
+        self.world.engine.light = True
+        self.wait(3600)
+        self.assertEqual(self.overdue(), [])
+
+    def test_a_send_never_changes_the_last_reports_state_and_a_report_keeps_the_send(self):
+        self.world.new_engine("cli").report("coder", "done", "finished")
+        before = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.world.tick(30)
+        self.world.new_engine("cli").send("coder", "platform", "one more thing", None, None)
+        mid = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertEqual((mid["state"], mid["at"]), (before["state"], before["at"]), "the final done still reads as done")
+        self.assertGreater(mid["send_at"], before["at"])
+        self.world.tick(30)
+        self.world.new_engine("cli").report("coder", "working", "again")
+        after = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertEqual((after["state"], after["send_at"]), ("working", mid["send_at"]))
+
     def test_the_wake_says_when_the_worker_last_reported_or_that_it_never_did(self):
         self.set_reminders()
         self.wait(3600)

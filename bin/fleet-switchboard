@@ -4070,7 +4070,10 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        return self.send_fact(fact, discovery, now, interrupt=interrupt)
+        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
+        if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
+            record_last_send(self.state_dir, sender, now)   # one helper with `report`: both count as being in touch
+        return outcome
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -5461,6 +5464,25 @@ def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
 
+def record_last_send(state_dir, sender, now):
+    """Remember that `sender` last SENT something to another agent (`send_at`, beside the last report's `state` and `at`, which it never changes): a worker that
+    messages its boss is alive and in touch, which the overdue-checkpoint check counts as reporting even where no transcript is read (v2_light).
+    Best effort, under a lock; never raises into `send`."""
+    try:
+        with agent_lock(state_dir, "files", seconds=2):
+            data = _read_small(state_dir, LAST_REPORT_FILE)
+            entry = dict(data.get(sender) or {})
+            entry["send_at"] = int(now)
+            data[sender] = entry
+            if len(data) > 500:
+                for old in sorted(data, key=lambda k: max(data[k].get("at", 0), data[k].get("send_at", 0)))[:len(data) - 500]:
+                    data.pop(old, None)
+            _write_small(state_dir, LAST_REPORT_FILE, data)
+        return True
+    except Exception:
+        return False
+
+
 def record_last_report(state_dir, sender, state, now):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
     from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
@@ -5468,7 +5490,10 @@ def record_last_report(state_dir, sender, state, now):
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
-            data[sender] = {"state": state, "at": int(now)}
+            entry = {"state": state, "at": int(now)}
+            if _is_number((data.get(sender) or {}).get("send_at")):
+                entry["send_at"] = data[sender]["send_at"]   # a report does not forget the last send
+            data[sender] = entry
             if len(data) > 500:   # bounded: the oldest go
                 for old in sorted(data, key=lambda k: data[k].get("at", 0))[:len(data) - 500]:
                     data.pop(old, None)
@@ -11102,12 +11127,14 @@ class ReminderFacts:
         return None
 
     def last_report(self, worker):
-        """When `worker` last made a report (epoch seconds, from `last-reports.json`), or None."""
+        """When `worker` last made a report or sent a message to an agent (epoch seconds, from `last-reports.json`), or None."""
         try:
-            at = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {}).get("at")
+            entry = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {})
+            times = [entry.get(key) for key in ("at", "send_at")]
         except (OSError, AttributeError):
             return None
-        return float(at) if _is_number(at) else None
+        times = [float(t) for t in times if _is_number(t)]
+        return max(times) if times else None
 
     def overdue_text(self, item):
         """The wake's text with the fact the boss needs: when the worker last reported, or that it has not since the launch."""
