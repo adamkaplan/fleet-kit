@@ -48,12 +48,16 @@ def clean(text, limit=NAME_MAX):
     return _CONTROL.sub(" ", str(text))[:limit]
 
 
+WORKFLOW_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.ya?ml")
+
+
 def settings(raw):
-    """`reds.reference_events` = {"owner/repo": ["merge_group", "schedule"]}; ValueError for a bad shape. Returns the map."""
+    """`reds` config: {"reference_events": {"owner/repo": [events]}, "workflow": {"owner/repo": "ci.yml"}}; ValueError for a bad shape. Returns the events map
+    (the workflow override map is read by `workflows`)."""
     if raw is None:
         return {}
-    if not isinstance(raw, dict) or set(raw) - {"reference_events"}:
-        raise ValueError("'reds' must be an object with only \"reference_events\" in it, got %r" % (raw,))
+    if not isinstance(raw, dict) or set(raw) - {"reference_events", "workflow"}:
+        raise ValueError("'reds' must be an object with only \"reference_events\" and \"workflow\" in it, got %r" % (raw,))
     events = raw.get("reference_events", {})
     if not isinstance(events, dict):
         raise ValueError("'reds.reference_events' must map OWNER/REPO to a list of events, got %r" % (events,))
@@ -62,7 +66,21 @@ def settings(raw):
             raise ValueError("'reds.reference_events' key %r is not OWNER/REPO" % (repo,))
         if not isinstance(listed, list) or not listed or len(listed) > 3 or any(e not in EVENTS_OK for e in listed) or len(set(listed)) != len(listed):
             raise ValueError("'reds.reference_events' for %s must be 1 to 3 different events of %s, got %r" % (repo, ", ".join(EVENTS_OK), listed))
+    workflows(raw)
     return events
+
+
+def workflows(raw):
+    """{"owner/repo": "ci.yml"}: the optional per-repo override of the workflow whose runs are main's runs (a workflow FILE name); ValueError for a bad one."""
+    found = (raw or {}).get("workflow", {})
+    if not isinstance(found, dict):
+        raise ValueError("'reds.workflow' must map OWNER/REPO to a workflow file name, got %r" % (found,))
+    for repo, name in found.items():
+        if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise ValueError("'reds.workflow' key %r is not OWNER/REPO" % (repo,))
+        if not isinstance(name, str) or not WORKFLOW_FILE.fullmatch(name):
+            raise ValueError("'reds.workflow' for %s must be a workflow file name such as ci.yml, got %r" % (repo, name))
+    return found
 
 
 def parse_artifact(raw):
@@ -205,17 +223,20 @@ def _when(text, now):
         return None
 
 
-def reference_runs(reader, repo, default_branch, events, newest):
-    """main's last runs of the reference events, newest first: [(run id, event, sha, created)]. One list call per event."""
+def reference_runs(reader, repo, default_branch, events, newest, workflow):
+    """main's last runs of ONE workflow on the reference events, newest first: [(run id, event, sha, created)]. `workflow` is the workflow id (an int) or its
+    file name; one list call per event, to that workflow's own runs (so a workflow that never uploads the artifact is never listed, never counted unknown)."""
     found = []
     for event in events:
-        query = "repos/%s/actions/runs?event=%s&status=completed&per_page=%d" % (repo, event, LIST_PAGE)
+        query = "repos/%s/actions/workflows/%s/runs?event=%s&status=completed&per_page=%d" % (repo, urllib.parse.quote(str(workflow), safe=""), event, LIST_PAGE)
         if event != "merge_group":
             query += "&branch=%s" % urllib.parse.quote(default_branch, safe="")
         body = reader.json(query)
         for run in body.get("workflow_runs", []) if isinstance(body, dict) else []:
             if not isinstance(run, dict) or not isinstance(run.get("id"), int):
                 continue
+            if isinstance(workflow, int) and run.get("workflow_id") not in (None, workflow):
+                continue   # defensive: only the workflow asked for
             branch = run.get("head_branch") or ""
             if event == "merge_group":
                 if not branch.startswith("gh-readonly-queue/%s/" % default_branch):
@@ -225,6 +246,11 @@ def reference_runs(reader, repo, default_branch, events, newest):
             found.append((run["id"], event, str(run.get("head_sha") or "")[:40], str(run.get("created_at") or "")))
     found.sort(key=lambda r: r[3], reverse=True)
     return found[:newest]
+
+
+def workflow_name(run):
+    """The workflow's display name from a run record, cleaned."""
+    return clean(run.get("name") or os.path.basename(str(run.get("path") or "")) or ("workflow %s" % run.get("workflow_id")), 60)
 
 
 ARTIFACT_PAGE = 100
@@ -273,7 +299,7 @@ def load_run(reader, repo, run_id, artifacts, cache, listing):
     return entry
 
 
-def run(reader, repo, number, events, cache_dir, now, out):
+def run(reader, repo, number, events, cache_dir, now, out, workflow=None):
     """Print the classification of `repo`#`number`; the exit status: 0 classified (or said it could not for want of an artifact), 1 a read failed."""
     try:
         pull = reader.json("repos/%s/pulls/%d" % (repo, number))
@@ -289,9 +315,36 @@ def run(reader, repo, number, events, cache_dir, now, out):
         if not pr_runs:
             out.write("reds %s#%d: no completed pull_request run for head %s: nothing to classify\n" % (repo, number, head[:7]))
             return EXIT_UNKNOWN
-        pr_run = pr_runs[0]
-        pr_entry = load_run(reader, repo, pr_run["id"], None, cache, listing)
-        refs = reference_runs(reader, repo, default_branch, events, MAIN_RUNS)
+        if workflow is not None:   # the override: the PR's run of that workflow file, wherever it stands
+            pr_runs = [r for r in pr_runs if os.path.basename(str(r.get("path") or "")) == workflow]
+            if not pr_runs:
+                out.write("reds %s#%d: the pull request has no completed run of workflow %s: cannot classify\n" % (repo, number, clean(workflow, 60)))
+                return EXIT_UNKNOWN
+        pr_run, pr_entry = None, None
+        for candidate in pr_runs:   # newest first: the first run that HOLDS the artifact is the pull request's run (several workflows run on a pull request)
+            entry = load_run(reader, repo, candidate["id"], None, cache, listing)
+            if "unknown" not in entry or not entry["unknown"].startswith("no artifact"):
+                pr_run, pr_entry = candidate, entry
+                break
+        if pr_run is None:
+            out.write("no failing-tests artifact on the pull request's run (looked at %d completed pull_request run(s) of head %s): cannot classify\n" % (len(pr_runs), head[:7]))
+            return EXIT_UNKNOWN
+        wf_name = workflow_name(pr_run)
+        wf = workflow if workflow is not None else pr_run.get("workflow_id")
+        if wf is None or isinstance(wf, bool) or (isinstance(wf, int) and wf <= 0):
+            # never fall back to listing the repo's runs by event alone: that was the defect. Say so and stop.
+            out.write("reds %s#%d: the pull request's run names no workflow (workflow unknown): cannot classify\n" % (repo, number))
+            return EXIT_UNKNOWN
+        others = []   # the other pull request runs that also hold an artifact (known from the cache or the artifact list: no download is made for them)
+        for candidate in pr_runs:
+            if candidate is pr_run:
+                continue
+            known = cache.get(candidate["id"])
+            if known is not None and not ("unknown" in known and known["unknown"].startswith("no artifact")):
+                others.append(candidate)
+            elif known is None and listing[0] is not None and candidate["id"] in listing[0][0]:
+                others.append(candidate)
+        refs = reference_runs(reader, repo, default_branch, events, MAIN_RUNS, wf)
         loaded = [(r, load_run(reader, repo, r[0], None, cache, listing)) for r in refs]
     except RedsError as err:
         out.write("reds %s#%d: cannot read (%s): nothing was classified\n" % (repo, number, clean(err, 160)))
@@ -312,28 +365,33 @@ def run(reader, repo, number, events, cache_dir, now, out):
             unknown.append((ref, "incomplete: not all tests ran"))
         else:
             usable.append({"names": entry["failed"], "latest": position == 0, "ref": ref})
-    out.write("reds %s#%d: %d failing in the pull request's run (%s%s)\n" % (repo, number, len(pr_names), pr_run.get("event", "pull_request"),
+    if others:
+        out.write("%d workflows hold a failing-tests artifact on this pull request (%s): the newest run's workflow, %s, was used\n" % (
+            1 + len(others), ", ".join(sorted({workflow_name(r) for r in [pr_run] + others})), wf_name))
+    out.write("reds %s#%d: %d failing in the pull request's run of workflow %s (%s%s)\n" % (repo, number, len(pr_names), wf_name, pr_run.get("event", "pull_request"),
                                                                               "" if pr_entry["complete"] else "; its list is INCOMPLETE: not all of its tests ran"))
     if loaded:
         ref = loaded[0][0]
         age = _when(ref[3], stamp)
-        line = "main's latest run: %s %s %s (reference events: %s)" % (ref[1], ref[2][:7], _age(age) + " ago" if age is not None else "time unknown", ", ".join(events))
+        line = "main's latest run: %s %s %s (workflow %s; reference events: %s)" % (ref[1], ref[2][:7], _age(age) + " ago" if age is not None else "time unknown", wf_name, ", ".join(events))
         if not (usable and usable[0]["latest"]):
             why = unknown[0][1] if unknown and unknown[0][0] == ref else "unknown"
             line += ": UNKNOWN (%s), so \"failing on main\" cannot be said" % why
         out.write(line + "\n")
     else:
-        out.write("main's latest run: none found among the runs of the reference events (%s)\n" % ", ".join(events))
+        out.write("main's latest run: none found among the runs of workflow %s on the reference events (%s)\n" % (wf_name, ", ".join(events)))
     if not usable:
         # No complete reference run: nothing to compare with. A red is NEVER called new on no evidence: say why and list the names as unknown.
         reasons = sorted({_why(r[1]) for r in unknown}) or ["none found"]
         out.write("no usable reference run (%s): cannot classify\n" % "; ".join(reasons))
+        if unknown and all(r[1].startswith("no artifact") for r in unknown):
+            out.write("no failing-tests artifact in the newest %d runs of workflow %s\n" % (len(unknown), wf_name))   # named: never as if another workflow's run lacked it
         out.write("  unknown (%d):\n" % len(pr_names))
         for name in pr_names[:200]:
             out.write("    %s\n" % clean(name))
         if len(pr_names) > 200:
             out.write("    ... %d more\n" % (len(pr_names) - 200))
-        out.write("main runs: %d listed, 0 usable, %d unknown%s\n" % (len(loaded), len(unknown), "".join("; run %d: %s" % (r[0][0], clean(r[1], 60)) for r in unknown[:5])))
+        out.write("main runs: %d listed (workflow %s), 0 usable, %d unknown%s\n" % (len(loaded), wf_name, len(unknown), "".join("; run %d: %s" % (r[0][0], clean(r[1], 60)) for r in unknown[:5])))
         return EXIT_UNKNOWN
     if not usable[0]["latest"]:
         out.write("main's latest run is unknown: classified by the %d older complete run(s) only; \"failing on main\" is not said\n" % len(usable))
@@ -347,5 +405,5 @@ def run(reader, repo, number, events, cache_dir, now, out):
             out.write("    %s%s%s\n" % (clean(name), note, "; matched by name only" if by_name else ""))
         if len(rows) > 200:
             out.write("    ... %d more\n" % (len(rows) - 200))
-    out.write("main runs: %d listed, %d usable, %d unknown%s\n" % (len(loaded), len(usable), len(unknown), "".join("; run %d: %s" % (r[0][0], clean(r[1], 60)) for r in unknown[:5])))
+    out.write("main runs: %d listed (workflow %s), %d usable, %d unknown%s\n" % (len(loaded), wf_name, len(usable), len(unknown), "".join("; run %d: %s" % (r[0][0], clean(r[1], 60)) for r in unknown[:5])))
     return EXIT_OK
