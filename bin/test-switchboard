@@ -39707,6 +39707,56 @@ class TestSettledOutside(ExternalWorld):
         self.run_pass(120)
         self.assertNotIn("permanent failure", self.count_line())
 
+    def test_the_settled_flag_lives_in_the_link_file_and_survives_a_restart(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        (link,) = self.links().values()
+        self.assertTrue(link["decided_outside"], "written to external-links.json")
+        self.world.engine.external_sync = None            # the daemon restarted: the link table is read again
+        revises = len([c for c in self.fake.calls if c[0] == "revise"])
+        self.fake.refuse.clear()
+        self.gh.issues[(API, 2)]["title"] = "Which database should the service use?"
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "revise"]), revises, "still settled after the restart: nothing is revised")
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+
+    def test_an_old_link_file_without_the_flag_keeps_todays_behaviour_and_a_corrupt_one_is_rebuilt(self):
+        ext = self.open_decision()
+        path = self.world.state / "external-links.json"
+        body = json.loads(path.read_text())
+        for link in body["links"].values():
+            link.pop("decided_outside", None)
+        path.write_text(json.dumps(body))
+        self.world.engine.external_sync = None
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2], "no flag: the revise goes as it always did")
+        path.write_text("{not json")
+        self.world.engine.external_sync = None
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertEqual(len(self.fake.items), 1, "a corrupt file is rebuilt by lookup, never trusted")
+
+    def test_the_settle_sends_nothing_new_and_pulls_once_per_cycle(self):
+        self.turn_on(poll_seconds=600)
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        sent = len(self.fake.calls)
+        pulls = self.pulls
+        self.run_pass(1)
+        self.assertEqual(len(self.fake.calls) - sent, 1, "only the revise that was refused: the settle itself sends nothing")
+        self.assertEqual(self.pulls - pulls, 1, "one pull on that cycle, not a loop")
+        self.run_pass(1)
+        self.assertEqual(self.pulls - pulls, 1, "and the long poll applies again after it")
+
     def test_s7_what_is_pushed_for_other_decisions_is_unchanged_after_a_settle(self):
         self.open_decision()
         self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
