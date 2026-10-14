@@ -137,3 +137,17 @@ test("an agent the pane file does not know, or a missing pane file, is a state n
   assert.equal(unknown.state, null)
   assert.match(text(blockLines(unknown, 80)[0]), /alpha\s+\?\s/)
 })
+
+test("hottest first is by heat, not by name", () => {
+  const hot = { ...full, pane: { ...pane, agents: { ...pane.agents, zeta: { role: "orchestrator", workspace: "w9", session: "ses_z", repo: "acme/z" } } },
+    load: { ...load, latest: { ...load.latest, zeta: { open_asks: 9, stalled: 5, busy: 1, idle: 0, decisions: 0 } }, episodes: { ...load.episodes, zeta: { sent: 5 } } } }
+  hot.pane.states.zeta = { state: "attached" }
+  const names = buildBlocks(hot, NOW).map((b) => b.name)
+  assert.equal(names[0], "zeta") // an alphabetical sort would put it last
+  assert.equal(names[1], "alpha")
+})
+
+test("a missing pane file draws the state as not recorded, not dead", () => {
+  const blocks = buildBlocks({ ...full, pane: null }, NOW)
+  assert.equal(blocks.length, 0) // with no pane file no workspace is known: nothing is drawn, nothing is called dead
+})
