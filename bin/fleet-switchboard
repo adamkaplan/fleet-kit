@@ -299,6 +299,7 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
     "v2_light": False,             # the owner's hotfix switch: ON turns OFF every optional read of session history (see V2_LIGHT_OFF); sends and writes are untouched
@@ -438,6 +439,8 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    if config["v2_events"] not in ("auto", "off"):
+        raise ConfigError("%s: 'v2_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_events"]))
     if not isinstance(config["v2_light"], bool):
         raise ConfigError("%s: 'v2_light' must be true or false, got %r" % (source, config["v2_light"]))
     if config["v2_transport"] not in ("auto", "cli"):
@@ -1056,6 +1059,10 @@ V2_ESSENTIAL_READS = ("session.get", "session.inbox.list", "session.permission.l
 V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
 V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
 V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
+V2_STREAM_LINE_MAX = 1024 * 1024  # one event line of the stream; a larger one is refused
+V2_STREAM_IDLE_SECONDS = 1800     # a stream that said nothing for this long is dropped and opened again (the service sends no keep-alive); that reopen is NOT a gap
+STREAM_OPENED = object()          # what stream_lines yields once the service answered
+STREAM_IDLE = object()            # what it yields when it ends because the stream was quiet for the whole idle time (the next open is not a gap)
 V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
 V2_SLOW_MIN_SAMPLES = 8
 V2_SLOW_WINDOW = 20
@@ -1125,6 +1132,50 @@ class V2Http:
             raise V2Unreachable("the service file names a process that is gone")
         token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
         self._info = (host, port, "Basic " + token)
+
+    def stream_lines(self, path, idle_seconds=V2_STREAM_IDLE_SECONDS):
+        """STREAM_OPENED once the service answered 200, then the lines of one SSE response (decoded, newline stripped), read on its OWN connection (never
+        under the request lock). A quiet stretch of `idle_seconds` (the service sends no keep-alive) ends the generator like a closed stream. Raises V2Unreachable
+        (no service, a refused connection, a password refused: use the old reads) or V2Error (any other status)."""
+        with self._lock:
+            if self._info is None:
+                self._load()
+            host, port, auth = self._info
+        conn = self.connect(host if ":" not in host else "[%s]" % host, port, timeout=idle_seconds)
+        try:
+            try:
+                conn.connect()
+                conn.request("GET", path, headers={"Authorization": auth, "Accept": "text/event-stream"})
+                response = conn.getresponse()
+            except (OSError, http.client.HTTPException):
+                with self._lock:
+                    self._info = None   # it may have moved (a restart on a new port): read the file again at the next connect, as `request` does
+                raise V2Unreachable("the service does not answer") from None
+            if response.status == 401:
+                with self._lock:
+                    self._info = None   # the password changed: read the file again at the next connect
+                raise V2Unreachable("the service refused the password")
+            if response.status != 200:
+                raise V2Error("http", response.status, "the event stream answered HTTP %d" % response.status)
+            yield STREAM_OPENED   # the service answered 200: only now is this a connection
+            while True:
+                try:
+                    raw = response.readline(V2_STREAM_LINE_MAX + 1)
+                except socket.timeout:
+                    yield STREAM_IDLE   # quiet for the whole idle time: ours to end, not the service's; the caller may reopen without marking a gap
+                    return
+                except (OSError, http.client.HTTPException):
+                    return   # a read timeout included: a response is not read on after a timeout (the socket refuses), so it ends and the caller reconnects
+                if not raw:
+                    return
+                if len(raw) > V2_STREAM_LINE_MAX:
+                    raise V2Error("too_large", None, "an event line over %d bytes was refused" % V2_STREAM_LINE_MAX)
+                yield raw.decode("utf-8", "replace").rstrip("\r\n")
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def close(self):
         conn, self._conn = self._conn, None
@@ -2590,6 +2641,241 @@ STATUS_REREAD_GAP = 5   # seconds: an agent whose state flaps is read again at m
 COMPACTION_TTL_MAX = 30   # seconds a compaction list is remembered (an orders fact for a compacted agent waits at most this long)
 
 
+# ---------------------------------------------------------------- the event feed (#290 slice 2)
+#
+# The daemon used to learn what happened in a session by READING its history on a timer. The service pushes the news: `GET /api/event` is ONE global
+# server-sent stream (a turn ended: `session.execution.succeeded`; a step ended; a permission or a form asked for). By contract it is VOLATILE (a
+# slow consumer overflows, events while disconnected are missed), so the feed is a HINT, never a ledger and never a source of TEXT (an event's text
+# can be partial or stale: a summary still comes from a fresh limit-1 read). It remembers per session which assistant message the events announced
+# and when a turn last ended; a (re)connect marks a gap and the next passes make ONE bounded read per session (`event.resync`); a periodic
+# reconciliation (at most one bounded read per session per FEED_RECONCILE_SECONDS) finds what an event did not announce (`event.missed`). The reader
+# thread does only: read a line, filter, remember. It makes no v2 call and writes nothing; the pass thread does the bounded reads. The stream is
+# OPTIONAL: with `v2_events: "off"`, no service file, a stale one or a stopped service the daemon works on its reads as before.
+
+FEED_TYPES = frozenset(("session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted",
+                        "session.text.ended", "session.step.ended", "session.error", "permission.asked", "form.created",
+                        "session.inbox.enqueued", "session.inbox.delivered"))
+FEED_RECONCILE_SECONDS = 600     # at most one bounded read per session in this time, in the absence of any event
+FEED_PAGE = 1                    # messages in a resync or reconcile read (the newest assistant message: bounded, far below 10)
+FEED_RECONCILES_PER_PASS = 2     # sessions reconciled in one pass: the work is spread, never a burst
+FEED_RESYNC_PER_PASS = 4         # sessions re-synced in one pass after a (re)connect: spread over passes, never a burst
+FEED_RESYNC_MIN_SECONDS = 120    # a session read this recently is not read again by a re-sync (a flapping stream cannot cause a read storm)
+FEED_SESSIONS_MAX = 500
+FEED_BACKOFF_MAX = 60
+FEED_STABLE_SECONDS = 30         # a connection that lasted this long starts the reconnect wait over
+FEED_ID_MAX = 128                # an id longer than this is not kept (ids are short; a line may be 1 MB)
+
+
+class EventFeed:
+    """One subscription to the service's event stream, and what it has learned per session: {"assistant": id of the newest assistant message
+    announced, "idle_ms": when the last turn ended, "read": when the daemon last read it, "event_at": when an event last named it}."""
+
+    def __init__(self, stream, audit=None, now=time.time, sleep=time.sleep, actor="daemon"):
+        self.stream, self.audit, self.now, self.sleep, self.actor = stream, audit, now, sleep, actor
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.seen = {}                # session id -> what the events said
+        self.connected = False
+        self.needs_resync = True      # a fresh feed has seen nothing: the first open re-syncs once
+        self.consumers = set()        # who needs the feed's reads: with none, the feed only OBSERVES (it costs a connection and no v2 call)
+        self.quiet_end = False        # the last connection ended because the stream was quiet: the next open is not a gap
+        self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0, "read_errors": 0}
+        self.down_reason = None
+
+    # -- the reader thread (reads, filters, remembers; no v2 call, no write)
+
+    def start(self):
+        if self.thread is None and self.stream is not None:
+            self.thread = threading.Thread(target=self.run, name="v2-event-feed", daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        backoff = 1
+        while not self.stop_event.is_set():
+            started = self.now()
+            try:
+                self.consume(self.stream.stream_lines("/api/event"))
+                if self.now() - started >= FEED_STABLE_SECONDS:
+                    backoff = 1   # it lived: a long connection that ended is not a flapping one
+            except Exception as err:   # anything at all: one bad connection is a counted error, never a dead reader thread
+                with self.lock:
+                    self.quiet_end = False   # a failed open: events may have been missed meanwhile, so the next open is a gap whatever ended the last connection
+                    self.connected = False
+                    self.down_reason = type(err).__name__
+                    self.counts["errors"] += 1
+            if self.stop_event.is_set():
+                break
+            self.sleep(min(backoff, FEED_BACKOFF_MAX))
+            backoff = min(backoff * 2, FEED_BACKOFF_MAX)
+
+    def consume(self, lines):
+        """Read every line of one connection. The gap is marked when the service ANSWERED (STREAM_OPENED), never before: a service that is down
+        opens nothing and costs nothing; and never after our own idle reopen (STREAM_IDLE: nothing was lost to a drop, only a quiet stream was
+        reopened). A connection that ended for any other reason is a gap: the next open re-syncs."""
+        try:
+            for line in lines:
+                if self.stop_event.is_set():
+                    break
+                if line is STREAM_OPENED:
+                    with self.lock:
+                        self.connected, self.down_reason = True, None
+                        self.counts["connects"] += 1
+                        if not self.quiet_end:
+                            self.needs_resync = True   # events between two connections are missed by contract
+                        self.quiet_end = False
+                elif line is STREAM_IDLE:
+                    with self.lock:
+                        self.quiet_end = True
+                else:
+                    self.handle(line)
+        finally:
+            with self.lock:
+                self.connected = False
+            close = getattr(lines, "close", None)
+            if close is not None:
+                close()   # a generator stopped early is closed now, not when it is collected: its connection goes with it
+
+    def handle(self, line):
+        if not line.startswith("data:"):
+            return
+        try:
+            event = json.loads(line[5:].strip())
+        except ValueError:
+            return
+        kind = event.get("type") if isinstance(event, dict) else None
+        if kind not in FEED_TYPES:
+            return
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        session = data.get("sessionID") if isinstance(data.get("sessionID"), str) and len(data["sessionID"]) <= FEED_ID_MAX else None
+        with self.lock:
+            self.counts["events"] += 1
+            if session is None:
+                return
+            entry = self._entry(session)
+            entry["event_at"] = self.now()
+            message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
+            if message and kind in ("session.text.ended", "session.step.ended"):
+                entry["assistant"] = message   # the id only: an event's text is never kept
+            elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
+                created = event.get("created")
+                finite = isinstance(created, (int, float)) and not isinstance(created, bool) and math.isfinite(created)   # NaN and Infinity are valid JSON to Python: int() of them raises
+                entry["idle_ms"] = int(created) if finite else int(self.now() * 1000)
+
+    # -- what the pass thread asks
+
+    def _entry(self, session):
+        """The remembered state of a session, made if new (at most FEED_SESSIONS_MAX are kept: the oldest goes). Call with the lock held."""
+        entry = self.seen.get(session)
+        if entry is None:
+            if len(self.seen) >= FEED_SESSIONS_MAX:
+                self.seen.pop(next(iter(self.seen)))
+            entry = self.seen[session] = {"assistant": None, "idle_ms": None, "read": None, "event_at": None}
+        return entry
+
+    def need(self, name):
+        """A reader that wants the feed's help registers here; until one does the feed reads nothing (it only observes)."""
+        with self.lock:
+            self.consumers.add(name)
+
+    def touched_since_read(self, session_id):
+        """True when an event named this session after the daemon last read it (or it was never read): a reader that wants only what is new may read."""
+        with self.lock:
+            entry = self.seen.get(session_id)
+            return entry is None or entry["read"] is None or (entry["event_at"] is not None and entry["event_at"] > entry["read"])
+
+    def status(self):
+        with self.lock:
+            return {"connected": self.connected, "events": self.counts["events"], "connects": self.counts["connects"], "resyncs": self.counts["resyncs"],
+                    "missed": self.counts["missed"], "errors": self.counts["errors"], "read_errors": self.counts["read_errors"], "sessions": len(self.seen), "down": self.down_reason}
+
+    def tick(self, engine, sessions):
+        """The pass thread's part, after a pass: ONE bounded read per session after a (re)connect (`event.resync`; at most FEED_RESYNC_PER_PASS per
+        pass, none read within FEED_RESYNC_MIN_SECONDS), and at most FEED_RECONCILES_PER_PASS sessions per pass whose last read is older than
+        FEED_RECONCILE_SECONDS (`event.missed` when an assistant message landed that no event announced). A read that fails (the breaker is open, the
+        service is slow) is simply tried again at the next pass. While the stream is down nothing is read here: the old reads are all there is."""
+        now = self.now()
+        with self.lock:
+            if not self.connected or not self.consumers:
+                return   # down, or nobody uses what a read would find: no read
+            if self.needs_resync:
+                pending = [s for s in sessions if self.seen.get(s) is None or self.seen[s]["read"] is None or now - self.seen[s]["read"] >= FEED_RESYNC_MIN_SECONDS]
+                pending.sort(key=lambda s: -1.0 if self.seen.get(s) is None else max(self.seen[s]["read"] or -1.0, self.seen[s].get("tried") or -1.0))   # the longest unread first: a failing few cannot starve the rest
+                chosen = pending[:FEED_RESYNC_PER_PASS]
+                if len(pending) <= FEED_RESYNC_PER_PASS:
+                    self.needs_resync = False
+                more, resync = self.needs_resync, True
+            else:
+                resync = False
+        if resync:
+            done = sum(1 for session in chosen if self._read(engine, session, now, announced=False))
+            with self.lock:
+                if not more:
+                    self.counts["resyncs"] += 1
+            self._audit("event.resync", {"sessions": done, "more": more, "reason": "start or reconnect: events while disconnected are missed by contract"})
+        with self.lock:
+            backlog = self.needs_resync   # a resync backlog reads the never-read ones itself, in its own order and cap
+            due = [s for s in sessions if (not backlog and (self.seen.get(s) is None or self.seen[s]["read"] is None))
+                   or (self.seen.get(s) is not None and self.seen[s]["read"] is not None and now - self.seen[s]["read"] >= FEED_RECONCILE_SECONDS)]
+        for session in due[:FEED_RECONCILES_PER_PASS]:
+            self._read(engine, session, now, announced=True)
+
+    def _read(self, engine, session, now, announced):
+        """One bounded read of the session's newest assistant message. True when it was made."""
+        try:
+            page = engine.v2.message_list(session, limit=FEED_PAGE, type="assistant")
+        except V2Error:
+            with self.lock:
+                self.counts["read_errors"] += 1
+                entry = self._entry(session)
+                entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
+            return False
+        newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
+        with self.lock:
+            entry = self._entry(session)
+            known, entry["read"] = entry["assistant"], now
+            missed = announced and known is not None and isinstance(newest, str) and known != newest   # a session no event ever named has nothing to have missed
+            if isinstance(newest, str) and known != newest:
+                entry["assistant"] = newest   # what the events did not say is learned here
+            if missed:
+                self.counts["missed"] += 1
+        if missed:
+            self._audit("event.missed", {"session": session, "last_seen": known, "found": newest})
+        return True
+
+    def _audit(self, name, detail):
+        if self.audit is not None:
+            try:
+                self.audit.append(self.actor, name, "v2", detail)
+            except OSError:
+                pass
+
+
+def start_event_feed(engine, config, now):
+    """#290: the service's pushed news, where the HTTP route exists and `v2_events` is "auto". Returns the feed, or None (the old reads only)."""
+    if config["v2_events"] != "auto" or getattr(engine.v2, "http", None) is None:
+        return None
+    engine.feed = EventFeed(engine.v2.http, engine.audit, now)
+    engine.feed.start()
+    return engine.feed
+
+
+def feed_tick(engine):
+    """After a pass: the feed's bounded reads. Never raises; a pass never fails for the feed."""
+    feed = getattr(engine, "feed", None)
+    if feed is None or getattr(engine, "light", False):
+        return   # v2_light: no optional read of session history, and the feed's resync and reconcile reads are such reads
+    try:
+        discovery = getattr(engine, "discovery", None)
+        sessions = sorted({o.session_id for o in discovery.agents.values() if getattr(o, "session_id", None)}) if discovery else []
+        feed.tick(engine, sessions)
+    except Exception as err:
+        engine._note("event.feed.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+
+
 class V2Reads:
     """What the daemon remembers of its reads of v2, and how much it may read.
 
@@ -2747,6 +3033,7 @@ class Switchboard:
         if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
             v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
+        self.feed = None  # the event feed (#290), when this process has one
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
@@ -3252,6 +3539,7 @@ class Switchboard:
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
+        feed_tick(self)   # #290: the event feed's bounded re-sync and reconciliation reads (never raises)
         record_v2_calls(self)
         return report
 
@@ -8046,6 +8334,8 @@ def record_v2_calls(engine):
         summary = v2_calls_summary(engine.v2, engine.now())
         if summary is None:
             return
+        if getattr(engine, "feed", None) is not None:
+            summary["events"] = engine.feed.status()   # the event feed's figures beside the call figures: the same file, the same line
         path = Path(engine.state_dir) / V2_CALLS_FILE
         temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
@@ -8075,6 +8365,10 @@ def v2_calls_status(state_dir, now):
         travelled = body.get("by_transport")
         if isinstance(travelled, dict) and travelled:
             text += "; by transport: " + ", ".join("%s %d" % (name, n) for name, n in sorted(travelled.items()) if isinstance(n, int))
+        events = body.get("events")
+        if isinstance(events, dict):
+            text += "; events: %s (%s heard, %s resync, %s missed)" % ("stream" if events.get("connected") else "DOWN: old reads", events.get("events"),
+                                                                       events.get("resyncs"), events.get("missed"))
         at = parse_iso(body.get("at"))
         if at is not None and now - at > 120:
             text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
@@ -12459,6 +12753,7 @@ def cmd_run(args, runner, now, wait):
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
     hub = attach_github(engine, config, state, runner, now)
+    start_event_feed(engine, config, now)
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
     if judge_server is not None:
         engine.judge_warm = make_judge_warmer(config, runner, now)
@@ -12473,6 +12768,8 @@ def cmd_run(args, runner, now, wait):
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
+        if getattr(engine, "feed", None) is not None:
+            engine.feed.stop()
         if hub is not None:
             hub.stop()
         if judge_server is not None:
