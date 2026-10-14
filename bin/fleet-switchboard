@@ -9802,6 +9802,10 @@ def external_status_line(config, state_dir, now):
     text = "%s; outbox %s; last pull %s" % ("ok" if body.get("state") == "ok" else "down: %s" % body.get("reason"),
                                             body.get("outbox", 0), "%s ago" % format_age(now - pulled) if pulled else "never")
     failures = body.get("permanent_failures") or 0
+    waiting = body.get("settled_waiting")
+    if isinstance(waiting, int) and not isinstance(waiting, bool) and waiting > 0:   # decided outside, answer not here yet: never invisible if it never arrives
+        oldest = body.get("settled_oldest")
+        text += "; settled outside, waiting for its answer: %d%s" % (waiting, " (oldest %s)" % format_age(max(0, now - oldest)) if isinstance(oldest, (int, float)) and not isinstance(oldest, bool) else "")
     return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
 

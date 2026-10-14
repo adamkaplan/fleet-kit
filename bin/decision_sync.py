@@ -111,7 +111,13 @@ class SyncEngine:
         if body is None or not isinstance(body.get("links"), dict):
             self.rebuild = True   # missing or unreadable: rebuilt from the adapter, never trusted
         else:
-            self.links = body["links"]
+            self.links = {k: v for k, v in body["links"].items() if isinstance(v, dict)}
+            for link in self.links.values():   # a hand-edited or damaged flag is "not settled": only the boolean True counts, anywhere
+                if link.get("decided_outside") is not True:
+                    link.pop("decided_outside", None)
+                    link.pop("decided_outside_at", None)
+                elif not isinstance(link.get("decided_outside_at"), (int, float)) or isinstance(link.get("decided_outside_at"), bool):
+                    link["decided_outside_at"] = self.now()
             self.cursor, self.last_pull = body.get("cursor"), body.get("last_pull")
             self.applied = [e for e in body.get("applied", []) if isinstance(e, str)]
             parked = body.get("parked")
@@ -127,6 +133,8 @@ class SyncEngine:
         self.links = {k: l for k, l in self.links.items()
                       if not (l.get("withdrawn") and now - l.get("withdrawn_at", now) > WITHDRAWN_KEEP_SECONDS)
                       and not (l.get("closed") and now - l.get("closed_at", now) > WITHDRAWN_KEEP_SECONDS)}
+        for key in [k for k in self.failed if (self.links.get(k) or {}).get("closed") or (self.links.get(k) or {}).get("withdrawn")]:
+            del self.failed[key]   # the decision is over (answered or withdrawn): its old failure is not a failure to show; a failed raise has no link and stays
         _write_json(self.links_path, {"version": 1, "links": self.links, "cursor": self.cursor,
                                       "last_pull": self.last_pull, "applied": self.applied[-APPLIED_LIMIT:],
                                       "parked": self.parked, "failed": self.failed})
@@ -192,6 +200,9 @@ class SyncEngine:
     def _enqueue(self, planned, desired):
         for item in planned:
             key, kind = item["key"], item["op"]
+            settled = self.links.get(item.get("rebind_from") or key) or self.links.get(key) or {}
+            if kind != "raise" and settled.get("decided_outside") is True and not settled.get("closed") and not settled.get("withdrawn"):
+                continue   # decided outside: its answer comes by the pull; nothing more is revised, withdrawn or reported
             want = desired.get(key)
             failed = self.failed.get(key)
             if failed is not None:
@@ -251,6 +262,7 @@ class SyncEngine:
             scoped = {e["boss"] for e in errors if e.get("source") == "reports" and e.get("boss")}
             if not reason and self.rebuild:
                 self.reconcile(desired)
+            self._close_settled(desired, kinds, scoped, now)
             self._enqueue(core.plan_operations(desired, self._projected(), kinds, now, scoped), desired)
             if reason:
                 status.update(state="down", reason=core.one_line(reason, 160))
@@ -265,7 +277,11 @@ class SyncEngine:
             self._save()
         except OSError as err:
             status.update(state="down", reason="cannot write the link table: %s" % (err.strerror or err))
-        status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed))
+        waiting = [l.get("decided_outside_at") for l in self.links.values()
+                   if l.get("decided_outside") is True and not l.get("closed") and not l.get("withdrawn") and not l.get("answered")]
+        stamps = [w for w in waiting if isinstance(w, (int, float)) and not isinstance(w, bool)]
+        status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed),
+                      settled_waiting=len(waiting), settled_oldest=min(stamps) if stamps else None)
         status["alarm"] = len(self.ops) > self.settings["outbox_alarm_depth"]
         failing = [o for o in self.ops if o.get("last_error")]
         if status["state"] == "ok" and failing:
@@ -315,6 +331,10 @@ class SyncEngine:
                     raise RuntimeError("no outside id is linked yet")
                 answer = self.adapter.push(operation, op["id"]) or {}
             except Exception as err:
+                if getattr(err, "settled_outside", False) is True and op["op"] != "raise":   # "already decided (or closed): read its answer instead": not a failure (a raise has no link to settle: it stays a permanent refusal, not tried again)
+                    self._settle_outside(op, err, now)
+                    blocked.add(op["key"])
+                    continue
                 if getattr(err, "permanent", False) is True:
                     self._drop_permanent(op, err, now)
                     blocked.add(op["key"])
@@ -335,11 +355,41 @@ class SyncEngine:
                                                            "idempotency": op["id"],
                                                            "external_id": answer.get("external_id")})
 
+    def _close_settled(self, desired, kinds, scoped, now):
+        """A link settled outside whose decision has left the local list (answered or resolved here) has nothing left to wait for: it is closed, so it stops
+        being counted as waiting. A decision whose source could not be read this pass is NOT gone: it is left alone."""
+        for key, link in self.links.items():
+            if link.get("decided_outside") is not True or link.get("closed") or link.get("withdrawn") or key in desired:
+                continue
+            if link.get("kind") in kinds or (link.get("kind") == "report" and link.get("boss") in scoped):
+                continue
+            link.update(closed=True, closed_at=now)
+            self.host.audit("external.settled_closed", key, {"reason": "the decision left the local list: nothing is waiting for its answer"})
+
+    def _settle_outside(self, op, err, now):
+        """The other side says the item is already decided or closed: that is its answer, not a failure. The operation (and the ones queued behind it for the
+        decision) are dropped, the link is marked `decided_outside` so nothing more is planned for it, any earlier failure of the key is cleared, and the next
+        cycle pulls at once so the answer is applied here. A link that was already answered or closed here has nothing left to pull."""
+        key = op["key"]
+        before = len(self.ops)
+        self.ops = [o for o in self.ops if o["key"] != key]
+        self.host.audit("external.settled_outside", key, {"op": op["op"], "reason": core.line_of("%s: %s" % (type(err).__name__, err), 200), "dropped_ops": before - len(self.ops)})
+        if op.get("note_only"):
+            return
+        self.failed.pop(key, None)
+        link = self.links.get(key)
+        if link is not None:
+            link.pop("last_error", None)
+            link.pop("failed_op", None)
+            if not (link.get("answered") or link.get("closed")):
+                link.update(decided_outside=True, decided_outside_at=now)
+                self.last_pull = None   # pull on this very cycle: the answer is on the other side
+
     def _drop_permanent(self, op, err, now):
         """The other side refused this operation for good: drop it and the operations queued behind it for the decision
         (they were planned on it), say so in the audit, mark the link, and remember it so that nothing is enqueued
         again until the decision changes. Never a withdraw, an answer or a retry."""
-        key, text = op["key"], core.one_line("%s: %s" % (type(err).__name__, err), 200)
+        key, text = op["key"], core.line_of("%s: %s" % (type(err).__name__, err), 200)   # redacted like every other outside text
         self.ops = [o for o in self.ops if o["key"] != key]
         self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1})
         if op.get("note_only"):

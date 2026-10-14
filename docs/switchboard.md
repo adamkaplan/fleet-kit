@@ -3129,8 +3129,12 @@ a failing delivery of an inbound answer (the event is not marked, the cursor sta
   backoff. A permanent refusal is dropped from the outbox (with the operations queued behind it for that decision), audited
   as `external.permanent_failure`, marked on the link (`last_error`, `failed_op`) and counted in the status line (`N permanent
   failure(s)`). It never withdraws or answers anything, is not enqueued again while the decision is unchanged, and a later
-  change of the decision enqueues a fresh operation. For a refused withdraw or revise (`already decided`) the engine does not
-  loop: the answer comes in by the next pull.
+  change of the decision enqueues a fresh operation. An `already decided` (or closed) reply to a revise, withdraw or status is NOT one of these failures (to a raise it still is: there is no link to settle): the adapter's `AlreadyDecided` carries
+  `settled_outside = true`, and the engine reads it as the other side's answer. The operation (and the ones behind it) are dropped and
+  audited as `external.settled_outside`, the link is marked `decided_outside`, nothing more is revised, withdrawn or reported for it,
+  the next cycle pulls at once so the answer is applied, and any earlier failure of that decision is cleared. The flag counts only as the boolean `true` (a damaged or hand-edited value is read as not settled and removed when the file is loaded), and `status` keeps a settled link whose answer has not come in sight: `settled outside, waiting for its answer: N (oldest 5m)`, until the answer is applied or the link closes. A failure entry is also
+  cleared whenever its link closes (answered or withdrawn), so the status count is the genuine failures only (a failed raise has no
+  link and stays counted). Every other permanent refusal behaves as above.
 
 `fleet-switchboard status` and `decisions` print one line when it is on: `external  ok; outbox N; last pull 12s ago`
 or `external  down: <why>`.

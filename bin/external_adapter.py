@@ -130,6 +130,7 @@ class AdapterError(Exception):
     disabled integration); False for what may pass (RateLimited, Unavailable)."""
 
     permanent = False
+    settled_outside = False   # True only for "already decided (or closed): read its answer instead": the sync engine settles the link outside, it is no failure
 
     def __init__(self, message, status=None, code=None):
         Exception.__init__(self, message)
@@ -171,7 +172,10 @@ class Conflict(AdapterError):
 
 
 class AlreadyDecided(Conflict):
-    """The item is already decided or finished: read its answer instead."""
+    """The item is already decided or finished: read its answer instead. The sync engine does NOT count this as a failure: the link is settled outside
+    (`settled_outside`), nothing more is pushed for it and the answer is pulled."""
+
+    settled_outside = True
 
 
 class RateLimited(AdapterError):
