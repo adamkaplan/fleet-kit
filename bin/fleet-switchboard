@@ -5994,13 +5994,35 @@ def worktree_in_use(engine, path):
     return worktree_session_in_use(engine, root)
 
 
-WORKTREE_SESSION_LOOKS = 200   # sessions read per removal; more keeps the worktree
+WORKTREE_SESSION_PAGES = 20    # pages of session.list read once per sweep; a list longer than this is incomplete
+
+
+def worktree_session_index(engine):
+    """({session id: directory}, complete) from ONE paged `session.list`, cached on the engine for the duration of a sweep (`engine._wt_sweep`);
+    a call outside a sweep reads fresh. V2Error propagates (the caller keeps the worktree)."""
+    cached = getattr(engine, "_wt_session_index", None)
+    if cached is not None and getattr(engine, "_wt_sweep", False):
+        return cached
+    index, cursor, complete = {}, None, False
+    for _ in range(WORKTREE_SESSION_PAGES):
+        page, cursor = engine.v2.session_list_page(None, cursor)
+        for item in page:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                index[item["id"]] = (item.get("location") or {}).get("directory") or item.get("directory")
+        if cursor is None:
+            complete = True
+            break
+    result = (index, complete)
+    if getattr(engine, "_wt_sweep", False):
+        engine._wt_session_index = result
+    return result
 
 
 def worktree_session_in_use(engine, root):
     """None when no NON-RETIRED agent's OpenCode session runs with its directory inside `root` (realpath, trailing "/"), else why it is kept. A session
     can run in a worktree while its pane sits elsewhere. The agents are those the switchboard knows (the pane-health registry and the last discovery);
-    a session that cannot be read keeps the worktree, and a session v2 no longer has (404) is no one's directory."""
+    their sessions are looked up in ONE `session.list` per sweep. A list that cannot be read keeps the worktree, and so does a known session missing
+    from an incomplete (too long) list; a session missing from a complete list is gone and is no one's directory."""
     if engine.state_dir is None:
         return None
     retired = read_retired(engine.state_dir)
@@ -6012,16 +6034,18 @@ def worktree_session_in_use(engine, root):
         if getattr(obs, "session_id", None):
             known[name] = obs.session_id
     todo = sorted((name, sid) for name, sid in known.items() if name not in retired)
-    if len(todo) > WORKTREE_SESSION_LOOKS:
-        return "more than %d agent sessions: cannot say none runs in it" % WORKTREE_SESSION_LOOKS
+    if not todo:
+        return None
+    try:
+        index, complete = worktree_session_index(engine)
+    except V2Error as err:
+        return "cannot read the session list (%s): cannot say no session runs in it" % _one_line(str(err), 80)
     for name, sid in todo:
-        try:
-            session = engine.v2.session_get(sid)
-        except V2Error as err:
-            if err.reason == "http" and err.status == 404:
-                continue
-            return "cannot read the session of %s (%s): cannot say it does not run in it" % (name, _one_line(str(err), 80))
-        where = ((session.get("location") or {}).get("directory") or session.get("directory")) if isinstance(session, dict) else None
+        if sid not in index:
+            if not complete:
+                return "the session of %s is not in the first %d pages of the session list: cannot say it does not run in it" % (name, WORKTREE_SESSION_PAGES)
+            continue
+        where = index[sid]
         if isinstance(where, str) and where and (os.path.realpath(where) + "/").startswith(root):
             return "the session of %s (%s) runs in it: retire it first" % (name, sid)
     return None
@@ -6074,8 +6098,12 @@ def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
     if not worktree_config(engine.config)["enabled"]:
         return ["worktree reclaim is switched off (worktree_reclaim.enabled is false): %d worktree(s) of %s kept" % (len(mine), name)]
     lines = []
-    for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]:
-        status, line = reclaim_worktree(engine, runner, path, entry, apply)
+    engine._wt_sweep, engine._wt_session_index = True, None   # one session.list for the whole sweep
+    try:
+        results = [(path,) + reclaim_worktree(engine, runner, path, entry, apply) for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]]
+    finally:
+        engine._wt_sweep, engine._wt_session_index = False, None
+    for path, status, line in results:
         lines.append(line)
         if status == "kept" and engine.audit is not None:
             engine.audit.append(engine.actor, "worktree.kept", name, {"path": path, "reason": _one_line(line, 160), "after": why})
@@ -6108,8 +6136,12 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
-    for path, entry in sorted(todo.items())[:WORKTREE_RECLAIM_MAX]:
-        status, line = reclaim_worktree(engine, runner, path, entry, bool(args.apply))
+    engine._wt_sweep, engine._wt_session_index = True, None   # one session.list for the whole sweep
+    try:
+        results = [reclaim_worktree(engine, runner, path, entry, bool(args.apply)) for path, entry in sorted(todo.items())[:WORKTREE_RECLAIM_MAX]]
+    finally:
+        engine._wt_sweep, engine._wt_session_index = False, None
+    for status, line in results:
         print(line)
         removed += status in ("removed", "would-remove", "gone")
         kept += status in ("kept", "refused")

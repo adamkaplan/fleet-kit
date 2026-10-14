@@ -4933,10 +4933,20 @@ class TestLaunch(Base):
         sb._write_small(self.world.state, sb.RETIRED_FILE, {})
         self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt) + "2"        # a sibling sharing a name prefix
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
-        with mock.patch.object(sb.V2Client, "session_get", side_effect=sb.V2Error("timeout", None, "slow")):
-            self.assertIn("cannot read the session", sb.worktree_in_use(engine, str(wt)))
-        with mock.patch.object(sb.V2Client, "session_get", side_effect=sb.V2Error("http", 404, "gone")):
+        with mock.patch.object(sb.V2Client, "session_list_page", side_effect=sb.V2Error("timeout", None, "slow")):
+            self.assertIn("cannot read the session list", sb.worktree_in_use(engine, str(wt)))
+        sid = self.world.sessions["elsewhere"]
+        with mock.patch.object(sb.V2Client, "session_list_page", return_value=([], None)):          # a complete list without the session: it is gone
             self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb, "WORKTREE_SESSION_PAGES", 1), mock.patch.object(sb.V2Client, "session_list_page", return_value=([], "more")):
+            self.assertIn("cannot say it does not run in it", sb.worktree_in_use(engine, str(wt)))     # an incomplete list
+        with mock.patch.object(sb.V2Client, "session_list_page", wraps=engine.v2.session_list_page) as listed:   # ONE list for a whole sweep
+            self.world.v2.sessions[sid]["directory"] = str(wt) + "2"
+            engine._wt_sweep = True
+            for _ in range(3):
+                self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+            engine._wt_sweep, engine._wt_session_index = False, None
+            self.assertEqual(listed.call_count, 1)
 
     def test_retiring_the_agent_whose_session_runs_in_its_worktree_still_removes_it_because_it_is_retired_first(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
