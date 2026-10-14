@@ -1,0 +1,4 @@
+{
+ "command": "plan",
+ "help": "usage: fleet-switchboard plan [-h] {check,template,review} ... positional arguments: {check,template,review} check Check a plan: scenarios well-formed, every Done-when clause covered; prints PASS or FAIL, one line per defect, and the plan's content hash template Print a prefilled plan for an ask: its Done-when clauses and one scenario stub per clause (read-only) review The plan review engine (off unless plan_review.enabled): adversarial lanes, at most 3 rounds options: -h, --help show this help message and exit"
+}
