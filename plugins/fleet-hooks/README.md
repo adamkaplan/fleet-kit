@@ -56,6 +56,14 @@ is not the main checkout (`~/Code/fleet-kit/bin`, or `$FLEET_KIT_MAIN`).
 Fix the link with `fleet-switchboard install`; the plugin reads it at service
 start, so a running service picks the change up at its next restart.
 
+## Tool-call tally (health view, #357)
+
+With the plugin judging (switchboard found), it also counts each permission evaluation per session and minute **in memory** and
+leaves `tool-rate.json` in the switchboard state directory (every 15 s when something moved, every 60 s otherwise). It holds session
+ids and counts only, 20 minutes and 200 sessions at most, and a fault in it never changes a tool call's outcome or latency. The
+count is **approximate**: it is evaluations, not a measured tool-call total. `bin/health_records.py` reads it; a file older than
+3 minutes (plugin not loaded) means "not recorded", never 0.
+
 Tests: `node --test plugins/fleet-hooks/index.test.mjs`.
 
 ## Shape (measured in the Lab, v2 2.0.22)

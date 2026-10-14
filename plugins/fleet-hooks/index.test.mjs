@@ -196,3 +196,92 @@ test("a flip is told to the next child once", async () => {
   const told = calls.map((c) => c.env.FLEET_SWITCHBOARD_MODE_FLIPS).filter(Boolean);
   assert.deepEqual(told, ["ses_1:shadow>enforcing"]);
 });
+
+// ---- #357: approximate tool-call tally for the health view
+import { makeTally, TALLY_MINUTES, TALLY_SESSIONS, TALLY_HEARTBEAT_MS } from "./index.js";
+
+test("every evaluation is counted per session and minute, judged or not", async () => {
+  let clock = 60000 * 100;
+  const tally = makeTally({ dir: "/nowhere", now: () => clock });
+  const { spawnFn } = fakeSpawn(() => ({ outcome: "allow", reason: "ok" }));
+  const h = makeHandler({ bin: "/x", spawnFn, tally, now: () => clock });
+  for (let i = 0; i < 7; i++) await h({ ...input("ses_a"), action: "read" }); // an action the plugin does not forward
+  clock += 60000;
+  for (let i = 0; i < 2; i++) await h(input("ses_a"));
+  await h(input("ses_b"));
+  const body = tally.body();
+  assert.deepEqual(body.sessions.ses_a, { 100: 7, 101: 2 });
+  assert.deepEqual(body.sessions.ses_b, { 101: 1 });
+});
+
+test("the tally is bounded in minutes and sessions", () => {
+  let clock = 0;
+  const tally = makeTally({ dir: "/nowhere", now: () => clock });
+  for (let i = 0; i < TALLY_SESSIONS + 50; i++) tally.count("ses_" + i);
+  assert.equal(Object.keys(tally.body().sessions).length, TALLY_SESSIONS);
+  tally.count("ses_old");
+  clock += 60000 * (TALLY_MINUTES + 1);
+  assert.equal(tally.body().sessions.ses_old, undefined);
+});
+
+test("a throwing or failing tally never changes the outcome", async () => {
+  const tally = { count() { throw new Error("boom"); } };
+  const { spawnFn } = fakeSpawn(() => ({ outcome: "deny", reason: "no", judged: true }));
+  const h = makeHandler({ bin: "/x", spawnFn, tally });
+  const i = input("ses_a");
+  await h(i);
+  assert.equal(i.effect, "deny");
+});
+
+test("flush writes only when something moved or the heartbeat is due, and survives a write error", async () => {
+  let clock = 1000000;
+  const writes = [];
+  const tally = makeTally({ dir: "/d", now: () => clock, writeFile: async (f, c) => writes.push(f), rename: async () => {} });
+  assert.equal(await tally.flush(), true); // first: heartbeat due
+  assert.equal(await tally.flush(), false);
+  tally.count("ses_a");
+  assert.equal(await tally.flush(), true);
+  clock += TALLY_HEARTBEAT_MS + 1;
+  assert.equal(await tally.flush(), true);
+  const bad = makeTally({ dir: "/d", now: () => clock, writeFile: async () => { throw new Error("ENOENT"); } });
+  assert.equal(await bad.flush(), false);
+});
+
+test("setup wires the tally into the evaluate hook, and only when judging is configured", async () => {
+  const { home } = fakeHome();
+  const seen = [];
+  const tally = { count: (s) => seen.push(s), flush: async () => false };
+  let evaluate;
+  const api = { shell: { hook() {} }, permission: { hook: (name, fn) => { evaluate = fn; } } };
+  await plugin.setup(api, {}, { home, tally });
+  await evaluate({ sessionID: "ses_w", action: "read", effect: "allow" });
+  assert.deepEqual(seen, ["ses_w"]);
+  const off = [];
+  await plugin.setup({ permission: { hook: () => off.push(1) }, shell: { hook() {} } }, {}, { home: fs.mkdtempSync(path.join(os.tmpdir(), "fleet-hooks-")), tally });
+  assert.deepEqual(off, []); // no switchboard found: nothing registered, nothing counted
+});
+
+test("the tally's temporary file has an unpredictable name and is created exclusively", async () => {
+  const names = [];
+  const flags = [];
+  const mk = () => makeTally({ dir: "/d", now: () => 1000000, writeFile: async (f, c, o) => { names.push(f); flags.push(o.flag); }, rename: async () => {} });
+  await mk().flush();
+  await mk().flush();
+  assert.notEqual(names[0], names[1]);
+  assert.deepEqual(flags, ["wx", "wx"]);
+});
+
+import { stateDirOf } from "./index.js";
+test("stateDirOf: an absolute XDG_STATE_HOME wins; a relative or unset one falls back to the home", () => {
+  assert.equal(stateDirOf({ XDG_STATE_HOME: "/xdg/state" }, "/home/user"), "/xdg/state/fleet-switchboard");
+  assert.equal(stateDirOf({ XDG_STATE_HOME: "relative" }, "/home/user"), "/home/user/.local/state/fleet-switchboard");
+  assert.equal(stateDirOf({}, "/home/user"), "/home/user/.local/state/fleet-switchboard");
+});
+
+test("a failed rename removes the temporary file", async () => {
+  const removed = [];
+  const tally = makeTally({ dir: "/d", now: () => 1000000, writeFile: async () => {}, rename: async () => { throw new Error("EXDEV"); }, unlink: async (f) => removed.push(f) });
+  assert.equal(await tally.flush(), false);
+  assert.equal(removed.length, 1);
+  assert.match(removed[0], /tool-rate\.json\.\d+\.[0-9a-f]{12}\.tmp$/);
+});

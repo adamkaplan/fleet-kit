@@ -189,6 +189,69 @@ def load_disk_janitor():
     return module
 
 
+def load_health_records():
+    """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
+    held = sys.modules.get("health_records")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("health_records", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["health_records"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("health_records", None)
+        raise
+    return module
+
+
+def health_recorder(engine):
+    """The engine's recorder of what it has already read (#357), made on first use. None when it cannot be made: health is never in a pass's way."""
+    held = getattr(engine, "health", None)
+    if held is None:
+        try:
+            held = engine.health = load_health_records().Recorder(time.time)
+        except Exception:
+            return None
+    return held
+
+
+def _health_fault(engine, where, err):
+    """A recorder fault is never in a pass's way, but it is said once per change of the error (`_note`), so a recorder that never records leaves a trace."""
+    try:
+        engine._note("health.error", where, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    except Exception:
+        pass
+
+
+def health_ingest_messages(engine, session, page):
+    """Messages the feed has just read, handed to the recorder. No read of its own; a fault is ignored."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is not None and isinstance(page, list):
+            for message in page[:20]:
+                recorder.ingest_message(session, message)
+    except Exception as err:
+        _health_fault(engine, "ingest", err)
+
+
+def health_write(engine, state, now):
+    """End of every pass (#357, from `finish_pass`, so it runs whatever is configured): the pushes seen in the PR picture, when one exists
+    (`state` is the ci recorder's, or None: the engine's own is used), and `health-records.json` (written only when its content changed, or on the heartbeat)."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is None or engine.state_dir is None:
+            return
+        state = state if state is not None else getattr(engine, "ci_record_state", None)
+        recorder.ingest_prs(getattr(state, "pr_state", None))
+        records = load_health_records()
+        body = recorder.body(records.read_tool_file(engine.state_dir))
+        state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
+    except Exception as err:
+        _health_fault(engine, "write", err)
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -3311,6 +3374,7 @@ class EventFeed:
                 entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
+        health_ingest_messages(engine, session, page)
         with self.lock:
             entry = self._entry(session)
             known, entry["read"] = entry["assistant"], now
@@ -9886,6 +9950,10 @@ def finish_pass(engine, discovery, report):
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        health_write(engine, None, engine.now())   # #357: not tied to the GitHub ci recorder, which returns early on a fleet with no plan_gates
+    except Exception as err:
+        engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
 
 
