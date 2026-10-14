@@ -9812,6 +9812,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
+        "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
