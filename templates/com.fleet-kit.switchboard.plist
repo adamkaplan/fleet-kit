@@ -72,8 +72,13 @@
 	<key>StandardOutPath</key>
 	<string>__STATE_DIR__/launchd-stdout.log</string>
 
+	<!--
+	  Interactive, not Background: the daemon answers people and agents, and a Background process gets the lowest scheduling class on macOS (it did not finish
+	  a 1-second task in 60 s on a machine kept busy at twice its cores, while the default class took 1.6 s). Interactive asks for the interactive class
+	  without sudo: a user agent, no UserName, no Nice.
+	-->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Interactive</string>
 	<key>WorkingDirectory</key>
 	<string>__HOME__</string>
 </dict>

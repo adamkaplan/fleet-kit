@@ -41772,6 +41772,56 @@ class TestComposeTrap(Base):
         self.assertNotIn("sudo", (REPO / "tools" / "fleet-compose-trap.sh").read_text().replace("Never uses sudo.", ""))
 
 
+class TestDaemonPriority(Base):
+    """P0 CPU item C: the daemon's LaunchAgent asks for the Interactive process class, with no root; ensure's own start is unchanged."""
+
+    def template(self):
+        import plistlib
+        return plistlib.loads((REPO / "templates" / "com.fleet-kit.switchboard.plist").read_bytes())
+
+    def test_s1_the_template_asks_for_the_interactive_class_and_nothing_that_needs_root(self):
+        plist = self.template()
+        self.assertEqual(plist["ProcessType"], "Interactive")
+        for key in ("UserName", "GroupName", "Nice", "SessionCreate"):
+            self.assertNotIn(key, plist)
+        self.assertEqual(plist["Label"], "com.fleet-kit.switchboard")
+        self.assertEqual(plist["ProgramArguments"][-2:], ["run", "--standby"])
+
+    def test_s2_what_install_writes_parses_and_says_the_same(self):
+        import plistlib
+        values = sb.service_values(REPO, sb.service_path_dirs(REPO, []))
+        written = plistlib.loads(sb.render_service("launchd", values, REPO).encode())
+        self.assertEqual(written["ProcessType"], "Interactive")
+        self.assertEqual(written["ProgramArguments"][-2:], ["run", "--standby"])
+        self.assertEqual(written["ProgramArguments"][0], values["__PYTHON__"])
+        self.assertNotIn("__", json.dumps(written), "every placeholder is filled")
+
+    def test_s3_ensures_own_start_is_unchanged(self):
+        seen = []
+        shell = {"PATH": "/usr/bin", "HERDR_PANE_ID": "w1:p1", "FLEET_SWITCHBOARD_ROLE": "coder", "HERDR_SOCKET_PATH": "/s"}
+        with mock.patch.dict(os.environ, shell, clear=True):
+            sb.spawn_daemon(self.world_state(), spawn=lambda argv, **kw: seen.append((argv, kw)))
+        argv, kw = seen[0]
+        self.assertEqual(argv[-1], "run")
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(kw["cwd"], str(self.world_state()))
+        self.assertNotIn("HERDR_PANE_ID", kw["env"])
+        self.assertNotIn("FLEET_SWITCHBOARD_ROLE", kw["env"])
+        self.assertFalse({"launchctl", "taskpolicy", "nice", "sudo"} & set(argv), "no wrapper around the start")
+
+    def world_state(self):
+        path = self.home / "state"
+        path.mkdir(exist_ok=True)
+        return path
+
+    def test_s4_the_docs_say_how_to_opt_in_check_and_go_back(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### The daemon's priority under load"):]
+        section = section[:section.index("\n### ", 10)] if "\n### " in section[10:] else section
+        for needle in ("ProcessType", "Interactive", "opt-in", "launchctl print", "no sudo", "fleet-switchboard install", "--uninstall"):
+            self.assertIn(needle, section)
+
+
 class TestDiskGuard(Base):
     """The disk guard: one stat of the state directory's volume per pass; the Chief of Staff is told once per episode below disk_guard.min_free_gb; `status`
     says how much is free; `disk prune` runs exactly two docker commands and refuses without docker."""
