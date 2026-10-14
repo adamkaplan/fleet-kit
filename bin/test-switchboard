@@ -6532,6 +6532,121 @@ class TestGithubVerification(Base):
         self.assertNotIn("==", inspect.getsource(sb.signature_matches))
 
 
+class TestPrEventFill(Base):
+    """#354: `pr-state` is filled from the forwarder's verified pull_request events: a PR of a watched repo (not under plan_gates) is known from open."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.engine = self.rig.hub, self.rig.gh, self.rig.world.engine
+        self.hub.tick()
+        self.secret = self.gh.procs[-1].secret
+        self.ref = "%s#31" % GH_REPO
+
+    def event(self, action="opened", number=31, head="a" * 40, labels=(), draft=False, merged=False, state="open", secret=None, repo=GH_REPO, signature="auto", raw=None):
+        payload = {"action": action, "number": number, "repository": {"full_name": repo},
+                   "pull_request": {"number": number, "head": {"sha": head}, "draft": draft, "merged": merged, "state": state,
+                                    "labels": [{"name": n} for n in labels]}}
+        body = raw if raw is not None else json.dumps(payload).encode()
+        headers = {"X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "d-%s-%s" % (action, number)}
+        if signature == "auto":
+            signature = sb.sign_body(secret or self.secret, body)
+        if signature is not None:
+            headers["X-Hub-Signature-256"] = signature
+        return self.hub.receive("/github", headers, body)
+
+    def snapshot_entry(self, ref=None):
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        body, why = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        self.assertIsNone(why)
+        return body["prs"].get(ref or self.ref)
+
+    def test_an_opened_event_for_a_never_seen_pr_is_known_with_head_draft_and_labels_and_no_gh_call(self):
+        calls = len(self.gh.api_calls)
+        self.assertEqual(self.event("opened", labels=("bug", "ready")), (202, "accepted"))
+        entry = self.snapshot_entry()
+        self.assertEqual((entry["state"], entry["head"], entry["labels"]), ("open", "a" * 40, ["bug", "ready"]))
+        body, _ = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        line = sb.pr_state_line(sb.pr_state_view(self.ref, body, [], self.rig.world.clock.now()))
+        self.assertIn("open", line)
+        self.assertIn("head aaaaaaaa", line)
+        self.assertEqual(len(self.gh.api_calls), calls, "no read of GitHub")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("opened", number=32, draft=True)
+        self.assertEqual(self.snapshot_entry("%s#32" % GH_REPO)["state"], "draft")
+
+    def test_later_events_update_the_entry_in_turn(self):
+        self.event("opened")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="b" * 40)
+        self.assertEqual(self.snapshot_entry()["head"], "b" * 40)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", head="b" * 40, labels=("hold",))
+        self.assertEqual(self.snapshot_entry()["labels"], ["hold"])
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("converted_to_draft", head="b" * 40, labels=("hold",), draft=True)
+        self.assertEqual(self.snapshot_entry()["state"], "draft")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("closed", head="b" * 40, merged=True, state="closed")
+        entry = self.snapshot_entry()
+        self.assertEqual(entry["state"], "merged")
+        self.assertIn("webhook", entry["why"])
+
+    def test_an_examination_at_the_same_head_is_kept_and_a_new_head_clears_it(self):
+        self.event("opened")
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        state.pr_state[self.ref].update({"checks": [{"name": "t", "conclusion": "success"}, {"name": "u", "conclusion": "success"}], "ci": "green", "examined_head": "a" * 40, "examined_at": 1})
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", labels=("x",))        # the same head
+        self.assertEqual(len(self.snapshot_entry()["checks"]), 2)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="c" * 40)    # a new head
+        self.assertNotIn("checks", self.snapshot_entry())
+
+    def test_an_unsigned_a_foreign_and_a_malformed_event_change_nothing(self):
+        self.assertEqual(self.event("opened", signature=None)[0], 401)
+        self.assertEqual(self.event("opened", signature="sha256=00")[0], 401)
+        self.assertEqual(self.event("opened", repo="other/unwatched")[0], 202)    # names another repo than the one it was verified for
+        self.assertEqual(self.event("opened", raw=b"not json")[0], 400)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+        self.assertEqual(self.event("opened", number=-4)[0], 202)
+        self.assertEqual(self.event("assigned")[0], 202)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+
+    def test_the_picture_stays_bounded_and_private_when_events_exceed_the_cap(self):
+        for n in range(1, sb.PR_STATE_MAX + 51):
+            self.hub.note_pr_event("pull_request", GH_REPO, {"action": "opened", "pull_request": {"number": n, "head": {"sha": "d" * 40}}})
+            self.rig.world.tick(1)
+        self.assertEqual(len(self.hub.pr_event_snapshot()), sb.PR_STATE_MAX)
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        path = self.rig.world.state / sb.PR_STATE_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(len(json.loads(path.read_text())["prs"]), sb.PR_STATE_MAX)
+
+    def test_a_list_read_older_than_an_event_does_not_undo_it_and_a_newer_one_does(self):
+        self.event("opened", head="e" * 40)
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        old_at = self.rig.world.clock.now() - 100
+        state.lists["fleet/scratch"] = (old_at, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "e" * 40)
+        state.lists["fleet/scratch"] = (self.rig.world.clock.now() + 100, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "f" * 40)
+
+    def test_the_pure_rule(self):
+        pe = sb.load_pr_events()
+        self.assertIsNone(pe.entry_for(None, "issues", {"action": "opened"}, 1))
+        self.assertIsNone(pe.entry_for(None, "pull_request", {"action": "assigned", "pull_request": {"number": 1}}, 1))
+        number, entry = pe.entry_for(None, "pull_request", {"action": "opened", "pull_request": {"number": 5, "head": {"sha": "x"}, "labels": [{"name": "a\x1b[31mb"}]}}, 7)
+        self.assertEqual((number, entry["state"], entry["labels"], entry["at"], entry["listed_at"]), (5, "open", ["a [31mb"], 7, 7))
+        picture = {"r#1": {"at": 5, "head": "h", "labels": []}}
+        self.assertEqual(pe.fold(picture, {"r#1": {"at": 3, "head": "old"}, "r#2": {"at": 9, "head": "n"}}, 10), 1)
+        self.assertEqual((picture["r#1"]["head"], picture["r#2"]["head"]), ("h", "n"))
+
+
 class TestGithubReceive(Base):
     def setUp(self):
         super().setUp()
