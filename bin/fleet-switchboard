@@ -155,6 +155,23 @@ def load_report_fold():
     return module
 
 
+def load_pr_events():
+    """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
+    held = sys.modules.get("pr_events")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("pr_events", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pr_events"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("pr_events", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -9489,6 +9506,10 @@ def publish_decisions(engine):
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
+        pr_events_pass(engine, now)   # #354: folds the webhook events into the pr-state picture and writes it, for watched repos too; no GitHub call
+    except Exception as err:
+        engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -12414,6 +12435,7 @@ class GitHubHub:
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
+        self.pr_events = {}     # #354: "owner/repo#N" -> the `pr-state` entry the last verified pull_request event made (memory only; the pass folds it in)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
         self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
 
@@ -12578,6 +12600,7 @@ class GitHubHub:
             self._set_marker(repo, self.now())
         self.note_issue_edit(event, repo, payload)
         self.note_awaiting_event(event, repo, payload)
+        self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
         return 202, "accepted"
@@ -12981,6 +13004,25 @@ class GitHubHub:
                                       "raised_by": raised if rows else None, "closed": closed, "waits_for": waits}
             else:
                 self.awaiting.pop(key, None)
+
+    def note_pr_event(self, event, repo, payload):
+        """A verified `pull_request` event: keep the entry for its PR in memory, with no read at all (#354). Never raises: a bad payload is not kept."""
+        try:
+            number = (payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None
+            ref = "%s#%s" % (plan_ledger.normal_repo(repo), number)
+            with self.lock:
+                made = load_pr_events().entry_for(self.pr_events.get(ref), event, payload, self.now())
+                if made is not None:
+                    self.pr_events[ref] = made[1]
+                    while len(self.pr_events) > PR_STATE_MAX:
+                        self.pr_events.pop(min(self.pr_events, key=lambda r: self.pr_events[r].get("at", 0)))
+        except Exception as err:
+            self._audit("github.rejected", repo, {"reason": "pull_request event not kept: %s" % _one_line(str(err))})
+
+    def pr_event_snapshot(self):
+        """A copy of the entries the events made, for the pass that folds them into the picture."""
+        with self.lock:
+            return {ref: dict(entry) for ref, entry in self.pr_events.items()}
 
     def note_awaiting_event(self, event, repo, payload):
         """A webhook event that carries an issue: keep the picture current with no read at all."""
@@ -17739,6 +17781,17 @@ PR_STATE_MAX = 400          # PRs kept in the file: the most recently seen
 PR_STATE_WRITE_GAP = 20     # seconds between writes of the file (unless something changed enough to matter: the pass always writes the first)
 
 
+def pr_events_pass(engine, now):
+    """Fold the entries the hub's verified pull_request events made into the picture and leave it for `pr-state`; a repo that is only watched (not under
+    `plan_gates`) is known from the moment a PR opens (#354). Reads nothing from GitHub; never raises into the pass."""
+    hub = getattr(engine, "hub", None)
+    if hub is None or engine.state_dir is None or not hasattr(hub, "pr_event_snapshot"):
+        return
+    state = engine.__dict__.setdefault("ci_record_state", CiRecordState())
+    load_pr_events().fold(state.pr_state, hub.pr_event_snapshot(), PR_STATE_MAX)
+    write_pr_state(engine, state, now)
+
+
 def pr_state_from_lists(state, repos):
     """The base entry of every open PR the pass's lists hold (head, draft, labels, when the list was read); a PR that left the list since is marked so."""
     for repo in repos:
@@ -17751,6 +17804,8 @@ def pr_state_from_lists(state, repos):
                 continue
             ref = "%s#%d" % (key, number)
             seen.add(ref)
+            if (state.pr_state.get(ref) or {}).get("via") == "event" and state.pr_state[ref].get("at", 0) > at:
+                continue   # #354: a webhook event newer than this list read is fresher than the list
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
             labels = sorted(_plain(name, 60) for name in ((l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20]) if isinstance(name, str) and name)   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
