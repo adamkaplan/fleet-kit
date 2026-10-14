@@ -59,7 +59,7 @@ NODE=$(kubectl get nodes -o name | head -1 | cut -d/ -f2)
 
 # 1. install Sysbox (upstream installer), then the fix and RuntimeClass
 kubectl label node "$NODE" sysbox-install=yes
-kubectl apply -f https://raw.githubusercontent.com/nestybox/sysbox/master/sysbox-k8s-manifests/sysbox-install.yaml
+kubectl apply -f https://raw.githubusercontent.com/nestybox/sysbox/<pinned tag or commit>/sysbox-k8s-manifests/sysbox-install.yaml
 kubectl apply -f cloud/k8s/containerd-fix.yaml
 kubectl apply -f cloud/k8s/runtimeclass.yaml      # if the installer already created it, this updates it
 kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20
@@ -112,7 +112,7 @@ minutes) belongs to the launcher.
 ## Trust boundaries and limits
 
 - `containerd-fix.yaml` is a node-root component: privileged, `hostPID`, and a ClusterRole that can `get` and `patch`
-  nodes. The label `sysbox-install=yes` is the only gate on where it runs; restrict who may label nodes.
+  nodes. The label `sysbox-install=yes` is the only gate on where it runs; the real boundary is who may patch node labels (the DaemonSet's own token can patch any node), so restrict that RBAC.
 - Sysbox is the boundary that makes the worker's `docker` group and `sudo start-dockerd` safe. Do not run the image
   outside a Sysbox pod with `WORKER_DOCKER` left at 1 on a shared host.
 - The scan finds known credential shapes only; "0 hits" is not proof that no secret exists.

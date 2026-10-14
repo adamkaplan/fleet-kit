@@ -52,4 +52,6 @@ while IFS= read -r layer; do
     || { echo "scan-secrets: cannot extract layer $layer: not scanned" >&2; exit 2; }
 done < <(python3 -c 'import json,sys; [print(l) for e in json.load(open(sys.argv[1])) for l in e["Layers"]]' "$work/img/manifest.json")
 [ "$n" -gt 0 ] || { echo "scan-secrets: no layers found in the image: not scanned" >&2; exit 2; }
+# layer files may carry modes that hide them from us; make them readable so none is skipped
+chmod -R u+rwX "$work/files" 2>/dev/null || true
 if scan_dir "$work/files"; then echo "scan-secrets: 0 hits"; else echo "scan-secrets: hits found" >&2; exit 1; fi

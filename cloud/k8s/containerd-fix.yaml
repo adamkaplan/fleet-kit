@@ -38,12 +38,16 @@ data:
         cp "$CFG" "$CFG.tmp"
         # rename the plugin key on sysbox-runc table headers only
         sed -i -E "s#^\[plugins\.[\"']$OLD[\"']\.containerd\.runtimes\.sysbox-runc#[plugins.'$NEW'.containerd.runtimes.sysbox-runc#" "$CFG.tmp"
+        if cmp -s "$CFG" "$CFG.tmp"; then
+          echo "sysbox-runc is registered in a form this fix does not move: exiting non-zero" >&2; exit 1
+        fi
         mv "$CFG.tmp" "$CFG"; sync
         if $HOST containerd config dump >/dev/null 2>&1 \
            && $HOST containerd config dump | grep -q 'runtimes.sysbox-runc'; then
           echo "config valid: restarting containerd"
           $HOST systemctl restart containerd
           $LABEL_CMD >/dev/null
+          bad=0
         else
           bad=$((bad + 1))
           echo "config invalid (try $bad): restoring backup" >&2
