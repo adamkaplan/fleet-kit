@@ -543,7 +543,7 @@ DEFAULTS = {
     "poll_seconds": 5,
     "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
-    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}}: the events whose runs on the default branch are "main's runs" (default: push)
+    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
@@ -19815,7 +19815,7 @@ def cmd_reds(args, runner, now):
     except Exception:
         cache_dir = None   # no cache is only more calls
     reader = _RedsReader(config, runner, now, repo)
-    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout)
+    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout, module.workflows(config.get("reds")).get(repo))
 
 
 cmd_reds.direct = True   # reads GitHub on its own terms: no daemon start
@@ -23001,7 +23001,22 @@ def load_tick(engine, discovery):
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake))
+    meter = {}
+    accounts = getattr(engine.intents, "accounts", None)
+    if accounts is not None:   # the gh accounts' own books: which account a repo uses, whether it is paused (#361), and the reads GitHub really billed (a 304 is free)
+        def snapshot():
+            with accounts.lock:   # GhAccounts.read appends and trims the deque from other threads under this lock
+                return list(accounts.calls)
+
+        def begin_read():
+            return max([call[0] for call in snapshot()] or [0])   # the newest read so far: what happens after it is this read's
+
+        def read_cost(since, repo):
+            account = accounts.describe(repo)   # only this account's reads are charged to it, and a 304 is free
+            return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
+        meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
+                 "begin_read": begin_read, "read_cost": read_cost}
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake, **meter))
 
 
 def cmd_load_replay(args, runner, now):

@@ -26,11 +26,12 @@ MOVES_ROWS_MAX = 20000
 ARCHIVE_READ_BYTES = 64 << 20    # per audit archive read by the replay
 AUDIT_TAIL_BYTES = 8 << 20
 HISTORY_DAYS = 3                 # finished days of the hourly series kept for the replay
-READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
+READ_BUDGET_DEFAULT = 30         # GitHub reads an hour for each gh account (the key load_alert.read_budget); a 304 is free
+READ_BUDGET_MAX = 60             # a hard ceiling: a key above it is a configuration error
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
 RETRY_SECONDS = 300              # after a failed read the same source is not tried again for this long
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
-DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0}
+DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0, "read_budget": READ_BUDGET_DEFAULT}
 _REF = re.compile(r"report on (?:([\w.-]+)/)?([\w.-]*)#(\d+)")
 
 
@@ -46,6 +47,9 @@ def validate(raw, where):
         value = section[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 168:
             raise ValueError("%s.%s must be a number of hours above 0 and at most 168, got %r" % (where, key, value))
+    budget = section["read_budget"]
+    if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= READ_BUDGET_MAX:
+        raise ValueError("%s.read_budget must be a whole number of GitHub reads an hour for each account, from 1 to %d, got %r" % (where, READ_BUDGET_MAX, budget))
     count = section["stalled_asks"]
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("%s.stalled_asks must be a whole number of 1 or more, got %r" % (where, count))
@@ -313,23 +317,70 @@ def charter_agent(body):
     return found.group(1) if found else None
 
 
-def _resolve_charters(ctx, state, now, reads):
+class _Budget:
+    """The reads of the last hour, counted for each gh account (the repositories one account reads share its count). `ctx` may supply
+    `account_of(repo)`, `paused(repo)` and `begin_read()` / `read_cost(token, repo)` (the reads GitHub really billed: a 304 is free); without them every
+    repository is one account, nothing is paused and a read costs what the caller says."""
+
+    def __init__(self, ctx, state, now):
+        self.ctx, self.now = ctx, now
+        self.limit = (ctx.cfg or {}).get("read_budget", READ_BUDGET_DEFAULT)
+        kept = []
+        for row in state.get("reads", []):
+            if isinstance(row, (int, float)) and not isinstance(row, bool):
+                row = [row, "default"]   # a row written before the budget was per account
+            if isinstance(row, list) and len(row) == 2 and isinstance(row[0], (int, float)) and now - row[0] < 3600:
+                kept.append([row[0], str(row[1])])
+        self.rows, self.paused_said = kept, set()
+
+    def account(self, repo):
+        of = getattr(self.ctx, "account_of", None)
+        return str(of(repo)) if of else "default"
+
+    def left(self, account):
+        return self.limit - sum(1 for _, a in self.rows if a == account)
+
+    def paused(self, repo, problems):
+        """True when the account of `repo` is paused by the rate limit: no read is tried and nothing is counted; said once per account."""
+        check = getattr(self.ctx, "paused", None)
+        if not check or not check(repo):
+            return False
+        account = self.account(repo)
+        if account not in self.paused_said:
+            self.paused_said.add(account)
+            problems.append("account %s is paused by the rate limit: its reads wait" % account)
+        return True
+
+    def metered(self, repo, default_cost, call):
+        """`call()` and charge what it cost, even when it fails (a failed read was still made)."""
+        begin, cost_of = getattr(self.ctx, "begin_read", None), getattr(self.ctx, "read_cost", None)
+        token = begin() if begin and cost_of else None
+        try:
+            return call()
+        finally:
+            cost = cost_of(token, repo) if begin and cost_of else default_cost
+            self.rows.extend([self.now, self.account(repo)] for _ in range(cost))
+
+    def to_state(self):
+        return self.rows
+
+
+def _resolve_charters(ctx, state, now, budget):
     """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
-    (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour and counted in the read budget as 2), else the `charter` of its
-    fleet metadata, unless that issue's own yaml names another agent; an `issue` number of its metadata is never used (it may be another orchestrator's)."""
+    (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour; it costs up to 3 reads and needs 2 left in the account's budget), else
+    the `charter` of its fleet metadata, unless that issue's own yaml names another agent; an `issue` number of its metadata is never used."""
     cache, problems, out = state.setdefault("charters", {}), [], {}
-    repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")})
+    repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")}, key=lambda r: (cache.get(r) or {}).get("at", 0))
     for repo in repos:
         entry = cache.get(repo) or {}
         if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])   # still failing: said every pass, read again only after the retry wait
             continue
-        if getattr(ctx, "read_charters", None) is None or len(reads) + 2 > READ_BUDGET:
+        if getattr(ctx, "read_charters", None) is None or budget.paused(repo, problems) or budget.left(budget.account(repo)) < 2:
             continue
-        reads.extend([now, now])
         try:
-            found = ctx.read_charters(repo)
+            found = budget.metered(repo, 2, lambda: ctx.read_charters(repo))
         except Exception as err:
             text = "%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__)
             problems.append(text)
@@ -351,9 +402,10 @@ def _resolve_charters(ctx, state, now, reads):
 
 
 def _refresh_asks(ctx, state, now):
-    """Re-read at most READ_BUDGET asks lists an hour (the oldest first); a failed read keeps the cached list and is told."""
-    cache, reads, problems = state.setdefault("asks", {}), [t for t in state.get("reads", []) if now - t < 3600], []
-    charters, more = _resolve_charters(ctx, state, now, reads)
+    """Re-read each asks list at most hourly, the oldest first, within each account's read budget; a failed read keeps the cached list and is told."""
+    cache, problems = state.setdefault("asks", {}), []
+    budget = _Budget(ctx, state, now)
+    charters, more = _resolve_charters(ctx, state, now, budget)
     problems.extend(more)
     state["charter_of"] = {n: c for n, c in charters.items() if c is not None}
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
@@ -363,11 +415,10 @@ def _refresh_asks(ctx, state, now):
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])
             continue
-        if not info.get("charter") or len(reads) >= READ_BUDGET:
+        if not info.get("charter") or budget.paused(info.get("repo"), problems) or budget.left(budget.account(info.get("repo"))) < 1:
             continue
-        reads.append(now)
         try:
-            found = ctx.read_asks(info["charter"], info.get("repo"))
+            found = budget.metered(info.get("repo"), 1, lambda: ctx.read_asks(info["charter"], info.get("repo")))
         except Exception as err:   # an unreadable source is told, not guessed
             text = "%s: asks not readable (%s)" % (name, str(err).splitlines()[0][:80] if str(err) else type(err).__name__)
             problems.append(text)
@@ -377,7 +428,7 @@ def _refresh_asks(ctx, state, now):
         cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
-    state["reads"] = reads
+    state["reads"] = budget.to_state()
     return problems
 
 

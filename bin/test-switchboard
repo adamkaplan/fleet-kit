@@ -42877,12 +42877,18 @@ class FakeActions:
         self.fail_paths = set()
         self.next_id = 100
 
-    def pr_run(self, names, complete=True, artifact=True):
-        return self.add_run("pull_request", "feature", names, complete, "2027-01-15T08:00:00Z", artifact, sha="b" * 40)
+    WORKFLOWS = {"A": (11, ".github/workflows/a-ci.yml"), "B": (22, ".github/workflows/b-style.yml")}
 
-    def add_run(self, event, branch, names, complete=True, created="2027-01-15T07:00:00Z", artifact=True, sha=None, expired=False, raw=None):
+    def pr_run(self, names, complete=True, artifact=True, workflow="A", created="2027-01-15T08:00:00Z", **more):
+        return self.add_run("pull_request", "feature", names, complete, created, artifact, sha="b" * 40, workflow=workflow, **more)
+
+    def add_run(self, event, branch, names, complete=True, created="2027-01-15T07:00:00Z", artifact=True, sha=None, expired=False, raw=None, workflow="A", no_workflow_id=False):
         self.next_id += 1
-        run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed"}
+        wid, path = self.WORKFLOWS[workflow]
+        run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed",
+               "workflow_id": wid, "name": "Workflow " + workflow, "path": path}
+        if no_workflow_id:
+            del run["workflow_id"]
         self.runs.setdefault(event, []).append(run)
         if artifact:
             self.zips[self.next_id + 5000] = raw if raw is not None else _artifact_zip(names, complete, self.next_id)
@@ -42903,7 +42909,15 @@ class FakeActions:
         if path == base + "pulls/12":
             return done(json.dumps(self.pull))
         query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        found = re.fullmatch(re.escape(base) + r"actions/workflows/([^/?]+)/runs", urllib.parse.urlparse(path).path)
+        if found:   # one workflow's own runs, by id or by file name
+            which = urllib.parse.unquote(found.group(1))
+            event = query["event"][0]
+            runs = [r for r in self.runs.get(event, []) if (getattr(self, "leak_foreign", False) or str(r.get("workflow_id")) == which or r["path"].endswith("/" + which)) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
+            return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
         if path.startswith(base + "actions/runs?"):
+            if "head_sha" not in query:
+                raise AssertionError("reds must not list the repo's runs by event alone: that was the defect (%r)" % path)
             event = query["event"][0]
             runs = [r for r in self.runs.get(event, []) if ("head_sha" not in query or r["head_sha"] == query["head_sha"][0]) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
             return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
@@ -42948,9 +42962,9 @@ class TestReds(Base):
                 raise sb.load_reds().RedsError(done.stderr)
             return done.stdout
 
-    def run_reds(self, events=("push",), cache=True):
+    def run_reds(self, events=("push",), cache=True, workflow=None):
         out = io.StringIO()
-        code = self.hs.run(self.Reader(self.fake, FakeActions.REPO), FakeActions.REPO, 12, list(events), self.state if cache else None, self.now, out)
+        code = self.hs.run(self.Reader(self.fake, FakeActions.REPO), FakeActions.REPO, 12, list(events), self.state if cache else None, self.now, out, workflow)
         return code, out.getvalue()
 
     def main_runs(self, histories, event="push", branch="main"):
@@ -42968,7 +42982,7 @@ class TestReds(Base):
         self.assertIn("also failing on main (1):\n    t/a.test::a (1 of 5 main runs)", out)
         self.assertIn("flaky on main (1):\n    t/b.test::b (2 of 5 main runs)", out)
         self.assertIn("new (1):\n    t/c.test::c", out)
-        self.assertRegex(out, r"main's latest run: push [0-9c]{7} \d+m ago \(reference events: push\)")
+        self.assertRegex(out, r"main's latest run: push [0-9c]{7} \d+m ago \(workflow Workflow A; reference events: push\)")
 
     def test_s2_one_failure_in_five_is_not_flaky_two_is(self):
         self.fake.pr_run(["x::once", "y::twice"])
@@ -42986,7 +43000,7 @@ class TestReds(Base):
         self.fake.add_run("push", "main", ["f::flaky-one"], created=self.created(250), expired=True)
         code, out = self.run_reds()
         self.assertEqual(code, 0, out)
-        self.assertIn("main runs: 5 listed, 2 usable, 3 unknown", out)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 2 usable, 3 unknown", out)
         self.assertIn("flaky on main", out)
         self.assertNotIn("flaky-one (2 of 5", out)
         self.assertIn("(2 of 2 main runs)", out)
@@ -43049,7 +43063,7 @@ class TestReds(Base):
         self.fake.add_run("schedule", "main", ["b::u"], created=self.created(70))
         self.fake.add_run("schedule", "feature", ["b::u"], created=self.created(1))
         code, out = self.run_reds(events=("merge_group", "schedule"))
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out)
         self.assertRegex(out, r"main's latest run: merge_group [0-9c]{7} ")
         self.assertIn("also failing on main (1):\n    a::t", out)
         code, out = self.run_reds(events=("push",))
@@ -43070,13 +43084,13 @@ class TestReds(Base):
         self.main_runs([["a::t"], []])
         code, out = self.run_reds()
         self.assertIn("its list is INCOMPLETE", out)
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out)
         self.assertIn("also failing on main (1)", out)
 
     def test_u1_a_failed_read_says_so_classifies_nothing_and_exits_1(self):
         self.fake.pr_run(["a::t"])
         self.main_runs([["a::t"]])
-        for bad in ("pulls/12", "actions/runs?head_sha", "actions/runs?event=push", "actions/artifacts?name"):
+        for bad in ("pulls/12", "actions/runs?head_sha", "actions/workflows/11/runs", "actions/artifacts?name"):
             fake = self.fake
             fake.fail_paths = {bad}
             code, out = self.run_reds(cache=False)
@@ -43089,12 +43103,14 @@ class TestReds(Base):
         self.fake.pr_run(["a::t"], artifact=False)
         code, out = self.run_reds()
         self.assertEqual(code, 3, "unknown, not classified")
-        self.assertIn("no usable failing-tests artifact (no artifact): unknown, nothing was classified", out)
+        self.assertIn("no failing-tests artifact on the pull request's run", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)   # the fakes reuse run ids
         broken = FakeActions()
         broken.add_run("pull_request", "feature", [], created=self.created(1), sha="b" * 40, raw=b"not a zip")
         self.fake = broken
         code, out = self.run_reds()
         self.assertIn("unknown, nothing was classified", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
         empty = FakeActions()
         self.fake = empty
         code, out = self.run_reds()
@@ -43149,7 +43165,138 @@ class TestReds(Base):
         self.assertEqual(code, 0, out)
         self.assertIn("1 older complete run(s) only", out)
         self.assertIn("new (2):\n    a::t (1 of 1 main runs)\n    b::u\n", out)
-        self.assertIn("main runs: 3 listed, 1 usable, 2 unknown", out)
+        self.assertIn("main runs: 3 listed (workflow Workflow A), 1 usable, 2 unknown", out)
+
+    # -- the workflow of the artifact (fix to #342: main's runs are the runs of the workflow that holds the pull request's artifact)
+
+    def test_s1_only_the_artifact_workflow_s_main_runs_are_listed_and_another_workflow_is_never_unknown(self):
+        self.fake.pr_run(["a::t", "b::u"])
+        for position in range(5):
+            self.fake.add_run("push", "main", ["a::t"] if position % 2 == 0 else [], created=self.created(10 + position * 60), workflow="A")
+            self.fake.add_run("push", "main", [], created=self.created(5 + position * 60), workflow="B", artifact=False)
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 5 usable, 0 unknown", out)
+        self.assertIn("workflow Workflow A; reference events: push", out)
+        listed = [c for c in self.fake.calls if "actions/workflows/" in c]
+        self.assertEqual(len(listed), 1)
+        self.assertIn("workflows/11/runs", listed[0])
+
+    def test_s1b_a_missing_artifact_of_the_chosen_workflow_is_unknown_and_another_workflow_never_is(self):
+        self.fake.pr_run(["a::t"])
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        self.fake.add_run("push", "main", [], created=self.created(20), workflow="A", artifact=False)       # A without its artifact: unknown, as before
+        self.fake.add_run("push", "main", [], created=self.created(5), workflow="B", artifact=False)        # B: never listed
+        code, out = self.run_reds()
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 1 usable, 1 unknown", out)
+
+    def test_s2_the_newest_pull_request_run_that_holds_the_artifact_is_the_pull_request_s_run_and_the_workflow_is_named(self):
+        self.fake.pr_run([], artifact=False, workflow="B", created="2027-01-15T09:00:00Z")   # the newest run, another workflow, no artifact
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 failing in the pull request's run of workflow Workflow A", out)
+        self.assertIn("also failing on main (1)", out)
+        self.assertNotIn("workflows hold a failing-tests artifact", out)
+
+    def test_s2b_when_two_workflows_hold_an_artifact_it_says_so_in_one_line_and_names_the_one_used(self):
+        self.fake.pr_run(["a::t"], workflow="B", created="2027-01-15T09:00:00Z")
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="B")
+        code, out = self.run_reds()
+        self.assertEqual(len([l for l in out.splitlines() if "workflows hold a failing-tests artifact" in l]), 1)
+        self.assertIn("2 workflows hold a failing-tests artifact on this pull request (Workflow A, Workflow B): the newest run's workflow, Workflow B, was used", out)
+        self.assertIn("(workflow Workflow B;", out)
+
+    def test_s3_a_pull_request_none_of_whose_runs_holds_an_artifact_cannot_be_classified_and_main_is_not_listed(self):
+        self.fake.pr_run([], artifact=False, workflow="A")
+        self.fake.pr_run([], artifact=False, workflow="B", created="2027-01-15T07:30:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("no failing-tests artifact on the pull request's run")]), 1)
+        self.assertFalse([c for c in self.fake.calls if "actions/workflows/" in c], "no main run of any workflow was listed")
+
+    def test_s4_the_messages_name_the_workflow_and_say_how_many_of_its_runs_were_looked_at(self):
+        self.fake.pr_run(["a::t"])
+        for position in range(5):
+            self.fake.add_run("push", "main", [], created=self.created(10 + position * 60), workflow="A", artifact=False)
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertEqual(len([l for l in out.splitlines() if l == "no failing-tests artifact in the newest 5 runs of workflow Workflow A"]), 1)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 0 usable, 5 unknown", out)
+
+    def test_s5_the_call_counts_with_two_reference_events_stay_within_14_cold_and_4_warm(self):
+        self.fake.pr_run(["a::t"])
+        for position in range(3):
+            self.fake.add_run("merge_group", "gh-readonly-queue/main/pr-%d-abc" % position, ["a::t"], created=self.created(10 + position * 60), workflow="A")
+        for position in range(2):
+            self.fake.add_run("schedule", "main", ["a::t"], created=self.created(40 + position * 60), workflow="A")
+            self.fake.add_run("schedule", "main", [], created=self.created(41 + position * 60), workflow="B", artifact=False)
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(self.fake.calls), 14, self.fake.calls)
+        cold = len(self.fake.calls)
+        del self.fake.calls[:]
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(self.fake.calls), 4, self.fake.calls)
+        self.assertTrue(all(len(a) == 3 for a in self.fake.argvs), "plain GETs only")
+
+    def test_s6_the_workflow_override_picks_the_pull_request_s_run_of_that_file_and_lists_its_runs(self):
+        self.fake.pr_run(["a::t"], workflow="B", created="2027-01-15T09:00:00Z")     # newer, with an artifact, but not the configured one
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(5), workflow="B")
+        code, out = self.run_reds(workflow="a-ci.yml")
+        self.assertEqual(code, 0, out)
+        self.assertIn("in the pull request's run of workflow Workflow A", out)
+        self.assertIn("main runs: 1 listed (workflow Workflow A)", out)
+        listed = [c for c in self.fake.calls if "actions/workflows/" in c]
+        self.assertIn("workflows/a-ci.yml/runs", listed[0])
+        code, out = self.run_reds(workflow="nothing.yml")
+        self.assertEqual(code, 3)
+        self.assertIn("no completed run of workflow nothing.yml", out)
+
+    def test_s6_the_override_setting_is_strict_a_file_name_only(self):
+        self.assertEqual(self.hs.workflows({"workflow": {"acme/widget": "ci.yml"}}), {"acme/widget": "ci.yml"})
+        for bad in ("../ci.yml", ".github/workflows/ci.yml", "https://x/ci.yml", "ci", "ci.yml?x=1", "", 5, None, "ci.yml\n"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.hs.workflows({"workflow": {"acme/widget": bad}})
+        for bad in ({"workflow": []}, {"workflow": {"nope": "ci.yml"}}):
+            with self.assertRaises(ValueError):
+                self.hs.workflows(bad)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "reds": {"workflow": {"acme/widget": "../x.yml"}}})
+
+    def test_a_run_with_no_workflow_id_says_workflow_unknown_and_never_lists_by_event_alone(self):
+        self.fake.pr_run(["a::t"], no_workflow_id=True)
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertIn("names no workflow (workflow unknown): cannot classify", out)
+        self.assertFalse([c for c in self.fake.calls if "actions/workflows/" in c or ("actions/runs?" in c and "head_sha" not in c)])
+
+    def test_a_non_positive_workflow_id_is_unknown_and_a_foreign_workflow_run_in_a_listing_is_skipped(self):
+        for bad in (0, -3, True):
+            with self.subTest(bad=bad):
+                self.fake = FakeActions()
+                shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+                self.fake.pr_run(["a::t"])
+                self.fake.runs["pull_request"][-1]["workflow_id"] = bad
+                code, out = self.run_reds()
+                self.assertEqual(code, 3, out)
+                self.assertIn("workflow unknown", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+        self.fake = FakeActions()
+        self.fake.pr_run(["a::t"])
+        own = self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        foreign = self.fake.add_run("push", "main", ["a::t"], created=self.created(5), workflow="A")
+        for run in self.fake.runs["push"]:
+            if run["id"] == foreign:
+                run["workflow_id"] = 22   # a listing that hands back another workflow's run: skipped, defensively
+        self.fake.leak_foreign = True
+        code, out = self.run_reds()
+        self.assertIn("main runs: 1 listed (workflow Workflow A), 1 usable, 0 unknown", out)
 
     def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
@@ -43160,8 +43307,8 @@ class TestReds(Base):
         with captured() as (out, err):
             code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
         self.assertEqual(code, 0, out.getvalue() + err.getvalue())
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out.getvalue())
-        self.assertIn("(reference events: merge_group, schedule)", out.getvalue())
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out.getvalue())
+        self.assertIn("reference events: merge_group, schedule)", out.getvalue())
         self.assertTrue(any("event=merge_group" in c for c in self.fake.calls) and not any("event=push" in c for c in self.fake.calls))
         self.fake.fail_paths = {"actions/artifacts?name"}
         shutil.rmtree(str(sb.state_dir_path() / "reds-cache"), ignore_errors=True)
@@ -43176,7 +43323,7 @@ class TestReds(Base):
         run = self.fake.add_run("push", "main", ["a::t"], created=self.created(10))
         self.fake.artifacts[run]["size_in_bytes"] = self.hs.ZIP_MAX + 1
         code, out = self.run_reds()
-        self.assertIn("main runs: 1 listed, 0 usable, 1 unknown; run %d: artifact too large" % run, out)
+        self.assertIn("main runs: 1 listed (workflow Workflow A), 0 usable, 1 unknown; run %d: artifact too large" % run, out)
         self.assertFalse([c for c in self.fake.calls if c.endswith("/zip") and str(self.fake.artifacts[run]["id"]) in c], "never downloaded")
         del self.fake.artifacts[run]["size_in_bytes"]
         shutil.rmtree(str(self.state / "reds-cache"))
@@ -47502,7 +47649,7 @@ class TestLoadAlert(Base):
         many = {"o%d" % n: self.orch(charter=n) for n in range(1, 41)}
         self.tick(self.T0, many)
         self.tick(self.T0 + 1800, many)
-        self.assertLessEqual(len(self.reads), 10)
+        self.assertLessEqual(len(self.reads), 30)   # the default budget: 30 reads an hour for the account (#348 amendment of PC-1)
         # an unreadable source: the cache goes stale, the asks are not believed, nobody is woken, and status says so once
         self.fail_reads = True
         self.woken.clear()
@@ -47722,10 +47869,142 @@ class TestLoadAlert(Base):
         state = json.loads((self.state_dir / "load.json").read_text())
         now = self.T0 + 2 * self.health.ASKS_FRESH_SECONDS + 10
         state["charters"] = {}
-        state["reads"] = [now - 60] * (self.health.READ_BUDGET - 1)
+        state["reads"] = [[now - 60, "default"]] * (self.health.READ_BUDGET_DEFAULT - 1)
         (self.state_dir / "load.json").write_text(json.dumps(state))
         self.health.tick(self.charters_ctx(now, calls, orch))
         self.assertEqual(len(calls), 2)                       # refused: no third call
+
+    def budget_ctx(self, at, orchestrators, asks_log, charters_log=None, **extra):
+        def read_asks(charter, repo):
+            asks_log.append((at, repo, charter))
+            return []
+        kw = dict(extra)
+        if charters_log is not None:
+            kw["read_charters"] = lambda repo: charters_log.append((at, repo)) or []
+        cfg = dict(self.health.DEFAULTS, **kw.pop("cfg", {}))
+        return self.health.Context(now=at, state_dir=str(self.state_dir), cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, cos="cos",
+                                   wake=self.woken.append, **kw)
+
+    def many(self, count, repo="r", first=1, charter=True):
+        return {"o%d" % n: {"charter": n if charter else None, "repo": repo, "busy": 0, "idle": 1, "messages": 0} for n in range(first, first + count)}
+
+    def test_the_read_budget_key_defaults_to_30_allows_60_and_refuses_the_rest(self):
+        self.assertEqual(self.health.validate(None, "x")["read_budget"], 30)
+        self.assertEqual(self.health.validate({"read_budget": 60}, "x")["read_budget"], 60)
+        for bad in (61, 0, "many", True, 2.5):
+            with self.assertRaises(ValueError, msg=repr(bad)) as raised:
+                self.health.validate({"read_budget": bad}, "x")
+            self.assertIn("read_budget", str(raised.exception))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"load_alert": {"read_budget": 61}})
+
+    def test_a_full_cycle_of_ten_orchestrators_on_five_repos_fits_one_hour_within_the_budget(self):
+        orch = {}
+        for r in range(5):
+            orch.update(self.many(2, repo="repo%d" % r, first=1 + 2 * r))
+        asks, charters = [], []
+        for k in range(12):                                   # a pass every 5 minutes for an hour
+            self.health.tick(self.budget_ctx(self.T0 + k * 300, orch, asks, charters))
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual((len(asks), len(charters)), (10, 5))   # every source read once in the hour
+        self.assertEqual(len(state["reads"]), 20)   # 5 x 2 + 10, well within 30
+        self.assertTrue(all(state["asks"][n]["at"] >= self.T0 for n in orch))
+
+    def test_a_hundred_orchestrators_stop_at_the_budget_and_the_oldest_are_read_first_next_hour(self):
+        orch = self.many(100)
+        first, second = [], []
+        self.health.tick(self.budget_ctx(self.T0, orch, first, []))
+        self.health.tick(self.budget_ctx(self.T0 + 600, orch, first, []))
+        self.assertEqual(len(first), 28)                      # 30 reads: 2 for the charters, 28 asks lists
+        self.health.tick(self.budget_ctx(self.T0 + 3700, orch, second, []))
+        self.assertEqual(len(second), 28)
+        self.assertEqual({c for _, _, c in first} & {c for _, _, c in second}, set())   # the ones never read come first
+
+    def test_a_paused_account_is_skipped_not_counted_and_named_while_another_is_read(self):
+        orch = dict(self.many(5, repo="work/r1"), **self.many(5, repo="own/r2", first=6))
+        asks, charters = [], []
+        ctx = self.budget_ctx(self.T0, orch, asks, charters, account_of=lambda repo: "work" if repo.startswith("work/") else "default",
+                              paused=lambda repo: repo.startswith("work/"))
+        self.health.tick(ctx)
+        self.assertEqual({repo for _, repo, _ in asks}, {"own/r2"})
+        self.assertEqual([repo for _, repo in charters], ["own/r2"])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual({a for _, a in state["reads"]}, {"default"})
+        self.assertEqual(len(state["reads"]), 7)             # 2 for the charters and 5 asks lists, none for the paused account
+        self.assertEqual([p for p in state["problems"] if "paused" in p], ["account work is paused by the rate limit: its reads wait"])
+        self.assertTrue(any("paused" in l for l in self.health.status_lines(str(self.state_dir), self.T0)))
+
+    def test_reads_answered_304_are_free_and_not_counted(self):
+        orch = self.many(40)
+        asks = []
+        ctx = self.budget_ctx(self.T0, orch, asks, begin_read=lambda: 0, read_cost=lambda token, repo: 0)   # every read answered 304
+        self.health.tick(ctx)
+        self.assertEqual(len(asks), 40)                       # past the 30 budget: none was billed
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["reads"], [])
+
+    def test_each_account_has_its_own_count_and_neither_starves_the_other(self):
+        orch = dict(self.many(40, repo="a/r"), **self.many(40, repo="b/r", first=41))
+        asks = []
+        ctx = self.budget_ctx(self.T0, orch, asks, account_of=lambda repo: repo.split("/")[0])
+        self.health.tick(ctx)
+        self.assertEqual((len([1 for _, repo, _ in asks if repo == "a/r"]), len([1 for _, repo, _ in asks if repo == "b/r"])), (30, 30))
+        self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 60)
+
+    def test_old_bare_number_rows_count_for_the_default_account_and_junk_rows_are_dropped(self):
+        orch = self.many(40)
+        (self.state_dir / "load.json").write_text(json.dumps({"reads": [self.T0 - 60] * 25 + [["x"], "junk", [self.T0 - 60, "default", 1], [self.T0 - 99999, "default"]]}))
+        asks = []
+        self.health.tick(self.budget_ctx(self.T0, orch, asks))
+        self.assertEqual(len(asks), 5)                        # 30 - 25 old rows left; the junk and the expired row count for nothing
+
+    def test_a_read_that_fails_is_still_charged(self):
+        def failing(charter, repo):
+            raise RuntimeError("gh is down")
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=self.many(3),
+                                  read_asks=failing, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 3)
+
+    def test_the_billing_snapshot_is_taken_under_the_accounts_lock_and_only_for_the_account(self):
+        calls = collections.deque()
+        lock = threading.Lock()
+        accounts = types.SimpleNamespace(calls=calls, lock=lock, paused={}, describe=lambda repo: repo.split("/")[0])
+        held = []
+        class Spy(collections.deque):
+            def __iter__(inner):
+                held.append(lock.locked())
+                return super().__iter__()
+        spy = Spy()
+        accounts.calls = spy
+        def _api(path, repo):
+            spy.append((self.T0 + len(spy) + 1, "a", "x", False))
+            spy.append((self.T0 + len(spy) + 1, "b", "x", False))   # another account's read at the same moment
+            return []
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        intents = types.SimpleNamespace(repo="a/r", _api=_api, accounts=accounts, open_asks=lambda c, r: [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 1, "repo": "a/r"})}))
+        self.assertTrue(held and all(held))                    # every iteration of the shared deque happened with the lock held
+        reads = json.loads((self.state_dir / "load.json").read_text())["reads"]
+        self.assertEqual({a for _, a in reads}, {"a"})         # the other account's concurrent read is not charged
+
+    def test_the_daemon_counts_what_github_billed_and_not_the_304s_nor_a_paused_account(self):
+        calls = collections.deque()
+        accounts = types.SimpleNamespace(calls=calls, lock=threading.Lock(), paused={"work": self.T0 + 600}, describe=lambda repo: "work" if repo.startswith("w/") else "default")
+        def _api(path, repo):
+            calls.append((self.T0 + len(calls) + 1, accounts.describe(repo), "x", "etag" in path))   # a path containing 'etag' stands for a 304
+            return []
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        intents = types.SimpleNamespace(repo="own/r", _api=_api, accounts=accounts, open_asks=lambda c, r: _api("asks-etag", r) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        discovery = types.SimpleNamespace(agents={"a": seen("a", {"role": "orchestrator", "charter": 1, "repo": "own/r"}),
+                                                  "w": seen("w", {"role": "orchestrator", "charter": 2, "repo": "w/r"})})
+        sb.load_tick(engine, discovery)
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual([a for _, a in state["reads"]], ["default"])   # only the labels read (no label found: 1 call) is billed; the 304 asks read and the paused account's are not
+        self.assertTrue(any("account work is paused" in p for p in state["problems"]))
 
     def test_many_orchestrators_with_no_charter_are_named_with_a_count(self):
         orch = {"o%d" % n: {"charter": None, "repo": None, "busy": 0, "idle": 0, "messages": 0} for n in range(9)}
