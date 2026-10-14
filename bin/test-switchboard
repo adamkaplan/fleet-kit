@@ -40154,6 +40154,147 @@ class TestDiskReport(Base):
             self.assertIn(phrase, section.lower())
 
 
+class TestTempJanitor(Base):
+    """The temp-directory janitor (ask #321): old AND unnamed entries only, a dry run by default, links never followed, each removal audited."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.outside = self.home / "outside"
+        self.outside.mkdir()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "keep": ["keepme-*"]}})
+        self.now = self.world.clock.now()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.as_cos()
+
+    def as_cos(self):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+
+    def old(self, name, days=10, body="x", directory=False):
+        path = self.temp / name
+        if directory:
+            path.mkdir()
+            (path / "inner.txt").write_text(body)
+        else:
+            path.write_text(body)
+        stamp = self.now - days * 86400
+        for p in ([path / "inner.txt"] if directory else []) + [path]:
+            os.utime(str(p), (stamp, stamp))
+        return path
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", *argv], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def audits(self):
+        return [e for e in self.world.audit() if e["event"] == "temp.removed"]
+
+    def test_s1_only_the_old_unnamed_entry_goes_and_a_dry_run_removes_nothing(self):
+        gone = self.old("scratch-old-unnamed.log")
+        by_path = self.old("named-by-path.txt")
+        by_name = self.old("named-by-basename-dir", directory=True)
+        glob = self.old("keepme-notes.txt")
+        marked = self.old("marked-dir", directory=True)
+        (marked / ".fleet-keep").write_text("")
+        young = [self.old("young-file.txt", days=1), self.old("young-dir", days=2, directory=True)]
+        (self.world.state / "reminders.json").write_text(json.dumps({"r1": {"text": "read %s later" % by_path}}))
+        (self.world.state / "other.json").write_text(json.dumps({"brief": "see named-by-basename-dir for the log"}))
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("would remove"), 1)
+        self.assertIn("would remove scratch-old-unnamed.log", out)
+        self.assertTrue(gone.exists())
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(gone.exists())
+        for kept in [by_path, by_name, glob, marked] + young:
+            self.assertTrue(kept.exists(), kept.name)
+        self.assertIn("kept named-by-path.txt: named by the fleet's records", out)
+        self.assertIn("kept keepme-notes.txt: matches a keep glob", out)
+        self.assertIn("holds a .fleet-keep marker", out)
+        self.assertTrue(self.temp.exists())
+
+    def test_s2_a_link_is_removed_as_a_link_a_foreign_and_an_oversized_entry_are_kept(self):
+        target = self.outside / "precious"
+        target.mkdir()
+        for i in range(5):
+            (target / ("f%d" % i)).write_text("keep me")
+        link = self.temp / "link-to-outside"
+        os.symlink(str(target), str(link))
+        os.utime(str(link), (self.now - 10 * 86400,) * 2, follow_symlinks=False)
+        big = self.old("big-dir", directory=True)
+        for i in range(6):
+            (big / ("g%d" % i)).write_text("x")
+            os.utime(str(big / ("g%d" % i)), (self.now - 10 * 86400,) * 2)
+        with mock.patch.object(self.jan, "WALK_ENTRIES", 3):
+            code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(link.is_symlink() or link.exists())
+        self.assertEqual(len(list(target.iterdir())), 5, "the link's target is untouched")
+        self.assertTrue(big.exists())
+        self.assertIn("kept big-dir: too many files", out)
+        rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), uid=os.getuid() + 1)
+        self.assertTrue(rows and all(r["action"] == "keep" and r["why"] == "owned by another user" for r in rows))
+
+    def test_the_temp_directory_must_be_a_plain_directory_the_user_owns_and_not_close_to_the_root(self):
+        link = self.home / "linked-tmp"
+        os.symlink(str(self.temp), str(link))
+        self.assertFalse(self.jan.safe_dir(link)[0])
+        self.assertFalse(self.jan.safe_dir(Path("/"))[0])
+        self.assertFalse(self.jan.safe_dir(Path(os.path.expanduser("~")))[0])
+        self.assertTrue(self.jan.safe_dir(self.temp)[0])
+
+    def test_s3_each_removal_is_one_audit_line_and_the_kill_switch_removes_nothing(self):
+        self.old("a-old-one.txt")
+        self.old("b-old-two.txt")
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(e["subject"], e["detail"]["bytes"]) for e in self.audits()], [("a-old-one.txt", 1), ("b-old-two.txt", 1)])
+        self.old("c-old-three.txt")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "enabled": False}})
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("switched off", err)
+        self.assertTrue((self.temp / "c-old-three.txt").exists())
+
+    def test_s4_an_ordinary_agent_may_not_apply_and_anyone_may_look(self):
+        victim = self.old("old-file.txt")
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator or the Chief of Staff", err)
+        self.as_cos()
+        self.assertTrue(victim.exists())
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        self.assertIn("would remove old-file.txt", out)
+
+    def test_a_hostile_name_is_printed_as_plain_text(self):
+        self.old("bad\x1b[2Jname.txt")
+        code, out, err = self.run_cli()
+        self.assertIn("would remove bad", out)
+        self.assertEqual([c for c in out if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
+
+    def test_a_bad_config_is_refused_with_its_reason(self):
+        for bad in ({"days": 0}, {"days": "7"}, {"keep": "x"}, {"enabled": "yes"}, {"dir": "relative"}, {"other": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.jan.validate(bad)
+        self.jan.validate({"days": 30, "keep": ["a*"], "dir": "/tmp/x", "enabled": True})
+
+    def test_s5_the_docs_say_what_counts_as_named_and_the_other_disk_subcommands_stay(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        for phrase in ("fleet-keep", "GitHub issue", "temp_janitor"):
+            self.assertIn(phrase, text)
+        disk = [a for a in sb.build_parser()._subparsers._group_actions[0].choices["disk"]._subparsers._group_actions[0].choices]
+        for name in ("prune", "reap-docker", "reclaim-worktrees", "janitor", "report"):
+            self.assertIn(name, disk)
+
+
 class TestDockerReaper(Base):
     """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
 
