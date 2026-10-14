@@ -552,7 +552,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
 
 
 def config_known_keys():
@@ -643,6 +643,7 @@ def validate_config(raw, source="config"):
     validate_decisions_config(config, source)  # PR 14
     validate_external_config(config, source)
     validate_friction_config(config, source)
+    validate_load_alert_config(config, source)
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
     validate_order_burst(config, source)
@@ -9971,6 +9972,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("friction-wake", "friction-wake", err, report)
     try:
+        load_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("load-alert", "load-alert", err, report)
+    try:
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
@@ -12822,6 +12827,10 @@ class GitHubHub:
             self._set_marker(repo, self.now())
         self.note_issue_edit(event, repo, payload)
         self.note_awaiting_event(event, repo, payload)
+        try:   # #348: a push, a PR opened or merged is real movement of the ask it closes: one small row, for the load figure
+            load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
+        except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
+            self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
@@ -13862,6 +13871,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
+            report["load"] = load_fleet_health().status_lines(state, now())
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -14053,6 +14063,7 @@ def format_status(report):
     lines.extend(report.get("pane_lines") or [])
     lines.extend("      " + report["v2_link"] for _ in [0] if report.get("v2_link"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
+    lines.extend("      " + line for line in report.get("load") or [])   # #348
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
@@ -21438,6 +21449,130 @@ def add_policy_parsers(sub):
                                                              "was judged for 30 minutes")
     sub.add_parser("judge-tool", help="Judge one tool call: JSON on stdin, one JSON line out, exit 0 "
                                       "(the fleet-hooks plugin runs this; the judge only tightens)")
+
+
+# ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
+def load_fleet_health():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
+    held = sys.modules.get("fleet_health")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("fleet_health", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fleet_health"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("fleet_health", None)
+        raise
+    return module
+
+
+def validate_load_alert_config(config, source):
+    """`load_alert`: absent or null is off (the load figures are still kept and shown)."""
+    if "load_alert" not in config:
+        return
+    try:
+        config["load_alert"] = load_fleet_health().validate(config["load_alert"], "%s: 'load_alert'" % source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+
+
+def load_tick(engine, discovery):
+    """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
+    makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
+    if discovery is None or engine.state_dir is None:
+        return []
+    health, now = load_fleet_health(), engine.now()
+    cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
+    reminders = read_reminders(engine.state_dir)
+    orchestrators = {}
+    for name, seen in sorted(discovery.agents.items()):
+        fleet = seen.fleet or {}
+        if fleet.get("role") != "orchestrator":
+            continue
+        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"]
+        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,
+                               "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
+                               "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+
+    def read_asks(charter, repo):
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        return [{"repo": issue.repo or repo, "number": issue.number} for issue in engine.intents.open_asks(charter, repo)]
+
+    def wake(text):
+        add_reminder(engine.state_dir, cos, now, now, text)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
+
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, cos=cos, wake=wake))
+
+
+def cmd_load_replay(args, runner, now):
+    """`load-replay`: when the load alert WOULD have fired over a recorded day of the hourly series (read-only; sends nothing)."""
+    health = load_fleet_health()
+    cfg = dict(health.DEFAULTS)
+    try:
+        configured = load_config().get("load_alert")
+        cfg = dict(cfg, **(configured or {}))
+    except ConfigError:
+        pass
+    for key, value in (("stalled_hours", args.stalled_hours), ("stalled_asks", args.stalled_asks), ("backlog_hours", args.backlog_hours)):
+        if value is not None:
+            cfg[key] = value
+    try:
+        cfg = health.validate(cfg, "load-replay")
+    except ValueError as err:
+        sys.stderr.write("%s: load-replay: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if args.day is not None and not re.fullmatch(r"\d{4}-\d\d-\d\d", args.day):
+        sys.stderr.write("%s: load-replay: --day must be a UTC date, YYYY-MM-DD, got %r\n" % (PROG, args.day[:20]))
+        return EXIT_USAGE
+    try:
+        if args.day is not None:
+            datetime.strptime(args.day, "%Y-%m-%d")
+    except ValueError:
+        sys.stderr.write("%s: load-replay: --day %r is not a calendar date\n" % (PROG, args.day))
+        return EXIT_USAGE
+    days, firings = health.replay(state_dir_path(), cfg, args.day)
+    chosen = args.day or datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%d")
+    source, notes = "the recorded hourly series", None
+    if args.from_audit or (firings is None and args.day):
+        firings, notes = health.replay_audit(state_dir_path(), cfg, chosen)
+        source = "the audit log and its archives (best effort)"
+    if firings is None:
+        print("no recorded day%s and no audit log to rebuild it from; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
+        return EXIT_USAGE if args.day else EXIT_OK
+    day = chosen if source != "the recorded hourly series" else (args.day or days[-1])
+    if args.json:
+        print(json.dumps({"day": day, "source": source, "not_recorded": notes, "days": days, "firings": firings}, indent=2, sort_keys=True))
+        return EXIT_OK
+    print("load alert replay over %s from %s (thresholds: %d stalled ask(s) of %g h, backlog %g h); recorded days: %s" % (
+        day, source, cfg["stalled_asks"], cfg["stalled_hours"], cfg["backlog_hours"], ", ".join(days) or "none"))
+    if notes:
+        print("not recorded for it: %s" % notes)
+    print("would have fired %d time(s)%s" % (len(firings), ":" if firings else ""))
+    for firing in firings:
+        print("  %s  %s  %s" % (firing["hour"], firing["orchestrator"], firing["text"]))
+    return EXIT_OK
+
+
+cmd_load_replay.direct = True   # reads a file: no daemon start
+
+
+def add_load_replay_parsers(sub):
+    replay = sub.add_parser("load-replay", help="When the load alert WOULD have fired over a recorded day of the hourly load series (read-only)")
+    replay.add_argument("--day", help="A UTC date, YYYY-MM-DD (default: the newest recorded day; the last few days are kept)")
+    replay.add_argument("--stalled-asks", type=int, default=None, help="Try another threshold: asks stalled")
+    replay.add_argument("--stalled-hours", type=float, default=None, help="Try another threshold: hours without movement")
+    replay.add_argument("--backlog-hours", type=float, default=None, help="Try another threshold: hours of moved asks in the backlog test")
+    replay.add_argument("--from-audit", action="store_true", help="Rebuild the day from the audit log and its archives even when the series holds it (a past day is rebuilt this way when the series does not)")
+    replay.add_argument("--json", action="store_true")
+
+
 # PR 10: move a v1 session into v2 (`import-v1`)
 #
 # One section, so the stack rebases cleanly. docs/switchboard.md, "v1
