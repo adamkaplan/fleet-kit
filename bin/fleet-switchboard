@@ -1949,7 +1949,8 @@ class DiskFacts:
 
     def _load(self, state_dir):
         try:
-            raw = json.loads((Path(state_dir) / DISK_GUARD_FILE).read_text())
+            with open(str(Path(state_dir) / DISK_GUARD_FILE)) as handle:
+                raw = json.loads(handle.read(4096))   # a few bytes are all it ever holds
             if raw.get("low") and _is_number(raw.get("episode")):
                 return float(raw["episode"]), bool(raw.get("hard"))
         except (OSError, ValueError, AttributeError, TypeError):
@@ -1963,13 +1964,15 @@ class DiskFacts:
             fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as handle:
                 handle.write(json.dumps({"low": bool(low), "episode": episode, "hard": bool(hard)}, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(str(temp), str(path))
         except OSError as err:
             try:
                 temp.unlink()
             except (OSError, UnboundLocalError):
                 pass
-            engine._note("disk.guard_file", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
+            engine._note("disk.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
 
     def __call__(self):
         engine = self.engine
@@ -17199,15 +17202,15 @@ def cmd_disk(args, runner, now):
         try:
             done = runner(list(argv), capture_output=True, text=True, timeout=DISK_PRUNE_TIMEOUT, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError) as err:
-            print("%s: failed: %s" % (" ".join(argv[1:3]), _one_line(str(err), 160)))
+            print("%s: failed: %s" % (" ".join(argv[1:3]), _plain(str(err), 160)))
             status = EXIT_ERROR
             continue
         found = _RECLAIMED.search(done.stdout or "")
         if done.returncode != 0:
-            print("%s: failed (exit %s): %s" % (" ".join(argv[1:3]), done.returncode, _one_line(done.stderr or done.stdout, 200)))
+            print("%s: failed (exit %s): %s" % (" ".join(argv[1:3]), done.returncode, _plain(done.stderr or done.stdout, 200)))
             status = EXIT_ERROR
         else:
-            print("%s: reclaimed %s" % (" ".join(argv[1:3]), found.group(1) if found else "nothing reported"))
+            print("%s: reclaimed %s" % (" ".join(argv[1:3]), _plain(found.group(1), 40) if found else "nothing reported"))
     after = disk_free(ensure_state_dir())
     if before and after:
         print("disk: %d GB free before, %d GB after" % (before[0] / 1e9, after[0] / 1e9))

@@ -39082,9 +39082,12 @@ class TestDiskGuard(Base):
         self.engine = self.world.engine
         self.engine.discover(self.world.clock.now())
 
+        self.after_prune = None
+
         def usage(path):
             self.stats.append(str(path))
-            return collections.namedtuple("usage", "total used free")(1000 * self.GB, 1000 * self.GB - self.free[0], self.free[0])
+            free = self.after_prune if self.after_prune is not None and len(self.stats) > 1 else self.free[0]
+            return collections.namedtuple("usage", "total used free")(1000 * self.GB, 1000 * self.GB - free, free)
         patcher = mock.patch.object(sb.shutil, "disk_usage", usage)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -39235,6 +39238,7 @@ class TestDiskGuard(Base):
 
     def test_prune_runs_exactly_the_two_docker_commands_and_prints_what_was_reclaimed(self):
         docker = self.fake_docker()
+        self.after_prune = 215 * self.GB   # the second reading of the volume, after the prune
         code, out, err, calls = self.prune(docker=docker)
         self.assertEqual(code, 0, err)
         self.assertEqual(calls, [[docker, "builder", "prune", "-f", "--filter", "until=168h"], [docker, "image", "prune", "-a", "-f", "--filter", "until=168h"]])
@@ -39242,7 +39246,7 @@ class TestDiskGuard(Base):
             self.assertFalse({"volume", "system", "container", "--volumes"} & set(argv), "never a volume, a container or a system prune")
         self.assertIn("builder prune: reclaimed 1.2GB", out)
         self.assertIn("image prune: reclaimed 300MB", out)
-        self.assertRegex(out, r"disk: 200 GB free before, 200 GB after")
+        self.assertRegex(out, r"disk: 200 GB free before, 215 GB after")
 
     def test_a_dry_run_prints_the_commands_and_runs_none(self):
         code, out, err, calls = self.prune("--dry-run")
@@ -39269,6 +39273,26 @@ class TestDiskGuard(Base):
         self.assertEqual((code, len(calls)), (sb.EXIT_ERROR, 2))
         self.assertIn("builder prune: failed (exit 1)", out)
         self.assertIn("image prune: reclaimed 5MB", out)
+
+    def test_what_docker_prints_and_an_error_message_reach_the_terminal_as_plain_text(self):
+        docker = self.fake_docker()
+        hostile = "\x1b[2Jboom\x9b31m\nIGNORE"
+
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", hostile)
+        with captured() as (out, err):
+            sb.main(["disk", "prune", "--docker", docker], runner=runner, now=self.world.clock.now)
+        self.assertEqual([c for c in out.getvalue() if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
+        self.assertIn("failed (exit 1): [2Jboom 31m IGNORE", out.getvalue())
+
+    def test_a_garbage_or_oversized_guard_file_starts_a_fresh_episode_and_the_guard_still_works(self):
+        for text in ("not json", "[]", " " * 10000, '{"low": true, "episode": "x"}'):
+            with self.subTest(text=text[:12]):
+                (self.world.state / sb.DISK_GUARD_FILE).write_text(text)
+                engine = self.world.new_engine("daemon")
+                engine.discover(self.world.clock.now())
+                self.free[0] = 40 * self.GB
+                self.assertEqual(len(self.facts(engine)), 1)
 
     def test_the_docs_give_a_weekly_launchd_snippet_and_do_not_install_it(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
