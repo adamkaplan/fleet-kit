@@ -238,7 +238,7 @@ def crossing(fig, cfg):
 
 def wake_text(fig, reasons, cfg):
     asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
-    name = re.sub(r"\s+", " ", str(fig["name"]))[:60]
+    name = re.sub(r"[\x00-\x1f\x7f]+|\s+", " ", str(fig["name"]))[:60]
     text = ("Load alert: %s is overloaded. %d open ask(s); %d with no real movement in %g h%s; moved %d in the last hour and %d in %g h; "
             "coders %s busy, %s idle; waiting on it: %s message(s), %s decision(s)." % (
                 name, fig["open_asks"], fig["stalled"], cfg["stalled_hours"], " (%s)" % asks if asks else "",

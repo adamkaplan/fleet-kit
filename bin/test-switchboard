@@ -44881,6 +44881,25 @@ class TestLoadAlert(Base):
         self.assertIn("load alert replay over 2026-10-14 from the audit log", out.getvalue())
         self.assertIn("would have fired 0 time(s)", out.getvalue())
 
+    def test_a_hostile_orchestrator_name_is_one_short_clean_line_in_the_wake(self):
+        self.asks = {1: [1, 2]}
+        name = "o\nrm -rf\x1b[31m " + "x" * 100
+        self.tick(self.T0, {name: self.orch(idle=1, charter=1)})
+        self.tick(self.T0 + 3 * 3600, {name: self.orch(idle=1, charter=1)})
+        text = self.woken[0]
+        self.assertNotRegex(text, "[\x00-\x1f\x7f]")
+        self.assertEqual(text.split(" is overloaded")[0].replace("Load alert: ", ""), ("o rm -rf [31m " + "x" * 100)[:60])
+
+    def test_an_oversize_move_file_is_pruned_to_the_recent_rows(self):
+        d = str(self.state_dir)
+        with mock.patch.object(self.health, "MOVES_READ_BYTES", 2000):
+            self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(100)])
+            self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [4], "kind": "push"}])
+            self.assertGreater((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+            self.health.prune_moves(d, self.T0)
+            self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[4]])
+            self.assertLess((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
