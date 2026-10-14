@@ -48716,6 +48716,29 @@ class TestLoadAlert(Base):
         row = [l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")][0]
         self.assertIn("stalled 1, waiting on owner 1, parked 1, waiting on cos 1", row)
 
+    def test_wait_labels_take_precedence_owner_then_cos_then_parked_and_the_bare_label_counts(self):
+        future = self.T0 + 9 * self.DAY
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos", "me:awaiting-user", "me:parked"], "parked_until": future},   # all three: the owner wins
+                               2: {"labels": ["me:awaiting-cos", "me:parked"], "parked_until": future},                       # cos beats parked
+                               3: {"labels": ["awaiting-user"]},                                                                # a bare, unprefixed label
+                               4: {"labels": ["me:parked"], "parked_until": future},
+                               5: {"labels": ["unrelated:label"]}})
+        self.assertEqual((got["waiting_owner"], got["waiting_cos"], got["parked"], got["stalled"]), (2, 1, 1, 1))
+
+    def test_asks_waiting_or_parked_do_not_make_the_busy_coders_rule_fire(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 6, "active_asks": 6, "stalled": 0, "stalled_asks": [], "moved_1h": 0, "moved_backlog": 1, "busy": 2, "idle": 0,
+                    "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertIn("at least twice", self.health.judge(fig(), cfg, None)[0])                       # 6 active asks, 1 moved, nothing in the last hour: fires
+        self.assertIsNone(self.health.judge(fig(active_asks=1, waiting_owner=3, waiting_cos=1, parked=1), cfg, None)[0])   # 5 of the 6 only wait or are parked: 1 active, no wake
+        # the same through a real pass: 6 asks, 5 waiting or parked, coders full, nothing moved
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY},
+                               6: {"labels": []}}, enabled=True)
+        self.assertEqual((got["open_asks"], got["active_asks"]), (6, 1))
+
     def test_waiting_asks_never_wake_the_chief_of_staff_but_plain_stalls_do(self):
         self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}}, enabled=True)
         for hours in (4, 5, 6):
