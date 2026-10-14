@@ -10901,7 +10901,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 133, "orchestrator": 179, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -10916,7 +10916,8 @@ ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "c
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7860, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
+# #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +228 B, orchestrator +1 line +212 B (the wider runtime's file sets each limit)
+ROLE_BYTE_LIMITS = {"coder": 8088, "orchestrator": 11132, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
