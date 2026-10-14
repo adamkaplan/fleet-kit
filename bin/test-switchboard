@@ -4938,6 +4938,18 @@ class TestLaunch(Base):
         with mock.patch.object(sb.V2Client, "session_get", side_effect=sb.V2Error("http", 404, "gone")):
             self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
 
+    def test_retiring_the_agent_whose_session_runs_in_its_worktree_still_removes_it_because_it_is_retired_first(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        wt = self.add_worktree("w-own-session")
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-own-session", 1)
+        self.world.v2.sessions[self.world.sessions["worker"]]["directory"] = str(wt)
+        self.health()
+        code, out, err = self.retire_as_operator("worker")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(wt.exists(), out)
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
