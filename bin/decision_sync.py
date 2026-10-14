@@ -111,7 +111,13 @@ class SyncEngine:
         if body is None or not isinstance(body.get("links"), dict):
             self.rebuild = True   # missing or unreadable: rebuilt from the adapter, never trusted
         else:
-            self.links = body["links"]
+            self.links = {k: v for k, v in body["links"].items() if isinstance(v, dict)}
+            for link in self.links.values():   # a hand-edited or damaged flag is "not settled": only the boolean True counts, anywhere
+                if link.get("decided_outside") is not True:
+                    link.pop("decided_outside", None)
+                    link.pop("decided_outside_at", None)
+                elif not isinstance(link.get("decided_outside_at"), (int, float)) or isinstance(link.get("decided_outside_at"), bool):
+                    link["decided_outside_at"] = self.now()
             self.cursor, self.last_pull = body.get("cursor"), body.get("last_pull")
             self.applied = [e for e in body.get("applied", []) if isinstance(e, str)]
             parked = body.get("parked")
@@ -195,7 +201,7 @@ class SyncEngine:
         for item in planned:
             key, kind = item["key"], item["op"]
             settled = self.links.get(item.get("rebind_from") or key) or self.links.get(key) or {}
-            if kind != "raise" and settled.get("decided_outside") and not settled.get("closed") and not settled.get("withdrawn"):
+            if kind != "raise" and settled.get("decided_outside") is True and not settled.get("closed") and not settled.get("withdrawn"):
                 continue   # decided outside: its answer comes by the pull; nothing more is revised, withdrawn or reported
             want = desired.get(key)
             failed = self.failed.get(key)
@@ -256,6 +262,7 @@ class SyncEngine:
             scoped = {e["boss"] for e in errors if e.get("source") == "reports" and e.get("boss")}
             if not reason and self.rebuild:
                 self.reconcile(desired)
+            self._close_settled(desired, kinds, scoped, now)
             self._enqueue(core.plan_operations(desired, self._projected(), kinds, now, scoped), desired)
             if reason:
                 status.update(state="down", reason=core.one_line(reason, 160))
@@ -270,7 +277,11 @@ class SyncEngine:
             self._save()
         except OSError as err:
             status.update(state="down", reason="cannot write the link table: %s" % (err.strerror or err))
-        status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed))
+        waiting = [l.get("decided_outside_at") for l in self.links.values()
+                   if l.get("decided_outside") is True and not l.get("closed") and not l.get("withdrawn") and not l.get("answered")]
+        stamps = [w for w in waiting if isinstance(w, (int, float)) and not isinstance(w, bool)]
+        status.update(outbox=len(self.ops), last_pull=self.last_pull, permanent_failures=len(self.failed),
+                      settled_waiting=len(waiting), settled_oldest=min(stamps) if stamps else None)
         status["alarm"] = len(self.ops) > self.settings["outbox_alarm_depth"]
         failing = [o for o in self.ops if o.get("last_error")]
         if status["state"] == "ok" and failing:
@@ -343,6 +354,17 @@ class SyncEngine:
             self.host.audit("external.pushed", op["key"], {"op": op["op"], "revision": op["revision"],
                                                            "idempotency": op["id"],
                                                            "external_id": answer.get("external_id")})
+
+    def _close_settled(self, desired, kinds, scoped, now):
+        """A link settled outside whose decision has left the local list (answered or resolved here) has nothing left to wait for: it is closed, so it stops
+        being counted as waiting. A decision whose source could not be read this pass is NOT gone: it is left alone."""
+        for key, link in self.links.items():
+            if link.get("decided_outside") is not True or link.get("closed") or link.get("withdrawn") or key in desired:
+                continue
+            if link.get("kind") in kinds or (link.get("kind") == "report" and link.get("boss") in scoped):
+                continue
+            link.update(closed=True, closed_at=now)
+            self.host.audit("external.settled_closed", key, {"reason": "the decision left the local list: nothing is waiting for its answer"})
 
     def _settle_outside(self, op, err, now):
         """The other side says the item is already decided or closed: that is its answer, not a failure. The operation (and the ones queued behind it for the

@@ -39757,6 +39757,50 @@ class TestSettledOutside(ExternalWorld):
         self.run_pass(1)
         self.assertEqual(self.pulls - pulls, 1, "and the long poll applies again after it")
 
+    def test_a_damaged_flag_value_is_never_a_settle_only_the_boolean_true_is(self):
+        ext = self.open_decision()
+        path = self.world.state / "external-links.json"
+        for bad in ("false", "no", 0, 1, [], [1], {}, "true", "yes", None):
+            with self.subTest(bad=bad):
+                body = json.loads(path.read_text())
+                for link in body["links"].values():
+                    link["decided_outside"] = bad
+                    link["decided_outside_at"] = 5
+                path.write_text(json.dumps(body))
+                self.world.engine.external_sync = None
+                revises = len([c for c in self.fake.calls if c[0] == "revise"])
+                self.gh.issues[(API, 2)]["title"] = "Which database should it use %s?" % json.dumps(bad)
+                self.run_pass(120)
+                self.run_pass(120)
+                self.assertGreater(len([c for c in self.fake.calls if c[0] == "revise"]), revises, "not settled: its revise went out")
+                (link,) = self.links().values()
+                self.assertNotIn("decided_outside", link, "normalised away when the file is loaded")
+                self.assertNotIn("settled outside", self.count_line())
+
+    def test_a_settled_link_waiting_for_its_answer_stays_visible_in_status_with_its_age(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.run_pass(300)
+        self.assertRegex(self.count_line(), r"settled outside, waiting for its answer: 1 \(oldest \d+[ms]\)")
+        self.assertNotIn("permanent failure", self.count_line())
+        self.fake.refuse.clear()
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertNotIn("settled outside", self.count_line(), "the answer was applied: nothing is waiting")
+
+    def test_a_settled_link_that_closes_by_withdrawal_stops_being_counted(self):
+        self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("settled outside, waiting for its answer: 1", self.count_line())
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertNotIn("waiting for its answer", self.count_line(), "it closed here: not waiting any more")
+
     def test_s7_what_is_pushed_for_other_decisions_is_unchanged_after_a_settle(self):
         self.open_decision()
         self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")

@@ -3131,7 +3131,7 @@ a failing delivery of an inbound answer (the event is not marked, the cursor sta
   change of the decision enqueues a fresh operation. An `already decided` (or closed) reply to a revise, withdraw or status is NOT one of these failures (to a raise it still is: there is no link to settle): the adapter's `AlreadyDecided` carries
   `settled_outside = true`, and the engine reads it as the other side's answer. The operation (and the ones behind it) are dropped and
   audited as `external.settled_outside`, the link is marked `decided_outside`, nothing more is revised, withdrawn or reported for it,
-  the next cycle pulls at once so the answer is applied, and any earlier failure of that decision is cleared. A failure entry is also
+  the next cycle pulls at once so the answer is applied, and any earlier failure of that decision is cleared. The flag counts only as the boolean `true` (a damaged or hand-edited value is read as not settled and removed when the file is loaded), and `status` keeps a settled link whose answer has not come in sight: `settled outside, waiting for its answer: N (oldest 5m)`, until the answer is applied or the link closes. A failure entry is also
   cleared whenever its link closes (answered or withdrawn), so the status count is the genuine failures only (a failed raise has no
   link and stays counted). Every other permanent refusal behaves as above.
 
