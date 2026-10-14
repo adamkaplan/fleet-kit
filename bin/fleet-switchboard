@@ -8830,16 +8830,21 @@ def record_order_notice(state_dir, repo, charter, action, text, caller, ordered_
     return item
 
 
-def ack_order_notice(state_dir, ident, window=None):
-    """Drop one heads-up, or a whole burst when `ident` is a group id (`<first id>+<count>`); True when something was there. An old single id still
-    drops just that one."""
+def ack_order_notice(state_dir, ident, window=None, now=None):
+    """Drop one heads-up, or a whole burst when `ident` is a group id (`<first id>+<count>`). Returns True when something was dropped, False when
+    nothing matched, and the string `changed:<n>` when the burst the id names now has n members (not `count`): nothing is dropped, so an order that
+    joined after the owner saw the row is never dropped unseen. Groups are made the way the panel's rows are: from the unexpired orders only and
+    with the same window. An old single id still drops just that one."""
     with order_notices_lock(state_dir):
         items = read_order_notices(state_dir)
         gone = {ident}
         m = _GROUP_ID.match(ident)
         if m and not any(i["id"] == ident for i in items):
-            for group in order_groups(items, ORDER_BURST_MINUTES * 60 if window is None else window):
+            live = [i for i in items if (now if now is not None else time.time()) - i["created"] < ORDER_NOTICE_TTL_SECONDS]
+            for group in order_groups(live, ORDER_BURST_MINUTES * 60 if window is None else window):
                 if group[0]["id"] == m.group(1):
+                    if len(group) != int(m.group(2)):
+                        return "changed:%d" % len(group)
                     gone = {g["id"] for g in group}
                     break
         kept = [i for i in items if i["id"] not in gone]
@@ -14447,9 +14452,13 @@ def _notice_ack(args, engine, state):
         if caller is not None:
             sys.stderr.write("%s: only the owner, in a plain shell, acks a heads-up; %s is a fleet agent\n" % (PROG, caller))
             return EXIT_USAGE
-        found = ack_order_notice(state, args.pr, order_burst_seconds(engine.config))
+        found = ack_order_notice(state, args.pr, order_burst_seconds(engine.config), engine.now())
     except (NoticeError, OSError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    if isinstance(found, str) and found.startswith("changed:"):
+        sys.stderr.write("%s: heads-up %s changed since it was shown (it now holds %s orders): nothing was dropped; ack the row as it reads now\n"
+                         % (PROG, args.pr, found.split(":", 1)[1]))
         return EXIT_USAGE
     if engine.audit is not None and found:
         engine.audit.append(engine.actor, "notice.ack", args.pr, {})
