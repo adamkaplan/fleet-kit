@@ -10902,7 +10902,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 130, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -10918,7 +10918,8 @@ ROLE_LINE_LIMITS = {"coder": 130, "orchestrator": 178, "chief-of-staff": 162, "c
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7960, "orchestrator": 11010, "chief-of-staff": 11650, "cos-subagent": 3500}
+# #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
+ROLE_BYTE_LIMITS = {"coder": 8186, "orchestrator": 11230, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -43415,6 +43416,52 @@ class TestCpuGuard(Base):
         cats = self.cg.categories("  10 /a/node\n  5 /b/node\n  3 \x1b[2Jevil\n  1 /c/x y\n")
         self.assertEqual(cats[0], ("node", 15.0))
         self.assertNotIn("\x1b", self.cg.detail(cats))
+
+
+class TestGithubWritingRule(unittest.TestCase):
+    """Ask #401, slice 1: the same one-sentence writing rule for GitHub text in the two skills, the coder and orchestrator definitions of both runtimes and the
+    pull request template."""
+
+    RULE = ('Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, '
+            'never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.')
+    FILES = ("skills/fleet-charter/SKILL.md", "skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/opencode/orchestrator.md",
+             "agents/copilot/coder.agent.md", "agents/copilot/orchestrator.agent.md", ".github/pull_request_template.md")
+
+    def test_s1_every_file_carries_the_rule_sentence_exactly(self):
+        for rel in self.FILES:
+            with self.subTest(file=rel):
+                self.assertIn(self.RULE, (REPO / rel).read_text())
+
+    def test_s2_it_is_one_sentence_everywhere_and_never_inside_a_code_fence(self):
+        found = set()
+        for rel in self.FILES:
+            text = (REPO / rel).read_text()
+            for line in text.splitlines():
+                at = line.find("Write GitHub text so a person can read it")
+                if at >= 0:
+                    found.add(line[at:].replace(" -->", "").rstrip())
+            inside, fenced = False, False
+            for line in text.splitlines():
+                if line.strip().startswith("```"):
+                    inside = not inside
+                elif inside and "Write GitHub text so a person can read it" in line:
+                    fenced = True
+            self.assertFalse(fenced, "%s: the rule sits inside a code fence" % rel)
+        self.assertEqual(found, {self.RULE})
+
+    def test_the_rule_is_not_in_the_front_matter_of_a_definition(self):
+        for rel in self.FILES[2:6]:
+            text = (REPO / rel).read_text()
+            head = text.split("\n---\n", 1)[0]
+            self.assertNotIn("Write GitHub text", head, rel)
+            self.assertTrue(text.startswith("---\n"), rel)
+
+    def test_s3_the_change_adds_text_only_and_leaves_the_shim_alone(self):
+        done = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], capture_output=True, text=True, cwd=str(REPO))
+        if done.returncode != 0 or not done.stdout.strip():
+            self.skipTest("no base to compare with")
+        changed = set(done.stdout.split())
+        self.assertNotIn("shims/gh", changed)
 
 
 class TestDiskGuard(Base):

@@ -50,6 +50,10 @@ turn: you are woken then, free while idle. Never poll. If you were launched with
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
 
+## Writing
+
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
+
 ## Skills
 
 **Before your first report, load the `fleet-coordination` skill.** It carries the
