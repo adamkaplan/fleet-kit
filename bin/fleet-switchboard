@@ -18142,6 +18142,8 @@ def cmd_disk_prune(args, runner, now):
 DISK_REPORT_WORKTREES = 20       # worktrees whose git state is read per report: git is a process per question
 DISK_WALK_ENTRIES = 200000       # entries one size walk looks at; past it the size is "at least"
 DISK_WALK_SECONDS = 5.0
+DISK_PS_SECONDS = 20
+DISK_PS_LINES = 20000             # lines of the process table scanned
 OPENCODE_DATA_DIR = "~/.local/share/opencode"
 
 
@@ -18239,8 +18241,8 @@ def disk_report(args, runner, now, out=print):
         lines.append("  %s: %s%s (%s)" % (label, "" if complete else ">=", _human(size), _plain(path, 120)))
     lines.append("orphans")
     try:
-        done = runner(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
-        table = done.stdout or "" if done.returncode == 0 else None
+        done = runner(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True, timeout=DISK_PS_SECONDS, stdin=subprocess.DEVNULL)
+        table = "\n".join((done.stdout or "").splitlines()[:DISK_PS_LINES]) if done.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         table = None
     if table is None:
@@ -18249,7 +18251,7 @@ def disk_report(args, runner, now, out=print):
         found = orphan_candidates(table, list(registry) + [str(temp)])
         lines.append("  candidates: %d (parent is init and the command names a registered worktree or the temp dir; reported only, nothing is killed)" % len(found))
         for pid, etime, command in found[:10]:
-            lines.append("    %d  up %s  %s" % (pid, etime, _plain(command, 100)))
+            lines.append("    %d  up %s  %s" % (pid, etime, _plain(command.split(None, 1)[0], 100)))   # the program only: its arguments could carry a secret
     return lines
 
 
@@ -18277,7 +18279,7 @@ def add_disk_parsers(sub):
     disk_sub = disk.add_subparsers(dest="disk_action", required=False)
     disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
     report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
-    report.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
+    report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
                                             "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
@@ -18290,8 +18292,8 @@ def add_disk_parsers(sub):
                                            "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
                                            "key `docker_reaper` is false. Each removal is one `docker.reaped` audit line.")
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
-    reap.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
-    prune.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
+    reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
+    prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")

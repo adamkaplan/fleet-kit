@@ -39976,7 +39976,7 @@ class TestDiskReport(Base):
         code, out, err = self.report("report")
         self.assertEqual(code, 0, err)
         self.assertEqual([l for l in out.splitlines() if not l.startswith(" ")], ["free", "docker", "worktrees", "caches", "orphans"])
-        self.assertIn("GB free", out)
+        self.assertIn("state volume: ", out)
         self.assertIn("temp dir: 3.0 KB", out)
         self.assertEqual(self.listing(), before, "the report wrote into the state directory")
         self.assertFalse(self.audit_exists())
@@ -39989,11 +39989,9 @@ class TestDiskReport(Base):
         self.assertEqual(self.calls, [["system", "df"]])
         self.assertIn("Images 3 1.2GB", out)
         self.calls.clear()
-        engine = self.world.new_engine("daemon")
-        engine.docker_reap_runner = None
-        sb.disk_status_line({}, self.world.state)
-        self.world.tick(3)
-        self.assertEqual(self.calls, [])
+        with captured():
+            sb.main(["status"], runner=self.runner(), now=self.world.clock.now)
+        self.assertEqual(self.calls, [], "the status pass asked docker")
 
     def test_s2_a_missing_docker_is_said_and_the_other_sections_still_print(self):
         code, out, err = self.report("report", docker="/nonexistent/docker")
@@ -40035,6 +40033,37 @@ class TestDiskReport(Base):
         self.assertIn("101  up 01:02:03", out)
         self.assertNotIn("102  up", out)
         self.assertIn("nothing is killed", out)
+
+    def test_orphan_lines_show_the_program_only_and_are_capped_at_ten(self):
+        self.ps_text = "".join("  %d 1 00:0%d python3 --token=SECRET %s/x\n" % (200 + i, i % 10, self.temp) for i in range(11))
+        code, out, err = self.report("report")
+        self.assertIn("candidates: 11 ", out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("    2")]), 10)
+        self.assertNotIn("SECRET", out)
+
+    def test_a_walk_past_its_time_budget_is_a_lower_bound_and_the_report_marks_it(self):
+        ticks = iter(range(0, 1000, 10))
+        size, complete = sb.tree_size(self.temp, seconds=5, clock=lambda: next(ticks))
+        self.assertFalse(complete)
+        with mock.patch.object(sb, "tree_size", lambda path: (1234, False)):
+            code, out, err = self.report("report")
+        self.assertIn("temp dir: >=1.2 KB", out)
+
+    def test_a_registered_directory_that_is_not_a_git_repository_is_said_not_cleaned(self):
+        plain = self.home / "not-git"
+        plain.mkdir()
+        (plain / "f").write_text("x")
+        self.assertTrue(sb.register_worktree(self.world.state, str(plain), "alpha", None, "x", 1))
+        code, out, err = self.report("report")
+        self.assertRegex(out, r"alpha  \S+not-git  .*git cannot read it")
+        self.assertTrue(plain.exists())
+
+    def test_a_docker_option_before_the_action_is_honoured(self):
+        code, out, err = self.report("report", docker="/nonexistent/docker")
+        self.assertIn("docker: not installed", out)
+        with captured() as (out, err):
+            code = sb.main(["disk", "--docker", "/nonexistent/docker", "report"], runner=self.runner(), now=self.world.clock.now)
+        self.assertIn("docker: not installed", out.getvalue())
 
     def test_orphans_say_so_when_ps_fails(self):
         def run(argv, **kwargs):
