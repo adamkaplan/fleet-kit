@@ -277,3 +277,11 @@ test("stateDirOf: an absolute XDG_STATE_HOME wins; a relative or unset one falls
   assert.equal(stateDirOf({ XDG_STATE_HOME: "relative" }, "/home/user"), "/home/user/.local/state/fleet-switchboard");
   assert.equal(stateDirOf({}, "/home/user"), "/home/user/.local/state/fleet-switchboard");
 });
+
+test("a failed rename removes the temporary file", async () => {
+  const removed = [];
+  const tally = makeTally({ dir: "/d", now: () => 1000000, writeFile: async () => {}, rename: async () => { throw new Error("EXDEV"); }, unlink: async (f) => removed.push(f) });
+  assert.equal(await tally.flush(), false);
+  assert.equal(removed.length, 1);
+  assert.match(removed[0], /tool-rate\.json\.\d+\.[0-9a-f]{12}\.tmp$/);
+});

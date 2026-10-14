@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -137,7 +138,7 @@ class Bounds(unittest.TestCase):
         newest = hr._hour(clock[0])
         kept = [int(h) for u in body["usage"].values() for h in u["hours"]]
         self.assertIn(newest, kept)           # the newest hour survives
-        self.assertGreater(newest - min(kept), -1)
+        self.assertGreater(min(kept), hr._hour(NOW))   # the oldest ingested hour is gone
         self.assertLess(len(kept), 40 * 30)   # something was dropped
 
     def test_only_names_and_numbers(self):
@@ -175,6 +176,7 @@ class Hooks(unittest.TestCase):
 
         engine = Engine()
         engine.notes = []
+        engine.health = hr.Recorder(lambda: NOW)   # a fixed clock: no test depends on the hour it runs in
         Client.calls = []
         return engine
 
@@ -184,10 +186,10 @@ class Hooks(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             engine = self.engine(d)
-            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, time.time())])
-            self.sb.health_write(engine, State, time.time())
+            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, NOW)])
+            self.sb.health_write(engine, State, NOW)
             State.pr_state = {"acme/api#1": {"head": "b"}}
-            self.sb.health_write(engine, State, time.time())
+            self.sb.health_write(engine, State, NOW)
             with open(os.path.join(d, hr.FILE)) as fh:
                 body = json.load(fh)
             self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 10)
@@ -201,18 +203,28 @@ class Hooks(unittest.TestCase):
         class State:
             pr_state = {}
 
-        with tempfile.TemporaryDirectory() as d:
-            engine = self.engine(d)
-            path = os.path.join(d, hr.FILE)
-            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, time.time())])
-            self.sb.health_write(engine, State, time.time())
-            first = os.stat(path).st_mtime_ns
-            time.sleep(0.02)
-            self.sb.health_write(engine, State, time.time() + 5)   # nothing new; only the timestamp moved
-            self.assertEqual(os.stat(path).st_mtime_ns, first)
-            self.sb.health_ingest_messages(engine, "ses_a", [msg("m2", 10, 0.5, time.time())])
-            self.sb.health_write(engine, State, time.time())
-            self.assertGreater(os.stat(path).st_mtime_ns, first)
+        wrote = []
+        real = self.sb.state_write
+
+        def counting(*args, **kwargs):
+            got = real(*args, **kwargs)
+            wrote.append(got)
+            return got
+
+        self.sb.state_write = counting
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                engine = self.engine(d)
+                self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, NOW)])
+                self.sb.health_write(engine, State, NOW)
+                self.assertEqual(wrote, [True])
+                self.sb.health_write(engine, State, NOW + 5)   # nothing new; only the timestamp would move
+                self.assertEqual(wrote, [True, False])
+                self.sb.health_ingest_messages(engine, "ses_a", [msg("m2", 10, 0.5, NOW)])
+                self.sb.health_write(engine, State, NOW + 6)
+                self.assertEqual(wrote, [True, False, True])
+        finally:
+            self.sb.state_write = real
 
     def test_a_fault_never_raises_and_is_said_once_per_change(self):
         class State:
@@ -221,9 +233,13 @@ class Hooks(unittest.TestCase):
         engine = self.engine("/nonexistent-dir-for-test")
         engine.health = None
         self.sb.health_ingest_messages(engine, "ses_a", "not a list")   # nothing to ingest: no fault
-        self.sb.health_write(engine, State, time.time())
+        self.sb.health_write(engine, State, NOW)
         self.assertEqual([n[0] for n in engine.notes], ["health.error"])
         self.assertEqual(engine.notes[0][1], "write")
+        # `_note` of the real engine says an unchanged error once and a changed one again: the hook passes the same detail for the same fault
+        self.sb.health_write(engine, State, NOW)
+        self.assertEqual(len(engine.notes), 2)
+        self.assertEqual(engine.notes[0], engine.notes[1])   # identical detail, so the engine's own once-per-change rule silences the repeat
 
     def test_the_feed_hands_what_it_read_to_the_recorder(self):
         class Stream:
@@ -231,7 +247,7 @@ class Hooks(unittest.TestCase):
 
         class V2:
             def message_list(self, session, limit=None, order=None, type=None, cursor=None):
-                return [msg("m7", 70, 0.7, time.time())]
+                return [msg("m7", 70, 0.7, NOW)]
 
         class Engine:
             v2 = V2()
@@ -239,7 +255,7 @@ class Hooks(unittest.TestCase):
 
         engine = Engine()
         feed = self.sb.EventFeed(Stream())
-        self.assertTrue(feed._read(engine, "ses_feed", time.time(), announced=False))
+        self.assertTrue(feed._read(engine, "ses_feed", NOW, announced=False))
         self.assertEqual(engine.health.context["ses_feed"]["tokens"], 70)
 
 
@@ -250,6 +266,11 @@ class StateDirRule(unittest.TestCase):
              ({"XDG_STATE_HOME": "relative/state"}, "/home/user/.local/state/fleet-switchboard"),
              ({}, "/home/user/.local/state/fleet-switchboard")]
 
+    def test_file_names_agree(self):
+        with open(os.path.join(HERE, "..", "plugins", "fleet-hooks", "index.js")) as fh:
+            self.assertIn('TALLY_FILE = "%s"' % hr.TOOL_FILE, fh.read())
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_daemon_and_plugin_agree(self):
         import subprocess
         loader = importlib.machinery.SourceFileLoader("sb_state_rule", os.path.join(HERE, "fleet-switchboard"))

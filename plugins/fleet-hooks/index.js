@@ -198,7 +198,7 @@ export function stateDirOf(env = process.env, home = os.homedir()) {
   return path.join(base, "fleet-switchboard");
 }
 
-export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFile, rename = fs.promises.rename }) {
+export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFile, rename = fs.promises.rename, unlink = fs.promises.unlink }) {
   const sessions = new Map(); // session -> Map(minute epoch -> count)
   let dirty = false;
   let lastWrite = 0;
@@ -234,15 +234,16 @@ export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFi
       const t = now();
       if (writing || !dir || (!dirty && t - lastWrite < TALLY_HEARTBEAT_MS)) return false;
       writing = true;
+      const file = path.join(dir, TALLY_FILE);
+      const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`; // a name nobody can predict, created exclusively
       try {
-        const file = path.join(dir, TALLY_FILE);
-        const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`; // a name nobody can predict, created exclusively
         await writeFile(tmp, JSON.stringify(tally.body()), { mode: 0o600, flag: "wx" });
         await rename(tmp, file);
         dirty = false;
         lastWrite = t;
         return true;
       } catch {
+        try { await unlink(tmp); } catch { /* best effort: nothing to remove */ }
         return false; // the state directory may not exist yet: the view says "not recorded"
       } finally {
         writing = false;
