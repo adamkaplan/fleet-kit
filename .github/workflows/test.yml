@@ -5,6 +5,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A head can be re-run without a push or a close and reopen: `gh workflow run test.yml --ref <branch>`. No inputs. The run is on the branch's head
+  # commit, so its checks (the same check names as a pull request run) count for that head. Its concurrency group is its commit sha:
+  # it never cancels the pull request's own run, and cancel-in-progress is false for it.
+  workflow_dispatch:
 
 permissions:
   contents: read

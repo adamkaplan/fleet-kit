@@ -4233,6 +4233,8 @@ refuses when the plan names no scenario for that role). `fleet-switchboard gates
 (newest first, default 10), the evidence records by actor (the switchboard's own `ci` records are the automatic ones) and the minutes from the first gate record to the merge,
 so the steps and minutes the gates cost can be reported.
 
+**Re-running a head's CI.** A head with no run, or a run that was cancelled, is re-run without a push or a close and reopen: `gh workflow run test.yml --ref <branch>` (the workflow has `workflow_dispatch`, no inputs; its checks are named like a pull request run's and count for the branch's head; its concurrency group is its commit sha, so it never cancels the pull request's own run). Then `gates ci-record <repo#N>`.
+
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
 check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
 verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
