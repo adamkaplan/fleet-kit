@@ -214,7 +214,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto",
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_transport": "auto", "disk_guard": None,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -9824,7 +9824,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
-        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
+        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
@@ -39065,6 +39065,169 @@ class TestAuditRotation(unittest.TestCase):
         entry = json.loads(self.path.read_text().splitlines()[-1])
         self.assertEqual(entry["event"], "audit.rotated")
         self.assertEqual((entry["detail"]["pruned"], entry["detail"]["archive"].startswith("audit-")), (["audit-2020-01-01.jsonl.gz"], True))
+
+
+class TestDiskGuard(Base):
+    """The disk guard: one stat of the state directory's volume per pass; the Chief of Staff is told once per episode below disk_guard.min_free_gb; `status`
+    says how much is free; `disk prune` runs exactly two docker commands and refuses without docker."""
+
+    GB = 10 ** 9
+
+    def setUp(self):
+        super().setUp()
+        self.free = [200 * self.GB]
+        self.stats = []
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+
+        def usage(path):
+            self.stats.append(str(path))
+            return collections.namedtuple("usage", "total used free")(1000 * self.GB, 1000 * self.GB - self.free[0], self.free[0])
+        patcher = mock.patch.object(sb.shutil, "disk_usage", usage)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def facts(self, engine=None):
+        engine = engine or self.engine
+        found, problems = engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "disk"]
+
+    def audits(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_the_config_key_is_validated_and_off_means_off(self):
+        for ok in (None, False, {}, {"min_free_gb": 80}, {"min_free_gb": 80, "hard_free_gb": 20}, {"hard_free_gb": 0}):
+            sb.validate_disk_guard(ok, "t")
+        for bad in (True, 5, [], {"min_free_gb": -1}, {"min_free_gb": "50"}, {"nope": 1}, {"min_free_gb": 5, "hard_free_gb": 10}, {"hard_free_gb": 60}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_disk_guard(bad, "t")
+        self.assertEqual(sb.disk_guard_settings({}), {"min_free_gb": 50, "hard_free_gb": 10})
+        self.assertIsNone(sb.disk_guard_settings({"disk_guard": False}))
+
+    def test_the_status_line_says_how_much_is_free_and_when_it_is_low(self):
+        self.free[0] = 238 * self.GB
+        self.assertEqual(sb.disk_status_line({}, self.world.state), "238 GB free (24%)")   # 238 of the 1000 GB the stand-in volume has, 23.8%
+        self.free[0] = 30 * self.GB
+        self.assertEqual(sb.disk_status_line({}, self.world.state), "30 GB free (3%): LOW (below 50 GB; hard line 10 GB)")
+        self.free[0] = 5 * self.GB
+        self.assertIn("VERY LOW", sb.disk_status_line({}, self.world.state))
+        self.assertIn("below 80 GB", sb.disk_status_line({"disk_guard": {"min_free_gb": 80}}, self.world.state))
+
+    def test_status_shows_the_disk_line_and_not_when_the_guard_is_off(self):
+        self.free[0] = 238 * self.GB
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertIn("disk       238 GB free", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "disk_guard": False})
+        self.assertNotIn("disk       ", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
+    def test_one_stat_per_pass_and_nothing_while_the_disk_is_fine(self):
+        for _ in range(5):
+            self.assertEqual(self.facts(), [])
+        self.assertEqual(len(self.stats), 5, "one disk_usage per collection: no walk")
+        self.assertEqual(self.audits("disk.low"), [])
+
+    def test_the_chief_of_staff_is_told_once_per_episode_and_the_episode_ends_above_the_threshold_plus_ten_percent(self):
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        self.assertEqual((first.recipient, first.kind, first.sender), ("cos", "disk", "switchboard"))
+        self.assertIn("disk low: 40 GB free", first.summary)
+        for free in (38, 30, 52, 54):                       # lower, and back up but not above 55
+            self.free[0] = free * self.GB
+            self.world.tick(30)
+            (again,) = self.facts()
+            self.assertEqual(again.key, first.key, "the same episode: the same key, so it is delivered once")
+        self.assertEqual(len(self.audits("disk.low")), 1, "audited once")
+        self.free[0] = 56 * self.GB                         # above 50 + 10%
+        self.assertEqual(self.facts(), [])
+        self.assertEqual(len(self.audits("disk.recovered")), 1)
+        self.world.tick(100)
+        self.free[0] = 45 * self.GB
+        (second,) = self.facts()
+        self.assertNotEqual(second.key, first.key, "a new episode: a new fact")
+        self.assertEqual(len(self.audits("disk.low")), 2)
+
+    def test_a_restart_does_not_begin_a_second_episode_and_a_hard_line_is_said_once(self):
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        self.assertEqual(json.loads((self.world.state / sb.DISK_GUARD_FILE).read_text())["low"], True)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.world.state / sb.DISK_GUARD_FILE)).st_mode), 0o600)
+        self.world.tick(60)
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        (again,) = self.facts(restarted)
+        self.assertEqual(again.key, first.key)
+        self.assertEqual(len(self.audits("disk.low")), 1)
+        self.free[0] = 8 * self.GB
+        self.facts(restarted)
+        self.facts(restarted)
+        self.assertEqual(len(self.audits("disk.hard")), 1, "worse inside the episode: said once, not a second wake")
+
+    def test_a_guard_that_is_off_or_a_volume_that_cannot_be_read_tells_nobody(self):
+        self.free[0] = 1 * self.GB
+        self.engine.config["disk_guard"] = False
+        self.assertEqual(self.facts(), [])
+        self.engine.config["disk_guard"] = None
+        with mock.patch.object(sb.shutil, "disk_usage", side_effect=OSError("gone")):
+            self.assertEqual(self.facts(), [])
+            self.assertIsNone(sb.disk_status_line({}, self.world.state))
+
+    # -- disk prune
+
+    def fake_docker(self, name="docker"):
+        path = self.home / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(path), 0o755)
+        return str(path)
+
+    def prune(self, *argv, exits=(0, 0), outputs=("Total reclaimed space: 1.2GB", "Total reclaimed space: 300MB"), docker=None):
+        calls = []
+        replies = iter(zip(exits, outputs))
+
+        def runner(argv_, **kwargs):
+            calls.append(list(argv_))
+            code, out = next(replies)
+            return subprocess.CompletedProcess(argv_, code, out, "boom" if code else "")
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--docker", docker or self.fake_docker(), *argv], runner=runner, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue(), calls
+
+    def test_prune_runs_exactly_the_two_docker_commands_and_prints_what_was_reclaimed(self):
+        docker = self.fake_docker()
+        code, out, err, calls = self.prune(docker=docker)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [[docker, "builder", "prune", "-f", "--filter", "until=168h"], [docker, "image", "prune", "-a", "-f", "--filter", "until=168h"]])
+        for argv in calls:
+            self.assertFalse({"volume", "system", "container", "--volumes"} & set(argv), "never a volume, a container or a system prune")
+        self.assertIn("builder prune: reclaimed 1.2GB", out)
+        self.assertIn("image prune: reclaimed 300MB", out)
+        self.assertIn("disk: ", out)
+
+    def test_a_dry_run_prints_the_commands_and_runs_none(self):
+        code, out, err, calls = self.prune("--dry-run")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("builder prune -f --filter until=168h", out)
+        self.assertIn("image prune -a -f --filter until=168h", out)
+
+    def test_without_docker_it_refuses_and_runs_nothing(self):
+        code, out, err, calls = self.prune(docker="/nonexistent/docker")
+        self.assertEqual((code, calls), (sb.EXIT_USAGE, []))
+        self.assertIn("docker is not installed", err)
+
+    def test_one_failing_command_is_said_and_the_other_still_runs(self):
+        code, out, err, calls = self.prune(exits=(1, 0), outputs=("", "Total reclaimed space: 5MB"))
+        self.assertEqual((code, len(calls)), (sb.EXIT_ERROR, 2))
+        self.assertIn("builder prune: failed (exit 1)", out)
+        self.assertIn("image prune: reclaimed 5MB", out)
+
+    def test_the_docs_give_a_weekly_launchd_snippet_and_do_not_install_it(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("StartCalendarInterval", text)
+        self.assertIn("disk prune", text)
+        self.assertIn("not installed", text)
 
 
 class TestV2Light(Base):
