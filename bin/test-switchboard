@@ -4480,7 +4480,7 @@ class TestLaunch(Base):
         self.assertNotIn("worker", sb.read_pane_health(self.world.state)["states"])
         self.health(100)
         self.assertEqual(getattr(self.engine, "pane_alerts", {}), {})
-        lines = sb.pane_health_status_lines(self.world.state)
+        lines = sb.pane_health_status_lines(self.world.state, self.world.clock.now())
         self.assertTrue(any("retired" in l and "worker" in l for l in lines))
         self.assertFalse(any("DEAD" in l for l in lines))
         code, out, err = self.run_cli("reattach", "--all-detached")
@@ -4555,8 +4555,42 @@ class TestLaunch(Base):
         self.assertEqual(sb.read_retired(self.world.state), {})
 
     def test_a_retired_listing_is_dropped_from_status_after_the_show_days(self):
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": {"at": 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
-        self.assertEqual(sb.pane_health_status_lines(self.world.state), [])
+        day = 86400
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
+                                                            "stale": {"at": 1000 - 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
+        inside = sb.pane_health_status_lines(self.world.state, 1000 + sb.RETIRED_SHOW_DAYS * day)          # fresh is exactly at the edge, stale just past it
+        self.assertTrue(inside and "fresh" in inside[0] and "stale" not in inside[0])
+        self.assertEqual(sb.pane_health_status_lines(self.world.state, 1000 + sb.RETIRED_SHOW_DAYS * day + 1), [])
+
+    def test_retire_on_an_unknown_name_is_refused_a_repeat_is_harmless_and_a_failed_report_record_is_noted(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        os.environ.pop("HERDR_PANE_ID", None)                                  # the operator
+        code, out, err = self.run_cli("retire", "nobody-here")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a fleet agent", err)
+        self.as_("boss")
+        self.health()
+        self.assertEqual(self.run_cli("retire", "worker")[0], 0)
+        self.assertEqual(self.run_cli("retire", "worker")[0], 0)
+        self.assertEqual(len(sb.read_retired(self.world.state)), 1)
+        self.assertEqual(self.run_cli("retire", "--undo", "worker")[0], 0)
+        self.assertIn("is not retired", self.run_cli("retire", "--undo", "worker")[1])
+        with mock.patch.object(sb, "record_last_report", return_value=False):
+            self.world.new_engine("cli").report("worker", "done", "finished")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error" and "last-reports.json" in e["detail"]["error"]])
+        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space")):
+            self.assertFalse(sb.record_last_report(self.world.state, "worker", "done", 1))
+
+    def test_a_relaunched_worker_with_a_new_session_is_not_hidden_by_an_old_retirement(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
 
     def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
         pane = self.detach()

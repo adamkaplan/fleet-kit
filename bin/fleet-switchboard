@@ -3271,8 +3271,8 @@ class Switchboard:
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
         waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
-        if self.state_dir is not None:
-            record_last_report(self.state_dir, sender, state, now)
+        if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+            self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
         return self.send_fact(fact, discovery, now, waiting)
 
     def check_issue_exists(self, repo, number, wait=None, own_repo=None):
@@ -4572,7 +4572,8 @@ def read_retired(state_dir):
 
 def record_last_report(state_dir, sender, state, now):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
-    from one that died. Best effort, under a lock, never raises into `report`."""
+    from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
+    worker then still shows DEAD and is never wrongly retired), and the caller notes it."""
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
@@ -4581,8 +4582,9 @@ def record_last_report(state_dir, sender, state, now):
                 for old in sorted(data, key=lambda k: data[k].get("at", 0))[:len(data) - 500]:
                     data.pop(old, None)
             _write_small(state_dir, LAST_REPORT_FILE, data)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def read_pane_health(state_dir):
@@ -4661,7 +4663,7 @@ def pane_health_pass(engine, now):
             for table in (agents, states, missing):   # nobody repaired it in days: it stops waking cos
                 table.pop(name, None)
             continue
-        if name in retired:
+        if name in retired and retired[name].get("session") in (None, agents[name].get("session")):   # the name AND its session, as in the live branch
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
@@ -4727,14 +4729,15 @@ class PaneFacts:
         return out
 
 
-def pane_health_status_lines(state_dir):
+def pane_health_status_lines(state_dir, now=None):
     """The `status` lines for detached or dead agents (nothing when every pane is attached or unknown)."""
     if state_dir is None:
         return []
     data = read_pane_health(state_dir)
     retired = read_retired(state_dir)
     bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
-    gone = [n for n, v in sorted(retired.items()) if time.time() - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
+    clock = time.time() if now is None else now
+    gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
     tail = (["      retired    %d finished worker(s), not watched: %s (`%s retire --undo <name>` reverses)" % (len(gone), ", ".join(gone[:8]), PROG)] if gone else [])
     if not bad:
         return tail
@@ -4919,6 +4922,9 @@ def cmd_retire(args, runner, now):
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
     with agent_lock(state, "files"):
+        who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
+        if who:
+            raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
         if args.undo:
             if retired.pop(name, None) is None:
@@ -4938,6 +4944,8 @@ def cmd_retire(args, runner, now):
             return EXIT_OK
         if seen is None and not known:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
+        for old in [n for n, v in retired.items() if now() - (v.get("at") or 0) > 4 * RETIRED_SHOW_DAYS * 86400]:
+            retired.pop(old, None)               # bounded: entries long past the status window are dropped
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
         _write_small(state, RETIRED_FILE, retired)
@@ -11930,7 +11938,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
-        report["pane_lines"] = pane_health_status_lines(state)
+        report["pane_lines"] = pane_health_status_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
