@@ -20,7 +20,8 @@ def launched(fleets, sessions, repo, repo_of, retired=None):
 
     `fleets` is {name: metadata.fleet} of the running agents, `sessions` {name: session id}, `repo_of(fleet)` the repo a record names (or None), `retired`
     {name: {"session": id or None}}. A tester counts only when: its role is `tester`; its recorded repo is `repo`; its recorded boss is an agent whose
-    own record says orchestrator and the same repo; and it is not retired (the name and its session, as retirement is recorded)."""
+    own record says orchestrator and the same repo; the launch was run BY that boss (`launched_by`, which the launch records from the caller's pane; a
+    launch from a plain shell or before this record existed does not count: use the configured list); and it is not retired (the name and its session, as retirement is recorded)."""
     found = {}
     for name, fleet in sorted((fleets or {}).items()):
         if not isinstance(fleet, dict) or fleet.get("role") != ROLE or repo_of(fleet) != repo:
@@ -28,6 +29,8 @@ def launched(fleets, sessions, repo, repo_of, retired=None):
         boss = _plain(fleet.get("reports_to"))
         boss_fleet = (fleets or {}).get(boss) if boss else None
         if not isinstance(boss_fleet, dict) or boss_fleet.get("role") != ORCHESTRATOR or repo_of(boss_fleet) != repo:
+            continue
+        if fleet.get("launched_by") != boss:   # the launch must have been RUN by that orchestrator: a coder cannot mint a tester by naming an orchestrator as its boss
             continue
         gone = (retired or {}).get(name)
         if isinstance(gone, dict) and gone.get("session") in (None, (sessions or {}).get(name)):
@@ -58,7 +61,6 @@ def lane_refusal(tester, launched_testers, authors, sessions, fleets=None):
             return "%s is not a different agent from %s, a coder launched on work item #%s" % (tester, name, issue)
     if tester in (authors or ()):
         return "%s wrote this PR: a tester cannot record a verdict on its own work" % tester
-    mine = (sessions or {}).get(tester)
     if mine is not None and any((sessions or {}).get(author) == mine for author in (authors or ())):
         return "%s runs in the session of a writer of this PR: it is not independent of it" % tester
     return None

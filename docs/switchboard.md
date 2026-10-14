@@ -4049,13 +4049,17 @@ names, for example `{"reviewer": ["reviewer-1"], "tester": ["tester-1"]}`. An ev
 for, which keeps a fresh install from accepting verdicts nobody was trusted to give. The **writers** of a PR are the author GitHub reports for it, anyone who recorded a proof for it, and the sender of its `notice pr`; a verdict is refused until at least one writer is known, so a writer that declared nothing cannot be its own evaluator; an author's verdict is refused when recorded, and ignored by `gates` if it is
 in the file anyway. The caller's identity is the session-based one, a guard against mistakes: it does not stop an agent that sets another agent's session variable. `verdict` requires `--evidence` like `prove`, and `--head` must be the PR's head. A scenario that still names the old personal evaluator spelling is judged by `owner`.
 
-**Testers from the launch record (#372).** The `tester` list is the configured one PLUS every running agent whose launch record (`launch --role tester`, kept in
-its session's fleet metadata) says: role `tester`, the PR's repo, and a boss whose own record is `orchestrator` for that same repo; a retired tester does not
-count. So a tester launched by a repo's orchestrator may record tester verdicts for that repo and no other. This widens who can record a verdict, and only
-for `tester`: `reviewer`, `ci` and `owner` never come from a launch record. A tester is independent when it is not a writer of the PR, runs in the session of no
-writer, and is a different agent from every coder launched on its work item; otherwise the verdict is refused. Each verdict a launched tester records is
-audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their source (`config` or
-`launch record`). The rules are `bin/launch_testers.py`.
+**Testers from the launch record (#372).** The `tester` list is the configured one PLUS every running agent whose launch record (`launch --role tester`, kept
+in its session's fleet metadata) says: role `tester`, the PR's repo, a boss whose own record is `orchestrator` for that same repo, and **launched by that
+boss** (`launched_by`: `launch` records the agent that ran it, as its pane identified it; a launch from a plain shell, or from before this record existed,
+does not count: use the configured list); a retired tester does not count. So a tester launched by a repo's orchestrator may record tester verdicts for that
+repo and no other, and a coder cannot mint one by naming an orchestrator as its boss. This widens who can record a verdict, and only for `tester`:
+`reviewer`, `ci` and `owner` never come from a launch record. **It is a guardrail, not a boundary:** the record is written at launch from the caller's pane
+identity (the session-based guard of #138, which a determined local agent can spoof), and the boundary that matters is who may run `launch`. A tester is
+refused when it is a writer of the PR, runs in the session of a writer, or is the same agent as a coder launched on its work item. Each verdict a launched
+tester records is audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their
+source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does).
+The rules are `bin/launch_testers.py`.
 
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
 it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is

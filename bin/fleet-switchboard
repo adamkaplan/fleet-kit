@@ -5121,9 +5121,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
-             "charter": charter, "repo": repo}
+             "charter": charter, "repo": repo, "launched_by": launched_by}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -5207,7 +5207,7 @@ def view_env(role, repo):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -5222,7 +5222,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     accounts = getattr(engine, "accounts", None)
@@ -11101,7 +11101,7 @@ def testers_status(config, agents, fleets, state):
         repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
         return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, read_retired(state))
     except Exception:
-        return []
+        return ["      tester     unreadable: the resolved testers could not be listed"]
 
 
 def triage_status_lines(triage):
@@ -13996,8 +13996,13 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
+        launcher = identify_caller(engine.herdr, engine.v2, os.environ)   # #372: who ran this launch, recorded in the session; a plain shell is nobody
+    except Exception:
+        launcher = None
+    try:
         done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                            launched_by=launcher if isinstance(launcher, str) and launcher else None)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -16468,25 +16473,21 @@ def cmd_prove(args, runner, now):
     return EXIT_OK
 
 
-def launched_fleets_for(ctx):
-    """{name: metadata.fleet} of the running agents, for the lane rule (#372); {} when discovery fails."""
-    try:
-        return {name: (seen.fleet or {}) for name, seen in ctx.engine.discover(ctx.engine.now()).agents.items()}
-    except Exception:
-        return {}
-
-
 def launched_testers_for(ctx):
-    """({name: launch record}, {name: session id}) of the running agents that the launch record makes testers of this PR's repo (#372). Never raises:
-    a discovery that fails or an unreadable retired list gives nothing launched, so only the configured list counts."""
+    """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
+    of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
+    counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
     try:
         agents = ctx.engine.discover(ctx.engine.now()).agents
         fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
         sessions = {name: seen.session_id for name, seen in agents.items()}
-        retired = read_retired(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
-        return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions
     except Exception:
-        return {}, {}
+        return {}, {}, {}
+    try:
+        retired = read_retired(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+    except Exception:
+        return {}, sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
 def cmd_verdict(args, runner, now):
@@ -16524,14 +16525,14 @@ def cmd_verdict(args, runner, now):
         if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
-        allowed, launch, sessions = ctx.config.get("plan_evaluators"), {}, {}
+        allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
         if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
-            launch, sessions = launched_testers_for(ctx)
+            launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
         if ok and named == "tester" and caller in launch:
-            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, launched_fleets_for(ctx))
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
