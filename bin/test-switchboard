@@ -18087,12 +18087,12 @@ class TestIdentityCheck(ReportBase):
         return done, (json.loads(log.read_text()) if log.exists() else None)
 
     def test_a_caller_with_no_repo_of_its_own_acts_as_the_account_of_the_repo_an_issue_or_pr_command_names_and_nothing_else_picks_one(self):
-        users = {"acme/*": "acct-personal", "other-org/*": "acct-janus"}
-        tokens = {"acct-personal": "tok-personal", "acct-janus": "tok-janus"}
+        users = {"acme/*": "acct-personal", "other-org/*": "acct-other"}
+        tokens = {"acct-personal": "tok-personal", "acct-other": "tok-other"}
         cases = (
-            (("issue", "list", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "other-org/svc"), "tok-janus"),
-            (("issue", "create", "--repo=acme/api", "--title", "t"), "tok-personal"), (("issue", "comment", "https://github.com/other-org/svc/issues/4", "--body", "x"), "tok-janus"),
-            (("pr", "ready", "https://github.com/acme/api/pull/9"), "tok-personal"), (("pr", "edit", "5", "-R", "other-org/svc", "--add-label", "x"), "tok-janus"),
+            (("issue", "list", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "other-org/svc"), "tok-other"),
+            (("issue", "create", "--repo=acme/api", "--title", "t"), "tok-personal"), (("issue", "comment", "https://github.com/other-org/svc/issues/4", "--body", "x"), "tok-other"),
+            (("pr", "ready", "https://github.com/acme/api/pull/9"), "tok-personal"), (("pr", "edit", "5", "-R", "other-org/svc", "--add-label", "x"), "tok-other"),
             (("issue", "close", "3", "-Racme/api"), "tok-personal"))
         for args, expected in cases:
             with self.subTest(args=args):

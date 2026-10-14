@@ -186,9 +186,9 @@ URL_REPO_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+
 
 
 VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--title", "-l", "--label", "-a", "--assignee", "-m", "--milestone", "-p", "--project",
-               "-r", "--reviewer", "-B", "--base", "-H", "--head", "-q", "--jq", "--json", "--template", "-c", "--comment", "-s", "--state",
+               "-r", "--reviewer", "-B", "--base", "-H", "--head", "-q", "--jq", "--json", "--template", "-s", "--state",
                "-S", "--search", "-L", "--limit", "--author", "--app", "--add-label", "--remove-label", "--add-assignee", "--remove-assignee",
-               "--add-reviewer", "--remove-reviewer", "--add-project", "--remove-project", "--reason", "-d", "--delete-branch-value", "--editor-value"}
+               "--add-reviewer", "--remove-reviewer", "--add-project", "--remove-project", "--reason"}
 TARGET_VERBS = {"view", "comment", "edit", "close", "reopen", "ready", "checks", "diff", "lock", "unlock", "status"}
 
 
