@@ -6212,10 +6212,72 @@ def cmd_reattach_all(args, runner, now, socket_call=None):
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def retire_close_problem(engine, runner, now, discovery, name, seen, force):
+    """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
+    Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
+    never the caller's own pane or session. What: the pane the switchboard has for the agent, read again live, must still hold THAT agent's session
+    (a stored pane id can name another terminal after a herdr restart). A working agent needs --force, which is refused while a registered worktree of
+    the agent holds uncommitted or unpushed work."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        who = "the operator"
+    elif kind[0] == "agent":
+        who = kind[1]
+        if who == name:
+            return None, "an agent cannot close its own pane"
+        if seen is None or boss_name(discovery, seen) != who:
+            return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+    else:
+        return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
+    if seen is None or not seen.pane or not seen.session_id:
+        return None, "%s has no pane and session the switchboard can see: nothing to close" % name
+    pane = seen.pane
+    if os.environ.get("HERDR_PANE_ID") == pane:
+        return None, "pane %s is the one you are in: never closed by you" % pane
+    try:
+        live = engine.herdr.agent_get(pane)
+    except HerdrError as err:
+        return None, "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 80))
+    if agent_session(live) != seen.session_id:
+        return None, "pane %s no longer holds %s's session: nothing was closed" % (pane, name)
+    if live.get("agent_status") in ("working", "blocked") and not force:
+        return None, "%s is %s: pass --force to close it anyway" % (name, live.get("agent_status"))
+    if force and live.get("agent_status") in ("working", "blocked") and engine.state_dir is not None:
+        for path, entry in sorted(read_worktrees(engine.state_dir).items()):
+            if isinstance(entry, dict) and entry.get("agent") == name:
+                facts = worktree_facts(runner, path)
+                if facts["exists"] and (facts["why"] or facts["dirty"] or facts["pushed"] is False):
+                    return None, "--force refused: %s holds uncommitted or unpushed work in %s" % (name, path)
+    return pane, None
+
+
+def retire_close_pane(engine, runner, now, name, pane, caller, force):
+    """Close `pane` after judging EVERYTHING again from a fresh discovery (the first judgment was before the retirement lock and the worktree reclaim):
+    who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
+    detail = {"pane": pane, "by": caller}
+    try:
+        fresh = engine.discover(engine.now())
+        again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
+        if why:
+            raise HerdrError("refused", why)
+        if again != pane:
+            raise HerdrError("moved", "the agent's pane is now %s, not %s" % (again, pane))
+        with engine._external("herdr.pane.close", name, {"pane": pane, "why": "retire --close"}):
+            engine.herdr.pane_close(pane)
+    except Exception as err:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_failed", name, dict(detail, why=_one_line(str(err), 120)))
+        return "pane %s was not closed (%s): the agent is retired" % (pane, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "fleetpane.closed", name, detail)
+    return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
-    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed. The
-    caller rule is `reattach`'s: the operator, the Chief of Staff or the agent's own boss; others are refused and audited."""
+    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
+    `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
+    Chief of Staff or the agent's own boss; others are refused and audited."""
     engine, state, _ = build_engine(runner, now, "cli")
     name = args.name
     if not NAME_RE.match(name or ""):
@@ -6229,6 +6291,14 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
+    close_pane, close_by = None, None
+    if getattr(args, "close", False) and not args.undo:
+        close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
+        close_by = identify_who(engine, runner, now)
+        if why:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
+            raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
         who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
         if who:
@@ -6270,7 +6340,11 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
+    if close_pane is not None:
+        line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
+        print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
+    else:
+        print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
     try:
         for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
             print("worktree: " + line)
@@ -6787,6 +6861,9 @@ def add_retire_parsers(sub):
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
+    retire.add_argument("--close", action="store_true", help="Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; "
+                                                             "the pane is read again and must still hold the agent's own session; never your own pane")
+    retire.add_argument("--force", action="store_true", help="With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)")
 
 
 def add_reattach_parsers(sub):
