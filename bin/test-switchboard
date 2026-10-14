@@ -214,7 +214,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto",
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "disk_guard": None,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -2388,7 +2388,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -8765,7 +8765,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -9978,12 +9978,24 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                      "timeout 5 fleet-switchboard waive acme/app#5 --gates G8 --reason x", "timeout 5 fleet-switchboard decisions batch --title x"):
             self.assertEqual(self.evaluate(rules, "shell", gate), "deny", gate)   # the collapsed denies still catch both the bare and the timeout forms
 
+    def test_retire_is_allowed_for_the_chief_of_staff_and_every_write_next_to_it_stays_denied(self):
+        _, rules = self.rules()
+        for command in ("fleet-switchboard retire worker --reason done", "fleet-switchboard retire --undo worker", "fleet-switchboard retire worker"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+        for command in ("timeout 30 fleet-switchboard retire worker", "fleet-switchboard review record acme/api#5 --reviewer code --block f",
+                        "fleet-switchboard impact clear acme/api#5 --reason x", "fleet-switchboard verdict --all --pr acme/api#5",
+                        "herdr pane close w1:p1", "herdr tab close w1:t1", "fleet-switchboard gates mode acme/app enforce"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)        # no raw herdr, and the other writes are as before
+        for path in self.PATHS:
+            _, lines, _ = self.block(path)
+            self.assertLess(len(lines), self.MAX_BLOCK_LINES)
+
     def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
         _, rules = self.parse(self.PATHS[1])
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard send x y"), "allow")
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard handoff --issue 5"), "deny")
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard launch v --agent orchestrator"), "deny")
-        for command in ("fleet-switchboard reattach x", "fleet-switchboard relaunch x"):
+        for command in ("fleet-switchboard reattach x", "fleet-switchboard relaunch x", "fleet-switchboard retire x"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
         self.assertEqual(self.evaluate(rules, "shell", "make build"), "deny")
 
@@ -10027,10 +10039,9 @@ class TestSelfRegisteringCli(unittest.TestCase):
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
-        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
+        "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
-        "disk": ("cmd_disk", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
@@ -18418,6 +18429,32 @@ class TestUnreportedStop(ReportBase):
     def test_a_stop_with_no_report_and_no_send_still_nudges(self):
         self.stop("OWED-ME: the migration is finished")
         self.assertIn("nudge", [f.kind for f in self.facts()])
+
+    def retire_entry(self, **fields):
+        entry = {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}
+        entry.update(fields)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": entry} if entry is not None else {})
+        for source in self.world.engine.sources:                      # a stop is judged once and remembered: forget it so the next look decides afresh
+            getattr(source, "_stops", {}).clear()
+
+    def test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked(self):
+        self.stop("OWED-ME: the migration is finished")
+        self.world.engine.state_dir = self.world.state
+        self.retire_entry()
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])       # only the idle rider: the rest is silenced
+        self.assertEqual(self.triage_events(), [], "the decision model is not asked about a retired worker")
+
+    def test_a_retirement_of_another_session_or_another_name_does_not_silence_a_stop_and_one_with_no_session_does(self):
+        self.stop("OWED-ME: the migration is finished")
+        self.world.engine.state_dir = self.world.state
+        self.retire_entry(session="ses_a_session_this_worker_no_longer_has")
+        self.assertIn("nudge", [f.kind for f in self.facts()], "a stale retirement of an older session still lets the stop be nudged")
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        for source in self.world.engine.sources:
+            getattr(source, "_stops", {}).clear()
+        self.assertIn("nudge", [f.kind for f in self.facts()], "another name's retirement does nothing")
+        self.retire_entry(session=None)
+        self.assertNotIn("nudge", [f.kind for f in self.facts()], "an entry that names no session retires the name")
 
     def test_a_stop_with_no_report_and_a_jev_answer_of_owed_nudges_the_worker_once(self):
         self.stop("OWED-ME: the migration is finished")
@@ -38914,6 +38951,80 @@ class TestV2ReadVolume(Base):
         before = sum(self.ops(uncached).values())
         self.assertGreater(before, 5 * total, "without the memory the same passes read about %d times: %s" % (before, self.ops(uncached)))
 
+    def test_twenty_agents_are_refreshed_by_one_session_list_not_twenty_session_gets(self):
+        world = self.world()
+        self.passes(world, 40)                      # 200 s: the 120 s memory expires once
+        ops = self.ops(world)
+        self.assertEqual(ops.get("session.get", 0), 0, ops)
+        self.assertEqual(ops.get("session.list", 0), 2, "one at the start and one when the memory expires: %s" % ops)
+        self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20)
+
+    def test_a_session_whose_time_moved_shows_its_new_time_after_the_next_list(self):
+        world = self.world()
+        self.passes(world, 2)
+        sid = world.sessions["agent4"]
+        before = world.engine.reads.sessions[sid][0]["time"]["updated"]
+        world.v2.sessions[sid]["messages"].append({"id": "msg_new", "type": "assistant", "time": {"created": world.clock.ms(world.clock.now()) + 5000}, "text": "x"})
+        world.tick(130)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        self.assertGreaterEqual(world.engine.reads.sessions[sid][0]["time"]["updated"], before + 1)
+        self.assertEqual(self.ops(world, mark).get("session.get", 0), 0)
+
+    def test_a_state_change_after_the_list_was_read_is_read_alone_not_from_the_older_list(self):
+        world = self.world()
+        self.passes(world, 2)                       # the list was read in the first pass
+        sid = world.sessions["agent3"]
+        world.tick(20)
+        world.v2.start_turn(sid, "a task", fleet=True, lasts=30)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        ops = self.ops(world, mark)
+        self.assertEqual((ops.get("session.get"), ops.get("session.list")), (1, None), ops)
+
+    def test_a_record_taken_from_the_list_ages_from_when_the_list_was_read(self):
+        world = self.world()
+        self.passes(world, 2)
+        listed_at = world.engine.reads.listed_at
+        world.tick(130)
+        world.engine.run_pass()
+        entry = world.engine.reads.sessions[world.sessions["agent5"]]
+        self.assertEqual(entry[1], world.engine.reads.listed_at)
+        self.assertGreater(entry[1], listed_at)
+
+    def test_a_session_the_list_page_does_not_hold_is_read_alone(self):
+        world = self.world()
+        world.engine.reads.LIST_PAGE = 5
+        world.v2.list_page_cap = 5
+        self.passes(world, 2)
+        ops = self.ops(world)
+        self.assertGreaterEqual(ops.get("session.get", 0), 15, "the 15 sessions past the page are read one by one: %s" % ops)
+        self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20)
+
+    def test_a_failed_list_falls_back_to_the_session_reads_and_is_not_retried_at_once(self):
+        world = self.world()
+        real, tries = world.engine.v2.session_list_page, []
+        world.engine.v2.session_list_page = lambda *a, **k: tries.append(1) or (_ for _ in ()).throw(sb.V2Error("timeout", None, "slow"))
+        try:
+            self.passes(world, 6)
+        finally:
+            world.engine.v2.session_list_page = real
+        self.assertEqual(self.ops(world).get("session.get", 0), 20, "every agent is still read, once")
+        self.assertEqual(len(tries), 1, "one attempt, and none again within half the memory")
+
+    def test_a_read_before_a_write_is_never_from_the_list(self):
+        world = self.world()
+        self.passes(world, 2)
+        mark = len(world.v2.calls)
+        world.engine.reads.session_info(world.sessions["agent1"], "idle", world.clock.now(), fresh=True)
+        ops = self.ops(world, mark)
+        self.assertEqual((ops.get("session.get"), ops.get("session.list")), (1, None))
+
+    def test_under_light_mode_no_list_is_read(self):
+        world = self.world(v2_light=True)
+        self.passes(world, 3)
+        self.assertEqual(self.ops(world).get("session.list", 0), 0)
+
     def test_once_warm_a_pass_of_idle_agents_reads_almost_nothing(self):
         world = self.world()
         self.passes(world, 2)
@@ -38933,6 +39044,8 @@ class TestV2ReadVolume(Base):
 
     def test_a_cache_fill_budget_per_pass_shares_the_reads_out_in_turn(self):
         world = self.world(v2_cache_seconds=30, v2_reads_per_pass=3, v2_reads_per_minute=1000)
+        world.engine.reads.LIST_PAGE = 1             # the list holds one session: the rest are read alone, which is what the budget shares out
+        world.v2.list_page_cap = 1
         self.passes(world, 1)                       # the first read of every agent is always made
         world.tick(40)                              # all 20 records are now old
         mark = len(world.v2.calls)
@@ -38944,7 +39057,7 @@ class TestV2ReadVolume(Base):
             mark = len(world.v2.calls)
             world.engine.run_pass()
             seen |= {self.params(call)["sessionID"] for call in world.v2.calls[mark:] if len(call) > 2 and call[2] == "session.get"}
-        self.assertEqual(len(seen), 20, "every agent is refreshed within a few passes: the stalest goes first")
+        self.assertEqual(len(seen), 19, "every agent but the one the list holds is refreshed within a few passes: the stalest goes first")
 
     def test_a_per_minute_cap_keeps_what_is_remembered_and_the_stale_record_is_still_used(self):
         world = self.world(v2_cache_seconds=30, v2_reads_per_pass=100, v2_reads_per_minute=5)
@@ -39557,6 +39670,268 @@ class TestAuditRotation(unittest.TestCase):
         entry = json.loads(self.path.read_text().splitlines()[-1])
         self.assertEqual(entry["event"], "audit.rotated")
         self.assertEqual((entry["detail"]["pruned"], entry["detail"]["archive"].startswith("audit-")), (["audit-2020-01-01.jsonl.gz"], True))
+
+
+class TestDiskGuard(Base):
+    """The disk guard: one stat of the state directory's volume per pass; the Chief of Staff is told once per episode below disk_guard.min_free_gb; `status`
+    says how much is free; `disk prune` runs exactly two docker commands and refuses without docker."""
+
+    GB = 10 ** 9
+
+    def setUp(self):
+        super().setUp()
+        self.free = [200 * self.GB]
+        self.stats = []
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+
+        self.after_prune = None
+
+        def usage(path):
+            self.stats.append(str(path))
+            free = self.after_prune if self.after_prune is not None and len(self.stats) > 1 else self.free[0]
+            return collections.namedtuple("usage", "total used free")(1000 * self.GB, 1000 * self.GB - free, free)
+        patcher = mock.patch.object(sb.shutil, "disk_usage", usage)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def facts(self, engine=None):
+        engine = engine or self.engine
+        found, problems = engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "disk"]
+
+    def audits(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_the_config_key_is_validated_and_off_means_off(self):
+        for ok in (None, False, {}, {"min_free_gb": 80}, {"min_free_gb": 80, "hard_free_gb": 20}, {"hard_free_gb": 0}):
+            sb.validate_disk_guard(ok, "t")
+        for bad in (True, 5, [], {"min_free_gb": -1}, {"min_free_gb": "50"}, {"nope": 1}, {"min_free_gb": 5, "hard_free_gb": 10}, {"hard_free_gb": 60}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_disk_guard(bad, "t")
+        self.assertEqual(sb.disk_guard_settings({}), {"min_free_gb": 50, "hard_free_gb": 10})
+        self.assertIsNone(sb.disk_guard_settings({"disk_guard": False}))
+
+    def test_the_status_line_says_how_much_is_free_and_when_it_is_low(self):
+        self.free[0] = 238 * self.GB
+        self.assertEqual(sb.disk_status_line({}, self.world.state), "238 GB free (24%)")   # 238 of the 1000 GB the stand-in volume has, 23.8%
+        self.free[0] = 30 * self.GB
+        self.assertEqual(sb.disk_status_line({}, self.world.state), "30 GB free (3%): LOW (below 50 GB; hard line 10 GB)")
+        self.free[0] = 5 * self.GB
+        self.assertIn("VERY LOW", sb.disk_status_line({}, self.world.state))
+        self.assertIn("below 80 GB", sb.disk_status_line({"disk_guard": {"min_free_gb": 80}}, self.world.state))
+
+    def test_status_shows_the_disk_line_and_not_when_the_guard_is_off(self):
+        self.free[0] = 238 * self.GB
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertIn("disk       238 GB free", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "disk_guard": False})
+        self.assertNotIn("disk       ", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
+    def test_one_stat_per_pass_and_nothing_while_the_disk_is_fine(self):
+        for _ in range(5):
+            self.assertEqual(self.facts(), [])
+        self.assertEqual(len(self.stats), 5, "one disk_usage per collection: no walk")
+        self.assertEqual(self.audits("disk.low"), [])
+
+    def test_the_chief_of_staff_is_told_once_per_episode_and_the_episode_ends_above_the_threshold_plus_ten_percent(self):
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        self.assertEqual((first.recipient, first.kind, first.sender), ("cos", "disk", "switchboard"))
+        self.assertIn("disk low: 40 GB free", first.summary)
+        for free in (38, 30, 52, 54):                       # lower, and back up but not above 55
+            self.free[0] = free * self.GB
+            self.world.tick(30)
+            (again,) = self.facts()
+            self.assertEqual(again.key, first.key, "the same episode: the same key, so it is delivered once")
+        self.assertEqual(len(self.audits("disk.low")), 1, "audited once")
+        self.free[0] = 56 * self.GB                         # above 50 + 10%
+        self.assertEqual(self.facts(), [])
+        self.assertEqual(len(self.audits("disk.recovered")), 1)
+        self.world.tick(100)
+        self.free[0] = 45 * self.GB
+        (second,) = self.facts()
+        self.assertNotEqual(second.key, first.key, "a new episode: a new fact")
+        self.assertEqual(len(self.audits("disk.low")), 2)
+
+    def test_two_episodes_that_recover_at_the_same_figure_are_both_audited(self):
+        for episode in range(2):
+            self.free[0] = 40 * self.GB
+            self.world.tick(100)
+            self.facts()
+            self.free[0] = 60 * self.GB   # the same figure each time
+            self.facts()
+        self.assertEqual(len(self.audits("disk.low")), 2)
+        self.assertEqual(len(self.audits("disk.recovered")), 2, "not swallowed as a repeat of the same detail")
+
+    def test_a_restart_does_not_begin_a_second_episode_and_a_hard_line_is_said_once(self):
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        self.assertEqual(json.loads((self.world.state / sb.DISK_GUARD_FILE).read_text())["low"], True)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.world.state / sb.DISK_GUARD_FILE)).st_mode), 0o600)
+        self.world.tick(60)
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        (again,) = self.facts(restarted)
+        self.assertEqual(again.key, first.key)
+        self.assertEqual(len(self.audits("disk.low")), 1)
+        self.free[0] = 8 * self.GB
+        self.facts(restarted)
+        self.facts(restarted)
+        self.assertEqual(len(self.audits("disk.hard")), 1, "worse inside the episode: said once, not a second wake")
+
+    def test_the_config_key_is_checked_by_validate_config_too(self):
+        sb.validate_config({"opencode": FAKE_OPENCODE, "disk_guard": {"min_free_gb": 80}})
+        for bad in ("yes", {"hard_free_gb": 99}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "disk_guard": bad})
+
+    def test_with_no_chief_of_staff_no_episode_begins_until_there_is_one_and_an_unreadable_volume_is_audited_once(self):
+        solo = World(self, agents=("coder",), config={})
+        solo.engine.discover(solo.clock.now())
+        self.free[0] = 5 * self.GB
+        found, _ = solo.engine.collect_facts()
+        self.assertEqual([f for f in found if f.kind == "disk"], [])
+        self.assertFalse((solo.state / sb.DISK_GUARD_FILE).exists(), "no episode was opened: nobody to tell")
+        solo.add_agent("cos", fleet={"role": "chief-of-staff"})
+        solo.engine.discover(solo.clock.now())
+        found, _ = solo.engine.collect_facts()
+        self.assertEqual(len([f for f in found if f.kind == "disk"]), 1, "the first pass with a Chief of Staff tells it")
+        with mock.patch.object(sb.shutil, "disk_usage", side_effect=OSError("gone")):
+            self.facts()
+            self.facts()
+        self.assertEqual(len(self.audits("disk.unreadable")), 1)
+
+    def test_an_episode_that_starts_below_the_hard_line_and_a_zero_size_volume(self):
+        self.free[0] = 4 * self.GB
+        (fact,) = self.facts()
+        self.assertEqual(len(self.audits("disk.low")), 1)
+        self.assertTrue(self.audits("disk.low")[0]["detail"]["hard"])
+        self.assertEqual(self.audits("disk.hard"), [], "it began hard: nothing worse to say")
+        with mock.patch.object(sb.shutil, "disk_usage", lambda path: collections.namedtuple("u", "total used free")(0, 0, 7 * self.GB)):
+            self.assertEqual(sb.disk_status_line({}, self.world.state), "7 GB free: VERY LOW (below 50 GB; hard line 10 GB)")
+
+    def test_a_failed_save_of_the_episode_is_said_and_leaves_no_temp_file(self):
+        self.free[0] = 40 * self.GB
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("disk full")):
+            self.assertEqual(len(self.facts()), 1, "the guard still works in memory")
+        self.assertEqual(list(self.world.state.glob("disk-guard.json.*.tmp")), [])
+        self.assertEqual(len(self.audits("disk.guard_file")), 1)
+
+    def test_a_guard_that_is_off_or_a_volume_that_cannot_be_read_tells_nobody(self):
+        self.free[0] = 1 * self.GB
+        self.engine.config["disk_guard"] = False
+        self.assertEqual(self.facts(), [])
+        self.engine.config["disk_guard"] = None
+        with mock.patch.object(sb.shutil, "disk_usage", side_effect=OSError("gone")):
+            self.assertEqual(self.facts(), [])
+            self.assertIsNone(sb.disk_status_line({}, self.world.state))
+
+    # -- disk prune
+
+    def fake_docker(self, name="docker"):
+        path = self.home / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(path), 0o755)
+        return str(path)
+
+    def prune(self, *argv, exits=(0, 0), outputs=("Total reclaimed space: 1.2GB", "Total reclaimed space: 300MB"), docker=None):
+        calls = []
+        replies = iter(zip(exits, outputs))
+
+        def runner(argv_, **kwargs):
+            calls.append(list(argv_))
+            code, out = next(replies)
+            return subprocess.CompletedProcess(argv_, code, out, "boom" if code else "")
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--docker", docker or self.fake_docker(), *argv], runner=runner, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue(), calls
+
+    def test_prune_runs_exactly_the_two_docker_commands_and_prints_what_was_reclaimed(self):
+        docker = self.fake_docker()
+        self.after_prune = 215 * self.GB   # the second reading of the volume, after the prune
+        code, out, err, calls = self.prune(docker=docker)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [[docker, "builder", "prune", "-f", "--filter", "until=168h"], [docker, "image", "prune", "-a", "-f", "--filter", "until=168h"]])
+        for argv in calls:
+            self.assertFalse({"volume", "system", "container", "--volumes"} & set(argv), "never a volume, a container or a system prune")
+        self.assertIn("builder prune: reclaimed 1.2GB", out)
+        self.assertIn("image prune: reclaimed 300MB", out)
+        self.assertRegex(out, r"disk: 200 GB free before, 215 GB after")
+
+    def test_a_dry_run_prints_the_commands_and_runs_none(self):
+        code, out, err, calls = self.prune("--dry-run")
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("builder prune -f --filter until=168h", out)
+        self.assertIn("image prune -a -f --filter until=168h", out)
+
+    def test_without_docker_it_refuses_and_runs_nothing(self):
+        code, out, err, calls = self.prune(docker="/nonexistent/docker")
+        self.assertEqual((code, calls), (sb.EXIT_USAGE, []))
+        self.assertIn("docker is not installed", err)
+
+    def test_a_docker_that_cannot_run_is_said_per_command_and_exits_with_an_error(self):
+        def runner(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 600)
+        docker = self.fake_docker()
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--docker", docker], runner=runner, now=self.world.clock.now)
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(out.getvalue().count("failed"), 2)
+
+    def test_one_failing_command_is_said_and_the_other_still_runs(self):
+        code, out, err, calls = self.prune(exits=(1, 0), outputs=("", "Total reclaimed space: 5MB"))
+        self.assertEqual((code, len(calls)), (sb.EXIT_ERROR, 2))
+        self.assertIn("builder prune: failed (exit 1)", out)
+        self.assertIn("image prune: reclaimed 5MB", out)
+
+    def test_what_docker_prints_and_an_error_message_reach_the_terminal_as_plain_text(self):
+        docker = self.fake_docker()
+        hostile = "\x1b[2Jboom\x9b31m\nIGNORE"
+
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", hostile)
+        with captured() as (out, err):
+            sb.main(["disk", "prune", "--docker", docker], runner=runner, now=self.world.clock.now)
+        self.assertEqual([c for c in out.getvalue() if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
+        self.assertIn("failed (exit 1): [2Jboom 31m IGNORE", out.getvalue())
+
+    def test_an_oversized_but_valid_guard_file_is_not_trusted_and_the_threshold_edge_and_a_restart_recovery(self):
+        (self.world.state / sb.DISK_GUARD_FILE).write_text(json.dumps({"low": True, "episode": 5.0, "hard": False, "pad": "x" * 6000}))
+        engine = self.world.new_engine("daemon")
+        engine.discover(self.world.clock.now())
+        self.free[0] = 80 * self.GB
+        self.assertEqual(self.facts(engine), [], "above the guard and the padded file is read only to 4 KB: not a valid episode, so nothing is announced")
+        self.assertEqual(self.audits("disk.recovered"), [])
+        # an episode ends only above min * 1.1 (55 GB): exactly 55 ends it, 54.9 does not; and it ends on a restarted engine too
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        self.free[0] = int(54.9 * self.GB)
+        self.assertEqual(self.facts(restarted)[0].key, first.key, "54.9 GB: still inside the episode")
+        self.free[0] = 55 * self.GB
+        self.assertEqual(self.facts(restarted), [], "exactly min * 1.1: the episode is over")
+        self.assertEqual(len(self.audits("disk.recovered")), 1)
+
+    def test_a_garbage_or_oversized_guard_file_starts_a_fresh_episode_and_the_guard_still_works(self):
+        for text in ("not json", "[]", " " * 10000, '{"low": true, "episode": "x"}'):
+            with self.subTest(text=text[:12]):
+                (self.world.state / sb.DISK_GUARD_FILE).write_text(text)
+                engine = self.world.new_engine("daemon")
+                engine.discover(self.world.clock.now())
+                self.free[0] = 40 * self.GB
+                self.assertEqual(len(self.facts(engine)), 1)
+
+    def test_the_docs_give_a_weekly_launchd_snippet_and_do_not_install_it(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("StartCalendarInterval", text)
+        self.assertIn("disk prune", text)
+        self.assertIn("not installed", text)
 
 
 class TestV2Light(Base):
