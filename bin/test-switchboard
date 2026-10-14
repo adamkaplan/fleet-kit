@@ -14,6 +14,7 @@ is non-zero on failure.
 """
 import ast
 import base64
+import calendar
 import collections
 import contextlib
 import errno
@@ -42737,7 +42738,7 @@ class FakeActions:
     REPO = "acme/widget"
 
     def __init__(self):
-        self.calls, self.runs, self.artifacts, self.zips = [], {}, {}, {}
+        self.calls, self.argvs, self.runs, self.artifacts, self.zips = [], [], {}, {}, {}
         self.pull = {"head": {"sha": "b" * 40}, "base": {"repo": {"default_branch": "main"}}}
         self.fail_paths = set()
         self.next_id = 100
@@ -42750,14 +42751,17 @@ class FakeActions:
         run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed"}
         self.runs.setdefault(event, []).append(run)
         if artifact:
-            self.artifacts[self.next_id] = {"id": self.next_id + 5000, "expired": expired, "workflow_run": {"id": self.next_id}}
             self.zips[self.next_id + 5000] = raw if raw is not None else _artifact_zip(names, complete, self.next_id)
+            self.artifacts[self.next_id] = {"id": self.next_id + 5000, "expired": expired, "workflow_run": {"id": self.next_id}, "size_in_bytes": len(self.zips[self.next_id + 5000])}
         return self.next_id
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         path = argv[-1]
         self.calls.append(path)
+        self.argvs.append(argv)
+        if len(argv) != 3 or argv[1] != "api" or any(a.startswith("-") for a in argv[2:]):
+            raise AssertionError("fake github serves `gh api <path>`, a plain GET; got %r" % argv)
         done = lambda text, code=0, err="": subprocess.CompletedProcess(argv, code, text, err)
         if any(bad in path for bad in self.fail_paths):
             return done("", 1, "gh: HTTP 500")
@@ -42879,9 +42883,8 @@ class TestReds(Base):
         del self.fake.calls[:]
         self.run_reds()
         self.assertLessEqual(len(self.fake.calls), 3, self.fake.calls)
-        self.assertFalse([c for c in self.fake.calls if "--method" in c])
+        self.assertTrue(self.fake.argvs and all(a[1] == "api" and len(a) == 3 for a in self.fake.argvs), "every call is a plain `gh api <path>` GET")
         # two reference events: 14 and 4
-        self.fake2 = FakeActions()
         second = FakeActions()
         second.pr_run(["a::t"])
         for position in range(3):
@@ -42954,7 +42957,6 @@ class TestReds(Base):
         self.assertEqual(code, 0)
         self.assertIn("no usable failing-tests artifact (no artifact): unknown, nothing was classified", out)
         broken = FakeActions()
-        broken.pr_run([], raw=b"not a zip") if False else None
         broken.add_run("pull_request", "feature", [], created=self.created(1), sha="b" * 40, raw=b"not a zip")
         self.fake = broken
         code, out = self.run_reds()
@@ -42963,6 +42965,67 @@ class TestReds(Base):
         self.fake = empty
         code, out = self.run_reds()
         self.assertIn("no completed pull_request run", out)
+
+    def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
+        self.fake.pr_run(["a::t", "b::u"])
+        self.fake.add_run("merge_group", "gh-readonly-queue/main/pr-1-x", ["a::t"], created=self.created(10))
+        self.fake.add_run("schedule", "main", ["b::u"], created=self.created(70))
+        self.fake.add_run("push", "main", ["b::u"], created=self.created(5))   # a push run: not a reference event of this repo
+        with captured() as (out, err):
+            code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out.getvalue())
+        self.assertIn("(reference events: merge_group, schedule)", out.getvalue())
+        self.assertTrue(any("event=merge_group" in c for c in self.fake.calls) and not any("event=push" in c for c in self.fake.calls))
+        self.fake.fail_paths = {"actions/artifacts?name"}
+        shutil.rmtree(str(sb.state_dir_path() / "reds-cache"), ignore_errors=True)
+        with captured() as (out, err):
+            code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was classified", out.getvalue())
+        self.assertNotIn("also failing on main", out.getvalue())
+
+    def test_an_oversized_or_unsized_artifact_is_refused_before_the_download_and_a_full_artifact_page_is_said(self):
+        self.fake.pr_run(["a::t"])
+        run = self.fake.add_run("push", "main", ["a::t"], created=self.created(10))
+        self.fake.artifacts[run]["size_in_bytes"] = self.hs.ZIP_MAX + 1
+        code, out = self.run_reds()
+        self.assertIn("main runs: 1 listed, 0 usable, 1 unknown; run %d: artifact too large" % run, out)
+        self.assertFalse([c for c in self.fake.calls if c.endswith("/zip") and str(self.fake.artifacts[run]["id"]) in c], "never downloaded")
+        del self.fake.artifacts[run]["size_in_bytes"]
+        shutil.rmtree(str(self.state / "reds-cache"))
+        code, out = self.run_reds()
+        self.assertIn("artifact too large or of unknown size", out)
+        # a full page: a run missing from it may be older than the page
+        self.fake.artifacts.update({10_000 + n: {"id": 20_000 + n, "expired": False, "workflow_run": {"id": 10_000 + n}, "size_in_bytes": 10} for n in range(100)})
+        missing = self.fake.add_run("push", "main", ["a::t"], created=self.created(5), artifact=False)
+        shutil.rmtree(str(self.state / "reds-cache"))
+        code, out = self.run_reds()
+        self.assertIn("run %d: no artifact in the newest 100" % missing, out)
+
+    def test_main_s_artifacts_are_capped_too_and_a_corrupt_cache_entry_is_a_miss(self):
+        self.fake.pr_run(["n1"])
+        self.main_runs([["n%d" % i for i in range(3000)]])
+        code, out = self.run_reds()
+        self.assertIn("n1 (1 of 1 main runs)", out)
+        cached = sorted((self.state / "reds-cache" / "acme_widget").glob("*.json"))
+        for path in cached:
+            body = json.loads(path.read_text())
+            self.assertLessEqual(len(body.get("failed", [])), self.hs.NAMES_MAX)
+            path.write_text("{garbage")
+        del self.fake.calls[:]
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, "a corrupt cache entry is read again, not trusted")
+        self.assertGreater(len(self.fake.calls), 4)
+
+    def test_the_age_is_right_in_any_time_zone(self):
+        stamp = calendar.timegm((2027, 1, 15, 8, 0, 0))
+        for zone in ("UTC", "America/New_York", "Asia/Kolkata"):
+            with mock.patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                self.assertEqual(self.hs._when("2027-01-15T07:00:00Z", stamp), 3600)
+        time.tzset()
 
     def test_the_artifact_reader_is_bounded_and_strict(self):
         for raw in (b"x" * (self.hs.ZIP_MAX + 1), b"PK not really", ):

@@ -19623,7 +19623,8 @@ cmd_disk.direct = True   # an operator's command on the machine: no daemon start
 
 
 class _RedsReader:
-    """GET-only reads for `reds` through the repo's own gh account: JSON through the account gate (counted, paused when the limit is spent), the artifact as bytes."""
+    """GET-only reads for `reds` through the repo's own gh account: JSON through the account gate (counted, paused when the limit is spent); the artifact as bytes
+    straight from the runner (not counted by the gate; its size was checked against the artifact list before this is called)."""
 
     def __init__(self, config, runner, now, repo):
         self.config, self.runner, self.repo = config, runner, repo

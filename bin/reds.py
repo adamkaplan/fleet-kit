@@ -3,8 +3,7 @@
 CI uploads one `failing-tests` artifact per run holding `failing-tests.json` = {"v": 1, "run": <id>, "head": "<sha>", "complete": true|false,
 "failed": ["<path>::<leaf>" or "<leaf>", ...]} (at most 2000 names of at most 200 characters; `complete` false when the run ended before all tests ran).
 Given a pull request this reads the PR's own run and MAIN's recent runs (the runs of the repo's reference events: `push` by default; `merge_group` and
-`schedule` for a repo with no push trigger), and says which failing names also fail on main's latest run, which are flaky there (2 or more of the last 5
-usable runs) and which are new. Read only; bounded calls; every finished run's answer is cached by run id.
+`schedule` for a repo with no push trigger), and says which failing names also fail on main's latest run, which are flaky there (2 or more of main's last 5 runs that are usable) and which are new. Read only; bounded calls; every finished run's answer is cached by run id.
 
   - A run with no artifact, an expired one, an unreadable one or `complete` false is UNKNOWN: it never counts as passing anything.
   - The PR's own list is the PR's claim: its `complete` flag never judges main, and main is only ever judged by main's own runs.
@@ -14,11 +13,13 @@ usable runs) and which are new. Read only; bounded calls; every finished run's a
 
 Pure of the switchboard: the caller hands it a reader with `json(path)` and `zip(path)` (GET only), the cache directory and the clock."""
 
+import calendar
 import io
 import json
 import os
 import re
 import time
+import urllib.parse
 import zipfile
 
 ARTIFACT = "failing-tests"
@@ -190,7 +191,7 @@ def _age(seconds):
 
 def _when(text, now):
     try:
-        return now - time.mktime(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")) + time.timezone
+        return now - calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
     except (ValueError, TypeError):
         return None
 
@@ -201,7 +202,7 @@ def reference_runs(reader, repo, default_branch, events, newest):
     for event in events:
         query = "repos/%s/actions/runs?event=%s&status=completed&per_page=%d" % (repo, event, LIST_PAGE)
         if event != "merge_group":
-            query += "&branch=%s" % default_branch
+            query += "&branch=%s" % urllib.parse.quote(default_branch, safe="")
         body = reader.json(query)
         for run in body.get("workflow_runs", []) if isinstance(body, dict) else []:
             if not isinstance(run, dict) or not isinstance(run.get("id"), int):
@@ -217,15 +218,21 @@ def reference_runs(reader, repo, default_branch, events, newest):
     return found[:newest]
 
 
+ARTIFACT_PAGE = 100
+
+
 def artifact_map(reader, repo):
-    """{run id: artifact id} for the repo's unexpired failing-tests artifacts: ONE list call."""
-    body = reader.json("repos/%s/actions/artifacts?name=%s&per_page=100" % (repo, ARTIFACT))
+    """({run id: (artifact id, size in bytes)}, truncated) for the repo's unexpired failing-tests artifacts: ONE list call of the newest ARTIFACT_PAGE.
+    `truncated` is true when the page was full: a run missing from it may simply be older than the page."""
+    body = reader.json("repos/%s/actions/artifacts?name=%s&per_page=%d" % (repo, ARTIFACT, ARTIFACT_PAGE))
+    items = body.get("artifacts", []) if isinstance(body, dict) else []
     found = {}
-    for item in body.get("artifacts", []) if isinstance(body, dict) else []:
+    for item in items:
         run = (item.get("workflow_run") or {}) if isinstance(item, dict) else {}
         if isinstance(item, dict) and not item.get("expired") and isinstance(item.get("id"), int) and isinstance(run.get("id"), int):
-            found.setdefault(run["id"], item["id"])
-    return found
+            size = item.get("size_in_bytes")
+            found.setdefault(run["id"], (item["id"], size if isinstance(size, int) and not isinstance(size, bool) else None))
+    return found, len(items) >= ARTIFACT_PAGE
 
 
 def load_run(reader, repo, run_id, artifacts, cache, listing):
@@ -235,9 +242,15 @@ def load_run(reader, repo, run_id, artifacts, cache, listing):
         return hit
     if listing[0] is None:
         listing[0] = artifact_map(reader, repo)
-    artifact = listing[0].get(run_id)
+    found, truncated = listing[0]
+    artifact = found.get(run_id)
     if artifact is None:
-        entry = {"unknown": "no artifact"}
+        entry = {"unknown": "no artifact in the newest %d" % ARTIFACT_PAGE if truncated else "no artifact"}
+        cache.put(run_id, entry)
+        return entry
+    artifact, size = artifact
+    if size is None or size > ZIP_MAX:   # refused BEFORE the download: the cap must bound what is fetched, not what is kept
+        entry = {"unknown": "artifact too large or of unknown size"}
         cache.put(run_id, entry)
         return entry
     try:
