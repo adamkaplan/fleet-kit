@@ -445,7 +445,7 @@ class U1Scope(unittest.TestCase):
             if path.startswith("docs/cloud-worker-interface.md"):
                 continue  # the contract itself is another PR
             self.assertEqual(status, "A", line)
-            self.assertTrue(path.startswith("cloud/") or path == "bin/test-cloud-worker", line)
+            self.assertTrue(path.startswith("cloud/") or path == "bin/test-cloud-launcher", line)
 
 
 if __name__ == "__main__":

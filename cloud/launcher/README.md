@@ -10,7 +10,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
 - `end_hook.py`, installed in the image as `fleet-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `fleet-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
-- Tests: `bin/test-cloud-worker` (fake `kubectl`, fake clock, real `git`, loopback HTTP; no cloud).
+- Tests: `bin/test-cloud-launcher` (fake `kubectl`, fake clock, real `git`, loopback HTTP; no cloud).
 
 ## What the image (slice A) must provide
 `fleet-end-hook` and `fleet-worker-activity` (prints `{"busy": bool, "last_activity": "<ISO UTC>"}` from the worker's
