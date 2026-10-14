@@ -29949,7 +29949,7 @@ class OrdersDeliveryCase(OrdersCase):
         return [a for a in self.world.admissions(name) if any(k.startswith("orders:") for k in a["keys"])]
 
     def gh_gets(self):
-        return len([c for c in self.gh.calls if "--method" not in c])
+        return len([c for c in self.gh.calls if "--method" not in c and not any("/sub_issues" in str(part) for part in c)])   # the load figure's own asks read (#348) is not the charter read
 
 
 class TestCompactionShape(unittest.TestCase):
@@ -44768,6 +44768,13 @@ class TestLoadAlert(Base):
         self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
         self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
         self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_an_idle_pass_rewrites_nothing(self):
+        self.asks = {1: [1]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        before = (self.state_dir / "load.json").stat().st_mtime_ns
+        self.tick(self.T0 + 60, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
 
     def test_a_pull_request_webhook_leaves_one_movement_row(self):
         hub = sb.GitHubHub.__new__(sb.GitHubHub)

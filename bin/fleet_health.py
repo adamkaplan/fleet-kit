@@ -298,6 +298,7 @@ def _refresh_asks(ctx, state, now):
 def tick(ctx):
     """One pass. Returns the list of (orchestrator, wake text) sent. Never raises for a source it cannot read."""
     now, state = ctx.now, _read_state(ctx.state_dir)
+    before_state = json.loads(json.dumps(state))
     problems = _refresh_asks(ctx, state, now)
     rows = read_moves(ctx.state_dir, now - 24 * 3600)
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
@@ -329,9 +330,11 @@ def tick(ctx):
             sent.append((name, text))
         elif text:
             episodes[name] = before   # not sent (off, or no Chief of Staff to tell): the episode is still open
-    state.update({"at": now, "series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
+    state.pop("at", None)
+    state.update({"series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
                   "latest": latest, "problems": problems, "alert": bool(ctx.cfg["enabled"])})
-    _write_state(ctx.state_dir, state)
+    if state != before_state:   # an idle pass rewrites nothing
+        _write_state(ctx.state_dir, state)
     prune_moves(ctx.state_dir, now)
     return sent
 
