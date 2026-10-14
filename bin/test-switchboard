@@ -11326,8 +11326,6 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
-        "heavy": ("cmd_heavy", ("args",)),
-        "reds": ("cmd_reds", ("args", "runner", "now")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -11467,10 +11465,18 @@ class TestSelfRegisteringCli(unittest.TestCase):
             git("merge", "--no-edit", "two")
             self.assertTrue((target / "alpha-cmd.json").exists() and (target / "beta-cmd.json").exists())
 
-    def test_the_old_dispatch_table_covers_every_command_but_version(self):
+    def test_the_old_dispatch_table_is_still_registered_and_every_registered_command_has_a_handler(self):
+        """OLD is the table of the ORIGINAL commands and never grows: a new command adds no row here. What must hold for every command, old or new, is
+        derived: it is registered, and `resolve_command` finds its `cmd_<action>` function."""
         parser, choices = self.commands()
-        self.assertEqual(sorted(set(choices) - {"version"}), sorted(set(self.OLD) - {"plan"} | {"plan"}))
+        self.assertTrue(set(self.OLD) <= set(choices), "an original command is gone: %s" % sorted(set(self.OLD) - set(choices)))
         self.assertEqual(parser.commands, frozenset(choices))
+        for action in sorted(set(choices) - {"version"}):
+            with self.subTest(action=action):
+                handler = sb.resolve_command(action, parser.commands)
+                self.assertTrue(callable(handler), "%s has no cmd_ function" % action)
+                required = [n for n, p in inspect.signature(handler).parameters.items() if p.default is p.empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+                self.assertTrue(set(required) <= set(sb.COMMAND_ARGUMENTS), "%s asks for %s, which a command is never given" % (action, sorted(set(required) - set(sb.COMMAND_ARGUMENTS))))
 
     def run_dispatch(self, action, **namespace):
         """dispatch() for `action` with every function replaced by a recorder that keeps the real signature: (return value, calls, ensure calls)."""
@@ -11520,14 +11526,49 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertEqual((code, calls, ensured), (0, [], []))
         self.assertIn(sb.VERSION, out.getvalue())
 
+    @staticmethod
+    def declared_groups():
+        """{group: set(actions)} read from the SOURCE: every module-level `cmd_x.<group> = True` of bin/fleet-switchboard, for a command the parser
+        registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
+        declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
+        registered = TestSelfRegisteringCli.commands()[0].commands
+        tree = ast.parse(SWITCHBOARD.read_text())
+        plain = {id(node) for node in tree.body}
+        for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
+            if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
+                                                    and x.value.id.startswith("cmd_") for x in node.targets):
+                if id(node) not in plain or not (isinstance(node.value, ast.Constant) and node.value.value is True):
+                    raise AssertionError("line %d declares a command's dispatch group in a form the guard cannot read: write `cmd_x.<group> = True` at module level" % node.lineno)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute) \
+                    and isinstance(node.targets[0].value, ast.Name) and node.targets[0].attr in declared \
+                    and isinstance(node.value, ast.Constant) and node.value.value is True and node.targets[0].value.id.startswith("cmd_"):
+                action = node.targets[0].value.id[4:].replace("_", "-")
+                if action in registered:
+                    declared[node.targets[0].attr].add(action)
+        return declared
+
+    def group_problems(self):
+        """One line per group whose effective set differs from what the commands declare, naming the commands."""
+        declared, problems = self.declared_groups(), []
+        for name, effective, key in (("DIRECT_ACTIONS", sb.DIRECT_ACTIONS, "direct"), ("LEDGER_ACTIONS", sb.LEDGER_ACTIONS, "ledger"),
+                                     ("ENSURE_ON_USE_COMMANDS", sb.ENSURE_ON_USE_COMMANDS, "ensure_on_use")):
+            if set(effective) != declared[key]:
+                problems.append("%s differs from what the commands declare: missing %s, extra %s" % (name, sorted(declared[key] - set(effective)), sorted(set(effective) - declared[key])))
+        return problems
+
     def test_the_error_mapping_and_the_special_groups_are_what_they_were(self):
-        # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
-        # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
+        # The effective groups (the module's views) must equal what the commands DECLARE (read from the source), exactly: a command whose declared
+        # group differs from its effective one fails loudly. And the pure-move guarantee stays: every original member is still in its group.
+        self.assertEqual(self.group_problems(), [])
+        with mock.patch.object(sb, "LEDGER_ACTIONS", frozenset(set(sb.LEDGER_ACTIONS) - {"gates"})):       # the guard fails loudly and names the command
+            self.assertEqual(self.group_problems(), ["LEDGER_ACTIONS differs from what the commands declare: missing ['gates'], extra []"])
+        with mock.patch.object(sb, "DIRECT_ACTIONS", frozenset(set(sb.DIRECT_ACTIONS) | {"send"})):
+            self.assertEqual(self.group_problems(), ["DIRECT_ACTIONS differs from what the commands declare: missing [], extra ['send']"])
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
-        # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
-        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "reds", "triage"})
-        self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
-        self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
+        self.assertTrue(set(self.OLD_LEDGER) <= set(sb.LEDGER_ACTIONS))
+        self.assertTrue(set(self.OLD_ENSURE_ON_USE) <= set(sb.ENSURE_ON_USE_COMMANDS))
+        self.assertNotIn("judge-tool", sb.ENSURE_ON_USE_COMMANDS, "judge-tool runs inside v2 on every tool call: it never starts the daemon")
         known = self.commands()[0].commands
 
         def raising(error):
