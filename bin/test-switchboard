@@ -39073,6 +39073,54 @@ class TestWriteOnlyOnChange(Base):
             sb.state_write(self.dir / "p.json", "x", nofollow=True)
         self.assertEqual(target.read_text(), "keep", "the link was not followed")
 
+    def test_an_outside_rewrite_is_repaired_at_the_next_call_and_a_touch_is_not_a_rewrite(self):
+        path = self.dir / "s.json"
+        sb.state_write(path, "aaaa", None, 90)
+        self.age(path)
+        self.assertFalse(sb.state_write(path, "aaaa", None, 90), "unchanged")
+        inode = os.stat(str(path)).st_ino
+        os.utime(str(path), (self.old + 5, self.old + 5))          # touched: the mtime moved, the content did not
+        self.assertFalse(sb.state_write(path, "aaaa", None, 90))
+        self.assertEqual(os.stat(str(path)).st_ino, inode, "a touch is not a rewrite: the file was not replaced")
+        path.write_text("bbbb")                                      # an outside writer (retire --undo): the same size, other bytes
+        self.age(path)
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90), "repaired at the next call, not at the heartbeat")
+        self.assertEqual(path.read_text(), "aaaa")
+        path.write_text("a much longer outside rewrite")             # another size
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90))
+        self.assertEqual(path.read_text(), "aaaa")
+        path.unlink()
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90), "deleted: written again")
+
+    def test_pane_health_is_repaired_after_an_outside_rewrite_at_the_next_pass(self):
+        world = World(self, agents=("a0", "a1"), config={"v2_cache_seconds": 120})
+        world.engine.run_pass()
+        path = world.state / sb.PANE_HEALTH_FILE
+        good = path.read_text()
+        self.assertTrue(json.loads(good)["states"])
+        path.write_text(json.dumps({"agents": {}, "states": {}, "missing": {}, "at": 1}))   # what `retire --undo` style rewrites do
+        world.tick(30)
+        world.engine.run_pass()
+        repaired = json.loads(path.read_text())
+        self.assertEqual(sorted(repaired["states"]), ["a0", "a1"], "the next pass wrote the picture again")
+
+    def test_the_pane_recheck_cadence_is_unchanged_now_that_the_file_is_not_rewritten_every_pass(self):
+        world = World(self, agents=("a0", "a1", "a2"), config={"v2_cache_seconds": 120})
+        checks = collections.Counter()
+        real = sb.pane_state
+
+        def counting(engine, name, *args, **kwargs):
+            checks[name] += 1
+            return real(engine, name, *args, **kwargs)
+        with mock.patch.object(sb, "pane_state", counting):
+            for _ in range(40):                 # 20 minutes of 30 s passes
+                world.engine.run_pass()
+                world.tick(30)
+        for name in ("a0", "a1", "a2"):
+            self.assertLessEqual(checks[name], 1200 // sb.PANE_CHECK_SECONDS + 2, "%s: one look per PANE_CHECK_SECONDS, not one per pass: %s" % (name, dict(checks)))
+            self.assertGreaterEqual(checks[name], 1200 // sb.PANE_CHECK_SECONDS - 1)
+        self.assertLessEqual(len((world.state / sb.PANE_HEALTH_FILE).read_text()), 10000)
+
     def test_a_policy_cache_entry_with_the_same_value_is_not_rewritten_while_young(self):
         clock = SimClock()
         cache = sb.BoundedFileCache(self.dir / "c.json", clock.now, 100, 5)

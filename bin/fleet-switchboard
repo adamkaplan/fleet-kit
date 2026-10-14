@@ -1004,8 +1004,9 @@ def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=F
     """Write `text` to `path` (a private file: a temp file, mode 0600, renamed into place) ONLY WHEN IT CHANGED. Returns True when it wrote.
 
     `stable` is the text to compare: the content without its volatile fields (a timestamp that moves every pass), default `text` itself.
-    What this process last wrote decides while the file is there (a file edited from outside, with the same stable content, is left alone until a
-    change or its heartbeat: nothing here is read as authority); a file that is missing is written. `heartbeat` (seconds) keeps a status
+    The comparison is with what is on the DISK: the file's size and modification time are checked against what this process wrote (one stat), and
+    a file that changed meanwhile (an outside writer, `retire --undo`) is read and compared with what was written, so an external rewrite is
+    repaired at the next call, not at the heartbeat; a mere touch is not. A file that is missing is written. `heartbeat` (seconds) keeps a status
     whose own timestamp is read as liveness fresh: it is rewritten when its last write is older than that. A write nobody needs costs the disk
     a write, an fsync and a rename that every file watcher sees: about twenty files used to be rewritten every pass."""
     path = Path(path)
@@ -1013,11 +1014,16 @@ def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=F
     stable = text if stable is None else stable
     last = _STATE_LAST.get(key)
     try:
-        exists = path.exists()
-        if exists and last is not None and last[0] == stable and (heartbeat is None or clock - last[1] < heartbeat):
-            return False
-        if exists and last is None and heartbeat is None and path.stat().st_size == len(text.encode("utf-8")) and path.read_text() == text:   # a file of another size is not even read
-            _STATE_LAST[key] = (stable, clock)
+        info = path.stat()
+        if last is not None and last[0] == stable and (heartbeat is None or clock - last[1] < heartbeat):
+            if (info.st_mtime_ns, info.st_size) == (last[3], last[4]):
+                return False
+            if path.read_text() == last[2]:   # touched, not rewritten: the content is what this process wrote
+                _STATE_LAST[key] = (last[0], last[1], last[2], info.st_mtime_ns, info.st_size)
+                return False
+            # the file is not what was written: an outside writer changed it; fall through and write it again
+        if last is None and heartbeat is None and info.st_size == len(text.encode("utf-8")) and path.read_text() == text:   # a file of another size is not even read
+            _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
             return False
     except OSError:
         pass
@@ -1036,7 +1042,11 @@ def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=F
         except OSError:
             pass
         raise
-    _STATE_LAST[key] = (stable, clock)
+    try:
+        info = path.stat()
+        _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
+    except OSError:
+        _STATE_LAST.pop(key, None)
     return True
 
 
@@ -4848,11 +4858,14 @@ def pane_health_pass(engine, now):
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
             continue
         prev = states.get(name) or {}
-        due = prev.get("session") != obs.session_id or prev.get("pane") != obs.pane or now - (prev.get("at") or 0) >= PANE_CHECK_SECONDS
+        # The schedule is the LAST CHECK, which the file no longer records every pass (its `at` is written only on a change): this process remembers it.
+        checked = max(prev.get("at") or 0, engine.__dict__.setdefault("pane_checked", {}).get(name, 0))
+        due = prev.get("session") != obs.session_id or prev.get("pane") != obs.pane or now - checked >= PANE_CHECK_SECONDS
         if due and budget > 0:
             budget -= 1
             state, why, info = pane_state(engine, name, obs.session_id, obs.pane, names, sessions)
-            if state != PANE_UNKNOWN:
+            if state != PANE_UNKNOWN:   # an unreadable look is not a check: it is repeated, as before
+                engine.pane_checked[name] = int(now)
                 if state != prev.get("state") and engine.audit is not None:
                     event = {PANE_DETACHED: "fleetpane.detached", PANE_DEAD: "fleetpane.dead"}.get(state, "fleetpane.recovered" if prev.get("state") in (PANE_DETACHED, PANE_DEAD) else None)
                     if event:
