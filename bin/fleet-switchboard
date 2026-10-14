@@ -1927,6 +1927,10 @@ class HerdrClient:
     def pane_close(self, pane):
         return self._call("pane", "close", pane)
 
+    def pane_list(self):
+        """Every pane herdr has, agent or plain terminal: [{"pane_id", "cwd", "foreground_cwd", ...}] (one read)."""
+        return self._result(self._call("pane", "list"), "panes", list)
+
     def pane_get(self, pane):
         """One pane as herdr shows it: {"pane_id", "workspace_id", "tab_id", "cwd", "terminal_title_stripped", "agent_status", ...}."""
         return self._result(self._call("pane", "get", pane), "pane", dict)
@@ -5969,27 +5973,24 @@ def _unregister_worktree(state_dir, path):
         return False
 
 
-WORKTREE_PANE_LOOKS = 40   # herdr panes read per removal
-
-
 def worktree_in_use(engine, path):
-    """None when no herdr pane has its working directory inside `path`, else why it is kept. Anything herdr cannot say keeps the worktree (no proof, no removal).
-    Only panes herdr lists as agents are seen: a plain terminal of the operator is not, which the docs say."""
+    """None when no herdr pane (an agent's OR a plain terminal) has its working directory, or its foreground process's, inside `path`; else why it is
+    kept. ONE `herdr pane list`, no row cap. Anything herdr cannot say keeps the worktree (no proof, no removal)."""
     herdr = getattr(engine, "herdr", None)
     if herdr is None:
         return None
     try:
-        panes = [e.get("pane_id") for e in herdr.agent_list() if isinstance(e, dict) and e.get("pane_id")]
-        root = os.path.realpath(path).rstrip("/") + "/"
-        for pane in panes[:WORKTREE_PANE_LOOKS]:
-            got = herdr.pane_get(pane)
-            cwd = got.get("cwd") if isinstance(got, dict) else None
-            if isinstance(cwd, str) and (os.path.realpath(cwd) + "/").startswith(root):
-                return "herdr pane %s is working in it: close that pane first" % pane
-        if len(panes) > WORKTREE_PANE_LOOKS:
-            return "more than %d herdr panes: cannot say none works in it" % WORKTREE_PANE_LOOKS
+        panes = herdr.pane_list()
     except HerdrError as err:
         return "herdr cannot say whether a pane works in it (%s)" % _one_line(str(err), 80)
+    root = os.path.realpath(path).rstrip("/") + "/"
+    for pane in panes:
+        if not isinstance(pane, dict):
+            return "herdr listed a pane this cannot read: it cannot say none works in it"
+        for key in ("cwd", "foreground_cwd"):
+            where = pane.get(key)
+            if isinstance(where, str) and where and (os.path.realpath(where) + "/").startswith(root):
+                return "herdr pane %s is working in it (%s): close it or leave that directory first" % (pane.get("pane_id"), key)
     return None
 
 
