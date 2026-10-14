@@ -44788,6 +44788,26 @@ class TestLoadAlert(Base):
         self.assertIn("would have fired 1 time(s)", out.getvalue())
         self.assertIn("o is overloaded", out.getvalue())
 
+    def test_a_past_day_is_rebuilt_from_the_audit_and_its_archive_and_says_what_is_not_recorded(self):
+        def line(ts, event, subject, detail, **extra):
+            return json.dumps(dict({"ts": ts, "actor": "cli", "event": event, "subject": subject, "detail": detail}, **extra))
+        archive = [line("2026-10-12T22:00:00.000Z", "v2.session.create", "coder1", {"fleet": {"reports_to": "orch", "issue": 5}}),
+                   line("2026-10-12T22:00:00.000Z", "reminder.add", "orch", {"from": "orch", "issue": 6, "repo": "acme/widget"})]
+        with gzip.open(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), "wt") as handle:
+            handle.write("\n".join(archive) + "\n")
+        os.utime(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), (self.T0, self.T0))
+        (self.state_dir / "audit.jsonl").write_text(line("2026-10-13T01:30:00.000Z", "v2.synthetic", "cos", {"description": "switchboard: coder1 report on widget#5: done"}, phase="intent") + "\n")
+        firings, notes = self.health.replay_audit(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-13")
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("orch", "2026-10-13 00:59Z"), ("orch", "2026-10-13 03:59Z")])
+        self.assertIn("coders not recorded busy", firings[0]["text"])
+        self.assertIn("coders busy and idle", notes)
+        self.assertIsNone(self.health.replay_audit(str(self.state_dir / "nowhere"), dict(self.health.DEFAULTS), "2026-10-13")[0])
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-13"], runner=None), 0, err.getvalue())
+        self.assertIn("from the audit log and its archives (best effort)", out.getvalue())
+        self.assertIn("not recorded for it:", out.getvalue())
+        self.assertIn("would have fired 2 time(s)", out.getvalue())
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})

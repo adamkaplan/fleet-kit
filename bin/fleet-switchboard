@@ -21121,14 +21121,21 @@ def cmd_load_replay(args, runner, now):
         sys.stderr.write("%s: load-replay: %s\n" % (PROG, err))
         return EXIT_USAGE
     days, firings = health.replay(state_dir_path(), cfg, args.day)
+    source, notes = "the recorded hourly series", None
+    if args.from_audit or (firings is None and args.day):
+        firings, notes = health.replay_audit(state_dir_path(), cfg, args.day or datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%d"))
+        source = "the audit log and its archives (best effort)"
     if firings is None:
-        print("no recorded day%s; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
+        print("no recorded day%s and no audit log to rebuild it from; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
         return EXIT_USAGE if args.day else EXIT_OK
+    day = args.day or days[-1]
     if args.json:
-        print(json.dumps({"days": days, "firings": firings}, indent=2, sort_keys=True))
+        print(json.dumps({"day": day, "source": source, "not_recorded": notes, "days": days, "firings": firings}, indent=2, sort_keys=True))
         return EXIT_OK
-    print("load alert replay over %s (thresholds: %d stalled ask(s) of %g h, backlog %g h); recorded days: %s" % (
-        args.day or days[-1], cfg["stalled_asks"], cfg["stalled_hours"], cfg["backlog_hours"], ", ".join(days)))
+    print("load alert replay over %s from %s (thresholds: %d stalled ask(s) of %g h, backlog %g h); recorded days: %s" % (
+        day, source, cfg["stalled_asks"], cfg["stalled_hours"], cfg["backlog_hours"], ", ".join(days) or "none"))
+    if notes:
+        print("not recorded for it: %s" % notes)
     print("would have fired %d time(s)%s" % (len(firings), ":" if firings else ""))
     for firing in firings:
         print("  %s  %s  %s" % (firing["hour"], firing["orchestrator"], firing["text"]))
@@ -21144,6 +21151,7 @@ def add_load_replay_parsers(sub):
     replay.add_argument("--stalled-asks", type=int, default=None, help="Try another threshold: asks stalled")
     replay.add_argument("--stalled-hours", type=float, default=None, help="Try another threshold: hours without movement")
     replay.add_argument("--backlog-hours", type=float, default=None, help="Try another threshold: hours of moved asks in the backlog test")
+    replay.add_argument("--from-audit", action="store_true", help="Rebuild the day from the audit log and its archives even when the series holds it (a past day is rebuilt this way when the series does not)")
     replay.add_argument("--json", action="store_true")
 
 

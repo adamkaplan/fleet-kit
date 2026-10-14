@@ -197,7 +197,7 @@ def crossing(fig, cfg):
     reasons, severity = [], 0
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
-    full = fig["busy"] > 0 and fig["idle"] == 0
+    full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
     if full and fig.get("moved_backlog") is not None and fig["open_asks"] > fig["moved_backlog"]:
         reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
     return severity, reasons
@@ -206,9 +206,9 @@ def crossing(fig, cfg):
 def wake_text(fig, reasons, cfg):
     asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
     text = ("Load alert: %s is overloaded. %d open ask(s); %d with no real movement in %g h%s; moved %d in the last hour and %d in %g h; "
-            "coders %d busy, %d idle; waiting on it: %d message(s), %s decision(s)." % (
+            "coders %s busy, %s idle; waiting on it: %s message(s), %s decision(s)." % (
                 fig["name"], fig["open_asks"], fig["stalled"], cfg["stalled_hours"], " (%s)" % asks if asks else "",
-                fig["moved_1h"], fig["moved_backlog"], cfg["backlog_hours"], fig["busy"], fig["idle"], fig["messages"], "not recorded" if fig["decisions"] is None else fig["decisions"]))
+                fig["moved_1h"], fig["moved_backlog"], cfg["backlog_hours"], *["not recorded" if fig[k] is None else fig[k] for k in ("busy", "idle", "messages", "decisions")]))
     actions = []
     if "stalled" in reasons:
         actions.append("move the stalled asks (%s) to another lane" % (asks or "named above"))
@@ -390,3 +390,126 @@ def replay(state_dir, cfg, day=None):
                 firings.append({"orchestrator": name, "hour": "%s %s:00Z" % (chosen, hour), "severity": severity, "reasons": reasons, "text": text})
     firings.sort(key=lambda f: (f["hour"], f["orchestrator"]))
     return days, firings
+
+
+# ---- a past day rebuilt from the audit log (best effort)
+
+RECONSTRUCT_NOT_RECORDED = ("coders busy and idle, messages waiting and decisions waiting (the audit does not hold them, so the backlog crossing cannot be "
+                            "judged); pushes and pull requests (only reports and plan approvals are audited); the real list of open asks, approximated by the asks "
+                            "an orchestrator's reports, reminders and workers named in the 24 hours before")
+RECONSTRUCT_WINDOW = 24 * 3600
+
+
+def _audit_files(state_dir, first):
+    state, files = Path(state_dir), []
+    try:
+        for path in sorted(state.glob("audit*.jsonl.gz")):
+            try:
+                if path.stat().st_mtime >= first:
+                    files.append(path)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if (state / "audit.jsonl").exists():
+        files.append(state / "audit.jsonl")
+    return files
+
+
+def _audit_events(state_dir, first, last, events):
+    """The audit entries between two epochs whose event is in `events`, oldest first by file; None when there is no audit file."""
+    import gzip
+    files = _audit_files(state_dir, first)
+    if not files:
+        return None
+    out = []
+    for path in files:
+        try:
+            with (gzip.open(str(path), "rt", encoding="utf-8", errors="replace") if path.suffix == ".gz" else open(str(path), encoding="utf-8", errors="replace")) as handle:
+                for line in handle:
+                    if not any(e in line for e in events):
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    at = _epoch(entry.get("ts")) if isinstance(entry, dict) else None
+                    if at is not None and first <= at < last and entry.get("event") in events:
+                        out.append((at, entry))
+        except (OSError, EOFError, ValueError):
+            continue   # an unreadable archive costs its days, not the replay
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def reconstruct_day(state_dir, day, cfg=DEFAULTS):
+    """{orchestrator: {hour: figures}} for a past UTC `day`, from the audit log and its archives: or None when no audit file exists. Best effort: see
+    RECONSTRUCT_NOT_RECORDED. Orchestrators are the agents workers were started to report to; an ask is in play for an hour while an orchestrator's report,
+    reminder or worker named it in the 24 h before; it moves when a report or a plan approval names it."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    events = {"v2.session.create", "reminder.add", "v2.synthetic", "plan.review.consensus"}
+    found = _audit_events(state_dir, start - RECONSTRUCT_WINDOW, start + 86400, events)
+    if found is None:
+        return None
+    bosses, mentions, moves = set(), [], []   # mentions: (at, boss, repo, number); moves: (at, boss, repo, number)
+    for at, entry in found:
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        event = entry.get("event")
+        if event == "v2.session.create":
+            fleet = detail.get("fleet") if isinstance(detail.get("fleet"), dict) else {}
+            if fleet.get("reports_to"):
+                bosses.add(str(fleet["reports_to"]))
+                if isinstance(fleet.get("issue"), int):
+                    mentions.append((at, str(fleet["reports_to"]), "", fleet["issue"]))
+        elif event == "reminder.add" and isinstance(detail.get("issue"), int) and detail.get("from"):
+            mentions.append((at, str(detail["from"]), str(detail.get("repo") or ""), detail["issue"]))
+        elif event == "v2.synthetic" and entry.get("phase") == "intent":
+            match = re.search(r"switchboard: ([\w.-]+) report on (?:([\w.-]+)/)?([\w.-]*)#(\d+)", str(detail.get("description") or ""))
+            if match:
+                repo = (match.group(2) + "/" if match.group(2) else "") + match.group(3)
+                moves.append((at, match.group(1), repo, int(match.group(4))))
+        elif event == "plan.review.consensus" and "#" in str(entry.get("subject")):
+            repo, _, ask = str(entry["subject"]).rpartition("#")
+            if ask.isdigit():
+                moves.append((at, None, repo, int(ask)))   # a plan approved moves the ask for whoever holds it
+    bosses.discard("cos")
+    result = {}
+    for boss in sorted(bosses):
+        mine = [m for m in mentions if m[1] == boss]
+        asks = {}
+        for at, _, repo, number in sorted(mine):
+            asks.setdefault(("", number), []).append(at)   # keyed by number: a worker's record names no repo, a reminder's may
+        hours = {}
+        for hour in range(24):
+            end = start + (hour + 1) * 3600
+            present, cfg_asks = [], []
+            for (repo, number), seen in asks.items():
+                seen = [t for t in seen if end - RECONSTRUCT_WINDOW <= t < end]
+                if seen:   # with no pushes in the audit, the baseline is the newest mention of any kind, so a quiet ask is not an alarm for what the audit cannot see
+                    present.append((repo, number, max(seen)))
+            if not present:
+                continue
+            rows = [{"at": at, "repo": "", "numbers": [number]} for at, who, repo, number in moves if at < end]   # a worker's report or a plan approval moves the ask it names
+            ask_list = [{"repo": repo, "number": number, "first_seen": first} for repo, number, first in present]
+            hours["%02d" % hour] = figures(boss, {"asks": ask_list, "busy": None, "idle": None, "messages": None, "decisions": None}, rows, end, cfg)
+        if hours:
+            result[boss] = hours
+    return result
+
+
+def replay_audit(state_dir, cfg, day):
+    """(firings, notes) for a past `day` rebuilt from the audit; firings is None when there is no audit to read."""
+    rebuilt = reconstruct_day(state_dir, day, cfg)
+    if rebuilt is None:
+        return None, RECONSTRUCT_NOT_RECORDED
+    firings = []
+    for name in sorted(rebuilt):
+        previous = None
+        for hour in sorted(rebuilt[name]):
+            fig = dict(rebuilt[name][hour])
+            text, previous = judge(fig, cfg, previous)
+            if text:
+                severity, reasons = crossing(fig, cfg)
+                firings.append({"orchestrator": name, "hour": "%s %s:59Z" % (day, hour), "severity": severity, "reasons": reasons, "text": text})
+    firings.sort(key=lambda f: (f["hour"], f["orchestrator"]))
+    return firings, RECONSTRUCT_NOT_RECORDED
