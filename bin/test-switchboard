@@ -40543,6 +40543,336 @@ class TestDiskReport(Base):
             self.assertIn(phrase, section.lower())
 
 
+class TestTempJanitor(Base):
+    """The temp-directory janitor (ask #321): old AND unnamed entries only, a dry run by default, links never followed, each removal audited."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.outside = self.home / "outside"
+        self.outside.mkdir()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "keep": ["keepme-*"]}})
+        self.shift(10)   # the janitor's clock: ten days after the files these tests create (a change time cannot be set back, so the clock moves forward)
+        (self.world.state / "state-marker.json").write_text("{}")   # a state directory with no record at all is refused
+        self.lsof = "p1\nfcwd\nn/\n"
+        self.lsof_code = 0
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.as_cos()
+
+    def shift(self, days):
+        self.world.clock.t = time.time() + days * 86400
+        self.now = self.world.clock.now()
+
+    def routed(self, argv, **kwargs):
+        if argv[0] == "lsof":
+            return subprocess.CompletedProcess(argv, self.lsof_code, self.lsof, "")
+        return self.world.route(argv, **kwargs)
+
+    def as_cos(self):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+
+    def old(self, name, days=10, body="x", directory=False):
+        path = self.temp / name
+        if directory:
+            path.mkdir()
+            (path / "inner.txt").write_text(body)
+        else:
+            path.write_text(body)
+        stamp = self.now - days * 86400
+        for p in ([path / "inner.txt"] if directory else []) + [path]:
+            os.utime(str(p), (stamp, stamp))
+        return path
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def audits(self):
+        return [e for e in self.world.audit() if e["event"] == "temp.removed"]
+
+    def test_s1_only_the_old_unnamed_entry_goes_and_a_dry_run_removes_nothing(self):
+        gone = self.old("scratch-old-unnamed.log")
+        by_path = self.old("named-by-path.txt")
+        by_name = self.old("named-by-basename-dir", directory=True)
+        glob = self.old("keepme-notes.txt")
+        marked = self.old("marked-dir", directory=True)
+        (marked / ".fleet-keep").write_text("")
+        young = [self.old("young-file.txt", days=1), self.old("young-dir", days=2, directory=True)]
+        (self.world.state / "reminders.json").write_text(json.dumps({"r1": {"text": "read %s later" % by_path}}))
+        (self.world.state / "other.json").write_text(json.dumps({"brief": "see named-by-basename-dir for the log"}))
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("would remove"), 1)
+        self.assertIn("would remove scratch-old-unnamed.log", out)
+        self.assertTrue(gone.exists())
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(gone.exists())
+        for kept in [by_path, by_name, glob, marked] + young:
+            self.assertTrue(kept.exists(), kept.name)
+        self.assertIn("kept named-by-path.txt: named by the fleet's records", out)
+        self.assertIn("kept keepme-notes.txt: matches a keep glob", out)
+        self.assertIn("holds a .fleet-keep marker", out)
+        self.assertTrue(self.temp.exists())
+
+    def test_s2_a_link_is_removed_as_a_link_a_foreign_and_an_oversized_entry_are_kept(self):
+        target = self.outside / "precious"
+        target.mkdir()
+        for i in range(5):
+            (target / ("f%d" % i)).write_text("keep me")
+        link = self.temp / "link-to-outside"
+        os.symlink(str(target), str(link))
+        os.utime(str(link), (self.now - 10 * 86400,) * 2, follow_symlinks=False)
+        big = self.old("big-dir", directory=True)
+        for i in range(6):
+            (big / ("g%d" % i)).write_text("x")
+            os.utime(str(big / ("g%d" % i)), (self.now - 10 * 86400,) * 2)
+        with mock.patch.object(self.jan, "WALK_ENTRIES", 3):
+            code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(link.is_symlink() or link.exists())
+        self.assertEqual(len(list(target.iterdir())), 5, "the link's target is untouched")
+        self.assertTrue(big.exists())
+        self.assertIn("kept big-dir: too many files", out)
+        rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), uid=os.getuid() + 1)
+        self.assertTrue(rows and all(r["action"] == "keep" and r["why"] == "owned by another user" for r in rows))
+
+    def test_the_temp_directory_must_be_a_plain_directory_the_user_owns_and_not_close_to_the_root(self):
+        link = self.home / "linked-tmp"
+        os.symlink(str(self.temp), str(link))
+        self.assertFalse(self.jan.safe_dir(link)[0])
+        self.assertFalse(self.jan.safe_dir(Path("/"))[0])
+        self.assertFalse(self.jan.safe_dir(Path(os.path.expanduser("~")))[0])
+        self.assertTrue(self.jan.safe_dir(self.temp)[0])
+
+    def test_s3_each_removal_is_one_audit_line_and_the_kill_switch_removes_nothing(self):
+        self.old("a-old-one.txt")
+        self.old("b-old-two.txt")
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(e["subject"], e["detail"]["bytes"]) for e in self.audits()], [("a-old-one.txt", 1), ("b-old-two.txt", 1)])
+        self.old("c-old-three.txt")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "enabled": False}})
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("switched off", err)
+        self.assertTrue((self.temp / "c-old-three.txt").exists())
+
+    def test_s4_an_ordinary_agent_may_not_apply_and_anyone_may_look(self):
+        victim = self.old("old-file.txt")
+        os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
+        code, out, err = self.run_cli("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator or the Chief of Staff", err)
+        self.as_cos()
+        self.assertTrue(victim.exists())
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        self.assertIn("would remove old-file.txt", out)
+
+    def test_the_cap_per_call_and_a_failed_removal_are_said_and_a_failed_removal_is_not_audited(self):
+        for i in range(3):
+            self.old("capped-%d.txt" % i)
+        with mock.patch.object(self.jan, "REMOVE_MAX", 2):
+            code, out, err = self.run_cli("--apply")
+        self.assertIn("only 2 entries handled per call", out)
+        self.assertEqual(len(self.audits()), 2)
+        self.assertEqual(len(list(self.temp.iterdir())), 1)
+        with mock.patch.object(self.jan, "remove_entry", side_effect=OSError("busy")):
+            code, out, err = self.run_cli("--apply")
+        self.assertIn("could not remove capped-2.txt: busy", out)
+        self.assertEqual(len(self.audits()), 2, "a failed removal writes no audit line")
+        self.assertTrue((self.temp / "capped-2.txt").exists())
+
+    def test_a_short_name_is_never_a_naming_a_jsonl_record_and_a_json_escaped_path_are(self):
+        short = self.old("a.txt")
+        long_ = self.old("escaped-\u00e9-name.txt")
+        by_jsonl = self.old("named-in-jsonl-file.txt")
+        (self.world.state / "short.json").write_text(json.dumps({"x": "a.txt is mentioned"}))
+        (self.world.state / "events.jsonl").write_text(json.dumps({"note": "see named-in-jsonl-file.txt"}) + "\n")
+        (self.world.state / "esc.json").write_text(json.dumps({"p": str(long_)}))
+        (self.world.state / "archive.jsonl.gz").write_text("named-in-jsonl-file.txt")   # a compressed archive is never read
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(short.exists(), "a name under 6 characters names nothing")
+        self.assertTrue(long_.exists(), "the JSON-escaped form of the path is found")
+        self.assertTrue(by_jsonl.exists())
+        (self.world.state / "events.jsonl").unlink()
+        (self.world.state / "esc.json").unlink()
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(by_jsonl.exists(), "a .gz archive does not protect it")
+
+    def test_records_that_cannot_be_read_in_full_mean_nothing_is_judged(self):
+        victim = self.old("old-victim-file.txt")
+        if os.getuid() != 0:   # root can read a file with mode 0
+            (self.world.state / "reminders.json").write_text("{}")
+            os.chmod(str(self.world.state / "reminders.json"), 0)
+            try:
+                code, out, err = self.run_cli("--apply")
+            finally:
+                os.chmod(str(self.world.state / "reminders.json"), 0o600)
+            self.assertTrue(victim.exists())
+            self.assertIn("could not be read in full", out)
+        with mock.patch.object(self.jan, "STATE_TOTAL_BYTES", 5):
+            (self.world.state / "reminders.json").write_text("x" * 50)
+            code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("could not be read in full", out)
+
+    def test_an_entry_that_changes_after_the_scan_is_kept(self):
+        victim = self.old("touched-after-scan.txt")
+        real = self.jan.scan
+
+        def scan_then_touch(*a, **k):
+            rows = real(*a, **k)
+            os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
+            return rows
+        with mock.patch.object(self.jan, "scan", scan_then_touch):
+            code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("kept touched-after-scan.txt: it changed since the scan", out)
+        self.assertEqual(self.audits(), [])
+
+    def test_an_audit_line_that_cannot_be_written_stops_the_removing(self):
+        self.old("a-first.txt")
+        self.old("b-second.txt")
+        def failing(name, detail):
+            raise OSError("disk full")
+        lines, removed, kept = self.jan.run(self.temp, self.world.state, self.now, self.jan.settings({}), True, failing)
+        self.assertIn("STOPPED: a-first.txt was removed but its audit line could not be written (disk full)", " ".join(lines))
+        self.assertEqual(removed, 1)
+        self.assertTrue((self.temp / "b-second.txt").exists())
+
+    def test_a_directory_outside_the_system_temp_directory_is_refused(self):
+        outside = REPO / "scenarios"   # a real directory the user owns, outside the system temp directory and not the home directory
+        ok, why = self.jan.safe_dir(outside)
+        self.assertFalse(ok)
+        self.assertIn("not under the system temp directory", why)
+        systmp = self.home / "systmp"
+        (systmp / "opencode").mkdir(parents=True)
+        with mock.patch.object(tempfile, "gettempdir", lambda: str(systmp)):   # a system temp directory the test owns: the reasons do not depend on who owns /tmp
+            ok, why = self.jan.safe_dir(systmp)
+            self.assertFalse(ok)
+            self.assertIn("is the system temp directory itself", why)
+            self.assertTrue(self.jan.safe_dir(systmp / "opencode")[0])
+            self.assertIn("not under the system temp directory", self.jan.safe_dir(self.temp)[1])
+        lines, removed, kept = self.jan.run(outside, self.world.state, self.now, self.jan.settings({}), True, lambda *a: None)
+        self.assertEqual((removed, lines[0][:8]), (0, "refused:"))
+
+    def test_an_entry_on_another_device_than_the_temp_directory_is_kept(self):
+        victim = self.old("mount-like.txt")
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **k):
+            info = real_lstat(path, *a, **k)
+            if str(path) == str(victim):
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, info.st_nlink, info.st_uid, info.st_gid, info.st_size, info.st_atime, info.st_mtime, info.st_ctime))
+            return info
+        with mock.patch.object(self.jan.os, "lstat", lstat):
+            row = self.jan.judge(str(victim), "", self.now, self.jan.settings({}))
+        self.assertEqual((row["action"], row["why"][:11]), ("keep", "is on anoth"))
+
+    def test_a_bad_temp_janitor_key_is_refused_by_the_config_loader_and_is_not_an_unknown_key(self):
+        bad = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"days": 0}}
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config(bad, "test")
+        good = dict(bad, temp_janitor={"days": 3})
+        self.assertEqual(sb.validate_config(good, "test")["temp_janitor"], {"days": 3})
+
+    def test_an_entry_a_live_process_has_as_its_working_directory_is_kept(self):
+        victim = self.old("old-work-dir", directory=True)
+        other = self.old("old-idle-dir", directory=True)
+        self.lsof = "p41\nfcwd\nn%s/inner\np42\nfcwd\nn/\n" % victim
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertFalse(other.exists())
+        self.assertIn("kept old-work-dir: a live process has it as its working directory", out)
+
+    def test_when_the_process_list_cannot_be_read_every_candidate_is_kept(self):
+        victim = self.old("old-victim.txt")
+        for code_, text in ((2, ""), (1, "")):
+            self.lsof_code, self.lsof = code_, text
+            code, out, err = self.run_cli("--apply")
+            self.assertTrue(victim.exists(), code_)
+            self.assertIn("cannot say whether anything is using it", out)
+        for failure in (OSError("no lsof"), subprocess.TimeoutExpired(["lsof"], 30)):
+            def boom(argv, **kwargs):
+                if argv[0] == "lsof":
+                    raise failure
+                return self.world.route(argv, **kwargs)
+            with captured() as (out, err):
+                sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertTrue(victim.exists())
+            self.assertIn("lsof did not run", out.getvalue())
+
+    def test_a_process_list_past_its_cap_keeps_every_candidate(self):
+        victim = self.old("old-victim.txt")
+        self.lsof = "p1\nfcwd\nn/\n" * 70000
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("lsof listed more than 200000 lines", out)
+
+    def test_an_old_modification_time_with_a_recent_change_time_is_kept(self):
+        restored = self.old("restored-from-tar", days=30, directory=True)
+        for p in (restored / "inner.txt", restored):
+            os.utime(str(p), (time.time() - 30 * 86400,) * 2)   # a tar or cp -a restore: old mtimes, a change time of just now
+        self.shift(1)
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(restored.exists())
+        self.shift(10)
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(restored.exists(), "the same tree is removed once its change time is old too")
+
+    def test_a_state_directory_with_no_record_at_all_keeps_everything(self):
+        victim = self.old("old-victim.txt")
+        (self.world.state / "state-marker.json").unlink()
+        for leftover in self.world.state.glob("*.json*"):
+            leftover.unlink()
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("could not be read in full", out)
+        lines, removed, kept = self.jan.run(self.temp, self.world.state, self.now, self.jan.settings({}), True, lambda *a: None)   # and directly: an empty state directory judges nothing
+        self.assertEqual(removed, 0)
+        self.assertTrue(victim.exists())
+
+    def test_a_scan_that_spends_its_time_budget_keeps_the_rest_and_judges_those_before_it(self):
+        self.old("a-old.txt")
+        self.old("b-old.txt")
+        t = [0]
+        real = self.jan.judge
+
+        def judge_then_pass_the_budget(*a, **k):
+            row = real(*a, **k)
+            t[0] += 1000   # the first entry's judging takes longer than the whole budget
+            return row
+        with mock.patch.object(self.jan, "judge", judge_then_pass_the_budget):
+            rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), clock=lambda: t[0])
+        self.assertEqual(rows[0]["action"], "remove", "the entry reached before the budget ran out is judged")
+        self.assertIn("time budget was spent", rows[1]["why"])
+        self.assertEqual(rows[1]["action"], "keep")
+
+    def test_a_hostile_name_is_printed_as_plain_text(self):
+        self.old("bad\x1b[2Jname.txt")
+        code, out, err = self.run_cli()
+        self.assertIn("would remove bad", out)
+        self.assertEqual([c for c in out if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
+
+    def test_a_bad_config_is_refused_with_its_reason(self):
+        for bad in ({"days": 0}, {"days": "7"}, {"keep": "x"}, {"enabled": "yes"}, {"dir": "relative"}, {"other": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.jan.validate(bad)
+        self.jan.validate({"days": 30, "keep": ["a*"], "dir": "/tmp/x", "enabled": True})
+
+    def test_s5_the_docs_say_what_counts_as_named_and_the_other_disk_subcommands_stay(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        for phrase in ("fleet-keep", "GitHub issue", "temp_janitor"):
+            self.assertIn(phrase, text)
+
+
 class TestDockerReaper(Base):
     """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
 
