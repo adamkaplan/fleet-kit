@@ -10228,13 +10228,22 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                   "az containerapp exec -n a -g g", "az containerapp up -n a", "az containerapp delete -n a -g g", "az containerapp update -n a -g g", "az vm start -n v -g g",
                   "az rest --method get --url https://x", "az acr credential show -n r")
 
+    AZ_MORE_SECRETS = ("az signalr key list -n s -g g", "az eventgrid topic key list -n t -g g", "az search admin-key show --service-name s -g g",
+                       "az search query-key list --service-name s -g g", "az webapp deployment list-publishing-profiles -n a -g g",
+                       "az functionapp deployment list-publishing-credentials -n f -g g", "az keyvault list", "az vm delete -n list -g g")
+    TIMEOUT_WRITES = ("timeout 5 gh secret set X --body view", "timeout 5 gh repo delete o/r view", "timeout 5 gh api repos/o/r/issues -X POST -f t=view",
+                      "timeout 5 gh workflow run ci.yml --ref view", "timeout 5 gh pr merge 5 --body view")
+
     def test_az_reads_are_allowed_generally_and_every_secret_reading_or_writing_verb_stays_denied(self):
         for path in self.PATHS:
             with self.subTest(file=path.name):
                 _, rules = self.parse(path)
-                for command in self.AZ_READS:
+                for command in self.AZ_READS + ("gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply",
+                                                "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api"):
                     self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
-                for command in self.AZ_SECRETS:
+                for command in self.TIMEOUT_WRITES:
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                for command in self.AZ_SECRETS + self.AZ_MORE_SECRETS:
                     self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
                     self.assertEqual(self.evaluate(rules, "shell", "timeout 30 " + command), "deny", "timeout 30 " + command)
 
@@ -18095,9 +18104,20 @@ class TestIdentityCheck(ReportBase):
                      ("issue", "list", "-R", "unmapped/repo")):
             with self.subTest(no_pick=args):     # only issue and pr commands (never merge) pick an account by what they name; the rest keep the inherited token
                 done, seen = self.run_gh_shim(None, users, tokens, args=args)
-                self.assertNotIn(seen and seen["token"], ("tok-personal", "tok-janus"))
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
         done, seen = self.run_gh_shim("acme/api", users, tokens, args=("issue", "list", "-R", "other-org/svc"))
         self.assertEqual(seen["token"], "tok-personal", "a caller WITH a repo keeps its own account: what it names never overrides it")
+        # what a body, a title or a second flag says never picks the account: a repo is taken only from the real flag or the target URL
+        for args in (("issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"), ("issue", "comment", "5", "--body", "-Rother-org/svc"),
+                     ("issue", "create", "--title", "https://github.com/other-org/svc/pull/1"), ("issue", "comment", "5", "-R", "acme/api", "-R", "other-org/svc", "--body", "x"),
+                     ("issue", "create", "-t", "-R", "--body", "other-org/svc")):
+            with self.subTest(steer=args):
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
+        shim = self.shim()
+        self.assertEqual(shim.explicit_repo(["issue", "comment", "5", "--body", "x", "-R", "acme/api"]), "acme/api")
+        self.assertEqual(shim.explicit_repo(["pr", "view", "https://github.com/other-org/svc/pull/3"]), "other-org/svc")
+        self.assertIsNone(shim.explicit_repo(["issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"]))
         # fail closed like a failed lookup: the account's token cannot be had, so an issue write is refused instead of run as the wrong account
         done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "comment", "3", "-R", "other-org/svc", "--body", "x"))
         self.assertNotEqual(done.returncode, 0)

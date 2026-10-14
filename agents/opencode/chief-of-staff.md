@@ -68,7 +68,8 @@ permissions:
   - {action: shell, resource: "gh issue edit *", effect: allow}
   - {action: shell, resource: "git *", effect: allow}
   - {action: shell, resource: "az * show *", effect: allow}
-  - {action: shell, resource: "az * list*", effect: allow}
+  - {action: shell, resource: "az * list *", effect: allow}
+  - {action: shell, resource: "az * list-usage *", effect: allow}
   - {action: shell, resource: "az * log *", effect: allow}
   - {action: shell, resource: "az * logs *", effect: allow}
   - {action: shell, resource: "az * status *", effect: allow}
@@ -88,10 +89,10 @@ permissions:
   - {action: shell, resource: "printf *", effect: allow}
   - {action: shell, resource: "date *", effect: allow}
   - {action: shell, resource: "sleep *", effect: allow}
-  - {action: shell, resource: "pwd", effect: allow}
-  - {action: shell, resource: "uptime", effect: allow}
-  - {action: shell, resource: "timeout * gh * view *", effect: allow}
-  - {action: shell, resource: "timeout * gh * list *", effect: allow}
+  - {action: shell, resource: "timeout * gh pr view *", effect: allow}
+  - {action: shell, resource: "timeout * gh issue view *", effect: allow}
+  - {action: shell, resource: "timeout * gh pr list *", effect: allow}
+  - {action: shell, resource: "timeout * gh issue list *", effect: allow}
   - {action: shell, resource: "herdr * list*", effect: allow}
   - {action: shell, resource: "herdr * get*", effect: allow}
   - {action: shell, resource: "herdr * read*", effect: allow}
@@ -188,9 +189,8 @@ permissions:
   - {action: shell, resource: "az *get-access-token*", effect: deny}
   - {action: shell, resource: "az rest*", effect: deny}
   - {action: shell, resource: "az containerapp exec*", effect: deny}
-  - {action: shell, resource: "az *list-keys*", effect: deny}
   - {action: shell, resource: "az *connection-string*", effect: deny}
-  - {action: shell, resource: "az *keys *", effect: deny}
+  - {action: shell, resource: "az *key*", effect: deny}
   - {action: shell, resource: "az *assword*", effect: deny}
   - {action: shell, resource: "az * create *", effect: deny}
   - {action: shell, resource: "az * delete *", effect: deny}
