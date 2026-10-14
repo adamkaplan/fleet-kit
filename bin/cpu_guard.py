@@ -179,8 +179,7 @@ def process_table(limit_seconds=2.0, clock=time.monotonic):
     totals = {}
     try:
         if sys.platform == "darwin":
-            import ctypes.util
-            lib = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib", use_errno=True)
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)   # the system path: no ctypes.util (it needs the platform's own dyld tables)
 
             class TaskInfo(ctypes.Structure):
                 _fields_ = [("virtual", ctypes.c_uint64), ("resident", ctypes.c_uint64), ("user", ctypes.c_uint64), ("system", ctypes.c_uint64), ("policy", ctypes.c_uint64),

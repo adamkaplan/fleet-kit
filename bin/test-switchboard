@@ -202,6 +202,14 @@ class Base(unittest.TestCase):
         bound.start()
         self.addCleanup(bound.stop)
         sb._VERSIONS.clear()
+        # No test reads the real machine's load or memory: the cpu and memory guards run in every engine pass, and a loaded CI runner would wake the Chief of
+        # Staff in an unrelated test. A test of the guards patches its own figures over these.
+        guard = sb.load_cpu_guard()
+        for target, name, value in ((os, "getloadavg", lambda: (0.1, 0.1, 0.1)), (guard, "memory_reading", lambda: guard.Memory(0, 10 * 10 ** 9, 5 * 10 ** 9)),
+                                    (guard, "process_table", lambda *a, **k: {})):
+            calm = mock.patch.object(target, name, value)
+            calm.start()
+            self.addCleanup(calm.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
