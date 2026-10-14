@@ -588,9 +588,10 @@ class TestStagger(Base):
         self.assertEqual(ackmod.stagger_offset("w2:p2"), 162)
         self.assertEqual(ackmod.stagger_offset("w6:p1"), 22)
         self.assertEqual(ackmod.stagger_offset("w9:p2"), 68)
-        out = subprocess.run([sys.executable, "-B", "-c",
-                              "import importlib.machinery as m;"
-                              "mod=m.SourceFileLoader('a', %r).load_module();"
+        out = subprocess.run([sys.executable, "-B", "-c",   # a fresh process; the loader API that exists on every Python (load_module() is gone on newer ones)
+                              "import importlib.machinery as m, importlib.util as u;"
+                              "l=m.SourceFileLoader('a', %r); s=u.spec_from_loader('a', l);"
+                              "mod=u.module_from_spec(s); s.loader.exec_module(mod);"
                               "print(mod.stagger_offset('w2:p2'))" % str(BIN / "heartbeat-ack")],
                              capture_output=True, text=True)
         self.assertEqual(out.stdout.strip(), "162", out.stderr)
