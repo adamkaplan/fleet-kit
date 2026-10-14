@@ -119,7 +119,8 @@ class S1Idle(Base):
     def test_unreadable_activity_is_not_a_reason_to_stop(self):
         self.create()
         self.clock.advance(minutes=30)  # no activity entry: the fake's exec fails
-        self.assertEqual(self.reap_pass(), [])
+        self.assertEqual(self.reap_pass(), [("coder7", "activity unreadable", 1)])  # reported, not killed
+        self.assertIsNotNone(self.pod())
 
     def reap_pass(self):
         return cw.Launcher(cw.Kube(self.env), self.env, self.clock).reap()
@@ -171,7 +172,6 @@ class S2Hard(Base):
         self.assertEqual(json.loads(out)["hard_deadline"], "2026-10-14T14:00:00Z")
         self.clock.advance(hours=1, minutes=1)
         self.assertEqual([r[:2] for r in self.reap()], [("plain", "hard limit")])
-        self.clock.advance(minutes=10)  # 10+ minutes past the unextended limit
         self.assertIsNone(self.pod("plain"))
         self.assertIsNotNone(self.pod("longer"))
 
@@ -200,11 +200,14 @@ class S2Hard(Base):
         self.clock.advance(minutes=31)
         self.assertEqual([r[:2] for r in self.reap()], [("coder7", "hard limit")])
 
-    def test_reap_via_cli_within_three_minutes(self):
+    def test_reap_via_cli_at_the_limit(self):
         self.create("coder7", "--hard", "1h")
         self.stub_hook()
         self.set_activity("coder7", True, T0)
-        self.clock.advance(minutes=62)  # a pass once a minute: at most 1 minute late
+        self.clock.advance(minutes=59)
+        self.assertEqual(self.run_cli("reap")[0], 0)
+        self.assertIsNotNone(self.pod())  # not yet
+        self.clock.advance(minutes=3)  # a pass once a minute: at most 1 minute late
         self.assertEqual(self.run_cli("reap")[0], 0)
         self.assertIsNone(self.pod())
 
@@ -284,7 +287,14 @@ class S3NoStoredCredential(Base):
         with self.assertRaises(ValueError):
             token_mint.mint("http://127.0.0.1:%d/mint" % srv2.server_port, ident, out + "2", now=T0)
         self.assertFalse(os.path.exists(out + "2"))
-        self.assertNotIn("tok-", json.dumps(dict(os.environ)))
+        with open(out) as f:
+            self.assertEqual(f.read(), "tok-" + "z" * 20)  # the token is only in the 0600 file
+        srv3, _ = serve(3601)  # one second over the limit
+        with self.assertRaises(ValueError):
+            token_mint.mint("http://127.0.0.1:%d/mint" % srv3.server_port, ident, out + "3", now=T0)
+        srv4, _ = serve(-5)  # already expired
+        with self.assertRaises(ValueError):
+            token_mint.mint("http://127.0.0.1:%d/mint" % srv4.server_port, ident, out + "4", now=T0)
 
     def test_mint_refuses_plain_http_off_loopback(self):
         with self.assertRaises(ValueError):

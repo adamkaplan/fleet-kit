@@ -26,7 +26,9 @@ def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, ope
     req = urllib.request.Request(endpoint, data=b"{}", method="POST",
                                  headers={"Authorization": "Bearer " + identity, "Content-Type": "application/json"})
     with opener(req, timeout=30) as r:
-        reply = json.load(r)
+        reply = json.loads(r.read(65536))  # a reply is a few hundred bytes: read at most 64 KiB
+    if not (isinstance(reply, dict) and isinstance(reply.get("token"), str) and isinstance(reply.get("expires_at"), str)):
+        raise ValueError("the token endpoint gave an unusable reply")
     now = now or dt.datetime.now(dt.timezone.utc)
     expires = dt.datetime.strptime(reply["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
     life = (expires - now).total_seconds()
@@ -34,9 +36,11 @@ def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, ope
         raise ValueError("the minted token lives %d seconds, more than %d" % (life, MAX_SECONDS))
     if life <= 0:
         raise ValueError("the minted token is already expired")
-    fd = os.open(out_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = out_file + ".new"  # written whole, then renamed: a reader never sees a partial token
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(reply["token"])
+    os.replace(tmp, out_file)
     return int(life)
 
 
@@ -44,7 +48,7 @@ def main():
     try:
         print("token minted, lives %d seconds" % mint(os.environ["FLEET_TOKEN_ENDPOINT"]))
         return 0
-    except (KeyError, ValueError, OSError) as e:
+    except (KeyError, ValueError, TypeError, OSError) as e:
         print("fleet-token-mint: %s" % e, file=sys.stderr)
         return 1
 

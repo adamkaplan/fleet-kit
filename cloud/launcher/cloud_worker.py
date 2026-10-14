@@ -132,7 +132,9 @@ def render_pod(a, worker, name, now, hard, env):
                         "fleet/idle-seconds": e["FLEET_IDLE_SECONDS"], "fleet/shape": a.shape,
                         "fleet/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
         "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("FLEET_CLOUD_SERVICE_ACCOUNT", "fleet-worker"),
-                 "containers": [{"name": "worker", "image": image, "env": [{"name": k, "value": v} for k, v in e.items()],
+                  "securityContext": {"runAsNonRoot": True},
+                 "containers": [{"name": "worker", "image": image,
+                                 "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
                                  "readinessProbe": {"httpGet": {"path": "/health", "port": 4096}},
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/fleet", "readOnly": True},
@@ -205,23 +207,30 @@ class Launcher:
             if self.kube.get_pod(name):
                 raise CloudError("worker %s already exists" % worker, EXIT_USAGE)
             password = secrets.token_urlsafe(32)
-            self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": {"app": LABEL}},
-                             "type": "Opaque", "stringData": {"password": password}})
-            self.kube.apply(spec)
+            # Single operator assumed: the check above and the applies below are not one atomic step.
             try:
+                self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": {"app": LABEL}},
+                                 "type": "Opaque", "stringData": {"password": password}})
+                self.kube.apply(spec)
                 self._wait_ready(name, a.wait)
-            except CloudError:
-                self.kube.delete(name)  # a pod that never answered is not left running (and costing)
-                raise
-            if a.password_fd is not None:
-                with os.fdopen(os.dup(a.password_fd), "w") as f:
-                    f.write(password)
+                if a.password_fd is not None:
+                    with os.fdopen(os.dup(a.password_fd), "w") as f:
+                        f.write(password)
+            except (CloudError, OSError) as e:
+                self._cleanup(name)  # nothing is left running (and costing) or holding a password
+                raise e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
             domain = self.env.get("FLEET_CLOUD_DOMAIN", "example.internal")
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/fleet/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "password_fd": a.password_fd}
         return self._audited(worker, "create", go)
+
+    def _cleanup(self, name):
+        try:
+            self.kube.delete(name)
+        except CloudError:
+            pass  # the original failure is the one to report
 
     def _wait_ready(self, name, seconds):
         end = self.clock() + dt.timedelta(seconds=seconds)
@@ -326,6 +335,8 @@ class Launcher:
                 "cost_estimate_usd": self.cost(pod)}
 
     def status(self, a):
+        if a.worker and not NAME_RE.match(a.worker):
+            raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         pods = [self.kube.get_pod(pod_name(a.worker))] if a.worker else self.kube.list_pods()
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
@@ -341,7 +352,7 @@ class Launcher:
                     hard = parse_iso(json.load(f)["hard_deadline"])
             except (OSError, ValueError, KeyError):
                 pass
-        return hard
+        return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
@@ -349,10 +360,20 @@ class Launcher:
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
-            if now >= self.hard_deadline(pod):
+            try:
+                hard = self.hard_deadline(pod)
+            except (ValueError, TypeError):
+                out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
+                continue
+            if now >= hard:
                 reason = "hard limit"
             else:
                 act = self.activity(pod["metadata"]["name"])
+                if act is None:
+                    # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
+                    # its hard limit; it is reported so it is not silent.
+                    out.append((worker, "activity unreadable", 1))
+                    continue
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
