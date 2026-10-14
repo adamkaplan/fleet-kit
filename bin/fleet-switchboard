@@ -324,6 +324,26 @@ def load_triage_digest():
 
 triage_digest = load_triage_digest()
 
+
+def load_dead_hint():
+    """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
+    held = sys.modules.get("dead_hint")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("dead_hint", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["dead_hint"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("dead_hint", None)
+        raise
+    return module
+
+
+dead_hint = load_dead_hint()
+
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
 
@@ -5735,6 +5755,9 @@ class PaneFacts:
             word = "DETACHED" if info["state"] == PANE_DETACHED else "DEAD"
             summary = ("%s is %s: pane %s, session %s (%s). Repair it with `%s reattach %s`; if the session is gone, `relaunch` is the next step."
                        % (name, word, info.get("pane"), info.get("session"), _one_line(info.get("why"), 120), PROG, name))
+            if info["state"] == PANE_DEAD:   # #379: what is known of it, and what to do (best effort: the hint is read-only, bounded and total on any file content)
+                summary += " " + dead_hint.hint(name, _read_small(engine.state_dir, LAST_REPORT_FILE).get(name), engine.now(),
+                                                boss_name(discovery, discovery.agents.get(name)) if name in discovery.agents else None) + "."
             for chief in chiefs:
                 if chief != name:
                     out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
@@ -5750,12 +5773,14 @@ def pane_health_status_lines(state_dir, now=None):
     retired = read_retired(state_dir)
     bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
+    last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
     tail = (["      retired    %d finished worker(s), not watched: %s (`%s retire --undo <name>` reverses)" % (len(gone), ", ".join(gone[:8]), PROG)] if gone else [])
     if not bad:
         return tail
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
-            ] + ["        run `%s reattach <name>`" % PROG] + tail
+            ] + ["        run `%s reattach <name>`" % PROG] + [
+        "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
