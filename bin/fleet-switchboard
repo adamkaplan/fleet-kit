@@ -18464,6 +18464,35 @@ def cmd_disk_report(args, runner, now):
     return EXIT_OK
 
 
+def janitor_busy_function(engine, runner, janitor):
+    """`busy(path)` for the temp janitor: why an entry is in use, else None; raises janitor.Unknown when something cannot be read (the entry is then kept).
+    In use = a herdr pane (an agent's or a plain terminal) works in it, a non-retired agent's session runs in it (both from `worktree_in_use`), or ANY live
+    process has it as its working directory (one `lsof -a -d cwd -Fn` per run, bounded by a timeout)."""
+    held = {}
+
+    def process_directories():
+        if "dirs" not in held:
+            try:
+                done = runner(["lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as err:
+                raise janitor.Unknown("lsof did not run: %s" % _one_line(str(err), 80))
+            if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
+                raise janitor.Unknown("lsof failed (exit %s)" % done.returncode)
+            held["dirs"] = [os.path.realpath(l[1:]) for l in (done.stdout or "").splitlines()[:200000] if l.startswith("n/")]
+        return held["dirs"]
+
+    def busy(path):
+        why = worktree_in_use(engine, path)
+        if why:
+            return why
+        root = os.path.realpath(path).rstrip("/") + "/"
+        for where in process_directories():
+            if (where.rstrip("/") + "/").startswith(root):
+                return "a live process has it as its working directory (%s)" % _plain(where, 100)
+        return None
+    return busy
+
+
 def cmd_disk_janitor(args, runner, now):
     """`disk janitor [--apply]`: the temp-directory janitor (bin/disk_janitor.py). A dry run by default; `--apply` is the operator's or the Chief of Staff's."""
     janitor = load_disk_janitor()
@@ -18476,8 +18505,10 @@ def cmd_disk_janitor(args, runner, now):
         if not cfg["enabled"]:
             raise LaunchError("the temp janitor is switched off (temp_janitor.enabled is false)")
     temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
-    lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
-                                       lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail))
+    with worktree_sweep(engine):   # one session.list for every in-use check of this run
+        lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
+                                           lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
+                                           busy=janitor_busy_function(engine, runner, janitor))
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))

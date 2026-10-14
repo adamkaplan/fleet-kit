@@ -40343,9 +40343,21 @@ class TestTempJanitor(Base):
         self.outside = self.home / "outside"
         self.outside.mkdir()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "keep": ["keepme-*"]}})
-        self.now = self.world.clock.now()
+        self.shift(10)   # the janitor's clock: ten days after the files these tests create (a change time cannot be set back, so the clock moves forward)
+        (self.world.state / "state-marker.json").write_text("{}")   # a state directory with no record at all is refused
+        self.lsof = "p1\nfcwd\nn/\n"
+        self.lsof_code = 0
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
         self.as_cos()
+
+    def shift(self, days):
+        self.world.clock.t = time.time() + days * 86400
+        self.now = self.world.clock.now()
+
+    def routed(self, argv, **kwargs):
+        if argv[0] == "lsof":
+            return subprocess.CompletedProcess(argv, self.lsof_code, self.lsof, "")
+        return self.world.route(argv, **kwargs)
 
     def as_cos(self):
         os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
@@ -40364,7 +40376,7 @@ class TestTempJanitor(Base):
 
     def run_cli(self, *argv):
         with captured() as (out, err):
-            code = sb.main(["disk", "janitor", *argv], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
     def audits(self):
@@ -40557,6 +40569,58 @@ class TestTempJanitor(Base):
             sb.validate_config(bad, "test")
         good = dict(bad, temp_janitor={"days": 3})
         self.assertEqual(sb.validate_config(good, "test")["temp_janitor"], {"days": 3})
+
+    def test_an_entry_a_live_process_has_as_its_working_directory_is_kept(self):
+        victim = self.old("old-work-dir", directory=True)
+        other = self.old("old-idle-dir", directory=True)
+        self.lsof = "p41\nfcwd\nn%s/inner\np42\nfcwd\nn/\n" % victim
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertFalse(other.exists())
+        self.assertIn("kept old-work-dir: a live process has it as its working directory", out)
+
+    def test_when_the_process_list_cannot_be_read_every_candidate_is_kept(self):
+        victim = self.old("old-victim.txt")
+        for code_, text in ((2, ""), (1, "")):
+            self.lsof_code, self.lsof = code_, text
+            code, out, err = self.run_cli("--apply")
+            self.assertTrue(victim.exists(), code_)
+            self.assertIn("cannot say whether anything is using it", out)
+        def boom(argv, **kwargs):
+            if argv[0] == "lsof":
+                raise OSError("no lsof")
+            return self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertTrue(victim.exists())
+        self.assertIn("lsof did not run", out.getvalue())
+
+    def test_an_old_modification_time_with_a_recent_change_time_is_kept(self):
+        restored = self.old("restored-from-tar", days=30, directory=True)
+        for p in (restored / "inner.txt", restored):
+            os.utime(str(p), (time.time() - 30 * 86400,) * 2)   # a tar or cp -a restore: old mtimes, a change time of just now
+        self.shift(1)
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(restored.exists())
+        self.shift(10)
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(restored.exists(), "the same tree is removed once its change time is old too")
+
+    def test_a_state_directory_with_no_record_at_all_keeps_everything(self):
+        victim = self.old("old-victim.txt")
+        (self.world.state / "state-marker.json").unlink()
+        for leftover in self.world.state.glob("*.json*"):
+            leftover.unlink()
+        code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("could not be read in full", out)
+
+    def test_a_scan_that_spends_its_time_budget_keeps_the_rest(self):
+        self.old("a-old.txt")
+        self.old("b-old.txt")
+        ticks = iter(range(0, 10000, 1000))
+        rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), clock=lambda: next(ticks))
+        self.assertTrue(any("time budget was spent" in r["why"] for r in rows))
 
     def test_a_hostile_name_is_printed_as_plain_text(self):
         self.old("bad\x1b[2Jname.txt")

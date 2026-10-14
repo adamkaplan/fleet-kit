@@ -1,10 +1,13 @@
 """The temp-directory janitor (ask #321). Pure of the switchboard: the caller hands it the directories, the clock, the settings and an audit
 function. It looks at the TOP-LEVEL entries of the temp directory only, and an entry is removed (as a unit) when ALL of these hold:
 
-  - it is older than `days`: the newest modification time of anything inside it (a bounded walk; a tree too big to judge is kept);
+  - it is older than `days`: the latest modification, change or birth time of the entry and of anything inside it (a bounded walk; a tree too big to judge
+    is kept; the change time is what a restore with tar or cp -a cannot fake);
   - the fleet's own records do not name it: its full path, or its basename when that is at least six characters, does not occur in any state
     file of the state directory (`*.json` and `*.jsonl`, never the compressed archives; a big file is read by its tail);
   - it does not match a keep-list glob of the settings, and it does not hold a `.fleet-keep` marker at its top;
+  - nothing is using it: no process has it as its working directory, no pane of the fleet works in it, no live agent session runs in it (the caller's
+    `busy` function says; if it cannot say, the entry is KEPT);
   - it belongs to the user running this, and it is not the temp directory itself.
 
 A symlink is removed as a link and never followed; a directory is removed without following any link inside it. Nothing here touches a path
@@ -21,11 +24,16 @@ from pathlib import Path
 DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None}
 KEEP_MARKER = ".fleet-keep"
 WALK_ENTRIES = 20000          # files one entry may hold and still be judged
-WALK_SECONDS = 5.0            # the whole scan
+WALK_SECONDS = 5.0            # one entry's walk
 REMOVE_MAX = 500              # removals per call
 STATE_FILE_BYTES = 2000000    # of one state file read (its tail)
 STATE_TOTAL_BYTES = 16000000
+SCAN_SECONDS = 60.0          # the whole scan: past it the remaining entries are kept
 MIN_NAME = 6                  # a basename shorter than this is too common to count as naming something
+
+
+class Unknown(Exception):
+    """Raised by the caller's `busy` function when it cannot say whether something uses an entry: the entry is then KEPT (fail closed)."""
 
 
 def settings(raw):
@@ -89,6 +97,8 @@ def named_text(state_dir):
         names = sorted(os.listdir(str(state_dir)))
     except OSError:
         return "", False
+    if not any(n.endswith(".json") or n.endswith(".jsonl") for n in names):
+        return "", False   # a state directory with no record at all is the wrong directory, or an empty one: nothing can be said to be unnamed
     for name in names:
         if not (name.endswith(".json") or name.endswith(".jsonl")):
             continue
@@ -111,6 +121,12 @@ def named_text(state_dir):
     return "\n".join(parts), complete
 
 
+def _stamp(info):
+    """The latest of modification time, change time and (where there is one) birth time: a tree restored with tar, cp -a, rsync -a or docker cp keeps its
+    OLD modification times, but its change time is when it was created, and a user cannot set that."""
+    return max(info.st_mtime, info.st_ctime, getattr(info, "st_birthtime", 0) or 0)
+
+
 def _newest(path, deadline, clock=time.monotonic):
     """(newest mtime under path, complete): a bounded walk that never follows a link and never crosses onto another device. Incomplete when a
     directory cannot be read, the walk is too big or too slow, or another device is mounted inside."""
@@ -118,7 +134,7 @@ def _newest(path, deadline, clock=time.monotonic):
         info = os.lstat(path)
     except OSError:
         return None, False
-    newest, seen, pending, complete = info.st_mtime, 0, [], True
+    newest, seen, pending, complete = _stamp(info), 0, [], True
     if stat.S_ISDIR(info.st_mode):
         pending.append(path)
     while pending:
@@ -137,7 +153,7 @@ def _newest(path, deadline, clock=time.monotonic):
                 except OSError:
                     complete = False
                     continue
-                newest = max(newest, st.st_mtime)
+                newest = max(newest, _stamp(st))
                 if stat.S_ISDIR(st.st_mode):
                     if st.st_dev != info.st_dev:
                         complete = False
@@ -178,7 +194,7 @@ def _forms(value):
     return {value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}
 
 
-def judge(path, text, now, cfg, uid=None, clock=time.monotonic):
+def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
     """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime):
     run compares it again right before removing. Reads only."""
     uid = os.getuid() if uid is None else uid
@@ -218,22 +234,37 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic):
     if newest > now - cfg["days"] * 86400:
         row["why"] = "newer than %d day(s)" % cfg["days"]
         return row
-    if any(form in text for form in _forms(path)) or (len(name) >= MIN_NAME and any(form in text for form in _forms(name))):
+    path_forms = _forms(path) | _forms(os.path.realpath(path))
+    if any(form in text for form in path_forms) or (len(name) >= MIN_NAME and any(form in text for form in _forms(name))):
         row["why"] = "named by the fleet's records"
         return row
+    if busy is not None:
+        try:
+            using = busy(path)
+        except Unknown as err:
+            row["why"] = "cannot say whether anything is using it (%s): kept" % err
+            return row
+        if using:
+            row["why"] = using
+            return row
     row["action"], row["size"] = "remove", _size(path, deadline, clock)
     row["ident"] = (info.st_dev, info.st_ino, newest)
     return row
 
 
-def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic):
+def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=None):
     """[judge rows] for each top-level entry, sorted by name; every entry is kept when the fleet's records could not be read in full. Reads only."""
     text, complete = named_text(state_dir)
     try:
         names = sorted(os.listdir(str(temp_dir)))
     except OSError:
         return []
-    rows = [judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock) for n in names]
+    budget, rows = clock() + SCAN_SECONDS, []
+    for n in names:
+        if clock() > budget:
+            rows.append({"name": n, "path": os.path.join(str(temp_dir), n), "action": "keep", "why": "the scan's time budget was spent: kept", "size": 0, "age_days": 0, "ident": None})
+            continue
+        rows.append(judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock, busy))
     if not complete:
         for row in rows:
             if row["action"] == "remove":
@@ -253,7 +284,7 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic):
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None):
     """Returns (lines, removed, kept). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
     entry (device, inode and newest modification time)."""
@@ -261,7 +292,7 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
     ok, why = safe_dir(temp_dir)
     if not ok:
         return ["refused: %s" % why], 0, 0
-    rows = scan(temp_dir, state_dir, now, cfg, uid, clock)
+    rows = scan(temp_dir, state_dir, now, cfg, uid, clock, busy)
     for row in rows:
         if row["action"] != "remove":
             kept += 1
@@ -274,7 +305,7 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             removed += 1
             continue
         again_text, again_complete = named_text(state_dir)
-        again = judge(row["path"], again_text, now, cfg, uid, clock)
+        again = judge(row["path"], again_text, now, cfg, uid, clock, busy)
         if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
             lines.append("kept %s: it changed since the scan" % row["name"])
             kept += 1
