@@ -104,6 +104,28 @@ def load_decision_core():
 decision_core = load_decision_core()
 
 
+def cloud():
+    """The remote-worker module, bin/cloud_worker.py (#371), loaded by path like decision_core and bound to this script's names. All of its logic
+    lives there; the hooks of launch, send, retire and status only call it through `run_cloud`."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cloud_worker.py")
+    held = sys.modules.get("cloud_worker")
+    if held is None or os.path.realpath(getattr(held, "__file__", "") or "") != path:
+        spec = importlib.util.spec_from_file_location("cloud_worker", path)
+        held = importlib.util.module_from_spec(spec)
+        sys.modules["cloud_worker"] = held
+        spec.loader.exec_module(held)
+    return held.bind(globals())
+
+
+def run_cloud(function, *arguments):
+    """`cloud_worker.<function>(*arguments)`; a CloudError reads as a LaunchError (a one-line failure, exit 1)."""
+    module = cloud()
+    try:
+        return getattr(module, function)(*arguments)
+    except module.CloudError as err:
+        raise LaunchError(str(err)) from None
+
+
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
@@ -5867,6 +5889,9 @@ def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed. The
     caller rule is `reattach`'s: the operator, the Chief of Staff or the agent's own boss; others are refused and audited."""
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        return run_cloud("cmd_retire", args, runner, now, remote)
     engine, state, _ = build_engine(runner, now, "cli")
     name = args.name
     if not NAME_RE.match(name or ""):
@@ -6438,6 +6463,16 @@ def add_retire_parsers(sub):
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
+
+
+def add_read_parsers(sub):
+    read = sub.add_parser("read", help="The newest messages of an agent's session, oldest first (a cloud worker is read on its own endpoint)")
+    read.add_argument("name", help="The agent's fleet name")
+    read.add_argument("--limit", type=int, default=20, help="How many messages (default 20, at most 200)")
+
+
+def cmd_read(args, runner, now):
+    return run_cloud("cmd_read", args, runner, now)
 
 
 def add_reattach_parsers(sub):
@@ -13703,10 +13738,15 @@ def format_status(report):
 
 def cmd_status(args, runner=subprocess.run, now=time.time):
     report = collect_status(runner, now)
+    cloud_lines, cloud_rows = cloud().status_extra(runner)   # cloud workers (#371): nothing when there are none
+    if cloud_rows:
+        report["cloud"] = cloud_rows
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
+        if cloud_lines:
+            print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR
 
 
@@ -13915,6 +13955,8 @@ def read_brief(path, stdin):
 
 
 def cmd_launch(args, runner, now, socket_call=None):
+    if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
+        return run_cloud("cmd_launch", args, runner, now)
     workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     if args.resume:
@@ -14136,6 +14178,9 @@ def cmd_send(args, runner, now):
 
 
 def _cmd_send(args, runner, now):
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        return run_cloud("cmd_send", args, runner, now, remote)
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
     if refusal:
@@ -21994,6 +22039,11 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
+    launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod)")
+    launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
+    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
+    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, S or M")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
