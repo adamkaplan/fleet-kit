@@ -39972,7 +39972,6 @@ class TestEventFeedStreamEdges(V2TransportBase):
         got = list(self.route(5).stream_lines("/api/event"))
         self.assertIs(got[0], sb.STREAM_OPENED)
         self.assertIs(got[-1], sb.STREAM_IDLE, "quiet for the whole idle time: ours to end")
-        original = sb.FakeServiceResponse.readline if hasattr(sb, "FakeServiceResponse") else None
         conn_class = type(self.service.connect("h", 1, timeout=5))
         real_get = conn_class.getresponse
 
